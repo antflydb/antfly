@@ -48,6 +48,7 @@ pub fn rerankDocumentsWithAntflyProvider(
 pub const Options = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
+    capability_cache: ?*remote_capabilities.Cache = null,
 };
 
 pub fn rerankDocumentsWithOptions(
@@ -86,9 +87,24 @@ pub fn rerankDocumentsWithOptions(
                 break :blk &header_storage;
             } else &.{};
             if (authorization_header) |value| try provider.setAuthorizationHeader(value);
-            var capability_cache = remote_capabilities.Cache.init(alloc, http.io);
-            defer capability_cache.deinit();
-            if (try capability_cache.getOrDiscover(http, cfg.defaultedUrl(), cfg.model, .rerank, headers)) |capabilities| {
+            var fallback_cache: ?remote_capabilities.Cache = null;
+            defer if (fallback_cache) |*cache| cache.deinit();
+            var capability_cache = options.capability_cache;
+            if (capability_cache == null) {
+                if (options.antfly_provider) |local| capability_cache = local.remote_capability_cache;
+            }
+            if (capability_cache == null) {
+                fallback_cache = remote_capabilities.Cache.init(alloc, http.io);
+                capability_cache = &fallback_cache.?;
+            }
+            const capability_lease = try capability_cache.?.getOrDiscoverLease(
+                http,
+                cfg.defaultedUrl(),
+                cfg.model,
+                .rerank,
+                headers,
+            );
+            if (capability_lease.capabilities) |capabilities| {
                 try capabilities.validateInvocation(.rerank, .{
                     .item_count = 1,
                     .modalities = .{ .text = true },
@@ -97,11 +113,13 @@ pub fn rerankDocumentsWithOptions(
                     .max_candidates_per_request = documents.len,
                 });
             }
-            if (try capability_cache.routingToken(cfg.defaultedUrl(), cfg.model, .rerank, headers)) |token|
+            if (capability_lease.routing_token) |token|
                 try provider.setCapabilityToken(token.slice());
+            if (capability_lease.descriptor_revision) |revision|
+                try provider.setCapabilityRevision(revision.slice());
             var result = provider.reranker().rerank(alloc, cfg.model, query, documents) catch |err| {
                 if (err == error.InferenceCapabilitiesStale)
-                    try capability_cache.invalidate(cfg.defaultedUrl(), cfg.model, .rerank, headers);
+                    try capability_cache.?.invalidate(cfg.defaultedUrl(), cfg.model, .rerank, headers);
                 return err;
             };
             defer result.deinit();

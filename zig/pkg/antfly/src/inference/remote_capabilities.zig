@@ -19,6 +19,7 @@ const capability_discovery_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const capability_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
 const capability_catalog_response_bytes: usize = 4 << 20;
 pub const capability_token_header = "X-Antfly-Capability-Token";
+pub const capability_revision_header = "X-Antfly-Capability-Revision";
 pub const capability_stale_header = "X-Antfly-Capability-Stale";
 const capability_token_max_bytes: usize = 128;
 
@@ -40,6 +41,30 @@ pub const RoutingToken = struct {
     }
 };
 
+pub const CapabilityRevision = struct {
+    bytes: [64]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn init(value: []const u8) !CapabilityRevision {
+        if (value.len != 64) return error.InvalidCapabilityRevision;
+        for (value) |byte| if (!std.ascii.isHex(byte)) return error.InvalidCapabilityRevision;
+        var result = CapabilityRevision{};
+        @memcpy(result.bytes[0..value.len], value);
+        result.len = @intCast(value.len);
+        return result;
+    }
+
+    pub fn slice(self: *const CapabilityRevision) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+pub const CapabilityLease = struct {
+    capabilities: ?work.InferenceCapabilities,
+    routing_token: ?RoutingToken = null,
+    descriptor_revision: ?CapabilityRevision = null,
+};
+
 fn monotonicNowNs(io: std.Io) u64 {
     _ = io;
     // Callers pass absolute deadlines produced by antfly_platform.time. Keep
@@ -51,6 +76,7 @@ fn monotonicNowNs(io: std.Io) u64 {
 const CachedCapability = struct {
     value: ?work.InferenceCapabilities,
     routing_token: ?RoutingToken = null,
+    descriptor_revision: ?CapabilityRevision = null,
     expires_at_ns: u64,
     stale_until_ns: u64,
 };
@@ -58,6 +84,7 @@ const CachedCapability = struct {
 const FailedDiscoveryCompletion = struct {
     value: ?work.InferenceCapabilities = null,
     routing_token: ?RoutingToken = null,
+    descriptor_revision: ?CapabilityRevision = null,
     err: ?anyerror = null,
 };
 
@@ -73,7 +100,11 @@ fn classifyFailedDiscovery(
     if (owner_context_error != null)
         return .{ .err = error.CapabilityDiscoveryOwnerAbandoned };
     if (stale) |entry| {
-        if (now_ns < entry.stale_until_ns) return .{ .value = entry.value, .routing_token = entry.routing_token };
+        if (now_ns < entry.stale_until_ns) return .{
+            .value = entry.value,
+            .routing_token = entry.routing_token,
+            .descriptor_revision = entry.descriptor_revision,
+        };
     }
     return .{ .err = discovery_error };
 }
@@ -84,6 +115,7 @@ const CapabilityFlight = struct {
     done: bool = false,
     value: ?work.InferenceCapabilities = null,
     routing_token: ?RoutingToken = null,
+    descriptor_revision: ?CapabilityRevision = null,
     err: ?anyerror = null,
     ready: std.Io.Event = .unset,
     refs_changed: std.Io.Event = .unset,
@@ -147,7 +179,18 @@ pub const Cache = struct {
         task: work.Task,
         headers: []const [2][]const u8,
     ) !?work.InferenceCapabilities {
-        return try self.getOrDiscoverWithContext(http, inference_url, model, task, headers, .{
+        return (try self.getOrDiscoverLease(http, inference_url, model, task, headers)).capabilities;
+    }
+
+    pub fn getOrDiscoverLease(
+        self: *Cache,
+        http: *httpx.Client,
+        inference_url: []const u8,
+        model: []const u8,
+        task: work.Task,
+        headers: []const [2][]const u8,
+    ) !CapabilityLease {
+        return try self.getOrDiscoverLeaseWithContext(http, inference_url, model, task, headers, .{
             .deadline_ns = monotonicNowNs(self.io) +| capability_discovery_timeout_ns,
         });
     }
@@ -161,6 +204,25 @@ pub const Cache = struct {
         headers: []const [2][]const u8,
         wait_context: WaitContext,
     ) !?work.InferenceCapabilities {
+        return (try self.getOrDiscoverLeaseWithContext(
+            http,
+            inference_url,
+            model,
+            task,
+            headers,
+            wait_context,
+        )).capabilities;
+    }
+
+    pub fn getOrDiscoverLeaseWithContext(
+        self: *Cache,
+        http: *httpx.Client,
+        inference_url: []const u8,
+        model: []const u8,
+        task: work.Task,
+        headers: []const [2][]const u8,
+        wait_context: WaitContext,
+    ) !CapabilityLease {
         const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, task, headers);
         defer self.alloc.free(key);
         while (true) {
@@ -175,7 +237,11 @@ pub const Cache = struct {
             if (self.entries.get(key)) |entry| {
                 if (now_ns < entry.expires_at_ns) {
                     self.mutex.unlock(self.io);
-                    return entry.value;
+                    return .{
+                        .capabilities = entry.value,
+                        .routing_token = entry.routing_token,
+                        .descriptor_revision = entry.descriptor_revision,
+                    };
                 }
             }
             if (self.flights.get(key)) |flight| {
@@ -204,6 +270,8 @@ pub const Cache = struct {
                 };
                 self.mutex.lockUncancelable(self.io);
                 const value = flight.value;
+                const routing_token = flight.routing_token;
+                const descriptor_revision = flight.descriptor_revision;
                 const flight_err = flight.err;
                 self.releaseFlightLocked(flight);
                 self.mutex.unlock(self.io);
@@ -211,7 +279,11 @@ pub const Cache = struct {
                     if (err == error.CapabilityDiscoveryOwnerAbandoned) continue;
                     return err;
                 }
-                return value;
+                return .{
+                    .capabilities = value,
+                    .routing_token = routing_token,
+                    .descriptor_revision = descriptor_revision,
+                };
             }
 
             const flight = self.alloc.create(CapabilityFlight) catch |err| {
@@ -238,15 +310,40 @@ pub const Cache = struct {
                     break :blk null;
                 };
                 self.mutex.lockUncancelable(self.io);
-                self.admitLocked(key, value.value, value.routing_token, monotonicNowNs(self.io)) catch {};
+                if (owner_context_error != null) {
+                    flight.err = error.CapabilityDiscoveryOwnerAbandoned;
+                    flight.done = true;
+                    flight.ready.set(self.io);
+                    self.releaseFlightLocked(flight);
+                    self.mutex.unlock(self.io);
+                    return owner_context_error.?;
+                }
+                self.admitLocked(
+                    key,
+                    value.value,
+                    value.routing_token,
+                    value.descriptor_revision,
+                    monotonicNowNs(self.io),
+                ) catch |err| {
+                    flight.err = err;
+                    flight.done = true;
+                    flight.ready.set(self.io);
+                    self.releaseFlightLocked(flight);
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
                 flight.value = value.value;
                 flight.routing_token = value.routing_token;
+                flight.descriptor_revision = value.descriptor_revision;
                 flight.done = true;
                 flight.ready.set(self.io);
                 self.releaseFlightLocked(flight);
                 self.mutex.unlock(self.io);
-                if (owner_context_error) |err| return err;
-                return value.value;
+                return .{
+                    .capabilities = value.value,
+                    .routing_token = value.routing_token,
+                    .descriptor_revision = value.descriptor_revision,
+                };
             } else |err| {
                 const owner_context_error: ?anyerror = blk: {
                     wait_context.check(monotonicNowNs(self.io)) catch |context_err| break :blk context_err;
@@ -261,16 +358,23 @@ pub const Cache = struct {
                 );
                 flight.value = completion.value;
                 flight.routing_token = completion.routing_token;
+                flight.descriptor_revision = completion.descriptor_revision;
                 flight.err = completion.err;
                 flight.done = true;
                 flight.ready.set(self.io);
                 const value = flight.value;
+                const routing_token = flight.routing_token;
+                const descriptor_revision = flight.descriptor_revision;
                 const flight_err = flight.err;
                 self.releaseFlightLocked(flight);
                 self.mutex.unlock(self.io);
                 if (owner_context_error) |context_err| return context_err;
                 if (flight_err) |flight_error| return flight_error;
-                return value;
+                return .{
+                    .capabilities = value,
+                    .routing_token = routing_token,
+                    .descriptor_revision = descriptor_revision,
+                };
             }
         }
     }
@@ -280,11 +384,13 @@ pub const Cache = struct {
         key: []const u8,
         value: ?work.InferenceCapabilities,
         routing_token: ?RoutingToken,
+        descriptor_revision: ?CapabilityRevision,
         now_ns: u64,
     ) !void {
         const cached = CachedCapability{
             .value = value,
             .routing_token = routing_token,
+            .descriptor_revision = descriptor_revision,
             .expires_at_ns = now_ns +| capability_cache_ttl_ns,
             .stale_until_ns = now_ns +| capability_cache_stale_ns,
         };
@@ -850,15 +956,23 @@ fn discoverWithContext(
         try RoutingToken.init(value)
     else
         null;
+    const descriptor_revision = if (response.headers.get(capability_revision_header)) |value|
+        try CapabilityRevision.init(value)
+    else
+        null;
+    if ((routing_token == null) != (descriptor_revision == null))
+        return error.IncompleteCapabilityLease;
     return .{
         .value = try parseModelCapabilities(alloc, response.body orelse return error.RemoteCapabilityDiscoveryFailed, model, task),
         .routing_token = routing_token,
+        .descriptor_revision = descriptor_revision,
     };
 }
 
 const DiscoveredCapability = struct {
     value: ?work.InferenceCapabilities,
     routing_token: ?RoutingToken,
+    descriptor_revision: ?CapabilityRevision,
 };
 
 test "remote Antfly capability cache retains and invalidates routing token with descriptor" {
@@ -866,19 +980,25 @@ test "remote Antfly capability cache retains and invalidates routing token with 
     defer io_impl.deinit();
     var cache = Cache.init(std.testing.allocator, io_impl.io());
     defer cache.deinit();
+    var http = httpx.Client.init(std.testing.allocator, io_impl.io());
+    defer http.deinit();
     const headers: []const [2][]const u8 = &.{.{ "Authorization", "Bearer test" }};
     const key = try capabilityCacheKeyAlloc(std.testing.allocator, "http://proxy", "model", .rerank, headers);
     defer std.testing.allocator.free(key);
     const token = try RoutingToken.init("route-lease");
+    const revision = try CapabilityRevision.init("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
     {
         cache.mutex.lockUncancelable(cache.io);
         defer cache.mutex.unlock(cache.io);
-        try cache.admitLocked(key, null, token, monotonicNowNs(cache.io));
+        try cache.admitLocked(key, null, token, revision, monotonicNowNs(cache.io));
     }
 
-    const retained = (try cache.routingToken("http://proxy", "model", .rerank, headers)) orelse
+    const lease = try cache.getOrDiscoverLease(&http, "http://proxy", "model", .rerank, headers);
+    const retained = lease.routing_token orelse
         return error.TestExpectedRoutingToken;
     try std.testing.expectEqualStrings("route-lease", retained.slice());
+    const retained_revision = lease.descriptor_revision orelse return error.TestExpectedCapabilityRevision;
+    try std.testing.expectEqualStrings(revision.slice(), retained_revision.slice());
     try cache.invalidate("http://proxy", "model", .rerank, headers);
     try std.testing.expectError(
         error.InferenceCapabilitiesUnavailable,

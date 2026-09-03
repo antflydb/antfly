@@ -28,6 +28,7 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const remote_capabilities = @import("../inference/remote_capabilities.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
@@ -312,6 +313,7 @@ pub const testing = if (builtin.is_test) struct {
 pub const ProvisionedTableReadCache = struct {
     alloc: std.mem.Allocator,
     threaded: Io.Threaded,
+    remote_capability_cache: remote_capabilities.Cache,
     lsm_cache: ?*lsm_backend.Cache = null,
     hbc_cache: ?*hbc_mod.Cache = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -440,15 +442,24 @@ pub const ProvisionedTableReadCache = struct {
     };
 
     pub fn init(alloc: std.mem.Allocator) ProvisionedTableReadCache {
+        const threaded = threaded_io_limits.initService(alloc);
         return .{
             .alloc = alloc,
-            .threaded = threaded_io_limits.initService(alloc),
+            .threaded = threaded,
+            // Cache synchronization must not retain a pointer to the local
+            // `threaded` value before this returned aggregate reaches its
+            // stable address.
+            .remote_capability_cache = remote_capabilities.Cache.init(
+                alloc,
+                std.Io.Threaded.global_single_threaded.io(),
+            ),
             .incoming_graph_routes = distributed_graph.IncomingSourceGroupCache.init(alloc),
         };
     }
 
     pub fn deinit(self: *ProvisionedTableReadCache) void {
         self.incoming_graph_routes.deinit();
+        self.remote_capability_cache.deinit();
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         for (self.entries.items) |entry| {
@@ -485,7 +496,7 @@ pub const ProvisionedTableReadCache = struct {
     fn managedReadRuntimeConfig(self: *const ProvisionedTableReadCache) ManagedReadRuntimeConfig {
         return .{
             .backend_runtime = self.backend_runtime,
-            .antfly_provider = self.antfly_provider,
+            .antfly_provider = providerWithCapabilityCache(self.antfly_provider, &@constCast(self).remote_capability_cache),
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .remote_content = self.remote_content,
@@ -3012,7 +3023,10 @@ pub const ProvisionedTableReadSource = struct {
     fn managedReadRuntimeConfig(self: *const ProvisionedTableReadSource) ManagedReadRuntimeConfig {
         return .{
             .backend_runtime = self.backend_runtime,
-            .antfly_provider = self.antfly_provider,
+            .antfly_provider = providerWithCapabilityCache(
+                self.antfly_provider,
+                if (self.cache) |cache| &cache.remote_capability_cache else null,
+            ),
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .remote_content = self.remote_content,
@@ -3485,7 +3499,10 @@ pub const ProvisionedTableReadSource = struct {
             try applyProvisionedQueryAggregations(routed, alloc, group_ids, table_name, response_req, &result, &meta, execution.db(), .stale);
             execution.releaseDb();
             try checkQueryDeadline(response_req);
-            try applyQueryPostProcessing(alloc, response_req, &result, &meta, routed.antfly_provider, routed.secret_store);
+            try applyQueryPostProcessing(alloc, response_req, &result, &meta, providerWithCapabilityCache(
+                routed.antfly_provider,
+                if (routed.cache) |cache| &cache.remote_capability_cache else null,
+            ), routed.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
         }
 
@@ -3561,7 +3578,10 @@ pub const ProvisionedTableReadSource = struct {
                 else => return err,
             };
             try checkQueryDeadline(graph_req);
-            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, routed.antfly_provider, routed.secret_store);
+            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, providerWithCapabilityCache(
+                routed.antfly_provider,
+                if (routed.cache) |cache| &cache.remote_capability_cache else null,
+            ), routed.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         var merged = queryProvisionedAcrossGroups(routed, alloc, group_ids, req, table_name, .stale) catch |err| switch (err) {
@@ -3589,7 +3609,10 @@ pub const ProvisionedTableReadSource = struct {
             else => return err,
         };
         try checkQueryDeadline(req);
-        try applyQueryPostProcessing(alloc, req, &merged, &meta, routed.antfly_provider, routed.secret_store);
+        try applyQueryPostProcessing(alloc, req, &merged, &meta, providerWithCapabilityCache(
+            routed.antfly_provider,
+            if (routed.cache) |cache| &cache.remote_capability_cache else null,
+        ), routed.secret_store);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
 
@@ -3961,7 +3984,10 @@ pub const ProvisionedTableReadSource = struct {
             defer meta.deinit(alloc);
             try applyProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), .stale);
             execution.releaseDb();
-            try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.antfly_provider, self.secret_store);
+            try applyQueryPostProcessing(alloc, response_req, &result, &meta, providerWithCapabilityCache(
+                self.antfly_provider,
+                if (self.cache) |cache| &cache.remote_capability_cache else null,
+            ), self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
         }
         unreachable;
@@ -5554,6 +5580,15 @@ const ManagedReadRuntimeConfig = struct {
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
 };
+
+fn providerWithCapabilityCache(
+    provider: ?managed_embedder.AntflyProvider,
+    cache: ?*remote_capabilities.Cache,
+) ?managed_embedder.AntflyProvider {
+    var bound = provider orelse return null;
+    bound.remote_capability_cache = cache;
+    return bound;
+}
 
 const TextStatsFanoutSlot = struct {
     arena: std.heap.ArenaAllocator,

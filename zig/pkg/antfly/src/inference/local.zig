@@ -180,7 +180,8 @@ pub const Provider = struct {
     cancellation: ?CancellationToken = null,
     auth_header: ?[2][]const u8 = null,
     capability_token: ?[]u8 = null,
-    request_header_storage: [2][2][]const u8 = undefined,
+    capability_revision: ?[]u8 = null,
+    request_header_storage: [3][2][]const u8 = undefined,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -208,6 +209,10 @@ pub const Provider = struct {
             self.allocator.free(token);
             self.capability_token = null;
         }
+        if (self.capability_revision) |revision| {
+            self.allocator.free(revision);
+            self.capability_revision = null;
+        }
     }
 
     pub fn setApiKey(self: *Provider, api_key: []const u8) !void {
@@ -219,9 +224,10 @@ pub const Provider = struct {
     pub fn setAuthorizationHeader(self: *Provider, auth_header: []const u8) !void {
         if (self.auth_header) |h| {
             if (std.mem.eql(u8, h[1], auth_header)) return;
-            self.allocator.free(h[1]);
         }
-        self.auth_header = .{ "Authorization", try self.allocator.dupe(u8, auth_header) };
+        const replacement = try self.allocator.dupe(u8, auth_header);
+        if (self.auth_header) |h| self.allocator.free(h[1]);
+        self.auth_header = .{ "Authorization", replacement };
     }
 
     /// Bind execution to the distributed capability snapshot used by the
@@ -229,9 +235,19 @@ pub const Provider = struct {
     pub fn setCapabilityToken(self: *Provider, token: []const u8) !void {
         if (self.capability_token) |existing| {
             if (std.mem.eql(u8, existing, token)) return;
-            self.allocator.free(existing);
         }
-        self.capability_token = try self.allocator.dupe(u8, token);
+        const replacement = try self.allocator.dupe(u8, token);
+        if (self.capability_token) |existing| self.allocator.free(existing);
+        self.capability_token = replacement;
+    }
+
+    pub fn setCapabilityRevision(self: *Provider, revision: []const u8) !void {
+        if (self.capability_revision) |existing| {
+            if (std.mem.eql(u8, existing, revision)) return;
+        }
+        const replacement = try self.allocator.dupe(u8, revision);
+        if (self.capability_revision) |existing| self.allocator.free(existing);
+        self.capability_revision = replacement;
     }
 
     pub fn setRequestCancellation(self: *Provider, cancellation: ?CancellationToken) void {
@@ -274,6 +290,10 @@ pub const Provider = struct {
         }
         if (self.capability_token) |token| {
             self.request_header_storage[count] = .{ "X-Antfly-Capability-Token", token };
+            count += 1;
+        }
+        if (self.capability_revision) |revision| {
+            self.request_header_storage[count] = .{ "X-Antfly-Capability-Revision", revision };
             count += 1;
         }
         return if (count == 0) null else self.request_header_storage[0..count];
@@ -608,12 +628,14 @@ test "antfly provider composes authorization and capability lease headers" {
     defer provider.deinit();
     try provider.setAuthorizationHeader("Bearer secret");
     try provider.setCapabilityToken("route-token");
+    try provider.setCapabilityRevision("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
     const headers = provider.requestHeaders() orelse return error.TestExpectedHeaders;
-    try std.testing.expectEqual(@as(usize, 2), headers.len);
+    try std.testing.expectEqual(@as(usize, 3), headers.len);
     try std.testing.expectEqualStrings("Authorization", headers[0][0]);
     try std.testing.expectEqualStrings("Bearer secret", headers[0][1]);
     try std.testing.expectEqualStrings("X-Antfly-Capability-Token", headers[1][0]);
     try std.testing.expectEqualStrings("route-token", headers[1][1]);
+    try std.testing.expectEqualStrings("X-Antfly-Capability-Revision", headers[2][0]);
 }
 
 test "antfly embed request omits nullable generated fields" {

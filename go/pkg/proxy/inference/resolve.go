@@ -58,6 +58,7 @@ type ResolutionLease struct {
 	model                         string
 	operation                     OperationType
 	capabilityToken               string
+	capabilityRevision            string
 	capabilityAuthorizationDigest [sha256.Size]byte
 	workloadType                  WorkloadType
 	once                          sync.Once
@@ -116,6 +117,7 @@ func (p *Proxy) AcquireRequestResolution(ctx context.Context, req ResolveRequest
 		model:                         req.Model,
 		operation:                     req.Operation,
 		capabilityToken:               headerValue(req.Headers, capabilityTokenHeader),
+		capabilityRevision:            headerValue(req.Headers, capabilityRevisionHeader),
 		capabilityAuthorizationDigest: sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(req.Headers))),
 		workloadType:                  resolveWorkloadType(req.Operation, req.Headers),
 		admission:                     &leaseAdmission{},
@@ -164,10 +166,11 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 	}
 
 	excluded := l.attempts.excludeAndSnapshot(l.Resolution.Endpoint)
-	if err := l.proxy.validateCapabilityLeaseDigest(l.capabilityToken, l.model, l.operation, l.Resolution.Pool, l.capabilityAuthorizationDigest); err != nil {
+	allowed, err := l.proxy.capabilityLeaseEndpointsDigest(l.capabilityToken, l.capabilityRevision, l.model, l.operation, l.Resolution.Pool, l.capabilityAuthorizationDigest)
+	if err != nil {
 		return nil, err
 	}
-	endpoint, err := l.proxy.router.RouteRequest(ctx, l.model, l.Resolution.Pool, l.workloadType, excluded, l.operation)
+	endpoint, err := l.proxy.router.RouteRequestWithin(ctx, l.model, l.Resolution.Pool, l.workloadType, excluded, allowed, l.operation)
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +186,7 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 		model:                         l.model,
 		operation:                     l.operation,
 		capabilityToken:               l.capabilityToken,
+		capabilityRevision:            l.capabilityRevision,
 		capabilityAuthorizationDigest: l.capabilityAuthorizationDigest,
 		workloadType:                  l.workloadType,
 		admission:                     l.admission,
@@ -344,18 +348,20 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 	if pool == "" {
 		pool = p.defaultPool
 	}
-	if err := p.validateCapabilityLease(
+	allowed, err := p.capabilityLeaseEndpointsDigest(
 		headerValue(headers, capabilityTokenHeader),
+		headerValue(headers, capabilityRevisionHeader),
 		routeReq.Model,
 		routeReq.Operation,
 		pool,
-		p.upstreamAuthorizationForHeaders(headers),
-	); err != nil {
+		sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(headers))),
+	)
+	if err != nil {
 		return nil, err
 	}
 
 	workloadType := resolveWorkloadType(routeReq.Operation, headers)
-	endpoint, err := p.resolveEndpoint(ctx, routeReq.Model, pool, workloadType, routeReq.Operation, reserve)
+	endpoint, err := p.resolveEndpoint(ctx, routeReq.Model, pool, workloadType, routeReq.Operation, reserve, allowed)
 	if err != nil {
 		return nil, &ResolutionError{
 			StatusCode: http.StatusServiceUnavailable,
@@ -371,12 +377,12 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 	}, nil
 }
 
-func (p *Proxy) resolveEndpoint(ctx context.Context, model, pool string, workloadType WorkloadType, operation OperationType, reserve bool) (*Endpoint, error) {
+func (p *Proxy) resolveEndpoint(ctx context.Context, model, pool string, workloadType WorkloadType, operation OperationType, reserve bool, allowed map[string]*Endpoint) (*Endpoint, error) {
 	if reserve {
-		return p.router.RouteRequest(ctx, model, pool, workloadType, nil, operation)
+		return p.router.RouteRequestWithin(ctx, model, pool, workloadType, nil, allowed, operation)
 	}
 
-	candidates := p.router.ResolveEndpointCandidates(model, pool, nil, operation)
+	candidates := p.router.ResolveEndpointCandidatesWithin(model, pool, nil, allowed, operation)
 	if len(candidates) == 0 {
 		return nil, &ResolutionError{
 			StatusCode: http.StatusServiceUnavailable,

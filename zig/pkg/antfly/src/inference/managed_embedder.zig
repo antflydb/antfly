@@ -77,6 +77,10 @@ pub const EmbeddingRequestContext = struct {
 
 pub const AntflyProvider = struct {
     ptr: *anyopaque,
+    /// Optional process/runtime-owned distributed capability cache. Stateless
+    /// task adapters (for example reranking) borrow this rather than creating
+    /// a cache for every query.
+    remote_capability_cache: ?*remote_capabilities.Cache = null,
     boundary_dispatch: runtime_callback_abi.CallbackDispatch = AntflyProviderBoundary.local_dispatch,
     embed_dense_texts: *const fn (
         ptr: *anyopaque,
@@ -1292,7 +1296,7 @@ pub const ManagedEmbedder = struct {
                 break :blk &header_storage;
             } else &.{};
             const cache = &@constCast(entry).remote_capability_cache.?;
-            if (cache.getOrDiscoverWithContext(
+            const discovered: ?remote_capabilities.CapabilityLease = cache.getOrDiscoverLeaseWithContext(
                 &http,
                 entry.base_url,
                 entry.model,
@@ -1305,7 +1309,8 @@ pub const ManagedEmbedder = struct {
             ) catch |err| switch (err) {
                 error.OutOfMemory, error.Canceled, error.Timeout => return err,
                 else => null,
-            }) |result| return result;
+            };
+            if (discovered) |lease| if (lease.capabilities) |result| return result;
         }
         // Unknown remote capability is deliberately conservative. It remains
         // usable, but the document planner cannot assume fused batching or a
@@ -4468,8 +4473,20 @@ fn embedPartItemsWithEntry(
         }
     }
     const capability_cache = &@constCast(entry).remote_capability_cache.?;
-    if (try capability_cache.routingToken(entry.base_url, entry.model, .embed, capability_headers)) |token|
-        try provider.setCapabilityToken(token.slice());
+    const capability_lease = try capability_cache.getOrDiscoverLeaseWithContext(
+        &http,
+        entry.base_url,
+        entry.model,
+        .embed,
+        capability_headers,
+        .{
+            .deadline_ns = embeddingOperationDeadline(entry),
+            .cancellation = entry.cancellation orelse .none,
+        },
+    );
+    if (capability_lease.routing_token) |token| try provider.setCapabilityToken(token.slice());
+    if (capability_lease.descriptor_revision) |revision|
+        try provider.setCapabilityRevision(revision.slice());
 
     var result = provider.embedParts(alloc, entry.model, items) catch |err| switch (err) {
         error.EmptyResponse => return error.EmptyEmbeddingResponse,

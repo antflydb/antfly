@@ -823,7 +823,7 @@ pub const InferenceCapabilities = struct {
     }
 };
 
-fn modalityForMimeType(content_type: []const u8) ?Modalities {
+pub fn modalityForMimeType(content_type: []const u8) ?Modalities {
     const essence = data_uri.mediaTypeEssence(content_type) catch return null;
     if (std.mem.startsWith(u8, essence, "text/") or std.mem.eql(u8, essence, "application/json"))
         return .{ .text = true };

@@ -824,8 +824,14 @@ pub const Runtime = struct {
             header_storage[0] = .{ "Authorization", auth_value.? };
             break :blk &header_storage;
         } else &.{};
-        if (try self.capability_cache.routingToken(cfg.resolvedUrl().?, cfg.model, .extract, headers)) |token|
-            cfg.capability_token = try alloc.dupe(u8, token.slice());
+        const lease = try self.capability_cache.getOrDiscoverLease(
+            self.http,
+            cfg.resolvedUrl().?,
+            cfg.model,
+            .extract,
+            headers,
+        );
+        try replaceCapabilityLeaseFields(alloc, cfg, lease);
     }
 
     fn invalidateExtractorCapabilityLease(self: *Runtime, alloc: Allocator, cfg: extracting.Config) !void {
@@ -1129,7 +1135,7 @@ pub const Runtime = struct {
             );
         }
 
-        const capabilities = (try capabilitiesForRequests(self, alloc, requests)) orelse
+        var capabilities = (try capabilitiesForRequests(self, alloc, requests)) orelse
             return error.BatchIncompatible;
         if (capabilities.task != .generate or capabilities.result_cardinality != .one_per_item)
             return error.InvalidInferenceCapabilities;
@@ -1145,16 +1151,27 @@ pub const Runtime = struct {
         defer if (token) |value| alloc.free(value);
         var auth_value: ?[]u8 = null;
         defer if (auth_value) |value| alloc.free(value);
-        var header_storage: [2][2][]const u8 = undefined;
+        var header_storage: [3][2][]const u8 = undefined;
         const auth_headers: []const [2][]const u8 = if (token) |value| auth: {
             auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value});
             header_storage[0] = .{ "Authorization", auth_value.? };
             break :auth header_storage[0..1];
         } else &.{};
         var header_count = auth_headers.len;
-        var routing_token = try self.capability_cache.routingToken(cfg.url, cfg.model, .generate, auth_headers);
-        if (routing_token) |*value| {
+        const capability_lease = try self.capability_cache.getOrDiscoverLease(
+            self.http,
+            cfg.url,
+            cfg.model,
+            .generate,
+            auth_headers,
+        );
+        capabilities = capability_lease.capabilities orelse return error.InvalidInferenceCapabilities;
+        if (capability_lease.routing_token) |value| {
             header_storage[header_count] = .{ remote_capabilities.capability_token_header, value.slice() };
+            header_count += 1;
+        }
+        if (capability_lease.descriptor_revision) |value| {
+            header_storage[header_count] = .{ remote_capabilities.capability_revision_header, value.slice() };
             header_count += 1;
         }
         const headers = header_storage[0..header_count];
@@ -1255,8 +1272,14 @@ pub const Runtime = struct {
             header_storage[0] = .{ "Authorization", auth_value.? };
             break :blk &header_storage;
         } else &.{};
-        if (try self.capability_cache.routingToken(cfg.url, cfg.model, .generate, headers)) |token|
-            cfg.capability_token = try alloc.dupe(u8, token.slice());
+        const lease = try self.capability_cache.getOrDiscoverLease(
+            self.http,
+            cfg.url,
+            cfg.model,
+            .generate,
+            headers,
+        );
+        try replaceCapabilityLeaseFields(alloc, cfg, lease);
     }
 
     fn invalidateGeneratorCapabilityLease(
@@ -1570,6 +1593,7 @@ pub const Runtime = struct {
             _ = try capabilitiesForRequests(self, alloc, &.{request});
             try self.bindGeneratorCapabilityLease(alloc, &cfg);
             parsed_cfg.generator.capability_token = cfg.capability_token;
+            parsed_cfg.generator.capability_revision = cfg.capability_revision;
         }
         const link = generating_runtime.ChainLink{ .generator = cfg };
         var result = generating_runtime.executeChainWithOptions(alloc, self.http, &.{link}, .{
@@ -1653,8 +1677,20 @@ pub const Runtime = struct {
             capability_auth_storage[0] = .{ "Authorization", capability_auth_value.? };
             break :blk &capability_auth_storage;
         } else &.{};
-        var routing_token: ?remote_capabilities.RoutingToken = null;
-        if (try self.readerCapabilities(alloc, cfg)) |capabilities| {
+        const discovered_capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and cfg.provider == .antfly) blk: {
+            const endpoint = cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
+            const lease = try self.capability_cache.getOrDiscoverLease(
+                self.http,
+                endpoint,
+                cfg.model orelse "",
+                .read,
+                capability_auth_headers,
+            );
+            if (lease.routing_token) |token| execution_cfg.capability_token = token.slice();
+            if (lease.descriptor_revision) |revision| execution_cfg.capability_revision = revision.slice();
+            break :blk lease.capabilities;
+        } else try self.readerCapabilities(alloc, cfg);
+        if (discovered_capabilities) |capabilities| {
             const inline_shape = try readerUriInvocationShape(alloc, capabilities, request);
             try capabilities.validateInvocation(.read, .{
                 .item_count = request.images.len,
@@ -1674,16 +1710,6 @@ pub const Runtime = struct {
             // provide the model contract. Third-party compatibility readers
             // retain their provider-owned validation until they expose one.
             return error.InvalidInferenceCapabilities;
-        }
-        if (!local_reader and cfg.provider == .antfly) {
-            const endpoint = cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
-            routing_token = try self.capability_cache.routingToken(
-                endpoint,
-                cfg.model orelse "",
-                .read,
-                capability_auth_headers,
-            );
-            if (routing_token) |*token| execution_cfg.capability_token = token.slice();
         }
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
@@ -1868,6 +1894,39 @@ pub const Runtime = struct {
             return try alloc.dupe(u8, result.text orelse "");
         }
 
+        var capability_auth_value: ?[]u8 = null;
+        defer if (capability_auth_value) |value| alloc.free(value);
+        var capability_auth_storage: [1][2][]const u8 = undefined;
+        const capability_auth_headers: []const [2][]const u8 = if (cfg_parsed.value.provider == .antfly and
+            (cfg_parsed.value.bearer_token orelse cfg_parsed.value.api_key) != null)
+        blk: {
+            capability_auth_value = try std.fmt.allocPrint(
+                alloc,
+                "Bearer {s}",
+                .{cfg_parsed.value.bearer_token orelse cfg_parsed.value.api_key.?},
+            );
+            capability_auth_storage[0] = .{ "Authorization", capability_auth_value.? };
+            break :blk &capability_auth_storage;
+        } else &.{};
+        if (cfg_parsed.value.provider == .antfly) {
+            const endpoint = cfg_parsed.value.resolvedUrl() orelse return error.InvalidTranscribingConfig;
+            const lease = try self.capability_cache.getOrDiscoverLease(
+                self.http,
+                endpoint,
+                cfg_parsed.value.model orelse "",
+                .transcribe,
+                capability_auth_headers,
+            );
+            if (lease.capabilities) |capabilities| try capabilities.validateInvocation(.transcribe, .{
+                .item_count = 1,
+                .modalities = .{ .audio = true },
+                .max_media_parts_per_item = 1,
+            });
+            if (lease.routing_token) |token| cfg_parsed.value.capability_token = token.slice();
+            if (lease.descriptor_revision) |revision|
+                cfg_parsed.value.capability_revision = revision.slice();
+        }
+
         var registry = transcribing.Registry.init(alloc);
         defer registry.deinit();
         try registry.registerConfig("asset", cfg_parsed.value);
@@ -1877,7 +1936,18 @@ pub const Runtime = struct {
         try runtime.loadFromRegistry(self.http, &registry);
 
         const provider = try runtime.get("asset");
-        var result = try provider.transcribe(alloc, .{ .url = request.source_text });
+        var result = provider.transcribe(alloc, .{ .url = request.source_text }) catch |err| {
+            if (err == error.InferenceCapabilitiesStale and cfg_parsed.value.provider == .antfly) {
+                const endpoint = cfg_parsed.value.resolvedUrl() orelse return err;
+                try self.capability_cache.invalidate(
+                    endpoint,
+                    cfg_parsed.value.model orelse "",
+                    .transcribe,
+                    capability_auth_headers,
+                );
+            }
+            return err;
+        };
         defer transcribing.deinitResponse(alloc, &result);
 
         if (isJsonContentType(request.content_type)) {
@@ -2091,6 +2161,28 @@ fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return std.mem.eql(u8, a.?, b.?);
+}
+
+fn replaceCapabilityLeaseFields(
+    alloc: Allocator,
+    cfg: anytype,
+    lease: remote_capabilities.CapabilityLease,
+) !void {
+    const new_token = if (lease.routing_token) |token|
+        try alloc.dupe(u8, token.slice())
+    else
+        null;
+    errdefer if (new_token) |value| alloc.free(value);
+    const new_revision = if (lease.descriptor_revision) |revision|
+        try alloc.dupe(u8, revision.slice())
+    else
+        null;
+    errdefer if (new_revision) |value| alloc.free(value);
+
+    if (cfg.capability_token) |value| alloc.free(@constCast(value));
+    if (cfg.capability_revision) |value| alloc.free(@constCast(value));
+    cfg.capability_token = new_token;
+    cfg.capability_revision = new_revision;
 }
 
 fn readerResultMatchesImageIdentity(result: readers.Result, image: readers.EncodedImage) bool {

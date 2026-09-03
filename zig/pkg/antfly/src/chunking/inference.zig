@@ -23,6 +23,8 @@ const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const inference_chunker = @import("inference_chunker");
 const chunk_provider = @import("provider.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
+const remote_capabilities = @import("../inference/remote_capabilities.zig");
+const inference_work = @import("../inference/work.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -110,15 +112,68 @@ pub fn chunkInputWithProvider(
     var http = httpx.Client.init(alloc, io_impl.io());
     defer http.deinit();
 
+    var fallback_capability_cache: ?remote_capabilities.Cache = null;
+    defer if (fallback_capability_cache) |*cache| cache.deinit();
+    var capability_cache = if (antfly_provider) |provider| provider.remote_capability_cache else null;
+    if (capability_cache == null) {
+        fallback_capability_cache = remote_capabilities.Cache.init(alloc, http.io);
+        capability_cache = &fallback_capability_cache.?;
+    }
+    const model = if (cfg.model.len > 0) cfg.model else "fixed";
+    const capability_lease = try capability_cache.?.getOrDiscoverLease(
+        &http,
+        cfg.api_url,
+        model,
+        .chunk,
+        &.{},
+    );
+    if (capability_lease.capabilities) |capabilities| {
+        const shape: inference_work.InvocationShape = switch (input) {
+            .text => |text| .{
+                .item_count = 1,
+                .modalities = .{ .text = true },
+                .text_bytes = text.len,
+                .max_text_bytes_per_item = text.len,
+            },
+            .binary => |binary| .{
+                .item_count = 1,
+                .modalities = inference_work.modalityForMimeType(binary.mime_type) orelse
+                    return error.UnsupportedChunkMediaType,
+                .encoded_media_bytes = binary.data.len,
+                .max_media_parts_per_item = 1,
+            },
+        };
+        try capabilities.validateInvocation(.chunk, shape);
+    }
+
     const url = try std.fmt.allocPrint(alloc, "{s}/chunk", .{cfg.api_url});
     defer alloc.free(url);
 
     const body = try encodeChunkRequest(alloc, cfg, input);
     defer alloc.free(body);
 
-    var resp = try http.post(url, .{ .json = body });
+    var header_storage: [2][2][]const u8 = undefined;
+    var header_count: usize = 0;
+    if (capability_lease.routing_token) |token| {
+        header_storage[header_count] = .{ remote_capabilities.capability_token_header, token.slice() };
+        header_count += 1;
+    }
+    if (capability_lease.descriptor_revision) |revision| {
+        header_storage[header_count] = .{ remote_capabilities.capability_revision_header, revision.slice() };
+        header_count += 1;
+    }
+    var resp = try http.post(url, .{ .json = body, .headers = header_storage[0..header_count] });
     defer resp.deinit();
-    if (!resp.ok()) return error.ChunkRequestFailed;
+    if (!resp.ok()) {
+        const stale = resp.headers.get(remote_capabilities.capability_stale_header);
+        if (resp.status.code == 409 and stale != null and
+            std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale.?, " \t"), "true"))
+        {
+            try capability_cache.?.invalidate(cfg.api_url, model, .chunk, &.{});
+            return error.InferenceCapabilitiesStale;
+        }
+        return error.ChunkRequestFailed;
+    }
     const response_body = resp.body orelse return error.EmptyResponse;
     return try parseChunkResponse(alloc, response_body);
 }

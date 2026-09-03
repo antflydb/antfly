@@ -58,6 +58,8 @@ pub const Config = struct {
     model: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     bearer_token: ?[]const u8 = null,
+    capability_token: ?[]const u8 = null,
+    capability_revision: ?[]const u8 = null,
     base_url: ?[]const u8 = null,
     url: ?[]const u8 = null,
     api_url: ?[]const u8 = null,
@@ -225,6 +227,8 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
         .model = try dupOpt(alloc, cfg.model),
         .api_key = try dupOpt(alloc, cfg.api_key),
         .bearer_token = try dupOpt(alloc, cfg.bearer_token),
+        .capability_token = try dupOpt(alloc, cfg.capability_token),
+        .capability_revision = try dupOpt(alloc, cfg.capability_revision),
         .base_url = try dupOpt(alloc, cfg.base_url),
         .url = try dupOpt(alloc, cfg.url),
         .api_url = try dupOpt(alloc, cfg.api_url),
@@ -243,6 +247,8 @@ pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
     freeOpt(alloc, cfg.model);
     freeOpt(alloc, cfg.api_key);
     freeOpt(alloc, cfg.bearer_token);
+    freeOpt(alloc, cfg.capability_token);
+    freeOpt(alloc, cfg.capability_revision);
     freeOpt(alloc, cfg.base_url);
     freeOpt(alloc, cfg.url);
     freeOpt(alloc, cfg.api_url);
@@ -315,6 +321,8 @@ const AntflyTranscriberState = struct {
     http: *httpx.Client,
     api_url: []const u8,
     auth_header: ?[2][]const u8 = null,
+    capability_token: ?[]const u8 = null,
+    capability_revision: ?[]const u8 = null,
     model: ?[]const u8 = null,
     language_code: ?[]const u8 = null,
     max_response_bytes: ?usize = null,
@@ -323,12 +331,25 @@ const AntflyTranscriberState = struct {
         const state = try alloc.create(AntflyTranscriberState);
         errdefer alloc.destroy(state);
 
+        const api_url = try alloc.dupe(u8, cfg.resolvedUrl() orelse "http://127.0.0.1:8080");
+        errdefer alloc.free(api_url);
+        const model = try dupOpt(alloc, cfg.model);
+        errdefer freeOpt(alloc, model);
+        const capability_token = try dupOpt(alloc, cfg.capability_token);
+        errdefer freeOpt(alloc, capability_token);
+        const capability_revision = try dupOpt(alloc, cfg.capability_revision);
+        errdefer freeOpt(alloc, capability_revision);
+        const language_code = try dupOpt(alloc, cfg.language_code);
+        errdefer freeOpt(alloc, language_code);
+
         state.* = .{
             .alloc = alloc,
             .http = http,
-            .api_url = try alloc.dupe(u8, cfg.resolvedUrl() orelse "http://127.0.0.1:8080"),
-            .model = try dupOpt(alloc, cfg.model),
-            .language_code = try dupOpt(alloc, cfg.language_code),
+            .api_url = api_url,
+            .model = model,
+            .capability_token = capability_token,
+            .capability_revision = capability_revision,
+            .language_code = language_code,
             .max_response_bytes = cfg.max_response_bytes,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| {
@@ -349,6 +370,8 @@ const AntflyTranscriberState = struct {
         self.alloc.free(self.api_url);
         freeOpt(self.alloc, self.model);
         freeOpt(self.alloc, self.language_code);
+        freeOpt(self.alloc, self.capability_token);
+        freeOpt(self.alloc, self.capability_revision);
         if (self.auth_header) |header| self.alloc.free(header[1]);
         self.alloc.destroy(self);
     }
@@ -381,18 +404,34 @@ const AntflyTranscriberState = struct {
         });
         defer alloc.free(body);
 
-        var header_buf: [1][2][]const u8 = undefined;
-        const headers: []const [2][]const u8 = if (self.auth_header) |header| blk: {
-            header_buf[0] = header;
-            break :blk header_buf[0..];
-        } else &.{};
+        var header_buf: [3][2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (self.auth_header) |header| {
+            header_buf[header_count] = header;
+            header_count += 1;
+        }
+        if (self.capability_token) |token| {
+            header_buf[header_count] = .{ "X-Antfly-Capability-Token", token };
+            header_count += 1;
+        }
+        if (self.capability_revision) |revision| {
+            header_buf[header_count] = .{ "X-Antfly-Capability-Revision", revision };
+            header_count += 1;
+        }
+        const headers = header_buf[0..header_count];
         var resp = try self.http.post(url, .{
             .json = body,
             .headers = headers,
             .max_response_size = self.max_response_bytes,
         });
         defer resp.deinit();
-        if (!resp.ok()) return error.TranscribeRequestFailed;
+        if (!resp.ok()) {
+            const stale = resp.headers.get("X-Antfly-Capability-Stale");
+            if (resp.status.code == 409 and stale != null and
+                std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale.?, " \t"), "true"))
+                return error.InferenceCapabilitiesStale;
+            return error.TranscribeRequestFailed;
+        }
 
         const payload = resp.body orelse return error.EmptyResponse;
         var parsed = try std.json.parseFromSlice(inference_api.types.TranscribeResponse, alloc, payload, .{

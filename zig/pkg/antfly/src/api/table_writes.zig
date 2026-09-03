@@ -26420,6 +26420,7 @@ fn chunkProviderFromAntflyProvider(provider: ?managed_embedder.AntflyProvider) ?
         .ptr = resolved.ptr,
         .boundary_dispatch = resolved.boundary_dispatch,
         .chunk_input_callback = @ptrCast(callback),
+        .remote_capability_cache = resolved.remote_capability_cache,
     };
 }
 

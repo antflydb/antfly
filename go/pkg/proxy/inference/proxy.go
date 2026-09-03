@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"net/url"
@@ -115,10 +116,14 @@ type Endpoint struct {
 	// yet. Bootstrap endpoints participate only in task-unscoped legacy lookup;
 	// executable routes require a discovered per-model operation.
 	CatalogKnown bool
-	QueueDepth   int32
-	LastSeen     time.Time
-	Healthy      bool
-	Connections  int32 // Active connections
+	// CatalogRevision changes whenever the endpoint's advertised model
+	// descriptors change. Capability leases bind to this observed epoch so an
+	// in-place limit or modality change invalidates plans made from older data.
+	CatalogRevisions map[[sha256.Size]byte][sha256.Size]byte
+	QueueDepth       int32
+	LastSeen         time.Time
+	Healthy          bool
+	Connections      int32 // Active connections
 }
 
 // ModelInfo contains information about a loaded model
@@ -310,13 +315,14 @@ func (r *ModelRegistry) RegisterEndpointWithHealth(address, healthURL, pool stri
 	ep, exists := r.endpoints[address]
 	if !exists {
 		ep = &Endpoint{
-			Address:      address,
-			HealthURL:    healthURL,
-			Pool:         pool,
-			WorkloadType: workloadType,
-			Models:       make(map[string]*ModelInfo),
-			Healthy:      true,
-			LastSeen:     time.Now(),
+			Address:          address,
+			HealthURL:        healthURL,
+			Pool:             pool,
+			WorkloadType:     workloadType,
+			Models:           make(map[string]*ModelInfo),
+			CatalogRevisions: make(map[[sha256.Size]byte][sha256.Size]byte),
+			Healthy:          true,
+			LastSeen:         time.Now(),
 		}
 		r.endpoints[address] = ep
 		r.circuitBreakers[address] = NewCircuitBreaker(5, 30*time.Second)
@@ -413,20 +419,74 @@ func (r *ModelRegistry) UpdateModelOperations(address string, operations map[str
 	r.updateModelOperationsForEndpoint(address, nil, operations)
 }
 
+func (r *ModelRegistry) updateModelOperationsAndRevisionForEndpoint(
+	address string,
+	expected *Endpoint,
+	operations map[string]map[OperationType]bool,
+	revision [sha256.Size]byte,
+	authorizationDigest [sha256.Size]byte,
+) {
+	models := make([]string, 0, len(operations))
+	for model := range operations {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	r.updateModelsForEndpoint(address, expected, models, operations, true, &revision, authorizationDigest)
+}
+
+func (r *ModelRegistry) setEndpointCatalogRevision(address string, expected *Endpoint, authorizationDigest, revision [sha256.Size]byte) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	endpoint := r.endpoints[address]
+	if endpoint == nil || endpoint != expected {
+		return false
+	}
+	if endpoint.CatalogRevisions == nil {
+		endpoint.CatalogRevisions = make(map[[sha256.Size]byte][sha256.Size]byte)
+	}
+	if _, exists := endpoint.CatalogRevisions[authorizationDigest]; !exists && len(endpoint.CatalogRevisions) >= 64 {
+		for key := range endpoint.CatalogRevisions {
+			delete(endpoint.CatalogRevisions, key)
+			break
+		}
+	}
+	endpoint.CatalogRevisions[authorizationDigest] = revision
+	return true
+}
+
+func (r *ModelRegistry) endpointCatalogRevisionMatches(address string, expected *Endpoint, authorizationDigest, revision [sha256.Size]byte) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	endpoint := r.endpoints[address]
+	if endpoint == nil || endpoint != expected {
+		return false
+	}
+	current, ok := endpoint.CatalogRevisions[authorizationDigest]
+	return ok && current == revision
+}
+
 func (r *ModelRegistry) updateModelOperationsForEndpoint(address string, expected *Endpoint, operations map[string]map[OperationType]bool) {
 	models := make([]string, 0, len(operations))
 	for model := range operations {
 		models = append(models, model)
 	}
 	sort.Strings(models)
-	r.updateModelsForEndpoint(address, expected, models, operations, true)
+	r.updateModelsForEndpoint(address, expected, models, operations, true, nil, [sha256.Size]byte{})
 }
 
 func (r *ModelRegistry) updateModels(address string, models []string, operations map[string]map[OperationType]bool, catalogKnown bool) {
-	r.updateModelsForEndpoint(address, nil, models, operations, catalogKnown)
+	r.updateModelsForEndpoint(address, nil, models, operations, catalogKnown, nil, [sha256.Size]byte{})
 }
 
-func (r *ModelRegistry) updateModelsForEndpoint(address string, expected *Endpoint, models []string, operations map[string]map[OperationType]bool, catalogKnown bool) {
+func (r *ModelRegistry) updateModelsForEndpoint(
+	address string,
+	expected *Endpoint,
+	models []string,
+	operations map[string]map[OperationType]bool,
+	catalogKnown bool,
+	revision *[sha256.Size]byte,
+	authorizationDigest [sha256.Size]byte,
+) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -492,6 +552,18 @@ func (r *ModelRegistry) updateModelsForEndpoint(address string, expected *Endpoi
 	ep.LastSeen = time.Now()
 	if catalogKnown {
 		ep.CatalogKnown = true
+	}
+	if revision != nil {
+		if ep.CatalogRevisions == nil {
+			ep.CatalogRevisions = make(map[[sha256.Size]byte][sha256.Size]byte)
+		}
+		if _, exists := ep.CatalogRevisions[authorizationDigest]; !exists && len(ep.CatalogRevisions) >= 64 {
+			for key := range ep.CatalogRevisions {
+				delete(ep.CatalogRevisions, key)
+				break
+			}
+		}
+		ep.CatalogRevisions[authorizationDigest] = *revision
 	}
 }
 
@@ -758,8 +830,13 @@ func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) err
 		r.markEndpointHealth(address, expected, false)
 		return err
 	}
-
-	r.updateModelOperationsForEndpoint(address, expected, models)
+	r.updateModelOperationsAndRevisionForEndpoint(
+		address,
+		expected,
+		models,
+		sha256.Sum256(body),
+		sha256.Sum256([]byte(authorization)),
+	)
 	r.markEndpointHealth(address, expected, true)
 	return nil
 }
@@ -916,7 +993,13 @@ func NewRouter(registry *ModelRegistry) *Router {
 
 // RouteRequest selects the best endpoint for a request
 func (r *Router) RouteRequest(ctx context.Context, model string, pool string, workloadType WorkloadType, excluded map[string]bool, operations ...OperationType) (*Endpoint, error) {
-	endpoints := r.ResolveEndpointCandidates(model, pool, excluded, operations...)
+	return r.RouteRequestWithin(ctx, model, pool, workloadType, excluded, nil, operations...)
+}
+
+// RouteRequestWithin selects only from the endpoint identities covered by a
+// capability lease. A nil allowed map preserves legacy, unfenced routing.
+func (r *Router) RouteRequestWithin(ctx context.Context, model string, pool string, workloadType WorkloadType, excluded map[string]bool, allowed map[string]*Endpoint, operations ...OperationType) (*Endpoint, error) {
+	endpoints := r.ResolveEndpointCandidatesWithin(model, pool, excluded, allowed, operations...)
 	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("no healthy endpoints available for model %s", model)
 	}
@@ -947,22 +1030,49 @@ func (r *Router) RouteRequest(ctx context.Context, model string, pool string, wo
 
 // ResolveEndpointCandidates returns currently eligible endpoint candidates without reserving them.
 func (r *Router) ResolveEndpointCandidates(model string, pool string, excluded map[string]bool, operations ...OperationType) []*Endpoint {
-	var operation OperationType
-	if len(operations) > 0 {
-		operation = operations[0]
-	}
+	return r.ResolveEndpointCandidatesWithin(model, pool, excluded, nil, operations...)
+}
+
+// ResolveEndpointCandidatesWithin intersects current operation eligibility
+// with the exact endpoint objects captured by a capability lease. Pointer
+// identity prevents an address-reused replacement from inheriting a lease.
+func (r *Router) ResolveEndpointCandidatesWithin(model string, pool string, excluded map[string]bool, allowed map[string]*Endpoint, operations ...OperationType) []*Endpoint {
 	var endpoints []*Endpoint
-	endpoints = r.registry.getAvailableEndpointsForModelOperation(model, pool, operation)
-
-	if len(endpoints) == 0 && pool != "" && operation == "" {
-		// Bootstrap inventory is usable only by legacy, task-unscoped callers.
-		// Every executable inference route carries an operation and must fail
-		// closed until the selected endpoint has advertised that exact
-		// model/task pair. This keeps a cached capability decision from being
-		// rebound to a newly joined, undiscovered node after topology churn.
-		endpoints = r.registry.getBootstrapEndpointsForPool(pool)
+	if len(operations) <= 1 {
+		var operation OperationType
+		if len(operations) == 1 {
+			operation = operations[0]
+		}
+		endpoints = r.registry.getAvailableEndpointsForModelOperation(model, pool, operation)
+		if len(endpoints) == 0 && pool != "" && operation == "" {
+			// Bootstrap inventory is usable only by legacy, task-unscoped callers.
+			// Every executable inference route carries an operation and must fail
+			// closed until the selected endpoint has advertised that exact
+			// model/task pair. This keeps a cached capability decision from being
+			// rebound to a newly joined, undiscovered node after topology churn.
+			endpoints = r.registry.getBootstrapEndpointsForPool(pool)
+		}
+	} else {
+		seen := make(map[*Endpoint]bool)
+		for _, operation := range operations {
+			for _, endpoint := range r.registry.getAvailableEndpointsForModelOperation(model, pool, operation) {
+				if !seen[endpoint] {
+					seen[endpoint] = true
+					endpoints = append(endpoints, endpoint)
+				}
+			}
+		}
 	}
 
+	if allowed != nil {
+		eligible := endpoints[:0]
+		for _, endpoint := range endpoints {
+			if expected, ok := allowed[endpoint.Address]; ok && expected == endpoint {
+				eligible = append(eligible, endpoint)
+			}
+		}
+		endpoints = eligible
+	}
 	filtered := filterExcludedEndpoints(endpoints, excluded)
 	if len(filtered) > 0 {
 		return filtered
@@ -1134,19 +1244,26 @@ type Proxy struct {
 }
 
 const defaultMaxProxyRequestBodyBytes int64 = 256 << 20
-const defaultMaxProxyRetainedBodyBytes int64 = 512 << 20
+const defaultMaxProxyRetainedBodyBytes int64 = 768 << 20
 const defaultMaxProxyRetainedCatalogBytes int64 = 256 << 20
 const capabilityLeaseTTL = 5 * time.Minute
 const maxCapabilityLeases = 1024
 const capabilityTokenHeader = "X-Antfly-Capability-Token"
+const capabilityRevisionHeader = "X-Antfly-Capability-Revision"
 const capabilityStaleHeader = "X-Antfly-Capability-Stale"
+
+type leasedEndpoint struct {
+	endpoint        *Endpoint
+	catalogRevision [sha256.Size]byte
+}
 
 type proxyCapabilityLease struct {
 	model               string
-	operation           OperationType
+	task                string
+	descriptorRevision  string
 	pool                string
 	authorizationDigest [sha256.Size]byte
-	endpoints           map[string]*Endpoint
+	endpoints           map[string]leasedEndpoint
 	expiresAt           time.Time
 }
 
@@ -1160,7 +1277,7 @@ type Config struct {
 	RouteWatchKubeconfig    string      // Optional kubeconfig path for route watching
 	UpstreamAuthorization   string      // Optional Authorization header value for upstream refreshes and requests
 	MaxRequestBodyBytes     int64       // Optional retained request-body ceiling; defaults to 256 MiB
-	MaxRetainedBodyBytes    int64       // Optional process-wide retained request-body ceiling; defaults to 512 MiB
+	MaxRetainedBodyBytes    int64       // Optional process-wide body+decode working-set ceiling; defaults to 768 MiB
 	MaxRetainedCatalogBytes int64       // Optional process-wide model-catalog ceiling; defaults to 256 MiB
 	Logger                  *zap.Logger // Optional logger (defaults to production logger)
 }
@@ -1193,8 +1310,9 @@ func NewProxy(cfg Config) *Proxy {
 	if maxRetainedBodyBytes <= 0 {
 		maxRetainedBodyBytes = defaultMaxProxyRetainedBodyBytes
 	}
-	if maxRetainedBodyBytes < p.maxRequestBodyBytes {
-		maxRetainedBodyBytes = p.maxRequestBodyBytes
+	minimumBodyAdmission := proxyBodyAdmissionBytes(p.maxRequestBodyBytes)
+	if maxRetainedBodyBytes < minimumBodyAdmission {
+		maxRetainedBodyBytes = minimumBodyAdmission
 	}
 	p.bodyAdmission = newByteAdmission(maxRetainedBodyBytes)
 	maxRetainedCatalogBytes := cfg.MaxRetainedCatalogBytes
@@ -1360,9 +1478,11 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	if pool == "" {
 		pool = p.defaultPool
 	}
+	authorization := p.upstreamAuthorizationForRequest(r)
+	authorizationDigest := sha256.Sum256([]byte(authorization))
 	var endpoints []*Endpoint
 	if model != "" {
-		endpoints = p.router.ResolveEndpointCandidates(model, pool, nil, taskScope.Operation)
+		endpoints = p.router.ResolveEndpointCandidates(model, pool, nil, semanticOperationsForTask(task, taskScope.Operation)...)
 	} else if pool == "" {
 		endpoints = p.registry.GetAvailableEndpoints()
 	} else {
@@ -1393,9 +1513,10 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	defer p.catalogAdmission.Release(catalogBytes)
 
 	type catalogResult struct {
-		endpoint *Endpoint
-		catalog  map[string]json.RawMessage
-		err      error
+		endpoint        *Endpoint
+		catalog         map[string]json.RawMessage
+		catalogRevision [sha256.Size]byte
+		err             error
 	}
 	resultBuffer := min(len(addresses), maxConcurrentModelCatalogRequests)
 	results := make(chan catalogResult, resultBuffer)
@@ -1415,7 +1536,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 				results <- catalogResult{err: err}
 				return
 			}
-			if authorization := p.upstreamAuthorizationForRequest(r); authorization != "" {
+			if authorization != "" {
 				request.Header.Set("Authorization", authorization)
 			}
 			response, err := p.registry.client.Do(request)
@@ -1442,7 +1563,9 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 				results <- catalogResult{err: errors.New("upstream catalog no longer advertises the scoped model task")}
 				return
 			}
-			results <- catalogResult{endpoint: endpoint, catalog: catalog}
+			results <- catalogResult{
+				endpoint: endpoint, catalog: catalog, catalogRevision: sha256.Sum256(body),
+			}
 		}(endpoint)
 	}
 
@@ -1450,15 +1573,26 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	successes := 0
 	failures := 0
 	mergedTooLarge := false
-	leaseEndpoints := make(map[string]*Endpoint, len(endpoints))
+	leaseEndpoints := make(map[string]leasedEndpoint, len(endpoints))
 	for range addresses {
 		result := <-results
 		if result.err != nil {
 			failures++
 			continue
 		}
+		if !p.registry.setEndpointCatalogRevision(
+			result.endpoint.Address,
+			result.endpoint,
+			authorizationDigest,
+			result.catalogRevision,
+		) {
+			failures++
+			continue
+		}
 		successes++
-		leaseEndpoints[result.endpoint.Address] = result.endpoint
+		leaseEndpoints[result.endpoint.Address] = leasedEndpoint{
+			endpoint: result.endpoint, catalogRevision: result.catalogRevision,
+		}
 		if !mergedTooLarge {
 			if model != "" {
 				mergeScopedModelCatalog(categories, result.catalog, taskScope, model)
@@ -1502,12 +1636,20 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		data = append(data, map[string]string{"id": model})
 	}
 	response["data"] = data
+	responseBody, err := json.Marshal(response)
+	if err != nil {
+		http.Error(w, "failed to encode merged inference model catalog", http.StatusInternalServerError)
+		return
+	}
+	descriptorDigest := sha256.Sum256(responseBody)
+	descriptorRevision := hex.EncodeToString(descriptorDigest[:])
 	if model != "" {
 		token, err := p.issueCapabilityLease(
 			model,
-			taskScope.Operation,
+			task,
+			descriptorRevision,
 			pool,
-			p.upstreamAuthorizationForRequest(r),
+			authorization,
 			leaseEndpoints,
 		)
 		if err != nil {
@@ -1515,21 +1657,22 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set(capabilityTokenHeader, token)
-		w.Header().Set("Access-Control-Expose-Headers", capabilityTokenHeader)
+		w.Header().Set(capabilityRevisionHeader, descriptorRevision)
+		w.Header().Set("Access-Control-Expose-Headers", capabilityTokenHeader+", "+capabilityRevisionHeader)
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(response); err != nil {
+	if _, err := w.Write(responseBody); err != nil {
 		p.logger.Warn("failed to encode merged inference model catalog", zap.Error(err))
 	}
 }
 
-func (p *Proxy) issueCapabilityLease(model string, operation OperationType, pool, authorization string, endpoints map[string]*Endpoint) (string, error) {
+func (p *Proxy) issueCapabilityLease(model, task, descriptorRevision, pool, authorization string, endpoints map[string]leasedEndpoint) (string, error) {
 	var random [32]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		return "", err
 	}
 	token := hex.EncodeToString(random[:])
-	allowed := make(map[string]*Endpoint, len(endpoints))
+	allowed := make(map[string]leasedEndpoint, len(endpoints))
 	for address, endpoint := range endpoints {
 		allowed[address] = endpoint
 	}
@@ -1552,20 +1695,24 @@ func (p *Proxy) issueCapabilityLease(model string, operation OperationType, pool
 		delete(p.capabilityLeases, oldestKey)
 	}
 	p.capabilityLeases[token] = proxyCapabilityLease{
-		model: model, operation: operation, pool: pool,
+		model: model, task: task, descriptorRevision: descriptorRevision, pool: pool,
 		authorizationDigest: sha256.Sum256([]byte(authorization)),
 		endpoints:           allowed, expiresAt: now.Add(capabilityLeaseTTL),
 	}
 	return token, nil
 }
 
-func (p *Proxy) validateCapabilityLease(token, model string, operation OperationType, pool, authorization string) error {
-	return p.validateCapabilityLeaseDigest(token, model, operation, pool, sha256.Sum256([]byte(authorization)))
+func (p *Proxy) validateCapabilityLease(token, revision, model string, operation OperationType, pool, authorization string) error {
+	_, err := p.capabilityLeaseEndpointsDigest(token, revision, model, operation, pool, sha256.Sum256([]byte(authorization)))
+	return err
 }
 
-func (p *Proxy) validateCapabilityLeaseDigest(token, model string, operation OperationType, pool string, authorizationDigest [sha256.Size]byte) error {
+func (p *Proxy) capabilityLeaseEndpointsDigest(token, revision, model string, operation OperationType, pool string, authorizationDigest [sha256.Size]byte) (map[string]*Endpoint, error) {
 	if token == "" {
-		return nil
+		if revision != "" {
+			return nil, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is incomplete"}
+		}
+		return nil, nil
 	}
 	now := time.Now()
 	p.capabilityLeaseMu.Lock()
@@ -1575,21 +1722,50 @@ func (p *Proxy) validateCapabilityLeaseDigest(token, model string, operation Ope
 		ok = false
 	}
 	p.capabilityLeaseMu.Unlock()
-	if !ok || lease.model != model || lease.operation != operation || lease.pool != pool ||
+	if !ok || lease.model != model || lease.task != semanticTaskForOperation(operation) ||
+		lease.descriptorRevision == "" || lease.descriptorRevision != revision || lease.pool != pool ||
 		lease.authorizationDigest != authorizationDigest {
-		return &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
+		return nil, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
 	}
-	candidates := p.router.ResolveEndpointCandidates(model, pool, nil, operation)
-	if len(candidates) != len(lease.endpoints) {
-		return &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
-	}
-	for _, endpoint := range candidates {
-		expected, allowed := lease.endpoints[endpoint.Address]
-		if !allowed || expected != endpoint {
-			return &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
+	allowed := make(map[string]*Endpoint, len(lease.endpoints))
+	for address, expected := range lease.endpoints {
+		if !p.registry.endpointCatalogRevisionMatches(
+			address,
+			expected.endpoint,
+			authorizationDigest,
+			expected.catalogRevision,
+		) {
+			return nil, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
 		}
+		allowed[address] = expected.endpoint
 	}
-	return nil
+	return allowed, nil
+}
+
+func semanticTaskForOperation(operation OperationType) string {
+	switch operation {
+	case "generate", "generate.batch", "chat.completions":
+		return "generate"
+	case "embed", "embeddings":
+		return "embed"
+	case "rerank", "rerank_multimodal":
+		return "rerank"
+	default:
+		return string(operation)
+	}
+}
+
+func semanticOperationsForTask(task string, fallback OperationType) []OperationType {
+	switch task {
+	case "generate":
+		return []OperationType{"generate", "generate.batch", "chat.completions"}
+	case "embed":
+		return []OperationType{"embed", "embeddings"}
+	case "rerank":
+		return []OperationType{"rerank", "rerank_multimodal"}
+	default:
+		return []OperationType{fallback}
+	}
 }
 
 type catalogTaskScope struct {
@@ -2325,26 +2501,26 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		http.Error(w, "inference request body is too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	// The request body must remain replayable for the full retry loop. Reserve
-	// its worst-case retained footprint before reading so concurrent PDF/media
-	// requests cannot multiply the per-request ceiling into unbounded process
-	// memory. Unknown-length bodies reserve the complete request allowance.
-	retainedBytes := p.maxRequestBodyBytes
+	// The body remains replayable for retries while model extraction decodes a
+	// second representation. Charge both live allocations. Known-length bodies
+	// are allocated exactly; chunked bodies reserve and allocate the full bound.
+	retainedBodyBytes := p.maxRequestBodyBytes
 	if r.ContentLength >= 0 {
-		retainedBytes = r.ContentLength
+		retainedBodyBytes = r.ContentLength
 	}
-	if err := p.bodyAdmission.Acquire(r.Context(), retainedBytes); err != nil {
+	admissionBytes := proxyBodyAdmissionBytes(retainedBodyBytes)
+	if err := p.bodyAdmission.Acquire(r.Context(), admissionBytes); err != nil {
 		http.Error(w, "request canceled while waiting for inference body admission", http.StatusRequestTimeout)
 		return
 	}
-	defer p.bodyAdmission.Release(retainedBytes)
-	body, err := io.ReadAll(io.LimitReader(r.Body, p.maxRequestBodyBytes+1))
+	defer p.bodyAdmission.Release(admissionBytes)
+	body, err := readProxyRequestBody(r.Body, r.ContentLength, p.maxRequestBodyBytes)
 	if err != nil {
+		if errors.Is(err, errProxyRequestBodyTooLarge) {
+			http.Error(w, "inference request body is too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "failed to read request", http.StatusBadRequest)
-		return
-	}
-	if int64(len(body)) > p.maxRequestBodyBytes {
-		http.Error(w, "inference request body is too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -2485,6 +2661,52 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 
 	p.recordProxyMetrics(pool, model, operation, start, "error")
 	http.Error(w, fmt.Sprintf("proxy request failed: %v", lastErr), http.StatusBadGateway)
+}
+
+var errProxyRequestBodyTooLarge = errors.New("inference request body is too large")
+
+// proxyBodyAdmissionBytes accounts for the retained replay body plus a
+// two-body JSON decode allowance (batch slice metadata and decoded strings).
+// Saturation keeps configuration arithmetic safe even when a caller supplies
+// an unreasonable ceiling.
+func proxyBodyAdmissionBytes(bodyBytes int64) int64 {
+	if bodyBytes <= 0 {
+		return 0
+	}
+	if bodyBytes > math.MaxInt64/3 {
+		return math.MaxInt64
+	}
+	return bodyBytes * 3
+}
+
+func readProxyRequestBody(reader io.Reader, contentLength, maxBytes int64) ([]byte, error) {
+	if contentLength > maxBytes {
+		return nil, errProxyRequestBodyTooLarge
+	}
+	allocationBytes := maxBytes
+	if contentLength >= 0 {
+		allocationBytes = contentLength
+	}
+	if allocationBytes < 0 || uint64(allocationBytes) > uint64(^uint(0)>>1) {
+		return nil, errProxyRequestBodyTooLarge
+	}
+	body := make([]byte, int(allocationBytes))
+	readBytes, err := io.ReadFull(reader, body)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if contentLength >= 0 && int64(readBytes) != contentLength {
+		return nil, io.ErrUnexpectedEOF
+	}
+	var extra [1]byte
+	extraBytes, extraErr := io.ReadFull(reader, extra[:])
+	if extraBytes != 0 {
+		return nil, errProxyRequestBodyTooLarge
+	}
+	if extraErr != nil && !errors.Is(extraErr, io.EOF) {
+		return nil, extraErr
+	}
+	return body[:readBytes], nil
 }
 
 func proxyRequestModel(body []byte, operation string) (string, error) {

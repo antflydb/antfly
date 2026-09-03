@@ -8,9 +8,11 @@
 //! crossing the checked native boundary.
 
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
+const remote_capabilities = @import("../inference/remote_capabilities.zig");
 
 pub const Provider = struct {
     ptr: *anyopaque,
     boundary_dispatch: runtime_callback_abi.CallbackDispatch,
     chunk_input_callback: *const anyopaque,
+    remote_capability_cache: ?*remote_capabilities.Cache = null,
 };

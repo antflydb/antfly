@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1739,29 +1740,35 @@ func TestScopedCatalogForwardsCallerAuthorization(t *testing.T) {
 	if recorder.Header().Get(capabilityTokenHeader) == "" {
 		t.Fatal("scoped catalog did not issue a capability lease")
 	}
+	if recorder.Header().Get(capabilityRevisionHeader) == "" {
+		t.Fatal("scoped catalog did not publish its descriptor revision")
+	}
 }
 
-func TestCapabilityLeaseRejectsChangedEndpointSet(t *testing.T) {
+func TestCapabilityLeaseConstrainsRoutingAfterEndpointAddition(t *testing.T) {
 	t.Parallel()
 
 	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://reader-a.internal", "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://reader-a.internal", "read", "owner/reader")
 	endpoints := p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read")
-	token, err := p.issueCapabilityLease("owner/reader", "read", "primary", "", capabilityEndpointSet(endpoints))
+	token, err := p.issueCapabilityLease("owner/reader", "read", "revision-a", "primary", "", capabilityEndpointSet(p.registry, endpoints))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.validateCapabilityLease(token, "owner/reader", "read", "primary", ""); err != nil {
+	if err := p.validateCapabilityLease(token, "revision-a", "owner/reader", "read", "primary", ""); err != nil {
 		t.Fatalf("fresh capability lease failed: %v", err)
 	}
 
 	p.registry.RegisterEndpoint("http://reader-b.internal", "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://reader-b.internal", "read", "owner/reader")
-	err = p.validateCapabilityLease(token, "owner/reader", "read", "primary", "")
-	var resolutionErr *ResolutionError
-	if !errors.As(err, &resolutionErr) || resolutionErr.StatusCode != http.StatusConflict {
-		t.Fatalf("changed endpoint set error = %#v, want capability-stale conflict", err)
+	allowed, err := p.capabilityLeaseEndpointsDigest(token, "revision-a", "owner/reader", "read", "primary", sha256.Sum256(nil))
+	if err != nil {
+		t.Fatalf("endpoint addition invalidated a safely constrainable lease: %v", err)
+	}
+	candidates := p.router.ResolveEndpointCandidatesWithin("owner/reader", "primary", nil, allowed, "read")
+	if len(candidates) != 1 || candidates[0].Address != "http://reader-a.internal" {
+		t.Fatalf("lease-constrained candidates = %#v, want only reader-a", candidates)
 	}
 }
 
@@ -1773,7 +1780,7 @@ func TestCapabilityLeaseRejectsReregisteredEndpointAtSameAddress(t *testing.T) {
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
 	endpoints := p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read")
-	token, err := p.issueCapabilityLease("owner/reader", "read", "primary", "", capabilityEndpointSet(endpoints))
+	token, err := p.issueCapabilityLease("owner/reader", "read", "revision-a", "primary", "", capabilityEndpointSet(p.registry, endpoints))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1781,7 +1788,7 @@ func TestCapabilityLeaseRejectsReregisteredEndpointAtSameAddress(t *testing.T) {
 	p.registry.UnregisterEndpoint(address)
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
-	err = p.validateCapabilityLease(token, "owner/reader", "read", "primary", "")
+	err = p.validateCapabilityLease(token, "revision-a", "owner/reader", "read", "primary", "")
 	var resolutionErr *ResolutionError
 	if !errors.As(err, &resolutionErr) || resolutionErr.StatusCode != http.StatusConflict {
 		t.Fatalf("re-registered endpoint error = %#v, want capability-stale conflict", err)
@@ -1796,24 +1803,191 @@ func TestCapabilityLeaseRejectsChangedAuthorization(t *testing.T) {
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
 	endpoints := p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read")
-	token, err := p.issueCapabilityLease("owner/reader", "read", "primary", "Bearer first", capabilityEndpointSet(endpoints))
+	token, err := p.issueCapabilityLease("owner/reader", "read", "revision-a", "primary", "Bearer first", capabilityEndpointSet(p.registry, endpoints))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = p.validateCapabilityLease(token, "owner/reader", "read", "primary", "Bearer second")
+	err = p.validateCapabilityLease(token, "revision-a", "owner/reader", "read", "primary", "Bearer second")
 	var resolutionErr *ResolutionError
 	if !errors.As(err, &resolutionErr) || resolutionErr.StatusCode != http.StatusConflict {
 		t.Fatalf("changed authorization error = %#v, want capability-stale conflict", err)
 	}
 }
 
-func capabilityEndpointSet(endpoints []*Endpoint) map[string]*Endpoint {
-	result := make(map[string]*Endpoint, len(endpoints))
+func TestGeneratorCapabilityLeaseAllowsExplicitRouteVariants(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	const address = "http://generator.internal"
+	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations(address, map[string]map[OperationType]bool{
+		"gemma4": {"generate": true, "generate.batch": true, "chat.completions": true},
+	})
+	for _, operation := range []OperationType{"generate", "generate.batch", "chat.completions"} {
+		endpoints := p.router.ResolveEndpointCandidates("gemma4", "primary", nil, operation)
+		token, err := p.issueCapabilityLease("gemma4", "generate", "revision-a", "primary", "", capabilityEndpointSet(p.registry, endpoints))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := p.validateCapabilityLease(token, "revision-a", "gemma4", operation, "primary", ""); err != nil {
+			t.Fatalf("semantic generator lease rejected %q: %v", operation, err)
+		}
+	}
+}
+
+func TestGeneratorCapabilityLeaseConstrainsEachRouteVariant(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p.registry.RegisterEndpoint("http://single.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://single.internal", map[string]map[OperationType]bool{
+		"gemma4": {"generate": true},
+	})
+	p.registry.RegisterEndpoint("http://batch.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://batch.internal", map[string]map[OperationType]bool{
+		"gemma4": {"generate.batch": true},
+	})
+	endpoints := p.router.ResolveEndpointCandidates(
+		"gemma4",
+		"primary",
+		nil,
+		semanticOperationsForTask("generate", "generate.batch")...,
+	)
+	token, err := p.issueCapabilityLease("gemma4", "generate", "revision-a", "primary", "", capabilityEndpointSet(p.registry, endpoints))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		operation OperationType
+		address   string
+	}{
+		{operation: "generate", address: "http://single.internal"},
+		{operation: "generate.batch", address: "http://batch.internal"},
+	} {
+		allowed, err := p.capabilityLeaseEndpointsDigest(token, "revision-a", "gemma4", test.operation, "primary", sha256.Sum256(nil))
+		if err != nil {
+			t.Fatalf("validate %q: %v", test.operation, err)
+		}
+		candidates := p.router.ResolveEndpointCandidatesWithin("gemma4", "primary", nil, allowed, test.operation)
+		if len(candidates) != 1 || candidates[0].Address != test.address {
+			t.Fatalf("%q candidates = %#v, want only %s", test.operation, candidates, test.address)
+		}
+	}
+}
+
+func TestScopedGeneratorCatalogLeaseExecutesSingleRoute(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body := `{"generators":{"gemma4":{"inference_capabilities":{"version":3,"task":"generate","input_modalities":["text"],"accepted_mime_types":["text/plain"],"input_granularity":"item","batch":{"mode":"serial_compatibility","preferred_items":1,"max_items":8,"max_encoded_media_bytes":0,"max_decoded_pixels":0,"max_media_parts_per_item":0,"per_item_failures":true},"task_limits":{"max_text_bytes_per_item":null,"max_input_tokens_per_item":null,"max_output_tokens_per_item":null,"max_candidates_per_request":null},"output":"generated_text","result_cardinality":"one_per_item","prompt_policy":"model_default","borrowed_attachments":false}}}}`
+		if req.Method == http.MethodPost {
+			body = `{"data":[{"text":"ok"}]}`
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	})}
+	const address = "http://generator.internal"
+	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations(address, map[string]map[OperationType]bool{
+		"gemma4": {"generate": true, "generate.batch": true, "chat.completions": true},
+	})
+
+	catalogRequest := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=gemma4&task=generate", nil)
+	catalogRecorder := httptest.NewRecorder()
+	p.handleModels(catalogRecorder, catalogRequest)
+	if catalogRecorder.Code != http.StatusOK {
+		t.Fatalf("catalog status = %d: %s", catalogRecorder.Code, catalogRecorder.Body.String())
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/ai/v1/generate", strings.NewReader(`{"model":"gemma4"}`))
+	request.Header.Set(capabilityTokenHeader, catalogRecorder.Header().Get(capabilityTokenHeader))
+	request.Header.Set(capabilityRevisionHeader, catalogRecorder.Header().Get(capabilityRevisionHeader))
+	recorder := httptest.NewRecorder()
+	p.handleGenerate(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("single generation status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestCapabilityLeaseRejectsChangedDescriptorRevision(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	const address = "http://reader.internal"
+	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, address, "read", "owner/reader")
+	endpoints := p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read")
+	token, err := p.issueCapabilityLease("owner/reader", "read", "revision-a", "primary", "", capabilityEndpointSet(p.registry, endpoints))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = p.validateCapabilityLease(token, "revision-b", "owner/reader", "read", "primary", "")
+	var resolutionErr *ResolutionError
+	if !errors.As(err, &resolutionErr) || resolutionErr.StatusCode != http.StatusConflict {
+		t.Fatalf("changed descriptor revision error = %#v, want capability-stale conflict", err)
+	}
+}
+
+func TestCapabilityLeaseRejectsRevisionWithoutToken(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	err := p.validateCapabilityLease("", "revision-a", "owner/reader", "read", "primary", "")
+	var resolutionErr *ResolutionError
+	if !errors.As(err, &resolutionErr) || resolutionErr.StatusCode != http.StatusConflict {
+		t.Fatalf("incomplete lease error = %#v, want conflict", err)
+	}
+}
+
+func TestCapabilityLeaseRejectsChangedEndpointCatalogRevision(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	const address = "http://reader.internal"
+	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, address, "read", "owner/reader")
+	endpoints := p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read")
+	token, err := p.issueCapabilityLease("owner/reader", "read", "revision-a", "primary", "", capabilityEndpointSet(p.registry, endpoints))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.registry.setEndpointCatalogRevision(
+		address,
+		endpoints[0],
+		sha256.Sum256(nil),
+		sha256.Sum256([]byte("changed-catalog")),
+	)
+	err = p.validateCapabilityLease(token, "revision-a", "owner/reader", "read", "primary", "")
+	var resolutionErr *ResolutionError
+	if !errors.As(err, &resolutionErr) || resolutionErr.StatusCode != http.StatusConflict {
+		t.Fatalf("changed endpoint catalog error = %#v, want capability-stale conflict", err)
+	}
+}
+
+func capabilityEndpointSet(registry *ModelRegistry, endpoints []*Endpoint) map[string]leasedEndpoint {
+	result := make(map[string]leasedEndpoint, len(endpoints))
+	revision := sha256.Sum256([]byte("test-catalog"))
 	for _, endpoint := range endpoints {
-		result[endpoint.Address] = endpoint
+		registry.setEndpointCatalogRevision(endpoint.Address, endpoint, sha256.Sum256(nil), revision)
+		result[endpoint.Address] = leasedEndpoint{endpoint: endpoint, catalogRevision: revision}
 	}
 	return result
+}
+
+func TestProxyBodyAdmissionAccountsForDecodeAndExactRetention(t *testing.T) {
+	t.Parallel()
+	const body = `{"model":"gemma4"}`
+	known, err := readProxyRequestBody(strings.NewReader(body), int64(len(body)), 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(known) != len(body) || cap(known) != len(body) {
+		t.Fatalf("known body len/cap = %d/%d, want %d/%d", len(known), cap(known), len(body), len(body))
+	}
+	if got := proxyBodyAdmissionBytes(int64(len(body))); got != int64(3*len(body)) {
+		t.Fatalf("admission = %d, want %d", got, 3*len(body))
+	}
 }
 
 func TestScopedCatalogRequiresProcessWideByteAdmission(t *testing.T) {

@@ -333,6 +333,7 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
         .api_key = try dupOpt(alloc, cfg.api_key),
         .bearer_token = try dupOpt(alloc, cfg.bearer_token),
         .capability_token = try dupOpt(alloc, cfg.capability_token),
+        .capability_revision = try dupOpt(alloc, cfg.capability_revision),
         .base_url = try dupOpt(alloc, cfg.base_url),
         .url = try dupOpt(alloc, cfg.url),
         .api_url = try dupOpt(alloc, cfg.api_url),
@@ -348,6 +349,7 @@ pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
     freeOpt(alloc, cfg.api_key);
     freeOpt(alloc, cfg.bearer_token);
     freeOpt(alloc, cfg.capability_token);
+    freeOpt(alloc, cfg.capability_revision);
     freeOpt(alloc, cfg.base_url);
     freeOpt(alloc, cfg.url);
     freeOpt(alloc, cfg.api_url);
@@ -376,6 +378,7 @@ const AntflyReaderState = struct {
     api_url: []const u8,
     auth_header: ?[2][]const u8 = null,
     capability_token: ?[]const u8 = null,
+    capability_revision: ?[]const u8 = null,
     model: []const u8,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -391,6 +394,8 @@ const AntflyReaderState = struct {
         errdefer freeOpt(alloc, prompt);
         const capability_token = try dupOpt(alloc, cfg.capability_token);
         errdefer freeOpt(alloc, capability_token);
+        const capability_revision = try dupOpt(alloc, cfg.capability_revision);
+        errdefer freeOpt(alloc, capability_revision);
         state.* = .{
             .alloc = alloc,
             .http = http,
@@ -399,6 +404,7 @@ const AntflyReaderState = struct {
             .prompt = prompt,
             .max_tokens = cfg.max_tokens,
             .capability_token = capability_token,
+            .capability_revision = capability_revision,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
@@ -413,6 +419,7 @@ const AntflyReaderState = struct {
         freeOpt(self.alloc, self.prompt);
         if (self.auth_header) |header| self.alloc.free(header[1]);
         freeOpt(self.alloc, self.capability_token);
+        freeOpt(self.alloc, self.capability_revision);
         self.alloc.destroy(self);
     }
 
@@ -441,7 +448,7 @@ const AntflyReaderState = struct {
 
         const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
         defer alloc.free(url);
-        var header_buf: [2][2][]const u8 = undefined;
+        var header_buf: [3][2][]const u8 = undefined;
         var header_count: usize = 0;
         if (self.auth_header) |header| {
             header_buf[header_count] = header;
@@ -449,6 +456,10 @@ const AntflyReaderState = struct {
         }
         if (self.capability_token) |token| {
             header_buf[header_count] = .{ "X-Antfly-Capability-Token", token };
+            header_count += 1;
+        }
+        if (self.capability_revision) |revision| {
+            header_buf[header_count] = .{ "X-Antfly-Capability-Revision", revision };
             header_count += 1;
         }
         const headers = header_buf[0..header_count];

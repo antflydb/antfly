@@ -52,6 +52,7 @@ pub const Config = struct {
     api_key: ?[]const u8 = null,
     bearer_token: ?[]const u8 = null,
     capability_token: ?[]const u8 = null,
+    capability_revision: ?[]const u8 = null,
     schema_json: []const u8 = "",
     options_json: []const u8 = "",
 
@@ -61,6 +62,7 @@ pub const Config = struct {
         if (self.api_key) |api_key| alloc.free(@constCast(api_key));
         if (self.bearer_token) |bearer_token| alloc.free(@constCast(bearer_token));
         if (self.capability_token) |capability_token| alloc.free(@constCast(capability_token));
+        if (self.capability_revision) |revision| alloc.free(@constCast(revision));
         if (self.schema_json.len > 0) alloc.free(@constCast(self.schema_json));
         if (self.options_json.len > 0) alloc.free(@constCast(self.options_json));
         self.* = undefined;
@@ -262,6 +264,7 @@ pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
         .api_key = api_key,
         .bearer_token = bearer_token,
         .capability_token = null,
+        .capability_revision = null,
         .schema_json = schema_json,
         .options_json = options_json,
     };
@@ -277,6 +280,7 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
         .api_key = if (cfg.api_key) |value| try alloc.dupe(u8, value) else null,
         .bearer_token = if (cfg.bearer_token) |value| try alloc.dupe(u8, value) else null,
         .capability_token = if (cfg.capability_token) |value| try alloc.dupe(u8, value) else null,
+        .capability_revision = if (cfg.capability_revision) |value| try alloc.dupe(u8, value) else null,
         .schema_json = try alloc.dupe(u8, cfg.schema_json),
         .options_json = try alloc.dupe(u8, cfg.options_json),
     };
@@ -356,6 +360,8 @@ const HttpExtractorState = struct {
         }
         if (self.cfg.capability_token) |token|
             try headers.append(alloc, .{ "X-Antfly-Capability-Token", token });
+        if (self.cfg.capability_revision) |revision|
+            try headers.append(alloc, .{ "X-Antfly-Capability-Revision", revision });
 
         var resp = try self.http.post(url, .{
             .json = body,
