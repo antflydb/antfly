@@ -36191,14 +36191,14 @@ test "api http server reports exhausted table mutation authority consistently" {
         .body = "{}",
     });
     defer public_create.deinit(alloc);
-    try expectPublicMetadataNotLeaderResponse(public_create);
+    try expectPublicMetadataMutationNotAdmittedResponse(public_create);
 
     var public_drop = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/tables/docs",
     });
     defer public_drop.deinit(alloc);
-    try expectPublicMetadataNotLeaderResponse(public_drop);
+    try expectPublicMetadataMutationNotAdmittedResponse(public_drop);
 
     var mcp_create = try server.executeMcpCreateTable("docs", "{}", null);
     defer mcp_create.deinit(alloc);
@@ -36211,6 +36211,68 @@ test "api http server reports exhausted table mutation authority consistently" {
     try std.testing.expectEqualStrings("1", mcp_drop.headers[0].value);
     try std.testing.expectEqual(@as(usize, 3), source.create_calls);
     try std.testing.expectEqual(@as(usize, 3), source.drop_calls);
+}
+
+test "api http server marks every proven table mutation pre-admission failure" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        mutation_error: anyerror,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .create_table = createTable,
+                .drop_table_exact = dropTableExact,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.mutation_error;
+        }
+
+        fn dropTableExact(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+        ) !metadata_table_topology_mutations.DropResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.mutation_error;
+        }
+    };
+
+    for ([_]anyerror{
+        error.TableTopologyProtocolUpgradeRequired,
+        error.RaftMutationDeadlineExceeded,
+    }) |mutation_error| {
+        const expected_body = switch (mutation_error) {
+            error.TableTopologyProtocolUpgradeRequired => "metadata cluster upgrade in progress; retry later",
+            error.RaftMutationDeadlineExceeded => "metadata mutation deadline exceeded before admission; retry later",
+            else => unreachable,
+        };
+        var source = FakeSource{ .mutation_error = mutation_error };
+        var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+
+        var create_response = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = "/tables/docs",
+            .content_type = "application/json",
+            .body = "{}",
+        });
+        defer create_response.deinit(alloc);
+        try expectPublicMetadataMutationNotAdmittedTextResponse(create_response, expected_body);
+
+        var drop_response = try executeHttpxTestRequest(&server, .{
+            .method = .DELETE,
+            .uri = "/tables/docs",
+        });
+        defer drop_response.deinit(alloc);
+        try expectPublicMetadataMutationNotAdmittedTextResponse(drop_response, expected_body);
+    }
 }
 
 test "api http server retries only pre-admission public table drop failures" {
@@ -38980,6 +39042,29 @@ fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
     try std.testing.expect(metadata_not_leader);
 }
 
+fn expectPublicMetadataMutationNotAdmittedResponse(resp: http_common.HttpResponse) !void {
+    try expectPublicMetadataNotLeaderResponse(resp);
+    try expectPublicMetadataMutationNotAdmittedMarker(resp);
+}
+
+fn expectPublicMetadataMutationNotAdmittedMarker(resp: http_common.HttpResponse) !void {
+    try std.testing.expectEqualStrings(
+        http_common.metadata_mutation_not_admitted_value,
+        resp.header(http_common.metadata_mutation_not_admitted_header) orelse
+            return error.MissingMutationNotAdmittedHeader,
+    );
+}
+
+fn expectPublicMetadataMutationNotAdmittedTextResponse(resp: http_common.HttpResponse, expected_body: []const u8) !void {
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings(expected_body, resp.body);
+    try std.testing.expectEqualStrings(
+        "1",
+        resp.header("Retry-After") orelse return error.MissingRetryAfterHeader,
+    );
+    try expectPublicMetadataMutationNotAdmittedMarker(resp);
+}
+
 fn expectPublicMetadataMutationOutcomeUnknownResponse(resp: http_common.HttpResponse) !void {
     try std.testing.expectEqual(@as(u16, 409), resp.status);
     try std.testing.expectEqualStrings(
@@ -38993,6 +39078,7 @@ fn expectPublicMetadataMutationOutcomeUnknownResponse(resp: http_common.HttpResp
     );
     try std.testing.expect(resp.header("Retry-After") == null);
     try std.testing.expect(resp.header(http_common.metadata_not_leader_header) == null);
+    try std.testing.expect(resp.header(http_common.metadata_mutation_not_admitted_header) == null);
 }
 
 fn expectPublicMetadataCapabilityUnavailableResponse(resp: http_common.HttpResponse) !void {
@@ -39135,7 +39221,7 @@ test "api http server returns retryable not leader when metadata proposal is dro
     });
     defer resp.deinit(alloc);
 
-    try expectPublicMetadataNotLeaderResponse(resp);
+    try expectPublicMetadataMutationNotAdmittedResponse(resp);
     try std.testing.expectEqual(@as(usize, 3), source.create_calls);
 }
 
