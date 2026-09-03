@@ -845,19 +845,21 @@ pub const AntflyApiHandler = struct {
                 return;
             }
             if (self.lease_renew_interval_ns) |interval_ns| if (self.lease_ttl_ns) |ttl_ns| if (self.lease_io) |io| {
-                var heartbeat_confirmed_at_ns = execution_lease_started_ns;
+                var heartbeat_confirmed_expiry_ns = transactions_api.sessionLeaseExpirationNs(ttl_ns, execution_lease_started_ns);
                 const heartbeat_start_ns = platform_time.realtimeNs();
-                const conservative_expiry_ns = transactions_api.sessionLeaseExpirationNs(ttl_ns, heartbeat_confirmed_at_ns);
-                if (heartbeat_start_ns +| interval_ns >= conservative_expiry_ns) {
+                if (heartbeat_start_ns +| interval_ns >= heartbeat_confirmed_expiry_ns) {
                     // If publishing the execution marker consumed most of the
                     // lease, establish a fresh fenced window before invoking
                     // externally visible transaction work. Failure after the
                     // durable marker is ambiguous and belongs to recovery.
-                    self.registry.renewOwnedLease(self.txn_id, self.owner_node_id, heartbeat_start_ns) catch {
+                    heartbeat_confirmed_expiry_ns = self.registry.confirmOwnedLeaseRunway(
+                        self.txn_id,
+                        self.owner_node_id,
+                        interval_ns,
+                    ) catch {
                         self.result.lease_ownership_uncertain = true;
                         return;
                     };
-                    heartbeat_confirmed_at_ns = heartbeat_start_ns;
                 }
                 var heartbeat = transactions_api.OwnedSessionLeaseHeartbeat.init(
                     self.registry,
@@ -865,27 +867,30 @@ pub const AntflyApiHandler = struct {
                     self.txn_id,
                     self.owner_node_id,
                     interval_ns,
-                    ttl_ns,
-                    heartbeat_confirmed_at_ns,
+                    heartbeat_confirmed_expiry_ns,
                 );
                 var heartbeat_future = std.Io.async(io, transactions_api.OwnedSessionLeaseHeartbeat.run, .{&heartbeat});
-                self.commit();
+                const lease_cancellation = transactions_api.OwnedSessionLeaseCancellation{
+                    .upstream = self.cancellation,
+                    .heartbeat = &heartbeat,
+                };
+                self.commit(lease_cancellation.token());
                 heartbeat.stop();
                 heartbeat_future.await(io);
-                self.result.lease_ownership_uncertain = heartbeat.isLost();
+                self.result.lease_ownership_uncertain = !heartbeat.isConfirmedAt(platform_time.realtimeNs());
                 return;
             };
-            self.commit();
+            self.commit(self.cancellation);
         }
 
-        fn commit(self: *@This()) void {
+        fn commit(self: *@This(), cancellation: db_mod.types.CancellationToken) void {
             self.result.outcome = self.source.commitTransactionWithIdAndCancellation(
                 self.alloc,
                 self.txn_id,
                 self.begin_timestamp,
                 self.tables,
                 self.sync_level,
-                self.cancellation,
+                cancellation,
             ) catch |err| {
                 self.result.commit_error = err;
                 return;
@@ -9749,7 +9754,7 @@ test "httpx idempotent batch continues after adopting an expired remote owner" {
         .deployment_mode = .distributed,
         .session_store_path = session_path,
         .session_store_scope = .cluster_shared,
-        .session_owner_lease_ttl_ns = 1,
+        .session_owner_lease_ttl_ns = 20 * std.time.ns_per_ms,
         .session_router = router.iface(),
         .session_executor = executor.iface(),
     }, status.iface(), null, writes.source());
@@ -9770,7 +9775,7 @@ test "httpx idempotent batch continues after adopting an expired remote owner" {
         null,
         &sealed,
     );
-    std.testing.io.sleep(std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+    std.testing.io.sleep(std.Io.Duration.fromMilliseconds(30), .awake) catch {};
 
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/idempotent-batch");
     defer request.deinit();

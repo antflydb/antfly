@@ -293,6 +293,18 @@ pub const TerminalCommitStatus = enum {
     }
 };
 
+fn terminalCommitProgress(status: TerminalCommitStatus) u2 {
+    return switch (status) {
+        .committed_recovery_pending => 0,
+        .committed_visibility_pending => 1,
+        .committed => 2,
+    };
+}
+
+fn laterTerminalCommitStatus(existing: TerminalCommitStatus, incoming: TerminalCommitStatus) TerminalCommitStatus {
+    return if (terminalCommitProgress(incoming) > terminalCommitProgress(existing)) incoming else existing;
+}
+
 /// Non-commit receipt state remains distinct from committed visibility debt.
 /// The versioned receipt keyspace, rather than permissive JSON decoding, is the
 /// compatibility boundary that prevents rollback binaries mutating it.
@@ -1735,6 +1747,8 @@ pub const SessionRegistry = struct {
     /// transaction stripe serializes access, just like the lease mutation it
     /// precedes.
     lease_renewal_failures_for_test: usize = 0,
+    lease_renewal_delay_ns_for_test: u64 = 0,
+    lease_renewal_io_for_test: ?std.Io = null,
 
     pub fn init(durable: ?*DurableSessionStore) SessionRegistry {
         return initWithOptions(durable, null, null, null, null, null);
@@ -2301,31 +2315,36 @@ pub const SessionRegistry = struct {
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
         if (candidate.idempotent_outcome != null) return error.TransactionOutcomeMismatch;
-        const coordinator_acknowledged = if (candidate.terminal_commit) |terminal| blk: {
-            const fills_provisional_repair_handoff = terminal.status == .committed and
-                terminal.repair_required and
-                terminal.coordinator_group_id == null and
-                status == .committed and
-                repair_required and
-                coordinator_group_id != null;
-            if (!fills_provisional_repair_handoff and
+        if (candidate.terminal_commit) |*terminal| {
+            // Replays of one transaction can complete out of order. Treat the
+            // durable result as a monotonic join: phase-two debt may advance to
+            // visibility debt and then committed, while repair and coordinator
+            // acknowledgement facts are sticky. A stale attempt must never
+            // turn a completed receipt back into retryable work.
+            if (terminal.coordinator_group_id != null and coordinator_group_id != null and
                 (terminal.coordinator_group_id != coordinator_group_id or
                     !optionalStringsEqual(terminal.coordinator_table_name, coordinator_table_name)))
             {
                 return error.TransactionCoordinatorMismatch;
             }
-            break :blk if (fills_provisional_repair_handoff) false else terminal.coordinator_acknowledged;
-        } else false;
-        if (candidate.terminal_commit) |*terminal| terminal.deinit(alloc);
-        candidate.terminal_commit = null;
-        const owned_coordinator_table_name = if (coordinator_table_name) |table_name| try alloc.dupe(u8, table_name) else null;
-        candidate.terminal_commit = .{
-            .status = status,
-            .repair_required = repair_required,
-            .coordinator_group_id = coordinator_group_id,
-            .coordinator_table_name = owned_coordinator_table_name,
-            .coordinator_acknowledged = coordinator_acknowledged,
-        };
+            terminal.status = laterTerminalCommitStatus(terminal.status, status);
+            terminal.repair_required = terminal.repair_required or repair_required;
+            // Error-only outcomes cannot report coordinator metadata. Preserve
+            // an established identity when such an older attempt arrives, and
+            // allow recovery to fill an identity that was previously absent.
+            if (terminal.coordinator_group_id == null) if (coordinator_group_id) |group_id| {
+                terminal.coordinator_group_id = group_id;
+                terminal.coordinator_table_name = try alloc.dupe(u8, coordinator_table_name.?);
+            };
+        } else {
+            candidate.terminal_commit = .{
+                .status = status,
+                .repair_required = repair_required,
+                .coordinator_group_id = coordinator_group_id,
+                .coordinator_table_name = if (coordinator_table_name) |table_name| try alloc.dupe(u8, table_name) else null,
+                .coordinator_acknowledged = false,
+            };
+        }
         touchSession(&candidate);
         try self.persistOwnedLocked(candidate);
 
@@ -3067,6 +3086,29 @@ pub const SessionRegistry = struct {
         }
     }
 
+    /// Drops a renewal projection only when it still describes the stale
+    /// snapshot that lost the durable lease. The transaction stripe held by
+    /// the caller prevents a concurrent local ownership mutation, while the
+    /// conditional check keeps this safe if the projection was refreshed.
+    fn forgetLostLeaseRenewalCandidateAssumeStripe(
+        self: *SessionRegistry,
+        txn_id: db_mod.types.TxnId,
+        kind: SessionKind,
+        owner_node_id: u64,
+        owner_incarnation: u64,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const session = self.sessions.getPtr(txn_id) orelse return;
+        if (session.owner_node_id != owner_node_id or
+            session.owner_incarnation != owner_incarnation or
+            sessionKind(session.*) != kind) return;
+        if (self.lease_renewal_candidates.remove(txn_id)) {
+            // Hash-map mutation invalidates an ordinal iterator position.
+            self.lease_renewal_scan_offset = 0;
+        }
+    }
+
     /// Publishes an authoritative durable ownership transition into this
     /// registry. The transaction stripe is held by the caller.
     fn publishAdoptedCandidateAssumeStripe(
@@ -3333,13 +3375,25 @@ pub const SessionRegistry = struct {
             } else null;
             self.mutex.unlock();
             if (incarnation == null) continue;
-            self.renewLeaseLockedAt(renewal.txn_id, renewal.kind, owner_node_id, incarnation.?, now_ns) catch |err| {
+            // Each durable write receives a fresh wall-clock timestamp. One
+            // slow early renewal must not consume the lease lifetime of every
+            // later item in this bounded batch.
+            const renewal_now_ns = @max(now_ns, platform_time.realtimeNs());
+            _ = self.renewLeaseLockedAt(renewal.txn_id, renewal.kind, owner_node_id, incarnation.?, renewal_now_ns) catch |err| {
                 // A stale cached owner is local work to forget, not a reason to
                 // suppress renewal for the rest of the batch. Other storage
                 // failures are reported after every independent lease had its
                 // chance to advance.
-                if (err != error.SessionLeaseLost and deferred_error == null)
+                if (err == error.SessionLeaseLost) {
+                    self.forgetLostLeaseRenewalCandidateAssumeStripe(
+                        renewal.txn_id,
+                        renewal.kind,
+                        owner_node_id,
+                        incarnation.?,
+                    );
+                } else if (deferred_error == null) {
                     deferred_error = err;
+                }
                 continue;
             };
             renewed += 1;
@@ -3365,11 +3419,11 @@ pub const SessionRegistry = struct {
         txn_id: db_mod.types.TxnId,
         owner_node_id: u64,
         now_ns: u64,
-    ) !void {
+    ) !u64 {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
-        const durable = self.durable orelse return;
+        const durable = self.durable orelse return std.math.maxInt(u64);
         var session = (try self.loadSessionCloneAssumeStripe(durable.alloc, txn_id)) orelse return error.SessionLeaseLost;
         defer session.deinit(durable.alloc);
         if (session.owner_node_id != owner_node_id or session.owner_incarnation != self.owner_incarnation)
@@ -3378,16 +3432,86 @@ pub const SessionRegistry = struct {
             self.lease_renewal_failures_for_test -= 1;
             return error.InjectedSessionLeaseRenewalFailure;
         }
-        try self.renewLeaseLockedAt(txn_id, sessionKind(session), owner_node_id, self.owner_incarnation, now_ns);
+        return try self.renewLeaseLockedAt(txn_id, sessionKind(session), owner_node_id, self.owner_incarnation, now_ns);
     }
 
-    fn renewLeaseLockedAt(self: *SessionRegistry, txn_id: db_mod.types.TxnId, kind: SessionKind, owner_node_id: u64, owner_incarnation: u64, now_ns: u64) !void {
-        const lease_store = self.lease_store orelse return;
-        const ttl_ns = self.owner_lease_ttl_ns orelse return;
-        const now_ms = now_ns / std.time.ns_per_ms;
+    /// Establishes a fresh lease window before external work starts. A slow
+    /// storage call may return with too little of the requested window left;
+    /// retrying is safe here because the caller has not begun that work yet.
+    pub fn confirmOwnedLeaseRunway(
+        self: *SessionRegistry,
+        txn_id: db_mod.types.TxnId,
+        owner_node_id: u64,
+        minimum_runway_ns: u64,
+    ) !u64 {
+        for (0..3) |_| {
+            const expires_at_ns = self.renewOwnedLease(
+                txn_id,
+                owner_node_id,
+                platform_time.realtimeNs(),
+            ) catch |err| switch (err) {
+                // This path runs before external work. If a just-persisted
+                // claim expired during slow I/O, atomically re-establish it by
+                // CASing the durable session incarnation and lease together.
+                error.SessionLeaseLost => try self.reacquireOwnedLeaseBeforeWork(txn_id, owner_node_id),
+                else => return err,
+            };
+            const observed_at_ns = platform_time.realtimeNs();
+            if (observed_at_ns < expires_at_ns and
+                expires_at_ns - observed_at_ns >= minimum_runway_ns) return expires_at_ns;
+        }
+        return error.SessionLeaseRunwayUnavailable;
+    }
+
+    fn reacquireOwnedLeaseBeforeWork(
+        self: *SessionRegistry,
+        txn_id: db_mod.types.TxnId,
+        owner_node_id: u64,
+    ) !u64 {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        const durable = self.durable orelse return std.math.maxInt(u64);
+        var session = (try self.loadSessionCloneAssumeStripe(durable.alloc, txn_id)) orelse return error.SessionLeaseLost;
+        defer session.deinit(durable.alloc);
+        if (session.owner_node_id != owner_node_id or
+            session.owner_incarnation != self.owner_incarnation) return error.SessionLeaseLost;
+        const ttl_ns = self.owner_lease_ttl_ns orelse return std.math.maxInt(u64);
+        const ttl_ms = sessionLeaseStorageTtlMs(ttl_ns);
+        const now_ns = platform_time.realtimeNs();
+        try self.delayLeaseMutationForTest();
+        if (!(try durable.saveWithLease(
+            session,
+            owner_node_id,
+            self.owner_incarnation,
+            now_ns / std.time.ns_per_ms,
+            ttl_ms,
+            true,
+            self.max_record_bytes,
+            null,
+        ))) return error.SessionLeaseLost;
+        return leaseExpiryNs(now_ns / std.time.ns_per_ms +| ttl_ms);
+    }
+
+    fn delayLeaseMutationForTest(self: *SessionRegistry) !void {
+        if (self.lease_renewal_delay_ns_for_test == 0) return;
+        const io = self.lease_renewal_io_for_test orelse return;
+        try io.sleep(
+            std.Io.Duration.fromNanoseconds(self.lease_renewal_delay_ns_for_test),
+            .awake,
+        );
+    }
+
+    fn renewLeaseLockedAt(self: *SessionRegistry, txn_id: db_mod.types.TxnId, kind: SessionKind, owner_node_id: u64, owner_incarnation: u64, now_ns: u64) !u64 {
+        const lease_store = self.lease_store orelse return std.math.maxInt(u64);
+        const ttl_ns = self.owner_lease_ttl_ns orelse return std.math.maxInt(u64);
+        const effective_now_ns = @max(now_ns, platform_time.realtimeNs());
+        const now_ms = effective_now_ns / std.time.ns_per_ms;
         const ttl_ms = sessionLeaseStorageTtlMs(ttl_ns);
         if (owner_incarnation != self.owner_incarnation) return error.SessionLeaseLost;
+        try self.delayLeaseMutationForTest();
         if (!(try lease_store.renew(txn_id, kind, owner_node_id, owner_incarnation, now_ms, ttl_ms))) return error.SessionLeaseLost;
+        return leaseExpiryNs(now_ms +| ttl_ms);
     }
 
     fn loadLeaseExpiryLocked(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !u64 {
@@ -3410,7 +3534,6 @@ pub const OwnedSessionLeaseHeartbeat = struct {
     txn_id: db_mod.types.TxnId,
     owner_node_id: u64,
     interval_ns: u64,
-    lease_ttl_ns: u64,
     stop_event: std.Io.Event = .unset,
     lost: std.atomic.Value(bool) = .init(false),
     expires_at_ns: std.atomic.Value(u64),
@@ -3421,8 +3544,7 @@ pub const OwnedSessionLeaseHeartbeat = struct {
         txn_id: db_mod.types.TxnId,
         owner_node_id: u64,
         interval_ns: u64,
-        lease_ttl_ns: u64,
-        confirmed_at_ns: u64,
+        confirmed_expires_at_ns: u64,
     ) OwnedSessionLeaseHeartbeat {
         return .{
             .registry = registry,
@@ -3430,15 +3552,26 @@ pub const OwnedSessionLeaseHeartbeat = struct {
             .txn_id = txn_id,
             .owner_node_id = owner_node_id,
             .interval_ns = interval_ns,
-            .lease_ttl_ns = lease_ttl_ns,
-            .expires_at_ns = .init(sessionLeaseExpirationNs(lease_ttl_ns, confirmed_at_ns)),
+            .expires_at_ns = .init(confirmed_expires_at_ns),
         };
     }
 
     pub fn run(self: *@This()) void {
         while (!self.stop_event.isSet()) {
+            const before_wait_ns = platform_time.realtimeNs();
+            const confirmed_expiry_ns = self.expires_at_ns.load(.acquire);
+            if (before_wait_ns >= confirmed_expiry_ns) {
+                if (self.stop_event.isSet()) return;
+                self.lost.store(true, .release);
+                return;
+            }
+            // After a slow renewal or transient failure, retry inside the
+            // remaining confirmed window instead of sleeping a full interval
+            // past it. Half the remaining window retains one retry opportunity.
+            const remaining_ns = confirmed_expiry_ns - before_wait_ns;
+            const wait_ns = @min(self.interval_ns, @max(@as(u64, 1), remaining_ns / 2));
             self.stop_event.waitTimeout(self.io, .{
-                .duration = .{ .raw = std.Io.Duration.fromNanoseconds(self.interval_ns), .clock = .awake },
+                .duration = .{ .raw = std.Io.Duration.fromNanoseconds(wait_ns), .clock = .awake },
             }) catch |err| switch (err) {
                 error.Timeout => {},
                 error.Canceled => {
@@ -3448,10 +3581,11 @@ pub const OwnedSessionLeaseHeartbeat = struct {
                 },
             };
             if (self.stop_event.isSet()) return;
-            const now_ns = platform_time.realtimeNs();
-            self.registry.renewOwnedLease(self.txn_id, self.owner_node_id, now_ns) catch |err| {
+            const renewal_started_ns = platform_time.realtimeNs();
+            const renewed_expiry_ns = self.registry.renewOwnedLease(self.txn_id, self.owner_node_id, renewal_started_ns) catch |err| {
+                const observed_at_ns = platform_time.realtimeNs();
                 if (err == error.SessionLeaseLost or
-                    now_ns >= self.expires_at_ns.load(.acquire))
+                    observed_at_ns >= self.expires_at_ns.load(.acquire))
                 {
                     self.lost.store(true, .release);
                     return;
@@ -3459,7 +3593,16 @@ pub const OwnedSessionLeaseHeartbeat = struct {
                 std.log.warn("session lease heartbeat renewal deferred txn_id={x} err={s}", .{ self.txn_id, @errorName(err) });
                 continue;
             };
-            self.expires_at_ns.store(sessionLeaseExpirationNs(self.lease_ttl_ns, now_ns), .release);
+            const observed_at_ns = platform_time.realtimeNs();
+            // Strict renewal proves that the durable owner still held a live
+            // lease at the storage boundary. If the newly written window was
+            // consumed before the call returned, recovery must take over under
+            // the same transaction ID.
+            if (observed_at_ns >= renewed_expiry_ns) {
+                self.lost.store(true, .release);
+                return;
+            }
+            self.expires_at_ns.store(renewed_expiry_ns, .release);
         }
     }
 
@@ -3469,6 +3612,30 @@ pub const OwnedSessionLeaseHeartbeat = struct {
 
     pub fn isLost(self: *const @This()) bool {
         return self.lost.load(.acquire);
+    }
+
+    pub fn isConfirmedAt(self: *const @This(), now_ns: u64) bool {
+        return !self.isLost() and now_ns < self.expires_at_ns.load(.acquire);
+    }
+};
+
+/// Combines request cancellation with the ownership fence used by retained
+/// transaction execution. Implementations that support cancellation can stop
+/// visibility waits promptly when the lease heartbeat loses authority.
+pub const OwnedSessionLeaseCancellation = struct {
+    upstream: db_mod.types.CancellationToken = .none,
+    heartbeat: *const OwnedSessionLeaseHeartbeat,
+
+    pub fn token(self: *const @This()) db_mod.types.CancellationToken {
+        return .{
+            .ptr = self,
+            .is_cancelled_fn = isCancelled,
+        };
+    }
+
+    fn isCancelled(ptr: *const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        return self.upstream.isCancelled() or self.heartbeat.isLost();
     }
 };
 
@@ -5817,6 +5984,81 @@ test "durable transaction sessions retain terminal commit coordinator handoff" {
     try std.testing.expectEqual(@as(usize, 1), try reader.cleanupExpired(std.testing.allocator, std.math.maxInt(u64)));
 }
 
+test "terminal commit receipts join concurrent replay results monotonically" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    const session = try registry.begin(alloc, .{ .sync_level = .full_index }, 9);
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}}}
+    );
+    defer request.deinit(alloc);
+    var sealed = (try registry.cloneCommitRequest(alloc, session.txn_id, &request)).?;
+    sealed.deinit(alloc);
+    _ = (try registry.markCommitExecutionStarted(alloc, session.txn_id)).?;
+
+    // An error-only attempt can establish debt without coordinator metadata.
+    _ = (try registry.recordTerminalCommitWithRepair(
+        alloc,
+        session.txn_id,
+        .committed_recovery_pending,
+        false,
+        null,
+        null,
+    )).?;
+    // Recovery fills the immutable coordinator identity and advances the debt.
+    _ = (try registry.recordTerminalCommitWithRepair(
+        alloc,
+        session.txn_id,
+        .committed_visibility_pending,
+        false,
+        7001,
+        "docs",
+    )).?;
+    // A slower original attempt must not regress status or erase identity.
+    _ = (try registry.recordTerminalCommitWithRepair(
+        alloc,
+        session.txn_id,
+        .committed_recovery_pending,
+        false,
+        null,
+        null,
+    )).?;
+
+    var pending = (try registry.getTerminalCommit(alloc, session.txn_id)).?;
+    try std.testing.expectEqual(TerminalCommitStatus.committed_visibility_pending, pending.status);
+    try std.testing.expectEqual(@as(?u64, 7001), pending.coordinator_group_id);
+    try std.testing.expectEqualStrings("docs", pending.coordinator_table_name.?);
+    pending.deinit(alloc);
+
+    _ = (try registry.recordTerminalCommitWithRepair(
+        alloc,
+        session.txn_id,
+        .committed,
+        false,
+        7001,
+        "docs",
+    )).?;
+    _ = (try registry.markTerminalCoordinatorAcknowledged(alloc, session.txn_id)).?;
+    // Repair evidence is sticky, but its stale visibility status is not.
+    _ = (try registry.recordTerminalCommitWithRepair(
+        alloc,
+        session.txn_id,
+        .committed_visibility_pending,
+        true,
+        null,
+        null,
+    )).?;
+
+    var terminal = (try registry.getTerminalCommit(alloc, session.txn_id)).?;
+    defer terminal.deinit(alloc);
+    try std.testing.expectEqual(TerminalCommitStatus.committed, terminal.status);
+    try std.testing.expect(terminal.repair_required);
+    try std.testing.expect(terminal.coordinator_acknowledged);
+    try std.testing.expectEqual(@as(?u64, 7001), terminal.coordinator_group_id);
+    try std.testing.expectEqualStrings("docs", terminal.coordinator_table_name.?);
+}
+
 test "repair-required transaction sessions replay propagation once then release coordination" {
     const alloc = std.testing.allocator;
     var registry = SessionRegistry.init(null);
@@ -6159,6 +6401,14 @@ test "shared session mutations and cleanup reject an adopted owner incarnation" 
         lease.expires_at_ms * std.time.ns_per_ms + 1,
     ));
     try std.testing.expect(owner.owner_incarnation != adopter.owner_incarnation);
+    try std.testing.expectEqual(@as(usize, 1), owner.lease_renewal_candidates.count());
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try owner.renewOwnedLeases(7, lease.expires_at_ms * std.time.ns_per_ms + 2),
+    );
+    // Losing durable ownership evicts the stale process-local projection. It
+    // must not consume a bounded renewal slot on every future supervisor pass.
+    try std.testing.expectEqual(@as(usize, 0), owner.lease_renewal_candidates.count());
 
     try std.testing.expectError(
         error.SessionLeaseLost,
@@ -6496,7 +6746,7 @@ test "transaction session registry renews and releases separate lease records" {
     var durable = DurableSessionStore.init(std.testing.allocator, &store);
 
     const lease_store = SessionLeaseStore.init(std.testing.allocator, &store);
-    var registry = SessionRegistry.initWithLeaseTtl(&durable, lease_store, 10 * std.time.ns_per_ms);
+    var registry = SessionRegistry.initWithLeaseTtl(&durable, lease_store, std.time.ns_per_s);
     defer registry.deinit(std.testing.allocator);
     const session = try registry.begin(std.testing.allocator, .{ .sync_level = .write }, 15);
 
@@ -6725,7 +6975,7 @@ test "transaction session registry can renew owned leases opportunistically" {
     const session = try registry.begin(std.testing.allocator, .{ .sync_level = .write }, 21);
 
     const initial = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
-    const renewed_now = initial.lease_expires_at + 2 * std.time.ns_per_ms;
+    const renewed_now = initial.lease_expires_at - 500 * std.time.ns_per_ms;
     try std.testing.expectEqual(@as(usize, 1), try registry.renewOwnedLeases(21, renewed_now));
     const renewed = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
     try std.testing.expect(renewed.lease_expires_at > initial.lease_expires_at);
@@ -7200,8 +7450,7 @@ test "lease renewal retries transient failure and excludes terminal receipts" {
         txn_id,
         0,
         5 * std.time.ns_per_ms,
-        ttl_ns,
-        now_ns,
+        sessionLeaseExpirationNs(ttl_ns, now_ns),
     );
     var future = std.Io.async(io_impl.io(), OwnedSessionLeaseHeartbeat.run, .{&heartbeat});
     io_impl.io().sleep(std.Io.Duration.fromMilliseconds(18), .awake) catch {};
@@ -7229,6 +7478,33 @@ test "lease renewal retries transient failure and excludes terminal receipts" {
         try std.testing.expect(rounds <= 3);
     }
     try std.testing.expectEqual(@as(usize, 2), total_renewed);
+}
+
+test "lease confirmation rejects windows consumed by storage latency" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-lease-runway", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    const leases = SessionLeaseStore.init(alloc, &store);
+    const ttl_ns = 2 * std.time.ns_per_ms;
+    var registry = SessionRegistry.initWithLeaseTtl(&durable, leases, ttl_ns);
+    defer registry.deinit(alloc);
+    const session = try registry.begin(alloc, .{ .sync_level = .write }, 0);
+
+    registry.lease_renewal_delay_ns_for_test = 5 * std.time.ns_per_ms;
+    registry.lease_renewal_io_for_test = io_impl.io();
+    try std.testing.expectError(
+        error.SessionLeaseRunwayUnavailable,
+        registry.confirmOwnedLeaseRunway(session.txn_id, 0, std.time.ns_per_ms),
+    );
 }
 
 test "session lease storage duration covers nanosecond to millisecond rounding" {

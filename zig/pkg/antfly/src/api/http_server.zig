@@ -3736,24 +3736,36 @@ pub const ApiHttpServer = struct {
             }) orelse continue;
             defer recovery.deinit(self.alloc);
             if (self.sessionRecoveryLeaseRenewInterval()) |interval_ns| if (recovery_io) |io| {
+                // Claim persistence may itself block. Establish and verify a
+                // fresh post-I/O window before starting any recovered 2PC work.
+                const confirmed_expiry_ns = self.txn_sessions.confirmOwnedLeaseRunway(
+                    txn_id,
+                    local_node_id,
+                    interval_ns,
+                ) catch |err| {
+                    std.log.warn("stable transaction recovery lease confirmation deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                    continue;
+                };
                 var heartbeat = transactions_api.OwnedSessionLeaseHeartbeat.init(
                     &self.txn_sessions,
                     io,
                     txn_id,
                     local_node_id,
                     interval_ns,
-                    self.cfg.session_owner_lease_ttl_ns.?,
-                    claim_now_ns,
+                    confirmed_expiry_ns,
                 );
                 var heartbeat_future = std.Io.async(io, transactions_api.OwnedSessionLeaseHeartbeat.run, .{&heartbeat});
-                self.advanceClaimedTransactionRecovery(source, txn_id, &recovery);
+                const lease_cancellation = transactions_api.OwnedSessionLeaseCancellation{
+                    .heartbeat = &heartbeat,
+                };
+                self.advanceClaimedTransactionRecovery(source, txn_id, &recovery, lease_cancellation.token());
                 heartbeat.stop();
                 heartbeat_future.await(io);
                 if (heartbeat.isLost())
                     std.log.warn("stable transaction recovery lost its owner lease txn_id={x}", .{txn_id});
                 continue;
             };
-            self.advanceClaimedTransactionRecovery(source, txn_id, &recovery);
+            self.advanceClaimedTransactionRecovery(source, txn_id, &recovery, .none);
         }
     }
 
@@ -3762,6 +3774,7 @@ pub const ApiHttpServer = struct {
         source: table_writes.TableWriteSource,
         txn_id: db_mod.types.TxnId,
         recovery: *transactions_api.PendingSessionRecovery,
+        cancellation: CancellationToken,
     ) void {
         switch (recovery.*) {
             .acknowledge => |acknowledgement| {
@@ -3786,7 +3799,7 @@ pub const ApiHttpServer = struct {
                     return;
                 };
                 defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
-                const outcome = (source.commitTransactionWithId(
+                const outcome = (source.commitTransactionWithIdAndCancellation(
                     self.alloc,
                     txn_id,
                     commit.begin_timestamp,
@@ -3799,6 +3812,7 @@ pub const ApiHttpServer = struct {
                         .write
                     else
                         commit.sync_level,
+                    cancellation,
                 ) catch |err| switch (err) {
                     error.EnrichmentWorkerFailed => {
                         // Older records and third-party sources may expose a
@@ -26641,8 +26655,8 @@ test "standalone durable receipt is recovered after owner process restart withou
         var owner = try ApiHttpServer.initWithConfig(alloc, .{
             .deployment_mode = .standalone,
             .session_store_path = session_path,
-            .session_owner_lease_ttl_ns = 5 * std.time.ns_per_ms,
-            .session_owner_lease_renew_interval_ns = std.time.ns_per_ms,
+            .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
+            .session_owner_lease_renew_interval_ns = 10 * std.time.ns_per_ms,
         }, source.iface(), null, writes.source());
         defer owner.deinit();
         try std.testing.expect(owner.txn_sessions.hasAtomicDurableStore());
@@ -26666,12 +26680,12 @@ test "standalone durable receipt is recovered after owner process restart withou
         // execution marker and before any terminal receipt is written.
     }
 
-    sleepNs(8 * std.time.ns_per_ms);
+    sleepNs(70 * std.time.ns_per_ms);
     var successor = try ApiHttpServer.initWithConfig(alloc, .{
         .deployment_mode = .standalone,
         .session_store_path = session_path,
-        .session_owner_lease_ttl_ns = 5 * std.time.ns_per_ms,
-        .session_owner_lease_renew_interval_ns = std.time.ns_per_ms,
+        .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
+        .session_owner_lease_renew_interval_ns = 10 * std.time.ns_per_ms,
     }, source.iface(), null, writes.source());
     defer successor.deinit();
     try successor.runSessionMaintenanceOnce();
