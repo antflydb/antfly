@@ -67,8 +67,11 @@ const cors_default_exposed_headers = [_][]const u8{
 const cors_default_max_age: u32 = 3600;
 const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
 const standalone_session_ttl_ns: u64 = std.time.ns_per_hour;
+const standalone_session_receipt_ttl_ns: u64 = std.time.ns_per_hour;
 const standalone_session_cleanup_interval_ns: u64 = std.time.ns_per_min;
 const standalone_session_max_count: usize = 1024;
+const standalone_session_max_receipt_count: usize = 65536;
+const standalone_session_max_receipt_bytes: usize = 512 * 1024 * 1024;
 const standalone_session_max_record_bytes: usize = 16 * 1024 * 1024;
 const standalone_session_savepoint_limit: usize = 64;
 const antfarm_installed_asset_root = "../share/antfly/antfarm";
@@ -2366,8 +2369,11 @@ pub fn runFromIterator(
             .restore_job_store = restore_job_store,
             .incoming_graph_route_store = incoming_graph_route_store,
             .session_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.ttl_seconds * std.time.ns_per_s else standalone_session_ttl_ns,
+            .session_receipt_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.receipt_ttl_seconds * std.time.ns_per_s else standalone_session_receipt_ttl_ns,
             .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,
             .session_max_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_count else standalone_session_max_count,
+            .session_max_receipt_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_receipt_count else standalone_session_max_receipt_count,
+            .session_max_receipt_bytes = if (loaded_config) |*cfg| cfg.transaction_sessions.max_receipt_bytes else standalone_session_max_receipt_bytes,
             .session_max_record_bytes = if (loaded_config) |*cfg| cfg.transaction_sessions.max_record_bytes else standalone_session_max_record_bytes,
             .session_savepoint_limit = if (loaded_config) |*cfg| cfg.transaction_sessions.max_savepoints else standalone_session_savepoint_limit,
         },

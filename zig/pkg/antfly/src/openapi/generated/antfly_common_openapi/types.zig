@@ -1708,16 +1708,25 @@ pub const TLSInfo = struct {
 /// Resource and retention limits for multi-request transaction sessions.
 pub const TransactionSessionConfig = struct {
     ttl_seconds: ?i64 = null,
+    /// Retention window for compact terminal idempotency receipts.
+    receipt_ttl_seconds: ?i64 = null,
     cleanup_interval_seconds: ?i64 = null,
     max_count: ?i64 = null,
+    /// Independent count budget for pending and retained idempotency receipts.
+    max_receipt_count: ?i64 = null,
+    /// Aggregate durable byte budget for pending and retained idempotency receipts.
+    max_receipt_bytes: ?i64 = null,
     max_record_bytes: ?i64 = null,
     max_savepoints: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "ttl_seconds", "ttl_seconds", true },
+        .{ "receipt_ttl_seconds", "receipt_ttl_seconds", true },
         .{ "cleanup_interval_seconds", "cleanup_interval_seconds", true },
         .{ "max_count", "max_count", true },
+        .{ "max_receipt_count", "max_receipt_count", true },
+        .{ "max_receipt_bytes", "max_receipt_bytes", true },
         .{ "max_record_bytes", "max_record_bytes", true },
         .{ "max_savepoints", "max_savepoints", true },
     };
@@ -1736,12 +1745,24 @@ pub const TransactionSessionConfig = struct {
             try jw.objectField("ttl_seconds");
             try jw.write(value);
         }
+        if (self.receipt_ttl_seconds) |value| {
+            try jw.objectField("receipt_ttl_seconds");
+            try jw.write(value);
+        }
         if (self.cleanup_interval_seconds) |value| {
             try jw.objectField("cleanup_interval_seconds");
             try jw.write(value);
         }
         if (self.max_count) |value| {
             try jw.objectField("max_count");
+            try jw.write(value);
+        }
+        if (self.max_receipt_count) |value| {
+            try jw.objectField("max_receipt_count");
+            try jw.write(value);
+        }
+        if (self.max_receipt_bytes) |value| {
+            try jw.objectField("max_receipt_bytes");
             try jw.write(value);
         }
         if (self.max_record_bytes) |value| {

@@ -5123,7 +5123,7 @@ pub const AntflyApiHandler = struct {
             return try self.respondIdempotentBatchTerminal(
                 ctx,
                 txn_id,
-                &snapshot.request,
+                snapshot.result,
                 &snapshot.terminal,
             );
         }
@@ -5184,7 +5184,7 @@ pub const AntflyApiHandler = struct {
         if (try self.api_server.txn_sessions.getTerminalCommit(alloc, txn_id)) |terminal_value| {
             var terminal = terminal_value;
             defer terminal.deinit(alloc);
-            return try self.respondIdempotentBatchTerminal(ctx, txn_id, &commit_req, &terminal);
+            return try self.respondIdempotentBatchTerminal(ctx, txn_id, try transactions_api.idempotentResultCounts(commit_req), &terminal);
         }
 
         const distributed_tables = try commit_req.distributedTables(alloc);
@@ -5399,7 +5399,7 @@ pub const AntflyApiHandler = struct {
         if (try self.api_server.txn_sessions.getTerminalCommit(alloc, txn_id)) |terminal_value| {
             var terminal = terminal_value;
             defer terminal.deinit(alloc);
-            return try self.respondIdempotentBatchTerminal(ctx, txn_id, request, &terminal);
+            return try self.respondIdempotentBatchTerminal(ctx, txn_id, try transactions_api.idempotentResultCounts(request.*), &terminal);
         }
         return try idempotentBatchError(ctx, 409, "unknown", "transaction_outcome_unknown", "receipt changed during reconciliation; retry with the same Idempotency-Key", true, &txn_hex);
     }
@@ -5408,7 +5408,7 @@ pub const AntflyApiHandler = struct {
         _: *AntflyApiHandler,
         ctx: *httpx.Context,
         txn_id: db_mod.types.TxnId,
-        request: *transactions_api.OwnedTransactionCommitRequest,
+        result: transactions_api.IdempotentResultCounts,
         terminal: *transactions_api.TerminalCommit,
     ) !httpx.Response {
         // Terminal replay is an immutable receipt projection. Any coordinator
@@ -5416,7 +5416,7 @@ pub const AntflyApiHandler = struct {
         // index and is advanced only by bounded maintenance workers.
         const effective_status = transactions_api.effectiveTerminalCommitStatus(terminal.*);
         const status = transactions_api.terminalCommitResponseStatus(effective_status, terminal.repair_required);
-        return try idempotentBatchSuccess(ctx, if (effective_status == .committed and !terminal.repair_required) 200 else 202, txn_id, status, request.tables);
+        return try idempotentBatchSuccessCounts(ctx, if (effective_status == .committed and !terminal.repair_required) 200 else 202, txn_id, status, result);
     }
 
     fn respondIdempotentBatchRejection(
@@ -5435,7 +5435,22 @@ pub const AntflyApiHandler = struct {
         status: []const u8,
         tables: []const transactions_api.TableCommitRequest,
     ) !httpx.Response {
-        const result = tables[0].result();
+        if (tables.len != 1) return error.InvalidTransactionSessionRecord;
+        const table_result = tables[0].result();
+        return try idempotentBatchSuccessCounts(ctx, status_code, txn_id, status, .{
+            .inserted = table_result.inserted,
+            .deleted = table_result.deleted,
+            .transformed = table_result.transformed,
+        });
+    }
+
+    fn idempotentBatchSuccessCounts(
+        ctx: *httpx.Context,
+        status_code: u16,
+        txn_id: db_mod.types.TxnId,
+        status: []const u8,
+        result: transactions_api.IdempotentResultCounts,
+    ) !httpx.Response {
         const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
         const reconcile = try std.fmt.allocPrint(ctx.allocator, "/db/v1/transactions/{s}", .{&txn_hex});
         defer ctx.allocator.free(reconcile);
@@ -9737,6 +9752,7 @@ test "httpx idempotent batch admission returns its documented JSON receipt error
         .session_store_path = session_path,
         .write_max_concurrent_requests = 1,
         .session_max_count = 2,
+        .session_max_receipt_count = 2,
         .backend_runtime = &runtime,
     }, source.iface(), null, writes.source());
     defer api_server.deinit();

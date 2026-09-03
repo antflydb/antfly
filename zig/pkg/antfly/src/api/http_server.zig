@@ -1101,12 +1101,15 @@ pub const ApiHttpServerConfig = struct {
     /// configured local storage root (or Lite file directory) is used.
     backup_staging_root: ?[]const u8 = null,
     session_ttl_ns: ?u64 = null,
+    session_receipt_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
     session_owner_lease_ttl_ns: ?u64 = null,
     session_owner_lease_renew_interval_ns: ?u64 = null,
     session_savepoint_limit: ?usize = null,
     session_max_count: ?usize = null,
     session_max_record_bytes: ?usize = null,
+    session_max_receipt_count: ?usize = null,
+    session_max_receipt_bytes: ?usize = null,
     /// Optional node-wide resource owner. The owner must outlive ApiHttpServer.
     /// Cache budgets and concurrency are intentionally not HTTP/API config.
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -2883,6 +2886,8 @@ pub const ApiHttpServer = struct {
                     cfg.session_savepoint_limit,
                     cfg.session_max_count,
                     cfg.session_max_record_bytes,
+                    cfg.session_max_receipt_count,
+                    cfg.session_max_receipt_bytes,
                 );
                 registry.durable_scope = cfg.session_store_scope;
                 break :blk registry;
@@ -3200,6 +3205,8 @@ pub const ApiHttpServer = struct {
                 effective_cfg.session_savepoint_limit,
                 effective_cfg.session_max_count,
                 effective_cfg.session_max_record_bytes,
+                effective_cfg.session_max_receipt_count,
+                effective_cfg.session_max_receipt_bytes,
             );
             server.txn_sessions.durable_scope = effective_cfg.session_store_scope;
         }
@@ -6813,12 +6820,17 @@ pub const ApiHttpServer = struct {
 
     fn maybeCleanupExpiredSessions(self: *ApiHttpServer) !void {
         const ttl_ns = self.cfg.session_ttl_ns orelse return;
+        const receipt_ttl_ns = self.cfg.session_receipt_ttl_ns orelse ttl_ns;
         const now_ns = platform_time.realtimeNs();
         const interval_ns = self.cfg.session_cleanup_interval_ns orelse ttl_ns;
         const previous_ns = self.last_session_cleanup_ns.load(.acquire);
         if (previous_ns != 0 and now_ns -| previous_ns < interval_ns) return;
         self.last_session_cleanup_ns.store(now_ns, .release);
-        _ = try self.txn_sessions.cleanupExpired(self.alloc, now_ns -| ttl_ns);
+        _ = try self.txn_sessions.cleanupExpiredWithCutoffs(
+            self.alloc,
+            now_ns -| ttl_ns,
+            now_ns -| receipt_ttl_ns,
+        );
     }
 
     fn routeInternalGroupQueryToReadSchema(ptr: *anyopaque, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
