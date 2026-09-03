@@ -817,6 +817,7 @@ pub const DurableSessionStore = struct {
     backend: Backend,
     fail_writes_for_test: bool = false,
     fail_lease_transition_after_session_write_for_test: bool = false,
+    capacity_scan_count_for_test: usize = 0,
 
     const Backend = union(enum) {
         docstore: *docstore_mod.DocStore,
@@ -947,7 +948,7 @@ pub const DurableSessionStore = struct {
         // process observes one serial capacity boundary. This scan is also
         // compatible with rolling binaries that do not maintain a counter.
         if (expected_owner == null) if (max_sessions) |limit| {
-            if (try countSessionsTxn(txn, limit) >= limit) return error.SessionLimitExceeded;
+            if (try self.countSessionsTxn(txn, limit) >= limit) return error.SessionLimitExceeded;
         };
 
         const owner_id = try ownerLeaseId(self.alloc, session.owner_node_id, session.owner_incarnation);
@@ -997,7 +998,8 @@ pub const DurableSessionStore = struct {
         return true;
     }
 
-    fn countSessionsTxn(txn: anytype, limit: usize) !usize {
+    fn countSessionsTxn(self: *DurableSessionStore, txn: anytype, limit: usize) !usize {
+        if (comptime @import("builtin").is_test) self.capacity_scan_count_for_test += 1;
         if (limit == 0) return 0;
         var cursor = try txn.openCursor();
         defer cursor.close();
@@ -1871,7 +1873,11 @@ pub const SessionRegistry = struct {
         };
         if (self.durable != null and self.lease_store != null and self.owner_lease_ttl_ns != null) {
             const ttl_ms = sessionLeaseStorageTtlMs(self.owner_lease_ttl_ns.?);
-            if (!(try self.durable.?.saveWithLease(session, null, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes, self.max_sessions))) return error.SessionLeaseLost;
+            // Node-local admission is already reserved under `mutex` against
+            // the cached durable count. Only a cluster-shared store needs the
+            // count-and-create boundary inside the backend transaction.
+            const atomic_max_sessions = if (self.durable_scope == .cluster_shared) self.max_sessions else null;
+            if (!(try self.durable.?.saveWithLease(session, null, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes, atomic_max_sessions))) return error.SessionLeaseLost;
         } else {
             try self.persistLocked(session);
         }
@@ -1905,7 +1911,7 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
 
-        const body_digest = try commitBodyDigest(alloc, sealed_request);
+        const body_digest = try canonicalCommitBodyDigest(alloc, sealed_request);
 
         if (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) |existing_value| {
             var existing = existing_value;
@@ -1962,7 +1968,8 @@ pub const SessionRegistry = struct {
 
         if (self.durable != null and self.lease_store != null and self.owner_lease_ttl_ns != null) {
             const ttl_ms = sessionLeaseStorageTtlMs(self.owner_lease_ttl_ns.?);
-            if (!(try self.durable.?.saveWithLease(session, null, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes, self.max_sessions))) {
+            const atomic_max_sessions = if (self.durable_scope == .cluster_shared) self.max_sessions else null;
+            if (!(try self.durable.?.saveWithLease(session, null, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes, atomic_max_sessions))) {
                 // Another API node won the create race. Load the immutable
                 // binding and return it only when it is the same operation.
                 var existing = (try self.durable.?.load(txn_id)) orelse return error.SessionLeaseLost;
@@ -2176,7 +2183,10 @@ pub const SessionRegistry = struct {
             candidate_owned = false;
             return error.UnsealedIdempotencyReceipt;
         }
-        const body_digest = try commitBodyDigest(alloc, extra_req);
+        const body_digest = if (expected_kind == .idempotent_receipt)
+            try canonicalCommitBodyDigest(alloc, extra_req)
+        else
+            try commitBodyDigest(alloc, extra_req);
         if (candidate.commit_body_digest) |sealed_digest| {
             if (!std.mem.eql(u8, &sealed_digest, &body_digest)) return error.TransactionCommitRequestMismatch;
             const sealed = candidate.staged orelse return error.InvalidTransactionSessionRecord;
@@ -2457,7 +2467,7 @@ pub const SessionRegistry = struct {
         if (!session.idempotent_receipt) return error.SessionKindMismatch;
         const terminal = session.terminal_commit orelse return null;
         const sealed_digest = session.commit_body_digest orelse return error.InvalidTransactionSessionRecord;
-        const supplied_digest = try commitBodyDigest(alloc, supplied_request);
+        const supplied_digest = try canonicalCommitBodyDigest(alloc, supplied_request);
         if (!std.mem.eql(u8, &sealed_digest, &supplied_digest))
             return error.TransactionCommitRequestMismatch;
         const sealed_request = session.staged orelse return error.InvalidTransactionSessionRecord;
@@ -5763,6 +5773,178 @@ fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
+/// Idempotency binds the logical JSON request, not incidental object insertion
+/// order. Arrays remain ordered because transform and operation order can be
+/// semantically significant; object-derived tables, inserts, and document
+/// fields are emitted by key.
+fn canonicalCommitBodyDigest(
+    alloc: std.mem.Allocator,
+    req: ?*const OwnedTransactionCommitRequest,
+) ![32]u8 {
+    const encoded = if (req) |value| try encodeCanonicalCommitRequest(alloc, value.*) else try alloc.dupe(u8, "null");
+    defer alloc.free(encoded);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+    return digest;
+}
+
+fn encodeCanonicalCommitRequest(alloc: std.mem.Allocator, req: OwnedTransactionCommitRequest) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"read_set\":[");
+    for (req.read_set, 0..) |item, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "{\"table\":");
+        try appendJsonString(alloc, &out, item.table_name);
+        try out.appendSlice(alloc, ",\"key\":");
+        try appendJsonString(alloc, &out, item.key);
+        try out.appendSlice(alloc, ",\"version\":");
+        const version_text = try std.fmt.allocPrint(alloc, "{d}", .{item.expected_version});
+        defer alloc.free(version_text);
+        try appendJsonString(alloc, &out, version_text);
+        try out.append(alloc, '}');
+    }
+    try out.appendSlice(alloc, "],\"tables\":{");
+    const table_order = try alloc.alloc(usize, req.tables.len);
+    defer alloc.free(table_order);
+    for (table_order, 0..) |*index, i| index.* = i;
+    std.mem.sort(usize, table_order, req.tables, struct {
+        fn lessThan(tables: []const TableCommitRequest, left: usize, right: usize) bool {
+            return std.mem.order(u8, tables[left].table_name, tables[right].table_name) == .lt;
+        }
+    }.lessThan);
+    for (table_order, 0..) |table_index, i| {
+        if (i > 0) try out.append(alloc, ',');
+        const table = req.tables[table_index];
+        try appendJsonString(alloc, &out, table.table_name);
+        try out.append(alloc, ':');
+        try appendCanonicalTableBatchRequest(alloc, &out, table);
+    }
+    try out.append(alloc, '}');
+    try out.appendSlice(alloc, ",\"sync_level\":");
+    try appendJsonString(alloc, &out, syncLevelText(req.sync_level));
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendCanonicalTableBatchRequest(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    table: TableCommitRequest,
+) !void {
+    try out.append(alloc, '{');
+    var first = true;
+    if (table.batch.writes.len > 0) {
+        first = false;
+        try out.appendSlice(alloc, "\"inserts\":{");
+        const write_order = try alloc.alloc(usize, table.batch.writes.len);
+        defer alloc.free(write_order);
+        for (write_order, 0..) |*index, i| index.* = i;
+        std.mem.sort(usize, write_order, table.batch.writes, struct {
+            fn lessThan(writes: []const db_mod.types.BatchWrite, left: usize, right: usize) bool {
+                return std.mem.order(u8, writes[left].key, writes[right].key) == .lt;
+            }
+        }.lessThan);
+        for (write_order, 0..) |write_index, i| {
+            if (i > 0) try out.append(alloc, ',');
+            const write = table.batch.writes[write_index];
+            try appendJsonString(alloc, out, write.key);
+            try out.append(alloc, ':');
+            try appendCanonicalJsonText(alloc, out, write.value);
+        }
+        try out.append(alloc, '}');
+    }
+    if (table.batch.deletes.len > 0) {
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try out.appendSlice(alloc, "\"deletes\":[");
+        for (table.batch.deletes, 0..) |key, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, key);
+        }
+        try out.append(alloc, ']');
+    }
+    if (table.batch.transforms.len > 0) {
+        if (!first) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "\"transforms\":[");
+        for (table.batch.transforms, 0..) |transform, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try out.appendSlice(alloc, "{\"key\":");
+            try appendJsonString(alloc, out, transform.key);
+            try out.appendSlice(alloc, ",\"operations\":[");
+            for (transform.operations, 0..) |op, op_index| {
+                if (op_index > 0) try out.append(alloc, ',');
+                try out.appendSlice(alloc, "{\"op\":");
+                try appendJsonString(alloc, out, db_mod.transform.transformOpText(op.op));
+                try out.appendSlice(alloc, ",\"path\":");
+                try appendJsonString(alloc, out, op.path);
+                if (op.value_json) |value_json| {
+                    try out.appendSlice(alloc, ",\"value\":");
+                    try appendCanonicalJsonText(alloc, out, value_json);
+                }
+                try out.append(alloc, '}');
+            }
+            try out.append(alloc, ']');
+            if (transform.upsert) try out.appendSlice(alloc, ",\"upsert\":true");
+            try out.append(alloc, '}');
+        }
+        try out.append(alloc, ']');
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendCanonicalJsonText(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    text: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, text, .{});
+    defer parsed.deinit();
+    try appendCanonicalJsonValue(alloc, out, parsed.value);
+}
+
+fn appendCanonicalJsonValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .array => |array| {
+            try out.append(alloc, '[');
+            for (array.items, 0..) |item, i| {
+                if (i > 0) try out.append(alloc, ',');
+                try appendCanonicalJsonValue(alloc, out, item);
+            }
+            try out.append(alloc, ']');
+        },
+        .object => |object| {
+            const keys = try alloc.alloc([]const u8, object.count());
+            defer alloc.free(keys);
+            var keys_it = object.iterator();
+            var key_index: usize = 0;
+            while (keys_it.next()) |entry| : (key_index += 1) keys[key_index] = entry.key_ptr.*;
+            std.mem.sort([]const u8, keys, {}, struct {
+                fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+                    return std.mem.order(u8, left, right) == .lt;
+                }
+            }.lessThan);
+            try out.append(alloc, '{');
+            for (keys, 0..) |key, i| {
+                if (i > 0) try out.append(alloc, ',');
+                try appendJsonString(alloc, out, key);
+                try out.append(alloc, ':');
+                try appendCanonicalJsonValue(alloc, out, object.get(key).?);
+            }
+            try out.append(alloc, '}');
+        },
+        else => {
+            const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        },
+    }
+}
+
 fn commitBodyDigest(
     alloc: std.mem.Allocator,
     req: ?*const OwnedTransactionCommitRequest,
@@ -6320,6 +6502,33 @@ test "cluster shared session capacity is enforced by the durable create transact
         second.begin(alloc, .{ .sync_level = .write }, 2),
     );
     try std.testing.expectEqual(@as(usize, 1), try durable.sessionCount());
+    try std.testing.expectEqual(@as(usize, 2), durable.capacity_scan_count_for_test);
+}
+
+test "node local leased session capacity uses the reserved durable count" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-local-capacity", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    const leases = SessionLeaseStore.init(alloc, &store);
+    var registry = SessionRegistry.initWithOptions(&durable, leases, std.time.ns_per_s, null, 2, null);
+    defer registry.deinit(alloc);
+
+    _ = try registry.begin(alloc, .{ .sync_level = .write }, 1);
+    _ = try registry.begin(alloc, .{ .sync_level = .write }, 1);
+    try std.testing.expectError(
+        error.SessionLimitExceeded,
+        registry.begin(alloc, .{ .sync_level = .write }, 1),
+    );
+    try std.testing.expectEqual(@as(usize, 2), try durable.sessionCount());
+    try std.testing.expectEqual(@as(usize, 0), durable.capacity_scan_count_for_test);
 }
 
 test "transaction session registry adopts durable session ownership" {
@@ -7225,6 +7434,30 @@ test "idempotent batch identities are scoped and session bodies are sealed" {
     try std.testing.expect(!registry.remove(alloc, alice_docs));
     var sealed = (try registry.cloneIdempotentCommitRequest(alloc, alice_docs, &first_request)).?;
     sealed.deinit(alloc);
+
+    // JSON object order is not part of the logical batch. A retry serialized
+    // by another SDK/runtime must still match the sealed operation, including
+    // nested document and transform-value objects.
+    const canonical_principal = "canonical-alice";
+    const canonical_txn = idempotentTransactionId(canonical_principal, "docs", "canonical-json");
+    var unordered_batch = try batch_api.parseBatchRequest(alloc,
+        \\{"inserts":{"two":{"z":2,"nested":{"b":2,"a":1}},"one":{"value":1}},"transforms":[{"key":"three","operations":[{"op":"$set","path":"value","value":{"z":2,"a":1}}]}],"sync_level":"write"}
+    );
+    defer unordered_batch.deinit(alloc);
+    var unordered_request = try ownedRequestFromBatch(alloc, "docs", unordered_batch);
+    defer unordered_request.deinit(alloc);
+    const canonical_first = try registry.beginIdempotentForPrincipal(alloc, canonical_txn, .{ .sync_level = .write }, 7, canonical_principal, &unordered_request);
+
+    var reordered_batch = try batch_api.parseBatchRequest(alloc,
+        \\{"sync_level":"write","transforms":[{"operations":[{"value":{"a":1,"z":2},"path":"value","op":"$set"}],"key":"three"}],"inserts":{"one":{"value":1},"two":{"nested":{"a":1,"b":2},"z":2}}}
+    );
+    defer reordered_batch.deinit(alloc);
+    var reordered_request = try ownedRequestFromBatch(alloc, "docs", reordered_batch);
+    defer reordered_request.deinit(alloc);
+    const canonical_replay = try registry.beginIdempotentForPrincipal(alloc, canonical_txn, .{ .sync_level = .write }, 7, canonical_principal, &reordered_request);
+    try std.testing.expectEqual(canonical_first.begin_timestamp, canonical_replay.begin_timestamp);
+    var canonical_sealed = (try registry.cloneIdempotentCommitRequest(alloc, canonical_txn, &reordered_request)).?;
+    canonical_sealed.deinit(alloc);
 
     var changed_batch = try batch_api.parseBatchRequest(alloc,
         \\{"inserts":{"one":{"value":2}},"sync_level":"write"}

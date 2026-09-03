@@ -5258,14 +5258,14 @@ pub const AntflyApiHandler = struct {
                         std.log.warn("idempotent batch committed but visibility receipt persistence is pending txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
                         return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
                     }) orelse return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
-                    return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
+                    return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_visibility_pending", commit_req.tables);
                 },
                 error.CommitPropagationIncomplete => {
                     _ = (self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .committed_recovery_pending, null, null) catch |persist_err| {
                         std.log.warn("idempotent batch committed but recovery receipt persistence is pending txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
                         return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
                     }) orelse return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
-                    return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
+                    return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_recovery_pending", commit_req.tables);
                 },
                 error.EnrichmentWorkerFailed => {
                     _ = (self.api_server.txn_sessions.recordTerminalCommitWithRepair(alloc, txn_id, .committed, true, null, null) catch |persist_err| {
@@ -8040,6 +8040,103 @@ test "httpx idempotent batch returns a typed committed handoff when receipt pers
     defer replay.deinit();
     try std.testing.expectEqual(@as(u16, 200), replay.status.code);
     try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
+}
+
+test "httpx idempotent batch first response matches persisted pending receipt" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const FakeWrites = struct {
+        commit_calls: usize = 0,
+        next_error: anyerror = error.CommitVisibilityNotSatisfied,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .commit_transaction_with_id = commitTransactionWithId,
+            } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn commitTransactionWithId(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.commit_calls += 1;
+            return self.next_error;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const session_path = "/tmp/antfly-httpx-idempotent-pending-replay";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
+
+    var status = AuthStatusSource{};
+    var writes = FakeWrites{};
+    var api_server = try ApiHttpServer.initWithConfig(alloc, .{
+        .deployment_mode = .standalone,
+        .session_store_path = session_path,
+    }, status.iface(), null, writes.source());
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    const body = "{\"inserts\":{\"counter\":{\"value\":1}},\"sync_level\":\"write\"}";
+    const cases = [_]struct {
+        key: []const u8,
+        commit_error: anyerror,
+        expected_status: []const u8,
+    }{
+        .{
+            .key = "visibility-pending",
+            .commit_error = error.CommitVisibilityNotSatisfied,
+            .expected_status = "committed_visibility_pending",
+        },
+        .{
+            .key = "recovery-pending",
+            .commit_error = error.CommitPropagationIncomplete,
+            .expected_status = "committed_recovery_pending",
+        },
+    };
+
+    for (cases) |case| {
+        writes.next_error = case.commit_error;
+        var first_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/idempotent-batch");
+        defer first_request.deinit();
+        first_request.body = body;
+        try first_request.headers.append("idempotency-key", case.key);
+        var first_ctx = httpx.Context.init(alloc, std.testing.io, &first_request);
+        defer first_ctx.deinit();
+        var first = try handler.idempotentBatchWrite(&first_ctx, "docs");
+        defer first.deinit();
+        try std.testing.expectEqual(@as(u16, 202), first.status.code);
+        var parsed_first = try std.json.parseFromSlice(std.json.Value, alloc, first.body.?, .{});
+        defer parsed_first.deinit();
+        try std.testing.expectEqualStrings(case.expected_status, parsed_first.value.object.get("status").?.string);
+
+        const calls_after_first = writes.commit_calls;
+        var replay_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/idempotent-batch");
+        defer replay_request.deinit();
+        replay_request.body = body;
+        try replay_request.headers.append("idempotency-key", case.key);
+        var replay_ctx = httpx.Context.init(alloc, std.testing.io, &replay_request);
+        defer replay_ctx.deinit();
+        var replay = try handler.idempotentBatchWrite(&replay_ctx, "docs");
+        defer replay.deinit();
+        try std.testing.expectEqual(@as(u16, 202), replay.status.code);
+        var parsed_replay = try std.json.parseFromSlice(std.json.Value, alloc, replay.body.?, .{});
+        defer parsed_replay.deinit();
+        try std.testing.expectEqualStrings(case.expected_status, parsed_replay.value.object.get("status").?.string);
+        try std.testing.expectEqual(calls_after_first, writes.commit_calls);
+    }
 }
 
 test "httpx idempotent batch keeps durable abort receipt failures typed and recoverable" {

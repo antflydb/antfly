@@ -313,8 +313,25 @@ def test_idempotent_batch_survives_lost_response_and_restart(stateful_api):
         sync_level="write",
     )
     payload = {
+        "inserts": {
+            "order:b": {"nested": {"z": 2, "a": 1}},
+            "order:a": {"value": 1},
+        },
         "transforms": [_transform("counter", _op("$inc", "value", 1))],
         "sync_level": "write",
+    }
+    reordered_payload = {
+        "sync_level": "write",
+        "transforms": [
+            {
+                "operations": [{"value": 1, "path": "value", "op": "$inc"}],
+                "key": "counter",
+            }
+        ],
+        "inserts": {
+            "order:a": {"value": 1},
+            "order:b": {"nested": {"a": 1, "z": 2}},
+        },
     }
     key = "counter-increment-1"
     path = f"/tables/{quote(table_name, safe='')}/idempotent-batch"
@@ -365,7 +382,7 @@ def test_idempotent_batch_survives_lost_response_and_restart(stateful_api):
 
     replay = stateful_api.s.post(
         f"{stateful_api.url}{path}",
-        json=payload,
+        json=reordered_payload,
         headers={"Idempotency-Key": key},
         timeout=30,
     )
@@ -375,6 +392,7 @@ def test_idempotent_batch_survives_lost_response_and_restart(stateful_api):
     assert replay.status_code in (200, 202), replay.text
     assert replay.json()["transaction_id"] == transaction_id
     assert stateful_api.lookup_key(table_name, "counter")["value"] == 1
+    assert stateful_api.lookup_key(table_name, "order:b")["nested"] == {"a": 1, "z": 2}
 
     status = stateful_api.s.get(
         f"{stateful_api.url}/transactions/{transaction_id}", timeout=30
