@@ -1,0 +1,192 @@
+---
+title: "Add Search and AI Answers to Your Site"
+description: "A React search page with live results and facets, plus a streaming answer box, both wired to one Antfly table"
+order: 2.2
+---
+
+<Questions>
+- How do I add search to my React app with Antfly?
+- How do I build a faceted search page with @antfly/components?
+- How do I add an AI answer box to my site?
+- Why doesn't my answer box fire when I type?
+- How do I show sources and collect feedback on generated answers?
+</Questions>
+
+## The Pattern
+
+`@antfly/components` is declarative: one `<Antfly>` provider holds the API URL, the table, and the auth headers, and every widget inside it is a child that contributes part of one batched query. You do not fetch, you do not hold state, you do not wire an effect. You place a `<QueryBox>`, a couple of `<Facet>`s, and a `<Results>`, and the provider's internal listener merges them into a single multiquery on every change.
+
+The insight that shapes the page: search results and generated answers are two reading modes over the same table. Results are for scanning — the reader's eye does the ranking, so ten decent hits are fine. The answer box is for asking — one paragraph, no scanning, and the reader believes it. So they get separate inputs on the page, and the expensive one only runs when someone means it.
+
+This guide builds both against a table called `docs` with a semantic index named `body_embeddings`. Replace those, the facet fields, and the URL with your own.
+
+## 1. Install the Packages
+
+```bash
+npm install @antfly/components @antfly/sdk react react-dom
+```
+
+`@antfly/sdk`, `react`, and `react-dom` are peer dependencies — install them explicitly. Then import the stylesheet once, at your app entry point:
+
+```ts
+import '@antfly/components/styles'
+```
+
+<Callout type="warning">
+Skip the stylesheet import and every component renders as unstyled markup — no dropdown positioning, no facet layout. It is the single most common "the library is broken" report.
+</Callout>
+
+## 2. Build the Search Page
+
+```tsx
+import {
+  ActiveFilters,
+  Antfly,
+  Autosuggest,
+  Facet,
+  QueryBox,
+  Results,
+} from '@antfly/components'
+
+const API = 'http://localhost:8080/db/v1'
+const HEADERS = { Authorization: `ApiKey ${import.meta.env.VITE_ANTFLY_KEY}` }
+
+export default function SearchPage() {
+  return (
+    <Antfly url={API} table="docs" headers={HEADERS}>
+      <QueryBox id="search" placeholder="Search the docs…">
+        <Autosuggest fields={['title']} returnFields={['title']} limit={5} />
+      </QueryBox>
+
+      <aside>
+        <Facet id="category" fields={['category']} />
+        <Facet id="product" fields={['product']} />
+        <ActiveFilters />
+      </aside>
+
+      <Results
+        id="results"
+        searchBoxId="search"
+        fields={['title', 'body', 'url']}
+        semanticIndexes={['body_embeddings']}
+        itemsPerPage={10}
+        items={(hits) =>
+          hits.map(({ _id, _source }) => (
+            <article key={_id}>
+              <a href={String(_source?.url)}>{String(_source?.title)}</a>
+              <p>{String(_source?.body ?? '').slice(0, 200)}…</p>
+            </article>
+          ))
+        }
+      />
+    </Antfly>
+  )
+}
+```
+
+`QueryBox` defaults to `mode="live"`, so this searches as you type. `semanticIndexes` is what turns on vector retrieval — without it you get BM25 only, exactly as on the API. And `itemsPerPage` is the prop that sizes the query (`limit` / `offset`); `Results.limit` looks like the page size but is not — it only sets the retrieval limit of sibling `Facet` queries.
+
+<Callout type="info">
+Facet buckets come from the stored document values at the field path you name — use the plain field name (`category`, not `category.keyword`). Values are never tokenized, so short label-like fields facet well and long prose fields make poor facets.
+</Callout>
+
+## 3. Add the Answer Box
+
+The answer box lives inside the same `<Antfly>` provider and gets its own input, in submit mode:
+
+```tsx
+import {
+  AnswerFeedback,
+  AnswerResults,
+  QueryBox,
+  renderThumbsUpDown,
+} from '@antfly/components'
+
+const GENERATOR = { provider: 'ollama', model: 'gemma3:4b' }
+
+export function AnswerBox() {
+  return (
+    <section>
+      <QueryBox
+        id="ask"
+        mode="submit"
+        placeholder="Ask a question…"
+        buttonLabel="Ask"
+      />
+
+      <AnswerResults
+        id="answer"
+        searchBoxId="ask"
+        fields={['title', 'body', 'url']}
+        semanticIndexes={['body_embeddings']}
+        generator={GENERATOR}
+        limit={10}
+        showHits
+      >
+        <AnswerFeedback
+          scale={1}
+          renderRating={renderThumbsUpDown}
+          onFeedback={({ feedback, query }) => {
+            void fetch('/api/answer-feedback', {
+              method: 'POST',
+              body: JSON.stringify({ query, rating: feedback.rating }),
+            })
+          }}
+        />
+      </AnswerResults>
+    </section>
+  )
+}
+```
+
+Drop `<AnswerBox />` in beside `<Results>` and the page is done. The answer streams in token by token, `showHits` renders the documents it answered from, and follow-up questions appear underneath — `showFollowUpQuestions` defaults to `true`, and it is not just a display flag: turning it off tells the server to stop producing them.
+
+<Callout type="warning">
+`searchBoxId` must match the `id` of the `QueryBox` driving it — `"ask"` here, `"search"` on `<Results>`. A mismatch throws nothing and logs nothing. `AnswerResults` simply never fires, and a mismatched semantic `Results` contributes no query at all, which stalls the whole batched request and leaves your facets empty too. When a page goes silent, check these two strings first.
+</Callout>
+
+<Callout type="info">
+The retrieval agent accepts `gemini`, `vertex`, `openai`, `ollama`, and `antfly` as generator providers. Other values parse against the schema and then fail the request with a 400.
+</Callout>
+
+## 4. Run It
+
+Start Antfly, then your dev server:
+
+```bash
+antfly standalone
+npm run dev
+```
+
+Type `billing` into the search box: results appear before you finish the word, and the category facet fills in with counts you can click to narrow. Then type `how do refunds work?` into the ask box and press Ask: an answer streams in, cites the documents it used, and offers a follow-up question or two.
+
+If the search box works and the ask box does nothing, you have a `searchBoxId` typo. If both are silent, open the network tab — an empty multiquery means no widget is contributing a query.
+
+## Why the Answer Box Gets Its Own Input
+
+It is tempting to run both off one box: type once, see results and an answer. The library will not let you, and that restriction is the good part.
+
+`AnswerResults` reacts only to *submissions*. In `mode="live"` a keystroke updates the search value but never sets a submitted timestamp, so the answer agent stays idle. Two inputs is not a limitation to work around — it is the throttle. Live search is a cheap indexed lookup and can happily run on every keystroke; an answer is retrieval plus reranking plus token generation, and running that on `h`, `ho`, `how`, `how ` would burn your generation budget on prefixes of a question nobody has finished asking.
+
+It also matches how people read. Someone scanning results is browsing and wants the list to move with them. Someone asking a question has composed a full sentence and expects a pause. Keeping the modes separate makes the pause honest instead of accidental.
+
+<Callout type="tip">
+To feed a follow-up question back into the ask box, set the `QueryBox` `initialValue` to the question, add `autoSubmit`, and bump `submitSignal` — the changing signal re-fires the submit even when the same question is clicked twice.
+</Callout>
+
+## Let Your Agent Drive
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome — e.g. "Add an Antfly-powered search page with an AI answer box to my React app, using @antfly/components" — and use this page to judge the result.
+
+## Next Steps
+
+- [React Antfly](/docs/ui/react-antfly): the full component reference — chat, custom inputs, citations, URL state
+- [Build a Support Answer Agent](/docs/guides/support-answer-agent): tune the retrieval behind the answer box with reranking and pruning
+- [Hybrid Search](/docs/guides/hybrid-search): combine BM25 and vector scoring so exact terms like error codes still land

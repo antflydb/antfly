@@ -1376,6 +1376,21 @@ Homebrew services, run:
 brew services stop antfly
 ```
 
+## Give Your Agent the Antfly Skill
+
+Everything you just did by hand, a coding agent can do for you. The
+[Antfly skill](https://github.com/antflydb/antfly-skills) packages verified,
+up-to-date knowledge of Antfly's APIs, query shapes, React components, and
+operations for Claude Code, Cursor, Codex, and other agent harnesses:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+From there, your agent can create tables, build indexes, and write queries
+against your running instance — and each [guide](/docs/guides) ends with a
+prompt you can hand it directly.
+
 ## Next Steps
 
 1. **[Explore the Dashboard](/docs/guides/dashboard)** — Manage tables, run queries, and monitor your cluster at `http://localhost:8080`

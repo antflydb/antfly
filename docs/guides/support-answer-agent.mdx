@@ -1,0 +1,178 @@
+---
+title: "Build a Support Answer Agent"
+description: "Auto-answering RAG over your help content: retrieve, rerank, prune, and answer in one call"
+order: 2.1
+---
+
+<Questions>
+- How do I build a support bot that answers from my help articles?
+- How do I use the retrieval agent to generate answers automatically?
+- How do I keep an auto-answering bot from answering off irrelevant context?
+- How do I tune pruning for RAG quality?
+</Questions>
+
+## The Pattern
+
+A support answer agent retrieves help articles and answers the customer directly. Nobody reviews the retrieved articles before the answer goes out: the agent believes what it retrieves, and the customer reads what the agent believes.
+
+That changes what "good retrieval" means. In a search bar, a marginally relevant article in position four is harmless; a human eye skips past it. In an answer agent, that same article becomes part of the answer. Reranking and pruning are not polish here. They are correctness features.
+
+This guide builds the whole loop in three steps: index your help content, then retrieve, rerank, prune, and answer in a single call.
+
+## 1. Create the Help Content Table
+
+Create a table with a semantic index over your articles. The embedder and chunker run locally on Antfly's built-in inference:
+
+```bash
+curl -X POST http://localhost:8080/db/v1/tables/help \
+  -H "Content-Type: application/json" \
+  -d '{
+    "indexes": {
+      "title_content": {
+        "type": "embeddings",
+        "template": "{{title}} {{content}}",
+        "embedder": {
+          "provider": "antfly",
+          "model": "BAAI/bge-small-en-v1.5"
+        },
+        "chunker": {
+          "provider": "antfly",
+          "text": {
+            "target_tokens": 200,
+            "overlap_tokens": 25
+          }
+        }
+      }
+    }
+  }'
+```
+
+Full-text (BM25) search works out of the box, so this one index gives you hybrid retrieval.
+
+## 2. Load Your Help Articles
+
+```bash
+curl -X POST http://localhost:8080/db/v1/tables/help/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inserts": {
+      "billing-cycles": {
+        "title": "How billing cycles work",
+        "content": "Your subscription renews on the same day each month. Invoices are issued 3 days before renewal..."
+      },
+      "cancel-plan": {
+        "title": "Canceling your plan",
+        "content": "You can cancel anytime from Settings > Billing. Your plan stays active until the end of the current cycle..."
+      },
+      "refund-policy": {
+        "title": "Refund policy",
+        "content": "Refunds are available within 14 days of an annual renewal. Monthly plans are not refundable..."
+      }
+    }
+  }'
+```
+
+Antfly extracts, chunks, and embeds each article automatically as it lands.
+
+## 3. Retrieve, Rerank, Prune, Answer
+
+One call to the retrieval agent runs the whole pipeline: semantic retrieval, cross-encoder reranking, score-based pruning, and answer generation with a local model.
+
+<Tabs defaultValue="cli">
+  <TabsList>
+    <TabsTrigger value="cli">CLI</TabsTrigger>
+    <TabsTrigger value="curl">cURL</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="cli">
+```bash
+antfly agents retrieval --table help \
+  --semantic-search "Can I get my money back if I cancel?" \
+  --indexes "title_content" \
+  --fields "title,content" \
+  --limit 20 \
+  --reranker '{
+    "provider": "antfly",
+    "model": "mixedbread-ai/mxbai-rerank-base-v1",
+    "field": "content"
+  }' \
+  --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
+  --generator '{
+    "provider": "ollama",
+    "model": "gemma3:4b"
+  }' \
+  --max-context-tokens 512 \
+  --generate --followup
+```
+  </TabsContent>
+
+  <TabsContent value="curl">
+```bash
+curl -X POST http://localhost:8080/db/v1/agents/retrieval \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "Can I get my money back if I cancel?",
+    "queries": [{
+      "table": "help",
+      "semantic_search": "Can I get my money back if I cancel?",
+      "indexes": ["title_content"],
+      "fields": ["title", "content"],
+      "limit": 20,
+      "reranker": {
+        "provider": "antfly",
+        "model": "mixedbread-ai/mxbai-rerank-base-v1",
+        "field": "content"
+      },
+      "pruner": {"min_score_ratio": 0.6, "max_score_gap_percent": 40}
+    }],
+    "generator": {
+      "provider": "ollama",
+      "model": "gemma3:4b"
+    },
+    "max_context_tokens": 512,
+    "steps": {
+      "generation": {"enabled": true},
+      "followup": {"enabled": true}
+    }
+  }'
+```
+  </TabsContent>
+</Tabs>
+
+The response contains the generated answer, the documents it was answered from, and suggested follow-up questions you can render as quick replies.
+
+<Callout type="info">
+The example generator runs locally via Ollama. You can also point it at Gemini, Vertex, OpenAI, or Antfly's local inference; see [RAG with alternative providers](/docs/guides/quickstart#rag-with-alternative-providers).
+</Callout>
+
+## Why Pruning Is a Correctness Feature
+
+Retrieval always returns the closest matches it has. When the customer asks about something your help center doesn't cover, "closest" can still be far away, and an answer generated from far-away context is confidently wrong.
+
+The pruner is the guardrail:
+
+- **`min_score_ratio: 0.6`** drops anything scoring less than 60% of the best match. If the best match itself is weak, everything goes, and the agent can fall back to "I don't know, let me hand you to a human": the correct answer when retrieval comes up empty.
+- **`max_score_gap_percent: 40`** detects the elbow where relevance falls off a cliff and stops there.
+
+It is better to answer from three right documents than five plausible ones. Start strict, watch what gets pruned on real queries, and loosen only when you see good articles being cut.
+
+<Callout type="tip">
+Retrieve generously and prune hard: a `limit` of 20 with a strict pruner beats a `limit` of 3 with no pruner. The reranker sees more candidates; the model sees only the survivors.
+</Callout>
+
+## Let Your Agent Drive
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome — e.g. "Build a support answer agent over my help table with reranking and pruning, following the Antfly skill" — and use this page to judge the result.
+
+## Next Steps
+
+- [Hybrid Search](/docs/guides/hybrid-search): add BM25 keyword matching for exact terms like error codes and product names
+- [Quickstart](/docs/guides/quickstart): the full tour, including alternative generation providers
+- [PostgreSQL Replication](/docs/guides/cdc-replication): stream help content straight from your existing database
