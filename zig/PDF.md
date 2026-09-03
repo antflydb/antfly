@@ -1409,6 +1409,31 @@ document. They are architectural requirements, not Florence-specific cleanup:
     detached copies, but ordinary HTTP forwarding reuses the immutable
     copy-on-write policy and compiled programs without configuration-sized
     allocations per request.
+151. **Scale-to-zero and capability leases were competing routing contracts.**
+    They now form one state machine. Scoped discovery renews every managed pool
+    in the operation's reachable route cohort, waits only for pools that were
+    actually cold, and then fans out the model catalog over the resulting exact
+    endpoint incarnations. Execution may renew a selected pool already present
+    in its lease, but it can never wake a new incarnation and smuggle it into an
+    old plan. Legacy unscoped execution retains request-driven activation.
+152. **Cold discovery discarded the namespace needed by the activator.**
+    `RouteCohort` now carries namespace-qualified activation targets in
+    addition to its registry pool projection. Route destinations and redirect
+    fallbacks retain their route namespace; an explicit or process-default
+    fallback remains intentionally unqualified. Activation waits use each
+    pool's declared deadline without polling past it.
+153. **A route could change while its cold capability cohort was waking.**
+    Discovery re-derives the cohort after activation and accepts it only at the
+    same route generation. Bounded retries cover ordinary informer races;
+    continuing policy churn returns the standard capability-stale conflict
+    instead of minting a lease for a mixture of generations.
+154. **Dynamic destination checks and operation admission used different
+    registry snapshots.** Condition statistics, capability-incarnation
+    filtering, exact operation support, endpoint choice, and circuit-breaker
+    reservation now linearize under one registry read lock. The resulting
+    reservation retains the admitted endpoint and breaker identities through
+    completion. Task-scoped routes never fall back to bootstrap or arbitrary
+    pool endpoints merely because the requested model has no exact executor.
 
 ### Post-review implementation contract
 
@@ -1471,6 +1496,14 @@ The hardening above follows these long-term rules:
   before retry. Legacy clients may omit the token, but never receive the
   planner/executor consistency guarantee. A lease-aware client never silently
   downgrades when its discovered snapshot is missing or evicted.
+- Scale-to-zero is a preparation step of scoped discovery, not an escape hatch
+  in scoped execution. Namespace-qualified reachable pools are renewed before
+  catalog fan-out; cold pools must register within their individual activation
+  deadlines, and the route generation must remain stable across that wait.
+  Only those discovered endpoint incarnations enter the lease. Execution can
+  refresh a represented pool's activation lease, while an absent pool requires
+  rediscovery. This preserves exact capability fencing on distributed
+  inference nodes without disabling request-driven cold starts.
 - Every executor owns final admission. Remote read and generation calls and
   multimodal embedding calls are split at both model item and encoded-byte
   ceilings. Image-bearing readers, generators, embedders, and extractors also

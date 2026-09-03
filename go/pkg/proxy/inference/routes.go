@@ -720,10 +720,20 @@ func (rm *RouteManager) matchInstalledAtGeneration(req *RouteRequest, generation
 // lower-priority route unreachable. A terminal route may intentionally expose
 // no pools (for example, a reject fallback).
 type RouteCohort struct {
-	Pools      []string
-	Matched    bool
-	Terminal   bool
-	Generation uint64
+	Pools             []string
+	ActivationTargets []RoutePoolTarget
+	Matched           bool
+	Terminal          bool
+	Generation        uint64
+}
+
+// RoutePoolTarget retains the namespace required to activate a routed pool.
+// Pools remains on RouteCohort as the registry lookup projection; activation
+// must not discard namespace identity because Kubernetes pool names are only
+// unique within a namespace.
+type RoutePoolTarget struct {
+	Namespace string
+	Pool      string
 }
 
 // PotentialCohortFor returns the route cohort that can handle an operation and
@@ -736,20 +746,34 @@ func (rm *RouteManager) PotentialCohortFor(req *RouteRequest) RouteCohort {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 	seen := make(map[string]bool)
+	seenTargets := make(map[RoutePoolTarget]bool)
+	cohort := RouteCohort{Generation: rm.generation}
 	appendRoutePools := func(out []string, route *Route) []string {
+		namespace := routeNamespace(route)
 		for _, destination := range route.Destinations {
 			if destination.Pool != "" && !seen[destination.Pool] {
 				seen[destination.Pool] = true
 				out = append(out, destination.Pool)
+			}
+			target := RoutePoolTarget{Namespace: namespace, Pool: destination.Pool}
+			if target.Pool != "" && !seenTargets[target] {
+				seenTargets[target] = true
+				cohort.ActivationTargets = append(cohort.ActivationTargets, target)
 			}
 		}
 		if route.Fallback != nil && route.Fallback.Action == "redirect" && route.Fallback.RedirectPool != "" && !seen[route.Fallback.RedirectPool] {
 			seen[route.Fallback.RedirectPool] = true
 			out = append(out, route.Fallback.RedirectPool)
 		}
+		if route.Fallback != nil && route.Fallback.Action == "redirect" && route.Fallback.RedirectPool != "" {
+			target := RoutePoolTarget{Namespace: namespace, Pool: route.Fallback.RedirectPool}
+			if !seenTargets[target] {
+				seenTargets[target] = true
+				cohort.ActivationTargets = append(cohort.ActivationTargets, target)
+			}
+		}
 		return out
 	}
-	cohort := RouteCohort{Generation: rm.generation}
 	for _, route := range rm.routes {
 		if len(route.Operations) > 0 && !route.Operations[req.Operation] {
 			continue
@@ -908,31 +932,63 @@ func (rm *RouteManager) selectDestinationWithin(route *Route, req *RouteRequest,
 		totalWeight += dest.Weight
 	}
 
+	return selectWeightedDestination(route, req, eligible, totalWeight), nil
+}
+
+// SelectActivationDestination chooses a genuinely cold destination using the
+// same static eligibility and weighted selection contract as normal routing.
+// A destination with healthy endpoints is runtime-ineligible, not cold, and
+// must fall through without spending the activation timeout.
+func (rm *RouteManager) SelectActivationDestination(route *Route, req *RouteRequest, registry *ModelRegistry, enabled func(string) bool) *Destination {
+	return rm.selectActivationDestinationWithin(route, req, registry, nil, enabled)
+}
+
+func (rm *RouteManager) selectActivationDestinationWithin(route *Route, req *RouteRequest, registry *ModelRegistry, allowed map[string]endpointRef, enabled func(string) bool) *Destination {
+	eligible := make([]Destination, 0, len(route.Destinations))
+	totalWeight := int32(0)
+	for _, destination := range route.Destinations {
+		if (allowed != nil && !endpointRefsContainPool(allowed, destination.Pool)) ||
+			!enabled(destination.Pool) ||
+			!staticDestinationEligible(&destination, req) ||
+			registry.poolConditionStatsWithin(destination.Pool, req.Model, allowed).HealthyEndpoints != 0 {
+			continue
+		}
+		eligible = append(eligible, destination)
+		totalWeight += destination.Weight
+	}
+	return selectWeightedDestination(route, req, eligible, totalWeight)
+}
+
+func endpointRefsContainPool(refs map[string]endpointRef, pool string) bool {
+	for _, ref := range refs {
+		if ref.endpoint != nil && ref.endpoint.pool == pool {
+			return true
+		}
+	}
+	return false
+}
+
+func selectWeightedDestination(route *Route, req *RouteRequest, eligible []Destination, totalWeight int32) *Destination {
 	if len(eligible) == 0 {
-		return nil, nil // No eligible destinations
+		return nil
 	}
-
-	// Weighted random selection
-	if len(eligible) == 1 {
-		return &eligible[0], nil
+	if len(eligible) == 1 || totalWeight <= 0 {
+		return &eligible[0]
 	}
-
-	if totalWeight <= 0 {
-		return &eligible[0], nil
-	}
-
-	// Use a deterministic weighted selection so repeated traffic splits
-	// remain stable without shared mutable RNG state.
 	selection := weightedSelectionValue(route, req, totalWeight)
 	cumulative := int32(0)
 	for i := range eligible {
 		cumulative += eligible[i].Weight
 		if selection < cumulative {
-			return &eligible[i], nil
+			return &eligible[i]
 		}
 	}
 
-	return &eligible[len(eligible)-1], nil
+	return &eligible[len(eligible)-1]
+}
+
+func staticDestinationEligible(dest *Destination, req *RouteRequest) bool {
+	return dest.TimeCondition == nil || dest.TimeCondition.IsActive(req.Timestamp)
 }
 
 func (rm *RouteManager) evaluateConditions(dest *Destination, req *RouteRequest, registry *ModelRegistry) bool {
@@ -941,6 +997,10 @@ func (rm *RouteManager) evaluateConditions(dest *Destination, req *RouteRequest,
 
 func (rm *RouteManager) evaluateConditionsWithin(dest *Destination, req *RouteRequest, registry *ModelRegistry, allowed map[string]endpointRef) bool {
 	stats := registry.poolConditionStatsWithin(dest.Pool, req.Model, allowed)
+	return rm.evaluateConditionStats(dest, req, stats)
+}
+
+func (rm *RouteManager) evaluateConditionStats(dest *Destination, req *RouteRequest, stats PoolConditionStats) bool {
 	if stats.HealthyEndpoints == 0 {
 		return false // Pool has no healthy endpoints
 	}
@@ -974,10 +1034,8 @@ func (rm *RouteManager) evaluateConditionsWithin(dest *Destination, req *RouteRe
 	}
 
 	// Check time condition
-	if dest.TimeCondition != nil {
-		if !dest.TimeCondition.IsActive(req.Timestamp) {
-			return false
-		}
+	if !staticDestinationEligible(dest, req) {
+		return false
 	}
 
 	return true

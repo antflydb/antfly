@@ -790,7 +790,10 @@ func (r *ModelRegistry) getBootstrapEndpointsForPool(pool string) []*Endpoint {
 func (r *ModelRegistry) GetEndpointsForPool(pool string) []*Endpoint {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	return r.availableEndpointsForPoolLocked(pool)
+}
 
+func (r *ModelRegistry) availableEndpointsForPoolLocked(pool string) []*Endpoint {
 	endpoints := r.pools[pool]
 	result := make([]*Endpoint, 0, len(endpoints))
 	for _, ep := range endpoints {
@@ -824,7 +827,10 @@ func (r *ModelRegistry) PoolConditionStats(pool, model string) PoolConditionStat
 func (r *ModelRegistry) poolConditionStatsWithin(pool, model string, allowed map[string]endpointRef) PoolConditionStats {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	return r.poolConditionStatsLocked(pool, model, allowed)
+}
 
+func (r *ModelRegistry) poolConditionStatsLocked(pool, model string, allowed map[string]endpointRef) PoolConditionStats {
 	stats := PoolConditionStats{}
 	endpoints := r.pools[pool]
 	if len(endpoints) == 0 {
@@ -873,6 +879,79 @@ func (r *ModelRegistry) poolConditionStatsWithin(pool, model string, allowed map
 	}
 
 	return stats
+}
+
+// AcquireDestinationEndpoint evaluates a route destination and reserves one
+// matching endpoint under the same registry snapshot. The circuit-breaker
+// reservation happens after condition evaluation, so a half-open probe cannot
+// invalidate the condition snapshot that admitted it.
+func (r *Router) AcquireDestinationEndpoint(req *RouteRequest, destination *Destination, workloadType WorkloadType) (*Endpoint, error) {
+	reservation, err := r.acquireDestinationEndpointWithin(req, destination, workloadType, nil, req.Operation)
+	if err != nil {
+		return nil, err
+	}
+	return reservation.ref.endpoint, nil
+}
+
+// acquireDestinationEndpointWithin linearizes dynamic route-condition
+// evaluation, operation filtering, capability-lease fencing, endpoint
+// selection, and circuit-breaker admission under one registry snapshot.
+func (r *Router) acquireDestinationEndpointWithin(req *RouteRequest, destination *Destination, workloadType WorkloadType, allowed map[string]endpointRef, operation OperationType) (endpointReservation, error) {
+	r.registry.mu.RLock()
+	defer r.registry.mu.RUnlock()
+
+	stats := r.registry.poolConditionStatsLocked(destination.Pool, req.Model, allowed)
+	if !r.routeManager.evaluateConditionStats(destination, req, stats) {
+		return endpointReservation{}, fmt.Errorf("route destination %s does not satisfy its conditions", destination.Pool)
+	}
+
+	refs := make([]endpointRef, 0)
+	if allowed != nil {
+		for address, expected := range allowed {
+			endpoint := r.registry.endpoints[address]
+			if endpoint == nil || endpoint != expected.endpoint || endpoint.incarnation != expected.incarnation ||
+				r.registry.circuitBreakers[address] != expected.breaker || endpoint.pool != destination.Pool ||
+				!r.registry.isEndpointAvailableLocked(endpoint) {
+				continue
+			}
+			refs = append(refs, expected)
+		}
+		sort.Slice(refs, func(i, j int) bool { return refs[i].endpoint.address < refs[j].endpoint.address })
+	} else {
+		for _, endpoint := range r.registry.getAvailableEndpointsForModelLocked(req.Model, destination.Pool, operation) {
+			breaker := r.registry.circuitBreakers[endpoint.address]
+			if breaker != nil {
+				refs = append(refs, endpointRef{endpoint: endpoint, incarnation: endpoint.incarnation, breaker: breaker})
+			}
+		}
+	}
+
+	for len(refs) > 0 {
+		candidates := make([]*Endpoint, len(refs))
+		for i := range refs {
+			candidates[i] = refs[i].endpoint
+		}
+		endpoint, err := r.selectEndpoint(req.Model, workloadType, candidates, true)
+		if err != nil {
+			return endpointReservation{}, err
+		}
+		selectedIndex := -1
+		for i := range refs {
+			if refs[i].endpoint == endpoint {
+				selectedIndex = i
+				break
+			}
+		}
+		if selectedIndex < 0 {
+			return endpointReservation{}, fmt.Errorf("selected endpoint is no longer a candidate")
+		}
+		selected := refs[selectedIndex]
+		if selected.breaker.TryAcquire() {
+			return endpointReservation{ref: selected}, nil
+		}
+		refs = append(refs[:selectedIndex], refs[selectedIndex+1:]...)
+	}
+	return endpointReservation{}, fmt.Errorf("no healthy endpoints available for model %s", req.Model)
 }
 
 func newModelInfo(name string) *ModelInfo {
@@ -1466,6 +1545,7 @@ type Proxy struct {
 	registry     *ModelRegistry
 	router       *Router
 	routeWatcher *RouteWatcher
+	activator    PoolActivator
 	server       *http.Server
 	logger       *zap.Logger
 
@@ -1510,6 +1590,11 @@ type proxyCapabilityLease struct {
 	authorizationDigest [sha256.Size]byte
 	endpoints           map[string]leasedEndpoint
 	expiresAt           time.Time
+}
+
+// SetPoolActivator configures request-driven activation for scale-to-zero pools.
+func (p *Proxy) SetPoolActivator(activator PoolActivator) {
+	p.activator = activator
 }
 
 // Config holds proxy configuration
@@ -1737,6 +1822,7 @@ func (p *Proxy) routingContextForRequest(r *http.Request, timestamp time.Time) (
 
 type catalogEndpointCohort struct {
 	endpoints       []*Endpoint
+	activation      []RoutePoolTarget
 	routeGeneration uint64
 }
 
@@ -1760,6 +1846,20 @@ func (p *Proxy) catalogEndpointCohortForRequest(routing RoutingContext, model st
 		seenPools[fallbackPool] = true
 		pools = append(pools, fallbackPool)
 	}
+	activation := append([]RoutePoolTarget(nil), cohort.ActivationTargets...)
+	if !cohort.Terminal && fallbackPool != "" {
+		fallbackTarget := RoutePoolTarget{Pool: fallbackPool}
+		found := false
+		for _, target := range activation {
+			if target == fallbackTarget {
+				found = true
+				break
+			}
+		}
+		if !found {
+			activation = append(activation, fallbackTarget)
+		}
+	}
 	seen := make(map[string]bool)
 	var endpoints []*Endpoint
 	for _, pool := range pools {
@@ -1770,11 +1870,103 @@ func (p *Proxy) catalogEndpointCohortForRequest(routing RoutingContext, model st
 			}
 		}
 	}
-	return catalogEndpointCohort{endpoints: endpoints, routeGeneration: cohort.Generation}
+	return catalogEndpointCohort{endpoints: endpoints, activation: activation, routeGeneration: cohort.Generation}
 }
 
 func (p *Proxy) catalogEndpointsForRequest(routing RoutingContext, model string, operation OperationType) []*Endpoint {
 	return p.catalogEndpointCohortForRequest(routing, model, operation).endpoints
+}
+
+// activateCatalogCohort makes scale-to-zero part of capability discovery. A
+// scoped lease may only name endpoint incarnations that answered discovery, so
+// waking a previously absent pool during execution would be too late: the new
+// incarnation is deliberately outside that lease. Every managed reachable pool
+// is renewed, while only pools that were cold are awaited.
+func (p *Proxy) activateCatalogCohort(ctx context.Context, targets []RoutePoolTarget) error {
+	if p.activator == nil || len(targets) == 0 {
+		return nil
+	}
+	type pendingActivation struct {
+		target   RoutePoolTarget
+		deadline time.Time
+	}
+	pending := make([]pendingActivation, 0, len(targets))
+	for _, target := range targets {
+		if target.Pool == "" || !p.activator.IsEnabled(target.Namespace, target.Pool) {
+			continue
+		}
+		wasCold := len(p.registry.GetEndpointsForPool(target.Pool)) == 0
+		started := time.Now()
+		wait, enabled, err := p.activatePool(ctx, target.Namespace, target.Pool)
+		if err != nil {
+			return fmt.Errorf("activate inference pool %s/%s: %w", target.Namespace, target.Pool, err)
+		}
+		if !enabled || !wasCold || len(p.registry.GetEndpointsForPool(target.Pool)) != 0 {
+			continue
+		}
+		if wait <= 0 {
+			return fmt.Errorf("inference pool %s/%s activation timed out", target.Namespace, target.Pool)
+		}
+		pending = append(pending, pendingActivation{target: target, deadline: started.Add(wait)})
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	for len(pending) > 0 {
+		now := time.Now()
+		remaining := pending[:0]
+		var nextDeadline time.Time
+		for _, activation := range pending {
+			if len(p.registry.GetEndpointsForPool(activation.target.Pool)) != 0 {
+				continue
+			}
+			if !now.Before(activation.deadline) {
+				return fmt.Errorf("inference pool %s/%s activation timed out", activation.target.Namespace, activation.target.Pool)
+			}
+			remaining = append(remaining, activation)
+			if nextDeadline.IsZero() || activation.deadline.Before(nextDeadline) {
+				nextDeadline = activation.deadline
+			}
+		}
+		pending = remaining
+		if len(pending) == 0 {
+			return nil
+		}
+		pollAfter := min(250*time.Millisecond, time.Until(nextDeadline))
+		timer := time.NewTimer(pollAfter)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil
+}
+
+const maxCatalogCohortPrepareAttempts = 3
+
+func (p *Proxy) prepareCatalogEndpointCohort(ctx context.Context, routing RoutingContext, model string, operation OperationType) (catalogEndpointCohort, error) {
+	for attempt := 0; attempt < maxCatalogCohortPrepareAttempts; attempt++ {
+		before := p.catalogEndpointCohortForRequest(routing, model, operation)
+		if err := p.activateCatalogCohort(ctx, before.activation); err != nil {
+			return catalogEndpointCohort{}, err
+		}
+		after := p.catalogEndpointCohortForRequest(routing, model, operation)
+		if before.routeGeneration == after.routeGeneration {
+			return after, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return catalogEndpointCohort{}, err
+		}
+	}
+	return catalogEndpointCohort{}, staleCapabilityResolutionError("inference routing policy changed during capability discovery")
 }
 
 const maxModelCatalogBytes = 8 << 20
@@ -1834,7 +2026,19 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		// Caller-scoped upstream catalogs still provide the authorization proof;
 		// this is only a route-cohort prefilter.
 		routing.ExplicitPool = pool
-		cohort := p.catalogEndpointCohortForRequest(routing, model, taskScope.Operation)
+		cohort, err := p.prepareCatalogEndpointCohort(r.Context(), routing, model, taskScope.Operation)
+		if err != nil {
+			if writeResolutionError(w, err) {
+				return
+			}
+			if r.Context().Err() != nil {
+				http.Error(w, "inference model catalog request canceled", http.StatusRequestTimeout)
+			} else {
+				p.logger.Warn("failed to prepare inference capability cohort", zap.Error(err))
+				http.Error(w, "inference capability cohort activation unavailable", http.StatusServiceUnavailable)
+			}
+			return
+		}
 		endpoints = cohort.endpoints
 		routeGeneration = cohort.routeGeneration
 	} else if pool == "" {

@@ -73,6 +73,14 @@ func (c RoutingContext) routeRequest(operation OperationType, model string) *Rou
 	}
 }
 
+// PoolActivator wakes and refreshes request-driven scale-to-zero pools.
+// Activate returns enabled=false for pools that are not managed by the
+// activator. When enabled is true, wait is the maximum cold-start window.
+type PoolActivator interface {
+	IsEnabled(namespace, pool string) bool
+	Activate(ctx context.Context, namespace, pool string) (wait time.Duration, enabled bool, err error)
+}
+
 // Resolution is the result of routing a request to a specific endpoint.
 type Resolution struct {
 	Route       *Route
@@ -396,9 +404,7 @@ func (p *Proxy) startBackgroundWorkers(ctx context.Context) {
 }
 
 func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing RoutingContext, reserve bool) (*Resolution, endpointReservation, error) {
-	var pool string
 	var matchedRoute *Route
-	var selectedDest *Destination
 	capabilityLease, err := p.validatedCapabilityLease(
 		headerValue(routing.Headers, capabilityTokenHeader),
 		headerValue(routing.Headers, capabilityRevisionHeader),
@@ -420,6 +426,7 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 	} else {
 		matchedRoute = p.router.RouteManager().matchInstalled(routeReq)
 	}
+	workloadType := resolveWorkloadType(routeReq.Operation, routing.Headers)
 	if matchedRoute != nil {
 		dest, err := p.router.RouteManager().selectDestinationWithin(matchedRoute, routeReq, p.registry, allowed)
 		if err != nil {
@@ -428,41 +435,242 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 				Message:    err.Error(),
 			}
 		}
+		if dest == nil {
+			dest = p.selectActivationDestinationWithin(matchedRoute, routeReq, allowed)
+		}
 		if dest != nil {
-			selectedDest = dest
-			pool = dest.Pool
-		} else if matchedRoute.Fallback != nil {
+			endpoint, reservation, resolveErr := p.resolvePoolTarget(
+				ctx, routeNamespace(matchedRoute), dest.Pool, routeReq, workloadType,
+				routeReq.Operation, reserve, dest, allowed,
+			)
+			if resolveErr == nil {
+				return &Resolution{
+					Route:       matchedRoute,
+					Destination: dest,
+					Endpoint:    endpoint,
+					Pool:        dest.Pool,
+				}, reservation, nil
+			}
+			if ctx.Err() != nil {
+				return nil, endpointReservation{}, resolutionError(ctx.Err())
+			}
+			if matchedRoute.Fallback == nil {
+				return nil, endpointReservation{}, resolutionError(resolveErr)
+			}
+		}
+		if matchedRoute.Fallback != nil {
 			fallbackPool, fallbackErr := p.resolveRouteFallback(ctx, matchedRoute, routeReq, allowed)
 			if fallbackErr != nil {
 				return nil, endpointReservation{}, fallbackErr
 			}
-			pool = fallbackPool
-		} else {
-			return nil, endpointReservation{}, noEligibleDestinationsError()
+			endpoint, reservation, resolveErr := p.resolvePoolTarget(
+				ctx, routeNamespace(matchedRoute), fallbackPool, routeReq, workloadType,
+				routeReq.Operation, reserve, nil, allowed,
+			)
+			if resolveErr != nil {
+				return nil, endpointReservation{}, resolutionError(resolveErr)
+			}
+			return &Resolution{Route: matchedRoute, Endpoint: endpoint, Pool: fallbackPool}, reservation, nil
 		}
+		return nil, endpointReservation{}, noEligibleDestinationsError()
 	}
 
-	if pool == "" {
-		pool = strings.TrimSpace(routing.ExplicitPool)
-	}
+	pool := strings.TrimSpace(routing.ExplicitPool)
 	if pool == "" {
 		pool = p.defaultPool
 	}
-	workloadType := resolveWorkloadType(routeReq.Operation, routing.Headers)
-	endpoint, reservation, err := p.resolveEndpoint(ctx, routeReq.Model, pool, workloadType, routeReq.Operation, reserve, allowed)
+	endpoint, reservation, err := p.resolvePoolTarget(
+		ctx, "", pool, routeReq, workloadType, routeReq.Operation, reserve, nil, allowed,
+	)
 	if err != nil {
-		return nil, endpointReservation{}, &ResolutionError{
-			StatusCode: http.StatusServiceUnavailable,
-			Message:    err.Error(),
-		}
+		return nil, endpointReservation{}, resolutionError(err)
 	}
 
 	return &Resolution{
-		Route:       matchedRoute,
-		Destination: selectedDest,
-		Endpoint:    endpoint,
-		Pool:        pool,
+		Endpoint: endpoint,
+		Pool:     pool,
 	}, reservation, nil
+}
+
+func resolutionError(err error) *ResolutionError {
+	if typed, ok := err.(*ResolutionError); ok {
+		return typed
+	}
+	return &ResolutionError{StatusCode: http.StatusServiceUnavailable, Message: err.Error()}
+}
+
+func (p *Proxy) selectActivationDestination(route *Route, req *RouteRequest) *Destination {
+	return p.selectActivationDestinationWithin(route, req, nil)
+}
+
+func (p *Proxy) selectActivationDestinationWithin(route *Route, req *RouteRequest, allowed map[string]endpointRef) *Destination {
+	if p.activator == nil {
+		return nil
+	}
+	namespace := routeNamespace(route)
+	return p.router.RouteManager().selectActivationDestinationWithin(route, req, p.registry, allowed, func(pool string) bool {
+		return p.activator.IsEnabled(namespace, pool)
+	})
+}
+
+// activateRouteDestination is retained as a small activation primitive for
+// callers that only need to select and wake a cold route destination. Request
+// resolution itself goes through resolvePoolTarget so every target follows the
+// same wake/wait/fallback state machine.
+func (p *Proxy) activateRouteDestination(ctx context.Context, route *Route, req *RouteRequest) (*Destination, time.Duration) {
+	selected := p.selectActivationDestination(route, req)
+	if selected == nil {
+		return nil, 0
+	}
+	namespace := routeNamespace(route)
+	wait, enabled, err := p.activatePool(ctx, namespace, selected.Pool)
+	if err != nil {
+		p.logger.Warn("failed to activate inference route destination", zap.String("namespace", namespace), zap.String("pool", selected.Pool), zap.Error(err))
+		return nil, 0
+	}
+	if !enabled {
+		return nil, 0
+	}
+	return selected, wait
+}
+
+// resolvePoolTarget resolves one concrete pool through a single state machine:
+// refresh its activation lease, satisfy the selected route's runtime
+// conditions when it was genuinely cold, acquire an endpoint, and return the
+// result to the caller for fallback handling.
+func (p *Proxy) resolvePoolTarget(
+	ctx context.Context,
+	namespace, pool string,
+	req *RouteRequest,
+	workloadType WorkloadType,
+	operation OperationType,
+	reserve bool,
+	destination *Destination,
+	allowed map[string]endpointRef,
+) (*Endpoint, endpointReservation, error) {
+	wasCold := p.registry.poolConditionStatsWithin(pool, req.Model, allowed).HealthyEndpoints == 0
+	activationWait, activationEnabled, activationErr := time.Duration(0), false, error(nil)
+	if allowed == nil || endpointRefsContainPool(allowed, pool) {
+		activationWait, activationEnabled, activationErr = p.activatePool(ctx, namespace, pool)
+	}
+	if activationErr != nil {
+		p.logger.Warn("failed to refresh inference pool activation", zap.String("namespace", namespace), zap.String("pool", pool), zap.Error(activationErr))
+	}
+	if wasCold && destination != nil && activationEnabled && activationErr == nil {
+		// Activation may make an endpoint visible synchronously. It is still not
+		// acquirable until the selected destination's dynamic conditions hold.
+		// Keeping that selection and acquisition in this state machine prevents
+		// a newly visible endpoint from bypassing model/queue/replica/latency rules.
+		if p.waitForRouteDestination(ctx, destination, req, allowed, activationWait) == nil {
+			return nil, endpointReservation{}, noEligibleDestinationsError()
+		}
+		if reserve {
+			reservation, err := p.router.acquireDestinationEndpointWithin(req, destination, workloadType, allowed, operation)
+			if err != nil {
+				return nil, endpointReservation{}, err
+			}
+			return reservation.ref.endpoint, reservation, nil
+		}
+		return p.resolveEndpoint(ctx, req.Model, pool, workloadType, operation, false, allowed)
+	}
+
+	if destination != nil && reserve {
+		reservation, err := p.router.acquireDestinationEndpointWithin(req, destination, workloadType, allowed, operation)
+		if err != nil {
+			return nil, endpointReservation{}, err
+		}
+		return reservation.ref.endpoint, reservation, nil
+	}
+	endpoint, reservation, err := p.resolveEndpoint(ctx, req.Model, pool, workloadType, operation, reserve, allowed)
+	if err == nil {
+		return endpoint, reservation, nil
+	}
+	if !wasCold || !activationEnabled || activationErr != nil {
+		return nil, endpointReservation{}, err
+	}
+
+	if destination != nil {
+		if p.waitForRouteDestination(ctx, destination, req, allowed, activationWait) == nil {
+			return nil, endpointReservation{}, err
+		}
+		return p.resolveEndpoint(ctx, req.Model, pool, workloadType, operation, reserve, allowed)
+	}
+	return p.waitForPoolEndpoint(ctx, req.Model, pool, workloadType, operation, reserve, allowed, activationWait)
+}
+
+func (p *Proxy) activatePool(ctx context.Context, namespace, pool string) (time.Duration, bool, error) {
+	if p.activator == nil || pool == "" {
+		return 0, false, nil
+	}
+	return p.activator.Activate(ctx, namespace, pool)
+}
+
+func routeNamespace(route *Route) string {
+	if route == nil {
+		return ""
+	}
+	namespace, _, found := strings.Cut(route.Name, "/")
+	if !found {
+		return ""
+	}
+	return namespace
+}
+
+func (p *Proxy) waitForRouteDestination(ctx context.Context, destination *Destination, req *RouteRequest, allowed map[string]endpointRef, maxWait time.Duration) *Destination {
+	if maxWait <= 0 {
+		return nil
+	}
+	req.Timestamp = time.Now()
+	if p.router.RouteManager().evaluateConditionsWithin(destination, req, p.registry, allowed) {
+		return destination
+	}
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-timer.C:
+			return nil
+		case <-ticker.C:
+			req.Timestamp = time.Now()
+			if p.router.RouteManager().evaluateConditionsWithin(destination, req, p.registry, allowed) {
+				return destination
+			}
+		}
+	}
+}
+
+func (p *Proxy) waitForPoolEndpoint(ctx context.Context, model, pool string, workloadType WorkloadType, operation OperationType, reserve bool, allowed map[string]endpointRef, maxWait time.Duration) (*Endpoint, endpointReservation, error) {
+	if maxWait <= 0 {
+		return p.resolveEndpoint(ctx, model, pool, workloadType, operation, reserve, allowed)
+	}
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	var lastErr error
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, endpointReservation{}, ctx.Err()
+		case <-timer.C:
+			if lastErr != nil {
+				return nil, endpointReservation{}, lastErr
+			}
+			return nil, endpointReservation{}, &ResolutionError{StatusCode: http.StatusServiceUnavailable, Message: "inference pool activation timed out"}
+		case <-ticker.C:
+			endpoint, reservation, err := p.resolveEndpoint(ctx, model, pool, workloadType, operation, reserve, allowed)
+			if err == nil {
+				return endpoint, reservation, nil
+			}
+			lastErr = err
+		}
+	}
 }
 
 func (p *Proxy) resolveEndpoint(ctx context.Context, model, pool string, workloadType WorkloadType, operation OperationType, reserve bool, allowed map[string]endpointRef) (*Endpoint, endpointReservation, error) {
