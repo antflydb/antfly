@@ -891,11 +891,11 @@ pub const DBCore = struct {
             0;
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |checkpoint| {
             if (self.index_manager.densePostingWalAuthoritativeByName(index_name)) {
-                // saveAppliedSequence is the terminal callback for the replay
-                // window that produced this boundary. It owns the active
-                // source capture (if any); generic status publishers use the
-                // idempotent observer API instead.
-                try self.index_manager.finishDensePostingSidecarCaptureByName(index_name, sequence);
+                // Source mutation paths publish with their exact capture
+                // lease before reaching this generic watermark callback. A
+                // mutation-free target advance may publish coverage here, but
+                // must never consume a newer transaction it does not own.
+                try self.index_manager.ensureDensePostingCoverageByName(index_name, sequence);
                 // The posting checkpoint/WAL commit boundary is the durable
                 // dense applied sequence. Lifecycle metadata is persisted only
                 // when status/generation/config identity changes.
@@ -911,7 +911,7 @@ pub const DBCore = struct {
                 .name = index_name,
                 .kind = .dense_vector,
             });
-            try self.index_manager.finishDensePostingSidecarCaptureByName(index_name, sequence);
+            try self.index_manager.ensureDensePostingCoverageByName(index_name, sequence);
         } else if (cfg) |value| {
             try self.index_manager.checkpointLsmWalForManagedIndex(.{
                 .name = index_name,

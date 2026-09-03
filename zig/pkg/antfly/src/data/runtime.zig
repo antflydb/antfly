@@ -28228,7 +28228,10 @@ test "data runtime runRound backs off retryable provision metadata failures" {
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
-        .status_source = undefined,
+        // runRound may schedule a runtime-status refresh after the injected
+        // metadata failure. Match production construction so that path has a
+        // valid interface instead of invoking undefined test memory.
+        .status_source = remote_metadata.statusSource(),
         .api_server_cfg = undefined,
         .query_async_limit = .limited(8),
         .backend_runtime = backend_runtime.ptr(),

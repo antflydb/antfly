@@ -51224,6 +51224,8 @@ test "managed startup catch-up advances counterless incomplete dense repair" {
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
     const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
+    var active_relative_path: ?[]u8 = null;
+    defer if (active_relative_path) |relative_path| alloc.free(relative_path);
 
     {
         var db = try db_mod.DB.open(alloc, path, .{
@@ -51246,9 +51248,13 @@ test "managed startup catch-up advances counterless incomplete dense repair" {
         const counter_key = try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:dense_artifact_target_count:{s}", .{"dense_idx"});
         defer alloc.free(counter_key);
         try db.core.store.delete(counter_key);
+        active_relative_path = (try db.core.index_manager.captureActiveIndexRootPointer("dense_idx")) orelse
+            return error.TestUnexpectedResult;
     }
 
-    const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{path});
+    // Native-v2 publication moves authority to an explicit generation root.
+    // Corrupt that selected root rather than the now-unused canonical path.
+    const dense_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ path, active_relative_path.? });
     defer alloc.free(dense_path);
     const dense_path_z = try alloc.dupeZ(u8, dense_path);
     defer alloc.free(dense_path_z);
@@ -51257,7 +51263,11 @@ test "managed startup catch-up advances counterless incomplete dense repair" {
             .dims = 3,
             .storage_backend = .lsm,
         }, .{});
-        try hbc.beginBulkIngestSession();
+        // A mutation-free abandoned bulk session carries no durable debt.
+        // Inject an actually incomplete publication through the format-aware
+        // boundary: native-v2 drops CURRENT, while legacy-v1 persists its
+        // interrupted-bulk marker.
+        try hbc.markPublishedGenerationIncompleteForTest();
         hbc.close();
     }
 
@@ -51288,7 +51298,7 @@ test "managed startup catch-up advances counterless incomplete dense repair" {
         .ttl_cleanup = .{ .enabled = false },
     });
     defer managed_db.close();
-    try std.testing.expectEqualStrings("IncompleteBulkPublish", managed_db.core.index_manager.loadFailure("dense_idx").?);
+    try std.testing.expectEqualStrings("MissingPostingCheckpoint", managed_db.core.index_manager.loadFailure("dense_idx").?);
 
     var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
     const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &managed_db, true, .isolated, .all_debt, .{});

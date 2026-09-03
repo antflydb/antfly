@@ -4362,7 +4362,20 @@ pub const HBCIndex = struct {
         if (self.write_session_depth == 0) return error.NoActiveWriteSession;
         if (self.write_session_kind != expected_kind) return error.WriteSessionKindMismatch;
         const finishing_outermost = self.write_session_depth == 1;
-        if (finishing_outermost and expected_kind == .bulk_publication) {
+        // A weak-sync public load can open its bulk session while the index is
+        // still LSM-backed, then have derived replay publish native authority
+        // before that otherwise mutation-free session is closed. There is no
+        // HBC transaction to publish in that case, and opening a native batch
+        // merely to flush empty deferred maps would incorrectly require a
+        // source capture. A session which did touch HBC state must still carry
+        // the capture/base required by beginRuntimeBatchTxn and fail closed if
+        // it does not.
+        const has_bulk_publication_work = self.bulk_publication_may_have_mutated or
+            self.deferred_quantized_nodes.count() != 0 or
+            self.deferred_node_keys.count() != 0 or
+            self.deferred_oversized_leaves.count() != 0;
+        const needs_bulk_publication = !self.nativeHbcAuthoritative() or has_bulk_publication_work;
+        if (finishing_outermost and expected_kind == .bulk_publication and needs_bulk_publication) {
             if (options.progress_fn) |progress| if (options.progress_ctx) |progress_ctx| {
                 progress(progress_ctx, .{
                     .phase = .begin,

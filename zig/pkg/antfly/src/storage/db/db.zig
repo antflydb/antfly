@@ -43382,14 +43382,16 @@ fn applyDerivedBatchToIndexReplayContext(
     index_ref: index_manager_mod.ManagedIndexRef,
 ) !bool {
     const replay_ctx: *ReplayApplyContextBatch = @ptrCast(@alignCast(ctx_ptr));
-    // A replay window may legitimately contain no mutations for this specific
-    // projection after lifecycle filtering. Its source boundary is still the
-    // batch sequence and must be published with the (possibly empty) capture.
+    const ctx = replay_ctx.batch;
+    if (!try batchAdvancesManagedIndexApplyStateForReplay(ctx.index_manager, batch, index_ref)) return false;
+    // Only a batch accepted by this projection may publish its source
+    // boundary from the window callback. A mutation-free tail is certified by
+    // canAdvanceDerivedToTargetAsync first, then Core.saveAppliedSequence
+    // emits the empty native coverage transaction. Publishing here would let
+    // the checkpoint itself bypass that cardinality proof.
     if (index_ref.kind == .dense_vector) {
         replay_ctx.dense_window_sequence = @max(replay_ctx.dense_window_sequence, batch.sequence);
     }
-    const ctx = replay_ctx.batch;
-    if (!try batchAdvancesManagedIndexApplyStateForReplay(ctx.index_manager, batch, index_ref)) return false;
 
     const async_ctx = AsyncContext{
         .alloc = ctx.alloc,
@@ -43545,7 +43547,7 @@ fn saveAppliedSequencesBatchLockedContext(
             // released but before this catalog/status phase acquired its
             // broader lock.
             if (!ctx.index_manager.densePostingCoverageIncludesByName(update.index_name, update.sequence)) {
-                try ctx.index_manager.finishDensePostingSidecarCaptureByName(update.index_name, update.sequence);
+                try ctx.index_manager.ensureDensePostingCoverageByName(update.index_name, update.sequence);
             }
         } else {
             generic_updates.appendAssumeCapacity(update);
@@ -43655,7 +43657,7 @@ fn checkpointManagedProjectionEffectsForAppliedSequenceUpdates(
             // persisted WAL-authoritative marker exists, publication is a
             // required half of this durability boundary and failure leaves
             // the source watermark unchanged for replay.
-            try index_manager.finishDensePostingSidecarCaptureByName(update.index_name, update.sequence);
+            try index_manager.ensureDensePostingCoverageByName(update.index_name, update.sequence);
         }
     }
 }
@@ -49415,14 +49417,14 @@ fn applyGraphDocClearsForIndex(ctx: *const AsyncContext, clears: []const derived
 
 fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !bool {
     const replay_ctx: *ReplayApplyContext = @ptrCast(@alignCast(ctx_ptr));
-    // Publish the replay window's source boundary even when lifecycle
-    // filtering proves there are no posting mutations to append.
-    if (index_ref.kind == .dense_vector) {
-        replay_ctx.dense_window_sequence = @max(replay_ctx.dense_window_sequence, batch.sequence);
-    }
     const self = replay_ctx.db;
     const resources = self.core.asyncResources();
     if (!try batchAdvancesManagedIndexApplyStateForReplay(resources.index_manager, batch, index_ref)) return false;
+    // See applyDerivedBatchToIndexReplayContext: irrelevant tail windows must
+    // not manufacture coverage before the target-advance completeness gate.
+    if (index_ref.kind == .dense_vector) {
+        replay_ctx.dense_window_sequence = @max(replay_ctx.dense_window_sequence, batch.sequence);
+    }
     const ctx = AsyncContext{
         .alloc = self.alloc,
         .io = self.backend_runtime.io(),
@@ -49546,6 +49548,20 @@ fn finishDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.
         resources.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
         return;
     }
+    if (replay_ctx.dense_window_sequence == 0) {
+        // The matching journal window contained no mutation applicable to
+        // this index. Discard its empty transaction; the caller may advance
+        // coverage only after canAdvanceDerivedToTargetAsync proves the
+        // current physical corpus complete.
+        if (replay_ctx.dense_capture_lease) |lease| if (lease.ownsLifecycle())
+            resources.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch |err| switch (err) {
+                error.PostingWalCaptureSuperseded, error.ExperimentalPostingCaptureNotActive => {},
+                else => return err,
+            };
+        replay_ctx.dense_capture_lease = null;
+        resources.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
+        return;
+    }
     errdefer if (replay_ctx.dense_capture_lease) |lease| if (lease.ownsLifecycle())
         resources.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
     errdefer resources.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
@@ -49604,6 +49620,16 @@ fn finishDerivedCatchUpWindowContext(ctx_ptr: *anyopaque, index_ref: index_manag
             };
         replay_ctx.dense_capture_lease = null;
         replay_ctx.dense_window_sequence = 0;
+        replay_ctx.batch.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
+        return;
+    }
+    if (replay_ctx.dense_window_sequence == 0) {
+        if (replay_ctx.dense_capture_lease) |lease| if (lease.ownsLifecycle())
+            replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch |err| switch (err) {
+                error.PostingWalCaptureSuperseded, error.ExperimentalPostingCaptureNotActive => {},
+                else => return err,
+            };
+        replay_ctx.dense_capture_lease = null;
         replay_ctx.batch.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
         return;
     }
@@ -51677,7 +51703,6 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
     const entry = ctx.index_manager.denseIndex(index_ref.name) orelse return true;
     if (!denseIndexIsArtifactBacked(entry)) return true;
     if (asyncContextHasActiveExternalDenseBulkWork(ctx)) return false;
-    if (ctx.active_dense_catch_up_sessions.load(.acquire) != 0) return true;
 
     const expected_doc_count = (try denseTargetCountForIndexContext(ctx, index_ref.name)) orelse {
         std.log.warn(
@@ -52127,7 +52152,15 @@ fn rebuildDenseIndexFromPrimaryVectorsSliceContext(
     }
     session_open = false;
     if (posting_capture) |lease| if (posting_capture_owned) {
-        try ctx.index_manager.finishDensePostingSidecarCaptureLeaseByName(index_name, lease, ctx.store.lastReplaySequence(0));
+        // A repair slice reads from its pinned source snapshot. Publishing the
+        // process's newer live tip here would certify journal mutations the
+        // candidate has not replayed yet and make its next capture reject the
+        // missing prefix. Ordinary one-shot rebuilds retain live-tip coverage.
+        const capture_sequence = if (ctx.snapshot_read_txn != null)
+            ctx.repair_sequence
+        else
+            ctx.store.lastReplaySequence(0);
+        try ctx.index_manager.finishDensePostingSidecarCaptureLeaseByName(index_name, lease, capture_sequence);
         posting_capture_owned = false;
     };
     const owned_resume_key = state.resume_key;
@@ -52305,7 +52338,14 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsSliceContext(
     }
     session_open = false;
     if (posting_capture) |lease| if (posting_capture_owned) {
-        try ctx.index_manager.finishDensePostingSidecarCaptureLeaseByName(index_name, lease, ctx.store.lastReplaySequence(0));
+        // Durable repair cursors are relative to the pinned source generation,
+        // not the current journal tip. Later source sequences belong to the
+        // explicit catch-up phase and must not be claimed by this snapshot.
+        const capture_sequence = if (ctx.snapshot_read_txn != null)
+            ctx.repair_sequence
+        else
+            ctx.store.lastReplaySequence(0);
+        try ctx.index_manager.finishDensePostingSidecarCaptureLeaseByName(index_name, lease, capture_sequence);
         posting_capture_owned = false;
     };
     const owned_resume_key = state.resume_key;
@@ -52640,6 +52680,24 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
         index_name,
         clean_checkpoint,
     );
+    // Stable-tip finalization can race ahead of the applied-sequence flush
+    // which normally refreshes this advisory restart snapshot. Persist the
+    // live cardinality at the lifecycle boundary itself so a later failed
+    // open never falls back to the empty creation-time snapshot. The clean
+    // projection marker remains correctness authority; status-cache failure
+    // must not roll it back or fail an otherwise complete user write.
+    DB.saveIndexStatusSnapshots(
+        ctx.alloc,
+        ctx.store,
+        ctx.index_manager,
+        &.{.{ .index_name = index_name, .sequence = applied_sequence }},
+    ) catch |err| {
+        std.log.warn("dense status snapshot persistence deferred index={s} sequence={} err={s}", .{
+            index_name,
+            applied_sequence,
+            @errorName(err),
+        });
+    };
     std.log.info(
         "dense projection stable-tip finalization completed index={s} sequence={} vectors={}",
         .{ index_name, applied_sequence, expected_count },
@@ -79186,6 +79244,11 @@ test "db catch-up rebuilds dense coverage before vacuous target advance" {
     const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
     defer alloc.free(artifact_key);
     try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dv_v1"),
+    );
+    try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("dv_v1").?.index.stats().active_count);
 
     const source_only_payload = try change_journal_mod.encodeRecord(alloc, .{
         .sequence = target_sequence,
@@ -83253,7 +83316,10 @@ test "db quarantined dense bootstrap tracks concurrent insert update and delete"
         .ttl_cleanup = .{ .enabled = false },
     });
     defer reopened.close();
-    try std.testing.expectEqualStrings("MissingPostingCheckpoint", reopened.core.index_manager.loadFailure(cfg.name).?);
+    // This is an explicitly legacy-v1 root. Its injected incomplete
+    // publication is represented by the durable bulk marker; native-v2 would
+    // fail with MissingPostingCheckpoint after CURRENT is removed.
+    try std.testing.expectEqualStrings("IncompleteBulkPublish", reopened.core.index_manager.loadFailure(cfg.name).?);
     try std.testing.expect(reopened.core.index_manager.denseIndex(cfg.name) == null);
     _ = try reopened.discoverRecoverableStartupIndexFailures(alloc, 1);
     const repair_id = (try reopened.indexRepairIdForIndex(alloc, cfg.name)) orelse return error.TestUnexpectedResult;
@@ -83423,7 +83489,7 @@ test "db index repair rebuilds dense index with missing native publication" {
     defer reopened.close();
 
     const recorded = reopened.core.index_manager.loadFailure("dense_idx") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("MissingPostingCheckpoint", recorded);
+    try std.testing.expectEqualStrings("IncompleteBulkPublish", recorded);
     const discovery = try reopened.discoverRecoverableStartupIndexFailures(alloc, 1);
     try std.testing.expectEqual(@as(usize, 1), discovery.discovered);
     try std.testing.expect(try reopened.hasPendingIndexRepairIntents(alloc));
@@ -83447,7 +83513,7 @@ test "db index repair rebuilds dense index with missing native publication" {
     // Discovery and pin acquisition must not delete or reopen the poisoned
     // root merely to make rebuilding convenient.
     try std.testing.expectError(
-        error.MissingPostingCheckpoint,
+        error.IncompleteBulkPublish,
         hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_index_path_z, .{
             .dims = 3,
             .storage_backend = .lsm,
@@ -86697,7 +86763,10 @@ test "db dense repair defers before candidate creation when node admission is ex
     const admission = resources.sliceStats(.dense_repair_working_set);
     try std.testing.expectEqual(@as(u64, 0), admission.used_bytes);
     try std.testing.expectEqual(@as(u64, 1), admission.hard_limit_rejections);
-    try std.testing.expectError(error.MissingPostingCheckpoint, hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
+    // This fixture is explicitly legacy-v1, so its injected interrupted
+    // publication is represented by the durable LSM bulk marker. Native-v2
+    // uses a missing CURRENT/checkpoint for the equivalent fail-closed state.
+    try std.testing.expectError(error.IncompleteBulkPublish, hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
         .dims = 2,
         .storage_backend = .lsm,
     }, .{}));
@@ -87669,7 +87738,16 @@ test "db restart clears stale dense generation intent after clean checkpoint" {
         try std.testing.expectEqual(index_repair_state.Phase.validating, interrupted.intent.phase);
         try std.testing.expect(interrupted.pin != null);
         try std.testing.expect(interrupted.intent.previous_pointer_captured);
-        try std.testing.expect(interrupted.intent.previous_active_relative_path == null);
+        // Native-v2 indexes always publish through a managed root pointer.
+        // Repair activation must retain the distinct predecessor so a crash
+        // before certification remains rollback-safe.
+        const predecessor = interrupted.intent.previous_active_relative_path orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expect(!std.mem.eql(
+            u8,
+            predecessor,
+            interrupted.intent.candidate_relative_path.?,
+        ));
         try std.testing.expect(try db.core.index_manager.isRepairCandidateActive(
             "dense_idx",
             interrupted.intent.candidate_relative_path.?,
@@ -88059,7 +88137,7 @@ test "db failed activated dense generation rolls back to retained predecessor" {
     });
     defer reopened.close();
     try std.testing.expectEqualStrings(
-        "IncompleteBulkPublish",
+        "MissingPostingCheckpoint",
         reopened.core.index_manager.loadFailure("dense_idx") orelse return error.TestUnexpectedResult,
     );
 
@@ -103417,15 +103495,15 @@ test "db native deferred restore preserves generated dense generation without em
             .sync_level = .full_index,
         });
         try source.runUntilIdle();
-        // Native-v2 publication is deliberately owned by the durable repair
-        // lane rather than the replay/posting idle drain: a large corpus must
-        // not turn an otherwise bounded idle barrier into a surprise linear
-        // rebuild. Exercise the same discovery + bounded execution sequence
-        // used by the public table runtime before capturing the source.
-        try std.testing.expect(try source.denseArtifactRebuildMaintenanceNeeded(alloc));
-        try std.testing.expect(try source.runDenseArtifactRebuildMaintenanceWithProgress(alloc, null, null));
-        const migration = try source.repairRecoverableStartupIndexFailures(alloc, 1, .{});
-        try std.testing.expectEqual(@as(usize, 1), migration.repaired);
+        // A fresh native-v2 index can now publish its clean projection during
+        // the normal full-index barrier. Older roots still converge through
+        // the durable repair lane. The backup invariant is the same in both
+        // cases, so exercise repair only when authoritative debt remains
+        // instead of requiring a particular publication schedule.
+        if (try source.denseArtifactRebuildMaintenanceNeeded(alloc)) {
+            try std.testing.expect(try source.runDenseArtifactRebuildMaintenanceWithProgress(alloc, null, null));
+            _ = try source.repairRecoverableStartupIndexFailures(alloc, 1, .{});
+        }
         try source.runUntilIdle();
         const cfg = source.core.index_manager.get("semantic_idx") orelse return error.TestUnexpectedResult;
         const checkpoint = try source.core.loadProjectionCheckpoint(alloc, cfg.name);
@@ -104428,7 +104506,7 @@ test "db restore dense artifact completion keeps every intent when one proof is 
     );
 }
 
-test "db restore dense rebuild rediscovery is pending rather than progress" {
+test "db restore owner converges rediscovered dense projection intent" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -104481,10 +104559,12 @@ test "db restore dense rebuild rediscovery is pending rather than progress" {
         7001,
     );
     try db.updateRestoreRuntimeRepairPhaseWithIo(alloc, std.testing.io, "sync_indexes", false);
-    try std.testing.expectError(
-        error.RestoreDenseArtifactRebuildIncomplete,
-        db.repairRestoreRuntimeStateStepIfNeeded(alloc),
-    );
+    try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
+    try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) == null);
+    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, std.mem.span(path))).?;
+    defer restore_state.deinit(alloc);
+    try std.testing.expect(restore_state.runtime_repair_complete);
+    try std.testing.expectEqualStrings("complete", restore_state.phase);
 }
 
 test "db restore dense rebuild publishes mixed progress before worker wait" {

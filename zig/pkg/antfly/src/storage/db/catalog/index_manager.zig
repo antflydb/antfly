@@ -12175,6 +12175,13 @@ pub const IndexManager = struct {
         return try self.persistDensePostingSidecarByNameWithOptions(name, applied_sequence, .{});
     }
 
+    /// Idempotently ensures that the native posting authority covers a source
+    /// boundary. This observer API never consumes a live source or maintenance
+    /// capture; callers without its lease must retry after that owner commits.
+    pub fn ensureDensePostingCoverageByName(self: *IndexManager, name: []const u8, applied_sequence: u64) !void {
+        return try self.persistDensePostingSidecarByNameWithOptions(name, applied_sequence, .{});
+    }
+
     /// Completes a source capture opened by this caller. Unlike the generic
     /// idempotent coverage publisher, an already-covered no-op transaction is
     /// consumed rather than left active for a later source window.
