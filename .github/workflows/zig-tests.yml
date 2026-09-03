@@ -21,6 +21,9 @@ on:
           - all
           - inference-e2e
 
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-cache
@@ -41,7 +44,7 @@ jobs:
       backup_s3: ${{ steps.detect.outputs.backup_s3 }}
       release_tooling: ${{ steps.detect.outputs.release_tooling }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
@@ -183,11 +186,23 @@ jobs:
           fi
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
+            ':(glob).github/workflows/*.yml' \
+            ':(glob).github/workflows/*.yaml' \
+            .github/dependabot.yml \
             scripts/install.sh \
+            scripts/publish-zig-runtime-dev.sh \
             scripts/test_install_download_markers.sh \
             scripts/test_quickstart_docs.py \
+            ':(glob)scripts/packaging/**' \
+            ':(glob)scripts/release/**' \
+            py/packages/cli/pyproject.toml \
+            ':(glob)ts/packages/cli*/**' \
+            docs/cli-packaging.md \
             docs/guides/quickstart.mdx \
-            .github/workflows/cli-publish.yml \
+            RELEASE.md \
+            zig/Dockerfile.runtime \
+            zig/cloudbuild.manifest.yaml \
+            zig/cloudbuild.runtime.yaml \
             .github/workflows/zig-tests.yml
           then
             echo "release_tooling=false" >> "$GITHUB_OUTPUT"
@@ -204,14 +219,25 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Test release download markers
-        run: |
-          scripts/test_install_download_markers.sh
-          scripts/test_quickstart_docs.py
-          sh -n scripts/install.sh
-          bash -n scripts/test_install_download_markers.sh
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+
+      # setup-zig downloads an .xz archive, and the release suite executes the
+      # real completion generator. Keep both dependencies explicit so a clean
+      # runner behaves the same as a developer machine.
+      - name: Install release test tools
+        run: sudo apt-get update && sudo apt-get install -y xz-utils
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Test release packaging and scripts
+        run: scripts/release/test.sh
 
   backup-s3-integration:
     name: backup-s3-integration
@@ -222,7 +248,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           submodules: true
 
@@ -230,7 +256,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
           use-cache: false
@@ -261,7 +287,7 @@ jobs:
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-arm64-codec
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-arm64-codec
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Verify native Linux ARM64 runner
         run: |
@@ -307,7 +333,7 @@ jobs:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           submodules: true
@@ -316,10 +342,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
           use-cache: false
@@ -564,7 +590,7 @@ jobs:
 
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: "temurin"
           java-version: "21"
@@ -586,7 +612,7 @@ jobs:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           submodules: true
 
@@ -594,10 +620,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
           use-cache: false
@@ -671,7 +697,7 @@ jobs:
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
       - name: Set up Java for TLA+
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: "temurin"
           java-version: "21"
@@ -784,7 +810,7 @@ jobs:
       ANTFLY_CI_ZIG_STRIP: "true"
       ANTFLY_CI_BUILD_CAPI: "true"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           submodules: true
 
@@ -792,7 +818,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
           use-cache: false
@@ -812,7 +838,7 @@ jobs:
         run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-base.tar.gz" zig-out/bin/antfly
 
       - name: Upload E2E executable
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base.tar.gz
@@ -842,7 +868,7 @@ jobs:
       ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
       ANTFLY_CI_TRACE: "1"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           submodules: true
 
@@ -850,7 +876,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
           use-cache: false
@@ -860,9 +886,11 @@ jobs:
           local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
           test_tmp="/mnt/cache/antfly/zig/e2e-tmp/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}"
-          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          echo "TMPDIR=$test_tmp" >> "$GITHUB_ENV"
+          {
+            echo "ZIG_LOCAL_CACHE_DIR=$local_cache"
+            echo "ZIG_GLOBAL_CACHE_DIR=$global_cache"
+            echo "TMPDIR=$test_tmp"
+          } >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache" "$test_tmp" "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
           mkdir -p "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
@@ -870,7 +898,7 @@ jobs:
           ln -s "/mnt/cache/antfly/zig/home-antfly-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -880,7 +908,7 @@ jobs:
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
 
       - name: Download E2E executable
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base
@@ -952,7 +980,7 @@ jobs:
       # checks or std.debug.assert invariants.
       ANTFLY_CI_ZIG_STRIP: "true"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           submodules: true
 
@@ -960,7 +988,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
           use-cache: false
@@ -980,7 +1008,7 @@ jobs:
         run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-full.tar.gz" zig-out/bin/antfly
 
       - name: Upload E2E executable
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: antfly-e2e-full-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full.tar.gz
@@ -1009,7 +1037,7 @@ jobs:
       HF_HOME: /mnt/cache/antfly/zig/hf
       ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           submodules: true
 
@@ -1027,7 +1055,7 @@ jobs:
           ln -s "/mnt/cache/antfly/zig/home-antfly-full-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -1038,7 +1066,7 @@ jobs:
 
       - name: Set up Rust WASI target
         if: matrix.suite == 'antfly'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: wasm32-wasip2
 
@@ -1047,7 +1075,7 @@ jobs:
         run: cargo build --manifest-path extensions/memoryaf/Cargo.toml --release --target wasm32-wasip2
 
       - name: Download E2E executable
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: antfly-e2e-full-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full
