@@ -30,9 +30,9 @@ mkdir -p "$HOME" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 
 cpu="${ANTFLY_CI_ZIG_CPU:-baseline}"
 optimize="${ANTFLY_CI_ZIG_OPTIMIZE:-Debug}"
-target_args=()
+build_args=(build)
 if [[ -n "${ANTFLY_CI_ZIG_TARGET:-}" ]]; then
-  target_args+=("-Dtarget=$ANTFLY_CI_ZIG_TARGET")
+  build_args+=("-Dtarget=$ANTFLY_CI_ZIG_TARGET")
 fi
 strip="${ANTFLY_CI_ZIG_STRIP:-false}"
 build_capi="${ANTFLY_CI_BUILD_CAPI:-false}"
@@ -78,14 +78,15 @@ if [[ "$build_capi" == "true" ]]; then
   build_steps+=(capi capi-smoke)
 fi
 
-python3 tools/run_bounded_zig_build.py --zig zig -- build \
-  "${target_args[@]}" \
-  -Dcpu="$cpu" \
-  -Doptimize="$optimize" \
-  -Dstrip="$strip" \
-  -Dcuda="$enable_cuda" \
-  -Dcuda-artifacts="$cuda_artifacts" \
+build_args+=(
+  "-Dcpu=$cpu"
+  "-Doptimize=$optimize"
+  "-Dstrip=$strip"
+  "-Dcuda=$enable_cuda"
+  "-Dcuda-artifacts=$cuda_artifacts"
   "${build_steps[@]}"
+)
+python3 tools/run_bounded_zig_build.py --zig zig -- "${build_args[@]}"
 
 chmod +x zig-out/bin/antfly
 

@@ -253,8 +253,7 @@ export function SecretsPage() {
         id: "actions",
         header: "",
         cell: ({ row }) =>
-          row.original.status === "configured_file" ||
-          row.original.status === "configured_both" ? (
+          row.original.status === "configured_file" || row.original.status === "configured_both" ? (
             <div className="text-right">
               <Button
                 variant="ghost"
@@ -387,8 +386,8 @@ export function SecretsPage() {
         <Alert>
           <AlertTriangle className="size-4" />
           <p className="text-sm">
-            Secret management via the dashboard is only available in single-node (standalone) mode. In
-            multi-node deployments, configure secrets using environment variables, Kubernetes
+            Secret management via the dashboard is only available in single-node (standalone) mode.
+            In multi-node deployments, configure secrets using environment variables, Kubernetes
             secrets, or the <code>antfly keystore add</code> CLI on each node.
           </p>
         </Alert>

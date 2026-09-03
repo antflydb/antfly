@@ -159,7 +159,11 @@ Unlike the older standalone TS dashboard, this UI understands:
 - `source_backend`, `source_id`, `source_path`, `source_url`, `source_version`
 - `section_path` for docsaf-derived content
 
-`find_related` and `entity_memories` use graph merge strategy `union`, matching the broader recall behavior used elsewhere in memory search.
+`find_related`, `entity_memories`, and graph-expanded search consume named,
+typed `graph_results`. Ranked retrieval hits retain their order, then hydrated
+graph-only memories are appended with exact key deduplication. Entity mention
+edges are indexed in both directions at write time so these reads remain exact
+with Antfly's outgoing distributed traversal contract.
 
 Source-reference fields are treated as immutable after creation. If an external document identity changes, the recommended flow is to create a replacement memory rather than mutate those identifiers in place.
 

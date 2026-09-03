@@ -816,7 +816,7 @@ fn executeTypedRemote(
             .bootstrap => |request| {
                 var out = try client.bootstrapStandby(remote_url, .{
                     .manifest_path = request.manifest_path,
-                    .content_root = request.content_root,
+                    .content_root = if (request.content_root) |root| .{ .value = root } else .absent,
                 });
                 defer out.deinit(alloc);
                 try writeTypedRemoteBody(alloc, io, plan.output, out.body);
@@ -865,9 +865,9 @@ fn executeTypedRemote(
         .read_check => |request| {
             var out = try client.checkRead(remote_url, .{
                 .consistency = @tagName(request.consistency),
-                .required_lsn = if (request.required_lsn) |raw| try i64FromU64(raw) else null,
-                .required_metadata_lsn = if (request.required_metadata_lsn) |raw| try i64FromU64(raw) else null,
-                .metadata_applied_lsn = if (request.metadata_applied_lsn) |raw| try i64FromU64(raw) else null,
+                .required_lsn = if (request.required_lsn) |raw| .{ .value = try i64FromU64(raw) } else .absent,
+                .required_metadata_lsn = if (request.required_metadata_lsn) |raw| .{ .value = try i64FromU64(raw) } else .absent,
+                .metadata_applied_lsn = if (request.metadata_applied_lsn) |raw| .{ .value = try i64FromU64(raw) } else .absent,
             });
             defer out.deinit(alloc);
             try writeTypedRemoteBody(alloc, io, plan.output, out.body);
@@ -1112,7 +1112,7 @@ fn primaryMetricsFromAdminSnapshot(alloc: std.mem.Allocator, snapshot: admin_api
             .safe_read_lag_lsn = safe_read_lag_lsn,
             .retention_lag_lsn = retention_lag_lsn,
             .status_code = status_code,
-            .last_error = boolGauge(slot.last_error != null),
+            .last_error = boolGauge(slot.last_error.valueOrNull() != null),
         };
         filled += 1;
     }
@@ -1165,10 +1165,10 @@ fn standbyMetricsFromAdminSnapshot(snapshot: admin_api.HAStandbySnapshot) !ha.me
         .received_lsn = try u64FromI64(snapshot.received_lsn),
         .applied_lsn = try u64FromI64(snapshot.applied_lsn),
         .safe_read_lsn = try u64FromI64(snapshot.safe_read_lsn),
-        .upstream_configured = boolGauge(snapshot.upstream_lsn != null),
-        .write_lag_lsn = if (snapshot.write_lag_lsn) |raw| try u64FromI64(raw) else 0,
-        .receive_lag_lsn = if (snapshot.receive_lag_lsn) |raw| try u64FromI64(raw) else 0,
-        .apply_lag_lsn = if (snapshot.apply_lag_lsn) |raw| try u64FromI64(raw) else 0,
+        .upstream_configured = boolGauge(snapshot.upstream_lsn.valueOrNull() != null),
+        .write_lag_lsn = if (snapshot.write_lag_lsn.valueOrNull()) |raw| try u64FromI64(raw) else 0,
+        .receive_lag_lsn = if (snapshot.receive_lag_lsn.valueOrNull()) |raw| try u64FromI64(raw) else 0,
+        .apply_lag_lsn = if (snapshot.apply_lag_lsn.valueOrNull()) |raw| try u64FromI64(raw) else 0,
         .unapplied_lsn_count = try u64FromI64(snapshot.unapplied_lsn_count),
         .caught_up_to_received = boolGauge(snapshot.caught_up_to_received),
         .can_serve_safe_reads = boolGauge(snapshot.can_serve_safe_reads),

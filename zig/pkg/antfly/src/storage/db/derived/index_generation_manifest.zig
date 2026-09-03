@@ -30,6 +30,17 @@ pub const Manifest = struct {
     }
 };
 
+/// Domain result for activation certification. Structural outcomes are kept
+/// distinct from operational I/O errors so recovery code can quarantine a bad
+/// generation without treating allocation, cancellation, or device failures
+/// as evidence that the durable artifact itself is invalid.
+pub const ReadyCertification = union(enum) {
+    ready: u64,
+    missing,
+    invalid,
+    identity_mismatch,
+};
+
 pub fn writeReady(
     alloc: Allocator,
     index_path: []const u8,
@@ -84,17 +95,45 @@ pub fn validateReady(
     expected_index_name: []const u8,
     expected_config_hash: u64,
 ) !u64 {
-    var manifest = try load(alloc, index_path);
+    return switch (try certifyReady(
+        alloc,
+        index_path,
+        expected_generation_id,
+        expected_index_name,
+        expected_config_hash,
+    )) {
+        .ready => |sequence| sequence,
+        .missing => error.FileNotFound,
+        .invalid => error.InvalidIndexGenerationManifest,
+        .identity_mismatch => error.IndexGenerationManifestMismatch,
+    };
+}
+
+pub fn certifyReady(
+    alloc: Allocator,
+    index_path: []const u8,
+    expected_generation_id: ?u128,
+    expected_index_name: []const u8,
+    expected_config_hash: u64,
+) !ReadyCertification {
+    var manifest = load(alloc, index_path) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        error.InvalidIndexGenerationManifest,
+        error.FileTooBig,
+        error.StreamTooLong,
+        => return .invalid,
+        else => return err,
+    };
     defer manifest.deinit(alloc);
     if (expected_generation_id) |generation_id| {
-        if (manifest.generation_id != generation_id) return error.IndexGenerationManifestMismatch;
+        if (manifest.generation_id != generation_id) return .identity_mismatch;
     }
     if (!std.mem.eql(u8, manifest.index_name, expected_index_name) or
         manifest.config_hash != expected_config_hash)
     {
-        return error.IndexGenerationManifestMismatch;
+        return .identity_mismatch;
     }
-    return manifest.ready_applied_sequence;
+    return .{ .ready = manifest.ready_applied_sequence };
 }
 
 fn manifestPathAlloc(alloc: Allocator, index_path: []const u8) ![]u8 {
@@ -163,4 +202,18 @@ test "index generation manifest is durable and fenced by identity" {
     try std.testing.expectEqual(@as(u64, 123), try validateReady(alloc, path, 91, "dense_idx", 44));
     try std.testing.expectError(error.IndexGenerationManifestMismatch, validateReady(alloc, path, 92, "dense_idx", 44));
     try std.testing.expectError(error.IndexGenerationManifestMismatch, validateReady(alloc, path, 91, "other", 44));
+
+    const mismatched = try certifyReady(alloc, path, 92, "dense_idx", 44);
+    try std.testing.expectEqual(ReadyCertification.identity_mismatch, std.meta.activeTag(mismatched));
+    const manifest_path = try manifestPathAlloc(alloc, path);
+    defer alloc.free(manifest_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = manifest_path,
+        .data = "invalid",
+    });
+    const invalid = try certifyReady(alloc, path, 91, "dense_idx", 44);
+    try std.testing.expectEqual(ReadyCertification.invalid, std.meta.activeTag(invalid));
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, manifest_path);
+    const missing = try certifyReady(alloc, path, 91, "dense_idx", 44);
+    try std.testing.expectEqual(ReadyCertification.missing, std.meta.activeTag(missing));
 }

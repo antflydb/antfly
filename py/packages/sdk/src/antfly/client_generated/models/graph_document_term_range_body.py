@@ -1,0 +1,81 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any, TypeVar
+
+from attrs import define as _attrs_define
+
+from ..types import UNSET, Unset
+
+T = TypeVar("T", bound="GraphDocumentTermRangeBody")
+
+
+@_attrs_define
+class GraphDocumentTermRangeBody:
+    """At least one of min or max is required and enforced by every Antfly execution boundary.
+
+    Attributes:
+        path (str): RFC 6901 JSON Pointer to the stored-document value.
+        min_ (str | Unset):
+        max_ (str | Unset):
+        inclusive_min (bool | Unset):  Default: True.
+        inclusive_max (bool | Unset):  Default: False.
+    """
+
+    path: str
+    min_: str | Unset = UNSET
+    max_: str | Unset = UNSET
+    inclusive_min: bool | Unset = True
+    inclusive_max: bool | Unset = False
+
+    def to_dict(self) -> dict[str, Any]:
+        path = self.path
+
+        min_ = self.min_
+
+        max_ = self.max_
+
+        inclusive_min = self.inclusive_min
+
+        inclusive_max = self.inclusive_max
+
+        field_dict: dict[str, Any] = {}
+
+        field_dict.update(
+            {
+                "path": path,
+            }
+        )
+        if min_ is not UNSET:
+            field_dict["min"] = min_
+        if max_ is not UNSET:
+            field_dict["max"] = max_
+        if inclusive_min is not UNSET:
+            field_dict["inclusive_min"] = inclusive_min
+        if inclusive_max is not UNSET:
+            field_dict["inclusive_max"] = inclusive_max
+
+        return field_dict
+
+    @classmethod
+    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        d = dict(src_dict)
+        path = d.pop("path")
+
+        min_ = d.pop("min", UNSET)
+
+        max_ = d.pop("max", UNSET)
+
+        inclusive_min = d.pop("inclusive_min", UNSET)
+
+        inclusive_max = d.pop("inclusive_max", UNSET)
+
+        graph_document_term_range_body = cls(
+            path=path,
+            min_=min_,
+            max_=max_,
+            inclusive_min=inclusive_min,
+            inclusive_max=inclusive_max,
+        )
+
+        return graph_document_term_range_body

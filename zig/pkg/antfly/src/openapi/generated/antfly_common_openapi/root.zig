@@ -16,6 +16,7 @@ pub const ExternalIoProtocol = types.ExternalIoProtocol;
 pub const FilesystemExternalIoConfig = types.FilesystemExternalIoConfig;
 pub const GcsCredentialConfig = types.GcsCredentialConfig;
 pub const GcsExternalIoConfig = types.GcsExternalIoConfig;
+pub const GraphExecutionConfig = types.GraphExecutionConfig;
 pub const HttpExternalIoConfig = types.HttpExternalIoConfig;
 pub const InferenceAdmissionConfig = types.InferenceAdmissionConfig;
 pub const InferenceConnectionConfig = types.InferenceConnectionConfig;

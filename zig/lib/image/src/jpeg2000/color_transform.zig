@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const decode_control = @import("decode_control.zig");
 
 pub const native_port_available = true;
 
@@ -30,11 +31,17 @@ const U5x8 = @Vector(simd_lanes_i32, u5);
 ///   B = Cb + G
 /// Operates in-place on the three component planes.
 pub fn inverseRct(y_plane: []i32, cb_plane: []i32, cr_plane: []i32) void {
+    inverseRctWithCancellation(y_plane, cb_plane, cr_plane, .{}) catch unreachable;
+}
+
+pub fn inverseRctWithCancellation(y_plane: []i32, cb_plane: []i32, cr_plane: []i32, cancellation: decode_control.CancellationProbe) !void {
     std.debug.assert(y_plane.len == cb_plane.len and cb_plane.len == cr_plane.len);
+    try cancellation.check();
 
     var i: usize = 0;
     const v_shift_2: U5x8 = @splat(2);
     while (i + simd_lanes_i32 <= y_plane.len) : (i += simd_lanes_i32) {
+        if (i & 4095 == 0) try cancellation.check();
         const yv: I32x8 = y_plane[i..][0..simd_lanes_i32].*;
         const cbv: I32x8 = cb_plane[i..][0..simd_lanes_i32].*;
         const crv: I32x8 = cr_plane[i..][0..simd_lanes_i32].*;
@@ -82,7 +89,12 @@ pub fn forwardRct(r_plane: []i32, g_plane: []i32, b_plane: []i32) void {
 ///   G = Y - 0.34413 * Cb - 0.71414 * Cr
 ///   B = Y + 1.772 * Cb
 pub fn inverseIct(y_plane: []f32, cb_plane: []f32, cr_plane: []f32) void {
+    inverseIctWithCancellation(y_plane, cb_plane, cr_plane, .{}) catch unreachable;
+}
+
+pub fn inverseIctWithCancellation(y_plane: []f32, cb_plane: []f32, cr_plane: []f32, cancellation: decode_control.CancellationProbe) !void {
     std.debug.assert(y_plane.len == cb_plane.len and cb_plane.len == cr_plane.len);
+    try cancellation.check();
 
     var i: usize = 0;
     const v_1_402: F32x8 = @splat(1.402);
@@ -90,6 +102,7 @@ pub fn inverseIct(y_plane: []f32, cb_plane: []f32, cr_plane: []f32) void {
     const v_0_71414: F32x8 = @splat(0.71414);
     const v_1_772: F32x8 = @splat(1.772);
     while (i + simd_lanes_f32 <= y_plane.len) : (i += simd_lanes_f32) {
+        if (i & 4095 == 0) try cancellation.check();
         const yv: F32x8 = y_plane[i..][0..simd_lanes_f32].*;
         const cbv: F32x8 = cb_plane[i..][0..simd_lanes_f32].*;
         const crv: F32x8 = cr_plane[i..][0..simd_lanes_f32].*;
@@ -263,6 +276,13 @@ pub fn applyCustomMctForward(matrix: CustomMctMatrix, planes: []const []f32) Cus
 
 /// Apply the inverse custom MCT in place across `planes`.
 pub fn applyCustomMctInverse(matrix: CustomMctMatrix, planes: []const []f32) CustomMctError!void {
+    applyCustomMctInverseWithCancellation(matrix, planes, .{}) catch |err| switch (err) {
+        error.Canceled => unreachable,
+        else => return @errorCast(err),
+    };
+}
+
+pub fn applyCustomMctInverseWithCancellation(matrix: CustomMctMatrix, planes: []const []f32, cancellation: decode_control.CancellationProbe) !void {
     try matrix.validate();
     const n = matrix.num_components;
     const px_count = try validatePlanes(planes, n);
@@ -270,8 +290,10 @@ pub fn applyCustomMctInverse(matrix: CustomMctMatrix, planes: []const []f32) Cus
     var in_buf: [custom_mct_max_components]f32 = undefined;
     var out_buf: [custom_mct_max_components]f32 = undefined;
 
+    try cancellation.check();
     var p: usize = 0;
     while (p < px_count) : (p += 1) {
+        if (p & 4095 == 0) try cancellation.check();
         var j: usize = 0;
         while (j < n) : (j += 1) in_buf[j] = planes[j][p];
         var i: usize = 0;

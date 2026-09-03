@@ -43,6 +43,7 @@ const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
+const native_artifact_sink = @import("native_artifact_sink.zig");
 const supports_main_lmdb = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
 const lmdb = if (supports_main_lmdb) @import("lmdb.zig") else struct {
     pub const CommitBackend = enum {
@@ -78,6 +79,8 @@ const lmdb_backend = if (supports_main_lmdb) @import("lmdb_backend.zig") else st
 const mem_backend = @import("mem_backend.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
 const storage_io = lsm_backend.storage_io;
+const fs_paths = @import("../common/fs_paths.zig");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const platform_time = @import("antfly_platform").time;
 const wal_mod = if (builtin.os.tag == .freestanding) @import("portable_wal.zig") else @import("wal.zig");
 const storage_sim = @import("sim_runtime.zig");
@@ -1010,6 +1013,13 @@ const MainStoreOwner = union(enum) {
         }
     }
 
+    fn pinNativeCheckpoint(self: *MainStoreOwner) !lsm_backend.Backend.NativeCheckpoint {
+        return switch (self.*) {
+            .lmdb, .mem => error.Unsupported,
+            .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
+        };
+    }
+
     fn snapshotLsmNativeStorageStats(self: *const MainStoreOwner) ?lsm_backend.NativeStorageStats {
         return switch (self.*) {
             .lmdb, .mem => null,
@@ -1809,6 +1819,92 @@ pub const PersistentIndex = struct {
 
     pub fn checkpointLsmWalAfterDurableBoundary(self: *PersistentIndex) !void {
         try self.main_store_owner.checkpointLsmWalAfterDurableBoundary();
+        try self.wal.checkpointLsmWalAfterDurableBoundary();
+    }
+
+    pub const NativeCheckpoints = struct {
+        main: lsm_backend.Backend.NativeCheckpoint,
+        wal: lsm_backend.Backend.NativeCheckpoint,
+        segments: ?NativeSegmentCheckpoint,
+
+        pub fn deinit(self: *NativeCheckpoints) void {
+            if (self.segments) |*segments| segments.deinit();
+            self.wal.deinit();
+            self.main.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// A retained writer snapshot pins every active immutable segment and its
+    /// mapped bytes. Retired cleanup cannot unlink the selected generation
+    /// until this owner is released after off-fence materialization.
+    pub const NativeSegmentCheckpoint = struct {
+        snapshot: *index_mod.IndexSnapshot,
+
+        pub fn deinit(self: *NativeSegmentCheckpoint) void {
+            self.snapshot.release();
+            self.* = undefined;
+        }
+
+        pub fn materialize(
+            self: *const NativeSegmentCheckpoint,
+            alloc: Allocator,
+            io: std.Io,
+            destination_root: []const u8,
+            cancellation: CancellationToken,
+        ) !u64 {
+            return try self.materializeWithSink(alloc, io, destination_root, cancellation, null);
+        }
+
+        pub fn materializeWithSink(
+            self: *const NativeSegmentCheckpoint,
+            alloc: Allocator,
+            io: std.Io,
+            destination_root: []const u8,
+            cancellation: CancellationToken,
+            sink: ?native_artifact_sink.Sink,
+        ) !u64 {
+            try fs_paths.createDirPathPortable(io, destination_root);
+            var total: u64 = 0;
+            for (self.snapshot.segments) |*segment| {
+                try cancellation.check();
+                const destination = try std.fmt.allocPrint(alloc, "{s}/{d}.seg", .{ destination_root, segment.id });
+                defer alloc.free(destination);
+                var file = try fs_paths.createFilePortable(io, destination, .{ .truncate = true });
+                defer file.close(io);
+                var writer_buffer: [16 * 1024]u8 = undefined;
+                var writer = file.writer(io, &writer_buffer);
+                try writer.interface.writeAll(segment.data.bytes());
+                try writer.end();
+                try file.sync(io);
+                if (sink) |active| {
+                    var digest: [native_artifact_sink.Sha256.digest_length]u8 = undefined;
+                    native_artifact_sink.Sha256.hash(segment.data.bytes(), &digest, .{});
+                    try active.record(destination, @intCast(segment.data.bytes().len), digest);
+                }
+                total = std.math.add(u64, total, @intCast(segment.data.bytes().len)) catch
+                    return error.FileTooBig;
+            }
+            try fs_paths.syncDirPortable(io, destination_root);
+            return total;
+        }
+    };
+
+    /// Pins both stores which make up a persistent text-index generation.
+    /// The caller keeps mutation admission fenced only for this bounded
+    /// manifest/run-reference operation; materialization happens later.
+    pub fn pinNativeCheckpoints(self: *PersistentIndex) !NativeCheckpoints {
+        self.lockStorage();
+        defer self.unlockStorage();
+        const segments = if (self.segment_files != null)
+            NativeSegmentCheckpoint{ .snapshot = self.writer.acquireSnapshot() }
+        else
+            null;
+        errdefer if (segments) |checkpoint| checkpoint.snapshot.release();
+        var main = try self.main_store_owner.pinNativeCheckpoint();
+        errdefer main.deinit();
+        const wal = try self.wal.pinNativeCheckpoint();
+        return .{ .main = main, .wal = wal, .segments = segments };
     }
 
     pub fn snapshotLsmNativeStorageStats(self: *const PersistentIndex) ?lsm_backend.NativeStorageStats {

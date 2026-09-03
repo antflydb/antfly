@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const decode_control = @import("decode_control.zig");
 
 pub const native_port_available = true;
 
@@ -232,7 +233,9 @@ fn bilinearIntegerReferenceGrid(
     component_origin_y: usize,
     xrsiz: usize,
     yrsiz: usize,
+    cancellation: decode_control.CancellationProbe,
 ) ![]Sample {
+    try cancellation.check();
     comptime {
         const info = @typeInfo(Sample);
         if (info != .int) @compileError("reference-grid bilinear samples must be integers");
@@ -251,6 +254,7 @@ fn bilinearIntegerReferenceGrid(
     const origin_y: f64 = @floatFromInt(component_origin_y);
     const x_scale: f64 = @floatFromInt(xrsiz);
     const y_scale: f64 = @floatFromInt(yrsiz);
+    var work_since_cancellation_check: usize = 0;
     for (0..out_height) |y| {
         const reference_y = reference_origin_y + y;
         const sy = (@as(f64, @floatFromInt(reference_y)) + 0.5) / y_scale - 0.5 - origin_y;
@@ -273,6 +277,7 @@ fn bilinearIntegerReferenceGrid(
                 @as(f64, @floatFromInt(input[y1 * in_width + x1])) * fx;
             out[y * out_width + x] = @intFromFloat(@round(top * (1.0 - fy) + bottom * fy));
         }
+        try cancellation.checkAfterWork(&work_since_cancellation_check, out_width);
     }
     return out;
 }
@@ -294,7 +299,25 @@ pub fn bilinearI32ReferenceGrid(
     xrsiz: usize,
     yrsiz: usize,
 ) ![]i32 {
-    return bilinearIntegerReferenceGrid(i32, allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz);
+    return bilinearI32ReferenceGridWithCancellation(allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz, .{});
+}
+
+pub fn bilinearI32ReferenceGridWithCancellation(
+    allocator: std.mem.Allocator,
+    input: []const i32,
+    in_width: usize,
+    in_height: usize,
+    out_width: usize,
+    out_height: usize,
+    reference_origin_x: usize,
+    reference_origin_y: usize,
+    component_origin_x: usize,
+    component_origin_y: usize,
+    xrsiz: usize,
+    yrsiz: usize,
+    cancellation: decode_control.CancellationProbe,
+) ![]i32 {
+    return bilinearIntegerReferenceGrid(i32, allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz, cancellation);
 }
 
 pub fn bilinearU8ReferenceGrid(
@@ -311,7 +334,25 @@ pub fn bilinearU8ReferenceGrid(
     xrsiz: usize,
     yrsiz: usize,
 ) ![]u8 {
-    return bilinearIntegerReferenceGrid(u8, allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz);
+    return bilinearU8ReferenceGridWithCancellation(allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz, .{});
+}
+
+pub fn bilinearU8ReferenceGridWithCancellation(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    in_width: usize,
+    in_height: usize,
+    out_width: usize,
+    out_height: usize,
+    reference_origin_x: usize,
+    reference_origin_y: usize,
+    component_origin_x: usize,
+    component_origin_y: usize,
+    xrsiz: usize,
+    yrsiz: usize,
+    cancellation: decode_control.CancellationProbe,
+) ![]u8 {
+    return bilinearIntegerReferenceGrid(u8, allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz, cancellation);
 }
 
 pub fn bilinearU16ReferenceGrid(
@@ -328,7 +369,25 @@ pub fn bilinearU16ReferenceGrid(
     xrsiz: usize,
     yrsiz: usize,
 ) ![]u16 {
-    return bilinearIntegerReferenceGrid(u16, allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz);
+    return bilinearU16ReferenceGridWithCancellation(allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz, .{});
+}
+
+pub fn bilinearU16ReferenceGridWithCancellation(
+    allocator: std.mem.Allocator,
+    input: []const u16,
+    in_width: usize,
+    in_height: usize,
+    out_width: usize,
+    out_height: usize,
+    reference_origin_x: usize,
+    reference_origin_y: usize,
+    component_origin_x: usize,
+    component_origin_y: usize,
+    xrsiz: usize,
+    yrsiz: usize,
+    cancellation: decode_control.CancellationProbe,
+) ![]u16 {
+    return bilinearIntegerReferenceGrid(u16, allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz, cancellation);
 }
 
 test "reference-grid U16 upsampling preserves a non-aligned image origin" {
@@ -360,6 +419,40 @@ test "reference-grid integer upsampling is consistent across sample depths" {
     defer std.testing.allocator.free(i32_result);
     try std.testing.expectEqualSlices(u8, &.{ 10, 10, 13, 18, 23 }, u8_result);
     try std.testing.expectEqualSlices(i32, &.{ 10, 10, 13, 18, 23 }, i32_result);
+}
+
+test "reference-grid upsampling cancellation releases partial output" {
+    const ProbeState = struct {
+        checks: usize = 0,
+
+        fn isCancelled(context: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(context.?)));
+            self.checks += 1;
+            return self.checks == 3;
+        }
+    };
+
+    const input = [_]u8{ 0, 64, 128, 255 };
+    var probe_state = ProbeState{};
+    try std.testing.expectError(
+        error.Canceled,
+        bilinearU8ReferenceGridWithCancellation(
+            std.testing.allocator,
+            &input,
+            2,
+            2,
+            128,
+            64,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            .{ .context = &probe_state, .is_cancelled_fn = ProbeState.isCancelled },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 3), probe_state.checks);
 }
 
 /// Bilinear upsampling for f32 planes.

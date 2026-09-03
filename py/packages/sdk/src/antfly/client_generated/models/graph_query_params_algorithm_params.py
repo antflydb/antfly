@@ -11,7 +11,7 @@ T = TypeVar("T", bound="GraphQueryParamsAlgorithmParams")
 
 @_attrs_define
 class GraphQueryParamsAlgorithmParams:
-    """Parameters for the graph algorithm"""
+    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

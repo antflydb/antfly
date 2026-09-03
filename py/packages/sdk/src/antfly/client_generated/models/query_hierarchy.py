@@ -31,7 +31,8 @@ class QueryHierarchy:
     size predictable. The presence of this object selects the canonical contract:
     without `group_by` or `children`, including when the object is empty, direct index
     matches are returned. `ancestors` only controls projected context and never changes result
-    cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+    cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit
+    source-grouped result shape.
 
         Attributes:
             group_by (HierarchyGroupBy | Unset):

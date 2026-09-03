@@ -33,7 +33,7 @@ docs/                Hand-written documentation (synced to docs site at build ti
 
 - **Zig 0.16** — required for the server runtime
 - **Go 1.26+** — required for retained Go SDKs and tools
-- **Node.js 18+** and **pnpm** — for TypeScript SDK, React components, and Antfarm dashboard
+- **Node.js and pnpm versions pinned in `ts/package.json`** — for reproducible TypeScript SDK and Antfarm artifacts; `make generate` uses Volta automatically when available
 
 ## Makefile Targets
 
@@ -42,7 +42,7 @@ Run `make help` for the full list. Key targets:
 | Target | Description |
 |--------|-------------|
 | `make build` | Build the `antfly` binary (includes Antfarm frontend and code generation) |
-| `make generate` | Regenerate OpenAPI types and Go/TS/Python SDKs |
+| `make generate` | Regenerate OpenAPI types, Go/TS/Python SDKs, and the embedded Antfarm dashboard |
 | `make lint` | Run linters across retained Go modules and TypeScript |
 | `make tidy` | Run `go mod tidy` across retained Go modules |
 | `make tidy-check` | Verify retained Go modules are tidy |
@@ -168,6 +168,7 @@ This runs:
 3. `go generate ./...` across retained Go modules (oapi-codegen)
 4. TypeScript SDK generation (`@antfly/sdk`)
 5. Python SDK generation
+6. Antfarm dashboard generation with the pinned Node and pnpm toolchain
 
 Look for `cfg.yaml` next to any `openapi.yaml` for oapi-codegen settings. Key convention: optional fields use `omitzero` instead of pointers.
 

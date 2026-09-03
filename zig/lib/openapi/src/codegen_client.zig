@@ -265,10 +265,10 @@ pub const ClientGenerator = struct {
         // Build request body
         if (!is_binary_request and body_type != null) {
             if (is_body_required) {
-                try self.w.line("const json_body = try httpx.json.Json.stringify(self.allocator, body);", .{});
+                try self.w.line("const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);", .{});
                 try self.w.line("defer self.allocator.free(json_body);", .{});
             } else {
-                try self.w.line("const json_body = if (body) |value| try httpx.json.Json.stringify(self.allocator, value) else null;", .{});
+                try self.w.line("const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;", .{});
                 try self.w.line("defer if (json_body) |value| self.allocator.free(value);", .{});
             }
         }
@@ -520,8 +520,9 @@ test "client generator preserves optional request body semantics" {
 
     const generated = w.toSlice();
     try std.testing.expect(std.mem.indexOf(u8, generated, "pub fn optionalBody(self: *@This(), body: ?[]const u8)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, generated, "const json_body = if (body) |value|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "pub fn requiredBody(self: *@This(), body: []const u8)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "pub fn optionalBinaryBody(self: *@This(), body: ?[]const u8)") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, ".body = value") != null);
 }

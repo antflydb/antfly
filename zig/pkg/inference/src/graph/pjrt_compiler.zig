@@ -1396,7 +1396,7 @@ pub fn compileGradientGraph(
 
             // Shape ops
             .reshape => |attrs| {
-                if (!hloShapeIsConcretePositive(attrs.new_shape)) return error.UnsupportedShape;
+                if (attrs.runtime_shape or !hloShapeIsConcretePositive(attrs.new_shape)) return error.UnsupportedShape;
                 node_map[nid] = try b.reshape(
                     try getHloId(node_map, ins[0]),
                     hlo.Shape.init(graphDTypeToHlo(attrs.new_shape.dtype), attrs.new_shape.dims[0..attrs.new_shape.rank()]),

@@ -18,11 +18,11 @@ T = TypeVar("T", bound="PatternMatch")
 
 @_attrs_define
 class PatternMatch:
-    """A single match from a pattern query
+    """Deprecated graph_searches pattern response row.
 
     Attributes:
-        bindings (PatternMatchBindings | Unset): Map of alias to matched node
-        path (list[PathEdge] | Unset): Edges traversed in this match
+        bindings (PatternMatchBindings | Unset):
+        path (list[PathEdge] | Unset):
     """
 
     bindings: PatternMatchBindings | Unset = UNSET

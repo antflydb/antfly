@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.query_request_expand_strategy import QueryRequestExpandStrategy
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -22,6 +21,7 @@ if TYPE_CHECKING:
     from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
     from ..models.geo_distance_query import GeoDistanceQuery
     from ..models.geo_shape_query import GeoShapeQuery
+    from ..models.graph_queries import GraphQueries
     from ..models.ip_range_query import IPRangeQuery
     from ..models.join_clause import JoinClause
     from ..models.match_all_query import MatchAllQuery
@@ -39,7 +39,6 @@ if TYPE_CHECKING:
     from ..models.query_request_aggregations import QueryRequestAggregations
     from ..models.query_request_embeddings import QueryRequestEmbeddings
     from ..models.query_request_foreign_sources import QueryRequestForeignSources
-    from ..models.query_request_graph_searches import QueryRequestGraphSearches
     from ..models.query_request_query import QueryRequestQuery
     from ..models.query_string_query import QueryStringQuery
     from ..models.regexp_query import RegexpQuery
@@ -75,6 +74,17 @@ class QueryRequest:
             IPRangeQuery | MatchAllQuery | MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery |
             MultiPhraseQuery | NumericRangeQuery | PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery |
             TermRangeQuery | Unset | WildcardQuery):
+        full_text_index (str | Unset): Full-text index used by `full_text_search` and by scoring text clauses in
+            `query`.
+            Use this to query a named document- or artifact-backed full-text index. The selected
+            index must exist and have type `full_text`. Omit this field to use the table's active
+            schema full-text index, preserving v0.2 behavior. Structured document filters continue
+            to use the active schema index even when retrieval uses a named artifact index. This
+            selector is invalid without `full_text_search` or a scoring text clause in `query` and
+            receives HTTP 422. This semantic relationship is enforced after the recursive query AST
+            is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses
+            from filter-only or exclusion-only trees.
+             Example: document_text.
         semantic_search (str | Unset): Natural language query for vector similarity search. Results are ranked by
             semantic similarity
             to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF).
@@ -107,9 +117,15 @@ class QueryRequest:
 
             When not specified, the semantic_search string is embedded as plain text.
              Example: {{remoteMedia url=this}}.
-        indexes (list[str] | Unset): List of vector index names to use for semantic search. Required when using
-            semantic_search.
-            Multiple indexes can be specified, and their results will be merged using RRF.
+        indexes (list[str] | Unset): Embedding index names selected for `semantic_search` or explicit `embeddings`.
+            Dense and sparse indexes are supported when the corresponding query representation is
+            supplied. Provisioned deployments require at least one index for `semantic_search`;
+            serverless may infer its single published dense index when this field is omitted. When
+            `embeddings` is supplied without this field, the embedding map keys select the indexes.
+            Provisioned results from multiple indexes are merged using RRF. Serverless currently
+            executes at most one dense and one sparse index per request; it rejects multiple
+            same-kind selectors and omitted selectors when more than one corresponding index is
+            published rather than choosing an index by catalog order.
              Example: ['title_body_nomic', 'description_embedding'].
         filter_prefix (str | Unset): Filter results by key prefix. Only returns documents whose keys start with this
             string.
@@ -195,7 +211,8 @@ class QueryRequest:
             size predictable. The presence of this object selects the canonical contract:
             without `group_by` or `children`, including when the object is empty, direct index
             matches are returned. `ancestors` only controls projected context and never changes result
-            cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+            cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit
+            source-grouped result shape.
         limit (int | Unset): Maximum number of top-level results to return. For semantic_search, this is the topk
             parameter.
             This does not limit nested matches attached through hierarchy.group_by.matches;
@@ -277,12 +294,9 @@ class QueryRequest:
         reranker (RerankerConfig | Unset): A unified configuration for a reranking provider. Example: {'provider':
             'ollama', 'model': 'dengcao/Qwen3-Reranker-0.6B:F16', 'field': 'content'}.
         analyses (Analyses | Unset):
-        graph_searches (QueryRequestGraphSearches | Unset): Declarative graph queries to execute after full-text/vector
-            searches.
-            Results can reference search results using node selectors like $full_text_results.
-        expand_strategy (QueryRequestExpandStrategy | Unset): Strategy for merging graph results with search results:
-            - union: Include nodes from both search and graph results
-            - intersection: Only include nodes appearing in both
+        graph_queries (GraphQueries | Unset): Named canonical graph operations. When graph_queries is present it must
+            contain at least one operation. A request may contain at most 64 operations, of which at most eight may be MATCH
+            operations. Keys use the versioned GraphIdentifier policy.
         document_renderer (str | Unset): Optional Handlebars template string for rendering document content in RAG
             queries.
             Template has access to document fields via `{{this.fields.fieldName}}`.
@@ -333,7 +347,7 @@ class QueryRequest:
             product catalogs, etc.) without ingesting that data into Antfly.
 
             **Supported operations on foreign tables:** filter_query, field selection, limit/offset.
-            **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker.
+            **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker.
 
             **Example - Join Antfly products with Postgres customers:**
             ```json
@@ -386,6 +400,7 @@ class QueryRequest:
         | Unset
         | WildcardQuery
     ) = UNSET
+    full_text_index: str | Unset = UNSET
     semantic_search: str | Unset = UNSET
     embedding_template: str | Unset = UNSET
     indexes: list[str] | Unset = UNSET
@@ -466,8 +481,7 @@ class QueryRequest:
     profile: bool | Unset = UNSET
     reranker: RerankerConfig | Unset = UNSET
     analyses: Analyses | Unset = UNSET
-    graph_searches: QueryRequestGraphSearches | Unset = UNSET
-    expand_strategy: QueryRequestExpandStrategy | Unset = UNSET
+    graph_queries: GraphQueries | Unset = UNSET
     document_renderer: str | Unset = UNSET
     pruner: Pruner | Unset = UNSET
     join: JoinClause | Unset = UNSET
@@ -562,6 +576,8 @@ class QueryRequest:
             full_text_search = self.full_text_search.to_dict()
         else:
             full_text_search = self.full_text_search.to_dict()
+
+        full_text_index = self.full_text_index
 
         semantic_search = self.semantic_search
 
@@ -744,13 +760,9 @@ class QueryRequest:
         if not isinstance(self.analyses, Unset):
             analyses = self.analyses.to_dict()
 
-        graph_searches: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.graph_searches, Unset):
-            graph_searches = self.graph_searches.to_dict()
-
-        expand_strategy: str | Unset = UNSET
-        if not isinstance(self.expand_strategy, Unset):
-            expand_strategy = self.expand_strategy.value
+        graph_queries: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.graph_queries, Unset):
+            graph_queries = self.graph_queries.to_dict()
 
         document_renderer = self.document_renderer
 
@@ -775,6 +787,8 @@ class QueryRequest:
             field_dict["query"] = query
         if full_text_search is not UNSET:
             field_dict["full_text_search"] = full_text_search
+        if full_text_index is not UNSET:
+            field_dict["full_text_index"] = full_text_index
         if semantic_search is not UNSET:
             field_dict["semantic_search"] = semantic_search
         if embedding_template is not UNSET:
@@ -823,10 +837,8 @@ class QueryRequest:
             field_dict["reranker"] = reranker
         if analyses is not UNSET:
             field_dict["analyses"] = analyses
-        if graph_searches is not UNSET:
-            field_dict["graph_searches"] = graph_searches
-        if expand_strategy is not UNSET:
-            field_dict["expand_strategy"] = expand_strategy
+        if graph_queries is not UNSET:
+            field_dict["graph_queries"] = graph_queries
         if document_renderer is not UNSET:
             field_dict["document_renderer"] = document_renderer
         if pruner is not UNSET:
@@ -852,6 +864,7 @@ class QueryRequest:
         from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
         from ..models.geo_distance_query import GeoDistanceQuery
         from ..models.geo_shape_query import GeoShapeQuery
+        from ..models.graph_queries import GraphQueries
         from ..models.ip_range_query import IPRangeQuery
         from ..models.join_clause import JoinClause
         from ..models.match_all_query import MatchAllQuery
@@ -869,7 +882,6 @@ class QueryRequest:
         from ..models.query_request_aggregations import QueryRequestAggregations
         from ..models.query_request_embeddings import QueryRequestEmbeddings
         from ..models.query_request_foreign_sources import QueryRequestForeignSources
-        from ..models.query_request_graph_searches import QueryRequestGraphSearches
         from ..models.query_request_query import QueryRequestQuery
         from ..models.query_string_query import QueryStringQuery
         from ..models.regexp_query import RegexpQuery
@@ -1129,6 +1141,8 @@ class QueryRequest:
             return componentsschemas_query_type_25
 
         full_text_search = _parse_full_text_search(d.pop("full_text_search", UNSET))
+
+        full_text_index = d.pop("full_text_index", UNSET)
 
         semantic_search = d.pop("semantic_search", UNSET)
 
@@ -1693,19 +1707,12 @@ class QueryRequest:
         else:
             analyses = Analyses.from_dict(_analyses)
 
-        _graph_searches = d.pop("graph_searches", UNSET)
-        graph_searches: QueryRequestGraphSearches | Unset
-        if isinstance(_graph_searches, Unset):
-            graph_searches = UNSET
+        _graph_queries = d.pop("graph_queries", UNSET)
+        graph_queries: GraphQueries | Unset
+        if isinstance(_graph_queries, Unset):
+            graph_queries = UNSET
         else:
-            graph_searches = QueryRequestGraphSearches.from_dict(_graph_searches)
-
-        _expand_strategy = d.pop("expand_strategy", UNSET)
-        expand_strategy: QueryRequestExpandStrategy | Unset
-        if isinstance(_expand_strategy, Unset):
-            expand_strategy = UNSET
-        else:
-            expand_strategy = QueryRequestExpandStrategy(_expand_strategy)
+            graph_queries = GraphQueries.from_dict(_graph_queries)
 
         document_renderer = d.pop("document_renderer", UNSET)
 
@@ -1734,6 +1741,7 @@ class QueryRequest:
             table=table,
             query=query,
             full_text_search=full_text_search,
+            full_text_index=full_text_index,
             semantic_search=semantic_search,
             embedding_template=embedding_template,
             indexes=indexes,
@@ -1758,8 +1766,7 @@ class QueryRequest:
             profile=profile,
             reranker=reranker,
             analyses=analyses,
-            graph_searches=graph_searches,
-            expand_strategy=expand_strategy,
+            graph_queries=graph_queries,
             document_renderer=document_renderer,
             pruner=pruner,
             join=join,

@@ -151,6 +151,7 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
             server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, cfg.*, source.*, reads.*, writes.*),
         .request_alloc_abi = undefined,
     };
+    if (reads.*) |read_source| read_source.bindIncomingGraphRoutes(&state.server.incoming_graph_routes);
     state.request_alloc_abi = .fromStd(&state.server.alloc);
     context.out_handle.* = state;
     context.out_request_alloc.* = &state.request_alloc_abi;

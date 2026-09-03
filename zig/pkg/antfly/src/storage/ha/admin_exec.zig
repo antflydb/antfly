@@ -490,9 +490,9 @@ fn adminReplicationSlot(slot: anytype, dropped: ?bool) !admin_api.HAReplicationS
         .safe_read_lsn = try adminI64(slot.safe_read_lsn),
         .active = slot.active,
         .reseed_required = slot.reseed_required,
-        .last_error = slot.last_error,
+        .last_error = if (slot.last_error) |last_error| .{ .value = last_error } else .null_value,
         .current_lsn = try adminI64(slot.current_lsn),
-        .dropped = dropped,
+        .dropped = if (dropped) |value| .{ .value = value } else .null_value,
     };
 }
 
@@ -509,7 +509,7 @@ fn adminReplicationSlots(alloc: Allocator, snapshot: status.PrimarySnapshot) ![]
             .safe_read_lsn = try adminI64(slot.safe_read_lsn),
             .active = slot.active,
             .reseed_required = slot.reseed_required,
-            .last_error = slot.last_error,
+            .last_error = if (slot.last_error) |last_error| .{ .value = last_error } else .null_value,
             .current_lsn = try adminI64(snapshot.current_lsn),
         };
     }
@@ -546,14 +546,14 @@ fn adminStandbySnapshot(snapshot: status.StandbySnapshot, node_id: []const u8) !
         .received_lsn = try adminI64(snapshot.received_lsn),
         .applied_lsn = try adminI64(snapshot.applied_lsn),
         .safe_read_lsn = try adminI64(snapshot.safe_read_lsn),
-        .upstream_lsn = if (snapshot.upstream_lsn) |value| try adminI64(value) else null,
-        .write_lag_lsn = if (snapshot.write_lag_lsn) |value| try adminI64(value) else null,
-        .receive_lag_lsn = if (snapshot.receive_lag_lsn) |value| try adminI64(value) else null,
-        .apply_lag_lsn = if (snapshot.apply_lag_lsn) |value| try adminI64(value) else null,
-        .last_error = snapshot.last_error,
-        .last_attempt_ns = if (snapshot.last_attempt_ns) |value| try adminI64(value) else null,
-        .last_success_ns = if (snapshot.last_success_ns) |value| try adminI64(value) else null,
-        .replication_failures_total = if (snapshot.replication_failures_total) |value| try adminI64(value) else null,
+        .upstream_lsn = if (snapshot.upstream_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
+        .write_lag_lsn = if (snapshot.write_lag_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
+        .receive_lag_lsn = if (snapshot.receive_lag_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
+        .apply_lag_lsn = if (snapshot.apply_lag_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
+        .last_error = if (snapshot.last_error) |last_error| .{ .value = last_error } else .null_value,
+        .last_attempt_ns = if (snapshot.last_attempt_ns) |value| .{ .value = try adminI64(value) } else .null_value,
+        .last_success_ns = if (snapshot.last_success_ns) |value| .{ .value = try adminI64(value) } else .null_value,
+        .replication_failures_total = if (snapshot.replication_failures_total) |value| .{ .value = try adminI64(value) } else .null_value,
         .unapplied_lsn_count = try adminI64(snapshot.unapplied_lsn_count),
         .caught_up_to_received = snapshot.caught_up_to_received,
         .can_serve_safe_reads = snapshot.can_serve_safe_reads,
@@ -578,7 +578,7 @@ fn adminSlotSnapshots(alloc: Allocator, slots: []const status.SlotSnapshot) ![]a
             .safe_read_lag_lsn = try adminI64(slot.safe_read_lag_lsn),
             .retention_lag_lsn = try adminI64(slot.retention_lag_lsn),
             .status = @tagName(slot.status),
-            .last_error = slot.last_error,
+            .last_error = if (slot.last_error) |last_error| .{ .value = last_error } else .null_value,
         };
     }
     return admin_slots;
@@ -622,13 +622,13 @@ fn adminReadDecision(decision: read_gate.Decision) !admin_api.HAReadDecision {
     return .{
         .action = @tagName(decision.action),
         .consistency = @tagName(decision.consistency),
-        .required_lsn = if (decision.required_lsn) |value| try adminI64(value) else null,
-        .required_metadata_lsn = if (decision.required_metadata_lsn) |value| try adminI64(value) else null,
+        .required_lsn = if (decision.required_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
+        .required_metadata_lsn = if (decision.required_metadata_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
         .received_lsn = try adminI64(decision.received_lsn),
         .applied_lsn = try adminI64(decision.applied_lsn),
         .safe_read_lsn = try adminI64(decision.safe_read_lsn),
-        .metadata_applied_lsn = if (decision.metadata_applied_lsn) |value| try adminI64(value) else null,
-        .serve_lsn = if (decision.serve_lsn) |value| try adminI64(value) else null,
+        .metadata_applied_lsn = if (decision.metadata_applied_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
+        .serve_lsn = if (decision.serve_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
         .missing_lsn_count = try adminI64(decision.missing_lsn_count),
         .metadata_missing_lsn_count = try adminI64(decision.metadata_missing_lsn_count),
     };

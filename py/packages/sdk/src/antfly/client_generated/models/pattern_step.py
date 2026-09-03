@@ -18,12 +18,12 @@ T = TypeVar("T", bound="PatternStep")
 
 @_attrs_define
 class PatternStep:
-    """A step in a graph pattern query
+    """Deprecated linear graph_searches pattern step.
 
     Attributes:
-        alias (str | Unset): Name for this node (reuse alias for cycle detection)
+        alias (str | Unset):
         node_filter (NodeFilter | Unset): Filter nodes during graph traversal using existing query primitives
-        edge (PatternEdgeStep | Unset): Edge constraints in a pattern step
+        edge (PatternEdgeStep | Unset): Deprecated linear graph_searches pattern edge.
     """
 
     alias: str | Unset = UNSET

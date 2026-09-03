@@ -41,7 +41,7 @@ type BatchRequest struct {
 	// Transform operations allow you to modify documents without read-modify-write races:
 	// - Operations are applied atomically on the server
 	// - Multiple operations per document are applied in sequence
-	// - Supports $set, $setOnInsert, $unset, $inc, $addToSet, $min, and $max
+	// - Supports $set, $setOnInsert, $unset, $inc, $push, $pull, $addToSet, $min, and $max
 	Transforms []Transform `json:"transforms,omitempty"`
 
 	// SyncLevel Synchronization level for the batch operation:
@@ -124,7 +124,8 @@ type QueryRequest struct {
 	// DistanceUnder maximum distance for semantic similarity search
 	DistanceUnder *float32 `json:"distance_under,omitempty"`
 
-	// Embeddings raw embeddings to use for semantic searches (the keys are the indexes to use for the queries).
+	// Embeddings supplies dense or sparse vectors directly. Its keys select indexes
+	// when Indexes is omitted; Indexes may select or order an explicit subset.
 	// Supports both dense ([]float32 via Embedding0) and sparse ({Indices, Values} via Embedding1) embeddings.
 	Embeddings map[string]Embedding `json:"embeddings,omitempty"`
 
@@ -145,6 +146,10 @@ type QueryRequest struct {
 
 	// FullTextSearch strongly-typed Bleve search query for full-text search
 	FullTextSearch *query.Query `json:"-"`
+
+	// FullTextIndex selects the named full-text index used by FullTextSearch.
+	// When omitted, the server uses the table schema's active full-text index.
+	FullTextIndex string `json:"full_text_index,omitempty"`
 
 	// Indexes to search (required for semantic search)
 	Indexes []string `json:"indexes,omitempty"`
@@ -183,9 +188,8 @@ type QueryRequest struct {
 	// DocumentRenderer optional Go template string for rendering document content to the prompt
 	DocumentRenderer string `json:"document_renderer,omitempty"`
 
-	// GraphSearches declarative graph queries to execute after full-text/vector searches.
-	// Results can reference search results using node selectors like $full_text_results.
-	GraphSearches map[string]GraphQuery `json:"graph_searches,omitempty"`
+	// GraphQueries contains declarative graph matching, traversal, and path queries.
+	GraphQueries map[string]GraphQuery `json:"graph_queries,omitempty"`
 
 	// Hierarchy controls top-level result shape, bounded child hits, and projected ancestors.
 	// A non-nil empty object selects direct index matches without ancestor hydration.
@@ -206,6 +210,11 @@ type QueryRequest struct {
 // It converts the strongly-typed *query.Query fields to json.RawMessage
 // for compatibility with the OAPI layer.
 func (q QueryRequest) MarshalJSON() ([]byte, error) {
+	if q.GraphQueries != nil {
+		if err := validateNamedGraphQueries(q.GraphQueries); err != nil {
+			return nil, err
+		}
+	}
 	// Convert SDK QueryRequest to oapi.QueryRequest
 	oapiReq := oapi.QueryRequest{
 		Table:            q.Table,
@@ -217,6 +226,7 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		Aggregations:     q.Aggregations,
 		Fields:           nil,
 		FilterPrefix:     q.FilterPrefix,
+		FullTextIndex:    q.FullTextIndex,
 		Indexes:          q.Indexes,
 		Limit:            q.Limit,
 		MergeConfig:      q.MergeConfig,
@@ -228,7 +238,7 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		Pruner:           q.Pruner,
 		SemanticSearch:   q.SemanticSearch,
 		DocumentRenderer: q.DocumentRenderer,
-		GraphSearches:    q.GraphSearches,
+		GraphQueries:     q.GraphQueries,
 		Hierarchy:        q.Hierarchy,
 		ForeignSources:   q.ForeignSources,
 	}
@@ -300,6 +310,7 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 		q.Fields = *oapiReq.Fields
 	}
 	q.FilterPrefix = oapiReq.FilterPrefix
+	q.FullTextIndex = oapiReq.FullTextIndex
 	q.Indexes = oapiReq.Indexes
 	q.Limit = oapiReq.Limit
 	q.MergeConfig = oapiReq.MergeConfig
@@ -311,7 +322,12 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 	q.Pruner = oapiReq.Pruner
 	q.SemanticSearch = oapiReq.SemanticSearch
 	q.DocumentRenderer = oapiReq.DocumentRenderer
-	q.GraphSearches = oapiReq.GraphSearches
+	q.GraphQueries = oapiReq.GraphQueries
+	if q.GraphQueries != nil {
+		if err := validateNamedGraphQueries(q.GraphQueries); err != nil {
+			return err
+		}
+	}
 	q.Hierarchy = oapiReq.Hierarchy
 	q.Join = oapiReq.Join
 	q.ForeignSources = oapiReq.ForeignSources

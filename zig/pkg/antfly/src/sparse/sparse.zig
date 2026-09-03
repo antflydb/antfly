@@ -1211,6 +1211,13 @@ pub const SparseIndex = struct {
                 .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
             }
         }
+
+        fn pinNativeCheckpoint(self: *StoreOwner) !lsm_backend.Backend.NativeCheckpoint {
+            return switch (self.*) {
+                .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
+                .none, .mem, .lmdb => error.Unsupported,
+            };
+        }
     };
 
     const OpenedStore = struct {
@@ -1316,6 +1323,10 @@ pub const SparseIndex = struct {
 
     pub fn checkpointLsmWalAfterDurableBoundary(self: *SparseIndex) !void {
         try self.owner.checkpointLsmWalAfterDurableBoundary();
+    }
+
+    pub fn pinNativeCheckpoint(self: *SparseIndex) !lsm_backend.Backend.NativeCheckpoint {
+        return try self.owner.pinNativeCheckpoint();
     }
 
     pub fn abortBulkIngestSession(self: *SparseIndex) void {

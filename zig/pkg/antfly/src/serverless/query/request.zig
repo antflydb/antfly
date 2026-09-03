@@ -56,6 +56,7 @@ pub const QueryRequest = struct {
     filter_prefix: ?[]u8 = null,
     filter_text: ?[]u8 = null,
     exclusion_text: ?[]u8 = null,
+    full_text_index: ?[]u8 = null,
     vector: ?[]f32 = null,
     sparse: ?[]SparseTermWeight = null,
     semantic_search: ?[]u8 = null,
@@ -85,6 +86,7 @@ pub const QueryRequest = struct {
         if (self.filter_prefix) |value| alloc.free(value);
         if (self.filter_text) |value| alloc.free(value);
         if (self.exclusion_text) |value| alloc.free(value);
+        if (self.full_text_index) |value| alloc.free(value);
         if (self.vector) |vector| alloc.free(vector);
         if (self.sparse) |weights| {
             for (weights) |*weight| weight.deinit(alloc);

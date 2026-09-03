@@ -292,6 +292,9 @@ export function conjunction(queries: Query[]): ConjunctionQuery {
  * disjunction([...queries], 2)
  */
 export function disjunction(queries: Query[], min?: number): DisjunctionQuery {
+  if (min !== undefined && (!Number.isInteger(min) || min < 0 || min > queries.length)) {
+    throw new RangeError("min must be an integer between 0 and the number of disjuncts");
+  }
   return {
     disjuncts: queries,
     min,

@@ -167,10 +167,13 @@ pub fn normalizeTableDefinitionIndexesValueAlloc(alloc: std.mem.Allocator, value
         const is_full_text = isPublicFullTextType(index_type);
 
         if (is_full_text) {
-            if (isArtifactBackedFullTextIndex(entry.value_ptr.object)) {
-                if (isReservedFullTextIndexName(entry.key_ptr.*)) return error.InvalidCreateTableRequest;
-            } else {
-                if (!isReservedFullTextIndexName(entry.key_ptr.*)) continue;
+            const artifact_backed = isArtifactBackedFullTextIndex(entry.value_ptr.object);
+            // `default` is the released compatibility spelling for the
+            // system-owned v0 full-text index. Preserve that mapping without
+            // letting it suppress arbitrary named full-text indexes.
+            if (std.mem.eql(u8, entry.key_ptr.*, "default") and !artifact_backed) continue;
+            if (isReservedFullTextIndexName(entry.key_ptr.*)) {
+                if (artifact_backed) return error.InvalidCreateTableRequest;
                 saw_full_text = true;
             }
         } else if (isReservedFullTextIndexName(entry.key_ptr.*)) {
@@ -296,7 +299,7 @@ pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8,
         else => return err,
     };
     errdefer alloc.free(normalized);
-    indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, normalized) catch |err| switch (err) {
+    indexes_api.validateArtifactEnrichmentsForIndexRequestJson(alloc, normalized) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidCreateIndexRequest,
     };
@@ -354,6 +357,8 @@ fn normalizeIndexConfigJson(
     options: NormalizeIndexOptions,
 ) ![]u8 {
     try validatePublicIndexObject(object);
+    const index_type = public_index_contract.parseKind(extractPublicIndexType(object) orelse "full_text") orelse
+        return error.InvalidCreateIndexRequest;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -371,21 +376,57 @@ fn normalizeIndexConfigJson(
         try appendField(alloc, &out, "type", .{ .string = "full_text" }, &first);
     }
 
+    const canonicalize_single_graph_source = index_type == .graph and
+        indexObjectGet(object, "sources") == null and
+        if (indexObjectGet(object, "source")) |source| source == .object else false;
+    if (canonicalize_single_graph_source) {
+        try appendCanonicalSingleGraphSourcesField(alloc, &out, object, &first);
+    }
+
     if (@hasField(Object, "map")) {
         var it = object.map.iterator();
         while (it.next()) |entry| {
             if (!options.include_name and std.mem.eql(u8, entry.key_ptr.*, "name")) continue;
+            if (canonicalize_single_graph_source and std.mem.eql(u8, entry.key_ptr.*, "source")) continue;
             try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
         }
     } else {
         var it = object.iterator();
         while (it.next()) |entry| {
             if (!options.include_name and std.mem.eql(u8, entry.key_ptr.*, "name")) continue;
+            if (canonicalize_single_graph_source and std.mem.eql(u8, entry.key_ptr.*, "source")) continue;
             try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
         }
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn indexObjectGet(object: anytype, key: []const u8) ?std.json.Value {
+    const Object = @TypeOf(object);
+    return if (@hasField(Object, "map")) object.map.get(key) else object.get(key);
+}
+
+fn appendCanonicalSingleGraphSourcesField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    object: anytype,
+    first_root_field: *bool,
+) !void {
+    const source_value = indexObjectGet(object, "source") orelse return error.InvalidCreateIndexRequest;
+    if (source_value != .object) return error.InvalidCreateIndexRequest;
+
+    if (!first_root_field.*) try out.append(alloc, ',');
+    first_root_field.* = false;
+    try out.appendSlice(alloc, "\"sources\":[{");
+    var first_source_field = true;
+    var source_it = source_value.object.iterator();
+    while (source_it.next()) |entry| {
+        if (entry.value_ptr.* == .null or std.mem.eql(u8, entry.key_ptr.*, "kind")) continue;
+        try appendField(alloc, out, entry.key_ptr.*, entry.value_ptr.*, &first_source_field);
+    }
+
+    try out.appendSlice(alloc, "}]");
 }
 
 fn validatePublicIndexObject(object: anytype) !void {
@@ -401,11 +442,68 @@ fn validatePublicIndexObject(object: anytype) !void {
         return error.InvalidCreateIndexRequest;
     try validatePublicInlineArtifactEnrichments(object);
     try validatePublicIndexFields(object, index_type);
+    try validatePublicIndexFieldRelationships(object, index_type);
     try validatePublicNestedIndexFields(object, index_type);
+}
+
+fn publicRelationshipFieldActive(object: anytype, field: []const u8) bool {
+    const value = indexObjectGet(object, field) orelse return false;
+    return switch (value) {
+        .null => false,
+        // Defaulted false is semantically absent for an opt-in mode such as
+        // `external`; generated clients commonly serialize that default.
+        .bool => |enabled| enabled,
+        else => true,
+    };
+}
+
+fn validatePublicIndexFieldRelationships(object: anytype, index_type: public_index_contract.Kind) !void {
+    const has_sources = publicRelationshipFieldActive(object, "sources");
+    switch (index_type) {
+        .full_text => {
+            if (has_sources and publicRelationshipFieldActive(object, "artifact_name"))
+                return error.InvalidCreateIndexRequest;
+        },
+        .graph => {
+            if (has_sources and publicRelationshipFieldActive(object, "source"))
+                return error.InvalidCreateIndexRequest;
+        },
+        .embeddings => {
+            if (has_sources) {
+                const conflicts = [_][]const u8{
+                    "external",
+                    "field",
+                    "template",
+                    "chunker",
+                    "embedding_name",
+                    "source_artifact_name",
+                };
+                for (conflicts) |field| {
+                    if (publicRelationshipFieldActive(object, field))
+                        return error.InvalidCreateIndexRequest;
+                }
+            }
+            if (publicRelationshipFieldActive(object, "source_artifact_name") and
+                !publicRelationshipFieldActive(object, "embedding_name"))
+            {
+                return error.InvalidCreateIndexRequest;
+            }
+        },
+        .algebraic => {},
+    }
 }
 
 fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_contract.Kind) !void {
     const Object = @TypeOf(object);
+    const sources = if (@hasField(Object, "map")) object.map.get("sources") else object.get("sources");
+    if (sources) |value| {
+        if (value != .null) try validatePublicArtifactSources(value, switch (index_type) {
+            .graph => .graph_sources,
+            .full_text => .full_text_sources,
+            else => .artifact_sources,
+        });
+    }
+    const source = if (@hasField(Object, "map")) object.map.get("source") else object.get("source");
     if (index_type == .embeddings) {
         const chunker = if (@hasField(Object, "map")) object.map.get("chunker") else object.get("chunker");
         if (chunker) |value| {
@@ -419,7 +517,6 @@ fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_con
     }
     if (index_type != .graph) return;
 
-    const source = if (@hasField(Object, "map")) object.map.get("source") else object.get("source");
     if (source) |value| {
         if (value != .null) try validatePublicCreatedShape(value, .graph_source);
     }
@@ -430,9 +527,6 @@ fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_con
     }
 
     const graph_shapes = .{
-        .{ "nodes", public_index_contract.CreatedObjectShape.graph_nodes },
-        .{ "edge", public_index_contract.CreatedObjectShape.graph_edge },
-        .{ "context", public_index_contract.CreatedObjectShape.graph_context },
         .{ "algebraic_planning", public_index_contract.CreatedObjectShape.graph_algebraic_planning },
     };
     inline for (graph_shapes) |field_shape| {
@@ -450,6 +544,20 @@ fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_con
     const resolvers = if (@hasField(Object, "map")) object.map.get("resolvers") else object.get("resolvers");
     if (resolvers) |value| {
         if (value != .null) try validatePublicCreatedShape(value, .graph_resolvers);
+    }
+}
+
+fn validatePublicArtifactSources(value: std.json.Value, shape: public_index_contract.CreatedObjectShape) !void {
+    try validatePublicCreatedShape(value, shape);
+    if (value.array.items.len == 0 or value.array.items.len > public_index_contract.max_artifact_sources)
+        return error.InvalidCreateIndexRequest;
+
+    for (value.array.items, 0..) |source, i| {
+        const artifact = source.object.get("artifact").?.string;
+        for (value.array.items[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.object.get("artifact").?.string, artifact))
+                return error.InvalidCreateIndexRequest;
+        }
     }
 }
 
@@ -527,6 +635,10 @@ fn validateCreateTableIndexesValue(value: std.json.Value) !void {
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .object) return error.InvalidCreateTableRequest;
         try validateCreateTableIndexName(entry.key_ptr.*);
+        if (entry.value_ptr.object.get("name")) |name_value| {
+            if (name_value != .string or !std.mem.eql(u8, name_value.string, entry.key_ptr.*))
+                return error.InvalidCreateTableRequest;
+        }
         validatePublicIndexObject(entry.value_ptr.object) catch return error.InvalidCreateTableRequest;
     }
 }
@@ -630,9 +742,9 @@ fn validatePublicIndexFields(object: anytype, index_type: public_index_contract.
 fn isArtifactBackedFullTextIndex(object: anytype) bool {
     const Object = @TypeOf(object);
     if (@hasField(Object, "map")) {
-        return object.map.contains("artifact_name") or object.map.contains("enrichments");
+        return object.map.contains("artifact_name") or object.map.contains("sources") or object.map.contains("enrichments");
     }
-    return object.contains("artifact_name") or object.contains("enrichments");
+    return object.contains("artifact_name") or object.contains("sources") or object.contains("enrichments");
 }
 
 fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -658,7 +770,8 @@ fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.jso
             else => return err,
         };
         defer alloc.free(normalized);
-        if (isPublicFullTextType(extractPublicIndexType(entry.value_ptr.object) orelse "full_text") and
+        if (std.mem.eql(u8, entry.key_ptr.*, "default") and
+            isPublicFullTextType(extractPublicIndexType(entry.value_ptr.object) orelse "full_text") and
             !isArtifactBackedFullTextIndex(entry.value_ptr.object)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
@@ -932,6 +1045,99 @@ test "table contract preserves embeddings create request fields" {
     );
 }
 
+test "table contract admits and preserves multi-source index requests" {
+    const cases = [_]struct {
+        name: []const u8,
+        body: []const u8,
+        expected_sources: []const u8,
+    }{
+        .{
+            .name = "document_text",
+            .body = "{\"type\":\"full_text\",\"field\":\"text\",\"sources\":[{\"artifact\":\"document_units_v1\",\"field\":\"summary\"},{\"artifact\":\"document_chunks_v1\"}]}",
+            .expected_sources = "\"sources\":[{\"artifact\":\"document_units_v1\",\"field\":\"summary\"},{\"artifact\":\"document_chunks_v1\"}]",
+        },
+        .{
+            .name = "document_vectors",
+            .body = "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_dense_v1\"},{\"artifact\":\"document_chunk_dense_v1\"}]}",
+            .expected_sources = "\"sources\":[{\"artifact\":\"document_dense_v1\"},{\"artifact\":\"document_chunk_dense_v1\"}]",
+        },
+        .{
+            .name = "document_graph",
+            .body = "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"document_relations_v1\",\"path\":\"$.relations[*]\"},{\"artifact\":\"document_links_v1\",\"format\":\"extraction_graph\"}]}",
+            .expected_sources = "\"sources\":[{\"artifact\":\"document_relations_v1\",\"path\":\"$.relations[*]\"},{\"artifact\":\"document_links_v1\",\"format\":\"extraction_graph\"}]",
+        },
+    };
+
+    for (cases) |case| {
+        const config_json = try parseCreateIndexRequest(std.testing.allocator, case.name, case.body);
+        defer std.testing.allocator.free(config_json);
+        try std.testing.expect(std.mem.indexOf(u8, config_json, case.expected_sources) != null);
+
+        const response = try indexes_api.encodeCreatedIndexConfig(std.testing.allocator, case.name, config_json);
+        defer std.testing.allocator.free(response);
+        try std.testing.expect(std.mem.indexOf(u8, response, case.expected_sources) != null);
+    }
+}
+
+test "table contract enforces stable graph source identities and numeric targets" {
+    const config_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "document_graph",
+        "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"target\":42}}]}",
+    );
+    defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"target\":42") != null);
+
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "document_graph",
+            "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":42,\"target\":\"doc:b\"}}]}",
+        ),
+    );
+}
+
+test "table contract admits and projects explicit embedding vector space" {
+    const config_json = try parseCreateIndexRequest(std.testing.allocator, "document_vectors", "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_dense_v1\"},{\"artifact\":\"document_chunk_dense_v1\"}],\"enrichments\":[{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"semantic_content\",\"chunk_size\":512},{\"name\":\"document_dense_v1\",\"kind\":\"embedding\",\"field\":\"semantic_content\",\"expected_dims\":3,\"vector_space\":\"searchaf:v1\"},{\"name\":\"document_chunk_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"document_chunks_v1\",\"expected_dims\":3,\"vector_space\":\"searchaf:v1\"}]}");
+    defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.count(u8, config_json, "\"vector_space\":\"searchaf:v1\"") == 2);
+
+    const response = try indexes_api.encodeCreatedIndexConfig(std.testing.allocator, "document_vectors", config_json);
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.count(u8, response, "\"vector_space\":\"searchaf:v1\"") == 2);
+}
+
+test "create index request defers upstream artifact resolution to merged catalog" {
+    const config_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "document_vectors",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_chunk_dense_v1\"}],\"enrichments\":[{\"name\":\"document_chunk_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"document_chunks_v1\",\"expected_dims\":3}]}",
+    );
+    defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "document_chunks_v1") != null);
+}
+
+test "table contract rejects malformed multi-source members" {
+    const invalid = [_][]const u8{
+        "{\"type\":\"full_text\",\"sources\":[]}",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"dense_v1\"},{\"artifact\":\"dense_v1\"}]}",
+        "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\"},{\"artifact\":\"relations_v1\",\"path\":\"$.links[*]\"}]}",
+        "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks_v1\",\"field\":\"\"}]}",
+        "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks_v1\",\"path\":\"$.text\"}]}",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{}]}",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"dense_v1\"}],\"enrichments\":[{\"name\":\"dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"vector_space\":\"\"}]}",
+        "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks_v1\"}],\"enrichments\":[{\"name\":\"chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512,\"vector_space\":\"dense-v1\"}]}",
+        "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"unknown\":true}]}",
+    };
+    for (invalid) |body| {
+        try std.testing.expectError(
+            error.InvalidCreateIndexRequest,
+            parseCreateIndexRequest(std.testing.allocator, "multi", body),
+        );
+    }
+}
+
 test "table contract public response omits unknown nested provider fields" {
     const config_json = try parseCreateIndexRequest(
         std.testing.allocator,
@@ -971,13 +1177,13 @@ test "table contract canonicalizes generated optional null fields" {
 
 test "table contract preserves typed artifact-backed graph configuration" {
     const body =
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}"},"content_type":"application/json","producer_json":{"type":"document_extraction","api_key":"write-only"},"execution":{"batch_items":8,"batch_bytes":262144}},"nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"{{ _item.source }}"}},"context":{"doc_fields":["title","body"]},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}]}
+        \\{"type":"graph","source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions","nodes":{"model":"document","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"{{ _item.source }}"}},"context":{"doc_fields":["title","body"]}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}"},"content_type":"application/json","producer_json":{"type":"document_extraction","api_key":"write-only"},"execution":{"batch_items":8,"batch_bytes":262144}},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}]}
     ;
     const config_json = try parseCreateIndexRequest(std.testing.allocator, "relations_graph", body);
     defer std.testing.allocator.free(config_json);
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"name\":\"relations_graph\",\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"source\":{\"type\":\"template\",\"value\":\"{{ body }}\"},\"execution\":{\"batch_items\":8,\"batch_bytes\":262144}},\"nodes\":{\"model\":\"document\",\"target\":\"{{ _item.target.text }}\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]},\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\",\"candidate_search\":\"prefix\"}]}",
+        "{\"name\":\"relations_graph\",\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"model\":\"document\",\"target\":\"{{ _item.target.text }}\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]}}],\"artifact\":{\"name\":\"relations_v1\",\"source\":{\"type\":\"template\",\"value\":\"{{ body }}\"},\"execution\":{\"batch_items\":8,\"batch_bytes\":262144}},\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\",\"candidate_search\":\"prefix\"}]}",
         config_json,
     );
 
@@ -988,14 +1194,42 @@ test "table contract preserves typed artifact-backed graph configuration" {
     defer table_req.deinit(std.testing.allocator);
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"nodes\":{\"model\":\"document\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]},\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\"}]}}",
+        "{\"relations_graph\":{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"model\":\"document\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]}}],\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\"}]}}",
         table_req.indexes_json.?,
     );
 }
 
+test "table contract rejects ambiguous index source spellings" {
+    const invalid = [_][]const u8{
+        "{\"type\":\"full_text\",\"artifact_name\":\"chunks_v1\",\"sources\":[{\"artifact\":\"chunks_v2\"}]}",
+        "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"sources\":[{\"artifact\":\"relations_v2\"}]}",
+        "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"nodes\":{\"model\":\"document\"},\"sources\":[{\"artifact\":\"relations_v2\"}]}",
+        "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"nodes\":{\"model\":\"document\"}},\"nodes\":{\"model\":\"external\"}}",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"source_artifact_name\":\"chunks_v1\"}",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"embedding_name\":\"dense_v1\",\"sources\":[{\"artifact\":\"dense_v2\"}]}",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"field\":\"body\",\"sources\":[{\"artifact\":\"dense_v1\"}]}",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"external\":true,\"sources\":[{\"artifact\":\"dense_v1\"}]}",
+    };
+    for (invalid) |body| {
+        try std.testing.expectError(
+            error.InvalidCreateIndexRequest,
+            parseCreateIndexRequest(std.testing.allocator, "ambiguous", body),
+        );
+    }
+
+    // Generated clients commonly serialize defaulted false booleans. That is
+    // not an active external mode and must remain compatible with sources.
+    const defaulted_external = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "vectors",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"external\":false,\"sources\":[{\"artifact\":\"dense_v1\"}]}",
+    );
+    defer std.testing.allocator.free(defaulted_external);
+}
+
 test "table contract rejects unknown fields in closed nested index objects" {
     const invalid_requests = [_][]const u8{
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","client_value":"private"}}
+        \\{"type":"graph","source":{"artifact":"relations_v1","client_value":"private"}}
         ,
         \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","client_value":"private"}}
         ,
@@ -1017,9 +1251,11 @@ test "table contract rejects unknown fields in closed nested index objects" {
         ,
         \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"execution":{"batch_items":0}}}
         ,
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","format":"unsupported"}}
+        \\{"type":"graph","source":{"artifact":"relations_v1","format":"unsupported"}}
         ,
         \\{"type":"graph","source":{"kind":"document_field","artifact":"relations_v1"}}
+        ,
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1"}}
         ,
         \\{"type":"graph","resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","client_value":"private"}]}
         ,
@@ -1029,9 +1265,15 @@ test "table contract rejects unknown fields in closed nested index objects" {
         ,
         \\{"type":"graph","edge_types":[{"topology":"graph"}]}
         ,
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":{"client_value":"private"}}}
+        \\{"type":"graph","source":{"artifact":"relations_v1","path":{"client_value":"private"}}}
         ,
         \\{"type":"graph","resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_limit":{"client_value":"private"}}]}
+        ,
+        \\{"type":"graph","nodes":{"model":"document"}}
+        ,
+        \\{"type":"graph","edge":{"type":"mentions"}}
+        ,
+        \\{"type":"graph","context":{"doc_fields":["title"]}}
         ,
         \\{"type":"graph","nodes":{"model":"document","client_value":"private"}}
         ,
@@ -1076,7 +1318,7 @@ test "table contract treats nullable nested index fields as omitted" {
     const config_json = try parseCreateIndexRequest(
         std.testing.allocator,
         "relations_graph",
-        "{\"type\":\"graph\",\"source\":null,\"artifact\":null,\"nodes\":null,\"edge\":null,\"context\":null,\"algebraic_planning\":null,\"edge_types\":null,\"resolvers\":null}",
+        "{\"type\":\"graph\",\"source\":null,\"artifact\":null,\"algebraic_planning\":null,\"edge_types\":null,\"resolvers\":null}",
     );
     defer std.testing.allocator.free(config_json);
     try ant_json.testing.expectEqualJsonText(
@@ -1139,7 +1381,7 @@ test "table contract rejects graph configs the runtime cannot materialize" {
         error.InvalidCreateTableRequest,
         parseCreateTableRequest(
             std.testing.allocator,
-            "{\"indexes\":{\"relations\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}}",
+            "{\"indexes\":{\"relations\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}}",
         ),
     );
 }
@@ -1162,10 +1404,10 @@ test "table contract rejects non-go full text fields" {
     );
 }
 
-test "table contract ignores create-table full text entries and preserves non-full-text indexes" {
+test "table contract maps the default alias and preserves named full-text indexes" {
     var req = try parseCreateTableRequest(
         std.testing.allocator,
-        "{\"description\":\"docs\",\"indexes\":{\"default\":{},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}}}",
+        "{\"description\":\"docs\",\"indexes\":{\"default\":{},\"body_search\":{\"type\":\"full_text\",\"field\":\"body\"},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}}}",
     );
     defer req.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("docs", req.description.?);
@@ -1175,6 +1417,10 @@ test "table contract ignores create-table full text entries and preserves non-fu
     const full_text = indexes.value.object.get("full_text_index_v0").?.object;
     try std.testing.expectEqualStrings("full_text_index_v0", full_text.get("name").?.string);
     try std.testing.expectEqualStrings("full_text", full_text.get("type").?.string);
+    const body_search = indexes.value.object.get("body_search").?.object;
+    try std.testing.expect(body_search.get("name") == null);
+    try std.testing.expectEqualStrings("full_text", body_search.get("type").?.string);
+    try std.testing.expectEqualStrings("body", body_search.get("field").?.string);
     const embedding = indexes.value.object.get("embed_idx").?.object;
     try std.testing.expect(embedding.get("name") == null);
     try std.testing.expectEqualStrings("embeddings", embedding.get("type").?.string);
@@ -1210,6 +1456,7 @@ test "table contract preserves artifact-backed public full text indexes" {
         "{\"type\":\"full_text\",\"field\":\"text\",\"artifact_name\":\"document_chunks_v1\",\"enrichments\":[{\"name\":\"document_units_v1\",\"kind\":\"asset\",\"field\":\"url\",\"content_type\":\"application/json\",\"producer_json\":\"{\\\"type\\\":\\\"document_extraction\\\",\\\"config\\\":{}}\"},{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"source_artifact_name\":\"document_units_v1\",\"field\":\"text\",\"chunk_size\":512,\"chunk_overlap\":50}]}";
     const config_json = try parseCreateIndexRequest(std.testing.allocator, "document_text", artifact_index);
     defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"field\":\"text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"artifact_name\":\"document_chunks_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"enrichments\"") != null);
 
@@ -1220,6 +1467,28 @@ test "table contract preserves artifact-backed public full text indexes" {
     defer table_req.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, table_req.indexes_json.?, "\"document_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, table_req.indexes_json.?, "\"artifact_name\":\"document_chunks_v1\"") != null);
+
+    const multi_source = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "document_text_union",
+        "{\"type\":\"full_text\",\"field\":\"text\",\"sources\":[{\"artifact\":\"title_chunks_v1\"},{\"artifact\":\"body_chunks_v1\"}]}",
+    );
+    defer std.testing.allocator.free(multi_source);
+    try std.testing.expect(std.mem.indexOf(u8, multi_source, "\"field\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, multi_source, "\"sources\":[") != null);
+
+    var multi_source_table = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"indexes\":{\"document_vectors\":{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_dense_v1\"}],\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"enrichments\":[{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512},{\"name\":\"document_dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3}]},\"document_text_union\":{\"type\":\"full_text\",\"field\":\"text\",\"sources\":[{\"artifact\":\"document_chunks_v1\"}]}}}",
+    );
+    defer multi_source_table.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, multi_source_table.indexes_json.?, "\"document_text_union\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, multi_source_table.indexes_json.?, "\"sources\":[{\"artifact\":\"document_chunks_v1\"}]") != null);
+
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(std.testing.allocator, "empty_field", "{\"type\":\"full_text\",\"field\":\"\"}"),
+    );
 
     try std.testing.expectError(
         error.InvalidCreateIndexRequest,
@@ -1403,19 +1672,18 @@ test "table contract normalizes table-definition indexes with versioned full tex
     try std.testing.expect(std.mem.indexOf(u8, normalized, "\"semantic_idx\":{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"dimension\":3}") != null);
 }
 
-test "table contract ignores full text indexes with name field in create table request" {
-    // Matches e2e test_table_create_table_ignores_user_full_text_index_entries payload
+test "table contract preserves named full text indexes with matching name fields" {
     var req = try parseCreateTableRequest(
         std.testing.allocator,
         "{\"num_shards\":1,\"indexes\":{\"search_idx\":{\"name\":\"search_idx\",\"type\":\"full_text\"},\"embed_idx\":{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}}",
     );
     defer req.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"search_idx\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"search_idx\":{\"name\":\"search_idx\",\"type\":\"full_text\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"embed_idx\"") != null);
 }
 
-test "table contract skips arbitrary public full text names in table-definition indexes" {
+test "table contract preserves arbitrary public full text names in table-definition indexes" {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
@@ -1426,8 +1694,18 @@ test "table contract skips arbitrary public full text names in table-definition 
 
     const normalized = try normalizeTableDefinitionIndexesValueAlloc(std.testing.allocator, parsed.value);
     defer std.testing.allocator.free(normalized);
-    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"search_idx\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"search_idx\":{\"name\":\"search_idx\",\"type\":\"full_text\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, normalized, "\"full_text_index_v0\"") != null);
+}
+
+test "table contract rejects create-table index names that disagree with their map identity" {
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"body_search\":{\"name\":\"other\",\"type\":\"full_text\",\"field\":\"body\"}}}",
+        ),
+    );
 }
 
 test "table contract schema update error message explains public sortable replacement for doc values" {

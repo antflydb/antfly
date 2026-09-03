@@ -39,7 +39,10 @@ pub const TransitionPhase = enum {
 
 pub const SplitStatus = struct {
     phase: TransitionPhase,
-    source_split_phase: ?shard_mod.SplitPhase,
+    // The source has no durable split phase while a destination is first being
+    // provisioned. HTTP JSON encoders may omit null optional fields, so absence
+    // on the internal wire must decode to the same state as an explicit null.
+    source_split_phase: ?shard_mod.SplitPhase = null,
     bootstrapped: bool,
     replay_required: bool,
     replay_caught_up: bool,
@@ -269,6 +272,24 @@ test "derive split transition phases" {
         const status = deriveSplitStatus(.none, true, 2, 2);
         try std.testing.expectEqual(TransitionPhase.finalized, status.phase);
     }
+}
+
+test "split status decodes an omitted nullable source phase" {
+    const encoded =
+        \\{
+        \\  "phase": "prepare",
+        \\  "bootstrapped": false,
+        \\  "replay_required": false,
+        \\  "replay_caught_up": false,
+        \\  "cutover_ready": false,
+        \\  "destination_ready_for_reads": false,
+        \\  "source_delta_sequence": 0,
+        \\  "dest_delta_sequence": 0
+        \\}
+    ;
+    const parsed = try std.json.parseFromSlice(SplitStatus, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.source_split_phase == null);
 }
 
 test "derive merge transition phases" {

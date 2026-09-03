@@ -7,6 +7,7 @@ replace github.com/dprotaso/go-yit v0.0.0-20250909171706-0a81c39169bc => github.
 
 require (
 	github.com/getkin/kin-openapi v0.142.0
+	github.com/go-json-experiment/json v0.0.0-20260214004413-d219187c3433
 	github.com/kaptinlin/jsonschema v0.7.6
 	github.com/oapi-codegen/runtime v1.6.0
 	github.com/stretchr/testify v1.11.1
@@ -16,7 +17,6 @@ require (
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/dprotaso/go-yit v0.0.0-20250909171706-0a81c39169bc // indirect
-	github.com/go-json-experiment/json v0.0.0-20260214004413-d219187c3433 // indirect
 	github.com/go-openapi/jsonpointer v0.23.1 // indirect
 	github.com/go-openapi/swag/jsonname v0.26.0 // indirect
 	github.com/goccy/go-yaml v1.19.2 // indirect

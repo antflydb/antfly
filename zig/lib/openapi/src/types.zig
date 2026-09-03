@@ -134,6 +134,9 @@ pub const Schema = struct {
     title: ?[]const u8 = null,
     description: ?[]const u8 = null,
     enum_values: []const []const u8 = &.{},
+    /// True when an enum contains the JSON null literal. String enum values
+    /// remain in enum_values so null-only and mixed nullable enums stay distinct.
+    enum_has_null: bool = false,
     properties: std.StringArrayHashMapUnmanaged(SchemaOrRef) = .{},
     required: []const []const u8 = &.{},
     items: ?*const SchemaOrRef = null,
@@ -173,7 +176,7 @@ pub const Schema = struct {
     /// Returns true if this schema represents a nullable type, handling both
     /// 3.0 (`nullable: true`) and 3.1 (`type: ["string", "null"]`) styles.
     pub fn isNullable(self: *const Schema) bool {
-        if (self.nullable) return true;
+        if (self.nullable or self.enum_has_null) return true;
         if (self.schema_type) |st| return st.includesNull();
         return false;
     }

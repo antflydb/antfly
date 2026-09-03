@@ -243,8 +243,8 @@ pub const InvokeInferenceConnectionPathParams = struct {
 };
 
 /// Parse the JSON request body for invokeInferenceConnection.
-pub fn parseInvokeInferenceConnectionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
-    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseInvokeInferenceConnectionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.ArrayHashMap(std.json.Value)) {
+    return std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for evaluate.
@@ -253,8 +253,8 @@ pub fn parseEvaluateBody(allocator: std.mem.Allocator, body: []const u8) !std.js
 }
 
 /// Parse the JSON request body for globalQuery.
-pub fn parseGlobalQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryRequest) {
-    return std.json.parseFromSlice(types.QueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseGlobalQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StatefulQueryRequest) {
+    return std.json.parseFromSlice(types.StatefulQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for restore.
@@ -555,8 +555,8 @@ pub const QueryTablePathParams = struct {
 };
 
 /// Parse the JSON request body for queryTable.
-pub fn parseQueryTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryRequest) {
-    return std.json.parseFromSlice(types.QueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseQueryTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StatefulQueryRequest) {
+    return std.json.parseFromSlice(types.StatefulQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// List table repair issues

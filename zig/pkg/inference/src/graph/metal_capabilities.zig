@@ -382,6 +382,11 @@ fn metalTransposeHasResidentShape(query: CapabilityQuery) bool {
 }
 
 fn metalReshapeHasResidentShape(query: CapabilityQuery) bool {
+    const attrs = switch (query.op) {
+        .reshape => |attrs| attrs,
+        else => return false,
+    };
+    if (attrs.runtime_shape) return false;
     const input_shape = nodeInputShape(query, 0) orelse return false;
     const output_shape = query.graph.node(query.node_id).output_shape;
     return input_shape.dtype == output_shape.dtype and
@@ -524,6 +529,7 @@ fn metalGatherHasResidentShape(query: CapabilityQuery) bool {
         .gather => |attrs| attrs,
         else => return false,
     };
+    if (attrs.elements) return false;
     if (attrs.axis != 0) return false;
     const input_shape = nodeInputShape(query, 0) orelse return false;
     const indices_shape = nodeInputShape(query, 1) orelse return false;

@@ -180,9 +180,10 @@ func SourceDocumentFromContentItem(item ContentItem, opts SourceDocumentOptions)
 	return doc, nil
 }
 
-// SourceDocumentRecords converts source documents to a linear-merge record map.
-func SourceDocumentRecords(docs []SourceDocument) map[string]any {
-	records := make(map[string]any, len(docs))
+// SourceDocumentRecords converts source documents to an object-only
+// linear-merge record map.
+func SourceDocumentRecords(docs []SourceDocument) map[string]map[string]any {
+	records := make(map[string]map[string]any, len(docs))
 	for _, doc := range docs {
 		records[doc.ID] = doc.ToDocument()
 	}

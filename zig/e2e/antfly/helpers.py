@@ -16,14 +16,12 @@
 
 from __future__ import annotations
 
-import json
 import threading
 import time
+from collections.abc import Callable
 from socketserver import BaseServer
-from typing import Callable
 
 import requests
-
 
 HTTP_SERVER_POLL_INTERVAL_S = 0.02
 
@@ -39,12 +37,14 @@ def start_http_server(server: BaseServer) -> threading.Thread:
     return thread
 
 
-def json_doc(**fields) -> str:
-    return json.dumps(fields, separators=(",", ":"), sort_keys=True)
+def json_doc(**fields: object) -> dict[str, object]:
+    """Construct a public JSON document without an intermediate encoding."""
+    return fields
 
 
-def upsert(doc_id: str, body: str) -> dict:
-    return {"kind": "upsert", "doc_id": doc_id, "body": body}
+def upsert(doc_id: str, document: dict[str, object]) -> dict[str, object]:
+    """Construct the canonical structural table-upsert mutation."""
+    return {"kind": "upsert", "doc_id": doc_id, "document": document}
 
 
 def assert_single_top_hit(payload: dict, doc_id: str) -> None:

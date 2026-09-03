@@ -29,14 +29,18 @@ class EnrichmentConfig:
             source_artifact_name (str | Unset): Existing artifact stream this enrichment consumes. Chunk enrichments may
                 consume asset artifacts; embedding enrichments may consume chunk artifacts.
             expected_dims (int | Unset): Expected embedding dimension for embedding enrichments.
+            vector_space (str | Unset): Optional stable model/token-space identifier for embedding artifacts. When omitted
+                on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally
+                compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot
+                be mixed; dimensions are always validated independently.
             chunk_size (int | Unset): Chunk size for chunk enrichments.
             chunk_overlap (int | Unset): Chunk overlap for chunk enrichments.
             chunker_json (str | Unset): Serialized chunker configuration for chunk enrichments.
             full_text_index (bool | Unset): When true on a chunk or asset enrichment, route generated text into the table's
                 default full-text index. Default: False.
             content_type (str | Unset): Produced asset content type for asset enrichments.
-            producer_json (str | Unset): Write-only serialized asset producer configuration. It may contain provider
-                credentials and is never returned.
+            producer_json (str | Unset): Write-only serialized producer configuration. For managed embedding enrichments
+                Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
             execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
                 operation. These fields tune how work is batched and do not change generated artifact identity.
     """
@@ -47,6 +51,7 @@ class EnrichmentConfig:
     template: str | Unset = UNSET
     source_artifact_name: str | Unset = UNSET
     expected_dims: int | Unset = UNSET
+    vector_space: str | Unset = UNSET
     chunk_size: int | Unset = UNSET
     chunk_overlap: int | Unset = UNSET
     chunker_json: str | Unset = UNSET
@@ -68,6 +73,8 @@ class EnrichmentConfig:
         source_artifact_name = self.source_artifact_name
 
         expected_dims = self.expected_dims
+
+        vector_space = self.vector_space
 
         chunk_size = self.chunk_size
 
@@ -101,6 +108,8 @@ class EnrichmentConfig:
             field_dict["source_artifact_name"] = source_artifact_name
         if expected_dims is not UNSET:
             field_dict["expected_dims"] = expected_dims
+        if vector_space is not UNSET:
+            field_dict["vector_space"] = vector_space
         if chunk_size is not UNSET:
             field_dict["chunk_size"] = chunk_size
         if chunk_overlap is not UNSET:
@@ -135,6 +144,8 @@ class EnrichmentConfig:
 
         expected_dims = d.pop("expected_dims", UNSET)
 
+        vector_space = d.pop("vector_space", UNSET)
+
         chunk_size = d.pop("chunk_size", UNSET)
 
         chunk_overlap = d.pop("chunk_overlap", UNSET)
@@ -161,6 +172,7 @@ class EnrichmentConfig:
             template=template,
             source_artifact_name=source_artifact_name,
             expected_dims=expected_dims,
+            vector_space=vector_space,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             chunker_json=chunker_json,

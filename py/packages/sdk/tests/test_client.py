@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import MagicMock, Mock, patch
 
 import httpx
@@ -14,11 +15,28 @@ from antfly import (  # noqa: E402
     CreatedEmbeddingsIndex,
     CreateEmbeddingsIndexRequest,
     CreateEmbeddingsIndexRequestType,
+    IndexMutationTemporarilyUnavailableError,
     StorageResourceExhaustedError,
     antfly_embedder,
+    count_graph_alias,
+    count_graph_rows,
+    graph_date_range_filter,
+    graph_numeric_range_filter,
+    graph_term_range_filter,
 )
 from antfly.client import normalize_base_url  # noqa: E402
 from antfly.client_generated.models.batch_request import BatchRequest  # noqa: E402
+from antfly.client_generated.models.graph_document_fuzzy_filter import (  # noqa: E402
+    GraphDocumentFuzzyFilter,
+)
+from antfly.client_generated.models.graph_document_numeric_range_filter import (  # noqa: E402
+    GraphDocumentNumericRangeFilter,
+)
+from antfly.client_generated.models.graph_document_term_filter import (  # noqa: E402
+    GraphDocumentTermFilter,
+)
+from antfly.client_generated.models.graph_match_node import GraphMatchNode  # noqa: E402
+from antfly.client_generated.models.graph_match_query import GraphMatchQuery  # noqa: E402
 from antfly.client_generated.models.inference_chat_message import InferenceChatMessage  # noqa: E402
 from antfly.client_generated.models.inference_generate_request import InferenceGenerateRequest  # noqa: E402
 from antfly.client_generated.models.inference_role import InferenceRole  # noqa: E402
@@ -64,6 +82,7 @@ class TestAntflyClient:
             "UNSET": "$unset",
             "INC": "$inc",
             "PUSH": "$push",
+            "PULL": "$pull",
             "ADD_TO_SET": "$addToSet",
             "MIN": "$min",
             "MAX": "$max",
@@ -78,6 +97,21 @@ class TestAntflyClient:
         assert request["type"] == "embeddings"
         assert request["dimension"] == 512
         assert "name" not in request
+
+    def test_graph_document_filters_parse_to_unambiguous_sdk_types(self) -> None:
+        exact = GraphMatchNode.from_dict({"filter": {"term": "beta", "path": "/title"}})
+        fuzzy = GraphMatchNode.from_dict({"filter": {"term": "beta", "path": "/title", "fuzziness": 1}})
+        numeric = GraphMatchNode.from_dict({"filter": {"numeric_range": {"path": "/score", "min": 0.8}}})
+
+        assert isinstance(exact.filter_, GraphDocumentTermFilter)
+        assert isinstance(fuzzy.filter_, GraphDocumentFuzzyFilter)
+        assert isinstance(numeric.filter_, GraphDocumentNumericRangeFilter)
+        assert exact.to_dict()["filter"] == {"term": "beta", "path": "/title"}
+        assert fuzzy.to_dict()["filter"] == {
+            "term": "beta",
+            "path": "/title",
+            "fuzziness": 1,
+        }
 
     def test_min_transform_serializes_from_generated_models(self) -> None:
         request = BatchRequest(
@@ -224,6 +258,25 @@ class TestAntflyClient:
         assert "table already exists" in str(exc_info.value)
 
     @patch("antfly.client.Client")
+    def test_create_table_rejects_invalid_inline_index_before_transport(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(ValueError, match=r"invalid index 'semantic'.*embedding_name"):
+            client.create_table(
+                name="test_table",
+                indexes={
+                    "semantic": {
+                        "type": "embeddings",
+                        "source_artifact_name": "document_chunks_v1",
+                    }
+                },
+            )
+
+        mock_httpx.stream.assert_not_called()
+
+    @patch("antfly.client.Client")
     def test_create_index_uses_path_identity_and_returns_config(self, mock_client_class: MagicMock) -> None:
         mock_httpx = MagicMock()
         created = {"name": "thumbnail", "type": "embeddings", "dimension": 512}
@@ -284,6 +337,20 @@ class TestAntflyClient:
             client.indexes.create("docs", "search", {"name": "other", "type": "full_text"})
 
     @patch("antfly.client.Client")
+    def test_create_index_rejects_invalid_relationships_before_transport(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(ValueError, match="requires a non-empty embedding_name"):
+            client.indexes.create(
+                "docs",
+                "vectors",
+                {"type": "embeddings", "source_artifact_name": "chunks_v1"},
+            )
+        mock_httpx.stream.assert_not_called()
+
+    @patch("antfly.client.Client")
     def test_create_index_preserves_storage_admission_retry(self, mock_client_class: MagicMock) -> None:
         mock_httpx = MagicMock()
         response = configure_response(
@@ -309,6 +376,30 @@ class TestAntflyClient:
         assert exc_info.value.retryable is True
         assert exc_info.value.retry_after_ms == 1250
         assert exc_info.value.retry_after_seconds == 2
+
+    @patch("antfly.client.Client")
+    def test_create_index_preserves_temporary_mutation_retry(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        response = configure_response(
+            mock_httpx,
+            503,
+            {
+                "error": "index_probe_unavailable",
+                "message": "model probe is temporarily unavailable",
+                "retryable": True,
+            },
+        )
+        response.headers = {"Retry-After": "4"}
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        with pytest.raises(IndexMutationTemporarilyUnavailableError) as exc_info:
+            client.indexes.create("docs", "vectors", {"type": "embeddings", "dimension": 512})
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.code == "index_probe_unavailable"
+        assert exc_info.value.retryable is True
+        assert exc_info.value.retry_after_seconds == 4
 
     @patch("antfly.client.Client")
     def test_query_preserves_sorted_cursor_contract(self, mock_client_class: MagicMock) -> None:
@@ -365,11 +456,418 @@ class TestAntflyClient:
         assert hit.field_id == "doc:2"
         assert hit.field_sort == ["2026-01-01T00:00:00Z", "doc:2"]
 
+    @patch("antfly.client.Client")
+    def test_query_forwards_named_full_text_index(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        configure_response(mock_httpx, 200, {"responses": []})
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        client.query(
+            table="docs",
+            full_text_search={"match": "singularity", "field": "text"},
+            full_text_index="document_text",
+        )
+
+        mock_httpx.stream.assert_called_once_with(
+            "POST",
+            "/db/v1/tables/docs/query",
+            json={
+                "full_text_search": {"match": "singularity", "field": "text"},
+                "full_text_index": "document_text",
+            },
+        )
+
     def test_query_rejects_ambiguous_aggregation_aliases(self) -> None:
         client = AntflyClient(base_url="http://localhost:8080")
 
         with pytest.raises(AntflyException, match="either aggregations or facets"):
             client.query(table="docs", aggregations={"a": {}}, facets={"b": {}})
+
+    @patch("antfly.client.Client")
+    def test_query_serializes_typed_graph_operations(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        configure_response(
+            mock_httpx,
+            200,
+            {
+                "responses": [
+                    {
+                        "took": 0,
+                        "status": 200,
+                        "graph_results": {
+                            "count_rows": {
+                                "kind": "aggregates",
+                                "aggregates": {"rows": {"value": "0", "exact": True}},
+                                "stats": {"returned_items": 1},
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+        graph_query = GraphMatchQuery.from_dict(
+            {
+                "index": "social",
+                "match": {"anchor": "a", "nodes": {"a": {}}, "edges": []},
+                "return": {"aggregates": {"rows": {"count": "*"}}},
+            }
+        )
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        client.query(table="docs", graph_queries={"count_rows": graph_query})
+
+        mock_httpx.stream.assert_called_once_with(
+            "POST",
+            "/db/v1/tables/docs/query",
+            json={
+                "graph_queries": {
+                    "count_rows": {
+                        "index": "social",
+                        "match": {"anchor": "a", "nodes": {"a": {}}, "edges": []},
+                        "return": {"aggregates": {"rows": {"count": "*"}}},
+                    }
+                }
+            },
+        )
+
+    def test_graph_count_helpers_construct_valid_generated_models(self) -> None:
+        assert count_graph_rows().to_dict() == {"count": "*"}
+        assert count_graph_alias("person").to_dict() == {
+            "count": "person",
+            "distinct": False,
+        }
+        assert count_graph_alias("person", distinct=True).to_dict() == {
+            "count": "person",
+            "distinct": True,
+        }
+        with pytest.raises(AntflyException, match="graph count alias"):
+            count_graph_alias("*")
+
+    def test_graph_range_helpers_are_validated_and_operation_keyed(self) -> None:
+        assert graph_numeric_range_filter("/score", min_value=0, inclusive_min=True).to_dict() == {
+            "numeric_range": {"path": "/score", "min": 0, "inclusive_min": True}
+        }
+        assert graph_term_range_filter("/status", max_value="z").to_dict() == {
+            "term_range": {"path": "/status", "max": "z"}
+        }
+        assert graph_date_range_filter("/created_at", start=datetime(2026, 1, 1, tzinfo=UTC)).to_dict() == {
+            "date_range": {"path": "/created_at", "start": "2026-01-01T00:00:00+00:00"}
+        }
+        with pytest.raises(AntflyException, match="requires min_value or max_value"):
+            graph_numeric_range_filter("/score")
+        with pytest.raises(AntflyException, match="RFC 6901"):
+            graph_term_range_filter("score", min_value="a")
+        with pytest.raises(AntflyException, match="finite number"):
+            graph_numeric_range_filter("/score", min_value=True)
+        with pytest.raises(AntflyException, match="min_value must not exceed max_value"):
+            graph_numeric_range_filter("/score", min_value=2, max_value=1)
+        with pytest.raises(AntflyException, match="must be a boolean"):
+            graph_numeric_range_filter("/score", min_value=1, inclusive_min="false")  # type: ignore[arg-type]
+        with pytest.raises(AntflyException, match="must be a string"):
+            graph_term_range_filter("/status", min_value=1)  # type: ignore[arg-type]
+        with pytest.raises(AntflyException, match="timezone-aware"):
+            graph_date_range_filter("/created_at", start=datetime(2026, 1, 1))
+        with pytest.raises(AntflyException, match="start must not exceed end"):
+            graph_date_range_filter(
+                "/created_at",
+                start=datetime(2026, 1, 2, tzinfo=UTC),
+                end=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        with pytest.raises(AntflyException, match="supported Unix-nanosecond range"):
+            graph_date_range_filter("/created_at", start=datetime(1969, 12, 31, tzinfo=UTC))
+        with pytest.raises(AntflyException, match="supported Unix-nanosecond range"):
+            graph_date_range_filter(
+                "/created_at",
+                start=datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=14))),
+            )
+        assert (
+            graph_date_range_filter(
+                "/created_at",
+                end=datetime(2554, 7, 21, 23, 34, 33, 709551, tzinfo=UTC),
+            ).to_dict()["date_range"]["end"]
+            == "2554-07-21T23:34:33.709551+00:00"
+        )
+        with pytest.raises(AntflyException, match="supported Unix-nanosecond range"):
+            graph_date_range_filter("/created_at", end=datetime(2554, 7, 21, 23, 34, 34, tzinfo=UTC))
+        normalized = graph_date_range_filter(
+            "/created_at",
+            start=datetime(2300, 1, 1, tzinfo=timezone(timedelta(seconds=30))),
+        ).to_dict()
+        assert normalized["date_range"]["start"] == "2299-12-31T23:59:30+00:00"
+
+    @pytest.mark.parametrize("distinct", [False, True])
+    def test_query_rejects_distinct_presence_on_row_count(self, distinct: bool) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        graph_query = {
+            "index": "social",
+            "match": {"anchor": "a", "nodes": {"a": {}}, "edges": []},
+            "return": {"aggregates": {"rows": {"count": "*", "distinct": distinct}}},
+        }
+
+        with pytest.raises(AntflyException, match="distinct is only valid for alias counts"):
+            client.query(table="docs", graph_queries={"count_rows": graph_query})
+
+    def test_query_rejects_invalid_graph_operation_values(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(AntflyException, match="generated graph query model or mapping"):
+            client.query(table="docs", graph_queries={"bad": 1})  # type: ignore[dict-item]
+
+    def test_query_rejects_empty_graph_queries(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(AntflyException, match="at least one named operation"):
+            client.query(table="docs", graph_queries={})
+
+    @pytest.mark.parametrize("name", [" bad", "bad\u00a0name", "bad\u200bname", "bad\u202ename", "*"])
+    def test_query_rejects_unsafe_graph_operation_names(self, name: str) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(AntflyException, match="GraphIdentifier policy"):
+            client.query(table="docs", graph_queries={name: {"traverse": {}}})
+
+    def test_query_rejects_unsafe_nested_graph_aliases(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        query = {
+            "index": "social",
+            "match": {
+                "anchor": "person",
+                "nodes": {"person": {}, "post\u200bauthor": {}},
+                "edges": [{"from": "person", "to": "post\u200bauthor"}],
+            },
+            "return": {"bindings": ["person"]},
+        }
+
+        with pytest.raises(AntflyException, match="match.nodes key"):
+            client.query(table="docs", graph_queries={"people": query})
+
+    @pytest.mark.parametrize(
+        ("edge_types", "error"),
+        [
+            (["bad\ud800"], "valid UTF-8"),
+            (["links", "links"], "duplicate edge types"),
+            (["文" * (65_536 // 3 + 1)], "at most 65536 UTF-8 bytes"),
+        ],
+    )
+    def test_query_rejects_edge_types_outside_wire_policy(self, edge_types: list[str], error: str) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        query = {
+            "match": {
+                "anchor": "person",
+                "nodes": {"person": {}, "author": {}},
+                "edges": [{"from": "person", "to": "author", "types": edge_types}],
+            },
+            "return": {"bindings": ["person"]},
+        }
+
+        with pytest.raises(AntflyException, match=error):
+            client.query(table="docs", graph_queries={"people": query})
+
+    def test_query_rejects_invalid_graph_match_edge_direction(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        query = {
+            "match": {
+                "anchor": "person",
+                "nodes": {"person": {}, "author": {}},
+                "edges": [{"from": "person", "to": "author", "direction": "sideways"}],
+            },
+            "return": {"bindings": ["person"]},
+        }
+
+        with pytest.raises(AntflyException, match="direction must be out, in, or both"):
+            client.query(table="docs", graph_queries={"people": query})
+
+        anti_join_query = {
+            "match": {
+                "anchor": "person",
+                "nodes": {"person": {}, "author": {}},
+                "edges": [],
+                "where": {"not_exists": {"edges": [{"from": "person", "to": "author", "direction": "sideways"}]}},
+            },
+            "return": {"bindings": ["person"]},
+        }
+        with pytest.raises(AntflyException, match=r"not_exists\.edges\[0\]\.direction must be out, in, or both"):
+            client.query(table="docs", graph_queries={"people": anti_join_query})
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            {
+                "match": {
+                    "anchor": "person",
+                    "nodes": {"person": {}, "author": {}},
+                    "edges": [{"from": "person", "to": "author", "edge_weight": {"min": -0.1}}],
+                },
+                "return": {"bindings": ["person"]},
+            },
+            {"traverse": {"start": {"keys": ["doc:a"]}, "edge_weight": {"max": -0.1}}},
+            {"shortest_path": {"from": {"key": "doc:a"}, "to": {"key": "doc:b"}, "edge_weight": {"min": -0.1}}},
+            {
+                "k_shortest_paths": {
+                    "from": {"key": "doc:a"},
+                    "to": {"key": "doc:b"},
+                    "k": 2,
+                    "edge_weight": {"max": -0.1},
+                }
+            },
+        ],
+    )
+    def test_query_rejects_negative_canonical_graph_weight_bounds(self, query: dict[str, object]) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        with pytest.raises(AntflyException, match="finite non-negative number"):
+            client.query(table="docs", graph_queries={"walk": {"index": "graph_idx", **query}})
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            {"traverse": {"start": {"keys": ["doc:a"]}, "edge_weight": None}},
+            {"traverse": {"start": {"keys": ["doc:a"]}, "edge_weight": {}}},
+            {
+                "shortest_path": {
+                    "from": {"key": "doc:a"},
+                    "to": {"key": "doc:b"},
+                    "objective": None,
+                }
+            },
+        ],
+    )
+    def test_query_rejects_empty_or_null_canonical_path_options(self, query: dict[str, object]) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        with pytest.raises(AntflyException):
+            client.query(table="docs", graph_queries={"walk": {"index": "graph_idx", **query}})
+
+    @pytest.mark.parametrize("operation", ["traverse", "shortest_path", "k_shortest_paths"])
+    def test_query_validates_graph_operation_direction(self, operation: str) -> None:
+        if operation == "traverse":
+            body: dict[str, object] = {"start": {"keys": ["doc:a"]}, "direction": "both"}
+        else:
+            body = {
+                "from": {"key": "doc:a"},
+                "to": {"key": "doc:b"},
+                "direction": "both",
+            }
+            if operation == "k_shortest_paths":
+                body["k"] = 2
+
+        with patch("antfly.client.Client") as mock_client_class:
+            mock_httpx = MagicMock()
+            configure_response(
+                mock_httpx,
+                200,
+                {
+                    "responses": [
+                        {
+                            "took": 0,
+                            "status": 200,
+                            "graph_results": {
+                                "walk": {
+                                    "kind": "nodes" if operation == "traverse" else "paths",
+                                    **({"nodes": []} if operation == "traverse" else {"paths": []}),
+                                    "stats": {
+                                        "returned_items": 0,
+                                        **({"truncated": False} if operation == "traverse" else {}),
+                                    },
+                                }
+                            },
+                        }
+                    ]
+                },
+            )
+            mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+            client = AntflyClient(base_url="http://localhost:8080")
+            client.query(table="docs", graph_queries={"walk": {"index": "graph_idx", operation: body}})
+            mock_httpx.stream.assert_called_once()
+
+        body["direction"] = "sideways"
+        client = AntflyClient(base_url="http://localhost:8080")
+        with pytest.raises(AntflyException, match="direction must be out, in, or both"):
+            client.query(table="docs", graph_queries={"walk": {"index": "graph_idx", operation: body}})
+
+    def test_query_rejects_more_than_eight_match_operations(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        graph_queries = {
+            f"match_{index}": {
+                "index": "graph_idx",
+                "match": {"anchor": "node", "nodes": {"node": {}}, "edges": []},
+                "return": {"bindings": ["node"]},
+            }
+            for index in range(9)
+        }
+        with pytest.raises(AntflyException, match="at most 8 match operations"):
+            client.query(table="docs", graph_queries=graph_queries)
+
+    def test_query_graph_hydration_and_table_qualifiers_fail_before_io(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        with pytest.raises(AntflyException, match="table must contain a non-whitespace"):
+            client.query(
+                table="docs",
+                graph_queries={
+                    "match": {
+                        "index": "graph",
+                        "match": {"anchor": "a", "nodes": {"a": {"table": " \t"}}, "edges": []},
+                        "return": {"bindings": ["a"]},
+                    }
+                },
+            )
+        with pytest.raises(AntflyException, match="fields requires include_documents=true"):
+            client.query(
+                table="docs",
+                graph_queries={"walk": {"index": "graph", "traverse": {"start": {"keys": ["a"]}, "fields": ["title"]}}},
+            )
+        with pytest.raises(AntflyException, match="maximum is 10000"):
+            client.query(
+                table="docs",
+                graph_queries={
+                    "match": {
+                        "index": "graph",
+                        "match": {"anchor": "a", "nodes": {"a": {}, "b": {}}, "edges": []},
+                        "return": {"bindings": ["a", "b"], "limit": 5001, "include_documents": True},
+                    }
+                },
+            )
+
+    @pytest.mark.parametrize(
+        ("start", "error"),
+        [
+            ({"result_ref": "$graph_results.bad\u200bname"}, "result_ref query name"),
+            (
+                {"result_ref": "$graph_results.people", "binding": "bad\u200bname"},
+                "traverse.start.binding",
+            ),
+            (
+                {"result_ref": "$query_results", "binding": "person"},
+                "binding requires a \\$graph_results",
+            ),
+        ],
+    )
+    def test_query_rejects_unsafe_graph_result_selectors(self, start: dict[str, object], error: str) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(AntflyException, match=error):
+            client.query(
+                table="docs",
+                graph_queries={"walk": {"index": "social", "traverse": {"start": start}}},
+            )
+
+    def test_query_identifier_preflight_matches_graph_predicate_depth_limit(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        where: dict[str, object] = {"not_equal": {"left": {"alias": "person"}, "right": {"alias": "author"}}}
+        for _ in range(16):
+            where = {"and": [where]}
+        query = {
+            "match": {
+                "anchor": "person",
+                "nodes": {"person": {}, "author": {}},
+                "edges": [{"from": "person", "to": "author"}],
+                "where": where,
+            },
+            "return": {"bindings": ["person"]},
+        }
+
+        with pytest.raises(AntflyException, match="maximum graph predicate depth"):
+            client.query(table="docs", graph_queries={"people": query})
 
     @patch("antfly.client.Client")
     @patch("antfly.client.lookup_key")

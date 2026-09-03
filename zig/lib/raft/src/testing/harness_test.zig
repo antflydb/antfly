@@ -1766,6 +1766,82 @@ test "multi-node read index preserves multiple pending contexts" {
     try std.testing.expectEqualStrings("ctx-two", read_states[1].request_ctx);
 }
 
+test "duplicate read context cannot release a stale read with delayed heartbeats" {
+    var cluster = try Cluster.initWithOptions(std.testing.allocator, &.{ 1, 2, 3 }, .{
+        .check_quorum = false,
+        .pre_vote = false,
+    });
+    defer cluster.deinit();
+
+    try cluster.campaign(1);
+    try cluster.deliverAll();
+
+    // Preserve a duplicate of follower 2's request, then deliver the request and
+    // its heartbeats while holding back only the heartbeat responses.
+    try cluster.readIndex(2, "A");
+    try std.testing.expectEqual(@as(usize, 1), cluster.pendingMessages());
+    var duplicate_a = try cluster.pendingMessageSlice()[0].clone(std.testing.allocator);
+    defer duplicate_a.deinit(std.testing.allocator);
+
+    try cluster.deliverNext();
+    try cluster.deliverNext();
+    try cluster.deliverNext();
+    try std.testing.expectEqual(@as(usize, 2), cluster.pendingMessages());
+
+    var delayed_heartbeat_responses = std.ArrayListUnmanaged(message.Message).empty;
+    defer {
+        for (delayed_heartbeat_responses.items) |*msg| msg.deinit(std.testing.allocator);
+        delayed_heartbeat_responses.deinit(std.testing.allocator);
+    }
+    try delayed_heartbeat_responses.ensureUnusedCapacity(std.testing.allocator, cluster.network.items.len);
+    while (cluster.network.items.len > 0) {
+        const delayed = cluster.network.orderedRemove(0);
+        try std.testing.expectEqual(message.MessageType.heartbeat_response, delayed.msg_type);
+        delayed_heartbeat_responses.appendAssumeCapacity(delayed);
+    }
+
+    // A periodic heartbeat completes A with a fresh quorum round. The original
+    // responses remain delayed until after another leader commits a newer entry.
+    try cluster.tick(1, 1);
+    try cluster.deliverAll();
+    const read_a = try cluster.collectReadStates(2);
+    defer freeReadStates(std.testing.allocator, read_a);
+    try std.testing.expectEqual(@as(usize, 1), read_a.len);
+    try std.testing.expectEqualStrings("A", read_a[0].request_ctx);
+
+    try cluster.block(1, 2);
+    try cluster.block(2, 1);
+    try cluster.block(1, 3);
+    try cluster.block(3, 1);
+
+    try cluster.campaign(2);
+    try cluster.deliverAll();
+    try std.testing.expectEqual(core.types.StateRole.leader, cluster.node(2).status().soft.role);
+    try cluster.propose(2, "newer-entry");
+    try cluster.deliverAll();
+    const minimum_safe_b = cluster.node(2).status().hard.commit_index;
+    try std.testing.expect(minimum_safe_b > cluster.node(1).status().hard.commit_index);
+
+    // Ask the isolated, stale leader for B, then replay the duplicate A request
+    // and A's original heartbeat responses. The pre-fix implementation attributed
+    // those responses to the duplicate and released B at the stale commit index.
+    try cluster.readIndex(1, "B");
+    try cluster.node(1).step(duplicate_a);
+    try cluster.collectReady(1);
+    for (delayed_heartbeat_responses.items) |delayed| {
+        try cluster.node(1).step(delayed);
+        try cluster.collectReady(1);
+    }
+
+    const stale_leader_reads = try cluster.collectReadStates(1);
+    defer freeReadStates(std.testing.allocator, stale_leader_reads);
+    for (stale_leader_reads) |read_state| {
+        if (!std.mem.eql(u8, "B", read_state.request_ctx)) continue;
+        try std.testing.expect(read_state.index >= minimum_safe_b);
+    }
+    try std.testing.expectEqual(@as(usize, 0), stale_leader_reads.len);
+}
+
 test "follower read index forwards to leader and surfaces local read state" {
     var cluster = try Cluster.initWithOptions(std.testing.allocator, &.{ 1, 2, 3 }, .{
         .check_quorum = false,

@@ -981,6 +981,8 @@ fn groupRestorePending(
             range.restore_location,
             range.restore_snapshot_path,
             range.restore_artifact_sha256,
+            range.restore_native_manifest_size_bytes,
+            range.restore_native_manifest_sha256,
         )) |progress| {
             if (!progress.runtime_repair_complete) continue;
             restored += 1;
@@ -1018,6 +1020,8 @@ fn findRestoreProgress(
     location: []const u8,
     snapshot_path: []const u8,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64,
+    native_manifest_sha256: []const u8,
 ) ?metadata_table_manager.RestoreProgressRecord {
     for (records) |record| {
         if (record.table_id != table_id) continue;
@@ -1027,6 +1031,8 @@ fn findRestoreProgress(
         if (!std.mem.eql(u8, record.location, location)) continue;
         if (!std.mem.eql(u8, record.snapshot_path, snapshot_path)) continue;
         if (!std.mem.eql(u8, record.artifact_sha256, artifact_sha256)) continue;
+        if (record.native_manifest_size_bytes != native_manifest_size_bytes) continue;
+        if (!std.mem.eql(u8, record.native_manifest_sha256, native_manifest_sha256)) continue;
         return record;
     }
     return null;

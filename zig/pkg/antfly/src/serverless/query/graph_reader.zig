@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const graph_edge_type = @import("../../graph/edge_type.zig");
 const graph_segment_mod = @import("../graph_segment/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const request_mod = @import("request.zig");
@@ -36,7 +37,7 @@ pub const Neighbor = struct {
 pub const GraphNeighborLimits = struct {
     max_limit: usize = 100_000,
     max_edge_types: usize = 64,
-    max_edge_type_bytes: usize = 64 * 1024,
+    max_edge_type_bytes: usize = graph_edge_type.max_bytes,
     max_edges_scanned: usize = 1_000_000,
     max_result_bytes: usize = 64 * 1024 * 1024,
 
@@ -52,7 +53,7 @@ pub const GraphTraversalLimits = struct {
     max_depth: u32 = 64,
     max_nodes_visited: usize = 100_000,
     max_edge_types: usize = 64,
-    max_edge_type_bytes: usize = 64 * 1024,
+    max_edge_type_bytes: usize = graph_edge_type.max_bytes,
     max_edges_scanned: usize = 1_000_000,
     max_result_bytes: usize = 64 * 1024 * 1024,
 

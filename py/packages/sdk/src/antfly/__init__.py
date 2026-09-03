@@ -2,7 +2,15 @@
 Antfly SDK - Python client for Antfly distributed key-value store and search engine.
 """
 
-from .client import AntflyClient, CreatedIndex, CreateIndexRequest, IndexOperations, antfly_embedder
+from .client import (
+    AntflyClient,
+    CreatedIndex,
+    CreateIndexRequest,
+    GraphQueriesInput,
+    GraphQueryInput,
+    IndexOperations,
+    antfly_embedder,
+)
 from .client_generated.models import (
     CreateAlgebraicIndexRequest,
     CreateAlgebraicIndexRequestType,
@@ -27,9 +35,36 @@ from .exceptions import (
     AntflyAuthError,
     AntflyConnectionError,
     AntflyException,
+    IndexMutationTemporarilyUnavailableError,
     InferenceAPIError,
     InferenceCapacityError,
     StorageResourceExhaustedError,
+)
+from .graph_identifier_policy_generated import (
+    GRAPH_IDENTIFIER_POLICY_VERSION,
+    GRAPH_IDENTIFIER_UNICODE_VERSION,
+    is_valid_graph_identifier,
+)
+from .graph_queries import (
+    GraphCountAggregate,
+    count_graph_alias,
+    count_graph_rows,
+    graph_date_range_filter,
+    graph_numeric_range_filter,
+    graph_term_range_filter,
+)
+from .index_config import (
+    ArtifactEmbeddingSource,
+    FullTextArtifactSource,
+    GraphArtifactSource,
+    GraphContextMapping,
+    GraphEdgeMapping,
+    GraphNodeMapping,
+    artifact_embedding_index_config,
+    artifact_full_text_index_config,
+    artifact_index_sources,
+    graph_index_sources,
+    validate_create_index_request_relationships,
 )
 
 __version__ = "0.1.0"
@@ -47,6 +82,8 @@ __all__ = [
     "CreateAlgebraicIndexRequest",
     "CreateAlgebraicIndexRequestType",
     "CreatedIndex",
+    "GraphQueryInput",
+    "GraphQueriesInput",
     "CreatedFullTextIndex",
     "CreatedEmbeddingsIndex",
     "CreatedGraphIndex",
@@ -57,12 +94,33 @@ __all__ = [
     "EmbedderProvider",
     "antfly_embedder",
     "AntflyException",
+    "IndexMutationTemporarilyUnavailableError",
     "AntflyConnectionError",
     "AntflyAuthError",
     "InferenceAPIError",
     "InferenceCapacityError",
     "StorageResourceExhaustedError",
+    "GRAPH_IDENTIFIER_POLICY_VERSION",
+    "GRAPH_IDENTIFIER_UNICODE_VERSION",
+    "is_valid_graph_identifier",
+    "GraphCountAggregate",
+    "count_graph_alias",
+    "count_graph_rows",
+    "graph_date_range_filter",
+    "graph_numeric_range_filter",
+    "graph_term_range_filter",
     "SparseEmbedding",
     "PackedSparseEmbedding",
+    "ArtifactEmbeddingSource",
+    "FullTextArtifactSource",
+    "GraphArtifactSource",
+    "GraphContextMapping",
+    "GraphEdgeMapping",
+    "GraphNodeMapping",
+    "artifact_embedding_index_config",
+    "artifact_full_text_index_config",
+    "artifact_index_sources",
+    "graph_index_sources",
+    "validate_create_index_request_relationships",
     "__version__",
 ]

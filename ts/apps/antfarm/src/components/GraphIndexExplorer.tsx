@@ -23,14 +23,15 @@ import {
 } from "@antfly/design-system";
 import { ForceGraph, type GraphData, type GraphEdge, type GraphNode } from "@antfly/graph";
 import type {
-  Edge,
-  EdgeDirection,
   EdgeTypeConfig,
+  GraphNodesResult,
+  GraphPathEdge,
+  GraphPathEndpoint,
+  GraphPathObjective,
+  GraphPathsResult,
   GraphQuery,
-  GraphQueryResult,
+  GraphResult,
   IndexStatus,
-  PathWeightMode,
-  QueryRequest,
 } from "@antfly/sdk";
 import { GitBranch, Hash, Loader2, Network, RefreshCw, Route, Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -41,10 +42,10 @@ type GraphMode = "neighbors" | "traverse" | "shortest_path";
 
 type ExplorerNodeMeta = {
   key: string;
+  table?: string;
   depth?: number;
-  distance?: number;
   document?: Record<string, unknown>;
-  path?: string[];
+  path?: GraphPathEndpoint[];
   resultCount?: number;
 };
 
@@ -101,6 +102,14 @@ function documentLabel(key: string, document?: Record<string, unknown>) {
   return displayKey(key);
 }
 
+function qualifiedDocumentLabel(
+  identity: { key: string; table?: string },
+  document?: Record<string, unknown>
+) {
+  const label = documentLabel(identity.key, document);
+  return identity.table ? displayKey(`${identity.table}/${label}`) : label;
+}
+
 function formatNumber(value: number | undefined, fallback = "-") {
   if (value === undefined || Number.isNaN(value)) return fallback;
   return Intl.NumberFormat(undefined, { maximumFractionDigits: 3 }).format(value);
@@ -119,17 +128,19 @@ function controlId(prefix: string, value: string) {
 }
 
 function normalizeEdge(
-  edge: Partial<Edge>,
+  edge: GraphPathEdge,
   fallbackIndex: number,
   pathEdge = false
 ): ExplorerEdge | null {
-  const source = edge.source;
-  const target = edge.target;
+  const source = edge.from.key;
+  const target = edge.to.key;
   if (!source || !target) return null;
+  const sourceId = graphNodeId(edge.from);
+  const targetId = graphNodeId(edge.to);
   return {
-    id: `${source}->${target}:${edge.type ?? "edge"}:${fallbackIndex}`,
-    source,
-    target,
+    id: `${sourceId}->${targetId}:${edge.type ?? "edge"}:${fallbackIndex}`,
+    source: sourceId,
+    target: targetId,
     weight: edge.weight ?? 1,
     type: edge.type,
     metadata: edge.metadata,
@@ -137,73 +148,78 @@ function normalizeEdge(
   };
 }
 
+function graphNodeId(identity: { key: string; table?: string }) {
+  // A JSON tuple is unambiguous even when user-controlled names contain the
+  // separator characters commonly used by ad-hoc composite keys.
+  return JSON.stringify([identity.table ?? null, identity.key]);
+}
+
 function addNode(
   nodes: Map<string, GraphNode<ExplorerNodeMeta>>,
-  key: string,
+  identity: string | { key: string; table?: string },
   patch?: Partial<ExplorerNodeMeta>
 ) {
-  const existing = nodes.get(key);
-  const metadata = { ...(existing?.metadata ?? { key }), key, ...patch };
-  nodes.set(key, {
-    id: key,
-    label: documentLabel(key, metadata.document),
+  const normalized = typeof identity === "string" ? { key: identity } : identity;
+  const id = graphNodeId(normalized);
+  const existing = nodes.get(id);
+  const metadata = { ...(existing?.metadata ?? normalized), ...normalized, ...patch };
+  nodes.set(id, {
+    id,
+    label: qualifiedDocumentLabel(normalized, metadata.document),
     type: metadata.depth === 0 ? "start" : "document",
     metric: metadata.resultCount ?? (metadata.depth !== undefined ? 1 / (metadata.depth + 1) : 1),
     metadata,
   });
 }
 
-function buildGraph(result: GraphQueryResult | null, startKey: string): ExplorerGraph {
+function graphVisualizationResult(
+  result: GraphResult | null
+): GraphNodesResult | GraphPathsResult | null {
+  return result?.kind === "nodes" || result?.kind === "paths" ? result : null;
+}
+
+function buildGraph(result: GraphResult | null, startKey: string): ExplorerGraph {
   const nodes = new Map<string, GraphNode<ExplorerNodeMeta>>();
   const edges = new Map<string, ExplorerEdge>();
 
   if (startKey) addNode(nodes, startKey, { depth: 0 });
 
-  for (const node of result?.nodes ?? []) {
+  // The explorer renders traversal/path results. Bindings and aggregates are
+  // valid graph-query results, but do not have a node/path visualization.
+  const graphResult = graphVisualizationResult(result);
+
+  for (const node of graphResult?.kind === "nodes" ? graphResult.nodes : []) {
     if (!node.key) continue;
-    addNode(nodes, node.key, {
+    const nodeIdentity = { key: node.key, table: node.table };
+    const pathNodes = node.path ?? [];
+    addNode(nodes, nodeIdentity, {
       depth: node.depth,
-      distance: node.distance,
       document: node.document as Record<string, unknown> | undefined,
-      path: node.path,
+      path: pathNodes,
       resultCount: 1,
     });
+    for (const identity of pathNodes) addNode(nodes, identity);
 
     for (const edge of node.path_edges ?? []) {
       const normalized = normalizeEdge(edge, edges.size, true);
       if (normalized) {
         edges.set(normalized.id, normalized);
-        addNode(nodes, normalized.source);
-        addNode(nodes, normalized.target);
-      }
-    }
-
-    for (const edge of node.edges ?? []) {
-      const normalized = normalizeEdge(edge, edges.size);
-      if (normalized) {
-        edges.set(normalized.id, normalized);
-        addNode(nodes, normalized.source);
-        addNode(nodes, normalized.target);
+        if (!nodes.has(normalized.source)) addNode(nodes, edge.from);
+        if (!nodes.has(normalized.target)) addNode(nodes, edge.to);
       }
     }
   }
 
-  for (const path of result?.paths ?? []) {
-    for (const key of path.nodes ?? []) addNode(nodes, key, { resultCount: 1 });
+  for (const item of graphResult?.kind === "paths" ? graphResult.paths : []) {
+    const path = item.path;
+    const pathNodes = path.nodes ?? [];
+    for (const identity of pathNodes) addNode(nodes, identity, { resultCount: 1 });
     for (const edge of path.edges ?? []) {
-      if (!edge.source || !edge.target) continue;
-      const normalized: ExplorerEdge = {
-        id: `${edge.source}->${edge.target}:${edge.type ?? "path"}:${edges.size}`,
-        source: edge.source,
-        target: edge.target,
-        weight: edge.weight ?? 1,
-        type: edge.type,
-        metadata: edge.metadata,
-        pathEdge: true,
-      };
+      const normalized = normalizeEdge(edge, edges.size, true);
+      if (!normalized) continue;
       edges.set(normalized.id, normalized);
-      addNode(nodes, normalized.source);
-      addNode(nodes, normalized.target);
+      if (!nodes.has(normalized.source)) addNode(nodes, edge.from);
+      if (!nodes.has(normalized.target)) addNode(nodes, edge.to);
     }
   }
 
@@ -220,12 +236,18 @@ function nodeTypeColors() {
   };
 }
 
-function resultSummary(result: GraphQueryResult | null) {
+function resultSummary(result: GraphResult | null) {
   if (!result) return { total: 0, paths: 0 };
-  return {
-    total: result.total ?? result.nodes?.length ?? result.paths?.length ?? 0,
-    paths: result.paths?.length ?? 0,
-  };
+  switch (result.kind) {
+    case "nodes":
+      return { total: result.stats.returned_items, paths: 0 };
+    case "paths":
+      return { total: result.stats.returned_items, paths: result.paths.length };
+    case "bindings":
+      return { total: result.rows.length, paths: 0 };
+    case "aggregates":
+      return { total: Object.keys(result.aggregates).length, paths: 0 };
+  }
 }
 
 function coerceInteger(value: string, fallback: number, min: number, max: number) {
@@ -255,7 +277,7 @@ export function GraphIndexExplorer({
   initialMode?: GraphMode;
   initialStartKey?: string;
   initialTargetKey?: string;
-  initialResult?: GraphQueryResult | null;
+  initialResult?: GraphResult | null;
 }) {
   const api = useApi();
   const graphIndexes = useMemo(() => graphIndexesOnly(indexes), [indexes]);
@@ -264,8 +286,7 @@ export function GraphIndexExplorer({
   const availableEdgeTypes = useMemo(() => edgeTypesForIndex(selectedIndex), [selectedIndex]);
   const [selectedEdgeTypes, setSelectedEdgeTypes] = useState<string[]>([]);
   const [mode, setMode] = useState<GraphMode>(initialMode);
-  const [direction, setDirection] = useState<EdgeDirection>("out");
-  const [weightMode, setWeightMode] = useState<PathWeightMode>("min_hops");
+  const [objective, setObjective] = useState<GraphPathObjective>("min_hops");
   const [startKey, setStartKey] = useState(initialStartKey);
   const [targetKey, setTargetKey] = useState(initialTargetKey);
   const [maxDepth, setMaxDepth] = useState(2);
@@ -275,7 +296,7 @@ export function GraphIndexExplorer({
   const [isLoading, setIsLoading] = useState(false);
   const [isLoadingKeys, setIsLoadingKeys] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<GraphQueryResult | null>(initialResult);
+  const [result, setResult] = useState<GraphResult | null>(initialResult);
   const [sampleKeys, setSampleKeys] = useState<string[]>([]);
   const [selectedNode, setSelectedNode] = useState<GraphNode<ExplorerNodeMeta> | null>(null);
 
@@ -305,7 +326,7 @@ export function GraphIndexExplorer({
       const response = await api.tables.query(tableName, {
         filter_query: { match_all: {} },
         limit: 20,
-      } as QueryRequest);
+      });
       const keys =
         response?.responses?.[0]?.hits?.hits?.map((hit) => hit._id).filter(Boolean) ?? [];
       setSampleKeys(keys);
@@ -331,31 +352,38 @@ export function GraphIndexExplorer({
     setError(null);
     setSelectedNode(null);
 
-    const params = {
-      edge_types: selectedEdgeTypes.length > 0 ? selectedEdgeTypes : undefined,
-      direction,
-      max_depth: maxDepth,
-      max_results: mode === "shortest_path" ? undefined : maxResults,
-      min_weight: minWeight > 0 ? minWeight : undefined,
-      include_paths: includePaths,
-      deduplicate_nodes: true,
-      weight_mode: mode === "shortest_path" ? weightMode : undefined,
-    };
-    const graphQuery: GraphQuery = {
-      type: mode,
-      index_name: selectedIndex.config.name,
-      start_nodes: { keys: [startKey.trim()] },
-      target_nodes: mode === "shortest_path" ? { keys: [targetKey.trim()] } : undefined,
-      params,
-      include_documents: true,
-      include_edges: true,
-    };
+    const graphQuery: GraphQuery =
+      mode === "shortest_path"
+        ? {
+            index: selectedIndex.config.name,
+            shortest_path: {
+              from: { key: startKey.trim() },
+              to: { key: targetKey.trim() },
+              edge_types: selectedEdgeTypes.length > 0 ? selectedEdgeTypes : undefined,
+              max_depth: maxDepth,
+              edge_weight: minWeight > 0 ? { min: minWeight } : undefined,
+              objective,
+              include_documents: true,
+            },
+          }
+        : {
+            index: selectedIndex.config.name,
+            traverse: {
+              start: { keys: [startKey.trim()] },
+              edge_types: selectedEdgeTypes.length > 0 ? selectedEdgeTypes : undefined,
+              max_depth: mode === "neighbors" ? 1 : maxDepth,
+              limit: maxResults,
+              edge_weight: minWeight > 0 ? { min: minWeight } : undefined,
+              include_paths: includePaths,
+              include_documents: true,
+            },
+          };
 
     try {
       const response = await api.tables.query(tableName, {
-        graph_searches: { explorer: graphQuery },
+        graph_queries: { explorer: graphQuery },
         limit: 10,
-      } as QueryRequest);
+      });
       const graphResult = response?.responses?.[0]?.graph_results?.explorer ?? null;
       setResult(graphResult);
     } catch (err) {
@@ -365,18 +393,17 @@ export function GraphIndexExplorer({
     }
   }, [
     api,
-    direction,
     includePaths,
     maxDepth,
     maxResults,
     minWeight,
     mode,
+    objective,
     selectedEdgeTypes,
     selectedIndex,
     startKey,
     tableName,
     targetKey,
-    weightMode,
   ]);
 
   const toggleEdgeType = (edgeType: string, checked: boolean) => {
@@ -526,50 +553,32 @@ export function GraphIndexExplorer({
               </div>
             )}
 
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-2">
-                <Label>Direction</Label>
-                <Select
-                  value={direction}
-                  onValueChange={(value) => setDirection(value as EdgeDirection)}
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="out">Out</SelectItem>
-                    <SelectItem value="in">In</SelectItem>
-                    <SelectItem value="both">Both</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="graph-max-depth">Depth</Label>
-                <Input
-                  id="graph-max-depth"
-                  type="number"
-                  min={1}
-                  max={12}
-                  value={maxDepth}
-                  onChange={(event) => setMaxDepth(coerceInteger(event.target.value, 2, 1, 12))}
-                />
-              </div>
+            <div className="space-y-2">
+              <Label htmlFor="graph-max-depth">Outgoing depth</Label>
+              <Input
+                id="graph-max-depth"
+                type="number"
+                min={1}
+                max={12}
+                value={maxDepth}
+                onChange={(event) => setMaxDepth(coerceInteger(event.target.value, 2, 1, 12))}
+              />
             </div>
 
             {mode === "shortest_path" ? (
               <div className="space-y-2">
                 <Label>Path score</Label>
                 <Select
-                  value={weightMode}
-                  onValueChange={(value) => setWeightMode(value as PathWeightMode)}
+                  value={objective}
+                  onValueChange={(value) => setObjective(value as GraphPathObjective)}
                 >
                   <SelectTrigger>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="min_hops">Min hops</SelectItem>
-                    <SelectItem value="min_weight">Min weight</SelectItem>
-                    <SelectItem value="max_weight">Max weight</SelectItem>
+                    <SelectItem value="min_weight_sum">Minimum total weight</SelectItem>
+                    <SelectItem value="max_weight_product">Maximum weight product</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -695,25 +704,17 @@ export function GraphIndexExplorer({
                   <div className="text-xs text-muted-foreground">Key</div>
                   <div className="break-all font-mono text-sm">{selectedNode.metadata?.key}</div>
                 </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <div>
-                    <div className="text-xs text-muted-foreground">Depth</div>
-                    <div className="font-medium">{selectedNode.metadata?.depth ?? "-"}</div>
-                  </div>
-                  <div>
-                    <div className="text-xs text-muted-foreground">Distance</div>
-                    <div className="font-medium">
-                      {formatNumber(selectedNode.metadata?.distance)}
-                    </div>
-                  </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">Depth</div>
+                  <div className="font-medium">{selectedNode.metadata?.depth ?? "-"}</div>
                 </div>
                 {selectedNode.metadata?.path && selectedNode.metadata.path.length > 0 && (
                   <div>
                     <div className="mb-1 text-xs text-muted-foreground">Path</div>
                     <div className="space-y-1">
-                      {selectedNode.metadata.path.map((key) => (
-                        <Badge key={key} className="mr-1 max-w-full">
-                          {displayKey(key)}
+                      {selectedNode.metadata.path.map((identity) => (
+                        <Badge key={graphNodeId(identity)} className="mr-1 max-w-full">
+                          {qualifiedDocumentLabel(identity)}
                         </Badge>
                       ))}
                     </div>

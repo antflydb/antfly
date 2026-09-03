@@ -11,7 +11,11 @@ FILES = {
     Path("api/query_operations/global_query.py"): 5,
     Path("api/query_operations/query_table.py"): 5,
 }
-REQUIRED_BODY = re.compile(r"(body:\s+QueryRequest\s+\|\s+File)\s+\|\s+Unset\s*=\s*UNSET")
+# The public HTTP operations intentionally expose the stateful compatibility
+# envelope, while the SDK's primary QueryRequest model remains canonical.
+# Keep this post-generation check tied to the endpoint body contract rather
+# than the canonical model's historical name.
+REQUIRED_BODY = re.compile(r"(body:\s+StatefulQueryRequest\s+\|\s+File)\s+\|\s+Unset\s*=\s*UNSET")
 NDJSON_HEADER = 'headers["Content-Type"] = "application/x-ndjson"'
 
 

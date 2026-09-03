@@ -2,7 +2,13 @@
  * Unit tests for the Antfly SDK client using Vitest
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { CreateTableRequest, QueryRequest, TableStatus } from "../src/types.js";
+import type {
+  ClusterStatus,
+  CreateTableRequest,
+  QueryRequest,
+  TableQueryRequest,
+  TableStatus,
+} from "../src/types.js";
 
 // Mock openapi-fetch at the top level
 const mockGet = vi.fn();
@@ -30,6 +36,7 @@ vi.mock("openapi-fetch", () => ({
 const {
   AntflyClient,
   HierarchyCursorStaleError,
+  IndexMutationTemporarilyUnavailableError,
   QueryTemporarilyUnavailableError,
   StorageResourceExhaustedError,
   StorageReadTemporarilyUnavailableError,
@@ -115,6 +122,26 @@ describe("AntflyClient", () => {
     });
   });
 
+  describe("status", () => {
+    it("returns the typed deployment capability contract", async () => {
+      const status: ClusterStatus = {
+        health: "healthy",
+        deployment_mode: "standalone",
+        index_capabilities: { artifact_sources: true, artifact_sources_state: "available" },
+      };
+      mockGet.mockResolvedValueOnce({ data: status, error: undefined });
+
+      await expect(client.getStatus()).resolves.toEqual(status);
+      expect(mockGet).toHaveBeenCalledWith("/db/v1/status");
+    });
+
+    it("rejects an empty successful status response", async () => {
+      mockGet.mockResolvedValueOnce({ data: undefined, error: undefined });
+
+      await expect(client.getStatus()).rejects.toThrow("response body was empty");
+    });
+  });
+
   describe("query", () => {
     it("should execute global query", async () => {
       const mockResponse = {
@@ -185,8 +212,9 @@ describe("AntflyClient", () => {
         error: undefined,
       });
 
-      const request: QueryRequest = {
+      const request: TableQueryRequest = {
         table: "products",
+        full_text_index: "product_text",
         full_text_search: {
           match: "laptop",
           field: "name",
@@ -273,6 +301,22 @@ describe("AntflyClient", () => {
       });
     });
 
+    it("rejects invalid inline indexes before creating a table", async () => {
+      const config = {
+        indexes: {
+          semantic: {
+            type: "embeddings",
+            source_artifact_name: "document_chunks_v1",
+          },
+        },
+      } as CreateTableRequest;
+
+      await expect(client.tables.create("new_table", config)).rejects.toThrow(
+        'Invalid index "semantic": Embedding source_artifact_name requires a non-empty embedding_name.'
+      );
+      expect(mockPost).not.toHaveBeenCalled();
+    });
+
     it("should query a specific table", async () => {
       const mockResponse = {
         responses: [
@@ -313,7 +357,7 @@ describe("AntflyClient", () => {
         error: undefined,
       });
       const controller = new AbortController();
-      const request: QueryRequest = { limit: 3 };
+      const request: TableQueryRequest = { limit: 3 };
 
       await client.tables.query("products", request, { signal: controller.signal });
 
@@ -322,6 +366,22 @@ describe("AntflyClient", () => {
         body: request,
         signal: controller.signal,
       });
+    });
+
+    it("rejects a competing body table on table-scoped queries before transport", async () => {
+      const ambiguous = { table: "other", limit: 3 } as QueryRequest;
+
+      await expect(
+        client.tables.query("products", ambiguous as unknown as TableQueryRequest)
+      ).rejects.toThrow(
+        'request.table must be omitted; the route already selects table "products"'
+      );
+      await expect(
+        client.tables.multiquery("products", [ambiguous as unknown as TableQueryRequest])
+      ).rejects.toThrow(
+        'requests[0].table must be omitted; the route already selects table "products"'
+      );
+      expect(mockPost).not.toHaveBeenCalled();
     });
 
     it("formats table query Problem Details errors", async () => {
@@ -838,13 +898,10 @@ describe("AntflyClient", () => {
       });
 
       expect(result).toEqual(created);
-      expect(mockPost).toHaveBeenCalledWith(
-        "/db/v1/tables/{tableName}/indexes/{indexName}",
-        {
-          params: { path: { tableName: "wikipedia", indexName: "thumbnail" } },
-          body: { type: "embeddings", dimension: 512 },
-        }
-      );
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/tables/{tableName}/indexes/{indexName}", {
+        params: { path: { tableName: "wikipedia", indexName: "thumbnail" } },
+        body: { type: "embeddings", dimension: 512 },
+      });
     });
 
     it("rejects an empty create response", async () => {
@@ -855,6 +912,16 @@ describe("AntflyClient", () => {
           dimension: 512,
         })
       ).rejects.toThrow("unexpected empty response");
+    });
+
+    it("rejects invalid index field relationships before transport", async () => {
+      await expect(
+        client.indexes.create("wikipedia", "thumbnail", {
+          type: "embeddings",
+          source_artifact_name: "thumbnail_chunks_v1",
+        })
+      ).rejects.toThrow("requires a non-empty embedding_name");
+      expect(mockPost).not.toHaveBeenCalled();
     });
 
     it("preserves storage admission retry metadata", async () => {
@@ -911,6 +978,37 @@ describe("AntflyClient", () => {
           dimension: 512,
         })
       ).rejects.toMatchObject({ retryAfterMs: 3000, retryAfterSeconds: 3 });
+    });
+
+    it("preserves temporary index mutation retry metadata", async () => {
+      mockPost.mockResolvedValueOnce({
+        data: undefined,
+        error: {
+          error: "index_probe_unavailable",
+          message: "model probe is temporarily unavailable",
+          retryable: true,
+        },
+        response: {
+          status: 503,
+          headers: new Headers({ "Retry-After": "4" }),
+        },
+      });
+
+      try {
+        await client.indexes.create("wikipedia", "thumbnail", {
+          type: "embeddings",
+          dimension: 512,
+        });
+        expect.fail("expected temporary index mutation failure");
+      } catch (error) {
+        expect(error).toBeInstanceOf(IndexMutationTemporarilyUnavailableError);
+        expect(error).toMatchObject({
+          status: 503,
+          code: "index_probe_unavailable",
+          retryable: true,
+          retryAfterSeconds: 4,
+        });
+      }
     });
   });
 

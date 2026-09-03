@@ -45,6 +45,9 @@ pub fn onnxDTypeToTermite(dt: DataType) !DType {
         .float32 => .f32,
         .float16 => .f16,
         .bfloat16 => .bf16,
+        .float64 => .f64,
+        .int8 => .i8,
+        .int16 => .i16,
         .int32 => .i32,
         .int64 => .i64,
         .uint8 => .u8,
@@ -282,6 +285,17 @@ fn extractRawDataAsF32(allocator: std.mem.Allocator, raw: []const u8, dt: DataTy
                 result[i] = @floatFromInt(v);
             }
         },
+        .int8 => {
+            if (raw.len < count) return error.InsufficientData;
+            for (0..count) |i| result[i] = @floatFromInt(@as(i8, @bitCast(raw[i])));
+        },
+        .int16 => {
+            if (raw.len < count * 2) return error.InsufficientData;
+            for (0..count) |i| {
+                const v = std.mem.readInt(i16, raw[i * 2 ..][0..2], .little);
+                result[i] = @floatFromInt(v);
+            }
+        },
         .int64 => {
             if (raw.len < count * 8) return error.InsufficientData;
             for (0..count) |i| {
@@ -394,8 +408,25 @@ test "onnxDTypeToTermite" {
     try std.testing.expectEqual(DType.f32, try onnxDTypeToTermite(.float32));
     try std.testing.expectEqual(DType.f16, try onnxDTypeToTermite(.float16));
     try std.testing.expectEqual(DType.bf16, try onnxDTypeToTermite(.bfloat16));
+    try std.testing.expectEqual(DType.f64, try onnxDTypeToTermite(.float64));
+    try std.testing.expectEqual(DType.i8, try onnxDTypeToTermite(.int8));
+    try std.testing.expectEqual(DType.i16, try onnxDTypeToTermite(.int16));
     try std.testing.expectEqual(DType.i32, try onnxDTypeToTermite(.int32));
     try std.testing.expectEqual(DType.i64, try onnxDTypeToTermite(.int64));
+}
+
+test "extractFloat32 from raw_data int8" {
+    const allocator = std.testing.allocator;
+    const values = [_]i8{ -128, -3, 0, 7, 127 };
+    var dims = [_]i64{values.len};
+    const tensor = TensorProto{
+        .dims = &dims,
+        .data_type = .int8,
+        .raw_data = std.mem.sliceAsBytes(&values),
+    };
+    const result = try extractFloat32(allocator, &tensor);
+    defer allocator.free(result);
+    try std.testing.expectEqualSlices(f32, &.{ -128.0, -3.0, 0.0, 7.0, 127.0 }, result);
 }
 
 test "numElements" {

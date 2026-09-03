@@ -456,6 +456,12 @@ pub const Storage = struct {
         /// The host guarantees that rename_absolute is an atomic replacement
         /// when source and destination are siblings on the same storage.
         rename_is_atomic: bool = false,
+        /// Logical storage paths share the process host namespace and may be
+        /// captured and atomically published as a complete directory
+        /// generation. This is intentionally distinct from path locking:
+        /// locking alone does not prove that a host-directory rename publishes
+        /// the bytes addressed through this storage implementation.
+        supports_host_path_generation_publication: bool = false,
         supports_native_path_locks: bool = false,
     };
 
@@ -614,6 +620,10 @@ pub const Storage = struct {
 
     pub fn supportsNativePathLocks(self: Storage) bool {
         return self.vtable.supports_native_path_locks;
+    }
+
+    pub fn supportsHostPathGenerationPublication(self: Storage) bool {
+        return self.vtable.supports_host_path_generation_publication;
     }
 };
 
@@ -1777,6 +1787,7 @@ else blk: {
                 .now_ns = nowNs,
                 .root_identity_alloc = nativeRootIdentityAlloc,
                 .rename_is_atomic = true,
+                .supports_host_path_generation_publication = true,
                 .supports_native_path_locks = true,
             };
 
@@ -2048,6 +2059,7 @@ else blk: {
             .now_ns = nowNs,
             .root_identity_alloc = rootIdentityAlloc,
             .rename_is_atomic = true,
+            .supports_host_path_generation_publication = true,
             .supports_native_path_locks = true,
         };
 
@@ -3033,6 +3045,17 @@ const memory_vtable: Storage.VTable = .{
     .now_ns = memoryNowNs,
     .rename_is_atomic = true,
 };
+
+test "native path locking does not imply host generation publication" {
+    var lock_only_vtable = memory_vtable;
+    lock_only_vtable.supports_native_path_locks = true;
+    var memory = MemoryStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    const lock_only: Storage = .{ .ptr = &memory, .vtable = &lock_only_vtable };
+
+    try std.testing.expect(lock_only.supportsNativePathLocks());
+    try std.testing.expect(!lock_only.supportsHostPathGenerationPublication());
+}
 
 fn memoryCreateDirPath(_: *anyopaque, _: []const u8) !void {}
 

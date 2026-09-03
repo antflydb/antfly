@@ -20,4 +20,15 @@ pub const legacy_record_version: u16 = 12;
 /// V13 is the first (unreleased) format carrying both compact repair state and
 /// the store reporter-incarnation fence.
 pub const repair_status_record_version: u16 = 13;
-pub const current_record_version: u16 = repair_status_record_version;
+/// V14 gates metadata transitions whose trailing native-restore identity is
+/// mandatory and StoreRecord's data-plane native-generation capability.
+pub const native_restore_identity_record_version: u16 = 14;
+/// V15 carries per-artifact replay observations and the store-level protocol
+/// capability used to keep artifact-index admission closed during rolling
+/// upgrades.
+pub const artifact_source_status_record_version: u16 = 15;
+/// V16 carries source-local terminal failure state. This keeps one failed
+/// enrichment stream from poisoning otherwise ready sources in a multi-source
+/// index while retaining V15 decoding during rolling upgrades.
+pub const artifact_source_failure_status_record_version: u16 = 16;
+pub const current_record_version: u16 = artifact_source_failure_status_record_version;

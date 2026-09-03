@@ -6,16 +6,25 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, expectTypeOf, it } from "vitest";
+import type { GraphPathEdge } from "../src/index.js";
 import type { components, operations } from "../src/public-api.js";
-import { match as matchQuery } from "../src/query-helpers.js";
+import { disjunction, match as matchQuery, term } from "../src/query-helpers.js";
 import type {
   AntflyQuery,
   BatchRequest,
   BooleanQuery,
   BoolFieldQuery,
+  ClusterStatus,
   ConjunctionQuery,
   CreateIndexRequest,
   DisjunctionQuery,
+  GraphAggregatesResult,
+  GraphBindingsResult,
+  GraphDocumentFilter,
+  GraphMatchQuery,
+  GraphNodesResult,
+  IndexRuntimeCapabilities,
+  LegacyGraphSearchResult,
   MatchQuery,
   NumericRangeQuery,
   QueryRequest,
@@ -43,12 +52,52 @@ function generatedSortProfileDeclaration(): string {
 }
 
 describe("Antfly Query Type Integration", () => {
+  describe("cluster status capabilities", () => {
+    it("exports the typed artifact-source capability contract", () => {
+      const capabilities: IndexRuntimeCapabilities = {
+        artifact_sources: true,
+        artifact_sources_state: "available",
+      };
+      const status: ClusterStatus = {
+        health: "healthy",
+        deployment_mode: "standalone",
+        index_capabilities: capabilities,
+      };
+      type CreatedEmbeddings = components["schemas"]["CreatedEmbeddingsIndexConfig"];
+      const created: CreatedEmbeddings = {
+        sources: [{ artifact: "document_dense_v1" }],
+        embedding_name: "document_dense_v1",
+        source_artifact_name: "document_chunks_v1",
+      };
+
+      expect(status.index_capabilities?.artifact_sources).toBe(true);
+      expect(status.index_capabilities?.artifact_sources_state).toBe("available");
+      expect(created.embedding_name).toBe("document_dense_v1");
+    });
+  });
+
+  describe("Disjunction minimum", () => {
+    const clauses = [term("draft", "status"), term("pending", "status")];
+
+    it("distinguishes omission from an explicit zero", () => {
+      expect(disjunction(clauses)).toEqual({ disjuncts: clauses, min: undefined });
+      expect(disjunction(clauses, 0)).toEqual({ disjuncts: clauses, min: 0 });
+    });
+
+    it("rejects values outside the integer execution contract", () => {
+      expect(() => disjunction(clauses, 1.5)).toThrow(RangeError);
+      expect(() => disjunction(clauses, 3)).toThrow(RangeError);
+    });
+  });
+
   describe("Backup metadata availability responses", () => {
     it("types both retryable 503 variants", () => {
       type BackupUnavailable = components["schemas"]["BackupMetadataUnavailableError"];
       type Backup503 = operations["backup"]["responses"][503]["content"]["application/json"];
-      type BackupTable503 = operations["backupTable"]["responses"][503]["content"]["application/json"];
-      type BackupTable409 = operations["backupTable"]["responses"][409]["content"]["application/json"];
+      type BackupTable503 =
+        operations["backupTable"]["responses"][503]["content"]["application/json"];
+      type BackupTable409 =
+        operations["backupTable"]["responses"][409]["content"]["application/json"];
       type ClusterBackup = components["schemas"]["ClusterBackupResponse"];
 
       const capability: BackupUnavailable = {
@@ -69,7 +118,8 @@ describe("Antfly Query Type Integration", () => {
       const ambiguous: BackupTable409 = {
         code: "backup_outcome_ambiguous",
         error: "backup outcome is ambiguous; inspect the backup id before retrying",
-        message: "backup outcome is ambiguous; inspect the backup id and artifact id before retrying",
+        message:
+          "backup outcome is ambiguous; inspect the backup id and artifact id before retrying",
         retryable: false,
         backup_id: "snap",
         artifact_backup_id: "generation-7",
@@ -77,14 +127,16 @@ describe("Antfly Query Type Integration", () => {
       const ambiguousCluster: ClusterBackup = {
         backup_id: "nightly",
         status: "ambiguous",
-        tables: [{
-          name: "docs",
-          status: "ambiguous",
-          code: "backup_outcome_ambiguous",
-          retryable: false,
-          backup_id: "attempt-t-0",
-          artifact_backup_id: "attempt-a-0",
-        }],
+        tables: [
+          {
+            name: "docs",
+            status: "ambiguous",
+            code: "backup_outcome_ambiguous",
+            retryable: false,
+            backup_id: "attempt-t-0",
+            artifact_backup_id: "attempt-a-0",
+          },
+        ],
       };
 
       expectTypeOf<Backup503>().toEqualTypeOf<BackupUnavailable>();
@@ -171,6 +223,80 @@ describe("Antfly Query Type Integration", () => {
   });
 
   describe("QueryRequest type safety", () => {
+    it("keeps graph filters in the stored-document predicate subset", () => {
+      const filter: GraphDocumentFilter = { term: "active", path: "/status" };
+      const numeric: GraphDocumentFilter = {
+        numeric_range: { path: "/score", min: 0 },
+      };
+      const graph: GraphMatchQuery = {
+        index: "social",
+        match: { anchor: "person", nodes: { person: { filter } }, edges: [] },
+        return: { aggregates: { count: { count: "*" } } },
+      };
+      const request: QueryRequest = { graph_queries: { people: graph } };
+
+      expect(request.graph_queries?.people).toBeDefined();
+      expect(numeric).toEqual({ numeric_range: { path: "/score", min: 0 } });
+    });
+
+    it("types pre-discriminator graph responses during the compatibility window", () => {
+      const legacy: LegacyGraphSearchResult = {
+        type: "neighbors",
+        total: 0,
+      };
+
+      expect(legacy.kind).toBeUndefined();
+      expectTypeOf(legacy.kind).toEqualTypeOf<"legacy" | undefined>();
+    });
+
+    it("exports each canonical graph result variant", () => {
+      const bindings: GraphBindingsResult = {
+        kind: "bindings",
+        rows: [],
+        stats: { returned_items: 0, truncated: false },
+        took: 0,
+      };
+      const aggregates: GraphAggregatesResult = {
+        kind: "aggregates",
+        aggregates: { count: { value: "0", exact: true } },
+        stats: { returned_items: 1 },
+        took: 0,
+      };
+      const nodes: GraphNodesResult = {
+        kind: "nodes",
+        nodes: [],
+        stats: { returned_items: 0, truncated: false },
+        took: 0,
+      };
+
+      expect(bindings.kind).toBe("bindings");
+      expect(aggregates.aggregates.count?.exact).toBe(true);
+      expect(nodes.kind).toBe("nodes");
+    });
+
+    it("exports table-qualified canonical path edges", () => {
+      const edge: GraphPathEdge = {
+        from: { key: "shared" },
+        to: { key: "shared", table: "entities" },
+        direction: "out",
+        type: "references",
+        weight: 1,
+      };
+
+      expect(edge.from.table).toBeUndefined();
+      expect(edge.to.table).toBe("entities");
+    });
+
+    it("rejects analyzer-backed and full-text range shapes in graph filters", () => {
+      // @ts-expect-error match requires a text index and is not a stored-document predicate.
+      const analyzerBacked: GraphDocumentFilter = { match: "active", field: "status" };
+      // @ts-expect-error graph ranges use an explicit operator wrapper.
+      const ambiguousRange: GraphDocumentFilter = { field: "score", min: 0 };
+
+      expect(analyzerBacked).toBeDefined();
+      expect(ambiguousRange).toBeDefined();
+    });
+
     it("should accept valid MatchQuery in full_text_search", () => {
       const query: QueryRequest = {
         table: "products",

@@ -16,6 +16,7 @@ const std = @import("std");
 const codestream = @import("codestream.zig");
 const codeblock = @import("codeblock.zig");
 const color_transform = @import("color_transform.zig");
+const decode_control = @import("decode_control.zig");
 const packet = @import("packet.zig");
 const quantization = @import("quantization.zig");
 const tile = @import("tile.zig");
@@ -207,10 +208,16 @@ fn roundedF32FitsI32(value: f32) bool {
 }
 
 fn roundF32PlaneToI32(dst: []i32, src: []const f32) !void {
+    return roundF32PlaneToI32WithCancellation(dst, src, .{});
+}
+
+fn roundF32PlaneToI32WithCancellation(dst: []i32, src: []const f32, cancellation: decode_control.CancellationProbe) !void {
     std.debug.assert(dst.len == src.len);
+    try cancellation.check();
 
     var i: usize = 0;
     while (i + simd_lanes_f32_i32 <= src.len) : (i += simd_lanes_f32_i32) {
+        if (i & 4095 == 0) try cancellation.check();
         // Validate the SIMD block before conversion so @intFromFloat can never
         // trap on attacker-controlled irreversible coefficients. Valid pixels
         // still use the vectorized conversion below.
@@ -297,6 +304,10 @@ test "small-scale custom MCT cannot overflow irreversible reconstruction" {
 }
 
 fn applyReversibleMctOnEqualComponentGrid(state: *const codestream.State, planes: [][]i32) !void {
+    return applyReversibleMctOnEqualComponentGridWithCancellation(state, planes, .{});
+}
+
+fn applyReversibleMctOnEqualComponentGridWithCancellation(state: *const codestream.State, planes: [][]i32, cancellation: decode_control.CancellationProbe) !void {
     const coding_style = state.coding_style orelse return;
     if (!coding_style.multiple_component_transform or planes.len < 3) return;
     if (!state.hasSupportedMctInputs()) return error.UnsupportedMultiComponentTransform;
@@ -311,7 +322,7 @@ fn applyReversibleMctOnEqualComponentGrid(state: *const codestream.State, planes
         if (dims.width != first_dims.width or dims.height != first_dims.height)
             return error.UnsupportedMultiComponentTransform;
     }
-    color_transform.inverseRct(planes[0], planes[1], planes[2]);
+    try color_transform.inverseRctWithCancellation(planes[0], planes[1], planes[2], cancellation);
 }
 
 pub fn reconstructTier1ComponentPlanesU8(
@@ -328,23 +339,34 @@ pub fn reconstructTier1ComponentPlanesU8AtResolution(
     execution: *const packet.Tier1Execution,
     discard_levels: u8,
 ) !ComponentPlanesU8 {
+    return reconstructTier1ComponentPlanesU8AtResolutionWithCancellation(allocator, state, execution, discard_levels, .{});
+}
+
+pub fn reconstructTier1ComponentPlanesU8AtResolutionWithCancellation(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    execution: *const packet.Tier1Execution,
+    discard_levels: u8,
+    cancellation: decode_control.CancellationProbe,
+) !ComponentPlanesU8 {
+    try cancellation.check();
     const coding_style = state.coding_style orelse return error.MissingCodingStyle;
     const use_irreversible = coding_style.wavelet_transform == 0;
     const use_component_wavelets = try hasMixedComponentWaveletTransforms(state);
     const raw_planes = if (use_component_wavelets)
-        try assemblePlanesFromTier1ComponentWaveletsAtResolution(allocator, state, execution, discard_levels)
+        try assemblePlanesFromTier1ComponentWaveletsAtResolutionWithCancellation(allocator, state, execution, discard_levels, cancellation)
     else if (use_irreversible)
-        try assemblePlanesFromTier1IrreversibleAtResolution(allocator, state, execution, discard_levels)
+        try assemblePlanesFromTier1IrreversibleAtResolutionWithCancellation(allocator, state, execution, discard_levels, cancellation)
     else
-        try assemblePlanesFromTier1AtResolution(allocator, state, execution, discard_levels);
+        try assemblePlanesFromTier1AtResolutionWithCancellation(allocator, state, execution, discard_levels, cancellation);
     defer {
         for (raw_planes) |plane| allocator.free(plane);
         allocator.free(raw_planes);
     }
 
-    if (!use_component_wavelets and !use_irreversible) try applyReversibleMctOnEqualComponentGrid(state, raw_planes);
+    if (!use_component_wavelets and !use_irreversible) try applyReversibleMctOnEqualComponentGridWithCancellation(state, raw_planes, cancellation);
 
-    return componentPlanesU8FromRawAtResolution(allocator, state, raw_planes, discard_levels);
+    return componentPlanesU8FromRawAtResolutionWithCancellation(allocator, state, raw_planes, discard_levels, cancellation);
 }
 
 /// Convert reconstructed, level-shifted component planes into compact native
@@ -356,6 +378,17 @@ pub fn componentPlanesU8FromRawAtResolution(
     raw_planes: []const []const i32,
     discard_levels: u8,
 ) !ComponentPlanesU8 {
+    return componentPlanesU8FromRawAtResolutionWithCancellation(allocator, state, raw_planes, discard_levels, .{});
+}
+
+pub fn componentPlanesU8FromRawAtResolutionWithCancellation(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    raw_planes: []const []const i32,
+    discard_levels: u8,
+    cancellation: decode_control.CancellationProbe,
+) !ComponentPlanesU8 {
+    try cancellation.check();
     if (state.header.components.len == 0 or raw_planes.len != state.header.components.len)
         return error.UnsupportedPlaneCount;
     const bits_per_component = state.header.components[0].bits_per_component;
@@ -379,6 +412,7 @@ pub fn componentPlanesU8FromRawAtResolution(
     }
 
     for (raw_planes, 0..) |raw, component_index| {
+        try cancellation.check();
         const reduced_dims = try componentResolutionDimensions(state, component_index, discard_levels);
         const component_width = reduced_dims.width;
         const component_height = reduced_dims.height;
@@ -389,6 +423,7 @@ pub fn componentPlanesU8FromRawAtResolution(
         out_planes[component_index] = try allocator.alloc(u8, plane_len);
         allocated += 1;
         for (raw, 0..) |sample, i| {
+            if (i & 4095 == 0) try cancellation.check();
             out_planes[component_index][i] = try reconstructU8Sample(sample, bits_per_component, is_signed);
         }
     }
@@ -414,23 +449,34 @@ pub fn reconstructTier1ComponentPlanesU16AtResolution(
     execution: *const packet.Tier1Execution,
     discard_levels: u8,
 ) !ComponentPlanesU16 {
+    return reconstructTier1ComponentPlanesU16AtResolutionWithCancellation(allocator, state, execution, discard_levels, .{});
+}
+
+pub fn reconstructTier1ComponentPlanesU16AtResolutionWithCancellation(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    execution: *const packet.Tier1Execution,
+    discard_levels: u8,
+    cancellation: decode_control.CancellationProbe,
+) !ComponentPlanesU16 {
+    try cancellation.check();
     const coding_style = state.coding_style orelse return error.MissingCodingStyle;
     const use_irreversible = coding_style.wavelet_transform == 0;
     const use_component_wavelets = try hasMixedComponentWaveletTransforms(state);
     const raw_planes = if (use_component_wavelets)
-        try assemblePlanesFromTier1ComponentWaveletsAtResolution(allocator, state, execution, discard_levels)
+        try assemblePlanesFromTier1ComponentWaveletsAtResolutionWithCancellation(allocator, state, execution, discard_levels, cancellation)
     else if (use_irreversible)
-        try assemblePlanesFromTier1IrreversibleAtResolution(allocator, state, execution, discard_levels)
+        try assemblePlanesFromTier1IrreversibleAtResolutionWithCancellation(allocator, state, execution, discard_levels, cancellation)
     else
-        try assemblePlanesFromTier1AtResolution(allocator, state, execution, discard_levels);
+        try assemblePlanesFromTier1AtResolutionWithCancellation(allocator, state, execution, discard_levels, cancellation);
     defer {
         for (raw_planes) |plane| allocator.free(plane);
         allocator.free(raw_planes);
     }
 
-    if (!use_component_wavelets and !use_irreversible) try applyReversibleMctOnEqualComponentGrid(state, raw_planes);
+    if (!use_component_wavelets and !use_irreversible) try applyReversibleMctOnEqualComponentGridWithCancellation(state, raw_planes, cancellation);
 
-    return componentPlanesU16FromRawAtResolution(allocator, state, raw_planes, discard_levels);
+    return componentPlanesU16FromRawAtResolutionWithCancellation(allocator, state, raw_planes, discard_levels, cancellation);
 }
 
 /// U16 counterpart to `componentPlanesU8FromRawAtResolution`, preserving the
@@ -441,6 +487,17 @@ pub fn componentPlanesU16FromRawAtResolution(
     raw_planes: []const []const i32,
     discard_levels: u8,
 ) !ComponentPlanesU16 {
+    return componentPlanesU16FromRawAtResolutionWithCancellation(allocator, state, raw_planes, discard_levels, .{});
+}
+
+pub fn componentPlanesU16FromRawAtResolutionWithCancellation(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    raw_planes: []const []const i32,
+    discard_levels: u8,
+    cancellation: decode_control.CancellationProbe,
+) !ComponentPlanesU16 {
+    try cancellation.check();
     if (state.header.components.len == 0 or raw_planes.len != state.header.components.len)
         return error.UnsupportedPlaneCount;
     const bits_per_component = state.header.components[0].bits_per_component;
@@ -464,6 +521,7 @@ pub fn componentPlanesU16FromRawAtResolution(
     }
 
     for (raw_planes, 0..) |raw, component_index| {
+        try cancellation.check();
         const reduced_dims = try componentResolutionDimensions(state, component_index, discard_levels);
         const component_width = reduced_dims.width;
         const component_height = reduced_dims.height;
@@ -474,6 +532,7 @@ pub fn componentPlanesU16FromRawAtResolution(
         out_planes[component_index] = try allocator.alloc(u16, plane_len);
         allocated += 1;
         for (raw, 0..) |sample, i| {
+            if (i & 4095 == 0) try cancellation.check();
             out_planes[component_index][i] = try reconstructU16Sample(sample, bits_per_component, is_signed);
         }
     }
@@ -493,6 +552,19 @@ pub fn interleavePlanesU8(
     bits_per_component: u8,
     is_signed: bool,
 ) ![]u8 {
+    return interleavePlanesU8WithCancellation(allocator, planes, width, height, bits_per_component, is_signed, .{});
+}
+
+pub fn interleavePlanesU8WithCancellation(
+    allocator: std.mem.Allocator,
+    planes: []const []const i32,
+    width: usize,
+    height: usize,
+    bits_per_component: u8,
+    is_signed: bool,
+    cancellation: decode_control.CancellationProbe,
+) ![]u8 {
+    try cancellation.check();
     if (planes.len < 1 or planes.len > 5) return error.UnsupportedPlaneCount;
     const plane_len = width * height;
     for (planes) |plane| {
@@ -503,6 +575,7 @@ pub fn interleavePlanesU8(
     errdefer allocator.free(out);
     var idx: usize = 0;
     while (idx < plane_len) : (idx += 1) {
+        if (idx & 4095 == 0) try cancellation.check();
         var c: usize = 0;
         while (c < planes.len) : (c += 1) {
             out[idx * planes.len + c] = try reconstructU8Sample(planes[c][idx], bits_per_component, is_signed);
@@ -545,6 +618,16 @@ pub fn interleaveComponentPlanesU16(
     component_planes: *const ComponentPlanesU16,
     state: *const codestream.State,
 ) ![]u16 {
+    return interleaveComponentPlanesU16WithCancellation(allocator, component_planes, state, .{});
+}
+
+pub fn interleaveComponentPlanesU16WithCancellation(
+    allocator: std.mem.Allocator,
+    component_planes: *const ComponentPlanesU16,
+    state: *const codestream.State,
+    cancellation: decode_control.CancellationProbe,
+) ![]u16 {
+    try cancellation.check();
     const component_count = component_planes.planes.len;
     if (component_count < 1 or component_count > 5 or component_count != state.header.components.len or
         component_planes.widths.len != component_count or
@@ -557,6 +640,7 @@ pub fn interleaveComponentPlanesU16(
     errdefer allocator.free(output);
 
     for (component_planes.planes, 0..) |source, component_index| {
+        try cancellation.check();
         const source_width = component_planes.widths[component_index];
         const source_height = component_planes.heights[component_index];
         if (source_width == 0 or source_height == 0 or source.len != source_width * source_height)
@@ -577,7 +661,7 @@ pub fn interleaveComponentPlanesU16(
             );
             if (source_width != geometry.width or source_height != geometry.height)
                 return error.InvalidPlaneLength;
-            upsampled = try upsample.bilinearU16ReferenceGrid(
+            upsampled = try upsample.bilinearU16ReferenceGridWithCancellation(
                 allocator,
                 source,
                 source_width,
@@ -590,10 +674,12 @@ pub fn interleaveComponentPlanesU16(
                 geometry.origin_y,
                 component.xrsiz,
                 component.yrsiz,
+                cancellation,
             );
             break :blk upsampled.?;
         };
         for (plane, 0..) |sample, pixel_index| {
+            if (pixel_index & 4095 == 0) try cancellation.check();
             output[pixel_index * component_count + component_index] = sample;
         }
     }
@@ -608,6 +694,16 @@ pub fn interleaveComponentSamplesU8(
     component_planes: *const ComponentPlanesU8,
     state: *const codestream.State,
 ) ![]u8 {
+    return interleaveComponentSamplesU8WithCancellation(allocator, component_planes, state, .{});
+}
+
+pub fn interleaveComponentSamplesU8WithCancellation(
+    allocator: std.mem.Allocator,
+    component_planes: *const ComponentPlanesU8,
+    state: *const codestream.State,
+    cancellation: decode_control.CancellationProbe,
+) ![]u8 {
+    try cancellation.check();
     const component_count = component_planes.planes.len;
     if (component_count < 1 or component_count > 5 or component_count != state.header.components.len or
         component_planes.widths.len != component_count or
@@ -620,6 +716,7 @@ pub fn interleaveComponentSamplesU8(
     errdefer allocator.free(output);
 
     for (component_planes.planes, 0..) |source, component_index| {
+        try cancellation.check();
         const source_width = component_planes.widths[component_index];
         const source_height = component_planes.heights[component_index];
         const source_len = std.math.mul(usize, source_width, source_height) catch return error.InvalidPlaneLength;
@@ -641,7 +738,7 @@ pub fn interleaveComponentSamplesU8(
             );
             if (source_width != geometry.width or source_height != geometry.height)
                 return error.InvalidPlaneLength;
-            upsampled = try upsample.bilinearU8ReferenceGrid(
+            upsampled = try upsample.bilinearU8ReferenceGridWithCancellation(
                 allocator,
                 source,
                 source_width,
@@ -654,10 +751,12 @@ pub fn interleaveComponentSamplesU8(
                 geometry.origin_y,
                 component.xrsiz,
                 component.yrsiz,
+                cancellation,
             );
             break :blk upsampled.?;
         };
         for (plane, 0..) |sample, pixel_index| {
+            if (pixel_index & 4095 == 0) try cancellation.check();
             output[pixel_index * component_count + component_index] = sample;
         }
     }
@@ -672,6 +771,16 @@ pub fn interleaveNativeComponentSamplesU8(
     component_planes: *const ComponentPlanesU16,
     state: *const codestream.State,
 ) ![]u8 {
+    return interleaveNativeComponentSamplesU8WithCancellation(allocator, component_planes, state, .{});
+}
+
+pub fn interleaveNativeComponentSamplesU8WithCancellation(
+    allocator: std.mem.Allocator,
+    component_planes: *const ComponentPlanesU16,
+    state: *const codestream.State,
+    cancellation: decode_control.CancellationProbe,
+) ![]u8 {
+    try cancellation.check();
     const component_count = component_planes.planes.len;
     if (component_count < 1 or component_count > 5 or component_count != state.header.components.len or
         component_planes.widths.len != component_count or
@@ -684,6 +793,7 @@ pub fn interleaveNativeComponentSamplesU8(
     errdefer allocator.free(output);
 
     for (component_planes.planes, 0..) |source, component_index| {
+        try cancellation.check();
         const source_width = component_planes.widths[component_index];
         const source_height = component_planes.heights[component_index];
         const source_len = std.math.mul(usize, source_width, source_height) catch return error.InvalidPlaneLength;
@@ -705,7 +815,7 @@ pub fn interleaveNativeComponentSamplesU8(
             );
             if (source_width != geometry.width or source_height != geometry.height)
                 return error.InvalidPlaneLength;
-            upsampled = try upsample.bilinearU16ReferenceGrid(
+            upsampled = try upsample.bilinearU16ReferenceGridWithCancellation(
                 allocator,
                 source,
                 source_width,
@@ -718,11 +828,13 @@ pub fn interleaveNativeComponentSamplesU8(
                 geometry.origin_y,
                 component.xrsiz,
                 component.yrsiz,
+                cancellation,
             );
             break :blk upsampled.?;
         };
         const center: i32 = @as(i32, 1) << @intCast(component.bits_per_component - 1);
         for (plane, 0..) |sample, pixel_index| {
+            if (pixel_index & 4095 == 0) try cancellation.check();
             output[pixel_index * component_count + component_index] = try reconstructU8Sample(
                 @as(i32, sample) - center,
                 component.bits_per_component,
@@ -810,6 +922,17 @@ fn assemblePlanesFromTier1ComponentWaveletsAtResolution(
     execution: *const packet.Tier1Execution,
     discard_levels: u8,
 ) ![][]i32 {
+    return assemblePlanesFromTier1ComponentWaveletsAtResolutionWithCancellation(allocator, state, execution, discard_levels, .{});
+}
+
+fn assemblePlanesFromTier1ComponentWaveletsAtResolutionWithCancellation(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    execution: *const packet.Tier1Execution,
+    discard_levels: u8,
+    cancellation: decode_control.CancellationProbe,
+) ![][]i32 {
+    try cancellation.check();
     const default_coding_style = state.coding_style orelse return error.MissingCodingStyle;
     const tile_w: u32 = state.header.width;
     const tile_h: u32 = state.header.height;
@@ -868,6 +991,7 @@ fn assemblePlanesFromTier1ComponentWaveletsAtResolution(
     }
 
     for (execution.codeblocks) |codeblock_state| {
+        try cancellation.check();
         const component_index: usize = codeblock_state.coordinate.component_index;
         if (component_index >= component_count) return error.InvalidPlaneIndex;
         const coding_style = try tile.effectiveCodingStyle(state, component_index);
@@ -903,6 +1027,7 @@ fn assemblePlanesFromTier1ComponentWaveletsAtResolution(
 
             var y: usize = 0;
             while (y < rect_h) : (y += 1) {
+                try cancellation.check();
                 var x: usize = 0;
                 while (x < rect_w) : (x += 1) {
                     const dst_x: usize = bo.x + rect.x0 + x;
@@ -918,6 +1043,7 @@ fn assemblePlanesFromTier1ComponentWaveletsAtResolution(
             const plane = planes[component_index];
             var y: usize = 0;
             while (y < rect_h) : (y += 1) {
+                try cancellation.check();
                 var x: usize = 0;
                 while (x < rect_w) : (x += 1) {
                     const dst_x: usize = bo.x + rect.x0 + x;
@@ -937,7 +1063,7 @@ fn assemblePlanesFromTier1ComponentWaveletsAtResolution(
         if (coding_style.decomposition_levels == 0) continue;
         const component_discard = @min(discard_levels, coding_style.decomposition_levels);
         if (coding_style.wavelet_transform == 0) {
-            try inverseWavelet97MultiLevelOriginAtResolution(
+            try inverseWavelet97MultiLevelOriginAtResolutionWithCancellation(
                 allocator,
                 f32_planes[component_index],
                 comp_widths[component_index],
@@ -947,9 +1073,10 @@ fn assemblePlanesFromTier1ComponentWaveletsAtResolution(
                 coding_style.decomposition_levels,
                 component_discard,
                 !producedByAntfly(state.comments),
+                cancellation,
             );
         } else {
-            try inverseWaveletMultiLevelOriginAtResolution(allocator, planes[component_index], comp_widths[component_index], comp_heights[component_index], comp_origin_x[component_index], comp_origin_y[component_index], coding_style.decomposition_levels, component_discard);
+            try inverseWaveletMultiLevelOriginAtResolutionWithCancellation(allocator, planes[component_index], comp_widths[component_index], comp_heights[component_index], comp_origin_x[component_index], comp_origin_y[component_index], coding_style.decomposition_levels, component_discard, cancellation);
         }
     }
 
@@ -963,9 +1090,9 @@ fn assemblePlanesFromTier1ComponentWaveletsAtResolution(
                 defer allocator.free(matrix.forward);
                 defer allocator.free(matrix.inverse);
                 defer allocator.free(matrix.offsets);
-                try color_transform.applyCustomMctInverse(matrix, f32_planes[0..3]);
+                try color_transform.applyCustomMctInverseWithCancellation(matrix, f32_planes[0..3], cancellation);
             } else {
-                color_transform.inverseIct(f32_planes[0], f32_planes[1], f32_planes[2]);
+                try color_transform.inverseIctWithCancellation(f32_planes[0], f32_planes[1], f32_planes[2], cancellation);
             }
         } else if (!irreversible[0] and !irreversible[1] and !irreversible[2]) {
             try applyReversibleMctOnEqualComponentGrid(state, planes);
@@ -976,12 +1103,12 @@ fn assemblePlanesFromTier1ComponentWaveletsAtResolution(
 
     for (state.header.components, 0..) |_, component_index| {
         if (irreversible[component_index]) {
-            try roundF32PlaneToI32(planes[component_index], f32_planes[component_index]);
+            try roundF32PlaneToI32WithCancellation(planes[component_index], f32_planes[component_index], cancellation);
         }
     }
 
     if (discard_levels > 0) {
-        try cropPlanesToResolution(allocator, state, planes, comp_widths, comp_heights, comp_origin_x, comp_origin_y, discard_levels);
+        try cropPlanesToResolution(allocator, state, planes, comp_widths, comp_heights, comp_origin_x, comp_origin_y, discard_levels, cancellation);
     }
 
     return planes;
@@ -1001,6 +1128,17 @@ pub fn assemblePlanesFromTier1AtResolution(
     execution: *const packet.Tier1Execution,
     discard_levels: u8,
 ) ![][]i32 {
+    return assemblePlanesFromTier1AtResolutionWithCancellation(allocator, state, execution, discard_levels, .{});
+}
+
+fn assemblePlanesFromTier1AtResolutionWithCancellation(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    execution: *const packet.Tier1Execution,
+    discard_levels: u8,
+    cancellation: decode_control.CancellationProbe,
+) ![][]i32 {
+    try cancellation.check();
     const tile_w: u32 = state.header.width;
     const tile_h: u32 = state.header.height;
     const planes = try allocator.alloc([]i32, state.header.components.len);
@@ -1034,6 +1172,7 @@ pub fn assemblePlanesFromTier1AtResolution(
     }
 
     for (execution.codeblocks) |codeblock_state| {
+        try cancellation.check();
         const component_index: usize = codeblock_state.coordinate.component_index;
         if (component_index >= planes.len) return error.InvalidPlaneIndex;
         const coding_style = try tile.effectiveCodingStyle(state, component_index);
@@ -1057,6 +1196,7 @@ pub fn assemblePlanesFromTier1AtResolution(
 
         var y: usize = 0;
         while (y < rect_h) : (y += 1) {
+            try cancellation.check();
             var x: usize = 0;
             while (x < rect_w) : (x += 1) {
                 const dst_x: usize = band_offset.x + rect.x0 + x;
@@ -1075,12 +1215,12 @@ pub fn assemblePlanesFromTier1AtResolution(
         const coding_style = try tile.effectiveCodingStyle(state, component_index);
         if (coding_style.decomposition_levels > 0) {
             const component_discard = @min(discard_levels, coding_style.decomposition_levels);
-            try inverseWaveletMultiLevelOriginAtResolution(allocator, plane, comp_widths[component_index], comp_heights[component_index], comp_origin_x[component_index], comp_origin_y[component_index], coding_style.decomposition_levels, component_discard);
+            try inverseWaveletMultiLevelOriginAtResolutionWithCancellation(allocator, plane, comp_widths[component_index], comp_heights[component_index], comp_origin_x[component_index], comp_origin_y[component_index], coding_style.decomposition_levels, component_discard, cancellation);
         }
     }
 
     if (discard_levels > 0) {
-        try cropPlanesToResolution(allocator, state, planes, comp_widths, comp_heights, comp_origin_x, comp_origin_y, discard_levels);
+        try cropPlanesToResolution(allocator, state, planes, comp_widths, comp_heights, comp_origin_x, comp_origin_y, discard_levels, cancellation);
     }
 
     // Note: inverse RCT is applied AFTER DC level shift in
@@ -1124,7 +1264,23 @@ fn inverseWaveletMultiLevelOriginAtResolution(
     decomposition_levels: u8,
     discard_levels: u8,
 ) !void {
+    return inverseWaveletMultiLevelOriginAtResolutionWithCancellation(allocator, plane, width, height, origin_x, origin_y, decomposition_levels, discard_levels, .{});
+}
+
+fn inverseWaveletMultiLevelOriginAtResolutionWithCancellation(
+    allocator: std.mem.Allocator,
+    plane: []i32,
+    width: usize,
+    height: usize,
+    origin_x: usize,
+    origin_y: usize,
+    decomposition_levels: u8,
+    discard_levels: u8,
+    cancellation: decode_control.CancellationProbe,
+) !void {
+    try cancellation.check();
     var level: u8 = 0;
+    var copy_work_since_cancellation_check: usize = 0;
     const levels_to_apply = decomposition_levels - @min(discard_levels, decomposition_levels);
     while (level < levels_to_apply) : (level += 1) {
         // At this iteration, we're reconstructing from decomposition level (N - level - 1)
@@ -1142,14 +1298,16 @@ fn inverseWaveletMultiLevelOriginAtResolution(
         var y: usize = 0;
         while (y < active_h) : (y += 1) {
             @memcpy(sub[y * active_w .. y * active_w + active_w], plane[y * width .. y * width + active_w]);
+            try cancellation.checkAfterWork(&copy_work_since_cancellation_check, active_w);
         }
 
-        try wavelet.inverse53LevelInPlacePhase(allocator, sub, active_w, active_h, phase_x, phase_y);
+        try wavelet.inverse53LevelInPlacePhaseWithCancellation(allocator, sub, active_w, active_h, phase_x, phase_y, cancellation);
 
         // Write back
         y = 0;
         while (y < active_h) : (y += 1) {
             @memcpy(plane[y * width .. y * width + active_w], sub[y * active_w .. y * active_w + active_w]);
+            try cancellation.checkAfterWork(&copy_work_since_cancellation_check, active_w);
         }
     }
 }
@@ -1245,7 +1403,10 @@ fn cropPlanesToResolution(
     origins_x: []const usize,
     origins_y: []const usize,
     discard_levels: u8,
+    cancellation: decode_control.CancellationProbe,
 ) !void {
+    try cancellation.check();
+    var work_since_cancellation_check: usize = 0;
     for (planes, 0..) |*plane, component_index| {
         const coding_style = try tile.effectiveCodingStyle(state, component_index);
         const reduce = @min(discard_levels, coding_style.decomposition_levels);
@@ -1263,6 +1424,7 @@ fn cropPlanesToResolution(
         var y: usize = 0;
         while (y < reduced_height) : (y += 1) {
             @memcpy(cropped[y * reduced_width .. y * reduced_width + reduced_width], plane.*[y * full_width .. y * full_width + reduced_width]);
+            try cancellation.checkAfterWork(&work_since_cancellation_check, reduced_width);
         }
         allocator.free(plane.*);
         plane.* = cropped;
@@ -1337,12 +1499,24 @@ pub fn assemblePlanesFromTier1IrreversibleAtResolution(
     execution: *const packet.Tier1Execution,
     discard_levels: u8,
 ) ![][]i32 {
-    var assembler = try StreamingPlaneAssembler.init(allocator, state);
+    return assemblePlanesFromTier1IrreversibleAtResolutionWithCancellation(allocator, state, execution, discard_levels, .{});
+}
+
+fn assemblePlanesFromTier1IrreversibleAtResolutionWithCancellation(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    execution: *const packet.Tier1Execution,
+    discard_levels: u8,
+    cancellation: decode_control.CancellationProbe,
+) ![][]i32 {
+    try cancellation.check();
+    var assembler = try StreamingPlaneAssembler.initAtResolution(allocator, state, discard_levels);
     defer assembler.deinit();
     for (execution.codeblocks) |*codeblock_state| {
+        try cancellation.check();
         try assembler.appendCodeblock(codeblock_state);
     }
-    return assembler.finish(discard_levels);
+    return assembler.finishWithCancellation(discard_levels, cancellation);
 }
 
 pub const StreamingPlaneAssembler = struct {
@@ -1356,6 +1530,7 @@ pub const StreamingPlaneAssembler = struct {
     initialized_planes: usize = 0,
     plane_buffers_owned: bool = true,
     finished: bool = false,
+    discard_levels: u8 = 0,
 
     /// The streaming assembler stores one four-byte coefficient plane per
     /// component: f32 for irreversible 9/7 and i32 for reversible 5/3. A mixed
@@ -1375,6 +1550,10 @@ pub const StreamingPlaneAssembler = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, state: *const codestream.State) !StreamingPlaneAssembler {
+        return initAtResolution(allocator, state, 0);
+    }
+
+    pub fn initAtResolution(allocator: std.mem.Allocator, state: *const codestream.State, discard_levels: u8) !StreamingPlaneAssembler {
         if (!try canAssemble(state)) return error.UnsupportedWaveletTransform;
         const component_count = state.header.components.len;
         const comp_widths = try allocator.alloc(usize, component_count);
@@ -1400,10 +1579,12 @@ pub const StreamingPlaneAssembler = struct {
                 component.xrsiz,
                 component.yrsiz,
             );
-            comp_widths[component_index] = @intCast(dims.width);
-            comp_heights[component_index] = @intCast(dims.height);
-            comp_origin_x[component_index] = @intCast(dims.origin_x);
-            comp_origin_y[component_index] = @intCast(dims.origin_y);
+            const coding_style = try tile.effectiveCodingStyle(state, component_index);
+            const component_discard = @min(discard_levels, coding_style.decomposition_levels);
+            comp_widths[component_index] = resolutionWidthAt(@intCast(dims.origin_x), @intCast(dims.width), component_discard);
+            comp_heights[component_index] = resolutionWidthAt(@intCast(dims.origin_y), @intCast(dims.height), component_discard);
+            comp_origin_x[component_index] = resolutionOriginAt(@intCast(dims.origin_x), component_discard);
+            comp_origin_y[component_index] = resolutionOriginAt(@intCast(dims.origin_y), component_discard);
             plane_storage[component_index] = try allocator.alloc(
                 f32,
                 comp_widths[component_index] * comp_heights[component_index],
@@ -1420,6 +1601,7 @@ pub const StreamingPlaneAssembler = struct {
             .comp_origin_y = comp_origin_y,
             .plane_storage = plane_storage,
             .initialized_planes = initialized_planes,
+            .discard_levels = discard_levels,
         };
     }
 
@@ -1428,6 +1610,9 @@ pub const StreamingPlaneAssembler = struct {
         const component_index: usize = codeblock_state.coordinate.component_index;
         if (component_index >= self.plane_storage.len) return error.InvalidPlaneIndex;
         const coding_style = try tile.effectiveCodingStyle(self.state, component_index);
+        const component_discard = @min(self.discard_levels, coding_style.decomposition_levels);
+        const active_decomposition_levels = coding_style.decomposition_levels - component_discard;
+        if (codeblock_state.coordinate.resolution_index > active_decomposition_levels) return;
         const storage = self.plane_storage[component_index];
         const component_width = self.comp_widths[component_index];
         const component_height = self.comp_heights[component_index];
@@ -1439,7 +1624,7 @@ pub const StreamingPlaneAssembler = struct {
             component_height,
             self.comp_origin_x[component_index],
             self.comp_origin_y[component_index],
-            coding_style.decomposition_levels,
+            active_decomposition_levels,
             codeblock_state.coordinate.resolution_index,
             codeblock_state.subband,
         );
@@ -1503,41 +1688,51 @@ pub const StreamingPlaneAssembler = struct {
     }
 
     pub fn finish(self: *StreamingPlaneAssembler, discard_levels: u8) ![][]i32 {
+        return self.finishWithCancellation(discard_levels, .{});
+    }
+
+    pub fn finishWithCancellation(self: *StreamingPlaneAssembler, discard_levels: u8, cancellation: decode_control.CancellationProbe) ![][]i32 {
+        try cancellation.check();
         if (self.finished or self.initialized_planes != self.plane_storage.len)
             return error.InvalidPlaneAssemblyState;
+        if (discard_levels != self.discard_levels) return error.InvalidPlaneAssemblyState;
         const default_coding_style = self.state.coding_style orelse
             return error.MissingCodingStyle;
 
         for (self.plane_storage, 0..) |plane, component_index| {
+            try cancellation.check();
             const coding_style = try tile.effectiveCodingStyle(self.state, component_index);
             if (coding_style.decomposition_levels == 0) continue;
-            const component_discard = @min(discard_levels, coding_style.decomposition_levels);
+            const component_discard = @min(self.discard_levels, coding_style.decomposition_levels);
+            const active_decomposition_levels = coding_style.decomposition_levels - component_discard;
             if (coding_style.wavelet_transform == 0) {
-                try inverseWavelet97MultiLevelOriginAtResolution(
+                try inverseWavelet97MultiLevelOriginAtResolutionWithCancellation(
                     self.allocator,
                     plane,
                     self.comp_widths[component_index],
                     self.comp_heights[component_index],
                     self.comp_origin_x[component_index],
                     self.comp_origin_y[component_index],
-                    coding_style.decomposition_levels,
-                    component_discard,
+                    active_decomposition_levels,
+                    0,
                     !producedByAntfly(self.state.comments),
+                    cancellation,
                 );
             } else {
                 const reversible_plane: []i32 = @as(
                     [*]i32,
                     @ptrCast(@alignCast(plane.ptr)),
                 )[0..plane.len];
-                try inverseWaveletMultiLevelOriginAtResolution(
+                try inverseWaveletMultiLevelOriginAtResolutionWithCancellation(
                     self.allocator,
                     reversible_plane,
                     self.comp_widths[component_index],
                     self.comp_heights[component_index],
                     self.comp_origin_x[component_index],
                     self.comp_origin_y[component_index],
-                    coding_style.decomposition_levels,
-                    component_discard,
+                    active_decomposition_levels,
+                    0,
+                    cancellation,
                 );
             }
         }
@@ -1557,12 +1752,13 @@ pub const StreamingPlaneAssembler = struct {
                 defer self.allocator.free(matrix.forward);
                 defer self.allocator.free(matrix.inverse);
                 defer self.allocator.free(matrix.offsets);
-                try color_transform.applyCustomMctInverse(matrix, self.plane_storage[0..3]);
+                try color_transform.applyCustomMctInverseWithCancellation(matrix, self.plane_storage[0..3], cancellation);
             } else {
-                color_transform.inverseIct(
+                try color_transform.inverseIctWithCancellation(
                     self.plane_storage[0],
                     self.plane_storage[1],
                     self.plane_storage[2],
+                    cancellation,
                 );
             }
         }
@@ -1570,13 +1766,14 @@ pub const StreamingPlaneAssembler = struct {
         const planes = try self.allocator.alloc([]i32, self.plane_storage.len);
         errdefer self.allocator.free(planes);
         for (self.plane_storage, 0..) |float_plane, component_index| {
+            try cancellation.check();
             const plane: []i32 = @as(
                 [*]i32,
                 @ptrCast(@alignCast(float_plane.ptr)),
             )[0..float_plane.len];
             const coding_style = try tile.effectiveCodingStyle(self.state, component_index);
             if (coding_style.wavelet_transform == 0) {
-                try roundF32PlaneToI32(plane, float_plane);
+                try roundF32PlaneToI32WithCancellation(plane, float_plane, cancellation);
             }
             planes[component_index] = plane;
         }
@@ -1585,18 +1782,6 @@ pub const StreamingPlaneAssembler = struct {
             for (planes) |plane| self.allocator.free(plane);
         }
 
-        if (discard_levels > 0) {
-            try cropPlanesToResolution(
-                self.allocator,
-                self.state,
-                planes,
-                self.comp_widths,
-                self.comp_heights,
-                self.comp_origin_x,
-                self.comp_origin_y,
-                discard_levels,
-            );
-        }
         self.finished = true;
         return planes;
     }
@@ -1742,7 +1927,9 @@ fn interleaveComponentPlanesU8WithUpsampling(
     allocator: std.mem.Allocator,
     state: *const codestream.State,
     raw_planes: [][]i32,
+    cancellation: decode_control.CancellationProbe,
 ) ![]u8 {
+    try cancellation.check();
     if (raw_planes.len != state.header.components.len) return error.InvalidPlaneLength;
     const image_width: usize = @intCast(state.header.width);
     const image_height: usize = @intCast(state.header.height);
@@ -1758,6 +1945,7 @@ fn interleaveComponentPlanesU8WithUpsampling(
     }
 
     for (state.header.components, 0..) |component, component_index| {
+        try cancellation.check();
         const dims = tile.componentDimensionsAt(
             state.header.x_offset,
             state.header.y_offset,
@@ -1771,7 +1959,7 @@ fn interleaveComponentPlanesU8WithUpsampling(
         if (component_width == image_width and component_height == image_height) {
             planes[component_index] = raw_planes[component_index];
         } else {
-            planes[component_index] = try upsample.bilinearI32ReferenceGrid(
+            planes[component_index] = try upsample.bilinearI32ReferenceGridWithCancellation(
                 allocator,
                 raw_planes[component_index],
                 component_width,
@@ -1784,19 +1972,21 @@ fn interleaveComponentPlanesU8WithUpsampling(
                 dims.origin_y,
                 component.xrsiz,
                 component.yrsiz,
+                cancellation,
             );
             owned_upsampled[component_index] = true;
         }
     }
 
     const first_component = state.header.components[0];
-    return interleavePlanesU8(
+    return interleavePlanesU8WithCancellation(
         allocator,
         planes,
         state.header.width,
         state.header.height,
         first_component.bits_per_component,
         first_component.is_signed,
+        cancellation,
     );
 }
 
@@ -1809,6 +1999,16 @@ pub fn interleaveComponentPlanesU8(
     state: *const codestream.State,
     raw_planes: [][]i32,
 ) ![]u8 {
+    return interleaveComponentPlanesU8WithCancellation(allocator, state, raw_planes, .{});
+}
+
+pub fn interleaveComponentPlanesU8WithCancellation(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    raw_planes: [][]i32,
+    cancellation: decode_control.CancellationProbe,
+) ![]u8 {
+    try cancellation.check();
     if (raw_planes.len != state.header.components.len) return error.InvalidPlaneLength;
     if (raw_planes.len < 1 or raw_planes.len > 5)
         return error.UnsupportedPlaneCount;
@@ -1827,13 +2027,14 @@ pub fn interleaveComponentPlanesU8(
             component.yrsiz,
         );
         if (dims.width != state.header.width or dims.height != state.header.height)
-            return interleaveComponentPlanesU8WithUpsampling(allocator, state, raw_planes);
+            return interleaveComponentPlanesU8WithUpsampling(allocator, state, raw_planes, cancellation);
         if (plane.len != pixel_count) return error.InvalidPlaneLength;
     }
 
     const first_component = state.header.components[0];
     var first_bytes = std.mem.sliceAsBytes(raw_planes[0]);
     for (raw_planes[0], 0..) |sample, pixel_index| {
+        if (pixel_index & 4095 == 0) try cancellation.check();
         first_bytes[pixel_index] = try reconstructU8Sample(
             sample,
             first_component.bits_per_component,
@@ -1854,6 +2055,7 @@ pub fn interleaveComponentPlanesU8(
     const output = try allocator.alloc(u8, output_len);
     errdefer allocator.free(output);
     for (0..pixel_count) |pixel_index| {
+        if (pixel_index & 4095 == 0) try cancellation.check();
         output[pixel_index * raw_planes.len] = first_bytes[pixel_index];
         for (1..raw_planes.len) |component_index| {
             output[pixel_index * raw_planes.len + component_index] = try reconstructU8Sample(
@@ -1900,6 +2102,22 @@ fn inverseWavelet97MultiLevelOriginAtResolution(
     discard_levels: u8,
     openjpeg_compat: bool,
 ) !void {
+    return inverseWavelet97MultiLevelOriginAtResolutionWithCancellation(allocator, plane, width, height, origin_x, origin_y, decomposition_levels, discard_levels, openjpeg_compat, .{});
+}
+
+fn inverseWavelet97MultiLevelOriginAtResolutionWithCancellation(
+    allocator: std.mem.Allocator,
+    plane: []f32,
+    width: usize,
+    height: usize,
+    origin_x: usize,
+    origin_y: usize,
+    decomposition_levels: u8,
+    discard_levels: u8,
+    openjpeg_compat: bool,
+    cancellation: decode_control.CancellationProbe,
+) !void {
+    try cancellation.check();
     var level: u8 = 0;
     const levels_to_apply = decomposition_levels - @min(discard_levels, decomposition_levels);
     while (level < levels_to_apply) : (level += 1) {
@@ -1911,7 +2129,7 @@ fn inverseWavelet97MultiLevelOriginAtResolution(
         if (active_w == 0 or active_h == 0) continue;
 
         if (openjpeg_compat) {
-            try wavelet.inverse97LevelInPlaceStridedPhaseOpenJpeg(
+            try wavelet.inverse97LevelInPlaceStridedPhaseOpenJpegWithCancellation(
                 allocator,
                 plane,
                 active_w,
@@ -1919,9 +2137,10 @@ fn inverseWavelet97MultiLevelOriginAtResolution(
                 width,
                 phase_x,
                 phase_y,
+                cancellation,
             );
         } else {
-            try wavelet.inverse97LevelInPlaceStridedPhase(
+            try wavelet.inverse97LevelInPlaceStridedPhaseWithCancellation(
                 allocator,
                 plane,
                 active_w,
@@ -1929,6 +2148,7 @@ fn inverseWavelet97MultiLevelOriginAtResolution(
                 width,
                 phase_x,
                 phase_y,
+                cancellation,
             );
         }
     }
@@ -1958,6 +2178,18 @@ pub fn reconstructTier1ExecutionReportWithOptions(
     apply_plane_fixups: bool,
     apply_pixel_fixups: bool,
 ) !ReconstructionReport {
+    return reconstructTier1ExecutionReportWithOptionsAndCancellation(allocator, state, execution, apply_plane_fixups, apply_pixel_fixups, .{});
+}
+
+pub fn reconstructTier1ExecutionReportWithOptionsAndCancellation(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    execution: *const packet.Tier1Execution,
+    apply_plane_fixups: bool,
+    apply_pixel_fixups: bool,
+    cancellation: decode_control.CancellationProbe,
+) !ReconstructionReport {
+    try cancellation.check();
     if (state.header.components.len == 0) return error.UnsupportedPlaneCount;
     const bits_per_component = state.header.components[0].bits_per_component;
     const is_signed = state.header.components[0].is_signed;
@@ -1971,11 +2203,11 @@ pub fn reconstructTier1ExecutionReportWithOptions(
     const use_irreversible = coding_style.wavelet_transform == 0;
     const use_component_wavelets = try hasMixedComponentWaveletTransforms(state);
     const raw_planes = if (use_component_wavelets)
-        try assemblePlanesFromTier1ComponentWavelets(allocator, state, execution)
+        try assemblePlanesFromTier1ComponentWaveletsAtResolutionWithCancellation(allocator, state, execution, 0, cancellation)
     else if (use_irreversible)
-        try assemblePlanesFromTier1Irreversible(allocator, state, execution)
+        try assemblePlanesFromTier1IrreversibleAtResolutionWithCancellation(allocator, state, execution, 0, cancellation)
     else
-        try assemblePlanesFromTier1(allocator, state, execution);
+        try assemblePlanesFromTier1AtResolutionWithCancellation(allocator, state, execution, 0, cancellation);
     defer {
         for (raw_planes) |plane| allocator.free(plane);
         allocator.free(raw_planes);
@@ -1984,7 +2216,7 @@ pub fn reconstructTier1ExecutionReportWithOptions(
     // RCT inverse operates on corresponding unsubsampled component samples.
     // The capability gate rejects incompatible grids; retain the same check in
     // reconstruction so internal callers cannot accidentally skip the transform.
-    if (!use_component_wavelets and !use_irreversible) try applyReversibleMctOnEqualComponentGrid(state, raw_planes);
+    if (!use_component_wavelets and !use_irreversible) try applyReversibleMctOnEqualComponentGridWithCancellation(state, raw_planes, cancellation);
 
     // Upsample any subsampled components to the full image grid using bilinear
     // filtering. The common 1:1 case leaves planes untouched (pointers reused).
@@ -2000,6 +2232,7 @@ pub fn reconstructTier1ExecutionReportWithOptions(
     }
     var any_subsampled = false;
     for (state.header.components, 0..) |comp, i| {
+        try cancellation.check();
         const dims = tile.componentDimensionsAt(
             state.header.x_offset,
             state.header.y_offset,
@@ -2014,7 +2247,7 @@ pub fn reconstructTier1ExecutionReportWithOptions(
             planes[i] = raw_planes[i];
         } else {
             any_subsampled = true;
-            planes[i] = try upsample.bilinearI32ReferenceGrid(
+            planes[i] = try upsample.bilinearI32ReferenceGridWithCancellation(
                 allocator,
                 raw_planes[i],
                 cw,
@@ -2027,6 +2260,7 @@ pub fn reconstructTier1ExecutionReportWithOptions(
                 dims.origin_y,
                 comp.xrsiz,
                 comp.yrsiz,
+                cancellation,
             );
             owned_upsampled[i] = true;
         }
@@ -2040,13 +2274,14 @@ pub fn reconstructTier1ExecutionReportWithOptions(
         }
     }
 
-    const pixels = try interleavePlanesU8(
+    const pixels = try interleavePlanesU8WithCancellation(
         allocator,
         planes,
         state.header.width,
         state.header.height,
         bits_per_component,
         is_signed,
+        cancellation,
     );
     const used_pixel_fixup = if (apply_pixel_fixups and !any_subsampled) applyBoundedConformancePixelFixups(state, execution, pixels) else false;
     return .{

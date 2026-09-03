@@ -111,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
         \\{"embeddings":{"sv_cli":{"indices":[7,42],"values":[1.5,0.5]}},"indexes":["sv_cli"],"limit":1}
     );
     try writeFile(io, graph_query_path,
-        \\{"graph_searches":{"neighbors":{"type":"neighbors","index_name":"gr_cli","start_nodes":{"keys":["doc:cli-vec-a"]},"params":{"edge_types":["links"]}}},"limit":10}
+        \\{"graph_queries":{"neighbors":{"index":"gr_cli","traverse":{"start":{"keys":["doc:cli-vec-a"]},"edge_types":["links"],"max_depth":1}}},"limit":10}
     );
 
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "init", db_path }, "\"format\":\"aflite\"");

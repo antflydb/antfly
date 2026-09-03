@@ -133,7 +133,7 @@ fn shapeIsConcretePositive(shape: @import("ml").graph.Shape) bool {
 
 fn reshapeHasCompileSafeShape(op: OpCode) bool {
     return switch (op) {
-        .reshape => |attrs| shapeIsConcretePositive(attrs.new_shape),
+        .reshape => |attrs| !attrs.runtime_shape and shapeIsConcretePositive(attrs.new_shape),
         else => true,
     };
 }

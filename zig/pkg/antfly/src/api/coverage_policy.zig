@@ -6,7 +6,15 @@
 const std = @import("std");
 const coverage_identity = @import("../storage/coverage_identity.zig");
 
-pub const incarnation_field = "_coverage_incarnation";
+/// Private catalog identity for the desired index incarnation. It is assigned
+/// by the metadata mutation path, stripped from every public response, and
+/// shared by all shards so same-name replacements cannot reuse stale runtime
+/// observations.
+pub const incarnation_field = "_index_incarnation";
+/// v0.2 persisted this embeddings-only spelling before incarnation fencing was
+/// generalized to full-text and graph indexes. It remains readable so stored
+/// metadata upgrades in place, but new writes always use `incarnation_field`.
+pub const legacy_coverage_incarnation_field = "_coverage_incarnation";
 
 pub const Policy = enum {
     strict,
@@ -34,9 +42,16 @@ pub fn validateStoredIndexConfig(value: std.json.Value) !void {
 fn validateIndexConfigWithPrivateFields(value: std.json.Value, allow_incarnation: bool) !void {
     if (value != .object) return error.InvalidIndexConfig;
     const stored_incarnation = value.object.get(incarnation_field);
-    if (stored_incarnation != null and !allow_incarnation) return error.InvalidIndexConfig;
+    const legacy_incarnation = value.object.get(legacy_coverage_incarnation_field);
+    if ((stored_incarnation != null or legacy_incarnation != null) and !allow_incarnation) return error.InvalidIndexConfig;
     if (stored_incarnation) |raw| {
         if (raw != .integer or raw.integer <= 0) return error.InvalidIndexConfig;
+    }
+    if (legacy_incarnation) |raw| {
+        if (raw != .integer or raw.integer <= 0) return error.InvalidIndexConfig;
+        if (stored_incarnation) |current| {
+            if (current.integer != raw.integer) return error.InvalidIndexConfig;
+        }
     }
     // These experimental spellings were never part of the public schema.
     if (value.object.get("coverage") != null or value.object.get("partial") != null or value.object.get("applies_when") != null) {
@@ -45,12 +60,13 @@ fn validateIndexConfigWithPrivateFields(value: std.json.Value, allow_incarnation
 
     const configured = value.object.get("coverage_policy");
     const index_type = value.object.get("type") orelse {
-        if (configured != null or stored_incarnation != null) return error.InvalidCoveragePolicy;
+        if (configured != null or stored_incarnation != null or legacy_incarnation != null) return error.InvalidCoveragePolicy;
         return;
     };
     if (index_type != .string) return error.InvalidIndexConfig;
     const embeddings = std.mem.eql(u8, index_type.string, "embeddings");
-    if ((configured != null or stored_incarnation != null) and !embeddings) return error.InvalidCoveragePolicy;
+    if (configured != null and !embeddings) return error.InvalidCoveragePolicy;
+    if (legacy_incarnation != null and !embeddings) return error.InvalidCoveragePolicy;
     if (configured == null) return;
     if (value.object.get("external")) |external| {
         if (external == .bool and external.bool) return error.InvalidCoveragePolicy;
@@ -65,10 +81,7 @@ fn newIncarnation(io: std.Io) !i64 {
 pub fn withFreshIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     if (value != .object) return error.InvalidIndexConfig;
     try validateIndexConfig(value);
-    const index_type = value.object.get("type") orelse return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    if (index_type != .string or !std.mem.eql(u8, index_type.string, "embeddings")) {
-        return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    }
+    _ = value.object.get("type") orelse return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -89,10 +102,7 @@ pub fn withIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value, cov
         .{},
     );
     defer cloned.deinit();
-    const index_type = cloned.value.object.get("type") orelse return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cloned.value, .{})});
-    if (index_type != .string or !std.mem.eql(u8, index_type.string, "embeddings")) {
-        return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cloned.value, .{})});
-    }
+    _ = cloned.value.object.get("type") orelse return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cloned.value, .{})});
     try cloned.value.object.put(arena, incarnation_field, .{ .integer = @intCast(coverage_incarnation) });
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cloned.value, .{})});
 }
@@ -103,16 +113,14 @@ pub fn withIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value, cov
 pub fn withIncarnationIfMissingAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     if (value != .object) return error.InvalidIndexConfig;
     try validateStoredIndexConfig(value);
-    if (value.object.get(incarnation_field)) |raw| {
-        _ = raw;
-        return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    }
+    if (incarnation(value) != null) return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     return try withFreshIncarnationAlloc(alloc, value);
 }
 
 pub fn incarnation(value: std.json.Value) ?u64 {
     if (value != .object) return null;
-    const raw = value.object.get(incarnation_field) orelse return null;
+    const raw = value.object.get(incarnation_field) orelse
+        value.object.get(legacy_coverage_incarnation_field) orelse return null;
     if (raw != .integer or raw.integer <= 0) return null;
     return @intCast(raw.integer);
 }
@@ -131,9 +139,12 @@ pub fn withMissingIncarnationsAlloc(alloc: std.mem.Allocator, indexes_json: []co
     while (it.next()) |entry| {
         const config = entry.value_ptr;
         if (config.* != .object or config.object.get(incarnation_field) != null) continue;
-        const index_type = config.object.get("type") orelse continue;
-        if (index_type != .string or !std.mem.eql(u8, index_type.string, "embeddings")) continue;
-        try config.object.put(arena, incarnation_field, .{ .integer = try newIncarnation(io_impl.io()) });
+        _ = config.object.get("type") orelse continue;
+        const assigned = if (config.object.get(legacy_coverage_incarnation_field)) |legacy| switch (legacy) {
+            .integer => |value| if (value > 0) value else return error.InvalidIndexConfig,
+            else => return error.InvalidIndexConfig,
+        } else try newIncarnation(io_impl.io());
+        try config.object.put(arena, incarnation_field, .{ .integer = assigned });
     }
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
 }
@@ -160,12 +171,12 @@ test "coverage policy accepts only the public embeddings contract" {
     defer unsupported_eligibility.deinit();
     try std.testing.expectError(error.InvalidCoveragePolicy, validateIndexConfig(unsupported_eligibility.value));
 
-    var reserved = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"embeddings\",\"_coverage_incarnation\":42}", .{});
+    var reserved = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"embeddings\",\"_index_incarnation\":42}", .{});
     defer reserved.deinit();
     try std.testing.expectError(error.InvalidIndexConfig, validateIndexConfig(reserved.value));
 }
 
-test "coverage policy assigns persistent private incarnations only to embeddings" {
+test "index configs receive persistent private incarnations across index kinds" {
     const alloc = std.testing.allocator;
 
     var embeddings = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"embeddings\",\"coverage_policy\":\"partial\"}", .{});
@@ -188,7 +199,7 @@ test "coverage policy assigns persistent private incarnations only to embeddings
     var parsed_indexes = try std.json.parseFromSlice(std.json.Value, alloc, indexes, .{});
     defer parsed_indexes.deinit();
     try std.testing.expect(incarnation(parsed_indexes.value.object.get("visual").?) != null);
-    try std.testing.expect(incarnation(parsed_indexes.value.object.get("title").?) == null);
+    try std.testing.expect(incarnation(parsed_indexes.value.object.get("title").?) != null);
 
     const replayed_json = try withIncarnationIfMissingAlloc(alloc, first.value);
     defer alloc.free(replayed_json);

@@ -18,8 +18,8 @@ import {
 } from "@antfly/design-system";
 import {
   type Table as AntflyTable,
-  type QueryRequest,
   queryResultTotalHits,
+  type TableQueryRequest,
   type TableStatus,
 } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
@@ -80,7 +80,7 @@ const TablesListPage: React.FC = () => {
       const counts = await Promise.allSettled(
         nextTables.map(async (table) => {
           if (table.storage_status?.empty) return [table.name, 0] as const;
-          const query: QueryRequest = {
+          const query: TableQueryRequest = {
             filter_query: { match_all: {} },
             count: true,
             limit: 0,

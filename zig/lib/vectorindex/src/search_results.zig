@@ -44,6 +44,15 @@ pub const ApproxSearchResult = struct {
     }
 };
 
+/// Whether the engine proved that the returned candidate window consumed the
+/// eligible search stream. Query-layer adaptive collection uses this signal to
+/// distinguish real post-processing loss from a legitimately short result set.
+pub const CandidateCoverage = enum {
+    unknown,
+    exhausted,
+    more,
+};
+
 fn resultWorseThan(_: void, a: SearchResult, b: SearchResult) std.math.Order {
     const primary = std.math.order(b.distance, a.distance);
     if (primary != .eq) return primary;
@@ -59,6 +68,7 @@ pub const SearchResults = struct {
     items: std.PriorityQueue(SearchResult, void, resultWorseThan),
     k: usize,
     max_items: usize,
+    candidate_coverage: CandidateCoverage = .unknown,
 
     pub fn init(alloc: Allocator, k: usize) SearchResults {
         return .{ .alloc = alloc, .items = .initContext({}), .k = k, .max_items = k };

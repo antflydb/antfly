@@ -445,7 +445,7 @@ func TestLiteCAPI(t *testing.T) {
 	fullTextQuery := []byte(`{"mode":"full_text","index_name":"ft_body_v1","text_query_type":"match","field":"body","text":"binding full text","limit":5}`)
 	denseQuery := []byte(`{"embeddings":{"dv_embedding_v1":[1.0,0.0]},"indexes":["dv_embedding_v1"],"limit":1}`)
 	sparseQuery := []byte(`{"embeddings":{"sv_embedding_v1":{"indices":[7,42],"values":[1.5,0.5]}},"indexes":["sv_embedding_v1"],"limit":1}`)
-	graphQuery := []byte(`{"graph_searches":{"neighbors":{"type":"neighbors","index_name":"gr_links_v1","start_nodes":{"keys":["doc:go-search"]},"params":{"edge_types":["links"]}}},"limit":10}`)
+	graphQuery := []byte(`{"graph_queries":{"neighbors":{"index":"gr_links_v1","traverse":{"start":{"keys":["doc:go-search"]},"edge_types":["links"],"max_depth":1}}},"limit":10}`)
 	hybridQuery := []byte(`{"full_text_search":{"match":{"field":"body","text":"hybrid alpha"}},"embeddings":{"dv_embedding_v1":[1.0,0.0]},"indexes":["dv_embedding_v1"],"merge_config":{"strategy":"rrf"},"limit":3}`)
 	assertSearchContains := func(handle *DB, label string, request []byte, want string) {
 		t.Helper()

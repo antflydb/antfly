@@ -72,6 +72,11 @@ pub const RangeRecord = struct {
     /// admission. New restores require a SHA-256 binding.
     restore_artifact_size_bytes: u64 = 0,
     restore_artifact_sha256: []const u8 = "",
+    /// Separately pinned identity for the native generation inventory. A
+    /// distributed restore may classify projection-local damage only when this
+    /// exact manifest remains authenticated across admission and execution.
+    restore_native_manifest_size_bytes: u64 = 0,
+    restore_native_manifest_sha256: []const u8 = "",
     /// Durable, bounded idempotency provenance for the most recently
     /// completed restore. Active replica progress can be garbage-collected
     /// without making an exact job retry ambiguous.

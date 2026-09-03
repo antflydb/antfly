@@ -21,7 +21,8 @@ class Path:
     Attributes:
         nodes (list[str] | Unset): Ordered list of node keys (base64-encoded)
         edges (list[PathEdge] | Unset):
-        total_weight (float | Unset):
+        total_weight (float | Unset): Sum of raw edge weights along the path. Path ordering still follows the selected
+            weight mode.
         length (int | Unset):
     """
 

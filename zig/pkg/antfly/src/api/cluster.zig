@@ -32,6 +32,7 @@ pub const ClusterStatus = struct {
     message: ?[]u8 = null,
     auth_enabled: bool = false,
     deployment_mode: common_config.DeploymentMode = .distributed,
+    index_capabilities: IndexRuntimeCapabilities = .{},
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
     storage: ?metadata_openapi.StorageRuntimeStatus = null,
@@ -49,6 +50,7 @@ pub const ClusterTopology = struct {
     message: ?[]u8 = null,
     auth_enabled: bool = false,
     deployment_mode: common_config.DeploymentMode = .distributed,
+    index_capabilities: IndexRuntimeCapabilities = .{},
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
     storage: ?metadata_openapi.StorageRuntimeStatus = null,
@@ -61,6 +63,17 @@ pub const ClusterTopology = struct {
         self.data.deinit(alloc);
         self.* = undefined;
     }
+};
+
+pub const IndexRuntimeCapabilities = struct {
+    artifact_sources: bool = true,
+    artifact_sources_state: ArtifactSourcesCapabilityState = .available,
+};
+
+pub const ArtifactSourcesCapabilityState = enum {
+    available,
+    upgrade_pending,
+    unsupported,
 };
 
 pub const SecretStoreStatus = struct {
@@ -295,6 +308,7 @@ pub fn topologyFromStatus(alloc: std.mem.Allocator, status: ClusterStatus) !Clus
         .message = message,
         .auth_enabled = status.auth_enabled,
         .deployment_mode = status.deployment_mode,
+        .index_capabilities = status.index_capabilities,
         .secret_store = secret_store,
         .runtime_config = runtime_config,
         .storage = status.storage,
@@ -604,6 +618,25 @@ test "generationless secret store status serializes a null source generation" {
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"supports_source_generation\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_generation\":null") != null);
+}
+
+test "cluster topology preserves deployment index capabilities" {
+    const alloc = std.testing.allocator;
+    var status = ClusterStatus{
+        .health = .healthy,
+        .deployment_mode = .serverless,
+        .index_capabilities = .{ .artifact_sources = false, .artifact_sources_state = .unsupported },
+    };
+    defer status.deinit(alloc);
+    var topology = try topologyFromStatus(alloc, status);
+    defer topology.deinit(alloc);
+
+    try std.testing.expect(!topology.index_capabilities.artifact_sources);
+    try std.testing.expectEqual(ArtifactSourcesCapabilityState.unsupported, topology.index_capabilities.artifact_sources_state);
+    const encoded = try std.json.Stringify.valueAlloc(alloc, topology, .{});
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"artifact_sources\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"artifact_sources_state\":\"unsupported\"") != null);
 }
 
 test "secret store status preserves unsupported source generation capability" {

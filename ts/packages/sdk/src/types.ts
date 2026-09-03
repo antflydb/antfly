@@ -41,7 +41,7 @@ export type Fuzziness = QueryComponents["schemas"]["Fuzziness"];
 // Request/Response types - Override with proper Antfly query types
 export type QueryRequest = Omit<
   components["schemas"]["QueryRequest"],
-  "full_text_search" | "filter_query" | "exclusion_query"
+  "full_text_search" | "filter_query" | "exclusion_query" | "graph_queries"
 > & {
   /** Full JSON Antfly search query with proper type checking */
   full_text_search?: AntflyQuery;
@@ -49,11 +49,22 @@ export type QueryRequest = Omit<
   filter_query?: AntflyQuery;
   /** Full JSON Antfly exclusion query with proper type checking */
   exclusion_query?: AntflyQuery;
+  /** Named graph queries with non-scoring, stored-document node filters. */
+  graph_queries?: Record<string, GraphQuery>;
+};
+/**
+ * Query body for a table-scoped endpoint. The table is selected exclusively by
+ * the route argument so one request cannot carry two competing table names.
+ */
+export type TableQueryRequest = Omit<QueryRequest, "table"> & {
+  readonly table?: never;
 };
 export type QueryResult = components["schemas"]["QueryResult"];
 export type QueryHit = components["schemas"]["QueryHit"];
 export type QueryHitsTotal = components["schemas"]["QueryHitsTotal"];
 export type QueryResponses = components["schemas"]["QueryResponses"];
+/** Stateful transport response; legacy graph values appear only for old graph_searches clients. */
+export type StatefulQueryResponses = components["schemas"]["StatefulQueryResponses"];
 
 export interface QueryHitsTotalFormatOptions {
   locale?: Intl.LocalesArgument;
@@ -167,6 +178,9 @@ export type EnrichmentConfig = components["schemas"]["EnrichmentConfig"];
 
 // Index types
 export type IndexConfig = components["schemas"]["IndexConfig"];
+export type EmbeddingsIndexConfig = components["schemas"]["EmbeddingsIndexConfig"];
+export type ArtifactIndexSource = components["schemas"]["ArtifactIndexSource"];
+export type GraphIndexSource = components["schemas"]["GraphArtifactSourceConfig"];
 export type CreateIndexRequest = components["schemas"]["CreateIndexRequest"];
 export type CreateFullTextIndexRequest = components["schemas"]["CreateFullTextIndexRequest"];
 export type CreateEmbeddingsIndexRequest = components["schemas"]["CreateEmbeddingsIndexRequest"];
@@ -175,6 +189,8 @@ export type CreateAlgebraicIndexRequest = components["schemas"]["CreateAlgebraic
 export type CreatedIndex = components["schemas"]["CreatedIndex"];
 export type IndexType = components["schemas"]["IndexType"];
 export type IndexStatus = components["schemas"]["IndexStatus"];
+export type IndexRuntimeCapabilities = components["schemas"]["IndexRuntimeCapabilities"];
+export type ClusterStatus = components["schemas"]["ClusterStatus"];
 
 // Graph index types
 export type GraphIndexConfig = components["schemas"]["GraphIndexConfig"];
@@ -187,12 +203,63 @@ export type EdgeDirection = components["schemas"]["EdgeDirection"];
 export type EdgesResponse = components["schemas"]["EdgesResponse"];
 export type TraversalRules = components["schemas"]["TraversalRules"];
 export type TraversalResult = components["schemas"]["TraversalResult"];
+export type GraphDocumentFilter = components["schemas"]["GraphDocumentFilter"];
+export type GraphEdgeWeightRange = components["schemas"]["GraphEdgeWeightRange"];
+export type GraphPathObjective = components["schemas"]["GraphPathObjective"];
+export type GraphPathEndpoint = components["schemas"]["GraphPathEndpoint"];
+export type GraphPathEdge = components["schemas"]["GraphPathEdge"];
+export type GraphPath = components["schemas"]["GraphPath"];
+export type GraphMatchEdge = components["schemas"]["GraphMatchEdge"];
+export type GraphAliasOperand = components["schemas"]["GraphAliasOperand"];
+export type GraphNotEqualPredicate = components["schemas"]["GraphNotEqualPredicate"];
+export type GraphNotExistsPattern = components["schemas"]["GraphNotExistsPattern"];
+export type GraphMatchNode = components["schemas"]["GraphMatchNode"];
+export type GraphOptionalMatch = components["schemas"]["GraphOptionalMatch"];
+export type GraphMatch = components["schemas"]["GraphMatch"];
+export type GraphMatchQuery = components["schemas"]["GraphMatchQuery"];
+export type GraphTraversal = components["schemas"]["GraphTraversal"];
+export type GraphTraverseQuery = components["schemas"]["GraphTraverseQuery"];
+export type GraphShortestPath = components["schemas"]["GraphShortestPath"];
+export type GraphShortestPathQuery = components["schemas"]["GraphShortestPathQuery"];
+export type GraphKShortestPaths = components["schemas"]["GraphKShortestPaths"];
+export type GraphKShortestPathsQuery = components["schemas"]["GraphKShortestPathsQuery"];
 export type GraphQuery = components["schemas"]["GraphQuery"];
-export type GraphQueryResult = components["schemas"]["GraphQueryResult"];
-export type GraphResultNode = components["schemas"]["GraphResultNode"];
+/** @deprecated Use GraphQuery through QueryRequest.graph_queries. */
+export type LegacyGraphQuery = components["schemas"]["LegacyGraphQuery"];
+/** @deprecated Compatibility type for LegacyGraphQuery. */
 export type GraphQueryType = components["schemas"]["GraphQueryType"];
-export type GraphNodeSelector = components["schemas"]["GraphNodeSelector"];
+/** @deprecated Compatibility type for LegacyGraphQuery. */
 export type GraphQueryParams = components["schemas"]["GraphQueryParams"];
+/** @deprecated Compatibility type for LegacyGraphQuery. */
+export type PatternStep = components["schemas"]["PatternStep"];
+/** @deprecated Compatibility type for legacy graph result matches. */
+export type PatternMatch = components["schemas"]["PatternMatch"];
+export type GraphResult = components["schemas"]["GraphResult"];
+export type GraphBindingsResult = components["schemas"]["GraphBindingsResult"];
+export type GraphAggregatesResult = components["schemas"]["GraphAggregatesResult"];
+export type GraphNodesResult = components["schemas"]["GraphNodesResult"];
+export type GraphPathResult = components["schemas"]["GraphPathResult"];
+export type GraphPathsResult = components["schemas"]["GraphPathsResult"];
+export type LegacyGraphSearchResult = components["schemas"]["LegacyGraphSearchResult"];
+export type GraphAggregateValue = components["schemas"]["GraphAggregateValue"];
+export type GraphResultStats = components["schemas"]["GraphResultStats"];
+export type GraphExactResultStats = components["schemas"]["GraphExactResultStats"];
+export type GraphResultRow = components["schemas"]["GraphResultRow"];
+export type GraphResultBinding = components["schemas"]["GraphResultBinding"];
+export type GraphBindingNode = components["schemas"]["GraphBindingNode"];
+export type GraphResultNode = components["schemas"]["GraphResultNode"];
+export type GraphNodeSelector = components["schemas"]["GraphNodeSelector"];
+export type GraphKeyNodeSelector = components["schemas"]["GraphKeyNodeSelector"];
+export type GraphIdentityNodeSelector = components["schemas"]["GraphIdentityNodeSelector"];
+export type GraphResultRefNodeSelector = components["schemas"]["GraphResultRefNodeSelector"];
+export type GraphReturn = components["schemas"]["GraphReturn"];
+export type GraphBindingsReturn = components["schemas"]["GraphBindingsReturn"];
+export type GraphAggregatesReturn = components["schemas"]["GraphAggregatesReturn"];
+export type GraphCountAggregate = components["schemas"]["GraphCountAggregate"];
+export type GraphRowCountAggregate = components["schemas"]["GraphRowCountAggregate"];
+export type GraphRowCountTarget = components["schemas"]["GraphRowCountTarget"];
+export type GraphAliasCountAggregate = components["schemas"]["GraphAliasCountAggregate"];
+export type GraphWhereExpression = components["schemas"]["GraphWhereExpression"];
 export type PathWeightMode = components["schemas"]["PathWeightMode"];
 
 // User and permission types

@@ -1117,7 +1117,7 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
 
         const graph_before = try api.searchJson(
             alloc,
-            "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"gr_v1\",\"start_nodes\":{\"keys\":[\"doc:vec:a\"]},\"params\":{\"edge_types\":[\"links\"]}}},\"limit\":10}",
+            "{\"graph_queries\":{\"neighbors\":{\"index\":\"gr_v1\",\"traverse\":{\"start\":{\"keys\":[\"doc:vec:a\"]},\"edge_types\":[\"links\"],\"max_depth\":1}}},\"limit\":10}",
         );
         defer alloc.free(graph_before);
         try std.testing.expect(std.mem.indexOf(u8, graph_before, "\"doc:vec:c\"") != null);
@@ -1275,7 +1275,7 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
 
         const graph_after = try restored.searchJson(
             alloc,
-            "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"gr_v1\",\"start_nodes\":{\"keys\":[\"doc:vec:a\"]},\"params\":{\"edge_types\":[\"links\"]}}},\"limit\":10}",
+            "{\"graph_queries\":{\"neighbors\":{\"index\":\"gr_v1\",\"traverse\":{\"start\":{\"keys\":[\"doc:vec:a\"]},\"edge_types\":[\"links\"],\"max_depth\":1}}},\"limit\":10}",
         );
         defer alloc.free(graph_after);
         try std.testing.expect(std.mem.indexOf(u8, graph_after, "\"doc:vec:c\"") != null);
@@ -1338,7 +1338,7 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
 
         const graph_after = try roundtrip.searchJson(
             alloc,
-            "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"gr_v1\",\"start_nodes\":{\"keys\":[\"doc:vec:a\"]},\"params\":{\"edge_types\":[\"links\"]}}},\"limit\":10}",
+            "{\"graph_queries\":{\"neighbors\":{\"index\":\"gr_v1\",\"traverse\":{\"start\":{\"keys\":[\"doc:vec:a\"]},\"edge_types\":[\"links\"],\"max_depth\":1}}},\"limit\":10}",
         );
         defer alloc.free(graph_after);
         try std.testing.expect(std.mem.indexOf(u8, graph_after, "\"doc:vec:c\"") != null);

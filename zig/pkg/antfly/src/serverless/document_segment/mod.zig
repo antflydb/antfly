@@ -16,15 +16,25 @@ pub const types = @import("types.zig");
 pub const codec = @import("codec.zig");
 
 pub const Entry = types.Entry;
+pub const IndexEntry = types.IndexEntry;
 pub const freeEntries = types.freeEntries;
+pub const freeIndexEntries = types.freeIndexEntries;
 pub const encodeAlloc = codec.encodeAlloc;
 pub const decodeAlloc = codec.decodeAlloc;
+pub const header_len = codec.header_len;
+pub const Header = codec.Header;
+pub const decodeHeader = codec.decodeHeader;
+pub const decodeIndexAlloc = codec.decodeIndexAlloc;
 
 test "serverless document segment module compiles" {
     _ = types;
     _ = codec;
     _ = Entry;
+    _ = IndexEntry;
     _ = freeEntries;
+    _ = freeIndexEntries;
     _ = encodeAlloc;
     _ = decodeAlloc;
+    _ = decodeHeader;
+    _ = decodeIndexAlloc;
 }

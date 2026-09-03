@@ -36,3 +36,4 @@ pub const RegexpQuery = types.RegexpQuery;
 pub const TermQuery = types.TermQuery;
 pub const TermRangeQuery = types.TermRangeQuery;
 pub const WildcardQuery = types.WildcardQuery;
+pub const BoostValue = types.BoostValue;

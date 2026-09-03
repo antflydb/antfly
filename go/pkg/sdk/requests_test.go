@@ -3,6 +3,7 @@ package sdk
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
@@ -16,6 +17,101 @@ func TestQueryRequestMarshalOmitsZeroJoin(t *testing.T) {
 	}
 	if bytes.Contains(body, []byte(`"join"`)) {
 		t.Fatalf("Marshal emitted zero join: %s", body)
+	}
+}
+
+func TestQueryRequestMarshalPreservesNamedFullTextIndex(t *testing.T) {
+	body, err := json.Marshal(QueryRequest{
+		Table:         "files",
+		FullTextIndex: "document_text",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"full_text_index":"document_text"`)) {
+		t.Fatalf("named full-text index missing from request: %s", body)
+	}
+	var roundTrip QueryRequest
+	if err := json.Unmarshal(body, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip.FullTextIndex != "document_text" {
+		t.Fatalf("named full-text index lost during unmarshal: %#v", roundTrip.FullTextIndex)
+	}
+}
+
+func TestQueryRequestMarshalValidatesCanonicalGraphOperationNames(t *testing.T) {
+	for _, name := range []string{" bad", "bad\u200bname", "*", "$reserved"} {
+		_, err := json.Marshal(QueryRequest{GraphQueries: map[string]GraphQuery{name: {}}})
+		if err == nil {
+			t.Fatalf("expected invalid graph operation name %q to fail", name)
+		}
+	}
+}
+
+func TestQueryRequestRejectsExplicitlyEmptyGraphQueries(t *testing.T) {
+	if _, err := json.Marshal(QueryRequest{GraphQueries: map[string]GraphQuery{}}); err == nil {
+		t.Fatal("expected explicitly empty graph_queries to fail")
+	}
+	var request QueryRequest
+	if err := json.Unmarshal([]byte(`{"graph_queries":{}}`), &request); err == nil {
+		t.Fatal("expected explicitly empty graph_queries to fail during unmarshal")
+	}
+}
+
+func TestQueryRequestMarshalEnforcesCanonicalGraphOperationLimit(t *testing.T) {
+	queries := make(map[string]GraphQuery, maxNamedGraphQueries+1)
+	for i := 0; i <= maxNamedGraphQueries; i++ {
+		queries[fmt.Sprintf("query_%d", i)] = GraphQuery{}
+	}
+	if _, err := json.Marshal(QueryRequest{GraphQueries: queries}); err == nil {
+		t.Fatal("expected too many canonical graph operations to fail")
+	}
+}
+
+func TestQueryRequestMarshalEnforcesMatchOperationLimit(t *testing.T) {
+	graphReturn, err := NewGraphBindingsReturn([]string{"node"}, GraphBindingsOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	matchQuery, err := NewGraphMatchQuery(GraphMatchQuery{
+		Index: "graph_idx",
+		Match: GraphMatch{
+			Anchor: "node",
+			Nodes:  map[string]GraphMatchNode{"node": {}},
+			Edges:  []GraphMatchEdge{},
+		},
+		Return: graphReturn,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queries := make(map[string]GraphQuery, maxGraphMatchQueries+1)
+	for i := 0; i <= maxGraphMatchQueries; i++ {
+		queries[fmt.Sprintf("match_%d", i)] = matchQuery
+	}
+	if _, err := json.Marshal(QueryRequest{GraphQueries: queries}); err == nil {
+		t.Fatal("expected too many canonical match operations to fail")
+	} else if !bytes.Contains([]byte(err.Error()), []byte("at most 8 match operations")) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestQueryRequestMarshalValidatesDirectGraphUnionValues(t *testing.T) {
+	start, err := NewGraphKeySelector("doc:a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var direct GraphQuery
+	if err := direct.FromGraphTraverseQuery(GraphTraverseQuery{
+		Traverse: GraphTraversal{Start: start, MaxDepth: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := json.Marshal(QueryRequest{
+		GraphQueries: map[string]GraphQuery{"walk": direct},
+	}); err == nil {
+		t.Fatal("expected direct graph union value with an empty index to fail locally")
 	}
 }
 

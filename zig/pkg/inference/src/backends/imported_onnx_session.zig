@@ -1962,6 +1962,138 @@ test "imported onnx session runs simple add model" {
     }
 }
 
+test "imported onnx session matches dynamic quantized integer matmul semantics" {
+    const allocator = std.testing.allocator;
+    const proto = onnx_graph.proto;
+
+    var matrix_dims = [_]proto.TensorShapeProto.Dimension{
+        .{ .dim_value = 2 },
+        .{ .dim_value = 2 },
+    };
+    var input_infos = [_]proto.ValueInfoProto{
+        .{
+            .name = "x",
+            .type_proto = .{ .tensor_type = .{
+                .elem_type = .float32,
+                .shape = .{ .dims = &matrix_dims },
+            } },
+        },
+    };
+    var output_infos = [_]proto.ValueInfoProto{
+        .{
+            .name = "q",
+            .type_proto = .{ .tensor_type = .{
+                .elem_type = .uint8,
+                .shape = .{ .dims = &matrix_dims },
+            } },
+        },
+        .{
+            .name = "scale",
+            .type_proto = .{ .tensor_type = .{
+                .elem_type = .float32,
+                .shape = .{ .dims = &.{} },
+            } },
+        },
+        .{
+            .name = "zp",
+            .type_proto = .{ .tensor_type = .{
+                .elem_type = .uint8,
+                .shape = .{ .dims = &.{} },
+            } },
+        },
+        .{
+            .name = "out",
+            .type_proto = .{ .tensor_type = .{
+                .elem_type = .float32,
+                .shape = .{ .dims = &matrix_dims },
+            } },
+        },
+    };
+
+    const weight_values = [_]i8{ 1, -2, 3, 4 };
+    const weight_zero_points = [_]i8{ 0, 0 };
+    var weight_dims = [_]i64{ 2, 2 };
+    var zero_point_dims = [_]i64{2};
+    var initializers = [_]proto.TensorProto{
+        .{
+            .name = "w",
+            .dims = &weight_dims,
+            .data_type = .int8,
+            .raw_data = std.mem.sliceAsBytes(&weight_values),
+        },
+        .{
+            .name = "wzp",
+            .dims = &zero_point_dims,
+            .data_type = .int8,
+            .raw_data = std.mem.sliceAsBytes(&weight_zero_points),
+        },
+    };
+
+    var dql_inputs = [_][]const u8{"x"};
+    var dql_outputs = [_][]const u8{ "q", "scale", "zp" };
+    var mm_inputs = [_][]const u8{ "q", "w", "zp", "wzp" };
+    var mm_outputs = [_][]const u8{"mm"};
+    var cast_inputs = [_][]const u8{"mm"};
+    var cast_outputs = [_][]const u8{"out"};
+    var cast_attrs = [_]proto.AttributeProto{
+        .{ .name = "to", .i = @intFromEnum(proto.DataType.float32), .attr_type = .int },
+    };
+    var nodes = [_]proto.NodeProto{
+        .{ .op_type = "DynamicQuantizeLinear", .inputs = &dql_inputs, .outputs = &dql_outputs },
+        .{ .op_type = "MatMulInteger", .inputs = &mm_inputs, .outputs = &mm_outputs },
+        .{ .op_type = "Cast", .inputs = &cast_inputs, .outputs = &cast_outputs, .attributes = &cast_attrs },
+    };
+    var opsets = [_]proto.OpsetImport{.{ .domain = "", .version = 12 }};
+    const graph_proto = proto.GraphProto{
+        .name = "dynamic_quantized_matmul",
+        .nodes = &nodes,
+        .initializers = &initializers,
+        .inputs = &input_infos,
+        .outputs = &output_infos,
+    };
+    const model = proto.ModelProto{
+        .ir_version = 7,
+        .opset_import = &opsets,
+        .graph = graph_proto,
+    };
+    const model_bytes = try onnx_graph.serializeModel(allocator, &model);
+    defer allocator.free(model_bytes);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = model_bytes });
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..], "model.onnx" });
+    defer allocator.free(path);
+
+    var session = try createSessionWithOptions(allocator, path, .native, .{
+        .graph_runtime_strategy = .partitioned,
+    });
+    defer session.close();
+
+    const input = [_]f32{ -2.0, -1.0, 0.0, 1.0 };
+    var input_tensor = try Tensor.initFloat32(allocator, "x", &.{ 2, 2 }, &input);
+    defer input_tensor.deinit();
+
+    var outputs = try session.run(&.{input_tensor}, allocator);
+    defer {
+        for (outputs) |*tensor| tensor.deinit();
+        allocator.free(outputs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), outputs.len);
+    // Native graph execution stores intermediate integer tensors in numeric
+    // f32 buffers; the graph-declared u8/i32 dtypes still drive rounding and
+    // downstream conversion semantics.
+    try std.testing.expectEqual(DType.f32, outputs[0].dtype);
+    try std.testing.expectEqualSlices(f32, &.{ 0.0, 85.0, 170.0, 255.0 }, outputs[0].asFloat32());
+    try std.testing.expectEqual(DType.f32, outputs[1].dtype);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.011764706), outputs[1].asFloat32()[0], 1e-8);
+    try std.testing.expectEqual(DType.f32, outputs[2].dtype);
+    try std.testing.expectEqual(@as(f32, 170.0), outputs[2].asFloat32()[0]);
+    try std.testing.expectEqual(DType.f32, outputs[3].dtype);
+    try std.testing.expectEqualSlices(f32, &.{ -425.0, 0.0, 255.0, 340.0 }, outputs[3].asFloat32());
+}
+
 test "ONNX artifact inspection includes and validates external tensor files" {
     const allocator = std.testing.allocator;
 

@@ -241,6 +241,16 @@ pub fn executeMultiDevice(
     const last_use = if (options.cached_analysis) |ca| ca.last_use else try interpreter.computeLastUse(allocator, graph, reachable);
     defer if (!have_cache) allocator.free(last_use);
 
+    var runtime_shape_tracker = try interpreter.RuntimeShapeTracker.init(allocator, graph, options.cached_analysis);
+    defer runtime_shape_tracker.deinit();
+    if (options.runtime_inputs) |inputs| {
+        const runtime_backend = (mesh.device(0) orelse return error.DeviceNotFound).backend;
+        for (inputs) |ri| {
+            if (ri.node_id >= count) continue;
+            try runtime_shape_tracker.record(runtime_backend, ri.node_id, ri.value);
+        }
+    }
+
     var owned_graph_buffer_plan: ?buffer_plan_mod.BufferPlan = null;
     defer if (owned_graph_buffer_plan) |*buffer_plan| buffer_plan.deinit();
     const graph_buffer_plan = if (options.cached_buffer_plan) |buffer_plan|
@@ -335,6 +345,7 @@ pub fn executeMultiDevice(
             .attention_layer = &attention_layer,
             .pair_second = &pair_second,
             .embedding_ids = options.embedding_ids,
+            .runtime_shape_tracker = &runtime_shape_tracker,
         };
 
         if (part.executor) |exec| {
@@ -360,6 +371,7 @@ pub fn executeMultiDevice(
                 .options = options,
                 .last_use = last_use,
                 .pair_second = pair_second,
+                .runtime_shapes = runtime_shape_tracker.runtimeShapes(),
             };
 
             // Execute each node in this partition.
@@ -379,6 +391,7 @@ pub fn executeMultiDevice(
                         values[i] = rt_val;
                     }
                     value_device[i] = dev_id;
+                    try runtime_shape_tracker.record(cb, node_id, values[i].?);
                     if (collect_stats and part.backend == .cuda) exec_stats.planned_operator_dispatches += 1;
                     continue;
                 }
@@ -395,6 +408,7 @@ pub fn executeMultiDevice(
                     }
                 }
                 value_device[i] = dev_id;
+                try runtime_shape_tracker.record(cb, node_id, values[i].?);
                 try interpreter.cloneOutputIfAliasedInputWouldBeFreed(
                     allocator,
                     graph,

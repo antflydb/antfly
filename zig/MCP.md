@@ -93,7 +93,7 @@ Example raw QueryRequest call:
 The raw `queryRequest` path is intentionally generic. It can carry the OpenAPI `QueryRequest` fields such as `query`,
 `full_text_search`, `filter_query`, `exclusion_query`, `semantic_search`, `embedding_template`, `indexes`,
 `embeddings`, `fields`, `hierarchy`, `limit`, `offset`, `order_by`, `search_after`, `search_before`, `distance_under`,
-`distance_over`, `search_effort`, `merge_config`, `count`, `profile`, `reranker`, `aggregations`, `graph_searches`,
+`distance_over`, `search_effort`, `merge_config`, `count`, `profile`, `reranker`, `aggregations`, `graph_queries`,
 `expand_strategy`, `document_renderer`, `pruner`, `join`, and `foreign_sources`.
 
 Raw mode rules:

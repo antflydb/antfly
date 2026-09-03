@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const test_support = @import("test_support.zig");
 
 const Allocator = std.mem.Allocator;
+const cancellation_work_bytes: usize = 64 * 1024;
 const adam7_x_starts = [_]usize{ 0, 4, 0, 2, 0, 1, 0 };
 const adam7_y_starts = [_]usize{ 0, 0, 4, 0, 2, 0, 1 };
 const adam7_x_steps = [_]usize{ 8, 8, 4, 4, 2, 2, 1 };
@@ -28,15 +29,32 @@ pub const DecodedImage = struct {
     height: u32,
 };
 
+/// Borrowed, allocation-free cancellation source for bounded PNG work.
+pub const CancellationProbe = struct {
+    context: ?*const anyopaque = null,
+    is_cancelled_fn: ?*const fn (?*const anyopaque) bool = null,
+
+    pub fn check(self: CancellationProbe) !void {
+        if (self.is_cancelled_fn) |is_cancelled| if (is_cancelled(self.context)) return error.Canceled;
+    }
+};
+
 pub fn hasSignature(bytes: []const u8) bool {
     return bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' });
 }
 
 pub fn encodeRgba(alloc: Allocator, width: u32, height: u32, rgba: []const u8) ![]u8 {
-    const expected = @as(usize, width) * @as(usize, height) * 4;
+    return try encodeRgbaWithCancellation(alloc, width, height, rgba, .{});
+}
+
+pub fn encodeRgbaWithCancellation(alloc: Allocator, width: u32, height: u32, rgba: []const u8, cancellation: CancellationProbe) ![]u8 {
+    try cancellation.check();
+    if (width == 0 or height == 0) return error.InvalidRgbaSize;
+    const pixel_count = std.math.mul(usize, width, height) catch return error.InvalidRgbaSize;
+    const expected = std.math.mul(usize, pixel_count, 4) catch return error.InvalidRgbaSize;
     if (rgba.len != expected) return error.InvalidRgbaSize;
 
-    const row_bytes = @as(usize, width) * 4;
+    const row_bytes = std.math.mul(usize, width, 4) catch return error.InvalidRgbaSize;
     // The flate writer requires an initial output buffer (and grows it through
     // Writer.Allocating as compressed bytes are emitted).
     var compressed = try std.Io.Writer.Allocating.initCapacity(alloc, 16 * 1024);
@@ -52,15 +70,25 @@ pub fn encodeRgba(alloc: Allocator, width: u32, height: u32, rgba: []const u8) !
         for (0..height) |row| {
             try compressor.writer.writeByte(0);
             const offset = row * row_bytes;
-            try compressor.writer.writeAll(rgba[offset..][0..row_bytes]);
+            const row_data = rgba[offset..][0..row_bytes];
+            var chunk_offset: usize = 0;
+            while (chunk_offset < row_data.len) {
+                try cancellation.check();
+                const chunk_end = chunk_offset + @min(row_data.len - chunk_offset, cancellation_work_bytes);
+                try compressor.writer.writeAll(row_data[chunk_offset..chunk_end]);
+                chunk_offset = chunk_end;
+            }
         }
+        try cancellation.check();
         try compressor.finish();
     }
+    try cancellation.check();
     const zlib = compressed.writer.buffered();
     const zlib_len = zlib.len;
     if (zlib_len > std.math.maxInt(u32)) return error.PngEncodeFailed;
 
     const png_len = 8 + chunkTotalLen(13) + chunkTotalLen(zlib_len) + chunkTotalLen(0);
+    try cancellation.check();
     const out = try alloc.alloc(u8, png_len);
     errdefer alloc.free(out);
     var cursor: usize = 0;
@@ -82,11 +110,21 @@ pub fn encodeRgba(alloc: Allocator, width: u32, height: u32, rgba: []const u8) !
     const idat_type_start = cursor;
     @memcpy(out[cursor .. cursor + 4], "IDAT");
     cursor += 4;
-    @memcpy(out[cursor .. cursor + zlib_len], zlib);
-    cursor += zlib_len;
-    writeU32be(out[cursor .. cursor + 4], crc32Fast(out[idat_type_start..cursor]));
+    var idat_crc = crc32FastUpdate(crc32FastInit(), out[idat_type_start..cursor]);
+    var zlib_offset: usize = 0;
+    while (zlib_offset < zlib.len) {
+        try cancellation.check();
+        const chunk_end = zlib_offset + @min(zlib.len - zlib_offset, cancellation_work_bytes);
+        const chunk = zlib[zlib_offset..chunk_end];
+        @memcpy(out[cursor .. cursor + chunk.len], chunk);
+        idat_crc = crc32FastUpdate(idat_crc, chunk);
+        cursor += chunk.len;
+        zlib_offset = chunk_end;
+    }
+    writeU32be(out[cursor .. cursor + 4], crc32FastFinal(idat_crc));
     cursor += 4;
 
+    try cancellation.check();
     appendChunkToBuffer(out, &cursor, "IEND", &.{});
     std.debug.assert(cursor == out.len);
     return out;
@@ -812,6 +850,42 @@ test "encode rgba writes png signature" {
     try std.testing.expectEqual(@as(u32, 2), decoded.width);
     try std.testing.expectEqual(@as(u32, 2), decoded.height);
     try std.testing.expectEqualSlices(u8, &rgba, decoded.rgba);
+}
+
+test "encode rgba cancellation bounds compression and IDAT work" {
+    const CancelAtCheck = struct {
+        checks: usize = 0,
+        cancel_at: usize,
+
+        fn isCancelled(context: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(context.?)));
+            self.checks += 1;
+            return self.checks >= self.cancel_at;
+        }
+
+        fn probe(self: *@This()) CancellationProbe {
+            return .{ .context = self, .is_cancelled_fn = isCancelled };
+        }
+    };
+
+    // A single scanline wider than one work chunk must remain interruptible.
+    const wide_rgba = [_]u8{0x5a} ** (20_000 * 4);
+    var during_compression = CancelAtCheck{ .cancel_at = 3 };
+    try std.testing.expectError(
+        error.Canceled,
+        encodeRgbaWithCancellation(std.testing.allocator, 20_000, 1, &wide_rgba, during_compression.probe()),
+    );
+    try std.testing.expectEqual(@as(usize, 3), during_compression.checks);
+
+    // Cancellation remains active after Deflate while IDAT is copied and its
+    // checksum is accumulated. The testing allocator verifies output cleanup.
+    const small_rgba = [_]u8{0xa5} ** (8 * 8 * 4);
+    var during_idat = CancelAtCheck{ .cancel_at = 13 };
+    try std.testing.expectError(
+        error.Canceled,
+        encodeRgbaWithCancellation(std.testing.allocator, 8, 8, &small_rgba, during_idat.probe()),
+    );
+    try std.testing.expectEqual(@as(usize, 13), during_idat.checks);
 }
 
 test "encode rgba compresses repetitive pages" {

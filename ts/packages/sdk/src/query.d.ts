@@ -131,7 +131,10 @@ export interface components {
         DisjunctionQuery: {
             disjuncts: components["schemas"]["Query"][];
             boost?: components["schemas"]["Boost"];
-            /** Format: double */
+            /**
+             * Format: uint32
+             * @description Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
+             */
             min?: number;
         };
         MatchAllQuery: {

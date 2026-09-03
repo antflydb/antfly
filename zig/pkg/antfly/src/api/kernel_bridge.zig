@@ -166,6 +166,14 @@ const OpaqueApiHttpServer = struct {
         return out;
     }
 
+    /// Opaque servers bind the source from inside `create`, after the heap-owned
+    /// kernel server reaches its stable address. Keep the direct and opaque
+    /// call sites uniform without exposing a kernel-owned cache pointer.
+    pub fn bindIncomingGraphRoutes(self: *OpaqueApiHttpServer, source: table_reads.TableReadSource) void {
+        _ = self;
+        _ = source;
+    }
+
     pub fn checkReady(self: *OpaqueApiHttpServer) !void {
         try callFallible(void, void, self.functions.check_ready, self.opaque_handle, null, null);
     }

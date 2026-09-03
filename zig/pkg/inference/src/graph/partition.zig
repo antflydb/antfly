@@ -235,6 +235,7 @@ pub const PartitionExecutor = struct {
         attention_layer: ?*usize = null,
         pair_second: ?*?CT = null,
         embedding_ids: ?[]const i64 = null,
+        runtime_shape_tracker: ?*interpreter.RuntimeShapeTracker = null,
     };
 
     pub const VTable = struct {

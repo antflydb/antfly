@@ -910,3 +910,79 @@ test "native graph runtime attaches native partition executors" {
         try std.testing.expect(part.executor != null);
     }
 }
+
+test "native partitioned runtimes restore request dimensions after flattened projection" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+
+    // Mirrors the dynamic sequence-classifier topology used by imported ONNX
+    // rerankers: [batch, sequence, hidden] is flattened for a projection and
+    // then restored from symbolic graph dimensions.
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ -1, -1, 4 }));
+    const weight = try builder.parameter("weight", Shape.init(.f32, &.{ 4, 5 }));
+    const flat = try builder.reshape(x, Shape.init(.f32, &.{ -1, 4 }));
+    const projected = try builder.matmul(flat, weight);
+    const restored = try builder.reshape(projected, Shape.init(.f32, &.{ -1, -1, 5 }));
+    try graph.markOutput(restored);
+
+    var weight_store = WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    defer {
+        native_mod.deinitPrefetchQueue(&weight_store);
+        weight_store.resident_weights.deinit(allocator);
+        weight_store.lazy_weights.deinit(allocator);
+    }
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const x_data = [_]f32{
+        1,  2,  3,  4,
+        5,  6,  7,  8,
+        9,  10, 11, 12,
+        13, 14, 15, 16,
+        17, 18, 19, 20,
+        21, 22, 23, 24,
+    };
+    const weight_data = [_]f32{
+        1, 0, 0, 0, 1,
+        0, 1, 0, 0, 1,
+        0, 0, 1, 0, 1,
+        0, 0, 0, 1, 1,
+    };
+    const x_value = try cb.fromFloat32Shape(&x_data, &.{ 2, 3, 4 });
+    defer cb.free(x_value);
+    const weight_value = try cb.fromFloat32Shape(&weight_data, &.{ 4, 5 });
+    defer cb.free(weight_value);
+    const runtime_inputs = [_]interpreter.RuntimeInput{
+        .{ .node_id = x, .value = x_value },
+        .{ .node_id = weight, .value = weight_value },
+    };
+    var analysis = try interpreter.CachedAnalysis.compute(allocator, &graph);
+    defer analysis.deinit(allocator);
+
+    for ([_]Strategy{ .partitioned, .compiled_preferred }) |strategy| {
+        var runtime = try Runtime.init(allocator, &graph, &cb, strategy);
+        defer runtime.deinit();
+
+        var result = try runtime.execute(allocator, &graph, .{
+            .runtime_inputs = &runtime_inputs,
+            .cached_analysis = analysis,
+        });
+        defer result.deinit(&runtime);
+
+        const actual_shape = try cb.tensorShape(result.outputs[0], allocator);
+        defer allocator.free(actual_shape);
+        try std.testing.expectEqualSlices(i64, &.{ 2, 3, 5 }, actual_shape);
+
+        const actual = try cb.toFloat32(result.outputs[0], allocator);
+        defer allocator.free(actual);
+        try std.testing.expectEqual(@as(usize, 30), actual.len);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 10 }, actual[0..5]);
+        try std.testing.expectEqualSlices(f32, &.{ 21, 22, 23, 24, 90 }, actual[25..30]);
+    }
+}

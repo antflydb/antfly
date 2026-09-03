@@ -47,9 +47,9 @@ Sleep 2s
 
 # Wait for embeddings to be queryable. This returns immediately on fast
 # machines and fails clearly instead of silently continuing after five minutes.
-Type@75ms `antfly index wait -t wikipedia -i title_body --timeout 20m`
+Type@75ms `antfly index wait -t wikipedia -i title_body --until queryable --timeout 20m`
 Enter
-Wait@1200s /ready/
+Wait@1200s /reached queryable:/
 Sleep 1s
 
 # --- Full-text search ---

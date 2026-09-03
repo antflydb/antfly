@@ -1760,7 +1760,19 @@ fn resolveDotOperandShapeFromPeer(
 
         if (dim <= 0) {
             if (indexOfAxis(batch_dims, axis)) |batch_index| {
-                if (batch_index < peer_batch_dims.len) {
+                // Generic dynamic ONNX dimensions (-1, and occasionally 0
+                // from incomplete shape inference) must retain a concrete
+                // runtime batch extent when one is already attached to the
+                // tensor. The peer may intentionally have a smaller repeated
+                // batch (for example one set of weights per attention head),
+                // so copying its extent would fold batch rows into the free
+                // dimension while preserving only the total element count.
+                if (declared_dim >= -1) {
+                    if (stored_shape) |shape| {
+                        if (i < shape.len and shape[i] > 0) dim = shape[i];
+                    }
+                }
+                if (dim <= 0 and batch_index < peer_batch_dims.len) {
                     const peer_axis = peer_batch_dims[batch_index];
                     if (peer_axis < peer_shape.len and peer_shape[peer_axis] > 0) {
                         dim = peer_shape[peer_axis];
@@ -38017,7 +38029,7 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
         if (!symbolic_batch_dims and lhs_has_batch and lhs_batch_shape.len > 0) computeStrides(lhs_batch_shape, lhs_batch_strides[0..lhs_batch_shape.len]);
         var rhs_batch_strides: [8]usize = undefined;
         if (!symbolic_batch_dims and rhs_has_batch and rhs_batch_shape.len > 0) computeStrides(rhs_batch_shape, rhs_batch_strides[0..rhs_batch_shape.len]);
-        if (symbolic_batch_dims or flattened_batch_broadcast or lhs_free_axis == null or rhs_free_axis == null or lhs_buf2.source_tensor != null or rhs_buf2.source_tensor != null) {
+        if (symbolic_batch_dims or lhs_free_axis == null or rhs_free_axis == null) {
             for (0..batch_size) |b| {
                 const lhs_batch_index = if (symbolic_batch_dims or flattened_batch_broadcast)
                     if (lhs_batch_elems == 1) 0 else b % lhs_batch_elems
@@ -38043,7 +38055,16 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
             const rhs_strides = logicalStridesOrContiguous(rhs, rhs_effective_shape, rhs_stride_scratch[0..rhs_effective_shape.len]);
 
             for (0..batch_size) |b| {
-                const lhs_batch_offset = if (lhs_has_batch and out_batch_shape.len > 0)
+                const lhs_batch_offset = if (lhs_has_batch and flattened_batch_broadcast)
+                    broadcastTensorOffsetForOutputBatch(
+                        if (lhs_batch_elems == 1) 0 else b % lhs_batch_elems,
+                        lhs_batch_shape,
+                        lhs_batch_strides[0..lhs_batch_shape.len],
+                        lhs_batch_shape,
+                        lhs_batch,
+                        lhs_strides,
+                    )
+                else if (lhs_has_batch and out_batch_shape.len > 0)
                     broadcastTensorOffsetForOutputBatch(
                         b,
                         out_batch_shape,
@@ -38054,7 +38075,16 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
                     )
                 else
                     0;
-                const rhs_batch_offset = if (rhs_has_batch and out_batch_shape.len > 0)
+                const rhs_batch_offset = if (rhs_has_batch and flattened_batch_broadcast)
+                    broadcastTensorOffsetForOutputBatch(
+                        if (rhs_batch_elems == 1) 0 else b % rhs_batch_elems,
+                        rhs_batch_shape,
+                        rhs_batch_strides[0..rhs_batch_shape.len],
+                        rhs_batch_shape,
+                        rhs_batch,
+                        rhs_strides,
+                    )
+                else if (rhs_has_batch and out_batch_shape.len > 0)
                     broadcastTensorOffsetForOutputBatch(
                         b,
                         out_batch_shape,
@@ -48045,6 +48075,64 @@ test "dot_general resolves rhs symbolic batch and free dims from lhs peer" {
 
     try std.testing.expectEqualSlices(i64, &.{ 2, 3, 4, 6 }, tensorStoredShape(out_ct).?);
     try std.testing.expectEqual(@as(usize, 2 * 3 * 4 * 6), getData(out_ct).len);
+}
+
+test "dot_general keeps concrete flattened batch extent with repeated per-head rhs" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+
+    const lhs_data = try allocator.alloc(f32, 4 * 3 * 2);
+    defer allocator.free(lhs_data);
+    @memset(lhs_data, 1.0);
+
+    const rhs_data = try allocator.alloc(f32, 2 * 5 * 2);
+    defer allocator.free(rhs_data);
+    for (0..2) |batch| {
+        for (0..5) |column| {
+            for (0..2) |contracting| {
+                rhs_data[(batch * 5 + column) * 2 + contracting] = @floatFromInt(batch * 100 + column * 10 + contracting + 1);
+            }
+        }
+    }
+
+    const lhs_ct = try compute.makeBuf(lhs_data, false);
+    defer freeTensor(&compute, lhs_ct);
+    const lhs_shaped = try compute.withLogicalShape(lhs_ct, &.{ 4, 3, 2 });
+
+    const rhs_ct = try compute.makeBuf(rhs_data, false);
+    defer freeTensor(&compute, rhs_ct);
+    const rhs_shaped = try compute.withLogicalShape(rhs_ct, &.{ 2, 5, 2 });
+    const rhs_transposed = try primTransposeOp(&compute, rhs_shaped, &.{ 0, 2, 1 }, &.{ 2, 5, 2 });
+    defer freeTensor(&compute, rhs_transposed);
+
+    const out_ct = try primDotGeneralOp(
+        &compute,
+        lhs_shaped,
+        rhs_transposed,
+        &.{ -1, -1, -1 },
+        &.{ 0, 0, 0 },
+        &.{2},
+        &.{1},
+        &.{0},
+        &.{0},
+    );
+    defer freeTensor(&compute, out_ct);
+
+    try std.testing.expectEqualSlices(i64, &.{ 4, 3, 5 }, tensorStoredShape(out_ct).?);
+    try std.testing.expectEqual(@as(usize, 4 * 3 * 5), getData(out_ct).len);
+    const expected_rows = [_][5]f32{
+        .{ 3, 23, 43, 63, 83 },
+        .{ 203, 223, 243, 263, 283 },
+        .{ 3, 23, 43, 63, 83 },
+        .{ 203, 223, 243, 263, 283 },
+    };
+    for (0..4) |batch| {
+        for (0..3) |row| {
+            const offset = (batch * 3 + row) * 5;
+            try std.testing.expectEqualSlices(f32, &expected_rows[batch], getData(out_ct)[offset..][0..5]);
+        }
+    }
 }
 
 test "dot_general handles batched rhs free-before-contract layout" {

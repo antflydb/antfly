@@ -1906,7 +1906,8 @@ fn convertOpToNode(
     // Determine if this op needs an extra shape input appended to its
     // ONNX input list. For Reshape / Expand the target shape lives in the
     // termite node's attributes; ONNX expects it as a second tensor input.
-    const shape_attr: ?Shape = switch (n.op) {
+    const existing_shape_input = n.num_inputs >= 2;
+    const shape_attr: ?Shape = if (existing_shape_input) null else switch (n.op) {
         .reshape => |a| a.new_shape,
         .broadcast_in_dim => |a| a.target_shape,
         else => null,
@@ -2155,7 +2156,7 @@ fn mapOp(alloc: Allocator, graph: *const Graph, n: *const Node) !OpMapping {
         .concat_prim => |a| try intAttrOp(alloc, "Concat", "axis", a.axis),
         .range => simpleOp("Range"),
         .shape_of => |a| try shapeOfOp(alloc, a),
-        .gather => |a| try intAttrOp(alloc, "Gather", "axis", a.axis),
+        .gather => |a| try intAttrOp(alloc, if (a.elements) "GatherElements" else "Gather", "axis", a.axis),
         .scatter_add => simpleOp("ScatterElements"),
 
         // Contraction

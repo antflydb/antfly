@@ -6,7 +6,7 @@ from fix_generated_client import FILES, NDJSON_HEADER, fix_generated_client
 
 
 def write_generated_files(root: Path, signature_count: int) -> None:
-    signature = "body: QueryRequest | File | Unset = UNSET"
+    signature = "body: StatefulQueryRequest | File | Unset = UNSET"
     for relative in FILES:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -20,7 +20,7 @@ def test_required_ndjson_body_is_not_made_optional(tmp_path: Path) -> None:
 
     for relative in FILES:
         source = (tmp_path / relative).read_text()
-        assert source.count("body: QueryRequest | File") == 5
+        assert source.count("body: StatefulQueryRequest | File") == 5
         assert "Unset = UNSET" not in source
 
 

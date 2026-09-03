@@ -13,6 +13,9 @@
 // limitations under the License.
 
 const std = @import("std");
+const cff_data = @import("cff_data.zig");
+
+const missing_glyph = std.math.maxInt(u16);
 
 pub const Error = error{
     InvalidCff,
@@ -20,9 +23,69 @@ pub const Error = error{
     MissingTable,
     UnsupportedCff,
     InvalidGlyphIndex,
+    GlyphOutlineTooComplex,
 };
 
 const ParseError = Error || std.mem.Allocator.Error;
+
+pub const OutlineLimits = struct {
+    max_operations: usize = std.math.maxInt(usize),
+    /// Optional caller-owned page/request meter. Every attempted charstring
+    /// operation is charged, including work performed before a parse error.
+    remaining_operations: ?*usize = null,
+};
+
+fn predefinedEncodingGlyphName(encoding: *const [256]u16, code: u8) ?[]const u8 {
+    const sid = encoding[code];
+    if (sid == 0 or sid >= cff_data.standard_strings.len) return null;
+    return cff_data.standard_strings[sid];
+}
+
+/// Adobe StandardEncoding names are shared by CFF and Type 1 fonts. Expose
+/// the canonical names so clients never have to round-trip through Unicode,
+/// where distinct PostScript glyph names can collapse or have no scalar.
+pub fn standardEncodingGlyphName(code: u8) ?[]const u8 {
+    return predefinedEncodingGlyphName(&cff_data.standard_encoding, code);
+}
+
+pub fn expertEncodingGlyphName(code: u8) ?[]const u8 {
+    return predefinedEncodingGlyphName(&cff_data.expert_encoding, code);
+}
+
+fn exactI32FromFloat(value: f64) Error!i32 {
+    if (!std.math.isFinite(value) or
+        @trunc(value) != value or
+        value < @as(f64, @floatFromInt(std.math.minInt(i32))) or
+        value > @as(f64, @floatFromInt(std.math.maxInt(i32))))
+    {
+        return error.InvalidCff;
+    }
+    return @intFromFloat(value);
+}
+
+fn boundedUsizeFromFloat(value: f64) Error!usize {
+    // Use max + 1 as an exclusive bound. On 64-bit targets maxInt rounds to
+    // 2^64 in f64 already; on narrower targets the addition preserves the
+    // representable maximum instead of rejecting it.
+    const upper_bound: f64 = @as(f64, @floatFromInt(std.math.maxInt(usize))) + 1.0;
+    if (!std.math.isFinite(value) or value < 0 or value >= upper_bound)
+        return error.InvalidCff;
+    return @intFromFloat(value);
+}
+
+fn roundedIsizeFromFloat(value: f64) Error!isize {
+    if (!std.math.isFinite(value)) return error.InvalidCff;
+    const rounded = @round(value);
+    const lower_bound: f64 = @floatFromInt(std.math.minInt(isize));
+    const upper_bound: f64 = @as(f64, @floatFromInt(std.math.maxInt(isize))) + 1.0;
+    if (rounded < lower_bound or rounded >= upper_bound) return error.InvalidCff;
+    return @intFromFloat(rounded);
+}
+
+fn charsetRangeValue(first: u16, delta: usize) Error!u16 {
+    if (delta > std.math.maxInt(u16) - @as(usize, first)) return error.InvalidCff;
+    return @intCast(@as(usize, first) + delta);
+}
 
 pub const GlyphPoint = @import("sfnt.zig").GlyphPoint;
 pub const GlyphContour = @import("sfnt.zig").GlyphContour;
@@ -50,6 +113,8 @@ pub const Font = struct {
     bytes: []const u8,
     charstrings: Index,
     charset: []u16,
+    encoding: [256]u16 = [_]u16{missing_glyph} ** 256,
+    string_index: Index = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
     global_subrs: Index,
     local_subrs: ?Index,
     fd_array: ?[]FontDict,
@@ -73,6 +138,7 @@ pub const Font = struct {
         const top_dict = try top_dict_index.getObject(bytes, 0);
         const charstrings_offset = try parseTopDictOffset(top_dict, .{ .primary = 17 });
         const charset_offset = parseTopDictOffset(top_dict, .{ .primary = 15 }) catch 0;
+        const encoding_offset = parseTopDictOffset(top_dict, .{ .primary = 16 }) catch 0;
         const private = parseTopDictPrivate(top_dict) catch null;
         const fd_array_offset = parseTopDictOffset(top_dict, .{ .primary = 12, .escaped = 36 }) catch 0;
         const fd_select_offset = parseTopDictOffset(top_dict, .{ .primary = 12, .escaped = 37 }) catch 0;
@@ -82,6 +148,7 @@ pub const Font = struct {
         const glyph_count = charstrings.count;
         const charset = try parseCharsetAlloc(alloc, bytes, charset_offset, glyph_count);
         errdefer alloc.free(charset);
+        const encoding = try parseEncoding(bytes, encoding_offset, charset, glyph_count);
 
         const local_subrs = if (private) |priv|
             try parseLocalSubrs(bytes, priv.size, priv.offset)
@@ -102,6 +169,8 @@ pub const Font = struct {
             .bytes = bytes,
             .charstrings = charstrings,
             .charset = charset,
+            .encoding = encoding,
+            .string_index = string_index,
             .global_subrs = global_subrs,
             .local_subrs = local_subrs,
             .fd_array = fd_array,
@@ -117,6 +186,10 @@ pub const Font = struct {
     }
 
     pub fn glyphOutlineAlloc(self: Font, alloc: std.mem.Allocator, glyph_index: u16) ParseError!?GlyphOutline {
+        return self.glyphOutlineAllocLimited(alloc, glyph_index, .{});
+    }
+
+    pub fn glyphOutlineAllocLimited(self: Font, alloc: std.mem.Allocator, glyph_index: u16, limits: OutlineLimits) ParseError!?GlyphOutline {
         if (glyph_index >= self.charstrings.count) return error.InvalidGlyphIndex;
         const program = try self.charstrings.getObject(self.bytes, glyph_index);
         if (program.len == 0) return null;
@@ -136,7 +209,13 @@ pub const Font = struct {
         var width_seen = false;
         var hint_count: usize = 0;
         var transient: [32]f64 = [_]f64{0} ** 32;
-        try self.executeCharStringAlloc(alloc, program, self.localSubrsForGlyph(glyph_index), &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, 0);
+        const shared_limit = if (limits.remaining_operations) |remaining| remaining.* else std.math.maxInt(usize);
+        var remaining_operations = @min(limits.max_operations, shared_limit);
+        const initial_operations = remaining_operations;
+        defer if (limits.remaining_operations) |remaining| {
+            remaining.* -|= initial_operations - remaining_operations;
+        };
+        try self.executeCharStringAllocLimited(alloc, program, self.localSubrsForGlyph(glyph_index), &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, &remaining_operations, 0);
 
         if (contours.items.len == 0) return null;
         return .{
@@ -146,6 +225,47 @@ pub const Font = struct {
             .x_max = 0,
             .y_max = 0,
         };
+    }
+
+    pub fn glyphCount(self: Font) usize {
+        return self.charstrings.count;
+    }
+
+    /// CFF charsets contain SIDs for name-keyed fonts and CIDs for CID-keyed
+    /// fonts. This lookup supports the latter without assuming CID == GID.
+    pub fn glyphIndexForCharsetValue(self: Font, value: u16) ?u16 {
+        for (self.charset, 0..) |candidate, glyph_index| {
+            if (candidate == value) return @intCast(glyph_index);
+        }
+        return null;
+    }
+
+    pub fn glyphIndexForName(self: Font, name: []const u8) ?u16 {
+        for (self.charset, 0..) |sid, glyph_index| {
+            const glyph_name = self.stringForSid(sid) orelse continue;
+            if (std.mem.eql(u8, glyph_name, name)) return @intCast(glyph_index);
+        }
+        return null;
+    }
+
+    pub fn glyphIndexForCustomName(self: Font, name: []const u8) ?u16 {
+        return self.glyphIndexForName(name);
+    }
+
+    pub fn glyphIndexForEmbeddedCode(self: Font, code: u8) ?u16 {
+        const glyph_index = self.encoding[code];
+        return if (glyph_index == missing_glyph) null else glyph_index;
+    }
+
+    pub fn glyphIndexForPredefinedCode(self: Font, code: u8, expert: bool) ?u16 {
+        const sid = if (expert) cff_data.expert_encoding[code] else cff_data.standard_encoding[code];
+        if (sid == 0) return null;
+        return self.glyphIndexForCharsetValue(sid);
+    }
+
+    fn stringForSid(self: Font, sid: u16) ?[]const u8 {
+        if (sid < cff_data.standard_strings.len) return cff_data.standard_strings[sid];
+        return self.string_index.getObject(self.bytes, sid - cff_data.standard_strings.len) catch null;
     }
 
     fn executeCharStringAlloc(
@@ -163,9 +283,31 @@ pub const Font = struct {
         transient: *[32]f64,
         subr_depth: u8,
     ) ParseError!void {
+        var remaining_operations: usize = std.math.maxInt(usize);
+        return self.executeCharStringAllocLimited(alloc, program, active_local_subrs, stack, current, contours, x, y, width_seen, hint_count, transient, &remaining_operations, subr_depth);
+    }
+
+    fn executeCharStringAllocLimited(
+        self: Font,
+        alloc: std.mem.Allocator,
+        program: []const u8,
+        active_local_subrs: ?Index,
+        stack: *std.ArrayList(f64),
+        current: *std.ArrayList(GlyphPoint),
+        contours: *std.ArrayList(GlyphContour),
+        x: *f64,
+        y: *f64,
+        width_seen: *bool,
+        hint_count: *usize,
+        transient: *[32]f64,
+        remaining_operations: *usize,
+        subr_depth: u8,
+    ) ParseError!void {
         if (subr_depth > 16) return error.UnsupportedCff;
         var i: usize = 0;
         while (i < program.len) {
+            if (remaining_operations.* == 0) return error.GlyphOutlineTooComplex;
+            remaining_operations.* -= 1;
             const b0 = program[i];
             i += 1;
             switch (b0) {
@@ -190,14 +332,23 @@ pub const Font = struct {
                     stack.clearRetainingCapacity();
                     width_seen.* = true;
                 },
-                6 => try executeAlternatingLines(alloc, stack, current, x, y, true),
-                7 => try executeAlternatingLines(alloc, stack, current, x, y, false),
-                8 => try executeRrcurveto(alloc, stack, current, x, y),
+                6 => {
+                    try executeAlternatingLines(alloc, stack, current, x, y, true);
+                    width_seen.* = true;
+                },
+                7 => {
+                    try executeAlternatingLines(alloc, stack, current, x, y, false);
+                    width_seen.* = true;
+                },
+                8 => {
+                    try executeRrcurveto(alloc, stack, current, x, y);
+                    width_seen.* = true;
+                },
                 10 => {
                     if (active_local_subrs == null or stack.items.len == 0) return error.UnsupportedCff;
                     const subr_index = try subroutineIndex(stack.orderedRemove(stack.items.len - 1), active_local_subrs.?.count);
                     const subr = try active_local_subrs.?.getObject(self.bytes, subr_index);
-                    try self.executeCharStringAlloc(alloc, subr, active_local_subrs, stack, current, contours, x, y, width_seen, hint_count, transient, subr_depth + 1);
+                    try self.executeCharStringAllocLimited(alloc, subr, active_local_subrs, stack, current, contours, x, y, width_seen, hint_count, transient, remaining_operations, subr_depth + 1);
                 },
                 11 => return,
                 12 => {
@@ -228,13 +379,24 @@ pub const Font = struct {
                         28 => try exchStack(stack),
                         29 => try indexStack(alloc, stack),
                         30 => try rollStack(alloc, stack),
-                        34 => try executeHflex(alloc, stack, current, x, y),
-                        35 => try executeFlex(alloc, stack, current, x, y),
-                        36 => try executeHflex1(alloc, stack, current, x, y),
-                        37 => try executeFlex1(alloc, stack, current, x, y),
+                        34 => {
+                            try executeHflex(alloc, stack, current, x, y);
+                            width_seen.* = true;
+                        },
+                        35 => {
+                            try executeFlex(alloc, stack, current, x, y);
+                            width_seen.* = true;
+                        },
+                        36 => {
+                            try executeHflex1(alloc, stack, current, x, y);
+                            width_seen.* = true;
+                        },
+                        37 => {
+                            try executeFlex1(alloc, stack, current, x, y);
+                            width_seen.* = true;
+                        },
                         else => return error.UnsupportedCff,
                     }
-                    width_seen.* = true;
                 },
                 14 => {
                     if (current.items.len > 0) try flushContour(alloc, contours, current);
@@ -259,10 +421,22 @@ pub const Font = struct {
                     stack.clearRetainingCapacity();
                     width_seen.* = true;
                 },
-                24 => try executeRcurveline(alloc, stack, current, x, y),
-                25 => try executeRlinecurve(alloc, stack, current, x, y),
-                26 => try executeVvcurveto(alloc, stack, current, x, y),
-                27 => try executeHhcurveto(alloc, stack, current, x, y),
+                24 => {
+                    try executeRcurveline(alloc, stack, current, x, y);
+                    width_seen.* = true;
+                },
+                25 => {
+                    try executeRlinecurve(alloc, stack, current, x, y);
+                    width_seen.* = true;
+                },
+                26 => {
+                    try executeVvcurveto(alloc, stack, current, x, y);
+                    width_seen.* = true;
+                },
+                27 => {
+                    try executeHhcurveto(alloc, stack, current, x, y);
+                    width_seen.* = true;
+                },
                 28 => {
                     if (i + 2 > program.len) return error.TruncatedCff;
                     const value: i16 = @bitCast((@as(u16, program[i]) << 8) | program[i + 1]);
@@ -273,10 +447,16 @@ pub const Font = struct {
                     if (stack.items.len == 0 or self.global_subrs.count == 0) return error.UnsupportedCff;
                     const subr_index = try subroutineIndex(stack.orderedRemove(stack.items.len - 1), self.global_subrs.count);
                     const subr = try self.global_subrs.getObject(self.bytes, subr_index);
-                    try self.executeCharStringAlloc(alloc, subr, active_local_subrs, stack, current, contours, x, y, width_seen, hint_count, transient, subr_depth + 1);
+                    try self.executeCharStringAllocLimited(alloc, subr, active_local_subrs, stack, current, contours, x, y, width_seen, hint_count, transient, remaining_operations, subr_depth + 1);
                 },
-                30 => try executeVhcurveto(alloc, stack, current, x, y),
-                31 => try executeHvcurveto(alloc, stack, current, x, y),
+                30 => {
+                    try executeVhcurveto(alloc, stack, current, x, y);
+                    width_seen.* = true;
+                },
+                31 => {
+                    try executeHvcurveto(alloc, stack, current, x, y);
+                    width_seen.* = true;
+                },
                 19, 20 => {
                     try consumeStemHints(stack, width_seen, hint_count);
                     const mask_bytes = (hint_count.* + 7) / 8;
@@ -308,7 +488,6 @@ pub const Font = struct {
                 },
                 else => return error.UnsupportedCff,
             }
-            width_seen.* = true;
         }
     }
 
@@ -388,7 +567,7 @@ fn parseTopDictOffset(dict_bytes: []const u8, target_operator: DictOperator) Err
                 };
                 if (matched) {
                     if (operands_len == 0) return error.InvalidCff;
-                    return @intFromFloat(operands[operands_len - 1]);
+                    return try boundedUsizeFromFloat(operands[operands_len - 1]);
                 }
                 operands_len = 0;
             },
@@ -504,8 +683,8 @@ fn parseTopDictPrivate(dict_bytes: []const u8) Error!PrivateDictRef {
                 if (matched) {
                     if (operands_len < 2) return error.InvalidCff;
                     return .{
-                        .size = @intFromFloat(operands[operands_len - 2]),
-                        .offset = @intFromFloat(operands[operands_len - 1]),
+                        .size = try boundedUsizeFromFloat(operands[operands_len - 2]),
+                        .offset = try boundedUsizeFromFloat(operands[operands_len - 1]),
                     };
                 }
                 operands_len = 0;
@@ -594,7 +773,8 @@ fn subroutineBias(count: u16) i32 {
 }
 
 fn subroutineIndex(operand: f64, count: u16) Error!usize {
-    const index = @as(i32, @intFromFloat(operand)) + subroutineBias(count);
+    const raw_index = try exactI32FromFloat(operand);
+    const index = std.math.add(i32, raw_index, subroutineBias(count)) catch return error.InvalidGlyphIndex;
     if (index < 0 or index >= count) return error.InvalidGlyphIndex;
     return @intCast(index);
 }
@@ -905,9 +1085,19 @@ fn parseCharsetAlloc(alloc: std.mem.Allocator, bytes: []const u8, charset_offset
     errdefer alloc.free(out);
     out[0] = 0;
     if (glyph_count == 1) return out;
-    if (charset_offset == 0) {
+    if (charset_offset <= 2) {
+        const predefined: []const u16 = switch (charset_offset) {
+            0 => &.{},
+            1 => &cff_data.expert_charset,
+            2 => &cff_data.expert_subset_charset,
+            else => unreachable,
+        };
+        if ((charset_offset == 0 and glyph_count > 229) or
+            (charset_offset != 0 and glyph_count > predefined.len)) return error.InvalidCff;
         var i: usize = 1;
-        while (i < glyph_count) : (i += 1) out[i] = @intCast(i);
+        while (i < glyph_count) : (i += 1) {
+            out[i] = if (charset_offset == 0) @intCast(i) else predefined[i];
+        }
         return out;
     }
     if (charset_offset >= bytes.len) return error.TruncatedCff;
@@ -931,7 +1121,7 @@ fn parseCharsetAlloc(alloc: std.mem.Allocator, bytes: []const u8, charset_offset
                 cursor += 3;
                 var j: usize = 0;
                 while (j <= left and i < glyph_count) : (j += 1) {
-                    out[i] = @intCast(first + j);
+                    out[i] = try charsetRangeValue(first, j);
                     i += 1;
                 }
             }
@@ -946,13 +1136,87 @@ fn parseCharsetAlloc(alloc: std.mem.Allocator, bytes: []const u8, charset_offset
                 cursor += 4;
                 var j: usize = 0;
                 while (j <= left and i < glyph_count) : (j += 1) {
-                    out[i] = @intCast(first + j);
+                    out[i] = try charsetRangeValue(first, j);
                     i += 1;
                 }
             }
             if (i != glyph_count) return error.InvalidCff;
         },
         else => return error.UnsupportedCff,
+    }
+    return out;
+}
+
+fn parseEncoding(bytes: []const u8, encoding_offset: usize, charset: []const u16, glyph_count: u16) ParseError![256]u16 {
+    var out = [_]u16{missing_glyph} ** 256;
+    if (encoding_offset <= 1) {
+        const predefined = if (encoding_offset == 0) &cff_data.standard_encoding else &cff_data.expert_encoding;
+        for (predefined, 0..) |sid, code| {
+            if (sid == 0) continue;
+            for (charset, 0..) |glyph_sid, glyph_index| {
+                if (glyph_sid == sid) {
+                    out[code] = @intCast(glyph_index);
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+    if (encoding_offset >= bytes.len) return error.TruncatedCff;
+    const raw_format = bytes[encoding_offset];
+    const has_supplements = (raw_format & 0x80) != 0;
+    const format = raw_format & 0x7f;
+    var cursor = encoding_offset + 1;
+    var glyph_index: u16 = 1;
+    switch (format) {
+        0 => {
+            if (cursor >= bytes.len) return error.TruncatedCff;
+            const code_count = bytes[cursor];
+            cursor += 1;
+            if (cursor + code_count > bytes.len or @as(usize, code_count) + 1 > glyph_count) return error.TruncatedCff;
+            for (bytes[cursor .. cursor + code_count]) |code| {
+                out[code] = glyph_index;
+                glyph_index += 1;
+            }
+            cursor += code_count;
+        },
+        1 => {
+            if (cursor >= bytes.len) return error.TruncatedCff;
+            const range_count = bytes[cursor];
+            cursor += 1;
+            var range_index: usize = 0;
+            while (range_index < range_count) : (range_index += 1) {
+                if (cursor + 2 > bytes.len) return error.TruncatedCff;
+                const first = bytes[cursor];
+                const left = bytes[cursor + 1];
+                cursor += 2;
+                var delta: usize = 0;
+                while (delta <= left) : (delta += 1) {
+                    const code = @as(usize, first) + delta;
+                    if (code > 255 or glyph_index >= glyph_count) return error.InvalidCff;
+                    out[code] = glyph_index;
+                    glyph_index += 1;
+                }
+            }
+        },
+        else => return error.UnsupportedCff,
+    }
+    if (!has_supplements) return out;
+    if (cursor >= bytes.len) return error.TruncatedCff;
+    const supplement_count = bytes[cursor];
+    cursor += 1;
+    var supplement_index: usize = 0;
+    while (supplement_index < supplement_count) : (supplement_index += 1) {
+        if (cursor + 3 > bytes.len) return error.TruncatedCff;
+        const code = bytes[cursor];
+        const sid = readU16(bytes, cursor + 1);
+        cursor += 3;
+        for (charset, 0..) |glyph_sid, index| {
+            if (glyph_sid == sid) {
+                out[code] = @intCast(index);
+                break;
+            }
+        }
     }
     return out;
 }
@@ -1040,7 +1304,8 @@ fn exchStack(stack: *std.ArrayList(f64)) Error!void {
 fn indexStack(alloc: std.mem.Allocator, stack: *std.ArrayList(f64)) ParseError!void {
     if (stack.items.len == 0) return error.InvalidCff;
     const idx_value = stack.pop().?;
-    const idx: usize = if (idxValueToSigned(idx_value) < 0) 0 else @intCast(idxValueToSigned(idx_value));
+    const idx_signed = try roundedIsizeFromFloat(idx_value);
+    const idx: usize = if (idx_signed < 0) 0 else @intCast(idx_signed);
     if (stack.items.len == 0) return error.InvalidCff;
     const from_top = if (idx >= stack.items.len) stack.items.len - 1 else idx;
     const value = stack.items[stack.items.len - 1 - from_top];
@@ -1051,11 +1316,11 @@ fn rollStack(alloc: std.mem.Allocator, stack: *std.ArrayList(f64)) ParseError!vo
     if (stack.items.len < 2) return error.InvalidCff;
     const j_value = stack.pop().?;
     const n_value = stack.pop().?;
-    const n_signed = idxValueToSigned(n_value);
+    const n_signed = try roundedIsizeFromFloat(n_value);
     if (n_signed < 0) return error.InvalidCff;
     const n: usize = @intCast(n_signed);
     if (n == 0 or n > stack.items.len) return error.InvalidCff;
-    var j = idxValueToSigned(j_value);
+    var j = try roundedIsizeFromFloat(j_value);
     const n_i: isize = @intCast(n);
     j = @mod(j, n_i);
     if (j < 0) j += n_i;
@@ -1076,7 +1341,7 @@ fn putTransient(stack: *std.ArrayList(f64), transient: *[32]f64) Error!void {
     if (stack.items.len < 2) return error.InvalidCff;
     const idx_value = stack.pop().?;
     const value = stack.pop().?;
-    const idx_signed = idxValueToSigned(idx_value);
+    const idx_signed = try roundedIsizeFromFloat(idx_value);
     if (idx_signed < 0 or idx_signed >= transient.len) return error.InvalidCff;
     transient[@intCast(idx_signed)] = value;
 }
@@ -1084,7 +1349,7 @@ fn putTransient(stack: *std.ArrayList(f64), transient: *[32]f64) Error!void {
 fn getTransient(alloc: std.mem.Allocator, stack: *std.ArrayList(f64), transient: *const [32]f64) ParseError!void {
     if (stack.items.len == 0) return error.InvalidCff;
     const idx_value = stack.pop().?;
-    const idx_signed = idxValueToSigned(idx_value);
+    const idx_signed = try roundedIsizeFromFloat(idx_value);
     if (idx_signed < 0 or idx_signed >= transient.len) return error.InvalidCff;
     try stack.append(alloc, transient[@intCast(idx_signed)]);
 }
@@ -1097,10 +1362,6 @@ fn ifelseStack(alloc: std.mem.Allocator, stack: *std.ArrayList(f64)) ParseError!
     const v1 = stack.pop().?;
     const chosen = if (v1 <= v2) s1 else s2;
     try stack.append(alloc, chosen);
-}
-
-fn idxValueToSigned(value: f64) isize {
-    return @intFromFloat(@round(value));
 }
 
 fn absFloat(v: f64) f64 {
@@ -1282,6 +1543,72 @@ test "cff hintmask skips mask bytes and continues outline parsing" {
     try std.testing.expectApproxEqAbs(@as(f64, 50), contours.items[0].points[1].x, 0.001);
 }
 
+test "cff consumes an explicit width before the first moveto" {
+    const alloc = std.testing.allocator;
+    const font = Font{
+        .bytes = &.{},
+        .charstrings = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
+        .charset = &.{},
+        .global_subrs = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
+        .local_subrs = null,
+        .fd_array = null,
+        .fd_select = null,
+    };
+    // 100 width; 10 20 rmoveto; 50 0 rlineto; endchar.
+    const program = [_]u8{ 239, 149, 159, 21, 189, 139, 5, 14 };
+
+    var contours = std.ArrayList(GlyphContour).empty;
+    defer {
+        for (contours.items) |*contour| contour.deinit(alloc);
+        contours.deinit(alloc);
+    }
+    var current = std.ArrayList(GlyphPoint).empty;
+    defer current.deinit(alloc);
+    var stack = std.ArrayList(f64).empty;
+    defer stack.deinit(alloc);
+    var x: f64 = 0;
+    var y: f64 = 0;
+    var width_seen = false;
+    var hint_count: usize = 0;
+    var transient: [32]f64 = [_]f64{0} ** 32;
+    try font.executeCharStringAlloc(alloc, &program, null, &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, 0);
+
+    try std.testing.expectEqual(@as(usize, 1), contours.items.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 10), contours.items[0].points[0].x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 20), contours.items[0].points[0].y, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 60), contours.items[0].points[1].x, 0.001);
+}
+
+test "cff enforces a shared charstring operation limit" {
+    const alloc = std.testing.allocator;
+    const font = Font{
+        .bytes = &.{},
+        .charstrings = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
+        .charset = &.{},
+        .global_subrs = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
+        .local_subrs = null,
+        .fd_array = null,
+        .fd_select = null,
+    };
+    const program = [_]u8{ 139, 139, 21, 14 };
+    var contours = std.ArrayList(GlyphContour).empty;
+    defer {
+        for (contours.items) |*contour| contour.deinit(alloc);
+        contours.deinit(alloc);
+    }
+    var current = std.ArrayList(GlyphPoint).empty;
+    defer current.deinit(alloc);
+    var stack = std.ArrayList(f64).empty;
+    defer stack.deinit(alloc);
+    var x: f64 = 0;
+    var y: f64 = 0;
+    var width_seen = false;
+    var hint_count: usize = 0;
+    var transient: [32]f64 = [_]f64{0} ** 32;
+    var remaining_operations: usize = 2;
+    try std.testing.expectError(error.GlyphOutlineTooComplex, font.executeCharStringAllocLimited(alloc, &program, null, &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, &remaining_operations, 0));
+}
+
 test "cff supports transient and logical Type2 operators" {
     const alloc = std.testing.allocator;
     const font = Font{
@@ -1344,20 +1671,24 @@ test "cff parses dict real operands" {
     try std.testing.expectEqual(@as(usize, 20), try parseTopDictOffset(&dict, .{ .primary = 15 }));
 }
 
+test "cff rejects unsafe float-to-integer control operands" {
+    try std.testing.expectError(error.InvalidCff, boundedUsizeFromFloat(std.math.nan(f64)));
+    try std.testing.expectError(error.InvalidCff, boundedUsizeFromFloat(std.math.inf(f64)));
+    try std.testing.expectError(error.InvalidCff, exactI32FromFloat(0.5));
+    try std.testing.expectError(error.InvalidCff, subroutineIndex(std.math.inf(f64), 1));
+    try std.testing.expectError(error.InvalidCff, roundedIsizeFromFloat(std.math.nan(f64)));
+}
+
 test "cff parses charset format 1" {
     const alloc = std.testing.allocator;
     const bytes =
         [_]u8{
-            0,
-            1,
-            0,
-            10,
-            1,
-            0,
-            20,
+            0, 0, 0,
+            1, 0, 10,
+            1, 0, 20,
             0,
         };
-    const charset = try parseCharsetAlloc(alloc, &bytes, 1, 4);
+    const charset = try parseCharsetAlloc(alloc, &bytes, 3, 4);
     defer alloc.free(charset);
     try std.testing.expectEqualSlices(u16, &.{ 0, 10, 11, 20 }, charset);
 }
@@ -1366,20 +1697,56 @@ test "cff parses charset format 2" {
     const alloc = std.testing.allocator;
     const bytes =
         [_]u8{
-            0,
-            2,
-            0,
-            30,
-            0,
-            2,
-            0,
-            40,
-            0,
-            0,
+            0,  0, 0,
+            2,  0, 30,
+            0,  2, 0,
+            40, 0, 0,
         };
-    const charset = try parseCharsetAlloc(alloc, &bytes, 1, 5);
+    const charset = try parseCharsetAlloc(alloc, &bytes, 3, 5);
     defer alloc.free(charset);
     try std.testing.expectEqualSlices(u16, &.{ 0, 30, 31, 32, 40 }, charset);
+}
+
+test "cff rejects overflowing charset ranges" {
+    const alloc = std.testing.allocator;
+    const format_1 = [_]u8{ 0, 0, 0, 1, 0xff, 0xff, 1 };
+    try std.testing.expectError(error.InvalidCff, parseCharsetAlloc(alloc, &format_1, 3, 3));
+
+    const format_2 = [_]u8{ 0, 0, 0, 2, 0xff, 0xff, 0, 1 };
+    try std.testing.expectError(error.InvalidCff, parseCharsetAlloc(alloc, &format_2, 3, 3));
+}
+
+test "cff resolves standard SID names and predefined encodings" {
+    var charset = [_]u16{ 0, 34, 35, 313 };
+    const font = Font{
+        .bytes = &.{},
+        .charstrings = .{ .count = 4, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
+        .charset = &charset,
+        .global_subrs = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
+        .local_subrs = null,
+        .fd_array = null,
+        .fd_select = null,
+    };
+    try std.testing.expectEqual(@as(?u16, 1), font.glyphIndexForName("A"));
+    try std.testing.expectEqual(@as(?u16, 2), font.glyphIndexForPredefinedCode('B', false));
+    try std.testing.expectEqual(@as(?u16, 3), font.glyphIndexForPredefinedCode(175, true));
+    try std.testing.expectEqual(@as(?u16, null), font.glyphIndexForName("G21"));
+    try std.testing.expectEqualStrings("acute", standardEncodingGlyphName(194).?);
+    try std.testing.expectEqualStrings("Macronsmall", expertEncodingGlyphName(175).?);
+}
+
+test "cff parses custom encoding with supplements" {
+    const bytes = [_]u8{
+        0, 0, 0,
+        0x80, 2, 65, 66, // format 0: A->GID1, B->GID2
+        1, 67, 0, 35, // supplement: C->SID35/GID2
+    };
+    const charset = [_]u16{ 0, 34, 35 };
+    const encoding = try parseEncoding(&bytes, 3, &charset, 3);
+    try std.testing.expectEqual(@as(u16, 1), encoding['A']);
+    try std.testing.expectEqual(@as(u16, 2), encoding['B']);
+    try std.testing.expectEqual(@as(u16, 2), encoding['C']);
+    try std.testing.expectEqual(missing_glyph, encoding['D']);
 }
 
 test "cff parses fdselect format 0" {

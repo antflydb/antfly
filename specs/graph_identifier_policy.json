@@ -1,0 +1,68 @@
+{
+  "policy_version": 1,
+  "unicode_version": "15.0.0",
+  "max_code_points": 128,
+  "max_utf8_bytes": 512,
+  "reserved_exact": ["*"],
+  "reserved_prefixes": ["$"],
+  "allowed_whitespace": ["0020"],
+  "unicode_white_space_ranges": [
+    ["0009", "000D"],
+    ["0020", "0020"],
+    ["0085", "0085"],
+    ["00A0", "00A0"],
+    ["1680", "1680"],
+    ["2000", "200A"],
+    ["2028", "2029"],
+    ["202F", "202F"],
+    ["205F", "205F"],
+    ["3000", "3000"]
+  ],
+  "general_category_cc_ranges": [
+    ["0000", "001F"],
+    ["007F", "009F"]
+  ],
+  "general_category_cf_ranges": [
+    ["00AD", "00AD"],
+    ["0600", "0605"],
+    ["061C", "061C"],
+    ["06DD", "06DD"],
+    ["070F", "070F"],
+    ["0890", "0891"],
+    ["08E2", "08E2"],
+    ["180E", "180E"],
+    ["200B", "200F"],
+    ["202A", "202E"],
+    ["2060", "2064"],
+    ["2066", "206F"],
+    ["FEFF", "FEFF"],
+    ["FFF9", "FFFB"],
+    ["110BD", "110BD"],
+    ["110CD", "110CD"],
+    ["13430", "1343F"],
+    ["1BCA0", "1BCA3"],
+    ["1D173", "1D17A"],
+    ["E0001", "E0001"],
+    ["E0020", "E007F"]
+  ],
+  "invalid_scalar_ranges": [
+    ["D800", "DFFF"]
+  ],
+  "conformance_cases": [
+    { "name": "ascii", "value": "author", "valid": true },
+    { "name": "internal_ascii_space", "value": "post author", "valid": true },
+    { "name": "visible_unicode", "value": "文章", "valid": true },
+    { "name": "decomposed_unicode", "value": "é", "valid": true },
+    { "name": "empty", "value": "", "valid": false },
+    { "name": "count_sentinel", "value": "*", "valid": false },
+    { "name": "reserved_prefix", "value": "$result", "valid": false },
+    { "name": "leading_space", "value": " author", "valid": false },
+    { "name": "trailing_space", "value": "author ", "valid": false },
+    { "name": "newline", "value": "post\nauthor", "valid": false },
+    { "name": "null_control", "value": "post\u0000author", "valid": false },
+    { "name": "non_breaking_space", "value": "post author", "valid": false },
+    { "name": "zero_width_space", "value": "post​author", "valid": false },
+    { "name": "line_separator", "value": "post author", "valid": false },
+    { "name": "bidi_override", "value": "post‮author", "valid": false }
+  ]
+}
