@@ -250,17 +250,23 @@ func NewRouteManager() *RouteManager {
 	}
 }
 
-// AddRoute adds a route (routes are re-sorted by priority)
-func (rm *RouteManager) AddRoute(route *Route) {
+// AddRoute adds or replaces a route (routes are re-sorted by priority). It is
+// deliberately idempotent: informer resyncs and equivalent declarative updates
+// preserve both the routing generation and live rate-limiter state.
+func (rm *RouteManager) AddRoute(route *Route) bool {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
 	// Remove existing route with same name
 	newRoutes := make([]*Route, 0, len(rm.routes)+1)
 	for _, r := range rm.routes {
-		if r.Name != route.Name {
-			newRoutes = append(newRoutes, r)
+		if r.Name == route.Name {
+			if routePolicyEqual(r, route) {
+				return false
+			}
+			continue
 		}
+		newRoutes = append(newRoutes, r)
 	}
 	newRoutes = append(newRoutes, route)
 
@@ -274,6 +280,134 @@ func (rm *RouteManager) AddRoute(route *Route) {
 
 	rm.routes = newRoutes
 	rm.generation++
+	return true
+}
+
+func routePolicyEqual(left, right *Route) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	if left.Name != right.Name || left.Priority != right.Priority ||
+		left.RetryAttempts != right.RetryAttempts || left.RetryTimeout != right.RetryTimeout ||
+		left.RetryOnRequestErrs != right.RetryOnRequestErrs || left.RetryOnCanceled != right.RetryOnCanceled ||
+		!boolMapEqual(left.Operations, right.Operations) ||
+		!boolMapEqual(left.SourceTables, right.SourceTables) ||
+		!boolMapEqual(left.SourceOrganizations, right.SourceOrganizations) ||
+		!boolMapEqual(left.SourceProjects, right.SourceProjects) ||
+		!boolMapEqual(left.SourceAPIKeys, right.SourceAPIKeys) ||
+		!boolMapEqual(left.RetryOnStatuses, right.RetryOnStatuses) ||
+		!regexpSliceEqual(left.ModelPatterns, right.ModelPatterns) ||
+		!stringMatcherMapEqual(left.HeaderMatchers, right.HeaderMatchers) ||
+		!timeWindowEqual(left.TimeWindow, right.TimeWindow) ||
+		!destinationSliceEqual(left.Destinations, right.Destinations) ||
+		!fallbackEqual(left.Fallback, right.Fallback) ||
+		!rateLimiterPolicyEqual(left.RateLimiter, right.RateLimiter) {
+		return false
+	}
+	return true
+}
+
+func boolMapEqual[K comparable](left, right map[K]bool) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if other, ok := right[key]; !ok || other != value {
+			return false
+		}
+	}
+	return true
+}
+
+func regexpSliceEqual(left, right []*regexp.Regexp) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] == nil || right[i] == nil {
+			if left[i] != right[i] {
+				return false
+			}
+			continue
+		}
+		if left[i].String() != right[i].String() {
+			return false
+		}
+	}
+	return true
+}
+
+func stringMatcherMapEqual(left, right map[string]*StringMatcher) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for name, matcher := range left {
+		other, ok := right[name]
+		if !ok || !stringMatcherEqual(matcher, other) {
+			return false
+		}
+	}
+	return true
+}
+
+func stringMatcherEqual(left, right *StringMatcher) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	if left.Exact != right.Exact || left.Prefix != right.Prefix {
+		return false
+	}
+	if left.Regex == nil || right.Regex == nil {
+		return left.Regex == right.Regex
+	}
+	return left.Regex.String() == right.Regex.String()
+}
+
+func timeWindowEqual(left, right *TimeWindow) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.StartHour == right.StartHour && left.StartMinute == right.StartMinute &&
+		left.EndHour == right.EndHour && left.EndMinute == right.EndMinute &&
+		boolMapEqual(left.Days, right.Days)
+}
+
+func thresholdEqual(left, right *ThresholdCondition) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.Operator == right.Operator && left.Value == right.Value
+}
+
+func destinationSliceEqual(left, right []Destination) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].Pool != right[i].Pool || left[i].Weight != right[i].Weight ||
+			left[i].RequireModelLoaded != right[i].RequireModelLoaded ||
+			!thresholdEqual(left[i].QueueDepthCondition, right[i].QueueDepthCondition) ||
+			!thresholdEqual(left[i].ReplicaCondition, right[i].ReplicaCondition) ||
+			!thresholdEqual(left[i].LatencyCondition, right[i].LatencyCondition) ||
+			!timeWindowEqual(left[i].TimeCondition, right[i].TimeCondition) {
+			return false
+		}
+	}
+	return true
+}
+
+func fallbackEqual(left, right *Fallback) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return *left == *right
+}
+
+func rateLimiterPolicyEqual(left, right *RateLimiter) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.rate == right.rate && left.burstSize == right.burstSize && left.perModel == right.perModel
 }
 
 // RemoveRoute removes a route by name

@@ -1533,6 +1533,20 @@ const maxMergedModelCatalogBytes = 32 << 20
 const maxConcurrentModelCatalogRequests = 8
 const maxModelCatalogWorkingBytes = 3 * maxModelCatalogBytes
 
+func modelCatalogFanoutPlan(endpointCount int, retainedByteLimit int64) (workerCount int, reservationBytes int64, err error) {
+	if endpointCount <= 0 {
+		return 0, 0, nil
+	}
+	workingBudget := retainedByteLimit - int64(maxMergedModelCatalogBytes)
+	if workingBudget < int64(maxModelCatalogWorkingBytes) {
+		return 0, 0, errByteAdmissionRequestTooLarge
+	}
+	workersByMemory := min(workingBudget/int64(maxModelCatalogWorkingBytes), int64(maxConcurrentModelCatalogRequests))
+	workerCount = min(endpointCount, int(workersByMemory))
+	reservationBytes = int64(maxMergedModelCatalogBytes) + int64(workerCount)*int64(maxModelCatalogWorkingBytes)
+	return workerCount, reservationBytes, nil
+}
+
 // handleModels publishes a conservative catalog for one routing scope. Antfly
 // clients provide model+task query parameters, allowing the proxy to aggregate
 // exactly the operation-eligible endpoints in the matching route cohort.
@@ -1587,12 +1601,15 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no operation-eligible inference endpoints", http.StatusServiceUnavailable)
 		return
 	}
-	// Bound the complete fan-out rather than each HTTP response in isolation.
-	// The merged catalog and up to maxConcurrentModelCatalogRequests decoded
-	// upstream catalogs can coexist while results are drained. Charge the raw
-	// body, RawMessage copy, and transient task-inventory parse for each slot.
-	catalogBytes := int64(maxMergedModelCatalogBytes) +
-		int64(min(len(addresses), maxConcurrentModelCatalogRequests))*int64(maxModelCatalogWorkingBytes)
+	// Turn the process-wide memory ceiling into a concurrency limit. The merged
+	// catalog and each active worker's raw body, RawMessage copy, and transient
+	// task-inventory parse can coexist; endpoints beyond the admitted worker count
+	// are processed by those same workers sequentially.
+	workerCount, catalogBytes, planErr := modelCatalogFanoutPlan(len(addresses), p.catalogAdmission.Limit())
+	if planErr != nil {
+		http.Error(w, "inference model catalog memory limit cannot admit one worker", http.StatusServiceUnavailable)
+		return
+	}
 	if err := p.catalogAdmission.Acquire(r.Context(), catalogBytes); err != nil {
 		status := http.StatusServiceUnavailable
 		if !errors.Is(err, errByteAdmissionRequestTooLarge) {
@@ -1609,7 +1626,6 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		eligible bool
 		err      error
 	}
-	workerCount := min(len(addresses), maxConcurrentModelCatalogRequests)
 	results := make(chan catalogResult)
 	jobs := make(chan *Endpoint, len(endpoints))
 	for _, endpoint := range endpoints {
@@ -1740,6 +1756,9 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 			leaseEndpoints,
 		)
 		if err != nil {
+			if writeResolutionError(w, err) {
+				return
+			}
 			if errors.Is(err, errCapabilityLeaseCapacity) {
 				w.Header().Set("Retry-After", "1")
 				http.Error(w, "inference capability lease capacity is temporarily exhausted", http.StatusServiceUnavailable)
@@ -1759,6 +1778,9 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) issueCapabilityLease(model, task string, operation OperationType, routeGeneration uint64, descriptorRevision, authorization string, endpoints map[string]leasedEndpoint) (string, error) {
+	if p.router.RouteManager().Generation() != routeGeneration {
+		return "", staleCapabilityResolutionError("inference routing policy changed during capability discovery")
+	}
 	authorizationDigest := sha256.Sum256([]byte(authorization))
 	identity := capabilityLeaseIdentity(model, task, operation, routeGeneration, descriptorRevision, authorizationDigest, endpoints)
 	allowed := make(map[string]leasedEndpoint, len(endpoints))
@@ -1771,48 +1793,68 @@ func (p *Proxy) issueCapabilityLease(model, task string, operation OperationType
 	now := time.Now()
 	p.capabilityLeaseMu.Lock()
 	defer p.capabilityLeaseMu.Unlock()
+	// Recheck after acquiring the table lock. An old discovery waiter must not
+	// purge leases issued for a newer generation while it was waiting here.
+	if p.router.RouteManager().Generation() != routeGeneration {
+		return "", staleCapabilityResolutionError("inference routing policy changed during capability discovery")
+	}
 	for token, lease := range p.capabilityLeases {
-		if !now.Before(lease.expiresAt) {
-			delete(p.capabilityLeases, token)
-			if p.capabilityLeaseByID[lease.identity] == token {
-				delete(p.capabilityLeaseByID, lease.identity)
-			}
+		if !now.Before(lease.expiresAt) || lease.routeGeneration != routeGeneration {
+			p.deleteCapabilityLeaseLocked(token, lease)
 		}
 	}
-	if token, ok := p.capabilityLeaseByID[identity]; ok {
-		if lease, live := p.capabilityLeases[token]; live {
+	var token string
+	if existingToken, ok := p.capabilityLeaseByID[identity]; ok {
+		if lease, live := p.capabilityLeases[existingToken]; live {
 			// Refresh the same immutable capability snapshot in place. Clients poll
 			// much more frequently than the execution lease TTL; minting a token per
 			// poll turns bounded safety state into an availability leak.
 			lease.expiresAt = now.Add(capabilityLeaseTTL)
-			p.capabilityLeases[token] = lease
-			return token, nil
+			p.capabilityLeases[existingToken] = lease
+			token = existingToken
+		} else {
+			delete(p.capabilityLeaseByID, identity)
 		}
-		delete(p.capabilityLeaseByID, identity)
 	}
-	if len(p.capabilityLeases) >= maxCapabilityLeases {
-		// Never invalidate an unexpired lease to admit a newer caller. Returning
-		// bounded backpressure preserves the planner/executor contract for work
-		// that has already been admitted.
+	if token == "" && len(p.capabilityLeases) >= maxCapabilityLeases {
+		// Never invalidate an unexpired lease from the current routing generation
+		// to admit a newer caller. Returning bounded backpressure preserves the
+		// planner/executor contract for work that has already been admitted.
 		return "", errCapabilityLeaseCapacity
 	}
-	var random [32]byte
-	if _, err := rand.Read(random[:]); err != nil {
-		return "", err
+	if token == "" {
+		var random [32]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			return "", err
+		}
+		token = hex.EncodeToString(random[:])
+		p.capabilityLeases[token] = proxyCapabilityLease{
+			identity:            identity,
+			model:               model,
+			task:                task,
+			operation:           operation,
+			routeGeneration:     routeGeneration,
+			descriptorRevision:  descriptorRevision,
+			authorizationDigest: authorizationDigest,
+			endpoints:           allowed, expiresAt: now.Add(capabilityLeaseTTL),
+		}
+		p.capabilityLeaseByID[identity] = token
 	}
-	token := hex.EncodeToString(random[:])
-	p.capabilityLeases[token] = proxyCapabilityLease{
-		identity:            identity,
-		model:               model,
-		task:                task,
-		operation:           operation,
-		routeGeneration:     routeGeneration,
-		descriptorRevision:  descriptorRevision,
-		authorizationDigest: authorizationDigest,
-		endpoints:           allowed, expiresAt: now.Add(capabilityLeaseTTL),
+	// Establish issuance at the captured routing generation. If policy changed
+	// while the lease table was being updated, retract the now-dead token instead
+	// of publishing a capability response that can never execute.
+	if p.router.RouteManager().Generation() != routeGeneration {
+		p.deleteCapabilityLeaseLocked(token, p.capabilityLeases[token])
+		return "", staleCapabilityResolutionError("inference routing policy changed during capability discovery")
 	}
-	p.capabilityLeaseByID[identity] = token
 	return token, nil
+}
+
+func (p *Proxy) deleteCapabilityLeaseLocked(token string, lease proxyCapabilityLease) {
+	delete(p.capabilityLeases, token)
+	if p.capabilityLeaseByID[lease.identity] == token {
+		delete(p.capabilityLeaseByID, lease.identity)
+	}
 }
 
 func capabilityLeaseIdentity(model, task string, operation OperationType, routeGeneration uint64, revision string, authorizationDigest [sha256.Size]byte, endpoints map[string]leasedEndpoint) [sha256.Size]byte {
@@ -1873,7 +1915,7 @@ type validatedCapabilityLease struct {
 func (p *Proxy) validatedCapabilityLease(token, revision, model string, operation OperationType, authorizationDigest [sha256.Size]byte) (validatedCapabilityLease, error) {
 	if token == "" {
 		if revision != "" {
-			return validatedCapabilityLease{}, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is incomplete"}
+			return validatedCapabilityLease{}, staleCapabilityResolutionError("inference capability lease is incomplete")
 		}
 		return validatedCapabilityLease{}, nil
 	}
@@ -1881,20 +1923,17 @@ func (p *Proxy) validatedCapabilityLease(token, revision, model string, operatio
 	p.capabilityLeaseMu.Lock()
 	lease, ok := p.capabilityLeases[token]
 	if ok && !now.Before(lease.expiresAt) {
-		delete(p.capabilityLeases, token)
-		if p.capabilityLeaseByID[lease.identity] == token {
-			delete(p.capabilityLeaseByID, lease.identity)
-		}
+		p.deleteCapabilityLeaseLocked(token, lease)
 		ok = false
 	}
 	p.capabilityLeaseMu.Unlock()
 	if !ok || lease.model != model || lease.task != semanticTaskForOperation(operation) || lease.operation != operation ||
 		lease.descriptorRevision == "" || lease.descriptorRevision != revision ||
 		lease.authorizationDigest != authorizationDigest {
-		return validatedCapabilityLease{}, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
+		return validatedCapabilityLease{}, staleCapabilityResolutionError("inference capability lease is stale")
 	}
 	if lease.routeGeneration != p.router.RouteManager().Generation() {
-		return validatedCapabilityLease{}, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
+		return validatedCapabilityLease{}, staleCapabilityResolutionError("inference capability lease is stale")
 	}
 	allowed := make(map[string]*Endpoint, len(lease.endpoints))
 	for address, expected := range lease.endpoints {
@@ -1902,7 +1941,7 @@ func (p *Proxy) validatedCapabilityLease(token, revision, model string, operatio
 			continue
 		}
 		if !p.registry.endpointIncarnationMatches(address, expected.endpoint) {
-			return validatedCapabilityLease{}, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
+			return validatedCapabilityLease{}, staleCapabilityResolutionError("inference capability lease is stale")
 		}
 		allowed[address] = expected.endpoint
 	}
@@ -2744,14 +2783,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 
 	lease, err := p.acquireRequestResolution(r.Context(), OperationType(operation), model, routing)
 	if err != nil {
-		if resolutionErr, ok := err.(*ResolutionError); ok {
-			if resolutionErr.StatusCode == http.StatusConflict {
-				w.Header().Set(capabilityStaleHeader, "true")
-			}
-			if resolutionErr.RetryAfter > 0 {
-				w.Header().Set("Retry-After", fmt.Sprintf("%d", resolutionErr.RetryAfter))
-			}
-			http.Error(w, resolutionErr.Message, resolutionErr.StatusCode)
+		if writeResolutionError(w, err) {
 			return
 		}
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -2764,11 +2796,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 
 	if err := lease.Admit(); err != nil {
 		lease.Release()
-		if resolutionErr, ok := err.(*ResolutionError); ok {
-			if resolutionErr.RetryAfter > 0 {
-				w.Header().Set("Retry-After", fmt.Sprintf("%d", resolutionErr.RetryAfter))
-			}
-			http.Error(w, resolutionErr.Message, resolutionErr.StatusCode)
+		if writeResolutionError(w, err) {
 			return
 		}
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -2792,6 +2820,9 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		}
 		if err != nil {
 			requestsTotal.WithLabelValues(pool, model, operation, "no_endpoint").Inc()
+			if writeResolutionError(w, err) {
+				return
+			}
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}

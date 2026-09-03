@@ -113,3 +113,13 @@ func (a *byteAdmission) Used() int64 {
 	defer a.mu.Unlock()
 	return a.used
 }
+
+// Limit returns the immutable process-wide capacity guarded by this admission
+// controller. Callers use it to reduce concurrency before requesting a
+// reservation instead of turning a valid low-memory configuration into a
+// permanent admission failure.
+func (a *byteAdmission) Limit() int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.limit
+}

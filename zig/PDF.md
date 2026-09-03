@@ -1307,12 +1307,35 @@ document. They are architectural requirements, not Florence-specific cleanup:
     separate operation-scoped leases and cache entries while retaining the same
     semantic task and typed result family.
 137. **A route update could reinterpret an unexpired capability lease.** Every
-    route installation or removal now advances a policy generation. Scoped
+    semantic route replacement or removal now advances a policy generation. Scoped
     discovery captures that generation in the cohort and lease identity;
     execution linearizes route matching against it. A mismatch returns the
     standard capability-stale conflict, causing clients to invalidate and
     rediscover immediately instead of repeatedly receiving an ordinary 503 from
     the intersection of a new route and an old endpoint set.
+138. **Informer resyncs looked like route-policy changes.** The watcher now
+    drops same-resource-version resync notifications before conversion, and the
+    route manager independently compares the complete compiled policy before
+    replacing it. Equivalent declarative updates preserve the generation, the
+    installed route object, and its live rate-limiter state. Only a semantic
+    policy change invalidates capability plans.
+139. **Retry-time resolution discarded stale-plan semantics.** Initial
+    resolution, admission, and every retry now share one typed
+    `ResolutionError` response path. Capability staleness is an explicit error
+    property rather than an inference from status 409, so every model family
+    receives the same conflict header and immediately invalidates its cached
+    plan while unrelated conflicts remain ordinary conflicts.
+140. **Catalog memory admission made concurrency an all-or-nothing constant.**
+    Scoped discovery now derives its worker count from the configured retained
+    byte ceiling after reserving the merge buffer. A limit that fits one worker
+    processes any additional inference nodes sequentially; only a limit that
+    cannot fit the merge buffer and one bounded response fails admission.
+141. **Obsolete routing generations occupied the bounded lease table.** Lease
+    issuance rejects a discovery generation that is already stale, rechecks it
+    before publishing the token, and removes expired or older-generation
+    entries before applying the capacity limit. Real route changes therefore
+    invalidate execution without turning already-dead safety state into a
+    five-minute availability leak.
 
 ### Post-review implementation contract
 
@@ -1343,7 +1366,9 @@ The hardening above follows these long-term rules:
   nor sends work to a node whose operation is bootstrap-unknown; the concrete
   node remains the final limit validator. Route matching is also generation
   fenced: policy replacement invalidates the lease rather than applying the new
-  route to an endpoint cohort planned under the old policy.
+  route to an endpoint cohort planned under the old policy. Informer resyncs and
+  equivalent route objects are explicitly generation-neutral, and retry-time
+  stale decisions use the same invalidation response as initial execution.
 - Discovery and execution form one capability lease. A scoped catalog response
   carries an opaque token and revision bound to model, semantic task, concrete
   operation, route-policy generation, effective authorization, exact descriptor
@@ -1357,7 +1382,9 @@ The hardening above follows these long-term rules:
   which precedes the process default. Execution then intersects the selected
   pool and concrete operation with the leased endpoints. Equivalent immutable
   snapshots renew and reuse their token rather than consuming another bounded
-  table slot.
+  table slot. Issuance purges leases from obsolete route generations before its
+  capacity check and refuses to publish a token if discovery raced a policy
+  replacement.
   Antfly clients attach both values to read,
   generation, embedding, reranking, chunking, extraction, and transcription
   transports; rewrite and classification use the same task contract when their
@@ -1378,6 +1405,11 @@ The hardening above follows these long-term rules:
   may stand in for the other. A numeric renderer limit is valid only while the
   document operation owns the corresponding process-wide reservation. Worker
   allocators stay private and thread-safe inside that owned grant.
+- Distributed catalog admission converts retained bytes into fan-out
+  concurrency: one fixed merge reservation plus one working-set reservation per
+  active endpoint request. Low-memory configurations reduce parallelism and
+  reuse workers across the remaining nodes rather than rejecting a fan-out that
+  can complete sequentially.
 - Render planners preserve a singleton quality invariant. The retained-output
   allowance for an item in a batch is never smaller than its admitted singleton
   allowance. If that invariant does not fit, the planner reduces the window;

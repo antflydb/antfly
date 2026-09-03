@@ -289,6 +289,76 @@ func TestProxyRequestRetryFailsOverToDifferentEndpoint(t *testing.T) {
 	}
 }
 
+func TestProxyRequestRetryPreservesCapabilityStaleResponse(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	for _, address := range []string{"http://primary-a.internal", "http://primary-b.internal"} {
+		p.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+		advertiseModelOperation(p.registry, address, "embed", "model-a")
+	}
+	route := &Route{
+		Name:               "default/retry-capability",
+		Operations:         map[OperationType]bool{"embed": true},
+		Destinations:       []Destination{{Pool: "primary", Weight: 100}},
+		RetryAttempts:      2,
+		RetryOnStatuses:    map[int]bool{http.StatusInternalServerError: true},
+		RetryOnRequestErrs: true,
+	}
+	p.Router().RouteManager().AddRoute(route)
+	revision := "revision-a"
+	endpoints := p.router.ResolveEndpointCandidates("model-a", "primary", nil, "embed")
+	token, err := p.issueCapabilityLease(
+		"model-a",
+		"embed",
+		"embed",
+		p.router.RouteManager().Generation(),
+		revision,
+		"",
+		capabilityEndpointSet(p.registry, endpoints),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var attempts int32
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		atomic.AddInt32(&attempts, 1)
+		// Simulate a policy update after the first attempt has already been
+		// admitted. The retry must tell the client to discard the old plan.
+		p.Router().RouteManager().AddRoute(&Route{
+			Name:            route.Name,
+			Priority:        1,
+			Operations:      route.Operations,
+			Destinations:    route.Destinations,
+			RetryAttempts:   route.RetryAttempts,
+			RetryOnStatuses: route.RetryOnStatuses,
+		})
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":"transient"}`)),
+			Request:    req,
+		}, nil
+	})}
+
+	request := httptest.NewRequest(http.MethodPost, "/ai/v1/embed", strings.NewReader(`{"model":"model-a"}`))
+	request.Header.Set(capabilityTokenHeader, token)
+	request.Header.Set(capabilityRevisionHeader, revision)
+	recorder := httptest.NewRecorder()
+	p.handleEmbed(recorder, request)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want capability-stale conflict: %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Header().Get(capabilityStaleHeader) != "true" {
+		t.Fatalf("headers = %v, want %s=true", recorder.Header(), capabilityStaleHeader)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Fatalf("backend attempts = %d, want retry rejected before second forwarding", got)
+	}
+}
+
 func TestProxyRequestRecordsFailureOnStreamCopyError(t *testing.T) {
 	t.Parallel()
 
@@ -2423,6 +2493,142 @@ func TestCapabilityLeaseRefreshReusesImmutableSnapshot(t *testing.T) {
 	}
 }
 
+func TestCapabilityLeaseIssuancePurgesObsoleteRouteGenerations(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	const address = "http://reader.internal"
+	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, address, "read", "owner/reader")
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:         "reader",
+		Operations:   map[OperationType]bool{"read": true},
+		Destinations: []Destination{{Pool: "primary", Weight: 1}},
+	})
+	endpoints := capabilityEndpointSet(p.registry, p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read"))
+	oldGeneration := p.router.RouteManager().Generation()
+	var oldToken string
+	for i := 0; i < maxCapabilityLeases; i++ {
+		token, err := p.issueCapabilityLease("owner/reader", "read", "read", oldGeneration, fmt.Sprintf("revision-old-%d", i), "", endpoints)
+		if err != nil {
+			t.Fatalf("old-generation lease %d: %v", i, err)
+		}
+		if i == 0 {
+			oldToken = token
+		}
+	}
+
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:         "reader",
+		Priority:     1,
+		Operations:   map[OperationType]bool{"read": true},
+		Destinations: []Destination{{Pool: "primary", Weight: 1}},
+	})
+	newGeneration := p.router.RouteManager().Generation()
+	newToken, err := p.issueCapabilityLease("owner/reader", "read", "read", newGeneration, "revision-new", "", endpoints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newToken == oldToken {
+		t.Fatal("new route generation reused the obsolete token")
+	}
+	if len(p.capabilityLeases) != 1 || len(p.capabilityLeaseByID) != 1 {
+		t.Fatalf("lease tables retained obsolete generation: tokens=%d identities=%d", len(p.capabilityLeases), len(p.capabilityLeaseByID))
+	}
+	if _, ok := p.capabilityLeases[oldToken]; ok {
+		t.Fatal("obsolete route-generation lease remains resident")
+	}
+	if _, err := p.issueCapabilityLease("owner/reader", "read", "read", oldGeneration, "revision-stale", "", endpoints); err == nil {
+		t.Fatal("issuance accepted an already-obsolete routing generation")
+	} else {
+		var resolutionErr *ResolutionError
+		if !errors.As(err, &resolutionErr) || !resolutionErr.CapabilityStale {
+			t.Fatalf("stale issuance error = %#v, want typed capability-stale error", err)
+		}
+	}
+}
+
+func TestResolutionErrorWriterMarksOnlyCapabilityStaleness(t *testing.T) {
+	t.Parallel()
+
+	ordinary := httptest.NewRecorder()
+	if !writeResolutionError(ordinary, &ResolutionError{StatusCode: http.StatusConflict, Message: "attempt still active"}) {
+		t.Fatal("typed resolution error was not handled")
+	}
+	if ordinary.Header().Get(capabilityStaleHeader) != "" {
+		t.Fatalf("ordinary conflict was marked capability-stale: %v", ordinary.Header())
+	}
+
+	stale := httptest.NewRecorder()
+	if !writeResolutionError(stale, staleCapabilityResolutionError("stale plan")) {
+		t.Fatal("typed stale error was not handled")
+	}
+	if stale.Code != http.StatusConflict || stale.Header().Get(capabilityStaleHeader) != "true" {
+		t.Fatalf("stale response = %d headers=%v", stale.Code, stale.Header())
+	}
+}
+
+func TestRouteManagerEquivalentUpdatePreservesGenerationAndState(t *testing.T) {
+	t.Parallel()
+
+	newRoute := func() *Route {
+		return &Route{
+			Name:                "default/full-policy",
+			Priority:            7,
+			Operations:          map[OperationType]bool{"generate.batch": true},
+			ModelPatterns:       []*regexp.Regexp{regexp.MustCompile(`^gemma`)},
+			HeaderMatchers:      map[string]*StringMatcher{"x-tenant": {Prefix: "tenant-", Regex: regexp.MustCompile(`tenant-[0-9]+`)}},
+			SourceTables:        map[string]bool{"documents": true},
+			SourceOrganizations: map[string]bool{"org": true},
+			SourceProjects:      map[string]bool{"project": true},
+			SourceAPIKeys:       map[string]bool{"prefix": true},
+			TimeWindow:          &TimeWindow{StartHour: 1, EndHour: 2, Days: map[int]bool{1: true}},
+			Destinations:        []Destination{{Pool: "gpu", Weight: 100, QueueDepthCondition: &ThresholdCondition{Operator: "<", Value: 10}, RequireModelLoaded: true}},
+			Fallback:            &Fallback{Action: "reject", StatusCode: 429, RetryAfter: 1},
+			RateLimiter:         NewRateLimiter(1, 1, true),
+			RetryAttempts:       2,
+			RetryTimeout:        time.Second,
+			RetryOnStatuses:     map[int]bool{500: true},
+			RetryOnRequestErrs:  true,
+			RetryOnCanceled:     true,
+		}
+	}
+
+	rm := NewRouteManager()
+	first := newRoute()
+	if !rm.AddRoute(first) {
+		t.Fatal("initial route was not added")
+	}
+	generation := rm.Generation()
+	if rm.AddRoute(newRoute()) {
+		t.Fatal("equivalent declarative update was treated as a policy change")
+	}
+	if got := rm.Generation(); got != generation {
+		t.Fatalf("generation = %d after no-op update, want %d", got, generation)
+	}
+	matched := rm.Match(&RouteRequest{
+		Operation:          "generate.batch",
+		Model:              "gemma4",
+		Headers:            map[string]string{"x-tenant": "tenant-1"},
+		SourceTable:        "documents",
+		SourceOrganization: "org",
+		SourceProject:      "project",
+		SourceAPIKey:       "prefix",
+		Timestamp:          time.Date(2026, time.January, 5, 1, 30, 0, 0, time.UTC),
+	})
+	if matched != first {
+		t.Fatal("equivalent update replaced the live route and its rate-limiter state")
+	}
+	changed := newRoute()
+	changed.Priority++
+	if !rm.AddRoute(changed) {
+		t.Fatal("real route policy change was ignored")
+	}
+	if got := rm.Generation(); got != generation+1 {
+		t.Fatalf("generation = %d after policy change, want %d", got, generation+1)
+	}
+}
+
 func TestCapabilityLeaseKeepsImmutableSnapshotAcrossCatalogRefresh(t *testing.T) {
 	t.Parallel()
 	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
@@ -2521,6 +2727,48 @@ func TestScopedCatalogRequiresProcessWideByteAdmission(t *testing.T) {
 	p.handleModels(recorder, request)
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if used := p.catalogAdmission.Used(); used != 0 {
+		t.Fatalf("catalog admission leaked %d bytes", used)
+	}
+}
+
+func TestScopedCatalogReducesFanoutToFitRetainedByteLimit(t *testing.T) {
+	t.Parallel()
+
+	const retainedLimit = int64(64 << 20)
+	workers, reservation, err := modelCatalogFanoutPlan(2, retainedLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workers != 1 || reservation != 56<<20 {
+		t.Fatalf("plan = %d workers, %d bytes; want 1 worker, %d bytes", workers, reservation, 56<<20)
+	}
+
+	p := NewProxy(Config{
+		DefaultPool:             "primary",
+		RefreshInterval:         time.Minute,
+		MaxRetainedCatalogBytes: retainedLimit,
+		Logger:                  zap.NewNop(),
+	})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"readers":{"owner/reader":{}}}`)),
+			Request:    req,
+		}, nil
+	})}
+	for _, address := range []string{"http://reader-a.internal", "http://reader-b.internal"} {
+		p.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+		advertiseModelOperation(p.registry, address, "read", "owner/reader")
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Freader&task=read", nil)
+	recorder := httptest.NewRecorder()
+	p.handleModels(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
 	}
 	if used := p.catalogAdmission.Used(); used != 0 {
 		t.Fatalf("catalog admission leaked %d bytes", used)

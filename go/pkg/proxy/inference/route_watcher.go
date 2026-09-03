@@ -131,18 +131,32 @@ func (w *RouteWatcher) onRouteAdd(obj any) {
 		return
 	}
 
-	w.routeManager.AddRoute(route)
+	if !w.routeManager.AddRoute(route) {
+		w.logger.Debug("route policy already installed", zap.String("name", route.Name))
+		return
+	}
 	w.logger.Info("added route", zap.String("name", route.Name), zap.Int32("priority", route.Priority))
 }
 
 func (w *RouteWatcher) onRouteUpdate(oldObj, newObj any) {
+	oldRoute, oldOK := oldObj.(*unstructured.Unstructured)
+	newRoute, newOK := newObj.(*unstructured.Unstructured)
+	// Shared informer resyncs deliberately deliver synthetic Update events with
+	// the same resource version. They are cache maintenance, not policy changes,
+	// and must not invalidate capability leases.
+	if oldOK && newOK && oldRoute.GetResourceVersion() != "" && oldRoute.GetResourceVersion() == newRoute.GetResourceVersion() {
+		return
+	}
 	route, err := w.convertRoute(newObj)
 	if err != nil {
 		w.logger.Error("failed to convert InferenceProxy", zap.Error(err))
 		return
 	}
 
-	w.routeManager.AddRoute(route) // AddRoute handles updates by name
+	if !w.routeManager.AddRoute(route) { // AddRoute handles updates by name.
+		w.logger.Debug("route update did not change policy", zap.String("name", route.Name))
+		return
+	}
 	w.logger.Info("updated route", zap.String("name", route.Name), zap.Int32("priority", route.Priority))
 }
 

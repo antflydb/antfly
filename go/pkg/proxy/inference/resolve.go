@@ -17,7 +17,9 @@ package proxy
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -115,9 +117,10 @@ type leaseAttempts struct {
 
 // ResolutionError is a user-facing routing failure.
 type ResolutionError struct {
-	StatusCode int
-	Message    string
-	RetryAfter int
+	StatusCode      int
+	Message         string
+	RetryAfter      int
+	CapabilityStale bool
 }
 
 func (e *ResolutionError) Error() string {
@@ -125,6 +128,31 @@ func (e *ResolutionError) Error() string {
 		return ""
 	}
 	return e.Message
+}
+
+func staleCapabilityResolutionError(message string) *ResolutionError {
+	return &ResolutionError{
+		StatusCode:      http.StatusConflict,
+		Message:         message,
+		CapabilityStale: true,
+	}
+}
+
+// writeResolutionError preserves the routing contract uniformly across initial
+// resolution, admission, and retry-time re-resolution.
+func writeResolutionError(w http.ResponseWriter, err error) bool {
+	var resolutionErr *ResolutionError
+	if !errors.As(err, &resolutionErr) {
+		return false
+	}
+	if resolutionErr.CapabilityStale {
+		w.Header().Set(capabilityStaleHeader, "true")
+	}
+	if resolutionErr.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(resolutionErr.RetryAfter))
+	}
+	http.Error(w, resolutionErr.Message, resolutionErr.StatusCode)
+	return true
 }
 
 // ResolveRequest resolves a request to an endpoint without forwarding it.
@@ -358,7 +386,7 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 		var current bool
 		matchedRoute, current = p.router.RouteManager().MatchAtGeneration(routeReq, capabilityLease.routeGeneration)
 		if !current {
-			return nil, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
+			return nil, staleCapabilityResolutionError("inference capability lease is stale")
 		}
 	} else {
 		matchedRoute = p.router.RouteManager().Match(routeReq)
