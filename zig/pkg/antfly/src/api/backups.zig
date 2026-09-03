@@ -3796,6 +3796,10 @@ fn resolveFilesystemLocationAlloc(alloc: std.mem.Allocator, configured_root: []c
     // that leave the configured root while still allowing backup directories to
     // be created below it.
     var ancestor: []const u8 = candidate;
+    // Preserve the sentinel in realPathFileAbsoluteAlloc's allocation shape;
+    // erasing it to []u8 would free one byte less than was allocated.
+    var canonical_ancestor: ?[:0]u8 = null;
+    defer if (canonical_ancestor) |value| alloc.free(value);
     while (true) {
         const canonical = std.Io.Dir.realPathFileAbsoluteAlloc(io, ancestor, alloc) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => {
@@ -3804,11 +3808,34 @@ fn resolveFilesystemLocationAlloc(alloc: std.mem.Allocator, configured_root: []c
             },
             else => return err,
         };
-        defer alloc.free(canonical);
-        if (!pathIsWithin(canonical_root, canonical)) return error.ConnectionPrefixDenied;
+        if (!pathIsWithin(canonical_root, canonical)) {
+            alloc.free(canonical);
+            return error.ConnectionPrefixDenied;
+        }
+        canonical_ancestor = canonical;
         break;
     }
-    return candidate;
+
+    // Authorization and later no-follow traversal must address the same
+    // filesystem identity. `realPath` above may have accepted an in-scope
+    // alias such as macOS `/var` -> `/private/var`; returning the lexical
+    // candidate would then make the secure component walker reject that alias
+    // as `NotDir`. Rebase only the not-yet-existing suffix onto the proven
+    // canonical ancestor. Every subsequently created component is still
+    // opened with no-follow semantics, so an attacker cannot redirect it.
+    const suffix_start = if (ancestor.len == candidate.len)
+        candidate.len
+    else if (ancestor.len == 1 and ancestor[0] == std.fs.path.sep)
+        1
+    else
+        ancestor.len + 1;
+    const suffix = candidate[suffix_start..];
+    const resolved = if (suffix.len == 0)
+        try alloc.dupe(u8, canonical_ancestor.?)
+    else
+        try std.fs.path.join(alloc, &.{ canonical_ancestor.?, suffix });
+    alloc.free(candidate);
+    return resolved;
 }
 
 fn pathIsWithin(root: []const u8, candidate: []const u8) bool {
@@ -3825,6 +3852,34 @@ test "restore filesystem scope containment handles filesystem roots and componen
     try std.testing.expect(pathIsWithin("/", "/private/tmp/backup"));
     try std.testing.expect(pathIsWithin("/var/backups", "/var/backups/tenant-a"));
     try std.testing.expect(!pathIsWithin("/var/backups", "/var/backups-evil"));
+}
+
+test "filesystem backup location returns the canonical authorized identity" {
+    if (std.fs.path.sep != '/') return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const physical = try std.fs.path.join(alloc, &.{ root, "physical" });
+    defer alloc.free(physical);
+    try fs_paths.createDirPathPortable(io, physical);
+    const alias = try std.fs.path.join(alloc, &.{ root, "alias" });
+    defer alloc.free(alias);
+    try std.Io.Dir.symLinkAbsolute(io, physical, alias, .{ .is_directory = true });
+
+    // A connection-scoped file URI is rooted at configured_root; its URI path
+    // is intentionally relative to that capability root.
+    const resolved = try resolveFilesystemLocationAlloc(alloc, root, "file:///alias/new/backup", io);
+    defer alloc.free(resolved);
+    const expected = try std.fs.path.join(alloc, &.{ physical, "new", "backup" });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
+
+    var opened = try openOrCreateBackupRootNoFollow(io, resolved);
+    opened.close(io);
 }
 
 pub fn createManifest(

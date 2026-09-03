@@ -62,6 +62,7 @@ const query_api = @import("query.zig");
 const public_table_http = @import("public_table_http.zig");
 const runtime_status = @import("runtime_status.zig");
 const stored_destination_authorization = @import("stored_destination_authorization.zig");
+const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 
 fn resolveCatalogGroupsEventually(
     alloc: std.mem.Allocator,
@@ -8023,10 +8024,12 @@ pub const ProvisionedTableWriteSource = struct {
             false;
         if (sibling_owns_table) return;
 
-        // No cached owner can provide a fresher status after this retirement.
-        // Remove cached observations instead of letting them masquerade as
-        // fresh, and let the next status request recover from durable storage.
-        self.invalidateRuntimeStatusCache(table_name);
+        // Owner retirement withdraws convergence/activity authority, not the
+        // last accepted serving generation. Status reads remain pure cached
+        // snapshots and the next owner publication must cross this target
+        // fence before it can report completion again.
+        if (self.runtime_status_cache) |snapshot_cache|
+            snapshot_cache.markTableTargetObservationPending(table_name);
         self.clearDirtyWriteTable(table_name);
     }
 
@@ -12583,7 +12586,16 @@ pub const ProvisionedTableWriteSource = struct {
         }) orelse return false;
         defer status.deinit(snapshot_cache.alloc);
 
-        _ = db.overlayRuntimeStatusBestEffort(snapshot_cache.alloc, &status.stats);
+        // A successful lifecycle overlay sampled the durable target and every
+        // derived publication fact under one apply-lock boundary. Promote it
+        // to an authoritative owner observation before publishing; otherwise
+        // a target fence copied from the cached snapshot can never recover,
+        // even after replay and publication have fully converged. A
+        // runtime-only overlay remains useful activity telemetry but must keep
+        // the cached convergence decision conservative.
+        if (db.overlayRuntimeStatusBestEffort(snapshot_cache.alloc, &status.stats)) {
+            self.markManagedWriterRuntimeStatus(&status);
+        }
         _ = snapshot_cache.publishGroup(publication_token, table_name, status) catch |err| {
             std.log.warn("managed runtime status overlay publish failed table={s} group_id={} err={s}", .{
                 table_name,
@@ -12753,12 +12765,27 @@ pub const ProvisionedTableWriteSource = struct {
                 if (db) |managed_db| {
                     if (self.runtime_status_cache) |snapshot_cache| {
                         publishRuntimeStatusSnapshotConsistent(self, snapshot_cache.alloc, table_name, group_id, managed_db) catch |err| {
-                            std.log.warn("managed runtime status blocking publish failed table={s} group_id={} err={s}", .{
-                                table_name,
-                                group_id,
-                                @errorName(err),
-                            });
-                            self.invalidateRuntimeStatusCache(table_name);
+                            if (err == error.RuntimeStatusPublicationFenced or err == error.WriterLocked) {
+                                std.log.debug("managed runtime status blocking publish deferred table={s} group_id={} err={s}", .{
+                                    table_name,
+                                    group_id,
+                                    @errorName(err),
+                                });
+                            } else {
+                                std.log.warn("managed runtime status blocking publish failed table={s} group_id={} err={s}", .{
+                                    table_name,
+                                    group_id,
+                                    @errorName(err),
+                                });
+                            }
+                            // Status publication is observational. An epoch
+                            // race, writer contention, or allocation failure
+                            // cannot revoke a previously accepted serving
+                            // generation; explicit repair/root transitions own
+                            // that authority. Keep the immutable snapshot,
+                            // withdraw only convergence proof, and ask the
+                            // resident owner to retry.
+                            self.markGroupTargetObservationPendingBestEffort(table_name, group_id, db);
                             self.markWriteCacheRefreshPending(table_name);
                             self.invalidateReadCache(table_name);
                             self.notifyLocalChange(table_name, .data);
@@ -12771,7 +12798,11 @@ pub const ProvisionedTableWriteSource = struct {
                         return;
                     }
                 }
-                self.invalidateRuntimeStatusCache(table_name);
+                // Owner absence is an observation gap, not a structural
+                // invalidation. Preserve the exact published generation and
+                // withdraw only latest-target convergence until a resident
+                // owner republishes.
+                self.markGroupTargetObservationPendingBestEffort(table_name, group_id, db);
                 self.markWriteCacheRefreshPending(table_name);
             },
             .invalidate => if (self.deferManagedRuntimeStatusPublication(table_name, group_id, db, true)) return,
@@ -13522,9 +13553,13 @@ pub const ProvisionedTableWriteSource = struct {
         // and cache leases also makes a busy return retain publication debt
         // without leaving the old audit available to an unlocked publisher.
         self.invalidateRepairHandoffOwnerAuditBestEffort(table_name, group_id);
-        if (!self.tryBeginStartupCatchUpGroupOperation(table_name, group_id, metadata.advance_index_repairs)) return busy_result;
+        if (!self.tryBeginStartupCatchUpGroupOperation(table_name, group_id, metadata.advance_index_repairs)) {
+            std.log.debug("managed catch-up admission deferred table={s} group_id={} phase=group_operation", .{ table_name, group_id });
+            return busy_result;
+        }
         if (!self.local_db_mutex.tryLock()) {
             self.endGroupOperation(table_name, group_id);
+            std.log.debug("managed catch-up admission deferred table={s} group_id={} phase=cache_mutex", .{ table_name, group_id });
             return busy_result;
         }
         // A resident writer is the authoritative owner for every maintenance
@@ -13548,9 +13583,13 @@ pub const ProvisionedTableWriteSource = struct {
             // pass is safe and avoids another fairness-sensitive transition.
             self.local_db_mutex.unlock();
             self.endGroupOperation(table_name, group_id);
-            if (!self.tryBeginGroupOperation(table_name, group_id)) return busy_result;
+            if (!self.tryBeginGroupOperation(table_name, group_id)) {
+                std.log.debug("managed catch-up admission deferred table={s} group_id={} phase=cold_group_operation", .{ table_name, group_id });
+                return busy_result;
+            }
             if (!self.local_db_mutex.tryLock()) {
                 self.endGroupOperation(table_name, group_id);
+                std.log.debug("managed catch-up admission deferred table={s} group_id={} phase=cold_cache_mutex", .{ table_name, group_id });
                 return busy_result;
             }
             live_owner_guard = live_cache: {
@@ -13562,12 +13601,14 @@ pub const ProvisionedTableWriteSource = struct {
         if (!use_live_owner and self.hasDirtyWriteTableWithLocalDbLocked(table_name)) {
             self.local_db_mutex.unlock();
             self.endGroupOperation(table_name, group_id);
+            std.log.debug("managed catch-up admission deferred table={s} group_id={} phase=dirty_writer", .{ table_name, group_id });
             return busy_result;
         }
         if (!use_live_owner) if (self.write_cache) |cache| {
             if (cache.hasForegroundStateForGroupTableLocked(group_id, table_name)) {
                 self.local_db_mutex.unlock();
                 self.endGroupOperation(table_name, group_id);
+                std.log.debug("managed catch-up admission deferred table={s} group_id={} phase=foreground_writer", .{ table_name, group_id });
                 return busy_result;
             }
         };
@@ -13592,9 +13633,17 @@ pub const ProvisionedTableWriteSource = struct {
         self.startup_catch_up_active.store(true, .monotonic);
         defer self.startup_catch_up_active.store(false, .monotonic);
 
-        const owned_indexes_json = if (metadata.indexes_json == null) try loadTableIndexesJson(alloc, self.catalog, table_name) else null;
+        // Queued maintenance metadata is only an admission hint. A repair job
+        // can outlive that snapshot whether it leases a resident writer or
+        // becomes the cold owner after eviction. Repair must therefore use
+        // current catalog authority for both paths; comparing or opening from
+        // stale queued JSON can falsely revoke a healthy serving snapshot or
+        // resurrect an obsolete index definition. Ordinary startup consumes
+        // its self-consistent supplied metadata without the extra catalog read.
+        const load_current_indexes = metadata.indexes_json == null or metadata.advance_index_repairs;
+        const owned_indexes_json = if (load_current_indexes) try loadTableIndexesJson(alloc, self.catalog, table_name) else null;
         defer if (owned_indexes_json) |value| alloc.free(value);
-        const indexes_json = metadata.indexes_json orelse owned_indexes_json;
+        const indexes_json = if (load_current_indexes) owned_indexes_json else metadata.indexes_json;
         const identity_namespace = if (metadata.identity_namespace) |namespace|
             namespace
         else if (metadata.indexes_json == null)
@@ -13618,17 +13667,22 @@ pub const ProvisionedTableWriteSource = struct {
             if (!ProvisionedTableWriteCache.entryManagedConfigMatches(guard.entry.?, indexes_json)) {
                 // Repair never reconciles desired table structure. Preserve
                 // the durable repair queue entry, but explicitly hand stale
-                // writer metadata to the coalesced structural owner instead
+                // writer metadata to the idempotent structural owner instead
                 // of spinning this bounded worker on the same mismatch.
-                if (!self.structuralStatusSnapshotOnlyBestEffort(table_name)) {
-                    self.enqueueTableStructuralReconcile(table_name) catch |err| {
-                        std.log.warn("managed index repair structural handoff failed table={s} group_id={} err={s}", .{
-                            table_name,
-                            group_id,
-                            @errorName(err),
-                        });
-                    };
-                }
+                //
+                // A status/publication fence is deliberately not evidence
+                // that structural work is queued: that fence can outlive the
+                // request while it waits for the resident owner to publish.
+                // The structural queue is its own coalescing authority and is
+                // therefore the only safe place to deduplicate this re-drive.
+                self.enqueueTableStructuralReconcile(table_name) catch |err| {
+                    std.log.warn("managed index repair structural handoff failed table={s} group_id={} err={s}", .{
+                        table_name,
+                        group_id,
+                        @errorName(err),
+                    });
+                };
+                std.log.debug("managed catch-up admission deferred table={s} group_id={} phase=writer_config", .{ table_name, group_id });
                 return busy_result;
             }
         }
@@ -14949,14 +15003,16 @@ pub const ProvisionedTableWriteSource = struct {
                     if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |cached_status| {
                         var status = cached_status;
                         errdefer status.deinit(alloc);
+                        var lifecycle_observed = false;
                         if (runtimeStatusNeedsAuthoritativeLifecycleRefresh(status)) {
                             const fresh_stats = try owned.db.runtimeStatusStatsConsistent(alloc);
                             db_mod.types.freeDBStats(alloc, status.stats);
                             status.stats = fresh_stats;
+                            lifecycle_observed = true;
                         } else {
-                            _ = owned.db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
+                            lifecycle_observed = owned.db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
                         }
-                        self.markManagedWriterRuntimeStatus(&status);
+                        if (lifecycle_observed) self.markManagedWriterRuntimeStatus(&status);
                         status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
                         if (status.created_at_millis == 0) {
                             status.created_at_millis = (owned.db.getGroupCreatedAtMillis(alloc, group_id) catch null) orelse 0;
@@ -14989,8 +15045,9 @@ pub const ProvisionedTableWriteSource = struct {
                 var owned = cached;
                 const release_alloc = if (owned.cache) |cache| cache.alloc else std.heap.page_allocator;
                 defer owned.deinit(release_alloc);
-                _ = owned.db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
-                self.markManagedWriterRuntimeStatus(status);
+                if (owned.db.overlayRuntimeStatusBestEffort(alloc, &status.stats)) {
+                    self.markManagedWriterRuntimeStatus(status);
+                }
                 status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
                 if (status.created_at_millis == 0) {
                     status.created_at_millis = (owned.db.getGroupCreatedAtMillis(std.heap.page_allocator, group_id) catch null) orelse 0;
@@ -15003,11 +15060,7 @@ pub const ProvisionedTableWriteSource = struct {
         _: *ProvisionedTableWriteSource,
         status: *runtime_status.LocalTableRuntimeStatus,
     ) void {
-        status.replaceMetadata(.{
-            .updated_at_ns = platform_time.monotonicNs(),
-            .source = .live_writer_publish,
-            .freshness = .fresh,
-        });
+        markRuntimeStatusFromDb(status, .idle);
     }
 
     fn lsmStorageStatsFromDb(db: *db_mod.DB) runtime_status.LsmStorageStats {
@@ -22429,26 +22482,27 @@ pub const HostedProvisionedTableWriteSource = struct {
             grouped.deinit(alloc);
         }
 
-        var snapshot = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&snapshot);
-        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
-        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
-        defer metadata_admin.freeRangeRefs(alloc, ranges);
-        if (ranges.len == 0) return null;
+        var routing = (try table_catalog.tableRoutingSnapshotForWrite(
+            alloc,
+            self.catalog,
+            table_name,
+            platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+        )) orelse return null;
+        defer routing.deinit(alloc);
 
         for (req.writes) |write| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, write.key) orelse return null;
-            const group = try ensureGroupBatch(alloc, &grouped, group_id);
+            const route = routing.resolveRouteForKey(write.key) orelse return null;
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, routing.fenceForRoute(route));
             try group.writes.append(alloc, write);
         }
         for (req.deletes) |key| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, key) orelse return null;
-            const group = try ensureGroupBatch(alloc, &grouped, group_id);
+            const route = routing.resolveRouteForKey(key) orelse return null;
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, routing.fenceForRoute(route));
             try group.deletes.append(alloc, key);
         }
         for (req.transforms) |transform| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, transform.key) orelse return null;
-            const group = try ensureGroupBatch(alloc, &grouped, group_id);
+            const route = routing.resolveRouteForKey(transform.key) orelse return null;
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, routing.fenceForRoute(route));
             try group.transforms.append(alloc, transform);
         }
 
@@ -22464,6 +22518,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
                         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group.group_id, table_name, .default_async);
                         defer cached.deinit(hosted_cache.write_cache.alloc);
+                        try validateProvisionedDbIdentityNamespaceExpected(group.identity_namespace, cached.db);
                         try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, group.writes.items, group.deletes.items, group.transforms.items);
                         var dispatch_ctx = DocumentChildRangeDispatchContext{
                             .source = self.source(),
@@ -22483,6 +22538,9 @@ pub const HostedProvisionedTableWriteSource = struct {
                     },
                     .remote => |remote| {
                         var client = self.httpClient(alloc);
+                        const fence = group.route_fence orelse return error.CatalogRouteFenceRequired;
+                        const encoded_fence = try std.json.Stringify.valueAlloc(alloc, fence, .{});
+                        defer alloc.free(encoded_fence);
                         const body = try encodeRemoteBatchRequest(alloc, .{
                             .writes = group.writes.items,
                             .deletes = group.deletes.items,
@@ -22494,38 +22552,30 @@ pub const HostedProvisionedTableWriteSource = struct {
                             .sync_level = req.sync_level,
                         });
                         defer alloc.free(body);
-                        var response = try client.fetchGroupBatch(remote.base_uri, group.group_id, table_name, body);
+                        var response = try client.fetchGroupBatchWithForwarding(
+                            remote.base_uri,
+                            group.group_id,
+                            table_name,
+                            body,
+                            internal_batch_forwarding.max_remaining_ms,
+                            .{
+                                .remaining_ms = internal_batch_forwarding.max_remaining_ms,
+                                .forwards_remaining = internal_batch_forwarding.max_forwards,
+                                .campaign_allowed = true,
+                            },
+                            null,
+                            encoded_fence,
+                        );
                         response.deinit(alloc);
                     },
                 }
             } else {
-                const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group.group_id);
-                defer alloc.free(path);
-                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-                defer io_impl.deinit();
-                std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
-                    error.FileNotFound => return null,
-                    else => return err,
-                };
-                const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-                var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group.group_id, table_name, .default_async);
-                defer cached.deinit(hosted_cache.write_cache.alloc);
-                try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, group.writes.items, group.deletes.items, group.transforms.items);
-                var dispatch_ctx = DocumentChildRangeDispatchContext{
-                    .source = self.source(),
-                    .table_name = table_name,
-                };
-                try cached.db.batchWithDocumentArtifactChildRangeDispatcher(.{
-                    .writes = group.writes.items,
-                    .deletes = group.deletes.items,
-                    .transforms = group.transforms.items,
-                    .graph_writes = req.graph_writes,
-                    .graph_deletes = req.graph_deletes,
-                    .predicates = req.predicates,
-                    .timestamp_ns = req.timestamp_ns,
-                    .sync_level = req.sync_level,
-                }, dispatch_ctx.dispatcher());
-                if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
+                // A durable path is not ownership authority. If the hosted
+                // router cannot identify an active replica, fail closed and
+                // let the background job retry after placement converges.
+                // Opening a merely-present local root here could write through
+                // a retired replica or a different table incarnation.
+                return error.GroupLeaderUnavailable;
             }
         }
     }
@@ -27658,6 +27708,8 @@ fn publishStructuralRuntimeObservations(
     // replace every group and clear those fences.
     const result = if (lifecycle_transition and target_index_name == null)
         try snapshot_cache.publishLifecycleTransition(completed, table_name, statuses[0..observations.len])
+    else if (target_index_name) |index_name|
+        try snapshot_cache.publishTargetedGroups(completed, table_name, index_name, statuses[0..observations.len])
     else
         try snapshot_cache.publishGroups(completed, table_name, statuses[0..observations.len]);
     try acceptRuntimeStatusPublication(result);
@@ -33043,7 +33095,10 @@ test "writer cache eviction retires dirty ownership after the last cache owner" 
 
     startup_cache.evictOldestTable();
     try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
-    try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+    var ownerless_snapshot = (try snapshot_cache.snapshot(alloc, "docs")) orelse return error.TestUnexpectedResult;
+    defer ownerless_snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ownerless_snapshot.items.len);
+    try std.testing.expect(!ownerless_snapshot.items[0].metadata.target_observation_complete);
     try std.testing.expectEqual(@as(u64, 9), read_cache.table_epochs.get("docs").?);
 }
 
@@ -33388,7 +33443,10 @@ test "startup cache clear retires dirty identity without a serving owner" {
 
     try std.testing.expectEqual(@as(usize, 0), startup_cache.table_metadata.items.len);
     try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
-    try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+    var ownerless_snapshot = (try snapshot_cache.snapshot(alloc, "docs")) orelse return error.TestUnexpectedResult;
+    defer ownerless_snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ownerless_snapshot.items.len);
+    try std.testing.expect(!ownerless_snapshot.items[0].metadata.target_observation_complete);
     try std.testing.expectEqual(@as(u64, 12), read_cache.table_epochs.get("docs").?);
 }
 
@@ -41143,6 +41201,33 @@ test "queued index catch-up does not reserve table write admission" {
     try std.testing.expect(source.retainOnlyTargetedStatusSnapshotFreshnessBestEffort("docs", &empty_statuses));
 }
 
+test "status publication fence does not suppress structural work re-drive" {
+    var catalog = StructuralReconcileTestCatalog{ .mode = .vanish };
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-status-fence-structural-redrive",
+        catalog.iface(),
+    );
+    defer source.deinit();
+
+    // A completed activation can retain this fence while it waits for the
+    // resident owner observation. It is not a queued/running reconcile job.
+    source.reserveTargetedStructuralReconcileStatus("docs", "semantic_idx");
+    defer source.releaseTargetedStructuralReconcileStatus("docs", "semantic_idx");
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+
+    // Keep the executor parked so the independently coalesced job can be
+    // observed directly.
+    source.structural_reconcile_scheduled.store(true, .release);
+    try source.enqueueTableStructuralReconcile("docs");
+
+    const io = source.table_activity_threaded.io();
+    source.structural_reconcile_mutex.lockUncancelable(io);
+    defer source.structural_reconcile_mutex.unlock(io);
+    try std.testing.expectEqual(@as(usize, 1), source.structural_reconcile_tables.items.len);
+    try std.testing.expectEqualStrings("docs", source.structural_reconcile_tables.items[0].table_name);
+    try std.testing.expect(source.structural_reconcile_tables.items[0].index_name == null);
+}
+
 test "targeted index reconciliation stales only the named cached index" {
     var catalog = StructuralReconcileTestCatalog{ .mode = .vanish };
     var source = ProvisionedTableWriteSource.init(
@@ -41387,6 +41472,30 @@ test "initial build edge after target authority release preserves runtime observ
                 .previous_admission = .serviceable,
                 .admission = .blocked,
             },
+        },
+    );
+
+    // Successful managed admission emits the same lifecycle class on its
+    // clear edge. Completion may retire readers, but it must not reinterpret
+    // normal materialization as corruption and withdraw the accepted runtime
+    // observation.
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityEvent(
+        &source,
+        "docs",
+        7001,
+        null,
+        .{
+            .change = .index_repair_cleared,
+            .repair = .{
+                .index_name = "thumbnail",
+                .work_class = .initial_build,
+                .previous_admission = .blocked,
+                .admission = .serviceable,
+            },
+            // A concurrently building sibling remains scheduler debt, but
+            // cannot turn this exact lifecycle edge into group-wide repair
+            // scope or revoke the accepted thumbnail observation.
+            .group_repair_debt_remains = true,
         },
     );
 
@@ -41698,11 +41807,47 @@ test "live repair final audit excludes concurrent group mutation through publica
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
 
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+            } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .indexes_json = "{}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .range_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
     var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
     defer snapshot_cache.deinit();
-    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
     defer source.deinit();
     source.write_cache = &write_cache;
     source.runtime_status_cache = &snapshot_cache;
@@ -41786,6 +41931,109 @@ test "live repair final audit excludes concurrent group mutation through publica
     try std.testing.expect(!retry.busy);
     try std.testing.expect(!retry.index_repair_pending);
     try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+}
+
+test "live repair validates resident writer against current catalog not queued metadata" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/repair-current-catalog-authority",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(path);
+    const current_indexes_json = "{}";
+    const stale_queued_indexes_json =
+        \\{"obsolete":{"type":"full_text"}}
+    ;
+    const namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
+
+    const Catalog = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{ .ptr = self, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+            } };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .indexes_json = current_indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .range_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var catalog = Catalog{};
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &snapshot_cache;
+
+    var cached = try source.getOrOpenCachedDbModeWithMetadata(
+        alloc,
+        &write_cache,
+        path,
+        7001,
+        "docs",
+        .writer_no_replay,
+        null,
+        null,
+        .{
+            .indexes_json = current_indexes_json,
+            .schema_json = "",
+            .identity_namespace = namespace,
+        },
+    );
+    try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, cached.db);
+    cached.deinit(alloc);
+
+    const result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
+        // This repair item was queued before a later catalog mutation. The
+        // current catalog and live writer agree, so it must not initiate a
+        // whole-table reconcile or fence the already-published snapshot.
+        .indexes_json = stale_queued_indexes_json,
+        .identity_namespace = namespace,
+        .advance_index_repairs = true,
+    });
+    try std.testing.expect(!result.busy);
+    try std.testing.expectEqual(@as(usize, 1), catalog.calls);
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    var snapshot = (try snapshot_cache.snapshot(alloc, "docs")).?;
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, snapshot.items[0].metadata.freshness);
 }
 
 test "terminal repair publication settles handoff or retains one fenced retry" {
@@ -42249,11 +42497,15 @@ test "structural reconcile publishes durable index repair debt once per group" {
         ProvisionedTableWriteSource.StructuralReconcileOutcome.complete,
         try source.reconcileTableStructureStep(alloc, &request),
     );
-    // The structural worker preserves the exact debt edge during its quantum,
-    // but must not request runnable repair admission until after releasing its
-    // table-wide reservation.
-    try std.testing.expectEqual(@as(usize, 1), capture.notification_count);
+    // Hook attachment may replay the already-durable level and the mutation
+    // itself may publish its transition edge. Both are intentionally
+    // idempotent observations. The structural request must nevertheless
+    // coalesce them to one group and must not request runnable repair
+    // admission until after releasing its table-wide reservation.
+    try std.testing.expect(capture.notification_count >= 1);
     try std.testing.expectEqual(@as(usize, 0), capture.runnable_signal_count);
+    try std.testing.expectEqual(@as(usize, 1), request.deferred_repair_group_ids.items.len);
+    const observations_before_handoff = capture.notification_count;
     var rebuilding = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer rebuilding.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), rebuilding.items.len);
@@ -42272,7 +42524,7 @@ test "structural reconcile publishes durable index repair debt once per group" {
     reconcile_active = false;
     source.releaseStructuralReconcileStatus("docs");
     request.publishDeferredRepairDebt(&source);
-    try std.testing.expectEqual(@as(usize, 2), capture.notification_count);
+    try std.testing.expectEqual(observations_before_handoff + 1, capture.notification_count);
     try std.testing.expectEqual(@as(usize, 1), capture.runnable_signal_count);
 
     var attempted_repair = false;
@@ -43968,6 +44220,141 @@ test "provisioned table write source visibility hook defers status sampling to r
     try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
 }
 
+test "fenced blocking status publication preserves accepted serving snapshot" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/fenced-blocking-status-publication",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+    var visible_generation = db.core.index_manager.lsm_root_generation;
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&visible_generation));
+
+    // Seed a deterministic, already-accepted serving observation. DB document
+    // statistics can legitimately lag an ordinary write, so they are not a
+    // suitable sentinel for this publication-ordering regression.
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", .{
+        .group_id = 7001,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .updated_at_ns = 123,
+            .target_observation_complete = true,
+        },
+        .stats = .{ .doc_count = 7 },
+    });
+    var accepted = (try snapshot_cache.snapshot(alloc, "docs")) orelse
+        return error.TestUnexpectedResult;
+    const accepted_doc_count = accepted.items[0].stats.doc_count;
+    try std.testing.expectEqual(@as(u64, 7), accepted_doc_count);
+    accepted.deinit(alloc);
+
+    const Fence = struct {
+        cache: *runtime_status.TableRuntimeSnapshotCache,
+        fired: bool = false,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fired) return;
+            self.fired = true;
+            // Model a concurrent targeted/catalog fence after the DB snapshot
+            // was sampled but before its completed publication token. This is
+            // an ordering miss, not evidence against the prior serving state.
+            self.cache.fenceTablePublications("docs");
+        }
+    };
+    var fence = Fence{ .cache = &snapshot_cache };
+    const previous_hook = test_before_runtime_status_publish_hook;
+    test_before_runtime_status_publish_hook = .{ .ptr = &fence, .run = Fence.run };
+    defer test_before_runtime_status_publish_hook = previous_hook;
+
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
+        &source,
+        "docs",
+        7001,
+        &db,
+        .publish_blocking,
+    );
+    try std.testing.expect(fence.fired);
+
+    var preserved = (try snapshot_cache.snapshot(alloc, "docs")) orelse
+        return error.TestUnexpectedResult;
+    defer preserved.deinit(alloc);
+    try std.testing.expectEqual(accepted_doc_count, preserved.items[0].stats.doc_count);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, preserved.items[0].metadata.freshness);
+    // Completion stays conservative until the owner retries against the new
+    // epoch, while the previously accepted serving facts remain intact.
+    try std.testing.expect(!preserved.items[0].metadata.target_observation_complete);
+}
+
+test "ownerless blocking publication preserves serving facts and fences convergence" {
+    const alloc = std.testing.allocator;
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-ownerless-blocking-publication",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .doc_count = 7,
+        .node_count = 3,
+        .serving_snapshot_ready = true,
+        .coverage_generation = 42,
+        .coverage_config_hash = 84,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", .{
+        .group_id = 7001,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .target_observation_complete = true,
+        },
+        .stats = .{ .doc_count = 7, .index_count = 1, .indexes = indexes[0..] },
+    });
+
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
+        &source,
+        "docs",
+        7001,
+        null,
+        .publish_blocking,
+    );
+
+    var preserved = (try snapshot_cache.snapshot(alloc, "docs")) orelse
+        return error.TestUnexpectedResult;
+    defer preserved.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 7), preserved.items[0].stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 7), preserved.items[0].stats.indexes[0].doc_count);
+    try std.testing.expect(preserved.items[0].stats.indexes[0].serving_snapshot_ready);
+    try std.testing.expect(!preserved.items[0].metadata.target_observation_complete);
+}
+
 test "provisioned table write source status visibility does not invalidate read cache" {
     const alloc = std.testing.allocator;
 
@@ -44812,7 +45199,12 @@ test "provisioned owner publication advances exact index replay target" {
     try std.testing.expect(!statuses.items[0].metadata.target_observation_complete);
     statuses.deinit(alloc);
 
-    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
+    // Activity refreshes normally reuse the immutable cached snapshot and
+    // overlay resident lifecycle facts. Once that overlay succeeds it is an
+    // exact owner observation and must be able to discharge the target fence;
+    // carrying the cached false bit forward would leave completion unknown
+    // forever after restart.
+    try std.testing.expect(source.overlayCachedManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
     statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);
@@ -47685,6 +48077,7 @@ test "managed startup catch-up marks FileNotFound index open terminal degraded" 
 
     const CountingCatalog = struct {
         calls: usize = 0,
+        table: metadata_table_manager.TableRecord,
 
         fn iface(self: *@This()) table_catalog.CatalogSource {
             return .{
@@ -47702,13 +48095,29 @@ test "managed startup catch-up marks FileNotFound index open terminal degraded" 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            return error.UnexpectedCatalogCall;
+            return .{
+                .status = .{
+                    .metadata_group_id = 1,
+                    .metadata_incarnation = "11111111111111111111111111111111".*,
+                    .metrics = .{},
+                },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    var catalog = CountingCatalog{};
+    var catalog = CountingCatalog{ .table = .{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = indexes_json,
+    } };
     var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
     defer snapshot_cache.deinit();
     var startup_write_cache = ProvisionedTableWriteCache.init(alloc);
@@ -47760,7 +48169,7 @@ test "managed startup catch-up marks FileNotFound index open terminal degraded" 
         .advance_index_repairs = true,
     });
 
-    try std.testing.expectEqual(@as(usize, 0), catalog.calls);
+    try std.testing.expectEqual(@as(usize, 2), catalog.calls);
     try std.testing.expect(!result.busy);
     try std.testing.expect(result.had_debt);
     try std.testing.expect(result.terminal_degraded);
@@ -54716,4 +55125,155 @@ test "publishing a provisioned write adapter does not start pointer-capturing re
     _ = source.source();
     try std.testing.expect(!source.dropped_table_recovery_started.load(.acquire));
     try std.testing.expect(!source.dropped_table_recovery_scheduled.load(.acquire));
+}
+
+test "hosted background writes carry the selected catalog fence through routed Raft admission" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/hosted-routed-batch",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    defer closeHostedManagedDbCacheForRoot(replica_root_dir);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .range_id = 71,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Router = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001) 2 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2 and group_id == 7001) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, inner_alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try inner_alloc.dupe(u8, "http://data-node.test");
+        }
+    };
+
+    const Executor = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, inner_alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/batch-routed-v1"));
+            try std.testing.expectEqual(@as(?u32, internal_batch_forwarding.max_remaining_ms), request.timeout_ms);
+            const forwarding = (try internal_batch_forwarding.parse(request)) orelse
+                return error.TestExpectedRoutedForwarding;
+            try std.testing.expectEqual(internal_batch_forwarding.max_forwards, forwarding.forwards_remaining);
+            try std.testing.expect(forwarding.campaign_allowed);
+
+            var encoded_fence: ?[]const u8 = null;
+            for (request.headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, metadata_api.catalog_route_fence_header)) {
+                    encoded_fence = header.value;
+                }
+            }
+            var parsed = try std.json.parseFromSlice(
+                metadata_api.CatalogRouteFence,
+                inner_alloc,
+                encoded_fence orelse return error.TestExpectedCatalogRouteFence,
+                .{},
+            );
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(u64, 7), parsed.value.table_id);
+            try std.testing.expectEqual(@as(u64, 7001), parsed.value.route.group_id);
+            try std.testing.expectEqual(@as(u64, 71), parsed.value.route.range_id);
+
+            const headers = try inner_alloc.alloc(http_common.Header, 1);
+            errdefer inner_alloc.free(headers);
+            const ack_name = try inner_alloc.dupe(u8, metadata_api.catalog_route_fence_ack_header);
+            errdefer inner_alloc.free(ack_name);
+            const ack_value = try inner_alloc.dupe(u8, metadata_api.catalog_route_fence_ack_value);
+            errdefer inner_alloc.free(ack_value);
+            headers[0] = .{ .name = ack_name, .value = ack_value };
+            return .{
+                .status = 201,
+                .headers = headers,
+                .body = try inner_alloc.dupe(u8, "{}"),
+            };
+        }
+    };
+
+    var executor = Executor{};
+    var source = HostedProvisionedTableWriteSource.init(
+        replica_root_dir,
+        Catalog.iface(),
+        Router.iface(),
+        executor.iface(),
+    );
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
 }

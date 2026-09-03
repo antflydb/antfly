@@ -336,6 +336,7 @@ const FailureAccumulator = struct {
         result.placement_incomplete = result.placement_incomplete or failure.phase != .routes;
         const entry = self.groups.getOrPutAssumeCapacity(failure.group_id);
         if (!entry.found_existing) {
+            result.addPlacementFailureClass(failure);
             const detail_index: ?u8 = if (result.failure_detail_count < result.failure_details.len)
                 @intCast(result.failure_detail_count)
             else
@@ -355,6 +356,8 @@ const FailureAccumulator = struct {
         if (existing_domain == new_domain or
             failureDomainPriority(new_domain) < failureDomainPriority(existing_domain))
         {
+            result.removePlacementFailureClass(entry.value_ptr.failure);
+            result.addPlacementFailureClass(failure);
             entry.value_ptr.failure = failure;
             if (entry.value_ptr.detail_index) |index| result.failure_details[index] = failure;
         }
@@ -377,6 +380,9 @@ pub const ReconcileResult = struct {
     route_retrying_groups: usize = 0,
     failed_groups: usize = 0,
     placement_incomplete: bool = false,
+    retryable_placement_failures: usize = 0,
+    permanent_placement_failures: usize = 0,
+    restart_required_placement_failures: usize = 0,
     omitted_failure_details: usize = 0,
     failure_detail_count: usize = 0,
     failure_details: [max_reconcile_failure_details]ReconcileFailure = undefined,
@@ -391,6 +397,37 @@ pub const ReconcileResult = struct {
 
     pub fn failures(self: *const ReconcileResult) []const ReconcileFailure {
         return self.failure_details[0..self.failure_detail_count];
+    }
+
+    /// Preserve the strongest exact placement-failure disposition even when
+    /// operator-facing details are truncated. Control loops may retry a
+    /// transient aggregate without turning permanent corruption or a runtime
+    /// policy mismatch into an endless retry.
+    pub fn placementFailureError(self: *const ReconcileResult) ?anyerror {
+        if (!self.placement_incomplete) return null;
+        if (self.restart_required_placement_failures != 0)
+            return error.ReplicaReconcileRestartRequired;
+        if (self.permanent_placement_failures != 0)
+            return error.ReplicaReconcilePermanentFailure;
+        return error.ReplicaReconcileIncomplete;
+    }
+
+    fn addPlacementFailureClass(self: *ReconcileResult, failure: ReconcileFailure) void {
+        if (failure.phase == .routes) return;
+        switch (failure.classification) {
+            .retryable => self.retryable_placement_failures += 1,
+            .permanent => self.permanent_placement_failures += 1,
+            .restart_required => self.restart_required_placement_failures += 1,
+        }
+    }
+
+    fn removePlacementFailureClass(self: *ReconcileResult, failure: ReconcileFailure) void {
+        if (failure.phase == .routes) return;
+        switch (failure.classification) {
+            .retryable => self.retryable_placement_failures -= 1,
+            .permanent => self.permanent_placement_failures -= 1,
+            .restart_required => self.restart_required_placement_failures -= 1,
+        }
     }
 
     fn recordFailure(
@@ -1877,6 +1914,51 @@ test "reconcile result bounds failure details while preserving failure count" {
         ReconcileFailurePhase.catalog_retirement,
         accumulator.groups.get(max_reconcile_failure_details + 1).?.failure.phase,
     );
+}
+
+test "reconcile result preserves aggregate placement failure disposition" {
+    var accumulator: FailureAccumulator = .{};
+    defer accumulator.deinit(std.testing.allocator);
+    try accumulator.groups.ensureTotalCapacity(std.testing.allocator, 3);
+    var result: ReconcileResult = .{};
+
+    result.recordFailure(&accumulator, .{
+        .group_id = 1,
+        .phase = .routes,
+        .classification = .retryable,
+        .err = error.ConnectionRefused,
+    });
+    try std.testing.expectEqual(@as(?anyerror, null), result.placementFailureError());
+
+    result.recordFailure(&accumulator, .{
+        .group_id = 2,
+        .phase = .admission_prepare,
+        .classification = .retryable,
+        .err = error.GenerationTransitionActive,
+    });
+    try std.testing.expectEqual(error.ReplicaReconcileIncomplete, result.placementFailureError().?);
+    try std.testing.expectEqual(@as(usize, 1), result.retryable_placement_failures);
+
+    // A later exact observation for the same group replaces, rather than
+    // double-counts, its aggregate disposition.
+    result.recordFailure(&accumulator, .{
+        .group_id = 2,
+        .phase = .admission_classify,
+        .classification = .permanent,
+        .err = error.ReplicaAdmissionRejected,
+    });
+    try std.testing.expectEqual(error.ReplicaReconcilePermanentFailure, result.placementFailureError().?);
+    try std.testing.expectEqual(@as(usize, 0), result.retryable_placement_failures);
+    try std.testing.expectEqual(@as(usize, 1), result.permanent_placement_failures);
+
+    result.recordFailure(&accumulator, .{
+        .group_id = 3,
+        .phase = .live_install,
+        .classification = .restart_required,
+        .err = error.ReplicaRuntimePolicyMismatch,
+    });
+    try std.testing.expectEqual(error.ReplicaReconcileRestartRequired, result.placementFailureError().?);
+    try std.testing.expectEqual(@as(usize, 1), result.restart_required_placement_failures);
 }
 
 test "reconcile retry domains preserve admission backoff and primary diagnostics" {

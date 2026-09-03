@@ -740,18 +740,6 @@ pub const JoinedBaseQueryRewrite = struct {
     appended_left_field: bool,
 };
 
-pub const OwnedRequestedFields = struct {
-    values: ?[]const []const u8 = null,
-    owned: [][]u8 = &.{},
-    appended: bool = false,
-
-    pub fn deinit(self: *OwnedRequestedFields, alloc: std.mem.Allocator) void {
-        for (self.owned) |value| alloc.free(value);
-        if (self.owned.len > 0) alloc.free(self.owned);
-        self.* = undefined;
-    }
-};
-
 // ---------------------------------------------------------------------------
 // JoinJobStore
 // ---------------------------------------------------------------------------
@@ -1489,7 +1477,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         requested_left_fields[i] = .{ .string = field };
     }
     if (contract_request.value.count == true) return error.InvalidQueryRequest;
-    const rewrite = rewriteJoinedBaseQueryBodyAlloc(alloc, contract_request.value, join.left_field) catch {
+    const rewrite = rewriteJoinedBaseQueryBodyAlloc(alloc, body, join.left_field) catch {
         return error.InternalFailure;
     };
     const appended_left_field = rewrite.appended_left_field;
@@ -4301,57 +4289,70 @@ fn supportedJoinFiltersFromOpenApi(
 
 pub fn rewriteJoinedBaseQueryBodyAlloc(
     alloc: std.mem.Allocator,
-    request: anytype,
+    body: []const u8,
     join_left_field: []const u8,
 ) !JoinedBaseQueryRewrite {
-    var effective_fields = try maybeAppendRequestedFieldAlloc(alloc, request.fields, join_left_field);
-    defer effective_fields.deinit(alloc);
+    // A join rewrite is a wire-envelope transformation, not a typed request
+    // reconstruction. Re-serializing the generated OpenAPI type materializes
+    // absent nullable fields as explicit nulls; public query admission
+    // intentionally distinguishes those states (notably for graph_queries).
+    // Mutate the admitted JSON envelope so every unrelated presence bit is
+    // preserved exactly.
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
 
-    var base_request = request;
-    base_request.fields = effective_fields.values;
-    base_request.join = null;
-    base_request.foreign_sources = null;
+    _ = parsed.value.object.orderedRemove("join");
+    _ = parsed.value.object.orderedRemove("foreign_sources");
+    const appended_left_field = try maybeAppendRequestedFieldValueAlloc(
+        parsed.arena.allocator(),
+        &parsed.value.object,
+        join_left_field,
+    );
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try std.json.Stringify.value(base_request, .{}, &out.writer);
     return .{
-        .body = try out.toOwnedSlice(),
-        .appended_left_field = effective_fields.appended,
+        .body = try stringifyJsonValueAlloc(alloc, parsed.value),
+        .appended_left_field = appended_left_field,
     };
 }
 
-fn maybeAppendRequestedFieldAlloc(
+fn maybeAppendRequestedFieldValueAlloc(
     alloc: std.mem.Allocator,
-    fields: ?[]const []const u8,
+    object: *std.json.ObjectMap,
     field_name: []const u8,
-) !OwnedRequestedFields {
-    const existing_fields = fields orelse return .{ .values = null };
-    if (std.mem.eql(u8, field_name, "_id")) {
-        return .{ .values = existing_fields };
+) !bool {
+    if (std.mem.eql(u8, field_name, "_id")) return false;
+    const fields = object.getPtr("fields") orelse return false;
+    if (fields.* == .null) return false;
+    if (fields.* != .array) return error.InvalidQueryRequest;
+    for (fields.array.items) |field| {
+        if (field != .string) return error.InvalidQueryRequest;
+        if (std.mem.eql(u8, field.string, field_name)) return false;
     }
-    for (existing_fields) |field| {
-        if (std.mem.eql(u8, field, field_name)) {
-            return .{ .values = existing_fields };
-        }
-    }
+    try fields.array.append(.{ .string = try alloc.dupe(u8, field_name) });
+    return true;
+}
 
-    const owned = try alloc.alloc([]u8, existing_fields.len + 1);
-    errdefer alloc.free(owned);
-    var initialized: usize = 0;
-    errdefer {
-        for (owned[0..initialized]) |value| alloc.free(value);
-    }
-    for (existing_fields, 0..) |field, idx| {
-        owned[idx] = try alloc.dupe(u8, field);
-        initialized += 1;
-    }
-    owned[existing_fields.len] = try alloc.dupe(u8, field_name);
-    return .{
-        .values = owned,
-        .owned = owned,
-        .appended = true,
-    };
+test "joined base rewrite preserves public envelope presence semantics" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"full_text_search":{"query":"body:order"},"fields":["product"],"limit":10,"join":{"right_table":"customers","on":{"left_field":"customer_id","right_field":"id"}},"foreign_sources":{"customers":{"type":"postgres","dsn":"postgres://db","postgres_table":"customers"}}}
+    ;
+    const rewrite = try rewriteJoinedBaseQueryBodyAlloc(alloc, body, "customer_id");
+    defer alloc.free(rewrite.body);
+
+    try std.testing.expect(rewrite.appended_left_field);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rewrite.body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(parsed.value.object.get("join") == null);
+    try std.testing.expect(parsed.value.object.get("foreign_sources") == null);
+    try std.testing.expect(parsed.value.object.get("graph_queries") == null);
+    const fields = parsed.value.object.get("fields") orelse return error.TestExpectedEqual;
+    try std.testing.expect(fields == .array);
+    try std.testing.expectEqual(@as(usize, 2), fields.array.items.len);
+    try std.testing.expectEqualStrings("product", fields.array.items[0].string);
+    try std.testing.expectEqualStrings("customer_id", fields.array.items[1].string);
 }
 
 pub fn encodeJoinPartitionRequest(

@@ -2488,6 +2488,10 @@ pub const VisibilityStats = struct {
 };
 
 pub const DBStats = struct {
+    /// Process-local identity of the resident DB owner that sampled this
+    /// status. Cache merge logic uses it only with an exact table root and
+    /// index incarnation; it is not part of the public status contract.
+    runtime_owner_id: u64 = 0,
     /// Process-local fingerprint of physical LSM/WAL publications. Runtime
     /// status uses it only to invalidate cached directory-byte observations.
     storage_change_token: u64 = 0,
@@ -3079,6 +3083,9 @@ pub const DBIndexStats = struct {
     // Authoritative O(1) projection of the resident search-admission gate for
     // this exact dense incarnation. Zero members is still a valid snapshot.
     serving_snapshot_ready: bool = false,
+    // Process-local immutable serving revision. It is ordered only when the
+    // enclosing DBStats observations have the same nonzero runtime_owner_id.
+    serving_snapshot_revision: u64 = 0,
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,

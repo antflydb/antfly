@@ -1160,10 +1160,11 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     first_floor = int(partial_status["searchable_vectors"])
     first_coverage_floor = int(partial_status["source_coverage"]["covered"])
     first_last_artifacts = first_floor
+    first_last_status = partial_status
     first_continuity_samples = 0
 
     def assert_first_serving_continuity() -> dict:
-        nonlocal first_last_artifacts, first_continuity_samples
+        nonlocal first_last_artifacts, first_last_status, first_continuity_samples
         request_started = time.monotonic()
         status = backup_api.get_index(table_name, index_name)["status"]
         request_elapsed = time.monotonic() - request_started
@@ -1175,8 +1176,13 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         assert readiness.get("incarnation") == first_incarnation, status
         assert readiness.get("queryable") is True, status
         searchable = int(status.get("searchable_vectors", 0))
-        assert searchable >= first_last_artifacts, status
+        assert searchable >= first_last_artifacts, json.dumps(
+            {"previous": first_last_status, "current": status},
+            indent=2,
+            sort_keys=True,
+        )
         first_last_artifacts = searchable
+        first_last_status = status
         covered = int((status.get("source_coverage") or {}).get("covered", 0))
         assert covered >= first_coverage_floor, status
         first_continuity_samples += 1
@@ -1234,7 +1240,9 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         status = backup_api.get_index(table_name, second_index_name)["status"]
         readiness = status.get("readiness") or {}
         pending_reasons = readiness.get("pending_reasons") or []
-        assert "runtime_unavailable" not in pending_reasons, status
+        assert "runtime_unavailable" not in pending_reasons, json.dumps(
+            {"activated": activated, "current": status}, indent=2, sort_keys=True
+        )
         assert status.get("repair") is None, status
         assert readiness.get("incarnation") == second_incarnation, status
         if (
@@ -1260,12 +1268,19 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     # refresh cycles while both incarnations are active: a missed heartbeat may
     # remove activity, but must never revoke serving authority or zero facts.
     second_floor = int(second_partial["searchable_vectors"])
+    second_coverage_floor = int(second_partial["source_coverage"]["covered"])
+    second_last_status = second_partial
     sampling_deadline = time.monotonic() + 3.0
     samples = 0
     while time.monotonic() < sampling_deadline:
         for sampled_index, incarnation, artifacts_floor, coverage_floor in (
             (index_name, first_incarnation, first_floor, first_coverage_floor),
-            (second_index_name, second_incarnation, second_floor, 1),
+            (
+                second_index_name,
+                second_incarnation,
+                second_floor,
+                second_coverage_floor,
+            ),
         ):
             if sampled_index == index_name:
                 assert_first_serving_continuity()
@@ -1280,11 +1295,23 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
             assert sampled_readiness.get("state") != "runtime_unavailable", sampled
             assert sampled_readiness.get("incarnation") == incarnation, sampled
             assert sampled_readiness.get("queryable") is True, sampled
-            assert int(sampled.get("searchable_vectors", 0)) >= artifacts_floor, sampled
-            assert (
-                int((sampled.get("source_coverage") or {}).get("covered", 0))
-                >= coverage_floor
-            ), sampled
+            sampled_artifacts = int(sampled.get("searchable_vectors", 0))
+            sampled_covered = int(
+                (sampled.get("source_coverage") or {}).get("covered", 0)
+            )
+            assert sampled_artifacts >= artifacts_floor, json.dumps(
+                {"previous": second_last_status, "current": sampled},
+                indent=2,
+                sort_keys=True,
+            )
+            assert sampled_covered >= coverage_floor, sampled
+            # No writes, updates, or deletes occur during this window. Within
+            # one incarnation and accepted source target, every newer serving
+            # observation is therefore monotonic. Mutations and incarnation
+            # replacement are the explicit boundaries where counts may fall.
+            second_floor = sampled_artifacts
+            second_coverage_floor = sampled_covered
+            second_last_status = sampled
         samples += 1
         time.sleep(0.05)
     assert samples >= 3

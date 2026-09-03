@@ -102,7 +102,7 @@ fn BoundaryImpl(comptime VTable: type) type {
                         const expected = native_abi.CallContract.of(field.name, Callback, Args, Payload);
                         if (!contract.matches(expected))
                             return error_abi.statusFromError(error.InvalidArgument);
-                        return invoke(field.type, callback, args, output);
+                        return invoke(field.name, field.type, callback, args, output);
                     }
                     return error_abi.statusFromError(error.InvalidArgument);
                 }
@@ -111,6 +111,7 @@ fn BoundaryImpl(comptime VTable: type) type {
         }
 
         fn invoke(
+            comptime field_name: []const u8,
             comptime Field: type,
             callback: *const anyopaque,
             args: *const anyopaque,
@@ -127,8 +128,10 @@ fn BoundaryImpl(comptime VTable: type) type {
 
             if (Payload == void) {
                 if (@typeInfo(Return) == .error_union) {
-                    @call(.auto, typed_callback, typed_args.*) catch |err|
+                    @call(.auto, typed_callback, typed_args.*) catch |err| {
+                        logUntransportableError(field_name, err);
                         return error_abi.statusFromError(err);
+                    };
                 } else {
                     @call(.auto, typed_callback, typed_args.*);
                 }
@@ -136,14 +139,28 @@ fn BoundaryImpl(comptime VTable: type) type {
             }
 
             const value = if (@typeInfo(Return) == .error_union)
-                @call(.auto, typed_callback, typed_args.*) catch |err|
-                    return error_abi.statusFromError(err)
+                @call(.auto, typed_callback, typed_args.*) catch |err| {
+                    logUntransportableError(field_name, err);
+                    return error_abi.statusFromError(err);
+                }
             else
                 @call(.auto, typed_callback, typed_args.*);
             const typed_output: *Payload = @ptrCast(@alignCast(output orelse
                 return error_abi.statusFromError(error.InvalidArgument)));
             typed_output.* = value;
             return .ok;
+        }
+
+        fn logUntransportableError(comptime field_name: []const u8, err: anyerror) void {
+            if (error_abi.errorHasStableDetail(err)) return;
+            // Compilation-local Zig error identities cannot cross the native
+            // runtime ABI. Preserve the behavioral fallback on the caller,
+            // but always retain the owning callback and original error in the
+            // server log so a missing stable classification is actionable.
+            std.log.err(
+                "runtime callback returned untransportable error method={s} err={s}",
+                .{ field_name, @errorName(err) },
+            );
         }
 
         fn callbackType(comptime Field: type) type {

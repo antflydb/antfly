@@ -2065,6 +2065,7 @@ const AggregatedIndexStatus = struct {
     expected_group_count: u64 = 0,
     reported_group_count: u64 = 0,
     fresh_group_count: u64 = 0,
+    fact_group_count: u64 = 0,
     target_observation_group_count: u64 = 0,
     stale_group_count: u64 = 0,
     missing_group_count: u64 = 0,
@@ -2189,6 +2190,7 @@ fn statusFreshnessCountsAsRemoteUnknown(metadata: runtime_status.RuntimeStatusMe
 const IndexObservationAuthority = struct {
     runtime_present: bool,
     incarnation_current: bool,
+    facts_authoritative: bool,
     freshness_authoritative: bool,
     readiness_authoritative: bool,
     convergence_authoritative: bool,
@@ -2222,6 +2224,7 @@ fn classifyIndexObservation(
     if (!runtime_present) return .{
         .runtime_present = false,
         .incarnation_current = incarnation_current,
+        .facts_authoritative = false,
         .freshness_authoritative = false,
         .readiness_authoritative = false,
         .convergence_authoritative = false,
@@ -2271,12 +2274,24 @@ fn classifyIndexObservation(
                     (cache_proves_serviceability or repair_proves_serviceability)))
     else
         false;
+    // Runtime facts are immutable and incarnation-scoped. A missed owner
+    // heartbeat may make activity and convergence stale, but it cannot erase
+    // the last accepted identity or counters. Exact structural fences still
+    // revoke this authority through `runtime_observation_stale`.
+    const facts_authoritative = !explicitly_stale and incarnation_current and
+        (if (metadata != null)
+            true
+        else if (@hasField(Item, "fact_group_count") and @hasField(Item, "expected_group_count"))
+            item.expected_group_count > 0 and item.fact_group_count == item.expected_group_count
+        else
+            true);
     // Aggregates have already reduced the per-shard freshness decision and do
     // not carry one table-level metadata label. Their stale/missing counters
     // remain an independent completeness fence during serialization.
     const metadata_authoritative = if (metadata) |value|
         statusFreshnessCountsAsFresh(value) or transition_serviceable or
-            (incarnation_current and published_snapshot_proves_serviceability)
+            (incarnation_current and
+                (cache_proves_serviceability or published_snapshot_proves_serviceability))
     else if (@hasField(Item, "runtime_fresh"))
         item.runtime_fresh
     else
@@ -2286,6 +2301,7 @@ fn classifyIndexObservation(
     return .{
         .runtime_present = true,
         .incarnation_current = incarnation_current,
+        .facts_authoritative = facts_authoritative,
         .freshness_authoritative = freshness_authoritative,
         .readiness_authoritative = readiness_authoritative,
         .convergence_authoritative = target_observation_complete,
@@ -2337,6 +2353,11 @@ fn aggregateIndexStatusIndexed(
         if (!runtime_present) continue;
         aggregate.reported_group_count += 1;
         aggregate.runtime_present = true;
+        // Source cardinality belongs to the table observation, not the index
+        // incarnation. Retain it even when this index is fenced or its owner
+        // heartbeat is stale; convergence authority independently decides
+        // whether the count can satisfy completion.
+        aggregate.table_doc_count +|= runtime.stats.source_doc_count;
         const matches_desired_incarnation = coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
         const shard_repair_lifecycle = publicIndexRepairLifecycle(item);
         // A runnable repair owns the quarantined candidate and its load error.
@@ -2407,7 +2428,10 @@ fn aggregateIndexStatusIndexed(
         } else {
             aggregate.stale_group_count += 1;
         }
-        const observation_current = authority.readiness_authoritative;
+        const observation_current = authority.facts_authoritative;
+        if (observation_current) aggregate.fact_group_count += 1;
+        if (index_observation_fresh and !authority.incarnation_current)
+            aggregate.coverage_config_mismatch_count += 1;
         // A serviceability proof is scoped to the dense incarnation itself,
         // not to the table-status publication epoch. Preserve it across a
         // transiently stale in-place observation so sibling index DDL cannot
@@ -2451,14 +2475,12 @@ fn aggregateIndexStatusIndexed(
                 }
             }
         }
-        // Coverage is projected only from current observations. Stale groups
-        // remain visible in diagnostics but cannot contribute cardinality or
-        // outcomes to a complete aggregate.
-        if (index_observation_fresh) {
-            aggregate.table_doc_count +|= runtime.stats.source_doc_count;
-            if (!observation_current) {
-                aggregate.coverage_config_mismatch_count += 1;
-            } else if (!item.coverage_summary_ready) {
+        // Preserve immutable counters from an exact-incarnation cached
+        // observation even when its owner heartbeat is stale. Convergence is
+        // fenced independently below, so these remain progress facts rather
+        // than a claim that coverage is complete for the latest target.
+        if (observation_current) {
+            if (!item.coverage_summary_ready) {
                 aggregate.coverage_summary_ready = false;
             } else {
                 aggregate.coverage_produced_count +|= item.coverage_produced_count;
@@ -2565,9 +2587,10 @@ fn aggregateIndexStatusIndexed(
         @intCast(expected_group_ids.len)
     else
         aggregate.reported_group_count;
-    if ((aggregate.fresh_group_count > 0 or
+    if ((aggregate.fact_group_count > 0 or
         aggregate.repair_active_generation_serviceable) and
-        aggregate.coverage_config_mismatch_count == 0)
+        aggregate.coverage_config_mismatch_count == 0 and
+        aggregate.fact_group_count == aggregate.expected_group_count)
     {
         aggregate.coverage_generation = coverage_generation;
         aggregate.coverage_config_hash = coverage_config_hash;
@@ -4038,11 +4061,10 @@ test "identity-proven embeddings stay current during sibling startup catch-up" {
     );
 }
 
-test "opening embeddings observation cannot publish cached queryability" {
+test "opening embeddings observation requires explicit serviceability authority" {
     var indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "semantic_idx",
         .kind = .dense_vector,
-        .runtime_observation_serviceable = true,
         .doc_count = 2,
         .node_count = 1,
         .coverage_produced_count = 2,
@@ -4076,9 +4098,24 @@ test "opening embeddings observation cannot publish cached queryability" {
 
     try std.testing.expectEqual(@as(u64, 0), aggregate.fresh_group_count);
     try std.testing.expectEqual(@as(u64, 1), aggregate.stale_group_count);
-    try std.testing.expectEqual(@as(u64, 0), aggregate.doc_count);
-    try std.testing.expectEqual(@as(u64, 0), aggregate.coverage_produced_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.fact_group_count);
+    try std.testing.expectEqual(@as(u64, 2), aggregate.doc_count);
+    try std.testing.expectEqual(@as(u64, 2), aggregate.coverage_produced_count);
 
+    indexes[0].runtime_observation_serviceable = true;
+    const cached_owner = aggregateIndexStatusIndexed(
+        &runtimes,
+        "semantic_idx",
+        &.{7},
+        42,
+        99,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), cached_owner.fresh_group_count);
+    try std.testing.expectEqual(@as(u64, 2), cached_owner.doc_count);
+    try std.testing.expectEqual(@as(u64, 2), cached_owner.coverage_produced_count);
+
+    indexes[0].runtime_observation_serviceable = false;
     indexes[0].runtime_observation_targeted_sibling = true;
     const targeted_sibling = aggregateIndexStatusIndexed(
         &runtimes,
@@ -4093,7 +4130,7 @@ test "opening embeddings observation cannot publish cached queryability" {
     try std.testing.expectEqual(@as(u64, 2), targeted_sibling.coverage_produced_count);
 }
 
-test "stale embeddings observation cannot publish cached queryability" {
+test "cached owner observation preserves serving authority without convergence authority" {
     var indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "semantic_idx",
         .kind = .dense_vector,
@@ -4108,7 +4145,11 @@ test "stale embeddings observation cannot publish cached queryability" {
     }};
     const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 7,
-        .metadata = .{ .source = .cached_snapshot, .freshness = .stale },
+        .metadata = .{
+            .source = .cached_snapshot,
+            .freshness = .stale,
+            .target_observation_complete = false,
+        },
         .stats = .{
             .source_doc_count = 2,
             .doc_count = 2,
@@ -4125,10 +4166,48 @@ test "stale embeddings observation cannot publish cached queryability" {
         null,
     ) orelse return error.TestUnexpectedResult;
 
-    try std.testing.expectEqual(@as(u64, 0), aggregate.fresh_group_count);
-    try std.testing.expectEqual(@as(u64, 1), aggregate.stale_group_count);
-    try std.testing.expectEqual(@as(u64, 0), aggregate.doc_count);
-    try std.testing.expectEqual(@as(u64, 0), aggregate.coverage_produced_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.fresh_group_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.fact_group_count);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.stale_group_count);
+    try std.testing.expectEqual(@as(u64, 2), aggregate.doc_count);
+    try std.testing.expectEqual(@as(u64, 2), aggregate.coverage_produced_count);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.target_observation_group_count);
+
+    // Losing the owner heartbeat removes serving/convergence freshness, not
+    // the immutable facts from the exact incarnation. This is the window a
+    // newly activated index occupies before its first published artifact.
+    indexes[0].runtime_observation_serviceable = false;
+    const retained_facts = aggregateIndexStatusIndexed(
+        &runtimes,
+        "semantic_idx",
+        &.{7},
+        42,
+        99,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), retained_facts.fresh_group_count);
+    try std.testing.expectEqual(@as(u64, 1), retained_facts.stale_group_count);
+    try std.testing.expectEqual(@as(u64, 1), retained_facts.fact_group_count);
+    try std.testing.expectEqual(@as(u64, 2), retained_facts.doc_count);
+    try std.testing.expectEqual(@as(u64, 2), retained_facts.coverage_produced_count);
+    const retained_authority = classifyIndexObservation(retained_facts, null, true, 42, 99);
+    try std.testing.expect(retained_authority.facts_authoritative);
+    try std.testing.expect(!retained_authority.freshness_authoritative);
+    try std.testing.expect(!retained_authority.convergence_authoritative);
+
+    indexes[0].runtime_observation_stale = true;
+    const fenced = aggregateIndexStatusIndexed(
+        &runtimes,
+        "semantic_idx",
+        &.{7},
+        42,
+        99,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), fenced.fresh_group_count);
+    try std.testing.expectEqual(@as(u64, 0), fenced.fact_group_count);
+    try std.testing.expectEqual(@as(u64, 1), fenced.stale_group_count);
+    try std.testing.expectEqual(@as(u64, 0), fenced.doc_count);
 }
 
 test "target-scoped stale full text observation cannot publish old readiness" {
@@ -4694,7 +4773,7 @@ test "derived coverage rejects unknown freshness for aggregate and shard views" 
     const aggregate = aggregateIndexStatus(&runtimes, "visual", &.{1}, 41) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 0), aggregate.fresh_group_count);
     try std.testing.expectEqual(@as(u64, 1), aggregate.unknown_group_count);
-    try std.testing.expectEqual(@as(u64, 0), aggregate.table_doc_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.table_doc_count);
     try std.testing.expect(aggregateRuntimeCoverageIncomplete(aggregate, 0, 41));
 
     var shard_status = std.ArrayListUnmanaged(u8).empty;
@@ -5880,6 +5959,7 @@ fn appendIndexReadinessStatus(
         @max(1, item.fresh_group_count)
     else
         1;
+    const observation_available = authority.facts_authoritative;
     const observation_fresh = authority.freshness_authoritative;
     const target_observation_complete = authority.convergence_authoritative;
     const topology_complete = if (@hasField(Item, "expected_group_count") and @hasField(Item, "fresh_group_count"))
@@ -5983,7 +6063,7 @@ fn appendIndexReadinessStatus(
     var queryable_blocker_emitted = false;
     if (!queryable) {
         if (serving_failed) try appendBlocker(alloc, out, "failure", &queryable_blocker_emitted);
-        if (!observation_fresh) try appendBlocker(alloc, out, "runtime_observation", &queryable_blocker_emitted);
+        if (!observation_available) try appendBlocker(alloc, out, "runtime_observation", &queryable_blocker_emitted);
         if (!topology_complete) try appendBlocker(alloc, out, "shard_observation", &queryable_blocker_emitted);
         if (!incarnation_current) try appendBlocker(alloc, out, "incarnation", &queryable_blocker_emitted);
         if (repair_blocks_queryable) try appendBlocker(alloc, out, "repair", &queryable_blocker_emitted);
@@ -5999,7 +6079,7 @@ fn appendIndexReadinessStatus(
     var complete_blocker_emitted = false;
     if (!complete) {
         if (failed) try appendBlocker(alloc, out, "failure", &complete_blocker_emitted);
-        if (!observation_fresh) try appendBlocker(alloc, out, "runtime_observation", &complete_blocker_emitted);
+        if (!observation_available) try appendBlocker(alloc, out, "runtime_observation", &complete_blocker_emitted);
         if (!target_observation_complete) try appendBlocker(alloc, out, "target_observation", &complete_blocker_emitted);
         if (!topology_complete) try appendBlocker(alloc, out, "shard_observation", &complete_blocker_emitted);
         if (!incarnation_current) try appendBlocker(alloc, out, "incarnation", &complete_blocker_emitted);
@@ -6042,7 +6122,7 @@ fn appendIndexReadinessStatus(
     }.run;
     if (terminal_load_failure) try appendReason(alloc, out, "load_failure", &emitted);
     if (terminal_enrichment_failure) try appendReason(alloc, out, "enrichment_failure", &emitted);
-    if (!observation_fresh) try appendReason(alloc, out, "runtime_unavailable", &emitted);
+    if (!observation_available) try appendReason(alloc, out, "runtime_unavailable", &emitted);
     if (!target_observation_complete) try appendReason(alloc, out, "target_observation", &emitted);
     if (!topology_complete) try appendReason(alloc, out, "shard_observation_incomplete", &emitted);
     if (!incarnation_current) try appendReason(alloc, out, "incarnation_pending", &emitted);
@@ -6099,6 +6179,7 @@ test "published embeddings snapshot remains queryable after isolated source fail
         .{
             .runtime_present = true,
             .incarnation_current = true,
+            .facts_authoritative = true,
             .freshness_authoritative = true,
             .readiness_authoritative = true,
             .convergence_authoritative = true,

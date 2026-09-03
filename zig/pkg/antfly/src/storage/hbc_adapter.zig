@@ -9030,15 +9030,47 @@ pub const HBCIndex = struct {
     // Stats
     // ========================================================================
 
-    pub fn stats(self: *const HBCIndex) IndexStats {
+    fn loadPublishedStats(self: *const HBCIndex, generation: u64) PublishedIndexStats {
         return .{
-            .dims = self.metadata.dims,
-            .active_count = self.publishedActiveCount(),
-            .node_count = self.publishedNodeCount(),
-            .root_node = self.publishedRootNode(),
-            .branching_factor = self.metadata.branching_factor,
-            .leaf_size = self.metadata.leaf_size,
+            .generation = generation,
+            .stats = .{
+                .dims = self.metadata.dims,
+                .active_count = self.publishedActiveCount(),
+                .node_count = self.publishedNodeCount(),
+                .root_node = self.publishedRootNode(),
+                .branching_factor = self.metadata.branching_factor,
+                .leaf_size = self.metadata.leaf_size,
+            },
         };
+    }
+
+    /// Returns one coherent immutable serving snapshot and its process-local
+    /// publication generation. The optimistic path is lock-free. A publisher
+    /// that remains in its odd commit generation is joined through the shared
+    /// publication lock rather than exposing a torn root/count observation or
+    /// spinning an owner thread while durable I/O completes.
+    pub fn publishedStats(self: *const HBCIndex) PublishedIndexStats {
+        for (0..8) |_| {
+            const before = self.publishedGeneration();
+            if ((before & 1) != 0) {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            const snapshot = self.loadPublishedStats(before);
+            const after = self.publishedGeneration();
+            if (before == after) return snapshot;
+        }
+
+        const mutable = @constCast(self);
+        mutable.published_snapshot_mu.lockShared();
+        defer mutable.published_snapshot_mu.unlockShared();
+        const generation = self.publishedGeneration();
+        std.debug.assert((generation & 1) == 0);
+        return self.loadPublishedStats(generation);
+    }
+
+    pub fn stats(self: *const HBCIndex) IndexStats {
+        return self.publishedStats().stats;
     }
 
     pub fn debugLeafForVector(self: *HBCIndex, vector_id: u64) !?u64 {
@@ -9195,6 +9227,10 @@ const ApproxSearchResults = vectorindex_search_results.ApproxSearchResults;
 pub const DebugLeafScore = vectorindex_search_types.DebugLeafScore;
 pub const DebugNodeDistance = vectorindex_search_types.DebugNodeDistance;
 pub const IndexStats = vectorindex_search_types.IndexStats;
+pub const PublishedIndexStats = struct {
+    generation: u64,
+    stats: IndexStats,
+};
 pub const HBCDebugNode = vectorindex_search_types.HBCDebugNode;
 
 // ============================================================================

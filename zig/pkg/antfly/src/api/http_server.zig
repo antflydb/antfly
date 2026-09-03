@@ -8210,7 +8210,11 @@ pub const ApiHttpServer = struct {
             backup_location,
             backup_id,
             operation_control.token(),
-        ) catch |err| return operation_control.normalizeInterruption(err)) {
+        ) catch |err| {
+            const normalized_err = operation_control.normalizeInterruption(err);
+            std.log.warn("table backup preflight failed phase=manifest_lookup class={s}", .{@errorName(normalized_err)});
+            return normalized_err;
+        }) {
             if (writer_lease_role.ownsCommittedRetirement()) {
                 self.scheduleTableBackupAttemptCleanup(
                     location_uri,
@@ -8359,7 +8363,11 @@ pub const ApiHttpServer = struct {
                     };
                     return error.BackupOutcomeAmbiguous;
                 },
-                else => return operation_control.normalizeInterruption(err),
+                else => {
+                    const normalized_err = operation_control.normalizeInterruption(err);
+                    std.log.warn("table backup preflight failed phase=reservation_admission class={s}", .{@errorName(normalized_err)});
+                    return normalized_err;
+                },
             };
             break :reservation_admission;
         }
@@ -8381,6 +8389,7 @@ pub const ApiHttpServer = struct {
                 operation_control.token(),
             ) catch |err| {
                 const normalized_err = operation_control.normalizeInterruption(err);
+                std.log.warn("table backup preflight failed phase=writer_lease_admission class={s}", .{@errorName(normalized_err)});
                 // A known precondition failure did not create this lease. It
                 // nevertheless proves another same-generation writer may be
                 // live, so retain both fences and require reconciliation.
@@ -8446,6 +8455,7 @@ pub const ApiHttpServer = struct {
             artifact_backup_id,
             operation_control.token(),
         ) catch |err| {
+            std.log.warn("table backup preflight failed phase=reservation_ownership_read class={s}", .{@errorName(err)});
             return self.rollbackFailedTableBackupAttempt(
                 io,
                 backup_location,
@@ -8649,17 +8659,51 @@ pub const ApiHttpServer = struct {
             .remote => self.destroyBackupStagingRoot(local_backup_root),
         };
 
-        const local_shards = table_writes_source.backupTable(self.alloc, table_name, .{
-            .backup_root = local_backup_root,
-            .backup_id = artifact_backup_id,
-            .format = format,
-            .io = io,
-            .fence = fence,
-            .cancellation = operation_control.token(),
-            .deadline_ns = operation_control.deadline_ns,
-        }) catch |err| {
-            if (err == error.BackupOutcomeAmbiguous) cleanup_safe.* = false;
-            return err;
+        var quiescence_attempt: u8 = 0;
+        const local_shards = while (true) {
+            try writer_lease.ensureOwned();
+            try operation_control.ensureActive();
+            const maybe_shards = table_writes_source.backupTable(self.alloc, table_name, .{
+                .backup_root = local_backup_root,
+                .backup_id = artifact_backup_id,
+                .format = format,
+                .io = io,
+                .fence = fence,
+                .cancellation = operation_control.token(),
+                .deadline_ns = operation_control.deadline_ns,
+            }) catch |err| switch (err) {
+                error.NativeBackupRepairStateNotQuiescent,
+                error.NativeBackupProjectionNotQuiescent,
+                => {
+                    // Each callback attempt owns and releases the provisioned
+                    // group-operation lease. Wait only at this coordinator
+                    // layer so the resident repair/publication owner can make
+                    // the exact transition the native snapshot requires.
+                    try operation_control.ensureActive();
+                    const now_ns = platform_time.monotonicNs();
+                    if (now_ns >= operation_control.deadline_ns) return error.Timeout;
+                    const delay_ns = @min(
+                        nativeBackupQuiescenceRetryDelayNs(quiescence_attempt),
+                        operation_control.deadline_ns - now_ns,
+                    );
+                    io.sleep(std.Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch |sleep_err|
+                        return operation_control.normalizeInterruption(sleep_err);
+                    quiescence_attempt +|= 1;
+                    continue;
+                },
+                error.BackupOutcomeAmbiguous => {
+                    cleanup_safe.* = false;
+                    return err;
+                },
+                else => {
+                    std.log.warn(
+                        "table backup shard capture failed table={s} format={s} class={s}",
+                        .{ table_name, @tagName(format), @errorName(err) },
+                    );
+                    return err;
+                },
+            };
+            break maybe_shards;
         };
         const shards = local_shards orelse return error.TableNotFound;
         defer freeBackupShards(self.alloc, shards);
@@ -8705,6 +8749,10 @@ pub const ApiHttpServer = struct {
             operation_control.token(),
         ) catch |err| {
             const normalized_err = operation_control.normalizeInterruption(err);
+            std.log.warn(
+                "table backup manifest publication failed table={s} format={s} class={s}",
+                .{ table_name, @tagName(format), @errorName(normalized_err) },
+            );
             cleanup_safe.* = switch (normalized_err) {
                 error.BackupAlreadyExists, error.BackupManifestTooLarge => true,
                 error.Canceled, error.Cancelled, error.Timeout => !remote_repository,
@@ -10283,6 +10331,12 @@ pub const ApiHttpServer = struct {
             error.TextMergeRuntimeShutdown,
             => return error.Backpressured,
             error.DenseRepairBackpressure => return error.DenseRepairBackpressure,
+            // Index definitions commit before their physical activation job.
+            // A full-index batch that reaches an older resident writer has
+            // not committed, so expose bounded retryable unavailability while
+            // the exact catalog incarnation is installed instead of leaking a
+            // storage-layer IndexNotFound as an internal 500.
+            error.IndexNotFound => return error.WriteUnavailable,
             error.LeaderUnavailable => return error.WriteUnavailable,
             error.HASyncCommitWouldBlock,
             error.HASyncCommitWaitLimitExceeded,
@@ -10975,7 +11029,7 @@ pub const ApiHttpServer = struct {
         try ensureRequestDeadline(request_deadline_ns);
         const requested_left_fields = contract_request.value.fields orelse &.{};
         if (contract_request.value.count == true) return error.InvalidQueryRequest;
-        const rewrite = try distributed_join.rewriteJoinedBaseQueryBodyAlloc(alloc, contract_request.value, join.left_field);
+        const rewrite = try distributed_join.rewriteJoinedBaseQueryBodyAlloc(alloc, body, join.left_field);
         const appended_left_field = rewrite.appended_left_field;
         const primary_body = rewrite.body;
         defer alloc.free(primary_body);
@@ -12411,14 +12465,21 @@ pub const ApiHttpServer = struct {
                 };
                 local_installation_complete = installed != null;
             }
-            // Consensus is the request's commit boundary. Queue insertion is
-            // an idempotent repair accelerator, so queue pressure after commit
-            // must not turn a created resource into a false HTTP failure that
-            // invites ambiguous client retries.
-            const reconcile_requested = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| requested: {
-                std.log.warn("public create index structural reconcile enqueue deferred table={s} index={s} err={}", .{ table_name, index_name, err });
-                break :requested null;
-            };
+            // A successful create callback is already the activation owner's
+            // acknowledgement: embedded sources installed synchronously and
+            // provisioned sources durably queued their target. Enqueuing the
+            // same target again after that acknowledgement creates a second
+            // status fence after the first one has handed off, briefly
+            // withdrawing the exact incarnation we just made observable.
+            // Reconciliation is the fallback only when projection prevented
+            // local installation or the callback could not accept ownership.
+            var reconcile_requested: ?void = {};
+            if (!local_installation_complete) {
+                reconcile_requested = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| requested: {
+                    std.log.warn("public create index structural reconcile enqueue deferred table={s} index={s} err={}", .{ table_name, index_name, err });
+                    break :requested null;
+                };
+            }
             if (!local_installation_complete and reconcile_requested == null) {
                 const scheduled = if (prepared_installation) |*prepared|
                     if (!prepared.owns_payload)
@@ -16901,6 +16962,20 @@ fn sleepNs(duration_ns: u64) void {
         .INTR => continue,
         else => return,
     };
+}
+
+const native_backup_quiescence_retry_base_ns: u64 = 10 * std.time.ns_per_ms;
+const native_backup_quiescence_retry_max_ns: u64 = 100 * std.time.ns_per_ms;
+
+fn nativeBackupQuiescenceRetryDelayNs(attempt: u8) u64 {
+    const shift: u6 = @intCast(@min(attempt, 4));
+    return @min(native_backup_quiescence_retry_base_ns << shift, native_backup_quiescence_retry_max_ns);
+}
+
+test "native backup coordinator quiescence retry is bounded" {
+    try std.testing.expectEqual(10 * std.time.ns_per_ms, nativeBackupQuiescenceRetryDelayNs(0));
+    try std.testing.expectEqual(20 * std.time.ns_per_ms, nativeBackupQuiescenceRetryDelayNs(1));
+    try std.testing.expectEqual(native_backup_quiescence_retry_max_ns, nativeBackupQuiescenceRetryDelayNs(20));
 }
 
 fn retryDeadlineExpired(deadline_ns: ?u64, now_ns: u64) bool {
@@ -34851,7 +34926,7 @@ test "api http server create index installs exact visible config and defers lagg
     defer retry_lookup.deinit();
     try std.testing.expectEqual(first_incarnation, coverage_policy.incarnation(retry_lookup.config).?);
     try std.testing.expectEqual(@as(usize, 2), writes.create_calls);
-    try std.testing.expectEqual(@as(usize, 2), writes.enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 0), writes.enqueue_calls);
 
     // Metadata is already committed when local capacity rejects the barrier.
     // Return the created resource and hand convergence to reconciliation;
@@ -34866,11 +34941,11 @@ test "api http server create index installs exact visible config and defers lagg
     defer locally_deferred_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), locally_deferred_resp.status);
     try std.testing.expectEqual(@as(usize, 3), writes.create_calls);
-    try std.testing.expectEqual(@as(usize, 3), writes.enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 1), writes.enqueue_calls);
 
-    // Queue pressure after the local capability barrier is not a false create
-    // failure: durable state and foreground write admission have both won.
-    writes.create_error = null;
+    // Queue pressure after the metadata commit is not a false create failure
+    // when local activation also cannot accept ownership.
+    writes.create_error = error.ResourceBudgetExceeded;
     writes.enqueue_error = error.ResourceBudgetExceeded;
     var enqueue_deferred_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -34880,7 +34955,8 @@ test "api http server create index installs exact visible config and defers lagg
     });
     defer enqueue_deferred_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), enqueue_deferred_resp.status);
-    try std.testing.expectEqual(@as(usize, 4), writes.enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 5), writes.create_calls);
+    try std.testing.expectEqual(@as(usize, 2), writes.enqueue_calls);
 
     // A committed proposal whose read projection is not visible yet returns
     // immediately and relies on the targeted reconciler. In particular, it
@@ -34897,8 +34973,8 @@ test "api http server create index installs exact visible config and defers lagg
     });
     defer lagging_projection_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), lagging_projection_resp.status);
-    try std.testing.expectEqual(@as(usize, 4), writes.create_calls);
-    try std.testing.expectEqual(@as(usize, 5), writes.enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 5), writes.create_calls);
+    try std.testing.expectEqual(@as(usize, 3), writes.enqueue_calls);
 
     // Hosted sources historically exposed create_index without either
     // structural-reconcile callback. A lagging projection must still install

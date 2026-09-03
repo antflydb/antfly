@@ -24,11 +24,22 @@
 #   ANTFLY_E2E_NOFILE_LIMIT=256 ANTFLY_E2E_REGRESSION_REPEATS=10 \
 #     scripts/ci/zig-e2e-regression-loop.sh \
 #     e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities
+#
+# Local settings may be kept in the ignored repository-root .env file. Override
+# the path with ANTFLY_E2E_ENV_FILE when a different settings file is useful.
 
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
+env_file="${ANTFLY_E2E_ENV_FILE:-$repo_root/.env}"
+if [[ "${ANTFLY_E2E_ENV_LOADED:-0}" != "1" && -f "$env_file" ]]; then
+  export ANTFLY_E2E_ENV_LOADED=1
+  set -a
+  # shellcheck disable=SC1090 # The local settings path is intentionally configurable.
+  source "$env_file"
+  set +a
+fi
 repeats="${ANTFLY_E2E_REGRESSION_REPEATS:-20}"
 workers="${ANTFLY_E2E_REGRESSION_WORKERS:-1}"
 preserve_failure_limit="${ANTFLY_E2E_PRESERVE_FAILURE_LIMIT:-1}"

@@ -922,6 +922,11 @@ pub const QueryVisibilityEvent = struct {
     change: QueryVisibilityChange,
     repair: ?IndexRepairVisibility = null,
     target_sequence: ?u64 = null,
+    /// An exact clear may leave other durable lifecycle work in the group.
+    /// This is a scheduling/replay fact, not an unknown-scope visibility
+    /// edge: consumers must audit the group without fencing unrelated index
+    /// incarnations.
+    group_repair_debt_remains: bool = false,
 };
 
 pub const QueryVisibilityHook = struct {
@@ -4812,10 +4817,7 @@ pub const DB = struct {
         }
         self.async_context.query_visibility_hook_mutex.unlock();
         if (pending_hook) |attached| {
-            // A repair edge raised before hook attachment cannot safely retain
-            // a borrowed index identity. Deliver it as unknown scope so the
-            // owner conservatively invalidates group-wide visibility.
-            attached.notify(.{ .change = .index_repair_pending });
+            self.replayPendingIndexRepairVisibility(attached);
             _ = self.async_context.query_visibility_hook_in_flight.fetchSub(1, .release);
         }
         if (hook == null) {
@@ -4832,6 +4834,55 @@ pub const DB = struct {
                 .ptr = self.async_context,
                 .on_change = notifyAsyncContextVisibilityHook,
                 .on_activity = notifyAsyncContextActivityHook,
+            });
+        }
+    }
+
+    /// Rehydrate visibility edges raised before the managed owner attached its
+    /// hook from durable repair authority. AsyncContext deliberately does not
+    /// retain borrowed intent strings; reducing those edges to unknown scope,
+    /// however, turns ordinary initial materialization into a table-wide
+    /// repair fence. Hook attachment is a control-plane boundary, so paying one
+    /// bounded checkpoint read here keeps steady-state notification allocation
+    /// free while preserving exact index/incarnation identity.
+    fn replayPendingIndexRepairVisibility(self: *DB, hook: QueryVisibilityHook) void {
+        lockAtomic(&self.async_context.index_repair_control_mutex);
+        var state = self.loadIndexRepairState(self.runtime_alloc) catch |err| {
+            self.async_context.index_repair_control_mutex.unlock();
+            switch (err) {
+                // A pending edge may have been cleared before attachment. No
+                // durable intent means there is no visibility debt to replay.
+                error.FileNotFound => return,
+                else => {
+                    // If durable scope itself cannot be trusted, retain the
+                    // conservative group-wide invalidation contract.
+                    std.log.warn("index repair visibility audit failed err={s}", .{@errorName(err)});
+                    hook.notify(.{ .change = .index_repair_pending });
+                    return;
+                },
+            }
+        };
+        self.async_context.index_repair_control_mutex.unlock();
+        defer state.deinit(self.runtime_alloc);
+
+        for (state.entries.items) |entry| {
+            const intent = entry.intent;
+            if (intent.phase == .terminal or intent.automation != .enabled) continue;
+            hook.notify(.{
+                .change = .index_repair_pending,
+                .repair = .{
+                    .index_name = intent.index_name,
+                    .work_class = switch (intent.work_class) {
+                        .repair => .repair,
+                        .initial_build => .initial_build,
+                    },
+                    .repair_id = intent.repair_id,
+                    .revision = intent.revision,
+                    .config_hash = intent.config_hash,
+                    .root_generation = intent.root_generation,
+                    .admission = indexRepairAdmission(intent),
+                    .action_required = indexRepairActionRequired(intent),
+                },
             });
         }
     }
@@ -4928,6 +4979,7 @@ pub const DB = struct {
         persisted_revision: u64,
         previous_admission: IndexRepairAdmission,
         previous_action_required: bool,
+        group_repair_debt_remains: bool,
     ) void {
         std.debug.assert(change == .index_repair_pending or change == .index_repair_cleared);
         const admission: IndexRepairAdmission = if (change == .index_repair_cleared)
@@ -4951,6 +5003,7 @@ pub const DB = struct {
                 .previous_action_required = previous_action_required,
                 .action_required = change != .index_repair_cleared and indexRepairActionRequired(intent),
             },
+            .group_repair_debt_remains = group_repair_debt_remains,
         });
     }
 
@@ -4959,6 +5012,13 @@ pub const DB = struct {
         const hook = ctx.query_visibility_hook orelse {
             switch (event.change) {
                 .index_repair_pending => ctx.index_repair_notification_pending = true,
+                .index_repair_cleared => if (event.repair != null) {
+                    // An exact clear carries enough aggregate information to
+                    // settle or retain the hook-attachment replay bit. A
+                    // legacy/unknown clear cannot prove that queued debt is
+                    // gone and therefore leaves the bit conservative.
+                    ctx.index_repair_notification_pending = event.group_repair_debt_remains;
+                },
                 .index_repair_progress => {},
                 else => {},
             }
@@ -4966,7 +5026,11 @@ pub const DB = struct {
             return;
         };
         if (event.change == .index_repair_pending or event.change == .index_repair_cleared) {
-            ctx.index_repair_notification_pending = false;
+            // A delivered exact clear settles its own edge, but it may also be
+            // the only bounded notification that another durable intent
+            // remains. Retain the replay bit for a later hook attachment
+            // without manufacturing an anonymous visibility invalidation.
+            ctx.index_repair_notification_pending = event.group_repair_debt_remains;
         }
         _ = ctx.query_visibility_hook_in_flight.fetchAdd(1, .acquire);
         ctx.query_visibility_hook_mutex.unlock();
@@ -12302,6 +12366,39 @@ pub const DB = struct {
         );
     }
 
+    /// Atomic managed admission normally defers the canonical derived worker
+    /// until shadow activation. The canonical generation can nevertheless
+    /// become independently serviceable while enrichment drains its durable
+    /// requests. Before retiring that admission intent, attach the ordinary
+    /// worker at the durable publication cursor so future writes continue to
+    /// advance the generation. Intent removal is deliberately ordered after
+    /// this fallible operation: a failed attachment remains durable repair
+    /// debt and is retried by the same single owner.
+    fn ensureManagedAdmissionCanonicalWorker(
+        self: *DB,
+        alloc: Allocator,
+        intent: index_repair_state.IndexRepairIntent,
+    ) !void {
+        if (!self.start_index_workers or self.executor.appliedSequence(intent.index_name) != null) return;
+
+        const configs = try self.core.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, configs);
+        const cfg = for (configs) |candidate| {
+            if (std.mem.eql(u8, candidate.name, intent.index_name)) break candidate;
+        } else return error.IndexNotFound;
+        if (cfg.kind != intent.kind or types.indexConfigHash(cfg) != intent.config_hash) {
+            return error.IndexConfigMismatch;
+        }
+
+        const applied = try self.core.loadAppliedSequence(alloc, intent.index_name);
+        try self.executor.addWorker(intent.index_name, .{
+            .name = intent.index_name,
+            .kind = intent.kind,
+        }, applied);
+        const current_target = self.core.nextDerivedSequence();
+        if (current_target > applied) self.executor.notifyIndexes(current_target, &.{intent.index_name});
+    }
+
     /// Progressive managed admission publishes only the canonical active
     /// generation. It may answer queries before corpus-wide coverage is
     /// complete once a durable worker checkpoint proves that every artifact
@@ -13193,6 +13290,7 @@ pub const DB = struct {
                 persisted_revision,
                 previous_admission,
                 previous_action_required,
+                false,
             );
         }
         const persisted_phase = update.phase orelse
@@ -13574,6 +13672,7 @@ pub const DB = struct {
             intent,
             persisted_revision,
             .serviceable,
+            false,
             false,
         );
         return repair_id;
@@ -14349,15 +14448,8 @@ pub const DB = struct {
             entry.intent.revision,
             indexRepairAdmission(entry.intent),
             indexRepairActionRequired(entry.intent),
+            remaining_replay_pin,
         );
-        if (remaining_replay_pin) {
-            // The removed intent identifies only the cleared index; replay is
-            // still pinned by one or more different durable intents. Never
-            // mislabel that group debt as belonging to the removed target.
-            // Unknown scope deliberately forces conservative group-wide
-            // invalidation in the coordination layer.
-            notifyQueryVisibilityHook(ctx, .index_repair_pending);
-        }
     }
 
     pub fn denseRepairWriteBackpressured(self: *const DB) bool {
@@ -14979,6 +15071,7 @@ pub const DB = struct {
                 1,
                 .serviceable,
                 false,
+                false,
             );
             result.discovered += 1;
             candidate.classified = true;
@@ -15530,6 +15623,7 @@ pub const DB = struct {
         // unrelated producer work win here keeps a healthy durable intent at
         // the head of a one-slot repair queue forever.
         if (try self.managedAdmissionGenerationIsServiceable(alloc, entry.intent)) {
+            try self.ensureManagedAdmissionCanonicalWorker(alloc, entry.intent);
             try self.removeIndexRepairIntentAndPin(alloc, repair_id);
             result.attempted = true;
             result.repaired = true;
@@ -21321,7 +21415,7 @@ pub const DB = struct {
             };
         }
         if (post_commit_error == null) {
-            self.initializeDenseArtifactTargetCounterIfNeeded(cfg) catch |err| {
+            self.initializeDenseArtifactTargetCounterForAdmission(cfg, disposition) catch |err| {
                 post_commit_error = err;
             };
         }
@@ -21391,9 +21485,20 @@ pub const DB = struct {
         };
         self.core.index_manager.clearManagedAdmissionSnapshotForIndex(index_name);
         self.core.index_manager.clearUnscopedRepairUnavailable(index_name);
+        // The managed-admission marker is the durable control record for an
+        // initial materialization, not corruption debt. Preserve that class
+        // on the clear edge just as the repair-intent path does. Leaving the
+        // default `.repair` here makes the serving layer interpret successful
+        // activation as a new corruption boundary and re-fence the exact
+        // incarnation it has just acknowledged.
         notifyQueryVisibilityEvent(self.async_context, .{
             .change = .index_repair_cleared,
-            .repair = .{ .index_name = index_name },
+            .repair = .{
+                .index_name = index_name,
+                .work_class = .initial_build,
+                .previous_admission = .blocked,
+                .admission = .serviceable,
+            },
         });
     }
 
@@ -24126,12 +24231,31 @@ pub const DB = struct {
         return std.mem.readInt(u64, raw[0..8], .little);
     }
 
-    fn initializeDenseArtifactTargetCounterIfNeeded(self: *DB, cfg: types.IndexConfig) !void {
+    fn initializeDenseArtifactTargetCounterForAdmission(
+        self: *DB,
+        cfg: types.IndexConfig,
+        disposition: IndexAdmissionDisposition,
+    ) !void {
         if (!try index_manager_mod.denseConfigRequiresArtifactCoverage(self.alloc, cfg)) return;
 
-        // Every catalog add owns a fresh coverage generation. Reset this
-        // name-scoped counter so debris from an interrupted deletion cannot
-        // become coverage evidence for a recreated generation.
+        // Every catalog add owns a fresh coverage generation. A managed
+        // admission over a non-empty source can race writes that committed
+        // artifacts after the catalog definition but before this resident
+        // runtime was installed. Leave its counter deliberately absent: the
+        // repair owner bootstraps the exact artifact count from a stable
+        // snapshot while concurrent artifact mutations accumulate in the
+        // bootstrap delta. Initializing it to zero would falsely certify that
+        // those durable artifacts did not exist and let replay advance past
+        // them without populating the new generation.
+        if (disposition == .managed_rebuild) {
+            try self.deleteDenseArtifactCounterMetadata(cfg.name);
+            return;
+        }
+
+        // Empty-source and ordinary admissions have no pre-admission artifact
+        // window to discover. Reset the name-scoped counter so debris from an
+        // interrupted deletion cannot become coverage evidence for a
+        // recreated generation.
         const key = try denseArtifactTargetCounterKeyAlloc(self.alloc, cfg.name);
         defer self.alloc.free(key);
         var value: [8]u8 = undefined;
@@ -27296,10 +27420,12 @@ pub const DB = struct {
                 },
                 .dense_vector => {
                     if (self.core.denseIndex(cfg.name)) |entry| {
-                        const hbc_stats = entry.index.stats();
+                        const published = entry.index.publishedStats();
+                        const hbc_stats = published.stats;
                         item.doc_count = hbc_stats.active_count;
                         item.node_count = hbc_stats.node_count;
                         item.root_node = hbc_stats.root_node;
+                        item.serving_snapshot_revision = published.generation;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
@@ -27362,6 +27488,7 @@ pub const DB = struct {
         }
 
         return .{
+            .runtime_owner_id = self.backend_owner_id,
             .storage_change_token = self.storageChangeTokenLocked(),
             .source_doc_count = identity_stats.live_ordinals,
             .doc_count = visible_doc_count,
@@ -84863,6 +84990,75 @@ test "db managed vector admission captures writes while durable repair is pendin
     try std.testing.expect(target.replay_target_sequence > target.replay_applied_sequence);
 }
 
+test "db managed vector admission discovers artifacts committed before resident activation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg = types.IndexConfig{
+        .name = "late_external",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    // Model a catalog create whose resident activation is queued while the
+    // write path accepts the newly committed external artifact.
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"arrived during activation\",\"_embeddings\":{\"late_external\":[1,0,0]}}",
+        }},
+        .sync_level = .write,
+    });
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", cfg.name);
+    defer alloc.free(artifact_key);
+    const artifact = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact);
+
+    const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+    // A non-empty managed admission must bootstrap from the authoritative
+    // artifact namespace. Zero here would incorrectly certify an empty target.
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, cfg.name),
+    );
+
+    var repaired = false;
+    for (0..16) |_| {
+        const step = try db.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
+        if (step.repaired) {
+            repaired = true;
+            break;
+        }
+        try std.testing.expect(!step.terminal);
+    }
+    try std.testing.expect(repaired);
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, cfg.name),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        db.core.index_manager.denseIndex(cfg.name).?.index.stats().active_count,
+    );
+
+    var result = try db.search(alloc, .{
+        .index_name = cfg.name,
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } },
+        .limit = 1,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
 test "db managed vector admission durably seeds missing enrichment artifacts" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -85060,6 +85256,26 @@ test "db managed repair scheduler defers canonical worker until shadow activatio
     const durable_applied = try db.core.loadAppliedSequence(alloc, cfg.name);
     try std.testing.expectEqual(durable_applied, db.executor.appliedSequence(cfg.name).?);
     try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
+
+    // Intent retirement must leave a live canonical consumer, not merely a
+    // serviceable point-in-time generation. Publish one later derived record
+    // and prove the newly attached worker advances from the durable cursor.
+    const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:b");
+    defer alloc.free(stored_key);
+    try db.core.store.put(stored_key, "{\"body\":\"beta\"}");
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:b", cfg.name);
+    defer alloc.free(artifact_key);
+    try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 0, 1, 0 });
+    const later_sequence = try appendDerivedBatchRecord(&db, .{
+        .dense_embeddings = &.{.{
+            .index_name = cfg.name,
+            .doc_key = "doc:b",
+            .artifact_key = artifact_key,
+            .vector = &[_]f32{ 1, 0, 0 },
+        }},
+    });
+    try db.runDerivedUntil(later_sequence);
+    try std.testing.expect(db.executor.appliedSequence(cfg.name).? >= later_sequence);
 }
 
 test "index repair inspection window is bounded and rotates fairly" {
@@ -87008,7 +87224,7 @@ test "db managed admission materialization never infers debt from replay lag" {
     try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
 }
 
-test "db managed visibility hook rehydrates durable repair debt once" {
+test "db managed visibility hook rehydrates exact durable initial build debt once" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -87045,6 +87261,10 @@ test "db managed visibility hook rehydrates durable repair debt once" {
 
     const Hook = struct {
         pending: usize = 0,
+        pending_unknown: usize = 0,
+        repair_id: u128 = 0,
+        index_name_matches: bool = false,
+        work_class: ?IndexLifecycleWorkClass = null,
 
         fn onChange(
             ptr: *anyopaque,
@@ -87054,7 +87274,15 @@ test "db managed visibility hook rehydrates durable repair debt once" {
             event: QueryVisibilityEvent,
         ) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (event.change == .index_repair_pending) self.pending += 1;
+            if (event.change != .index_repair_pending) return;
+            self.pending += 1;
+            const repair = event.repair orelse {
+                self.pending_unknown += 1;
+                return;
+            };
+            self.repair_id = repair.repair_id;
+            self.index_name_matches = std.mem.eql(u8, repair.index_name, index_name);
+            self.work_class = repair.work_class;
         }
     };
     var hook = Hook{};
@@ -87069,6 +87297,10 @@ test "db managed visibility hook rehydrates durable repair debt once" {
         .on_change = Hook.onChange,
     });
     try std.testing.expectEqual(@as(usize, 1), hook.pending);
+    try std.testing.expectEqual(@as(usize, 0), hook.pending_unknown);
+    try std.testing.expectEqual(repair_id, hook.repair_id);
+    try std.testing.expect(hook.index_name_matches);
+    try std.testing.expectEqual(IndexLifecycleWorkClass.initial_build, hook.work_class.?);
 
     try std.testing.expectEqual(
         repair_id,
@@ -87078,6 +87310,61 @@ test "db managed visibility hook rehydrates durable repair debt once" {
     // Reconciliation adopts the same durable intent without creating a hot
     // loop of cache invalidations and duplicate scheduler notifications.
     try std.testing.expectEqual(@as(usize, 1), hook.pending);
+}
+
+test "db completed managed admission emits an initial build clear edge" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const Hook = struct {
+        clears: usize = 0,
+        index_matches: bool = false,
+        work_class: ?IndexLifecycleWorkClass = null,
+        previous_admission: ?IndexRepairAdmission = null,
+        admission: ?IndexRepairAdmission = null,
+
+        fn onChange(
+            ptr: *anyopaque,
+            _: []const u8,
+            _: u64,
+            _: ?*DB,
+            event: QueryVisibilityEvent,
+        ) void {
+            if (event.change != .index_repair_cleared) return;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const lifecycle = event.repair orelse return;
+            self.clears += 1;
+            self.index_matches = std.mem.eql(u8, lifecycle.index_name, "semantic");
+            self.work_class = lifecycle.work_class;
+            self.previous_admission = lifecycle.previous_admission;
+            self.admission = lifecycle.admission;
+        }
+    };
+    var hook = Hook{};
+    db.setQueryVisibilityHook(.{
+        .ptr = &hook,
+        .table_name = "docs",
+        .group_id = 7001,
+        .db = &db,
+        .on_change = Hook.onChange,
+    });
+    defer db.setQueryVisibilityHook(null);
+
+    try db.finalizeCompletedIndexAdmission("semantic");
+    try std.testing.expectEqual(@as(usize, 1), hook.clears);
+    try std.testing.expect(hook.index_matches);
+    try std.testing.expectEqual(IndexLifecycleWorkClass.initial_build, hook.work_class.?);
+    try std.testing.expectEqual(IndexRepairAdmission.blocked, hook.previous_admission.?);
+    try std.testing.expectEqual(IndexRepairAdmission.serviceable, hook.admission.?);
 }
 
 test "db managed admission rejects regressed identity evidence" {
@@ -87443,6 +87730,11 @@ test "db durable repair classification emits exact admission and action edges" {
         .db = &db,
         .on_change = Capture.onChange,
     });
+    // Hook attachment replays the current durable level so a newly resident
+    // owner cannot miss repair debt created before it installed the callback.
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(repair_id, capture.repair_id);
+    capture = .{};
 
     try db.updateIndexRepairIntent(alloc, repair_id, .{
         .trigger = .projection_generation_invalid,
@@ -87806,6 +88098,7 @@ test "db removing one repair pin preserves pressure gate for another index" {
     }
     const Hook = struct {
         cleared_a: usize = 0,
+        clear_reported_remaining_debt: bool = false,
         pending_unknown: usize = 0,
         pending_exact: usize = 0,
 
@@ -87814,6 +88107,7 @@ test "db removing one repair pin preserves pressure gate for another index" {
             switch (event.change) {
                 .index_repair_cleared => if (event.repair) |repair| {
                     self.cleared_a += @intFromBool(std.mem.eql(u8, repair.index_name, "dense_a"));
+                    self.clear_reported_remaining_debt = event.group_repair_debt_remains;
                 },
                 .index_repair_pending => if (event.repair == null) {
                     self.pending_unknown += 1;
@@ -87846,11 +88140,27 @@ test "db removing one repair pin preserves pressure gate for another index" {
     try db.removeIndexRepairIntentAndPin(alloc, repair_a);
     try std.testing.expect(db.async_context.index_repair_replay_pinned.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), hook.cleared_a);
-    try std.testing.expectEqual(@as(usize, 1), hook.pending_unknown);
+    try std.testing.expect(hook.clear_reported_remaining_debt);
+    try std.testing.expectEqual(@as(usize, 0), hook.pending_unknown);
     try std.testing.expectEqual(@as(usize, 0), hook.pending_exact);
     var remaining = try db.loadIndexRepairState(alloc);
     try std.testing.expect(remaining.minimumRetainAfterSequence() != null);
     remaining.deinit(alloc);
+
+    // Hook churn must rehydrate the exact remaining intent. The clear's
+    // aggregate scheduling bit cannot degrade back into anonymous repair
+    // scope, which would conservatively revoke every cached incarnation.
+    db.setQueryVisibilityHook(null);
+    hook = .{};
+    db.setQueryVisibilityHook(.{
+        .ptr = &hook,
+        .table_name = "docs",
+        .group_id = 7001,
+        .db = &db,
+        .on_change = Hook.onChange,
+    });
+    try std.testing.expectEqual(@as(usize, 0), hook.pending_unknown);
+    try std.testing.expectEqual(@as(usize, 1), hook.pending_exact);
 
     try db.removeIndexRepairIntentAndPin(alloc, repair_b);
     try std.testing.expect(!db.async_context.index_repair_replay_pinned.load(.acquire));

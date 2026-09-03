@@ -598,11 +598,33 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         image_coverage = image_status["status"]["source_coverage"]
         assert image_coverage["policy"] == "partial"
         assert image_coverage["total"] == 3
-        assert image_coverage["covered"] == 1
-        assert image_coverage["skipped"] == 2
+        assert image_coverage["covered"] >= 1
         assert image_coverage["failed"] == 0
-        assert image_coverage["complete"] is True, json.dumps(image_status, indent=2)
-        assert image_coverage["healthy"] is True
+        assert image_status["status"]["readiness"]["queryable"] is True
+        assert image_status["status"]["searchable_vectors"] >= 1
+
+        # The searchable-artifact threshold proves serving authority, not
+        # convergence authority. Wait separately for an exact target
+        # observation before asserting whole-source completion.
+        def completed_image_coverage() -> dict | None:
+            current = parse_json(
+                cli("index", "get", "--table", table, "--index", "thumbnail").stdout
+            )
+            coverage = current["status"]["source_coverage"]
+            if coverage["observation_complete"] and coverage["complete"]:
+                return current
+            return None
+
+        completed_image_status = wait_until(
+            completed_image_coverage, timeout_s=5.0, interval_s=0.025
+        )
+        assert completed_image_status is not None, json.dumps(image_status, indent=2)
+        completed_image_coverage_status = completed_image_status["status"][
+            "source_coverage"
+        ]
+        assert completed_image_coverage_status["covered"] == 1
+        assert completed_image_coverage_status["skipped"] == 2
+        assert completed_image_coverage_status["healthy"] is True
         assert cli_media_server.request_count >= 1, (
             "the image quickstart path did not exercise remoteMedia over HTTP"
         )
@@ -651,7 +673,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             status = parse_json(
                 cli("index", "get", "--table", table, "--index", "thumbnail").stdout
             )["status"]
-            if status["coverage"]["terminal_failed"] >= 1:
+            if status["source_coverage"]["failed"] >= 1:
                 return status
             return None
 
@@ -698,9 +720,11 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             status = parse_json(
                 cli("index", "get", "--table", table, "--index", "thumbnail").stdout
             )["status"]
-            coverage = status["coverage"]
+            coverage = status["source_coverage"]
             if (
-                coverage["terminal_failed"] >= 1
+                coverage["observation_complete"]
+                and coverage["failed"] >= 1
+                and coverage["pending"] is not None
                 and coverage["pending"] >= 1
                 and status["readiness"]["state"] == "queryable_partial"
                 and status["searchable_vectors"] == 1

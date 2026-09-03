@@ -24,7 +24,6 @@ from urllib.parse import quote
 
 import pytest
 import requests
-
 from conftest import IndexReadinessProtocolError, ready_index_status
 from helpers import assert_created_index, json_doc, upsert, wait_until
 
@@ -540,7 +539,7 @@ def test_stateful_managed_algebraic_generation_rebuild_catches_up_and_reopens(
         stateful_api.get_index(table_name, index_name),
         indent=2,
         sort_keys=True,
-    )
+    ) + "\nserver logs:\n" + stateful_api.debug_logs()
     aggregations = _algebraic_aggregations(stateful_api, table_name)
     assert aggregations["amount_sum"]["value"] == 15
     assert {
@@ -1009,12 +1008,14 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
         indexed = int(
             latest_status.get("total_indexed", latest_status.get("doc_count", 0))
         )
+        source_coverage = latest_status.get("source_coverage") or {}
         if (
             indexed < 6
             or applied < target
             or latest_status.get("replay_catch_up_required") is not False
             or latest_status.get("catch_up_active") is not False
             or latest_status.get("catch_up_phase") != "idle"
+            or source_coverage.get("observation_complete") is not True
         ):
             return None
         return latest_status
@@ -1025,17 +1026,17 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
     # The default strict policy reports the three field-less documents as
     # settled but uncovered. It must not rewrite the authoritative replay
     # ledger into fake pending work or imply that a worker is still active.
-    coverage = converged["coverage"]
-    assert coverage["policy"] == "strict"
-    assert coverage["complete"] is False
-    assert coverage["source_total"] == 9
-    assert coverage["produced"] == 6
-    assert coverage["skipped"] == 3
-    assert coverage["settled"] == 9
-    assert coverage["uncovered"] == 3
-    assert coverage["pending"] == 0
-    assert coverage["healthy"] is False
-    assert coverage["degraded"] is True
+    source_coverage = converged["source_coverage"]
+    assert source_coverage["policy"] == "strict"
+    assert source_coverage["observation_complete"] is True
+    assert source_coverage["complete"] is False
+    assert source_coverage["total"] == 9
+    assert source_coverage["covered"] == 6
+    assert source_coverage["skipped"] == 3
+    assert source_coverage["failed"] == 0
+    assert source_coverage["pending"] == 0
+    assert source_coverage["healthy"] is False
+    assert source_coverage["degraded"] is True
     assert converged["backfill_active"] is False
     assert converged["rebuilding"] is False
     assert converged["backfill_progress"] == pytest.approx(1.0)

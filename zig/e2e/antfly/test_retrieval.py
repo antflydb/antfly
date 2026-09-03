@@ -89,6 +89,31 @@ def _post_until_hit_ids(
     return result
 
 
+def _create_ready_tree_index(backup_api, table_name: str) -> None:
+    index_name = "doc_hierarchy"
+    assert_created_index(
+        backup_api.post(
+            f"/tables/{table_name}/indexes/{index_name}",
+            {
+                "type": "graph",
+                "edge_types": [{"name": "contains", "topology": "tree"}],
+            },
+        ),
+        index_name,
+        "graph",
+    )
+    # Index creation durably accepts the definition and activation continues
+    # asynchronously. A full-index write intentionally waits for the physical
+    # incarnation rather than racing the activation owner.
+    backup_api.wait_index_ready(
+        table_name,
+        index_name,
+        timeout_s=30.0,
+        interval_s=0.05,
+        until="complete",
+    )
+
+
 def _index_status(api, table_name: str, index_name: str) -> dict | None:
     try:
         return api.get(f"/tables/{table_name}/indexes/{index_name}").get("status")
@@ -545,17 +570,7 @@ def test_retrieval_agent_tree_search_pipeline(backup_api):
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert_created_index(
-        backup_api.post(
-            f"/tables/{table_name}/indexes/doc_hierarchy",
-            {
-                "type": "graph",
-                "edge_types": [{"name": "contains", "topology": "tree"}],
-            },
-        ),
-        "doc_hierarchy",
-        "graph",
-    )
+    _create_ready_tree_index(backup_api, table_name)
 
     batch = backup_api.batch_write(
         table_name,
@@ -626,17 +641,7 @@ def test_retrieval_agent_tree_search_from_roots(backup_api):
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert_created_index(
-        backup_api.post(
-            f"/tables/{table_name}/indexes/doc_hierarchy",
-            {
-                "type": "graph",
-                "edge_types": [{"name": "contains", "topology": "tree"}],
-            },
-        ),
-        "doc_hierarchy",
-        "graph",
-    )
+    _create_ready_tree_index(backup_api, table_name)
 
     batch = backup_api.batch_write(
         table_name,
@@ -700,17 +705,7 @@ def test_retrieval_agent_tree_search_generation(backup_api, inference_generator)
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert_created_index(
-        backup_api.post(
-            f"/tables/{table_name}/indexes/doc_hierarchy",
-            {
-                "type": "graph",
-                "edge_types": [{"name": "contains", "topology": "tree"}],
-            },
-        ),
-        "doc_hierarchy",
-        "graph",
-    )
+    _create_ready_tree_index(backup_api, table_name)
 
     batch = backup_api.batch_write(
         table_name,
@@ -1296,17 +1291,7 @@ def test_retrieval_agent_streaming_tree_progress(backup_api):
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert_created_index(
-        backup_api.post(
-            f"/tables/{table_name}/indexes/doc_hierarchy",
-            {
-                "type": "graph",
-                "edge_types": [{"name": "contains", "topology": "tree"}],
-            },
-        ),
-        "doc_hierarchy",
-        "graph",
-    )
+    _create_ready_tree_index(backup_api, table_name)
 
     batch = backup_api.batch_write(
         table_name,

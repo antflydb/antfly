@@ -4248,6 +4248,11 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         // control-plane backoff preserves that exclusion without terminating
         // the data process and permanently removing a destination voter.
         error.TransitionDestinationProvisioningBusy,
+        // The reconciler retains exact per-group failure classification. This
+        // aggregate is emitted only when all placement failures in the round
+        // are retryable; permanent and restart-required aggregates use
+        // distinct errors and remain fatal to this process lifecycle.
+        error.ReplicaReconcileIncomplete,
         // Placement and split-transition projections are multi-row. A data
         // node can briefly observe its destination placement before the
         // provisioning range becomes visible in the same snapshot. Fail
@@ -4305,6 +4310,9 @@ test "data runtime treats transient metadata failures as retryable bootstrap fai
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataIncarnationUnavailable));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MissingAuthoritativeBootstrapVoters));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.TransitionDestinationProvisioningBusy));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.ReplicaReconcileIncomplete));
+    try std.testing.expect(!isRetryableMetadataBootstrapError(error.ReplicaReconcilePermanentFailure));
+    try std.testing.expect(!isRetryableMetadataBootstrapError(error.ReplicaReconcileRestartRequired));
     try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidArguments));
     try std.testing.expect(!isRetryableMetadataBootstrapError(error.MetadataIncarnationMismatch));
 }
@@ -12961,7 +12969,9 @@ pub const DataServer = struct {
                 break :failed null;
             };
             if (result) |value| {
-                if (value.hasPlacementFailures()) reconcile_commit_error = error.ReplicaReconcileIncomplete;
+                if (value.placementFailureError()) |err| {
+                    reconcile_commit_error = err;
+                }
             }
             if (reconcile_commit_error == null) {
                 if (apply_group_transition) |*transition| transition.commit();

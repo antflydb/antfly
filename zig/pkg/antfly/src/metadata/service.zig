@@ -5566,7 +5566,7 @@ pub const MetadataService = struct {
         }
         self.unlockRuntime();
         if (finish_error) |err| return err;
-        if (reconcile_result.?.hasPlacementFailures()) return error.ReplicaReconcileIncomplete;
+        if (reconcile_result.?.placementFailureError()) |err| return err;
     }
 
     fn refreshLocalTransitions(self: *MetadataService) !void {
@@ -9510,7 +9510,7 @@ pub const MetadataHttpService = struct {
         }
         self.unlockRuntime();
         if (finish_error) |err| return err;
-        if (reconcile_result.?.hasPlacementFailures()) return error.ReplicaReconcileIncomplete;
+        if (reconcile_result.?.placementFailureError()) |err| return err;
     }
 
     fn refreshLocalTransitions(self: *MetadataHttpService, round_inputs: ?*const LocalTransitionInputs) !void {
@@ -10952,6 +10952,21 @@ fn ensureCdcWorkPermit(service: anytype) !void {
         return;
     }
 
+    const locked_now_ms = service.reconcile_lease.nowMs();
+    if (cdcLocalLeaseHasRenewalMargin(&service.reconcile_lease, locked_now_ms)) {
+        // Leadership plus an applied, unexpired local lease is already the
+        // authority needed by this owner. No other node can acquire the lease
+        // before expiry, so re-reading the projected store on every provider
+        // checkpoint adds latency and can turn a transient projection miss
+        // into a false work failure. Projection I/O remains mandatory once
+        // the renewal margin is reached.
+        service.cdc_permit_check_after_ns.store(
+            locked_now_ns +| permit_cache_ns,
+            .release,
+        );
+        return;
+    }
+
     const renew_timeout_ns = @min(
         linearizable_metadata_read_timeout_ns,
         service.reconcile_lease.config.lease_ttl_ms *| std.time.ns_per_ms,
@@ -10996,6 +11011,40 @@ fn ensureCdcWorkPermit(service: anytype) !void {
         platform_clock.Clock.real().sleepMs(1);
     }
     return error.CdcWorkLeaseRenewalTimeout;
+}
+
+fn cdcLocalLeaseHasRenewalMargin(
+    lease: *const metadata_reconcile_lease.State,
+    now_ms: u64,
+) bool {
+    if (!lease.config.enabled or !lease.held_by_local or
+        lease.owner_node_id != lease.local_node_id)
+        return false;
+    const minimum_remaining_ms = @max(
+        @as(u64, 1),
+        lease.config.lease_ttl_ms / 2,
+    );
+    return lease.expires_at_ms > now_ms +| minimum_remaining_ms;
+}
+
+test "cdc work permit reuses an applied local lease only before its renewal margin" {
+    var lease = metadata_reconcile_lease.State.init(7, .{
+        .lease_ttl_ms = 5_000,
+    });
+    try std.testing.expect(!cdcLocalLeaseHasRenewalMargin(&lease, 10_000));
+
+    _ = lease.observe(true, .{
+        .owner_node_id = 7,
+        .expires_at_ms = 15_001,
+    }, 10_000);
+    try std.testing.expect(cdcLocalLeaseHasRenewalMargin(&lease, 10_000));
+    try std.testing.expect(!cdcLocalLeaseHasRenewalMargin(&lease, 12_501));
+
+    _ = lease.observe(true, .{
+        .owner_node_id = 8,
+        .expires_at_ms = 20_000,
+    }, 12_501);
+    try std.testing.expect(!cdcLocalLeaseHasRenewalMargin(&lease, 12_501));
 }
 
 fn cdcWorkDeadlineNs(service: anytype) !u64 {
