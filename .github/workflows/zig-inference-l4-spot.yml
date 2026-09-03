@@ -35,7 +35,7 @@ jobs:
       ANTFLY_CI_ZIG_CUDA: "true"
       ANTFLY_CI_ZIG_CUDA_ARTIFACTS: fatbin
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -70,7 +70,7 @@ jobs:
         run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-cuda.tar.gz" zig-out/bin/antfly
 
       - name: Upload E2E executable
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: antfly-e2e-cuda-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-cuda.tar.gz
@@ -105,7 +105,7 @@ jobs:
       RUN_MULTIMODAL_GENERATOR_TESTS: "1"
       RUN_CLIPCLAP_CONTRACT_TESTS: "1"
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -130,10 +130,10 @@ jobs:
           ln -s /mnt/cache/antfly/zig/home-antfly ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
       - name: Download E2E executable
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: antfly-e2e-cuda-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-cuda
@@ -220,7 +220,7 @@ jobs:
 
       - name: Upload GPU evidence
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: l4-spot-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gpu-*.csv
