@@ -138,12 +138,6 @@ func NewK8sWatcher(proxy *Proxy, cfg K8sWatcherConfig) (*K8sWatcher, error) {
 		externalAddrs: make(map[string][]string),
 		scalePools:    make(map[string]scaleToZeroPool),
 	}
-	// A namespaced watcher supplies the natural default-pool scope unless the
-	// proxy was configured explicitly. Cluster-wide watchers leave it empty and
-	// therefore fail closed instead of choosing among ambiguous same-named pools.
-	if proxy.defaultPoolNamespace == "" {
-		proxy.defaultPoolNamespace = cfg.Namespace
-	}
 	proxy.SetPoolActivator(w)
 	return w, nil
 }

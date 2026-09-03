@@ -136,10 +136,10 @@ func (w *RouteWatcher) onRouteAdd(obj any) {
 		return
 	}
 	if !changed {
-		w.logger.Debug("route policy already installed", zap.String("name", route.Name))
+		w.logger.Debug("route policy already installed", zap.String("namespace", route.Namespace), zap.String("name", route.Name))
 		return
 	}
-	w.logger.Info("added route", zap.String("name", route.Name), zap.Int32("priority", route.Priority))
+	w.logger.Info("added route", zap.String("namespace", route.Namespace), zap.String("name", route.Name), zap.Int32("priority", route.Priority))
 }
 
 func (w *RouteWatcher) onRouteUpdate(oldObj, newObj any) {
@@ -162,11 +162,11 @@ func (w *RouteWatcher) onRouteUpdate(oldObj, newObj any) {
 		w.logger.Error("failed to update InferenceProxy", zap.Error(err))
 		return
 	}
-	if !changed { // UpsertRoute handles updates by name.
-		w.logger.Debug("route update did not change policy", zap.String("name", route.Name))
+	if !changed { // UpsertRoute handles updates by complete route identity.
+		w.logger.Debug("route update did not change policy", zap.String("namespace", route.Namespace), zap.String("name", route.Name))
 		return
 	}
-	w.logger.Info("updated route", zap.String("name", route.Name), zap.Int32("priority", route.Priority))
+	w.logger.Info("updated route", zap.String("namespace", route.Namespace), zap.String("name", route.Name), zap.Int32("priority", route.Priority))
 }
 
 func (w *RouteWatcher) onRouteDelete(obj any) {
@@ -176,9 +176,10 @@ func (w *RouteWatcher) onRouteDelete(obj any) {
 		return
 	}
 
-	name := u.GetNamespace() + "/" + u.GetName()
-	w.routeManager.RemoveRoute(name)
-	w.logger.Info("removed route", zap.String("name", name))
+	namespace := u.GetNamespace()
+	name := u.GetName()
+	w.routeManager.RemoveRoute(namespace, name)
+	w.logger.Info("removed route", zap.String("namespace", namespace), zap.String("name", name))
 }
 
 // convertRoute converts an unstructured InferenceProxy to the proxy's Route type
@@ -194,13 +195,14 @@ func (w *RouteWatcher) convertRoute(obj any) (*Route, error) {
 		return nil, fmt.Errorf("spec not found")
 	}
 
-	// Build the route name with namespace for uniqueness
+	// Preserve namespace and name as separate identity fields. Namespace is also
+	// the routing scope for every pool referenced by this policy.
 	namespace := u.GetNamespace()
 	name := u.GetName()
-	fullName := namespace + "/" + name
 
 	route := &Route{
-		Name:                fullName,
+		Namespace:           namespace,
+		Name:                name,
 		Priority:            getInt32(spec, "priority", 100),
 		Operations:          make(map[OperationType]bool),
 		ModelPatterns:       make([]*RegexPattern, 0),

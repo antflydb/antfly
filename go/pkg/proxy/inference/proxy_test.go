@@ -67,7 +67,7 @@ func TestProxyStartStopsOnContextCancel(t *testing.T) {
 func TestStartBackgroundDiscoversRegisteredEndpointsWhenPeriodicRefreshDisabled(t *testing.T) {
 	t.Parallel()
 
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -167,7 +167,8 @@ func TestSelectDestinationUsesWeights(t *testing.T) {
 
 	rm := NewRouteManager()
 	route := &Route{
-		Name: "default/weighted",
+		Namespace: "default",
+		Name:      "weighted",
 		Destinations: []Destination{
 			{Pool: "pool-a", Weight: 80},
 			{Pool: "pool-b", Weight: 20},
@@ -209,7 +210,7 @@ func TestProxyRequestRetriesRetryableStatus(t *testing.T) {
 	var attempts int32
 
 	p := NewProxy(Config{
-		DefaultPool:     "default",
+		DefaultPool:     RoutePoolTarget{Pool: "default"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -233,7 +234,8 @@ func TestProxyRequestRetriesRetryableStatus(t *testing.T) {
 	p.RegisterEndpoint("http://inference.internal", "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://inference.internal", "embed", "bge-small-en-v1.5")
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:       "default/retry",
+		Namespace:  "default",
+		Name:       "retry",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{
 			{Pool: "primary", Weight: 100},
@@ -265,7 +267,7 @@ func TestProxyRequestRetryFailsOverToDifferentEndpoint(t *testing.T) {
 	var hosts []string
 
 	p := NewProxy(Config{
-		DefaultPool:     "default",
+		DefaultPool:     RoutePoolTarget{Pool: "default"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -292,7 +294,8 @@ func TestProxyRequestRetryFailsOverToDifferentEndpoint(t *testing.T) {
 	advertiseModelOperation(p.registry, "http://primary-b.internal", "embed", "bge-small-en-v1.5")
 	atomic.StoreInt32(&p.registry.endpoints["http://primary-b.internal"].runtime.connections, 1)
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:       "default/retry-failover",
+		Namespace:  "default",
+		Name:       "retry-failover",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{
 			{Pool: "primary", Weight: 100},
@@ -324,13 +327,14 @@ func TestProxyRequestRetryFailsOverToDifferentEndpoint(t *testing.T) {
 func TestProxyRequestRetryPreservesCapabilityStaleResponse(t *testing.T) {
 	t.Parallel()
 
-	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	for _, address := range []string{"http://primary-a.internal", "http://primary-b.internal"} {
 		p.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 		advertiseModelOperation(p.registry, address, "embed", "model-a")
 	}
 	route := &Route{
-		Name:               "default/retry-capability",
+		Namespace:          "default",
+		Name:               "retry-capability",
 		Operations:         map[OperationType]bool{"embed": true},
 		Destinations:       []Destination{{Pool: "primary", Weight: 100}},
 		RetryAttempts:      2,
@@ -395,7 +399,7 @@ func TestProxyRequestRecordsFailureOnStreamCopyError(t *testing.T) {
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "default",
+		DefaultPool:     RoutePoolTarget{Pool: "default"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -412,7 +416,8 @@ func TestProxyRequestRecordsFailureOnStreamCopyError(t *testing.T) {
 	p.RegisterEndpoint("http://primary.internal", "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://primary.internal", "embed", "bge-small-en-v1.5")
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:       "default/stream-error",
+		Namespace:  "default",
+		Name:       "stream-error",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{
 			{Pool: "primary", Weight: 100},
@@ -438,7 +443,7 @@ func TestResolveRequestUsesVerifiedHostedSource(t *testing.T) {
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "default",
+		DefaultPool:     RoutePoolTarget{Pool: "default"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -457,7 +462,8 @@ func TestResolveRequestUsesVerifiedHostedSource(t *testing.T) {
 	p.RegisterEndpoint("http://source.internal", "source-pool", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://source.internal", "embed", "bge-small-en-v1.5")
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:                "default/source-context",
+		Namespace:           "default",
+		Name:                "source-context",
 		Operations:          map[OperationType]bool{OperationType("embed"): true},
 		SourceOrganizations: map[string]bool{"org-1": true},
 		SourceProjects:      map[string]bool{"project-1": true},
@@ -490,7 +496,7 @@ func TestResolveRequestStaysInSelectedPoolWhenModelIsLoadedElsewhere(t *testing.
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "default",
+		DefaultPool:     RoutePoolTarget{Pool: "default"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -501,7 +507,8 @@ func TestResolveRequestStaysInSelectedPoolWhenModelIsLoadedElsewhere(t *testing.
 	advertiseModelOperation(p.registry, "http://source.internal", "embed", "bge-small-en-v1.5")
 
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:                "default/source-context",
+		Namespace:           "default",
+		Name:                "source-context",
 		Operations:          map[OperationType]bool{OperationType("embed"): true},
 		SourceOrganizations: map[string]bool{"org-1": true},
 		Destinations: []Destination{
@@ -530,7 +537,7 @@ func TestProxyRequestDoesNotMatchHostedSourceRouteFromHeadersAlone(t *testing.T)
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "default",
+		DefaultPool:     RoutePoolTarget{Pool: "default"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -549,7 +556,8 @@ func TestProxyRequestDoesNotMatchHostedSourceRouteFromHeadersAlone(t *testing.T)
 	p.RegisterEndpoint("http://source.internal", "source-pool", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://default.internal", "embed", "bge-small-en-v1.5")
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:                "default/source-context",
+		Namespace:           "default",
+		Name:                "source-context",
 		Operations:          map[OperationType]bool{OperationType("embed"): true},
 		SourceOrganizations: map[string]bool{"org-1": true},
 		SourceProjects:      map[string]bool{"project-1": true},
@@ -583,7 +591,7 @@ func TestProxyQueueFallbackWaitsForEligibleDestination(t *testing.T) {
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "default",
+		DefaultPool:     RoutePoolTarget{Pool: "default"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -600,7 +608,8 @@ func TestProxyQueueFallbackWaitsForEligibleDestination(t *testing.T) {
 
 	p.RegisterEndpoint("http://default.internal", "default", WorkloadTypeGeneral)
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:       "default/queue",
+		Namespace:  "default",
+		Name:       "queue",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{
 			{Pool: "queued", Weight: 100},
@@ -658,11 +667,12 @@ func (a testPoolActivator) Activate(ctx context.Context, namespace, pool string)
 func TestResolveRequestActivatesZeroPoolBeforeRedirectFallback(t *testing.T) {
 	t.Parallel()
 
-	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
 	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://cpu.internal", "extract", "gliner2")
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:       "default/gpu",
+		Namespace:  "default",
+		Name:       "gpu",
 		Operations: map[OperationType]bool{OperationType("extract"): true},
 		Destinations: []Destination{
 			{Pool: "gpu", Weight: 100},
@@ -703,11 +713,12 @@ func TestResolveRequestActivatesZeroPoolBeforeRedirectFallback(t *testing.T) {
 func TestResolveRequestUsesFallbackAfterActivationTimeout(t *testing.T) {
 	t.Parallel()
 
-	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
 	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://cpu.internal", "extract", "gliner2")
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:         "default/gpu-timeout",
+		Namespace:    "default",
+		Name:         "gpu-timeout",
 		Operations:   map[OperationType]bool{OperationType("extract"): true},
 		Destinations: []Destination{{Pool: "gpu", Weight: 100}},
 		Fallback:     &Fallback{Action: "redirect", RedirectPool: "cpu"},
@@ -735,7 +746,8 @@ func TestSynchronousColdActivationCannotBypassDynamicConditions(t *testing.T) {
 	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://cpu.internal", "extract", "not-loaded")
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:         "default/model-gated-cold",
+		Namespace:    "default",
+		Name:         "model-gated-cold",
 		Operations:   map[OperationType]bool{OperationType("extract"): true},
 		Destinations: []Destination{{Pool: "gpu", Weight: 100, RequireModelLoaded: true}},
 		Fallback:     &Fallback{Action: "redirect", RedirectPool: "cpu"},
@@ -767,7 +779,8 @@ func TestRuntimeIneligiblePoolFallsBackWithoutColdStartWait(t *testing.T) {
 	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://cpu.internal", "extract", "not-loaded")
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:         "default/runtime-ineligible",
+		Namespace:    "default",
+		Name:         "runtime-ineligible",
 		Operations:   map[OperationType]bool{OperationType("extract"): true},
 		Destinations: []Destination{{Pool: "gpu", Weight: 100, RequireModelLoaded: true}},
 		Fallback:     &Fallback{Action: "redirect", RedirectPool: "cpu"},
@@ -804,7 +817,8 @@ func TestResolveRequestActivatesColdRedirectFallback(t *testing.T) {
 	p := NewProxy(Config{Logger: zap.NewNop()})
 	p.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:         "default/cold-fallback",
+		Namespace:    "default",
+		Name:         "cold-fallback",
 		Operations:   map[OperationType]bool{OperationType("extract"): true},
 		Destinations: []Destination{{Pool: "gpu", Weight: 100, RequireModelLoaded: true}},
 		Fallback:     &Fallback{Action: "redirect", RedirectPool: "cpu"},
@@ -856,7 +870,8 @@ func TestColdRouteActivationUsesDestinationWeights(t *testing.T) {
 		},
 	})
 	route := &Route{
-		Name: "team-a/weighted-cold",
+		Namespace: "team-a",
+		Name:      "weighted-cold",
 		Destinations: []Destination{
 			{Pool: "gpu-a", Weight: 80},
 			{Pool: "gpu-b", Weight: 20},
@@ -893,7 +908,8 @@ func TestColdRouteActivationHonorsDestinationTimeCondition(t *testing.T) {
 		},
 	})
 	route := &Route{
-		Name: "default/time-window",
+		Namespace: "default",
+		Name:      "time-window",
 		Destinations: []Destination{
 			{Pool: "inactive", Weight: 100, TimeCondition: &TimeWindow{StartHour: 13, EndHour: 14}},
 			{Pool: "active", Weight: 1, TimeCondition: &TimeWindow{StartHour: 11, EndHour: 13}},
@@ -934,7 +950,8 @@ func TestColdRouteWaitRemainsBoundToSelectedDestination(t *testing.T) {
 		},
 	})
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:       "default/bound-cold",
+		Namespace:  "default",
+		Name:       "bound-cold",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{
 			{Pool: "gpu-a", Weight: 50},
@@ -1042,7 +1059,7 @@ func TestForwardRequestSendsUpstreamAuthorization(t *testing.T) {
 	var gotAuthorization atomic.Value
 
 	p := NewProxy(Config{
-		DefaultPool:           "default",
+		DefaultPool:           RoutePoolTarget{Pool: "default"},
 		RefreshInterval:       time.Minute,
 		UpstreamAuthorization: authorization,
 		Logger:                zap.NewNop(),
@@ -1082,7 +1099,7 @@ func TestResolveRequestDoesNotAdvanceBurstRoundRobinState(t *testing.T) {
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "burst",
+		DefaultPool:     RoutePoolTarget{Pool: "burst"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -1149,13 +1166,14 @@ func TestResolveRequestDoesNotFallThroughToDefaultPoolAfterMatchedRoute(t *testi
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "default",
+		DefaultPool:     RoutePoolTarget{Pool: "default"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
 	p.RegisterEndpoint("http://default.internal", "default", WorkloadTypeGeneral)
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:                "default/matched-no-dest",
+		Namespace:           "default",
+		Name:                "matched-no-dest",
 		Operations:          map[OperationType]bool{OperationType("embed"): true},
 		SourceOrganizations: map[string]bool{"org-1": true},
 		Destinations: []Destination{
@@ -1205,7 +1223,8 @@ func TestSelectDestinationHonorsLatencyCondition(t *testing.T) {
 
 	rm := NewRouteManager()
 	route := &Route{
-		Name: "default/latency",
+		Namespace: "default",
+		Name:      "latency",
 		Destinations: []Destination{
 			{
 				Pool:             "slow",
@@ -1252,7 +1271,8 @@ func TestSelectDestinationSkipsOpenCircuitPools(t *testing.T) {
 
 	rm := NewRouteManager()
 	route := &Route{
-		Name: "default/circuit-breaker",
+		Namespace: "default",
+		Name:      "circuit-breaker",
 		Destinations: []Destination{
 			{
 				Pool:             "open-pool",
@@ -1316,14 +1336,15 @@ func TestAcquireRoutedRequestOwnsRecoveredCircuitProbe(t *testing.T) {
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "primary",
+		DefaultPool:     RoutePoolTarget{Pool: "primary"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
 	p.RegisterEndpoint("http://recovering.internal", "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://recovering.internal", "embed", "model-a")
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:       "default/recovering",
+		Namespace:  "default",
+		Name:       "recovering",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{{
 			Pool:             "primary",
@@ -1415,11 +1436,44 @@ func TestPublicRouterAPIsPreserveNamespaceIdentity(t *testing.T) {
 	}
 }
 
+func TestRouteUsesExplicitNamespaceInsteadOfNameEncoding(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	p.RegisterEndpointInNamespace("http://team-a.internal", "team-a", "gpu", WorkloadTypeGeneral)
+	p.RegisterEndpointInNamespace("http://misleading.internal", "misleading", "gpu", WorkloadTypeGeneral)
+	for _, address := range []string{"http://team-a.internal", "http://misleading.internal"} {
+		advertiseModelOperation(p.registry, address, "read", "owner/reader")
+	}
+	_, err := p.Router().RouteManager().UpsertRoute(&Route{
+		Namespace:     "team-a",
+		Name:          "misleading/reader",
+		Operations:    map[OperationType]bool{"read": true},
+		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/reader$`)},
+		Destinations:  []Destination{{Pool: "gpu", Weight: 100}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lease, err := p.AcquireRequestResolution(context.Background(), ResolveRequest{
+		Operation: "read",
+		Model:     "owner/reader",
+		Timestamp: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if got := lease.Resolution.Endpoint.Namespace(); got != "team-a" {
+		t.Fatalf("resolved namespace = %q, want explicit team-a", got)
+	}
+}
+
 func TestResolveRequestDoesNotClaimCircuitBreakerProbe(t *testing.T) {
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "primary",
+		DefaultPool:     RoutePoolTarget{Pool: "primary"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -1470,7 +1524,7 @@ func TestResolveRequestDoesNotConsumeRouteRateLimit(t *testing.T) {
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "primary",
+		DefaultPool:     RoutePoolTarget{Pool: "primary"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -1478,7 +1532,8 @@ func TestResolveRequestDoesNotConsumeRouteRateLimit(t *testing.T) {
 	advertiseModelOperation(p.registry, "http://primary.internal", "embed", "model-a")
 
 	route := &Route{
-		Name:         "default/rate-limit",
+		Namespace:    "default",
+		Name:         "rate-limit",
 		Operations:   map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{{Pool: "primary", Weight: 100}},
 		RateLimiter:  NewRateLimiter(1, 1, false),
@@ -1527,7 +1582,7 @@ func TestAcquireRequestResolutionUsesResolvedModelForPerModelRateLimit(t *testin
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "primary",
+		DefaultPool:     RoutePoolTarget{Pool: "primary"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -1535,7 +1590,8 @@ func TestAcquireRequestResolutionUsesResolvedModelForPerModelRateLimit(t *testin
 	advertiseModelOperation(p.registry, "http://primary.internal", "embed", "model-a", "model-b")
 
 	route := &Route{
-		Name:         "default/per-model-rate-limit",
+		Namespace:    "default",
+		Name:         "per-model-rate-limit",
 		Operations:   map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{{Pool: "primary", Weight: 100}},
 		RateLimiter:  NewRateLimiter(1, 1, true),
@@ -1586,7 +1642,7 @@ func TestAcquireRequestResolutionBeginForwardingUpdatesLeastLoadedSelection(t *t
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "primary",
+		DefaultPool:     RoutePoolTarget{Pool: "primary"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -1630,7 +1686,7 @@ func TestResolutionLeaseNextAttemptSharesAdmissionDecision(t *testing.T) {
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "primary",
+		DefaultPool:     RoutePoolTarget{Pool: "primary"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -1640,7 +1696,8 @@ func TestResolutionLeaseNextAttemptSharesAdmissionDecision(t *testing.T) {
 	advertiseModelOperation(p.registry, "http://primary-b.internal", "embed", "model-a")
 
 	route := &Route{
-		Name:          "default/retry-admission",
+		Namespace:     "default",
+		Name:          "retry-admission",
 		Operations:    map[OperationType]bool{OperationType("embed"): true},
 		Destinations:  []Destination{{Pool: "primary", Weight: 100}},
 		RateLimiter:   NewRateLimiter(1, 1, false),
@@ -1689,7 +1746,7 @@ func TestResolutionLeaseNextAttemptRequiresCompletedCurrentAttempt(t *testing.T)
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "primary",
+		DefaultPool:     RoutePoolTarget{Pool: "primary"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -1698,7 +1755,8 @@ func TestResolutionLeaseNextAttemptRequiresCompletedCurrentAttempt(t *testing.T)
 	advertiseModelOperation(p.registry, "http://primary-a.internal", "embed", "model-a")
 	advertiseModelOperation(p.registry, "http://primary-b.internal", "embed", "model-a")
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:       "default/retry-ordering",
+		Namespace:  "default",
+		Name:       "retry-ordering",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{
 			{Pool: "primary", Weight: 100},
@@ -1739,7 +1797,7 @@ func TestResolutionLeaseNextAttemptExcludesFailedEndpoint(t *testing.T) {
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "primary",
+		DefaultPool:     RoutePoolTarget{Pool: "primary"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -1749,7 +1807,8 @@ func TestResolutionLeaseNextAttemptExcludesFailedEndpoint(t *testing.T) {
 	advertiseModelOperation(p.registry, "http://primary-b.internal", "embed", "model-a")
 	atomic.StoreInt32(&p.registry.endpoints["http://primary-b.internal"].runtime.connections, 1)
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:       "default/retry-endpoints",
+		Namespace:  "default",
+		Name:       "retry-endpoints",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{
 			{Pool: "primary", Weight: 100},
@@ -1787,7 +1846,7 @@ func TestProxyRequestKeepsConnectionCountUntilResponseBodyCloses(t *testing.T) {
 	defer func() { _ = bodyWriter.Close() }()
 
 	p := NewProxy(Config{
-		DefaultPool:     "primary",
+		DefaultPool:     RoutePoolTarget{Pool: "primary"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -1865,7 +1924,7 @@ func TestReadyRequiresRoutableEndpoint(t *testing.T) {
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:     "primary",
+		DefaultPool:     RoutePoolTarget{Pool: "primary"},
 		RefreshInterval: time.Minute,
 		Logger:          zap.NewNop(),
 	})
@@ -1936,7 +1995,7 @@ func TestExtractModelOperationsPreservesTaskIdentity(t *testing.T) {
 }
 
 func TestResolveFiltersDiscoveredModelByOperation(t *testing.T) {
-	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.RegisterEndpoint("http://generator.internal", "primary", WorkloadTypeGeneral)
 	p.RegisterEndpoint("http://reader.internal", "primary", WorkloadTypeGeneral)
 	p.registry.UpdateModelOperations("http://generator.internal", map[string]map[OperationType]bool{
@@ -1963,7 +2022,7 @@ func TestResolveFiltersDiscoveredModelByOperation(t *testing.T) {
 }
 
 func TestResolveRejectsSuccessfullyDiscoveredTaskUnknownModel(t *testing.T) {
-	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.RegisterEndpoint("http://legacy.internal", "primary", WorkloadTypeGeneral)
 	p.registry.UpdateModelOperations("http://legacy.internal", map[string]map[OperationType]bool{
 		"shared": {},
@@ -1976,7 +2035,7 @@ func TestResolveRejectsSuccessfullyDiscoveredTaskUnknownModel(t *testing.T) {
 }
 
 func TestResolveFailsClosedBeforeCatalogDiscovery(t *testing.T) {
-	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.RegisterEndpoint("http://bootstrap.internal", "primary", WorkloadTypeGeneral)
 	p.registry.UpdateModels("http://bootstrap.internal", []string{"shared"})
 
@@ -1986,7 +2045,7 @@ func TestResolveFailsClosedBeforeCatalogDiscovery(t *testing.T) {
 }
 
 func TestResolveDoesNotRebindCachedCapabilityToUndiscoveredReplacement(t *testing.T) {
-	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.RegisterEndpoint("http://reader-a.internal", "primary", WorkloadTypeGeneral)
 	p.registry.UpdateModelOperations("http://reader-a.internal", map[string]map[OperationType]bool{
 		"shared": {"read": true},
@@ -2004,7 +2063,7 @@ func TestResolveDoesNotRebindCachedCapabilityToUndiscoveredReplacement(t *testin
 }
 
 func TestResolveDoesNotPoolFallbackAfterCatalogDiscovery(t *testing.T) {
-	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.RegisterEndpoint("http://known.internal", "primary", WorkloadTypeGeneral)
 	p.registry.UpdateModelOperations("http://known.internal", map[string]map[OperationType]bool{
 		"model-a": {"generate": true},
@@ -2020,7 +2079,7 @@ func TestProxyRoutesReadAndHomogeneousGenerateBatch(t *testing.T) {
 
 	var pathsMu sync.Mutex
 	var paths []string
-	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		pathsMu.Lock()
 		paths = append(paths, req.URL.Path)
@@ -2062,7 +2121,7 @@ func TestProxyRoutesReadAndHomogeneousGenerateBatch(t *testing.T) {
 func TestProxyRejectsMixedModelGenerateBatchBeforeForwarding(t *testing.T) {
 	t.Parallel()
 
-	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	forwarded := false
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		forwarded = true
@@ -2083,7 +2142,7 @@ func TestProxyRejectsMixedModelGenerateBatchBeforeForwarding(t *testing.T) {
 }
 
 func TestProxyBoundsRetainedInferenceRequestBody(t *testing.T) {
-	p := NewProxy(Config{DefaultPool: "primary", MaxRequestBodyBytes: 16, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, MaxRequestBodyBytes: 16, Logger: zap.NewNop()})
 	p.RegisterEndpoint("http://inference.internal", "primary", WorkloadTypeGeneral)
 	p.registry.UpdateModels("http://inference.internal", []string{"model-a"})
 
@@ -2103,10 +2162,96 @@ func TestProxyBoundsRetainedInferenceRequestBody(t *testing.T) {
 	}
 }
 
+func TestProxyUnscopedModelCatalogRequiresPool(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	p.RegisterEndpointInNamespace("http://tenant-a.internal", "tenant-a", "gpu", WorkloadTypeGeneral)
+	p.RegisterEndpointInNamespace("http://tenant-b.internal", "tenant-b", "gpu", WorkloadTypeGeneral)
+
+	recorder := httptest.NewRecorder()
+	p.handleModels(recorder, httptest.NewRequest(http.MethodGet, "/ai/v1/models", nil))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestExplicitGlobalDefaultPoolExcludesNamespacedEndpoints(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{
+		DefaultPool: RoutePoolTarget{Pool: "gpu"},
+		Logger:      zap.NewNop(),
+	})
+	p.RegisterEndpoint("http://global.internal", "gpu", WorkloadTypeGeneral)
+	p.RegisterEndpointInNamespace("http://tenant-a.internal", "tenant-a", "gpu", WorkloadTypeGeneral)
+	for _, address := range []string{"http://global.internal", "http://tenant-a.internal"} {
+		advertiseModelOperation(p.registry, address, "read", "owner/reader")
+	}
+
+	lease, err := p.AcquireRequestResolution(context.Background(), ResolveRequest{
+		Operation: "read",
+		Model:     "owner/reader",
+		Timestamp: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if got := lease.Resolution.Endpoint.Address(); got != "http://global.internal" {
+		t.Fatalf("default-pool endpoint = %q, want global endpoint", got)
+	}
+}
+
+func TestNamespacedDefaultPoolExcludesPeerNamespaces(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{
+		DefaultPool: RoutePoolTarget{Namespace: "tenant-a", Pool: "gpu"},
+		Logger:      zap.NewNop(),
+	})
+	var catalogHost atomic.Value
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		catalogHost.Store(req.URL.Host)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+			Request:    req,
+		}, nil
+	})}
+	for namespace, address := range map[string]string{
+		"tenant-a": "http://tenant-a.internal",
+		"tenant-b": "http://tenant-b.internal",
+	} {
+		p.RegisterEndpointInNamespace(address, namespace, "gpu", WorkloadTypeGeneral)
+		advertiseModelOperation(p.registry, address, "read", "owner/reader")
+	}
+
+	lease, err := p.AcquireRequestResolution(context.Background(), ResolveRequest{
+		Operation: "read",
+		Model:     "owner/reader",
+		Timestamp: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if got := lease.Resolution.Endpoint.Namespace(); got != "tenant-a" {
+		t.Fatalf("default-pool namespace = %q, want tenant-a", got)
+	}
+
+	recorder := httptest.NewRecorder()
+	p.handleModels(recorder, httptest.NewRequest(http.MethodGet, "/ai/v1/models", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("catalog status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if got, _ := catalogHost.Load().(string); got != "tenant-a.internal" {
+		t.Fatalf("catalog host = %q, want tenant-a.internal", got)
+	}
+}
+
 func TestProxyModelCatalogIntersectsDuplicateCapabilities(t *testing.T) {
 	t.Parallel()
 
-	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		body := `{"generators":{"gemma4":{"inputs":["text","image"],"capabilities":["native_batch_generate_multimodal","shared"]}}}`
 		if req.URL.Host == "serial.internal" {
@@ -2143,7 +2288,7 @@ func TestProxyModelCatalogIntersectsDuplicateCapabilities(t *testing.T) {
 }
 
 func TestProxyModelCatalogScopesDiscoveryToSelectedPoolAndTask(t *testing.T) {
-	p := NewProxy(Config{DefaultPool: "cpu", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		body := `{"readers":{"florence":{"inputs":["image"]}}}`
 		if req.URL.Host == "gpu.internal" {
@@ -2177,7 +2322,7 @@ func TestProxyModelCatalogScopesDiscoveryToSelectedPoolAndTask(t *testing.T) {
 }
 
 func TestScopedCatalogActivatesColdRouteBeforeIssuingLease(t *testing.T) {
-	p := NewProxy(Config{DefaultPool: "cpu", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -2187,7 +2332,8 @@ func TestScopedCatalogActivatesColdRouteBeforeIssuingLease(t *testing.T) {
 		}, nil
 	})}
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:          "tenant-a/cold-reader",
+		Namespace:     "tenant-a",
+		Name:          "cold-reader",
 		Operations:    map[OperationType]bool{"read": true},
 		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/reader$`)},
 		Destinations:  []Destination{{Pool: "gpu", Weight: 100}},
@@ -2242,7 +2388,7 @@ func TestScopedCatalogActivatesColdRouteBeforeIssuingLease(t *testing.T) {
 }
 
 func TestScopedCatalogFallsBackWhenSelectedColdPoolCannotActivate(t *testing.T) {
-	p := NewProxy(Config{DefaultPool: "cpu", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -2253,7 +2399,8 @@ func TestScopedCatalogFallsBackWhenSelectedColdPoolCannotActivate(t *testing.T) 
 	})}
 	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:          "default/cold-reader-fallback",
+		Namespace:     "default",
+		Name:          "cold-reader-fallback",
 		Operations:    map[OperationType]bool{"read": true},
 		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/reader$`)},
 		Destinations:  []Destination{{Pool: "gpu", Weight: 100}},
@@ -2307,7 +2454,8 @@ func TestScopedCatalogKeepsNamespacedPoolsDisjoint(t *testing.T) {
 	p.RegisterEndpointInNamespace("http://tenant-a.internal", "tenant-a", "gpu", WorkloadTypeGeneral)
 	p.RegisterEndpointInNamespace("http://tenant-b.internal", "tenant-b", "gpu", WorkloadTypeGeneral)
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:          "tenant-a/reader",
+		Namespace:     "tenant-a",
+		Name:          "reader",
 		Operations:    map[OperationType]bool{"read": true},
 		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/reader$`)},
 		Destinations:  []Destination{{Pool: "gpu", Weight: 100}},
@@ -2339,13 +2487,14 @@ func TestScopedCatalogKeepsNamespacedPoolsDisjoint(t *testing.T) {
 }
 
 func TestScopedCatalogDoesNotActivateUnknownConditionalRoutes(t *testing.T) {
-	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
 	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"readers":{"owner/reader":{}}}`)), Request: req}, nil
 	})}
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:           "tenant-a/private-reader",
+		Namespace:      "tenant-a",
+		Name:           "private-reader",
 		Priority:       100,
 		Operations:     map[OperationType]bool{"read": true},
 		ModelPatterns:  []*RegexPattern{MustRegexPattern(`^owner/reader$`)},
@@ -2457,7 +2606,7 @@ func TestChunkCatalogAliasesNormalizeAcrossMixedVersions(t *testing.T) {
 
 func TestScopedCatalogForwardsCallerAuthorization(t *testing.T) {
 	const caller = "Bearer caller-token"
-	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if got := req.Header.Get("Authorization"); got != caller {
 			t.Fatalf("Authorization = %q, want %q", got, caller)
@@ -2490,11 +2639,12 @@ func TestScopedCatalogForwardsCallerAuthorization(t *testing.T) {
 
 func TestScopedCatalogUsesRouteCapabilityCohort(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	p.registry.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:          "default/gemma-reader",
+		Namespace:     "default",
+		Name:          "gemma-reader",
 		Operations:    map[OperationType]bool{"read": true},
 		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/reader$`)},
 		Destinations:  []Destination{{Pool: "gpu", Weight: 1}},
@@ -2522,7 +2672,7 @@ func TestScopedCatalogUsesRouteCapabilityCohort(t *testing.T) {
 
 func TestScopedCatalogIncludesUnknownConditionalRouteContext(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	p.registry.RegisterEndpoint("http://tenant-gpu.internal", "tenant-gpu", WorkloadTypeGeneral)
 	p.Router().RouteManager().UpsertRoute(&Route{
@@ -2597,7 +2747,7 @@ func TestScopedCatalogIncludesUnknownConditionalRouteContext(t *testing.T) {
 
 func TestRoutesPrecedeExplicitPoolForDiscoveryAndExecution(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	p.registry.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://cpu.internal", "read", "owner/reader")
@@ -2645,7 +2795,7 @@ func TestRoutesPrecedeExplicitPoolForDiscoveryAndExecution(t *testing.T) {
 
 func TestTerminalRejectRouteDoesNotExposeDefaultPool(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "reject-reader",
@@ -2665,7 +2815,7 @@ func TestTerminalRejectRouteDoesNotExposeDefaultPool(t *testing.T) {
 
 func TestCatalogCohortIsBoundToConcreteOperation(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	p.registry.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
 	p.Router().RouteManager().UpsertRoute(&Route{
@@ -2688,7 +2838,7 @@ func TestCatalogCohortIsBoundToConcreteOperation(t *testing.T) {
 
 func TestTerminalAliasRejectDoesNotFallThroughViaSemanticTask(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "reject-batch-generator",
@@ -2703,7 +2853,7 @@ func TestTerminalAliasRejectDoesNotFallThroughViaSemanticTask(t *testing.T) {
 
 func TestCapabilityLeaseRejectsRoutePolicyGenerationChange(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://gpu-a.internal", "gpu-a", WorkloadTypeGeneral)
 	p.registry.RegisterEndpoint("http://gpu-b.internal", "gpu-b", WorkloadTypeGeneral)
 	for _, address := range []string{"http://gpu-a.internal", "http://gpu-b.internal"} {
@@ -2747,7 +2897,7 @@ func TestCapabilityLeaseRejectsRoutePolicyGenerationChange(t *testing.T) {
 
 func TestMultimodalRerankHandlerPreservesConcreteOperation(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	p.registry.RegisterEndpoint("http://multimodal.internal", "gpu", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://cpu.internal", "rerank", "owner/reranker")
@@ -2783,7 +2933,7 @@ func TestMultimodalRerankHandlerPreservesConcreteOperation(t *testing.T) {
 func TestCapabilityLeaseConstrainsRoutingAfterEndpointAddition(t *testing.T) {
 	t.Parallel()
 
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://reader-a.internal", "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://reader-a.internal", "read", "owner/reader")
 	endpoints := p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read")
@@ -2814,7 +2964,7 @@ func TestCapabilityLeaseConstrainsRoutingAfterEndpointAddition(t *testing.T) {
 func TestCapabilityLeaseFiltersWeightedRouteDestinationsBeforeSelection(t *testing.T) {
 	t.Parallel()
 
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	for _, endpoint := range []struct{ address, pool string }{
 		{address: "http://catalog-failed.internal", pool: "unleased"},
 		{address: "http://catalog-ready.internal", pool: "leased"},
@@ -2823,7 +2973,8 @@ func TestCapabilityLeaseFiltersWeightedRouteDestinationsBeforeSelection(t *testi
 		advertiseModelOperation(p.registry, endpoint.address, "generate", "gemma4")
 	}
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:          "default/generator",
+		Namespace:     "default",
+		Name:          "generator",
 		Operations:    map[OperationType]bool{"generate": true},
 		ModelPatterns: []*RegexPattern{MustRegexPattern(`^gemma4$`)},
 		Destinations: []Destination{
@@ -2856,7 +3007,7 @@ func TestCapabilityLeaseFiltersWeightedRouteDestinationsBeforeSelection(t *testi
 func TestCapabilityLeaseRejectsReregisteredEndpointAtSameAddress(t *testing.T) {
 	t.Parallel()
 
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	const address = "http://reader.internal"
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
@@ -2885,7 +3036,7 @@ func TestCapabilityLeaseRejectsReregisteredEndpointAtSameAddress(t *testing.T) {
 func TestCapabilityLeaseIssuanceReclaimsReplacedEndpointIncarnations(t *testing.T) {
 	t.Parallel()
 
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	const address = "http://reader.internal"
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
@@ -2918,7 +3069,7 @@ func TestCapabilityLeaseIssuanceReclaimsReplacedEndpointIncarnations(t *testing.
 func TestCapabilityLeaseRejectsEndpointTopologyChange(t *testing.T) {
 	t.Parallel()
 
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	const address = "http://reader.internal"
 	p.registry.RegisterEndpointWithHealth(address, address+"/ready", "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
@@ -2970,7 +3121,7 @@ func TestEndpointReservationRejectsChangedIncarnation(t *testing.T) {
 
 func TestResolutionCompletionUsesReservedCircuitBreaker(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	const address = "http://reader.internal"
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	p.registry.mu.RLock()
@@ -3025,7 +3176,7 @@ func TestEndpointSnapshotsAreDetachedAndStable(t *testing.T) {
 func TestCapabilityLeaseRejectsChangedAuthorization(t *testing.T) {
 	t.Parallel()
 
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	const address = "http://reader.internal"
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
@@ -3044,7 +3195,7 @@ func TestCapabilityLeaseRejectsChangedAuthorization(t *testing.T) {
 
 func TestGeneratorCapabilityLeaseAllowsExplicitRouteVariants(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	const address = "http://generator.internal"
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	p.registry.UpdateModelOperations(address, map[string]map[OperationType]bool{
@@ -3064,7 +3215,7 @@ func TestGeneratorCapabilityLeaseAllowsExplicitRouteVariants(t *testing.T) {
 
 func TestCapabilityLeaseRejectsSemanticAliasReuse(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	const address = "http://generator.internal"
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	p.registry.UpdateModelOperations(address, map[string]map[OperationType]bool{
@@ -3090,7 +3241,7 @@ func TestCapabilityLeaseRejectsSemanticAliasReuse(t *testing.T) {
 
 func TestGeneratorCapabilityLeaseConstrainsEachRouteVariant(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://single.internal", "primary", WorkloadTypeGeneral)
 	p.registry.UpdateModelOperations("http://single.internal", map[string]map[OperationType]bool{
 		"gemma4": {"generate": true},
@@ -3124,7 +3275,7 @@ func TestGeneratorCapabilityLeaseConstrainsEachRouteVariant(t *testing.T) {
 
 func TestScopedGeneratorCatalogLeaseExecutesSingleRoute(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		body := `{"generators":{"gemma4":{"inference_capabilities":{"version":3,"task":"generate","input_modalities":["text"],"accepted_mime_types":["text/plain"],"input_granularity":"item","batch":{"mode":"serial_compatibility","preferred_items":1,"max_items":8,"max_encoded_media_bytes":0,"max_decoded_pixels":0,"max_media_parts_per_item":0,"per_item_failures":true},"task_limits":{"max_text_bytes_per_item":null,"max_input_tokens_per_item":null,"max_output_tokens_per_item":null,"max_candidates_per_request":null},"output":"generated_text","result_cardinality":"one_per_item","prompt_policy":"model_default","borrowed_attachments":false}}}}`
 		if req.Method == http.MethodPost {
@@ -3163,7 +3314,7 @@ func TestScopedGeneratorCatalogLeaseExecutesSingleRoute(t *testing.T) {
 func TestScopedCatalogLeaseFollowsNonDefaultRouteAndCallerCatalog(t *testing.T) {
 	t.Parallel()
 	var executedHost atomic.Value
-	p := NewProxy(Config{DefaultPool: "default", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "default"}, Logger: zap.NewNop()})
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		body := `{}`
 		if req.Method == http.MethodGet && req.URL.Host == "gpu.internal" {
@@ -3185,7 +3336,8 @@ func TestScopedCatalogLeaseFollowsNonDefaultRouteAndCallerCatalog(t *testing.T) 
 	// The service-credential inventory intentionally does not advertise this
 	// tenant-visible model. The caller-authorized scoped catalog is authoritative.
 	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:          "default/tenant-generator",
+		Namespace:     "default",
+		Name:          "tenant-generator",
 		Operations:    map[OperationType]bool{"generate": true},
 		ModelPatterns: []*RegexPattern{MustRegexPattern(`^tenant/gemma4$`)},
 		Destinations:  []Destination{{Pool: "gpu", Weight: 100}},
@@ -3215,7 +3367,7 @@ func TestScopedCatalogLeaseFollowsNonDefaultRouteAndCallerCatalog(t *testing.T) 
 
 func TestCapabilityLeaseRejectsChangedDescriptorRevision(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	const address = "http://reader.internal"
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
@@ -3233,7 +3385,7 @@ func TestCapabilityLeaseRejectsChangedDescriptorRevision(t *testing.T) {
 
 func TestCapabilityLeaseRejectsRevisionWithoutToken(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	err := p.validateCapabilityLease("", "revision-a", "owner/reader", "read", "")
 	var resolutionErr *ResolutionError
 	if !errors.As(err, &resolutionErr) || resolutionErr.StatusCode != http.StatusConflict {
@@ -3243,7 +3395,7 @@ func TestCapabilityLeaseRejectsRevisionWithoutToken(t *testing.T) {
 
 func TestCapabilityLeaseCapacityNeverEvictsLiveLease(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	const address = "http://reader.internal"
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
@@ -3268,7 +3420,7 @@ func TestCapabilityLeaseCapacityNeverEvictsLiveLease(t *testing.T) {
 
 func TestCapabilityLeaseRefreshReusesImmutableSnapshot(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	const address = "http://reader.internal"
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
@@ -3294,7 +3446,7 @@ func TestCapabilityLeaseRefreshReusesImmutableSnapshot(t *testing.T) {
 func TestCapabilityLeaseIssuancePurgesObsoleteRouteGenerations(t *testing.T) {
 	t.Parallel()
 
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	const address = "http://reader.internal"
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
@@ -3371,7 +3523,8 @@ func TestRouteManagerEquivalentUpdatePreservesGenerationAndState(t *testing.T) {
 
 	newRoute := func() *Route {
 		return &Route{
-			Name:                "default/full-policy",
+			Namespace:           "default",
+			Name:                "full-policy",
 			Priority:            7,
 			Operations:          map[OperationType]bool{"generate.batch": true},
 			ModelPatterns:       []*RegexPattern{MustRegexPattern(`^gemma`)},
@@ -3444,7 +3597,8 @@ func TestRouteManagerOwnsImmutablePolicySnapshots(t *testing.T) {
 
 	rm := NewRouteManager()
 	source := &Route{
-		Name:               "default/reader",
+		Namespace:          "default",
+		Name:               "reader",
 		Operations:         map[OperationType]bool{"read": true},
 		ModelPatterns:      []*RegexPattern{MustRegexPattern(`^reader$`)},
 		HeaderMatchers:     map[string]*StringMatcher{"x-tenant": {Exact: "tenant-a"}},
@@ -3573,7 +3727,7 @@ func TestRouteManagerInstalledMatchDoesNotAllocate(t *testing.T) {
 
 func TestCapabilityLeaseKeepsImmutableSnapshotAcrossCatalogRefresh(t *testing.T) {
 	t.Parallel()
-	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
 	const address = "http://reader.internal"
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
@@ -3660,7 +3814,7 @@ func TestScopedCatalogRequiresProcessWideByteAdmission(t *testing.T) {
 	t.Parallel()
 
 	p := NewProxy(Config{
-		DefaultPool:             "primary",
+		DefaultPool:             RoutePoolTarget{Pool: "primary"},
 		RefreshInterval:         time.Minute,
 		MaxRetainedCatalogBytes: 1,
 		Logger:                  zap.NewNop(),
@@ -3692,7 +3846,7 @@ func TestScopedCatalogReducesFanoutToFitRetainedByteLimit(t *testing.T) {
 	}
 
 	p := NewProxy(Config{
-		DefaultPool:             "primary",
+		DefaultPool:             RoutePoolTarget{Pool: "primary"},
 		RefreshInterval:         time.Minute,
 		MaxRetainedCatalogBytes: retainedLimit,
 		Logger:                  zap.NewNop(),
@@ -3951,7 +4105,7 @@ func TestConservativeCapabilitiesPreserveSingletonExecution(t *testing.T) {
 }
 
 func TestProxyModelCatalogLeasesOnlySuccessfulCandidates(t *testing.T) {
-	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if req.URL.Host == "failed.internal" {
 			return nil, errors.New("catalog unavailable")

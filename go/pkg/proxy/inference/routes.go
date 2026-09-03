@@ -27,8 +27,12 @@ import (
 
 // Route represents a compiled InferenceProxy for fast matching
 type Route struct {
-	Name     string
-	Priority int32
+	// Namespace is the immutable routing scope for every destination in this
+	// route. Empty namespace denotes explicitly global standalone pools. Name is
+	// only the route identity and has no routing semantics.
+	Namespace string
+	Name      string
+	Priority  int32
 
 	// Declarative matchers. The manager compiles private programs when it owns
 	// an installed route snapshot.
@@ -331,10 +335,10 @@ func (rm *RouteManager) UpsertRoute(route *Route) (bool, error) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
-	// Remove existing route with same name
+	// Remove the existing route with the same namespace/name identity.
 	newRoutes := make([]*Route, 0, len(rm.routes)+1)
 	for _, r := range rm.routes {
-		if r.Name == candidate.Name {
+		if r.Namespace == candidate.Namespace && r.Name == candidate.Name {
 			if routePolicyEqual(r, candidate) {
 				return false, nil
 			}
@@ -350,10 +354,13 @@ func (rm *RouteManager) UpsertRoute(route *Route) (bool, error) {
 	}
 	newRoutes = append(newRoutes, candidate)
 
-	// Sort by priority (descending), then by name (ascending) for stable ordering
+	// Sort by priority (descending), then by complete identity for stable ordering.
 	sort.Slice(newRoutes, func(i, j int) bool {
 		if newRoutes[i].Priority != newRoutes[j].Priority {
 			return newRoutes[i].Priority > newRoutes[j].Priority
+		}
+		if newRoutes[i].Namespace != newRoutes[j].Namespace {
+			return newRoutes[i].Namespace < newRoutes[j].Namespace
 		}
 		return newRoutes[i].Name < newRoutes[j].Name
 	})
@@ -524,7 +531,7 @@ func routePolicyEqual(left, right *Route) bool {
 	if left == nil || right == nil {
 		return left == right
 	}
-	if left.Name != right.Name || left.Priority != right.Priority ||
+	if left.Namespace != right.Namespace || left.Name != right.Name || left.Priority != right.Priority ||
 		left.RetryAttempts != right.RetryAttempts || left.RetryTimeout != right.RetryTimeout ||
 		left.RetryOnRequestErrs != right.RetryOnRequestErrs || left.RetryOnCanceled != right.RetryOnCanceled ||
 		!boolMapEqual(left.Operations, right.Operations) ||
@@ -647,14 +654,14 @@ func rateLimiterPolicyEqual(left, right *RateLimiter) bool {
 	return left.rate == right.rate && left.burstSize == right.burstSize && left.perModel == right.perModel
 }
 
-// RemoveRoute removes a route by name
-func (rm *RouteManager) RemoveRoute(name string) {
+// RemoveRoute removes a route by its complete namespace/name identity.
+func (rm *RouteManager) RemoveRoute(namespace, name string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
 	newRoutes := make([]*Route, 0, len(rm.routes))
 	for _, r := range rm.routes {
-		if r.Name != name {
+		if r.Namespace != namespace || r.Name != name {
 			newRoutes = append(newRoutes, r)
 		}
 	}
@@ -749,7 +756,7 @@ func (rm *RouteManager) PotentialCohortFor(req *RouteRequest) RouteCohort {
 	seenTargets := make(map[RoutePoolTarget]bool)
 	cohort := RouteCohort{Generation: rm.generation}
 	appendRoutePools := func(out []string, route *Route) []string {
-		namespace := routeNamespace(route)
+		namespace := route.Namespace
 		for _, destination := range route.Destinations {
 			if destination.Pool != "" && !seen[destination.Pool] {
 				seen[destination.Pool] = true
@@ -924,7 +931,7 @@ func (rm *RouteManager) selectDestinationWithin(route *Route, req *RouteRequest,
 
 	for _, dest := range route.Destinations {
 		// Check conditions
-		if !rm.evaluateConditionsInNamespaceWithin(&dest, req, registry, routeNamespace(route), allowed) {
+		if !rm.evaluateConditionsInNamespaceWithin(&dest, req, registry, route.Namespace, allowed) {
 			continue
 		}
 
@@ -946,7 +953,7 @@ func (rm *RouteManager) SelectActivationDestination(route *Route, req *RouteRequ
 func (rm *RouteManager) selectActivationDestinationWithin(route *Route, req *RouteRequest, registry *ModelRegistry, allowed map[string]endpointRef, enabled func(string) bool) *Destination {
 	eligible := make([]Destination, 0, len(route.Destinations))
 	totalWeight := int32(0)
-	namespace := routeNamespace(route)
+	namespace := route.Namespace
 	for _, destination := range route.Destinations {
 		if (allowed != nil && !endpointRefsContainNamespacedPool(allowed, namespace, destination.Pool)) ||
 			!enabled(destination.Pool) ||
@@ -1159,6 +1166,8 @@ func parseFloatInternal(s string, v *float64, n *int) (bool, error) {
 
 func weightedSelectionValue(route *Route, req *RouteRequest, totalWeight int32) int32 {
 	h := fnv.New32a()
+	_, _ = h.Write([]byte(route.Namespace))
+	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(route.Name))
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(req.Model))

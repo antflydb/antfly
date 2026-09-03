@@ -19,7 +19,7 @@ func TestRouteWatcherIgnoresInformerResyncUpdate(t *testing.T) {
 	t.Parallel()
 
 	routes := NewRouteManager()
-	routes.UpsertRoute(&Route{Name: "default/reader", Priority: 1})
+	routes.UpsertRoute(&Route{Namespace: "default", Name: "reader", Priority: 1})
 	generation := routes.Generation()
 	watcher := &RouteWatcher{routeManager: routes, logger: zap.NewNop()}
 	oldObject := &unstructured.Unstructured{Object: map[string]any{
@@ -50,5 +50,44 @@ func TestRouteWatcherRejectsInvalidHeaderRegex(t *testing.T) {
 	}}
 	if _, err := watcher.convertRoute(object); err == nil {
 		t.Fatal("invalid header regex was accepted")
+	}
+}
+
+func TestRouteWatcherPreservesExplicitRouteIdentity(t *testing.T) {
+	t.Parallel()
+	watcher := &RouteWatcher{routeManager: NewRouteManager(), logger: zap.NewNop()}
+	object := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"namespace": "tenant-a", "name": "reader"},
+		"spec":     map[string]any{},
+	}}
+	route, err := watcher.convertRoute(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.Namespace != "tenant-a" || route.Name != "reader" {
+		t.Fatalf("route identity = %q/%q, want tenant-a/reader", route.Namespace, route.Name)
+	}
+}
+
+func TestRouteManagerKeepsSameNamedRoutesDisjointByNamespace(t *testing.T) {
+	t.Parallel()
+	routes := NewRouteManager()
+	for _, namespace := range []string{"tenant-a", "tenant-b"} {
+		changed, err := routes.UpsertRoute(&Route{
+			Namespace:    namespace,
+			Name:         "reader",
+			Destinations: []Destination{{Pool: "gpu", Weight: 100}},
+		})
+		if err != nil || !changed {
+			t.Fatalf("install %s/reader: changed=%v err=%v", namespace, changed, err)
+		}
+	}
+	if len(routes.routes) != 2 {
+		t.Fatalf("installed routes = %d, want 2", len(routes.routes))
+	}
+
+	routes.RemoveRoute("tenant-a", "reader")
+	if len(routes.routes) != 1 || routes.routes[0].Namespace != "tenant-b" || routes.routes[0].Name != "reader" {
+		t.Fatalf("routes after tenant-a delete = %#v", routes.routes)
 	}
 }

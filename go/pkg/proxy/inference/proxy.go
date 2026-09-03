@@ -1664,17 +1664,16 @@ type Proxy struct {
 	server       *http.Server
 	logger       *zap.Logger
 
-	defaultPool          string
-	defaultPoolNamespace string
-	listenAddr           string
-	maxRequestBodyBytes  int64
-	bodyAdmission        *byteAdmission
-	catalogAdmission     *byteAdmission
-	refreshWake          chan struct{}
-	capabilityLeaseMu    sync.Mutex
-	capabilityLeases     map[string]proxyCapabilityLease
-	capabilityLeaseByID  map[[sha256.Size]byte]string
-	verifiedSource       VerifiedSourceResolver
+	defaultPool         RoutePoolTarget
+	listenAddr          string
+	maxRequestBodyBytes int64
+	bodyAdmission       *byteAdmission
+	catalogAdmission    *byteAdmission
+	refreshWake         chan struct{}
+	capabilityLeaseMu   sync.Mutex
+	capabilityLeases    map[string]proxyCapabilityLease
+	capabilityLeaseByID map[[sha256.Size]byte]string
+	verifiedSource      VerifiedSourceResolver
 }
 
 // VerifiedSourceResolver authenticates source-scoped routing attributes for an
@@ -1715,9 +1714,11 @@ func (p *Proxy) SetPoolActivator(activator PoolActivator) {
 
 // Config holds proxy configuration
 type Config struct {
-	ListenAddr              string
-	DefaultPool             string
-	DefaultPoolNamespace    string // Namespace of DefaultPool; empty selects globally scoped standalone endpoints
+	ListenAddr string
+	// DefaultPool is an immutable namespace/pool routing target. Its zero value
+	// disables default-pool fallback. A nonempty Pool with an empty Namespace
+	// explicitly selects globally scoped standalone endpoints.
+	DefaultPool             RoutePoolTarget
 	RefreshInterval         time.Duration
 	EnableRouteWatching     bool                   // Enable watching InferenceProxy CRs
 	RouteWatchNamespace     string                 // Namespace to watch for routes (empty for all)
@@ -1742,16 +1743,15 @@ func NewProxy(cfg Config) *Proxy {
 	}
 
 	p := &Proxy{
-		registry:             registry,
-		router:               router,
-		defaultPool:          cfg.DefaultPool,
-		defaultPoolNamespace: cfg.DefaultPoolNamespace,
-		listenAddr:           cfg.ListenAddr,
-		logger:               logger,
-		refreshWake:          make(chan struct{}, 1),
-		capabilityLeases:     make(map[string]proxyCapabilityLease),
-		capabilityLeaseByID:  make(map[[sha256.Size]byte]string),
-		verifiedSource:       cfg.VerifiedSourceResolver,
+		registry:            registry,
+		router:              router,
+		defaultPool:         cfg.DefaultPool,
+		listenAddr:          cfg.ListenAddr,
+		logger:              logger,
+		refreshWake:         make(chan struct{}, 1),
+		capabilityLeases:    make(map[string]proxyCapabilityLease),
+		capabilityLeaseByID: make(map[[sha256.Size]byte]string),
+		verifiedSource:      cfg.VerifiedSourceResolver,
 	}
 	p.maxRequestBodyBytes = cfg.MaxRequestBodyBytes
 	if p.maxRequestBodyBytes <= 0 {
@@ -1954,9 +1954,9 @@ func (p *Proxy) catalogEndpointCohortForRequest(routing RoutingContext, model st
 	targets := append([]RoutePoolTarget(nil), cohort.PoolTargets...)
 	// Without a definite route, this operation can fall through to its explicit
 	// pool and then the process default. A terminal reject contributes neither.
-	fallbackPool := firstNonEmpty(strings.TrimSpace(routing.ExplicitPool), p.defaultPool)
+	fallbackPool := firstNonEmpty(strings.TrimSpace(routing.ExplicitPool), p.defaultPool.Pool)
 	if !cohort.Terminal && fallbackPool != "" {
-		fallbackTarget := RoutePoolTarget{Namespace: p.defaultPoolNamespace, Pool: fallbackPool}
+		fallbackTarget := RoutePoolTarget{Namespace: p.defaultPool.Namespace, Pool: fallbackPool}
 		found := false
 		for _, target := range targets {
 			if target == fallbackTarget {
@@ -2000,9 +2000,9 @@ func (p *Proxy) catalogActivationPath(req *RouteRequest, route *Route, fallbackP
 		if fallbackPool == "" {
 			return nil
 		}
-		return []RoutePoolTarget{{Namespace: p.defaultPoolNamespace, Pool: fallbackPool}}
+		return []RoutePoolTarget{{Namespace: p.defaultPool.Namespace, Pool: fallbackPool}}
 	}
-	namespace := routeNamespace(route)
+	namespace := route.Namespace
 	if destination, err := p.router.RouteManager().selectDestinationWithin(route, req, p.registry, nil); err == nil && destination != nil {
 		return []RoutePoolTarget{{Namespace: namespace, Pool: destination.Pool}}
 	}
@@ -2140,7 +2140,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	pool := routing.ExplicitPool
 	if pool == "" && model == "" {
-		pool = p.defaultPool
+		pool = p.defaultPool.Pool
 	}
 	authorization := p.upstreamAuthorizationForRequest(r)
 	var endpoints []*Endpoint
@@ -2168,9 +2168,10 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		endpoints = cohort.endpoints
 		routeGeneration = cohort.routeGeneration
 	} else if pool == "" {
-		endpoints = p.registry.GetAvailableEndpoints()
+		http.Error(w, "unscoped model catalog requires an explicit or configured default pool", http.StatusBadRequest)
+		return
 	} else {
-		endpoints = p.registry.getEndpointsForNamespacedPool(p.defaultPoolNamespace, pool)
+		endpoints = p.registry.getEndpointsForNamespacedPool(p.defaultPool.Namespace, pool)
 	}
 	type catalogTarget struct {
 		endpoint    *Endpoint

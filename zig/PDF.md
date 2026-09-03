@@ -1419,9 +1419,10 @@ document. They are architectural requirements, not Florence-specific cleanup:
 152. **Cold discovery discarded the namespace needed by the activator.**
     `RouteCohort` now carries namespace-qualified activation targets in
     addition to its registry pool projection. Route destinations and redirect
-    fallbacks retain their route namespace; an explicit or process-default
-    fallback remains intentionally unqualified. Activation waits use each
-    pool's declared deadline without polling past it.
+    fallbacks retain their route namespace; explicit-pool and process-default
+    fallback use the immutable configured default scope, whose empty namespace
+    is explicitly global. Activation waits use each pool's declared deadline
+    without polling past it.
 153. **A route could change while its cold capability cohort was waking.**
     Discovery re-derives the cohort after activation and accepts it only at the
     same route generation. Bounded retries cover ordinary informer races;
@@ -1867,9 +1868,19 @@ The hardening above follows these long-term rules:
     circuit admission, execution, and retry. Same-named pools in different
     namespaces cannot enter each other's capability leases. The legacy empty
     namespace is an explicit global standalone scope rather than an accidental
-    loss of Kubernetes identity. The default pool has an explicit namespace;
-    a namespaced watcher supplies it when omitted, while a cluster-wide watcher
-    fails closed unless the operator configures an unambiguous namespace.
+    loss of Kubernetes identity. The process default is one immutable
+    `RoutePoolTarget`, not independently mutable pool and namespace strings:
+    its zero value disables fallback, while `{Namespace: "", Pool: "gpu"}`
+    explicitly selects a global standalone pool. Watcher construction never
+    rewrites that choice. Unscoped model discovery without an explicit or
+    configured default pool fails closed instead of merging a cluster-wide
+    cross-namespace catalog.
+    Route policy carries `Namespace` separately from `Name`; slashes in a
+    display/identity name have no scheduling meaning. Route installation,
+    equality, ordering, removal, cohort discovery, activation, and execution
+    all use the complete `(namespace, name)` or `(namespace, pool)` identity as
+    appropriate, so programmatic and informer-installed routes have identical
+    namespace semantics.
 52. **Implemented after route-generation review:** potential cohort discovery
     and exact activation matching bind to the same immutable route generation.
     A mutation observed while constructing that plan causes no activation. A

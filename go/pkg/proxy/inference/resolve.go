@@ -268,9 +268,9 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 	if err != nil {
 		return nil, err
 	}
-	namespace := routeNamespace(l.Resolution.Route)
-	if l.Resolution.Route == nil {
-		namespace = l.proxy.defaultPoolNamespace
+	namespace := l.proxy.defaultPool.Namespace
+	if l.Resolution.Route != nil {
+		namespace = l.Resolution.Route.Namespace
 	}
 	reservation, err := l.proxy.router.routeRequestInNamespaceWithin(ctx, l.model, namespace, l.Resolution.Pool, l.workloadType, excluded, allowed, l.operation)
 	if err != nil {
@@ -444,7 +444,7 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 		}
 		if dest != nil {
 			endpoint, reservation, resolveErr := p.resolvePoolTarget(
-				ctx, routeNamespace(matchedRoute), dest.Pool, routeReq, workloadType,
+				ctx, matchedRoute.Namespace, dest.Pool, routeReq, workloadType,
 				routeReq.Operation, reserve, dest, allowed,
 			)
 			if resolveErr == nil {
@@ -468,7 +468,7 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 				return nil, endpointReservation{}, fallbackErr
 			}
 			endpoint, reservation, resolveErr := p.resolvePoolTarget(
-				ctx, routeNamespace(matchedRoute), fallbackPool, routeReq, workloadType,
+				ctx, matchedRoute.Namespace, fallbackPool, routeReq, workloadType,
 				routeReq.Operation, reserve, nil, allowed,
 			)
 			if resolveErr != nil {
@@ -481,10 +481,10 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 
 	pool := strings.TrimSpace(routing.ExplicitPool)
 	if pool == "" {
-		pool = p.defaultPool
+		pool = p.defaultPool.Pool
 	}
 	endpoint, reservation, err := p.resolvePoolTarget(
-		ctx, p.defaultPoolNamespace, pool, routeReq, workloadType, routeReq.Operation, reserve, nil, allowed,
+		ctx, p.defaultPool.Namespace, pool, routeReq, workloadType, routeReq.Operation, reserve, nil, allowed,
 	)
 	if err != nil {
 		return nil, endpointReservation{}, resolutionError(err)
@@ -511,7 +511,7 @@ func (p *Proxy) selectActivationDestinationWithin(route *Route, req *RouteReques
 	if p.activator == nil {
 		return nil
 	}
-	namespace := routeNamespace(route)
+	namespace := route.Namespace
 	return p.router.RouteManager().selectActivationDestinationWithin(route, req, p.registry, allowed, func(pool string) bool {
 		return p.activator.IsEnabled(namespace, pool)
 	})
@@ -526,7 +526,7 @@ func (p *Proxy) activateRouteDestination(ctx context.Context, route *Route, req 
 	if selected == nil {
 		return nil, 0
 	}
-	namespace := routeNamespace(route)
+	namespace := route.Namespace
 	wait, enabled, err := p.activatePool(ctx, namespace, selected.Pool)
 	if err != nil {
 		p.logger.Warn("failed to activate inference route destination", zap.String("namespace", namespace), zap.String("pool", selected.Pool), zap.Error(err))
@@ -607,17 +607,6 @@ func (p *Proxy) activatePool(ctx context.Context, namespace, pool string) (time.
 		return 0, false, nil
 	}
 	return p.activator.Activate(ctx, namespace, pool)
-}
-
-func routeNamespace(route *Route) string {
-	if route == nil {
-		return ""
-	}
-	namespace, _, found := strings.Cut(route.Name, "/")
-	if !found {
-		return ""
-	}
-	return namespace
 }
 
 func (p *Proxy) waitForRouteDestination(ctx context.Context, namespace string, destination *Destination, req *RouteRequest, allowed map[string]endpointRef, maxWait time.Duration) *Destination {
