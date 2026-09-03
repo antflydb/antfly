@@ -266,9 +266,147 @@ func TestValidateInferencePool_AcceleratorWithGPU(t *testing.T) {
 			"nvidia.com/gpu": resource.MustParse("1"),
 		},
 	}
+	pool.Spec.Hardware.Accelerator = "nvidia-l4"
 
 	if err := pool.ValidateInferencePool(); err != nil {
 		t.Errorf("expected no error for Accelerator with GPU, got: %v", err)
+	}
+}
+
+func TestValidateInferencePool_AcceleratorWithRequestedGPU(t *testing.T) {
+	pool := validPool()
+	pool.Spec.GKE = &GKEConfig{
+		Autopilot:             true,
+		AutopilotComputeClass: "Accelerator",
+	}
+	pool.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("1"),
+		},
+	}
+	pool.Spec.Hardware.Accelerator = "nvidia-l4"
+
+	if err := pool.ValidateInferencePool(); err != nil {
+		t.Errorf("expected GPU requests to satisfy validation, got: %v", err)
+	}
+}
+
+func TestValidateInferencePool_AcceleratorRequiresGPUType(t *testing.T) {
+	pool := validPool()
+	pool.Spec.GKE = &GKEConfig{Autopilot: true, AutopilotComputeClass: "Accelerator"}
+	pool.Spec.Resources = &corev1.ResourceRequirements{Limits: corev1.ResourceList{
+		"nvidia.com/gpu": resource.MustParse("1"),
+	}}
+
+	err := pool.ValidateInferencePool()
+	if err == nil || !strings.Contains(err.Error(), "spec.hardware.accelerator") {
+		t.Fatalf("expected missing GPU type error, got %v", err)
+	}
+}
+
+func TestValidateInferencePool_AutopilotGPURequiresAcceleratorClass(t *testing.T) {
+	pool := validPool()
+	pool.Spec.GKE = &GKEConfig{Autopilot: true, AutopilotComputeClass: "Balanced"}
+	pool.Spec.Hardware.Accelerator = "nvidia-l4"
+	pool.Spec.Resources = &corev1.ResourceRequirements{Limits: corev1.ResourceList{
+		"nvidia.com/gpu": resource.MustParse("1"),
+	}}
+
+	err := pool.ValidateInferencePool()
+	if err == nil || !strings.Contains(err.Error(), "must be 'Accelerator'") {
+		t.Fatalf("expected Autopilot GPU compute class error, got %v", err)
+	}
+}
+
+func TestValidateInferencePool_ExplicitInferenceBackend(t *testing.T) {
+	tests := []struct {
+		name        string
+		backend     InferenceRuntimeBackend
+		accelerator string
+		gpu         bool
+		wantError   string
+	}{
+		{name: "cpu", backend: InferenceRuntimeBackendCPU},
+		{name: "cpu rejects accelerator", backend: InferenceRuntimeBackendCPU, accelerator: "nvidia-l4", wantError: "cannot be combined"},
+		{name: "cuda accelerator without resource", backend: InferenceRuntimeBackendCUDA, accelerator: "nvidia-l4", wantError: "positive GPU request or limit"},
+		{name: "cuda resource", backend: InferenceRuntimeBackendCUDA, gpu: true},
+		{name: "cuda requires hardware", backend: InferenceRuntimeBackendCUDA, wantError: "positive GPU request or limit"},
+		{name: "cuda rejects tpu", backend: InferenceRuntimeBackendCUDA, accelerator: "tpu-v5-lite-podslice", wantError: "cannot use a TPU"},
+		{name: "pjrt", backend: InferenceRuntimeBackendPJRT, accelerator: "tpu-v5-lite-podslice"},
+		{name: "pjrt requires tpu", backend: InferenceRuntimeBackendPJRT, accelerator: "nvidia-l4", wantError: "requires a TPU"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pool := validPool()
+			pool.Spec.Hardware.InferenceBackend = test.backend
+			pool.Spec.Hardware.Accelerator = test.accelerator
+			if test.gpu {
+				pool.Spec.Resources = &corev1.ResourceRequirements{Limits: corev1.ResourceList{
+					"nvidia.com/gpu": resource.MustParse("1"),
+				}}
+			}
+			err := pool.ValidateInferencePool()
+			if test.wantError == "" {
+				if err != nil {
+					t.Fatalf("unexpected validation error: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("expected error containing %q, got %v", test.wantError, err)
+			}
+		})
+	}
+}
+
+func TestHasGPUResourcesRequiresPositiveQuantity(t *testing.T) {
+	zero := &corev1.ResourceRequirements{Limits: corev1.ResourceList{
+		"nvidia.com/gpu": resource.MustParse("0"),
+	}}
+	if HasGPUResources(zero) {
+		t.Fatal("zero GPU limit must not satisfy the backend capability contract")
+	}
+	positive := &corev1.ResourceRequirements{Requests: corev1.ResourceList{
+		"cloud.google.com/gke-gpu": resource.MustParse("1"),
+	}}
+	if !HasGPUResources(positive) {
+		t.Fatal("positive GPU request must satisfy the backend capability contract")
+	}
+}
+
+func TestValidateInferencePool_ScaleToZeroContract(t *testing.T) {
+	idle := metav1.Duration{Duration: 10 * time.Minute}
+	wait := metav1.Duration{Duration: 4 * time.Minute}
+	wake := int32(1)
+	pool := validPool()
+	pool.Spec.Replicas = ReplicaConfig{Min: 0, Max: 1}
+	pool.Spec.Autoscaling = &AutoscalingConfig{Enabled: false}
+	pool.Spec.ScaleToZero = &ScaleToZeroConfig{
+		Enabled:           true,
+		IdleTimeout:       &idle,
+		ActivationTimeout: &wait,
+		WakeReplicas:      &wake,
+	}
+	if err := pool.ValidateInferencePool(); err != nil {
+		t.Fatalf("expected valid scale-to-zero config, got %v", err)
+	}
+}
+
+func TestValidateInferencePool_RejectsScaleToZeroWithNonzeroMinimum(t *testing.T) {
+	pool := validPool()
+	pool.Spec.ScaleToZero = &ScaleToZeroConfig{Enabled: true}
+	err := pool.ValidateInferencePool()
+	if err == nil || !strings.Contains(err.Error(), "spec.replicas.min must be 0") {
+		t.Fatalf("expected scale-to-zero minimum error, got %v", err)
+	}
+}
+
+func TestValidateInferencePool_RejectsScaleToZeroWithHPA(t *testing.T) {
+	pool := validPool()
+	pool.Spec.Replicas.Min = 0
+	pool.Spec.Autoscaling = &AutoscalingConfig{Enabled: true}
+	pool.Spec.ScaleToZero = &ScaleToZeroConfig{Enabled: true}
+	err := pool.ValidateInferencePool()
+	if err == nil || !strings.Contains(err.Error(), "spec.autoscaling.enabled must be false") {
+		t.Fatalf("expected scale-to-zero HPA conflict, got %v", err)
 	}
 }
 

@@ -1,0 +1,39 @@
+name: Nightly request
+
+# "nightly" is a channel contract, not a required cadence. This workflow emits
+# only an untrusted request; the default-branch build controller validates it.
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: "Optional exact commit from the default branch; defaults to its current head"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: antfly-nightly-build
+  cancel-in-progress: false
+
+jobs:
+  request:
+    name: Request a nightly snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write untrusted nightly request
+        env:
+          REQUESTED_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          mkdir -p dist/build-request
+          jq -n \
+            --arg tag "v0.0.0-dev.${GITHUB_RUN_ID}" \
+            --arg source_commit "$REQUESTED_COMMIT" \
+            '{schema_version: 1, request_kind: "nightly", tag: $tag, source_commit: $source_commit, channel: "nightly"}' \
+            > dist/build-request/build-request.json
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: antfly-build-request
+          path: dist/build-request/build-request.json
+          if-no-files-found: error

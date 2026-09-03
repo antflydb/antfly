@@ -441,16 +441,16 @@ describe("Listener", () => {
       );
 
       await waitFor(() => {
-        expect(msearchSpy.mock.calls.length).toBeGreaterThan(callCountBeforeRerender);
+        const autosuggestQuery = msearchSpy.mock.calls
+          .slice(callCountBeforeRerender)
+          .flatMap((call) => call[1] ?? [])
+          .find(
+            (request: { query?: { fields?: string[] } }) =>
+              request.query?.fields?.[0] === "name__keyword"
+          );
+
+        expect(autosuggestQuery).toBeTruthy();
       });
-
-      const latestQueries = msearchSpy.mock.calls[msearchSpy.mock.calls.length - 1][1];
-      const autosuggestQuery = latestQueries.find(
-        (request: { query?: { fields?: string[] } }) =>
-          request.query?.fields?.[0] === "name__keyword"
-      );
-
-      expect(autosuggestQuery).toBeTruthy();
 
       msearchSpy.mockRestore();
     });

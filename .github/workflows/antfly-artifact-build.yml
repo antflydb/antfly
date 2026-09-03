@@ -1,0 +1,226 @@
+name: Immutable Antfly artifact build
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        description: "Version identity, including v prefix"
+        required: true
+        type: string
+      source_commit:
+        description: "Exact default-branch commit to build"
+        required: true
+        type: string
+      channel:
+        description: "auto, stable, next, or nightly"
+        required: true
+        type: string
+      build_controller_commit:
+        description: "Exact default-branch workflow and script controller commit"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ZIG_VERSION: 0.16.0
+  NIXPKGS_REV: c5c4a43b0e8056328ec4529f735cabdb8f1942bb
+  MACOS_SDK_VERSION: "15.5"
+  MACOS_SDK_SHA256: c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
+
+jobs:
+  release-plan:
+    name: Resolve artifact and channel policy
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.platforms.outputs.matrix }}
+      channel: ${{ steps.channel.outputs.channel }}
+      build_controller_commit: ${{ steps.controller.outputs.commit }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.build_controller_commit }}
+          fetch-depth: 0
+      - name: Validate pinned release build controller
+        id: controller
+        env:
+          BUILD_CONTROLLER_COMMIT: ${{ inputs.build_controller_commit }}
+          WORKFLOW_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_CONTROLLER_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$BUILD_CONTROLLER_COMMIT"
+          test "$WORKFLOW_COMMIT" = "$BUILD_CONTROLLER_COMMIT"
+          echo "commit=$BUILD_CONTROLLER_COMMIT" >> "$GITHUB_OUTPUT"
+      - name: Require compatible immutable default-branch source
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" "origin/$DEFAULT_BRANCH"
+          python scripts/release/validate_source_contract.py --commit "$SOURCE_COMMIT"
+      - name: Validate release channel
+        id: channel
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          REQUESTED_CHANNEL: ${{ inputs.channel }}
+        run: |
+          python scripts/release/release_channels.py resolve \
+            --tag "$RELEASE_TAG" \
+            --channel "$REQUESTED_CHANNEL" \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Validate and export release platforms
+        id: platforms
+        run: |
+          matrix="$(python scripts/release/release_platforms.py github-matrix)"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build-zig-runtime-archives:
+    name: Build Zig archive (${{ matrix.artifact_name }})
+    needs: release-plan
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.release-plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_commit }}
+          submodules: true
+
+      - name: Install Linux build dependencies
+        if: ${{ matrix.os == 'linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates file
+
+      - name: Install Nix
+        if: ${{ matrix.os == 'linux' }}
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ env.NIXPKGS_REV }}.tar.gz
+
+      - name: Install glibc-linked Zig
+        if: ${{ matrix.os == 'linux' }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A zig_0_16 --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
+
+      - name: Install pinned macOS cross-compilation SDK
+        if: ${{ matrix.macos_sdk == 'true' }}
+        run: |
+          set -euo pipefail
+          sdk_archive="$RUNNER_TEMP/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"
+          sdk_stage="$RUNNER_TEMP/macos-sdk"
+          curl --fail --location --retry 3 \
+            "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" \
+            -o "$sdk_archive"
+          echo "$MACOS_SDK_SHA256  $sdk_archive" | sha256sum --check --strict
+          mkdir -p "$sdk_stage"
+          tar -xJf "$sdk_archive" -C "$sdk_stage"
+          sdk_path="$sdk_stage/MacOSX${MACOS_SDK_VERSION}.sdk"
+          test -d "$sdk_path/System/Library/Frameworks/Metal.framework"
+          test -d "$sdk_path/System/Library/Frameworks/MetalPerformanceShaders.framework"
+          test -d "$sdk_path/System/Library/Frameworks/Accelerate.framework"
+          echo "SDK_PATH=$sdk_path" >> "$GITHUB_ENV"
+
+      - name: Test reproducible archive packaging
+        run: python3 scripts/packaging/test_reproducible_tar.py
+
+      - name: Build archive
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          archive="antfly_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}${{ matrix.archive_suffix }}.tar.gz"
+          jobs_arg=()
+          if [ -n "${{ matrix.zig_jobs }}" ]; then
+            jobs_arg=(--jobs "${{ matrix.zig_jobs }}")
+          fi
+          scripts/packaging/build_zig_release_archive.sh \
+            --version "$version" \
+            --target "${{ matrix.zig_target }}" \
+            --optimize "${{ matrix.zig_optimize }}" \
+            "${jobs_arg[@]}" \
+            --archive-name "$archive" \
+            --out-dir dist/release-archives \
+            --metal "${{ matrix.metal }}" \
+            --system-blas "${{ matrix.system_blas }}"
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/release-archives/*.tar.gz
+          if-no-files-found: error
+
+  package-cli-artifacts:
+    name: Build immutable CLI package snapshot
+    needs:
+      - release-plan
+      - build-zig-runtime-archives
+    uses: ./.github/workflows/cli-package.yml
+    with:
+      version: ${{ inputs.tag_name }}
+      source_commit: ${{ inputs.source_commit }}
+
+  package-release-source:
+    name: Stage commit-bound release support files
+    needs: release-plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.release-plan.outputs.build_controller_commit }}
+          fetch-depth: 0
+      - name: Stage exact source objects
+        run: |
+          git fetch --no-tags origin "${{ inputs.source_commit }}"
+          python scripts/release/stage_release_source.py \
+            --commit "${{ inputs.source_commit }}" \
+            --out-dir dist/release-source
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: antfly-release-source
+          path: dist/release-source/
+          if-no-files-found: error
+
+  release-request:
+    name: Record immutable release identity
+    needs:
+      - release-plan
+      - build-zig-runtime-archives
+      - package-cli-artifacts
+      - package-release-source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.release-plan.outputs.build_controller_commit }}
+      - name: Write request
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          BUILD_CONTROLLER_COMMIT: ${{ needs.release-plan.outputs.build_controller_commit }}
+          RELEASE_CHANNEL: ${{ needs.release-plan.outputs.channel }}
+        run: |
+          mkdir -p dist/release-request
+          python scripts/release/release_channels.py spec \
+            --tag "$RELEASE_TAG" \
+            --channel "$RELEASE_CHANNEL" \
+            --source-commit "$SOURCE_COMMIT" \
+            --build-controller-commit "$BUILD_CONTROLLER_COMMIT" \
+            > dist/release-request/release-request.json
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: antfly-release-request
+          path: dist/release-request/release-request.json
+          if-no-files-found: error
