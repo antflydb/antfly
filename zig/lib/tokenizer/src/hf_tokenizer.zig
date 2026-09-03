@@ -36,6 +36,17 @@ const PreTokenizerType = enum {
     none, // No pre-tokenization
 };
 
+const ByteLevelPretokenizer = enum {
+    gpt2,
+    /// Exact scanner for the Split(regex)+ByteLevel sequence shipped by
+    /// Qwen3-VL. ByteLevel itself has `use_regex=false`; the preceding Split
+    /// owns the pretoken boundaries.
+    qwen,
+};
+
+const qwen_byte_level_split_regex =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
 const MetaspacePrependScheme = enum {
     always,
     first,
@@ -48,14 +59,30 @@ pub const HfTokenizer = struct {
     vocab: std.StringHashMapUnmanaged(i32),
     id_to_token: std.AutoHashMapUnmanaged(i32, []const u8),
     added_tokens: std.StringHashMapUnmanaged(i32),
+    special_token_ids: std.AutoHashMapUnmanaged(i32, void),
     /// Trie of added-token byte sequences for fast longest-match-at-cursor and
     /// next-occurrence lookups. Built lazily after `parseAddedTokens`.
     added_trie: AddedTokenTrie,
     special: SpecialTokens,
     pad_token_seen: bool,
+    /// TemplateProcessing post-processor wrap: token IDs emitted before and
+    /// after the encoded sequence (e.g. Qwen3-Embedding appends a single
+    /// <|endoftext|>). Owned by `allocator`; freed on deinit.
+    template_prepend_ids: []i32,
+    template_append_ids: []i32,
+    /// True when a TemplateProcessing post-processor (or GGUF
+    /// add_bos/add_eos metadata) supplied an explicit wrap template. The
+    /// template then replaces the legacy [CLS]/[SEP] wrap in encodeForModel.
+    has_template_processing: bool,
+    /// True when cls/sep were explicitly assigned by a post-processor,
+    /// added-token match, or applySpecialTokenIds — as opposed to resting at
+    /// the BERT-flavored struct defaults (101/102). Non-word-piece models
+    /// without explicit wrap tokens must not be wrapped with those defaults.
+    wrap_specials_explicit: bool,
     do_lowercase: bool,
     replace_space_with: ?[]const u8,
     pre_tokenizer_type: PreTokenizerType,
+    byte_level_pretokenizer: ByteLevelPretokenizer,
     // WordPiece fields
     continuing_prefix: []const u8,
     max_input_chars_per_word: usize,
@@ -704,6 +731,7 @@ pub const HfTokenizer = struct {
         .encodeGeneration = @ptrCast(&encodeGeneration),
         .decode = @ptrCast(&decode),
         .specialTokens = @ptrCast(&getSpecialTokens),
+        .allSpecialTokenIds = @ptrCast(&getAllSpecialTokenIds),
         .vocabSize = @ptrCast(&getVocabSize),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -730,13 +758,39 @@ pub const HfTokenizer = struct {
         pad_id: ?i32,
         unk_id: ?i32,
     ) void {
-        if (bos_id) |id| self.special.cls_id = id;
-        if (eos_id) |id| self.special.sep_id = id;
+        if (bos_id) |id| {
+            self.special.cls_id = id;
+            self.wrap_specials_explicit = true;
+        }
+        if (eos_id) |id| {
+            self.special.sep_id = id;
+            self.wrap_specials_explicit = true;
+        }
         if (pad_id) |id| {
             self.special.pad_id = id;
             self.pad_token_seen = true;
         }
         if (unk_id) |id| self.special.unk_id = id;
+    }
+
+    /// Install an explicit encodeForModel wrap template, overriding both the
+    /// legacy [CLS]/[SEP] wrap and any tokenizer.json-derived template. GGUF
+    /// loaders use this to honor tokenizer.ggml.add_bos_token /
+    /// add_eos_token metadata (e.g. Qwen3-Embedding: no BOS, one trailing
+    /// EOS) instead of unconditionally wrapping with bos/eos.
+    pub fn applyModelWrapTemplate(
+        self: *HfTokenizer,
+        prepend_ids: []const i32,
+        append_ids: []const i32,
+    ) !void {
+        const owned_prepend = try self.allocator.dupe(i32, prepend_ids);
+        errdefer self.allocator.free(owned_prepend);
+        const owned_append = try self.allocator.dupe(i32, append_ids);
+        if (self.template_prepend_ids.len > 0) self.allocator.free(self.template_prepend_ids);
+        if (self.template_append_ids.len > 0) self.allocator.free(self.template_append_ids);
+        self.template_prepend_ids = owned_prepend;
+        self.template_append_ids = owned_append;
+        self.has_template_processing = true;
     }
 
     /// Load from a tokenizer.json file via an Io.Dir handle.
@@ -779,12 +833,18 @@ pub const HfTokenizer = struct {
             .vocab = .{},
             .id_to_token = .{},
             .added_tokens = .{},
+            .special_token_ids = .{},
             .added_trie = .{},
             .special = .{},
             .pad_token_seen = false,
+            .template_prepend_ids = &.{},
+            .template_append_ids = &.{},
+            .has_template_processing = false,
+            .wrap_specials_explicit = false,
             .do_lowercase = false,
             .replace_space_with = null,
             .pre_tokenizer_type = .bert,
+            .byte_level_pretokenizer = .gpt2,
             .continuing_prefix = "##",
             .max_input_chars_per_word = 100,
             .merge_ranks = .{},
@@ -944,10 +1004,12 @@ pub const HfTokenizer = struct {
                         self.pre_tokenizer_type = .none;
                     }
                 } else if (std.mem.eql(u8, t.string, "Sequence")) {
-                    var saw_split = false;
-                    // For Sequence pre-tokenizers, use the first meaningful type.
-                    // CLIP commonly uses Split(regex) followed by ByteLevel; the
-                    // split removes whitespace before byte-level BPE runs.
+                    var saw_removed_inverted_split = false;
+                    var saw_qwen_byte_level_split = false;
+                    // Preserve the Split semantics that precede ByteLevel. CLIP
+                    // uses Removed+invert=true and intentionally discards the
+                    // unmatched whitespace. Qwen and Llama use Isolated splits,
+                    // whose whitespace must remain part of byte-level pretokens.
                     if (obj.get("pretokenizers")) |pts| {
                         if (pts == .array) {
                             for (pts.array.items) |item| {
@@ -955,9 +1017,13 @@ pub const HfTokenizer = struct {
                                     if (item.object.get("type")) |pt| {
                                         if (pt == .string) {
                                             if (std.mem.eql(u8, pt.string, "Split")) {
-                                                saw_split = true;
+                                                saw_removed_inverted_split = splitRemovesUnmatchedText(item.object);
+                                                saw_qwen_byte_level_split = splitUsesQwenByteLevelRegex(item.object);
                                             } else if (std.mem.eql(u8, pt.string, "ByteLevel")) {
-                                                self.pre_tokenizer_type = if (saw_split) .byte_level_split else .byte_level;
+                                                self.pre_tokenizer_type = if (saw_removed_inverted_split) .byte_level_split else .byte_level;
+                                                if (!saw_removed_inverted_split and saw_qwen_byte_level_split) {
+                                                    self.byte_level_pretokenizer = .qwen;
+                                                }
                                                 return;
                                             } else if (std.mem.eql(u8, pt.string, "Metaspace")) {
                                                 self.pre_tokenizer_type = .metaspace;
@@ -976,6 +1042,30 @@ pub const HfTokenizer = struct {
                 }
             }
         }
+    }
+
+    fn splitRemovesUnmatchedText(obj: std.json.ObjectMap) bool {
+        const behavior = obj.get("behavior") orelse return false;
+        const invert = obj.get("invert") orelse return false;
+        return behavior == .string and
+            std.mem.eql(u8, behavior.string, "Removed") and
+            invert == .bool and invert.bool;
+    }
+
+    fn splitUsesQwenByteLevelRegex(obj: std.json.ObjectMap) bool {
+        const behavior = obj.get("behavior") orelse return false;
+        const invert = obj.get("invert") orelse return false;
+        const pattern = obj.get("pattern") orelse return false;
+        if (behavior != .string or
+            !std.mem.eql(u8, behavior.string, "Isolated") or
+            invert != .bool or invert.bool or
+            pattern != .object)
+        {
+            return false;
+        }
+        const regex = pattern.object.get("Regex") orelse return false;
+        return regex == .string and
+            std.mem.eql(u8, regex.string, qwen_byte_level_split_regex);
     }
 
     fn inferModelType(obj: std.json.ObjectMap) ModelType {
@@ -1316,6 +1406,11 @@ pub const HfTokenizer = struct {
             const key = try self.dupeArenaString(content.string);
             try self.added_tokens.put(self.allocator, key, id);
             try self.added_trie.insert(self.allocator, key, id);
+            if (item.object.get("special")) |special_value| {
+                if (special_value == .bool and special_value.bool) {
+                    try self.special_token_ids.put(self.allocator, id, {});
+                }
+            }
 
             // Also add to vocab/id_to_token if not present
             if (!self.vocab.contains(key)) {
@@ -1324,8 +1419,14 @@ pub const HfTokenizer = struct {
             }
 
             // Detect common special tokens by content
-            if (std.mem.eql(u8, content.string, "[CLS]")) self.special.cls_id = id;
-            if (std.mem.eql(u8, content.string, "[SEP]")) self.special.sep_id = id;
+            if (std.mem.eql(u8, content.string, "[CLS]")) {
+                self.special.cls_id = id;
+                self.wrap_specials_explicit = true;
+            }
+            if (std.mem.eql(u8, content.string, "[SEP]")) {
+                self.special.sep_id = id;
+                self.wrap_specials_explicit = true;
+            }
             if (std.mem.eql(u8, content.string, "[PAD]")) {
                 self.special.pad_id = id;
                 self.pad_token_seen = true;
@@ -1333,10 +1434,22 @@ pub const HfTokenizer = struct {
             if (std.mem.eql(u8, content.string, "[UNK]")) self.special.unk_id = id;
             if (std.mem.eql(u8, content.string, "[MASK]")) self.special.mask_id = id;
             // RoBERTa/GPT-style special tokens
-            if (std.mem.eql(u8, content.string, "<s>")) self.special.cls_id = id;
-            if (std.mem.eql(u8, content.string, "<bos>")) self.special.cls_id = id;
-            if (std.mem.eql(u8, content.string, "</s>")) self.special.sep_id = id;
-            if (std.mem.eql(u8, content.string, "<eos>")) self.special.sep_id = id;
+            if (std.mem.eql(u8, content.string, "<s>")) {
+                self.special.cls_id = id;
+                self.wrap_specials_explicit = true;
+            }
+            if (std.mem.eql(u8, content.string, "<bos>")) {
+                self.special.cls_id = id;
+                self.wrap_specials_explicit = true;
+            }
+            if (std.mem.eql(u8, content.string, "</s>")) {
+                self.special.sep_id = id;
+                self.wrap_specials_explicit = true;
+            }
+            if (std.mem.eql(u8, content.string, "<eos>")) {
+                self.special.sep_id = id;
+                self.wrap_specials_explicit = true;
+            }
             if (std.mem.eql(u8, content.string, "<pad>")) {
                 self.special.pad_id = id;
                 self.pad_token_seen = true;
@@ -1352,10 +1465,29 @@ pub const HfTokenizer = struct {
         else
             "";
 
+        // Composite post-processors nest the interesting entries one level
+        // down (e.g. Qwen3 ships Sequence[ByteLevel, TemplateProcessing]).
+        if (std.mem.eql(u8, processor_type, "Sequence")) {
+            if (obj.get("processors")) |procs| {
+                if (procs == .array) {
+                    for (procs.array.items) |proc| {
+                        if (proc == .object) self.parsePostProcessor(proc.object);
+                    }
+                }
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, processor_type, "TemplateProcessing")) {
+            self.parseTemplateProcessing(obj);
+            return;
+        }
+
         if (obj.get("cls")) |cls| {
             if (cls == .array and cls.array.items.len >= 2) {
                 if (cls.array.items[1] == .integer) {
                     self.special.cls_id = @intCast(cls.array.items[1].integer);
+                    self.wrap_specials_explicit = true;
                 }
             }
         }
@@ -1363,25 +1495,11 @@ pub const HfTokenizer = struct {
             if (sep == .array and sep.array.items.len >= 2) {
                 if (sep.array.items[1] == .integer) {
                     self.special.sep_id = @intCast(sep.array.items[1].integer);
+                    self.wrap_specials_explicit = true;
                 }
             }
         }
-        if (obj.get("special_tokens")) |st| {
-            if (st == .object) {
-                if (st.object.get("[CLS]")) |cls| self.resolveSpecialToken(cls, &self.special.cls_id);
-                if (st.object.get("[SEP]")) |sep| self.resolveSpecialToken(sep, &self.special.sep_id);
-                if (st.object.get("[PAD]")) |pad| {
-                    self.resolveSpecialToken(pad, &self.special.pad_id);
-                    self.pad_token_seen = true;
-                }
-                if (st.object.get("<bos>")) |bos| self.resolveSpecialToken(bos, &self.special.cls_id);
-                if (st.object.get("<eos>")) |eos| self.resolveSpecialToken(eos, &self.special.sep_id);
-                if (st.object.get("<pad>")) |pad| {
-                    self.resolveSpecialToken(pad, &self.special.pad_id);
-                    self.pad_token_seen = true;
-                }
-            }
-        }
+        self.extractSpecialTokensMap(obj);
 
         if (!self.pad_token_seen and
             std.mem.eql(u8, processor_type, "RobertaProcessing") and
@@ -1390,6 +1508,113 @@ pub const HfTokenizer = struct {
             // CLIP tokenizers use RobertaProcessing with BOS/EOS specials but
             // no distinct pad token. HuggingFace pads these models with EOS.
             self.special.pad_id = self.special.sep_id;
+        }
+    }
+
+    fn extractSpecialTokensMap(self: *HfTokenizer, obj: std.json.ObjectMap) void {
+        if (obj.get("special_tokens")) |st| {
+            if (st == .object) {
+                if (st.object.get("[CLS]")) |cls| {
+                    self.resolveSpecialToken(cls, &self.special.cls_id);
+                    self.wrap_specials_explicit = true;
+                }
+                if (st.object.get("[SEP]")) |sep| {
+                    self.resolveSpecialToken(sep, &self.special.sep_id);
+                    self.wrap_specials_explicit = true;
+                }
+                if (st.object.get("[PAD]")) |pad| {
+                    self.resolveSpecialToken(pad, &self.special.pad_id);
+                    self.pad_token_seen = true;
+                }
+                if (st.object.get("<bos>")) |bos| {
+                    self.resolveSpecialToken(bos, &self.special.cls_id);
+                    self.wrap_specials_explicit = true;
+                }
+                if (st.object.get("<eos>")) |eos| {
+                    self.resolveSpecialToken(eos, &self.special.sep_id);
+                    self.wrap_specials_explicit = true;
+                }
+                if (st.object.get("<pad>")) |pad| {
+                    self.resolveSpecialToken(pad, &self.special.pad_id);
+                    self.pad_token_seen = true;
+                }
+            }
+        }
+    }
+
+    /// Parse a TemplateProcessing post-processor's `single` template into
+    /// prepend/append wrap-token lists. `SpecialToken` entries resolve
+    /// through the processor's `special_tokens` map by name; the `Sequence`
+    /// entry marks the boundary between prepended and appended specials.
+    /// Qwen3-Embedding uses `[Sequence A, <|endoftext|>]`; BERT-style
+    /// tokenizers use `[[CLS], Sequence A, [SEP]]` — both resolve here.
+    fn parseTemplateProcessing(self: *HfTokenizer, obj: std.json.ObjectMap) void {
+        self.extractSpecialTokensMap(obj);
+
+        const single = obj.get("single") orelse return;
+        if (single != .array) return;
+        const st_map: ?std.json.ObjectMap = if (obj.get("special_tokens")) |st|
+            (if (st == .object) st.object else null)
+        else
+            null;
+
+        var prepend = std.ArrayListUnmanaged(i32).empty;
+        defer prepend.deinit(self.allocator);
+        var append = std.ArrayListUnmanaged(i32).empty;
+        defer append.deinit(self.allocator);
+        var seen_sequence = false;
+
+        for (single.array.items) |entry| {
+            if (entry != .object) continue;
+            if (entry.object.get("Sequence") != null) {
+                seen_sequence = true;
+                continue;
+            }
+            const special = entry.object.get("SpecialToken") orelse continue;
+            if (special != .object) continue;
+            const name_val = special.object.get("id") orelse continue;
+            if (name_val != .string) continue;
+            var resolved: i32 = -1;
+            if (st_map) |map| {
+                if (map.get(name_val.string)) |st_entry| {
+                    self.resolveSpecialToken(st_entry, &resolved);
+                }
+            }
+            if (resolved < 0) {
+                // Fall back to vocab/added-token lookup by content.
+                if (self.added_tokens.get(name_val.string)) |id| {
+                    resolved = id;
+                } else if (self.vocab.get(name_val.string)) |id| {
+                    resolved = id;
+                }
+            }
+            if (resolved < 0) return; // Unresolvable template: keep legacy wrap.
+            const target = if (seen_sequence) &append else &prepend;
+            target.append(self.allocator, resolved) catch return;
+        }
+        if (!seen_sequence) return;
+
+        const owned_prepend = self.allocator.dupe(i32, prepend.items) catch return;
+        const owned_append = self.allocator.dupe(i32, append.items) catch {
+            self.allocator.free(owned_prepend);
+            return;
+        };
+        if (self.template_prepend_ids.len > 0) self.allocator.free(self.template_prepend_ids);
+        if (self.template_append_ids.len > 0) self.allocator.free(self.template_append_ids);
+        self.template_prepend_ids = owned_prepend;
+        self.template_append_ids = owned_append;
+        self.has_template_processing = true;
+
+        // Keep cls/sep coherent with the template edges so consumers that
+        // reason in bos/eos terms (encodeGeneration, pad fallbacks) see the
+        // template's tokens rather than the BERT-flavored defaults.
+        if (owned_prepend.len > 0) {
+            self.special.cls_id = owned_prepend[0];
+            self.wrap_specials_explicit = true;
+        }
+        if (owned_append.len > 0) {
+            self.special.sep_id = owned_append[owned_append.len - 1];
+            self.wrap_specials_explicit = true;
         }
     }
 
@@ -2884,6 +3109,7 @@ pub const HfTokenizer = struct {
             text.len < parallel_bpe_min_bytes or
             self.model_type != .bpe or
             self.pre_tokenizer_type != .byte_level or
+            self.byte_level_pretokenizer != .gpt2 or
             self.do_lowercase or
             self.replace_space_with != null or
             self.end_of_word_suffix.len != 0)
@@ -3741,6 +3967,15 @@ pub const HfTokenizer = struct {
         scratch: *BpeScratch,
     ) !void {
         try ids.ensureUnusedCapacity(allocator, (text.len / 3) + 8);
+        if (self.byte_level_pretokenizer == .qwen) {
+            var start: usize = 0;
+            while (start < text.len) {
+                const end = qwenPreTokenEnd(text, start);
+                try self.bpeEncodeWord(allocator, text[start..end], ids, scratch);
+                start = end;
+            }
+            return;
+        }
         var start: usize = 0;
         while (start < text.len) {
             if (gpt2AsciiBoundaryMask(text, start)) |boundary_mask| {
@@ -5011,7 +5246,7 @@ pub const HfTokenizer = struct {
         }
     }
 
-    /// Count exact GPT-2 ByteLevel pretokens without vocabulary lookup, cache
+    /// Count exact ByteLevel pretokens without vocabulary lookup, cache
     /// access, BPE merging, or output allocation. This isolates scanner
     /// throughput for the benchmark harness while sharing the production
     /// boundary implementation.
@@ -5024,6 +5259,13 @@ pub const HfTokenizer = struct {
         }
         var count: usize = 0;
         var start: usize = 0;
+        if (self.byte_level_pretokenizer == .qwen) {
+            while (start < text.len) {
+                start = qwenPreTokenEnd(text, start);
+                count +|= 1;
+            }
+            return count;
+        }
         while (start < text.len) {
             if (gpt2AsciiBoundaryMask(text, start)) |boundary_mask| {
                 const remaining = boundary_mask & ~@as(u64, 1);
@@ -6750,21 +6992,33 @@ pub const HfTokenizer = struct {
             defer allocator.free(raw_ids);
 
             const special = self.getSpecialTokens();
-            const max_tokens = if (max_length >= 2) max_length - 2 else 0;
+            const legacy_wrap = [2]i32{ special.cls_id, special.sep_id };
+            const plan = self.modelWrapPlan(&legacy_wrap);
+            const wrap_len = plan.prepend.len + plan.append.len;
+            const max_tokens = if (max_length > wrap_len) max_length - wrap_len else 0;
             const token_count = @min(raw_ids.len, max_tokens);
-            const total = token_count + 2;
             const ids = try allocator.alloc(i32, max_length);
             const mask = try allocator.alloc(i32, max_length);
 
-            ids[0] = special.cls_id;
-            mask[0] = 1;
-            for (0..token_count) |i| {
-                ids[i + 1] = raw_ids[i];
-                mask[i + 1] = 1;
+            var pos: usize = 0;
+            for (plan.prepend) |tid| {
+                if (pos >= max_length) break;
+                ids[pos] = tid;
+                mask[pos] = 1;
+                pos += 1;
             }
-            ids[total - 1] = special.sep_id;
-            mask[total - 1] = 1;
-            for (total..max_length) |i| {
+            for (raw_ids[0..token_count]) |tid| {
+                ids[pos] = tid;
+                mask[pos] = 1;
+                pos += 1;
+            }
+            for (plan.append) |tid| {
+                if (pos >= max_length) break;
+                ids[pos] = tid;
+                mask[pos] = 1;
+                pos += 1;
+            }
+            for (pos..max_length) |i| {
                 ids[i] = special.pad_id;
                 mask[i] = 0;
             }
@@ -6774,6 +7028,38 @@ pub const HfTokenizer = struct {
                 .allocator = allocator,
             };
         }
+    }
+
+    const WrapPlan = struct {
+        prepend: []const i32,
+        append: []const i32,
+    };
+
+    /// Decide how encodeForModel wraps the raw sequence:
+    /// 1. A parsed TemplateProcessing template wins (HF truncates the
+    ///    sequence first, so wrap tokens always survive truncation).
+    /// 2. Explicitly declared cls/sep (post-processor, added tokens, or GGUF
+    ///    metadata) keep the legacy single-token wrap.
+    /// 3. WordPiece models keep the historical BERT-default wrap even
+    ///    without explicit declarations.
+    /// 4. Everything else (e.g. BPE decoders without a post-processor) gets
+    ///    no wrap — matching HF, which adds nothing for such models. The
+    ///    BERT-flavored SpecialTokens defaults (101/102) must never leak
+    ///    into a decoder-model encoding.
+    fn modelWrapPlan(self: *const HfTokenizer, legacy: *const [2]i32) WrapPlan {
+        if (self.has_template_processing) {
+            return .{
+                .prepend = self.template_prepend_ids,
+                .append = self.template_append_ids,
+            };
+        }
+        if (self.wrap_specials_explicit or self.model_type == .word_piece) {
+            return .{
+                .prepend = if (legacy[0] >= 0) legacy[0..1] else &.{},
+                .append = if (legacy[1] >= 0) legacy[1..2] else &.{},
+            };
+        }
+        return .{ .prepend = &.{}, .append = &.{} };
     }
 
     fn unigramEncodeWord(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8, ids: *std.ArrayListUnmanaged(i32)) !void {
@@ -7013,28 +7299,37 @@ pub const HfTokenizer = struct {
         max_length: usize,
     ) !@import("tokenizer.zig").EncodeResult {
         const special = self.getSpecialTokens();
-        const max_tokens = if (max_length >= 2) max_length - 2 else 0;
+        const legacy_wrap = [2]i32{ special.cls_id, special.sep_id };
+        const plan = self.modelWrapPlan(&legacy_wrap);
+        const wrap_len = plan.prepend.len + plan.append.len;
+        const max_tokens = if (max_length > wrap_len) max_length - wrap_len else 0;
         const token_count = @min(raw_ids.len, max_tokens);
-        const total = token_count + 2;
         const ids = try allocator.alloc(i32, max_length);
         const mask = try allocator.alloc(i32, max_length);
         const offsets = try allocator.alloc([2]u32, max_length);
 
-        ids[0] = special.cls_id;
-        mask[0] = 1;
-        offsets[0] = .{ 0, 0 };
-
-        for (0..token_count) |i| {
-            ids[i + 1] = raw_ids[i];
-            mask[i + 1] = 1;
-            offsets[i + 1] = raw_offsets[i];
+        var pos: usize = 0;
+        for (plan.prepend) |tid| {
+            if (pos >= max_length) break;
+            ids[pos] = tid;
+            mask[pos] = 1;
+            offsets[pos] = .{ 0, 0 };
+            pos += 1;
         }
-
-        ids[total - 1] = special.sep_id;
-        mask[total - 1] = 1;
-        offsets[total - 1] = .{ 0, 0 };
-
-        for (total..max_length) |i| {
+        for (0..token_count) |i| {
+            ids[pos] = raw_ids[i];
+            mask[pos] = 1;
+            offsets[pos] = raw_offsets[i];
+            pos += 1;
+        }
+        for (plan.append) |tid| {
+            if (pos >= max_length) break;
+            ids[pos] = tid;
+            mask[pos] = 1;
+            offsets[pos] = .{ 0, 0 };
+            pos += 1;
+        }
+        for (pos..max_length) |i| {
             ids[i] = special.pad_id;
             mask[i] = 0;
             offsets[i] = .{ 0, 0 };
@@ -7110,6 +7405,31 @@ pub const HfTokenizer = struct {
         return self.special;
     }
 
+    fn getAllSpecialTokenIds(self: *HfTokenizer, allocator: std.mem.Allocator) ![]u32 {
+        var unique = std.AutoHashMapUnmanaged(u32, void).empty;
+        defer unique.deinit(allocator);
+        var declared = self.special_token_ids.keyIterator();
+        while (declared.next()) |id| {
+            if (id.* >= 0) try unique.put(allocator, @intCast(id.*), {});
+        }
+        for ([_]i32{
+            self.special.cls_id,
+            self.special.sep_id,
+            self.special.pad_id,
+            self.special.unk_id,
+            self.special.mask_id,
+        }) |id| {
+            if (id >= 0 and self.id_to_token.contains(id)) try unique.put(allocator, @intCast(id), {});
+        }
+        const result = try allocator.alloc(u32, unique.count());
+        errdefer allocator.free(result);
+        var iterator = unique.keyIterator();
+        var index: usize = 0;
+        while (iterator.next()) |id| : (index += 1) result[index] = id.*;
+        std.mem.sort(u32, result, {}, std.sort.asc(u32));
+        return result;
+    }
+
     fn getVocabSize(self: *HfTokenizer) usize {
         return self.id_to_token.count();
     }
@@ -7120,9 +7440,12 @@ pub const HfTokenizer = struct {
             allocator.free(s);
         }
         self.arena_strings.deinit(allocator);
+        if (self.template_prepend_ids.len > 0) allocator.free(self.template_prepend_ids);
+        if (self.template_append_ids.len > 0) allocator.free(self.template_append_ids);
         self.vocab.deinit(allocator);
         self.id_to_token.deinit(allocator);
         self.added_tokens.deinit(allocator);
+        self.special_token_ids.deinit(allocator);
         self.added_trie.deinit(allocator);
         self.merge_ranks.deinit(allocator);
         self.merge_pairs.deinit(allocator);
@@ -7512,6 +7835,113 @@ fn gpt2PreTokenEnd(text: []const u8, start: usize) usize {
         if (last_start > start) end = last_start;
     }
     return end;
+}
+
+fn qwenContractionLen(text: []const u8) ?usize {
+    const contractions = [_][]const u8{ "'s", "'t", "'re", "'ve", "'m", "'ll", "'d" };
+    for (contractions) |suffix| {
+        if (text.len >= suffix.len and
+            std.ascii.eqlIgnoreCase(text[0..suffix.len], suffix))
+        {
+            return suffix.len;
+        }
+    }
+    return null;
+}
+
+/// Return the next boundary for Qwen3-VL's exact Split regex. Keeping this
+/// scanner separate from GPT-2 is important: Qwen emits one numeric codepoint
+/// per pretoken, permits one non-CR/LF prefix before a letter run, and attaches
+/// CR/LF runs to preceding punctuation. Those distinctions change BPE merges.
+fn qwenPreTokenEnd(text: []const u8, start: usize) usize {
+    std.debug.assert(start < text.len);
+    if (qwenContractionLen(text[start..])) |contraction_len| {
+        return start + contraction_len;
+    }
+
+    const first = gpt2CharAt(text, start);
+    if (first.class == .letter) {
+        var end = start + first.len;
+        while (end < text.len) {
+            const next = gpt2CharAt(text, end);
+            if (next.class != .letter) break;
+            end += next.len;
+        }
+        return end;
+    }
+
+    // [^\r\n\p{L}\p{N}]?\p{L}+
+    const next_start = start + first.len;
+    if (text[start] != '\r' and text[start] != '\n' and
+        first.class != .number and next_start < text.len)
+    {
+        const next = gpt2CharAt(text, next_start);
+        if (next.class == .letter) {
+            var end = next_start + next.len;
+            while (end < text.len) {
+                const letter = gpt2CharAt(text, end);
+                if (letter.class != .letter) break;
+                end += letter.len;
+            }
+            return end;
+        }
+    }
+
+    // \p{N} intentionally matches exactly one Unicode numeric codepoint.
+    if (first.class == .number) return next_start;
+
+    //  ?[^\s\p{L}\p{N}]+[\r\n]*
+    var punctuation_start = start;
+    if (text[start] == ' ' and next_start < text.len and
+        gpt2CharAt(text, next_start).class == .other)
+    {
+        punctuation_start = next_start;
+    }
+    if (gpt2CharAt(text, punctuation_start).class == .other) {
+        var end = punctuation_start;
+        while (end < text.len) {
+            const punctuation = gpt2CharAt(text, end);
+            if (punctuation.class != .other) break;
+            end += punctuation.len;
+        }
+        while (end < text.len and (text[end] == '\r' or text[end] == '\n')) {
+            end += 1;
+        }
+        return end;
+    }
+
+    if (first.class == .whitespace) {
+        var end = next_start;
+        var last_crlf_end: ?usize = if (text[start] == '\r' or text[start] == '\n')
+            next_start
+        else
+            null;
+        while (end < text.len) {
+            const whitespace = gpt2CharAt(text, end);
+            if (whitespace.class != .whitespace) break;
+            if (text[end] == '\r' or text[end] == '\n') {
+                last_crlf_end = end + whitespace.len;
+            }
+            end += whitespace.len;
+        }
+
+        // \s*[\r\n]+ ends after the final CR/LF in a contiguous whitespace
+        // span and leaves any following non-newline whitespace for the next
+        // regex match.
+        if (last_crlf_end) |newline_end| return newline_end;
+
+        // Match \s+(?!\S) before the final \s+ alternative: immediately
+        // before content it emits all but the last whitespace codepoint.
+        if (end < text.len) {
+            const last_start = prevCodepointBoundary(text, end);
+            if (last_start > start) return last_start;
+        }
+        return end;
+    }
+
+    // Invalid UTF-8 is classified as punctuation above. Retain an explicit
+    // progress fallback so malformed inputs can never stall tokenization.
+    return next_start;
 }
 
 const Gpt2AsciiClassMasks = struct {
@@ -10875,17 +11305,17 @@ test "metaspace pre-tokenizer split false with first prepend" {
     try std.testing.expectEqualStrings("\xe2\x96\x81What\xe2\x96\x81is\xe2\x96\x812+2?", words[0]);
 }
 
-test "byte-level decode applies to Sequence[Split, ByteLevel] pre-tokenizers" {
+test "isolated Sequence Split preserves Qwen whitespace through ByteLevel" {
     const allocator = std.testing.allocator;
 
-    // The pre_tokenizer shape used by Llama 3 and Qwen3. It parses to
-    // .byte_level_split, which decode once treated as "not byte level", leaving the
-    // raw space marker 'Ġ' (U+0120) and newline marker 'Ċ' (U+010A) in output text.
+    // Qwen's Split owns the regex semantics while ByteLevel runs with
+    // use_regex=false. The exact signature selects the Qwen scanner rather
+    // than GPT-2 or CLIP pretokenization.
     const json_str =
         \\{
         \\  "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
-        \\    {"type": "Split", "pattern": {"Regex": "\\s+"}, "behavior": "Isolated", "invert": false},
-        \\    {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false}
+        \\    {"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false},
+        \\    {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false}
         \\  ]},
         \\  "decoder": {"type": "ByteLevel"},
         \\  "model": {
@@ -10902,10 +11332,281 @@ test "byte-level decode applies to Sequence[Split, ByteLevel] pre-tokenizers" {
     var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
     defer tok.deinitSelf();
 
-    try std.testing.expectEqual(PreTokenizerType.byte_level_split, tok.pre_tokenizer_type);
+    try std.testing.expectEqual(PreTokenizerType.byte_level, tok.pre_tokenizer_type);
+    try std.testing.expectEqual(ByteLevelPretokenizer.qwen, tok.byte_level_pretokenizer);
+
+    const ids = try tok.encode(allocator, "Okay let see\n");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 10, 11, 12, 13 }, ids);
 
     const text = try tok.decode(allocator, &.{ 10, 11, 12, 13 });
     defer allocator.free(text);
 
     try std.testing.expectEqualStrings("Okay let see\n", text);
+}
+
+test "Qwen ByteLevel Split scanner matches reference regex boundaries" {
+    const input = "We'RE QWEN42?\n<Document: Mars>\tOK  tail\r\n  ";
+    const expected = [_][]const u8{
+        "We",
+        "'RE",
+        " QWEN",
+        "4",
+        "2",
+        "?\n",
+        "<Document",
+        ":",
+        " Mars",
+        ">",
+        "\tOK",
+        " ",
+        " tail",
+        "\r\n",
+        "  ",
+    };
+
+    var start: usize = 0;
+    for (expected) |piece| {
+        const end = qwenPreTokenEnd(input, start);
+        try std.testing.expectEqualStrings(piece, input[start..end]);
+        start = end;
+    }
+    try std.testing.expectEqual(input.len, start);
+}
+
+test "removed inverted Sequence Split retains CLIP whitespace-removal mode" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\{
+        \\  "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+        \\    {"type": "Split", "pattern": {"Regex": "[^\\s]+"}, "behavior": "Removed", "invert": true},
+        \\    {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true}
+        \\  ]},
+        \\  "model": {"type": "BPE", "vocab": {"hello": 1}, "merges": []}
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+    try std.testing.expectEqual(PreTokenizerType.byte_level_split, tok.pre_tokenizer_type);
+}
+
+test "all special token ids include Qwen added-token markers" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\{
+        \\  "added_tokens": [
+        \\    {"id": 0, "content": "<unk>", "special": true},
+        \\    {"id": 4, "content": "<|im_start|>", "special": true},
+        \\    {"id": 5, "content": "<|im_end|>", "special": true},
+        \\    {"id": 6, "content": "ordinary-added", "special": false}
+        \\  ],
+        \\  "model": {"type": "BPE", "vocab": {"<unk>": 0, "text": 1, "<|im_start|>": 4, "<|im_end|>": 5, "ordinary-added": 6}, "merges": []}
+        \\}
+    ;
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+    const ids = try tok.tokenizer().allSpecialTokenIds(allocator);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 4, 5 }, ids);
+}
+
+test "TemplateProcessing appends exactly one trailing eos and no leading token" {
+    const allocator = std.testing.allocator;
+
+    // Qwen3-Embedding shape: Sequence[ByteLevel, TemplateProcessing] with
+    // single = [Sequence A, <|endoftext|>].
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 0, "b": 1, "c": 2, "ab": 3, "abc": 4},
+        \\    "merges": ["a b", "ab c"]
+        \\  },
+        \\  "pre_tokenizer": {"type": "BertPreTokenizer"},
+        \\  "added_tokens": [
+        \\    {"id": 9, "content": "<|endoftext|>", "special": true}
+        \\  ],
+        \\  "post_processor": {
+        \\    "type": "Sequence",
+        \\    "processors": [
+        \\      {"type": "ByteLevel", "add_prefix_space": false},
+        \\      {
+        \\        "type": "TemplateProcessing",
+        \\        "single": [
+        \\          {"Sequence": {"id": "A", "type_id": 0}},
+        \\          {"SpecialToken": {"id": "<|endoftext|>", "type_id": 0}}
+        \\        ],
+        \\        "special_tokens": {
+        \\          "<|endoftext|>": {"id": "<|endoftext|>", "ids": [9], "tokens": ["<|endoftext|>"]}
+        \\        }
+        \\      }
+        \\    ]
+        \\  }
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+    try std.testing.expect(tok.has_template_processing);
+    try std.testing.expectEqual(@as(usize, 0), tok.template_prepend_ids.len);
+    try std.testing.expectEqualSlices(i32, &.{9}, tok.template_append_ids);
+    // Template edge propagates to sep for bos/eos-oriented consumers.
+    try std.testing.expectEqual(@as(i32, 9), tok.special.sep_id);
+
+    var result = try tok.tokenizer().encodeForModel(allocator, "abc", 8);
+    defer result.deinit();
+    // No leading special, "abc" -> id 4, one trailing eos, then padding.
+    try std.testing.expectEqual(@as(i32, 4), result.ids[0]);
+    try std.testing.expectEqual(@as(i32, 9), result.ids[1]);
+    try std.testing.expectEqual(@as(i32, 1), result.attention_mask[0]);
+    try std.testing.expectEqual(@as(i32, 1), result.attention_mask[1]);
+    try std.testing.expectEqual(@as(i32, 0), result.attention_mask[2]);
+    var eos_count: usize = 0;
+    for (result.ids, result.attention_mask) |id, mask| {
+        if (mask > 0 and id == 9) eos_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), eos_count);
+}
+
+test "TemplateProcessing eos survives max-length truncation" {
+    const allocator = std.testing.allocator;
+
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 0, "b": 1, "c": 2},
+        \\    "merges": []
+        \\  },
+        \\  "pre_tokenizer": {"type": "BertPreTokenizer"},
+        \\  "added_tokens": [
+        \\    {"id": 9, "content": "<|endoftext|>", "special": true}
+        \\  ],
+        \\  "post_processor": {
+        \\    "type": "TemplateProcessing",
+        \\    "single": [
+        \\      {"Sequence": {"id": "A", "type_id": 0}},
+        \\      {"SpecialToken": {"id": "<|endoftext|>", "type_id": 0}}
+        \\    ],
+        \\    "special_tokens": {
+        \\      "<|endoftext|>": {"id": "<|endoftext|>", "ids": [9], "tokens": ["<|endoftext|>"]}
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+
+    // "a b c a b c" -> 6 raw tokens; max_length 4 leaves room for 3 + eos.
+    var result = try tok.tokenizer().encodeForModel(allocator, "a b c a b c", 4);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i32, 0), result.ids[0]);
+    try std.testing.expectEqual(@as(i32, 1), result.ids[1]);
+    try std.testing.expectEqual(@as(i32, 2), result.ids[2]);
+    try std.testing.expectEqual(@as(i32, 9), result.ids[3]);
+    try std.testing.expectEqual(@as(i32, 1), result.attention_mask[3]);
+}
+
+test "bpe without post-processor gets no bert-default wrap tokens" {
+    const allocator = std.testing.allocator;
+
+    // Regression: BPE decoder tokenizers with no post_processor previously
+    // wrapped with the SpecialTokens struct defaults (101/102) — valid but
+    // wrong token ids for such models. HF adds nothing here.
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 0, "b": 1, "c": 2, "ab": 3, "abc": 4},
+        \\    "merges": ["a b", "ab c"]
+        \\  },
+        \\  "pre_tokenizer": {"type": "BertPreTokenizer"}
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+    try std.testing.expect(!tok.wrap_specials_explicit);
+
+    var result = try tok.tokenizer().encodeForModel(allocator, "abc", 4);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i32, 4), result.ids[0]);
+    try std.testing.expectEqual(@as(i32, 1), result.attention_mask[0]);
+    try std.testing.expectEqual(@as(i32, 0), result.attention_mask[1]);
+    for (result.ids, result.attention_mask) |id, mask| {
+        if (mask > 0) {
+            try std.testing.expect(id != 101);
+            try std.testing.expect(id != 102);
+        }
+    }
+}
+
+test "bert-style TemplateProcessing keeps cls and sep wrap" {
+    const allocator = std.testing.allocator;
+
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "WordPiece",
+        \\    "unk_token": "[UNK]",
+        \\    "vocab": {"[CLS]": 101, "[SEP]": 102, "[PAD]": 0, "[UNK]": 100, "hello": 7}
+        \\  },
+        \\  "pre_tokenizer": {"type": "BertPreTokenizer"},
+        \\  "post_processor": {
+        \\    "type": "TemplateProcessing",
+        \\    "single": [
+        \\      {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+        \\      {"Sequence": {"id": "A", "type_id": 0}},
+        \\      {"SpecialToken": {"id": "[SEP]", "type_id": 0}}
+        \\    ],
+        \\    "special_tokens": {
+        \\      "[CLS]": {"id": "[CLS]", "ids": [101], "tokens": ["[CLS]"]},
+        \\      "[SEP]": {"id": "[SEP]", "ids": [102], "tokens": ["[SEP]"]}
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+    try std.testing.expectEqual(@as(i32, 101), tok.special.cls_id);
+    try std.testing.expectEqual(@as(i32, 102), tok.special.sep_id);
+
+    var result = try tok.tokenizer().encodeForModel(allocator, "hello", 8);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i32, 101), result.ids[0]);
+    try std.testing.expectEqual(@as(i32, 7), result.ids[1]);
+    try std.testing.expectEqual(@as(i32, 102), result.ids[2]);
+    try std.testing.expectEqual(@as(i32, 0), result.attention_mask[3]);
+}
+
+test "applyModelWrapTemplate overrides gguf bos and eos wrap" {
+    const allocator = std.testing.allocator;
+
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 0, "b": 1, "c": 2, "abc": 4, "<|endoftext|>": 9},
+        \\    "merges": []
+        \\  },
+        \\  "pre_tokenizer": {"type": "BertPreTokenizer"}
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+    // GGUF metadata application: bos maps to cls, eos to sep...
+    tok.applySpecialTokenIds(9, 9, 9, null);
+    // ...but add_bos_token=false / add_eos_token=true installs an eos-only wrap.
+    try tok.applyModelWrapTemplate(&.{}, &.{9});
+
+    var result = try tok.tokenizer().encodeForModel(allocator, "abc", 4);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i32, 4), result.ids[0]);
+    try std.testing.expectEqual(@as(i32, 9), result.ids[1]);
+    try std.testing.expectEqual(@as(i32, 1), result.attention_mask[1]);
+    try std.testing.expectEqual(@as(i32, 0), result.attention_mask[2]);
 }

@@ -24,6 +24,8 @@ const manifest_mod = @import("manifest.zig");
 const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
 const gguf_writer = @import("../gguf/writer.zig");
+const managed_receipt = @import("../registry/managed_receipt.zig");
+const qwen3vl_catalog = @import("../registry/qwen3vl_catalog.zig");
 
 pub const Level = enum {
     compatible,
@@ -62,10 +64,17 @@ pub const Policy = struct {
     allow_unknown: bool = false,
 };
 
+pub const Qwen3VlPromotion = enum {
+    none,
+    generation_2b_q4_k_m,
+    reranker_2b_q8_0,
+};
+
 pub const Inspection = struct {
     architecture: []u8,
     expert_count: u32 = 0,
     qualified_gemma4_a4b: bool = false,
+    qwen3vl_promotion: Qwen3VlPromotion = .none,
     artifact_inspected: bool = true,
 
     pub fn deinit(self: *Inspection, allocator: std.mem.Allocator) void {
@@ -97,8 +106,201 @@ pub fn inspectAlloc(
     region.preserveFileCacheOnDeinit();
     const metadata = gguf_format.readSupportMetadata(region.data) catch return result;
     result.artifact_inspected = true;
+    result.qwen3vl_promotion = inspectQwen3VlPromotion(
+        allocator,
+        man,
+        metadata,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => .none,
+    };
     try applyArtifactMetadata(allocator, &result, metadata);
     return result;
+}
+
+fn qwen3VlGeometryIsQualified(metadata: gguf_format.SupportMetadata) bool {
+    const architecture = metadata.architecture orelse return false;
+    return (std.mem.eql(u8, architecture, "qwen3vl") or
+        std.mem.eql(u8, architecture, "qwen3_vl")) and
+        metadata.block_count == 28 and
+        metadata.embedding_length == 2048 and
+        metadata.expert_count == 0;
+}
+
+fn receiptSourceMatches(
+    receipt: managed_receipt.DownloadReceipt,
+    owner: []const u8,
+    name: []const u8,
+    variant: []const u8,
+) bool {
+    const source = receipt.source orelse return false;
+    return std.mem.eql(u8, source.owner, owner) and
+        std.mem.eql(u8, source.name, name) and
+        std.mem.eql(u8, source.variant, variant);
+}
+
+fn receiptArtifactMatches(
+    receipt: managed_receipt.DownloadReceipt,
+    path: []const u8,
+    size: u64,
+    expected_sha256: ?[]const u8,
+) bool {
+    for (receipt.artifacts) |artifact| {
+        if (!std.mem.eql(u8, artifact.path, path)) continue;
+        if (artifact.size != size) return false;
+        if (expected_sha256) |expected| {
+            const actual = artifact.sha256 orelse return false;
+            return std.mem.eql(u8, actual, expected);
+        }
+        return artifact.sha256 == null;
+    }
+    return false;
+}
+
+fn generationReceiptMatches(
+    man: *const manifest_mod.ModelManifest,
+    receipt: managed_receipt.DownloadReceipt,
+) bool {
+    if (!std.mem.eql(u8, man.inference_bundle_family, manifest_mod.qwen3_vl_gguf_bundle_family) or
+        receipt.version != 2 or receipt.artifacts.len != 10)
+    {
+        return false;
+    }
+    const source = receipt.source orelse return false;
+    const bundle = qwen3vl_catalog.findGenerationBundleForHubRef(
+        source.owner,
+        source.name,
+        source.variant,
+    ) orelse return false;
+    if (bundle.size != .vl_2b) return false;
+    const decoder_path = man.gguf_path orelse return false;
+    const projector_path = man.gguf_projector_path orelse return false;
+    if (!std.mem.eql(u8, std.fs.path.basename(decoder_path), bundle.decoder.path) or
+        !std.mem.eql(u8, std.fs.path.basename(projector_path), bundle.projector.path))
+    {
+        return false;
+    }
+    for (bundle.artifacts()) |artifact| {
+        if (!receiptArtifactMatches(receipt, artifact.path, artifact.size, artifact.sha256))
+            return false;
+    }
+    for (qwen3vl_catalog.promoted_generation_2b_metadata_artifacts) |artifact| {
+        // These bytes are generated inside the managed pull transaction, so
+        // legacy receipts intentionally have no declared digest. The exact
+        // content gate below re-hashes them against the catalog identity.
+        if (!receiptArtifactMatches(receipt, artifact.path, artifact.size, null))
+            return false;
+    }
+    return true;
+}
+
+fn rerankerReceiptMatches(
+    man: *const manifest_mod.ModelManifest,
+    receipt: managed_receipt.DownloadReceipt,
+) bool {
+    if (!man.isQwen3VlRerankerGgufBundle() or
+        receipt.version != 2 or
+        receipt.artifacts.len != qwen3vl_catalog.promoted_reranker_artifacts.len or
+        !receiptSourceMatches(
+            receipt,
+            qwen3vl_catalog.promoted_reranker_owner,
+            qwen3vl_catalog.promoted_reranker_name,
+            qwen3vl_catalog.promoted_reranker_variant,
+        ))
+    {
+        return false;
+    }
+    const decoder_path = man.gguf_path orelse return false;
+    const projector_path = man.gguf_projector_path orelse return false;
+    if (!std.mem.eql(
+        u8,
+        std.fs.path.basename(decoder_path),
+        qwen3vl_catalog.promoted_reranker_decoder.path,
+    ) or !std.mem.eql(
+        u8,
+        std.fs.path.basename(projector_path),
+        qwen3vl_catalog.promoted_reranker_projector.path,
+    )) return false;
+    for (qwen3vl_catalog.promoted_reranker_artifacts) |artifact| {
+        if (!receiptArtifactMatches(receipt, artifact.path, artifact.size, artifact.sha256))
+            return false;
+    }
+    return true;
+}
+
+fn qwen3VlPromotionFromReceipt(
+    man: *const manifest_mod.ModelManifest,
+    metadata: gguf_format.SupportMetadata,
+    receipt: managed_receipt.DownloadReceipt,
+) Qwen3VlPromotion {
+    if (!qwen3VlGeometryIsQualified(metadata)) return .none;
+    if (generationReceiptMatches(man, receipt)) return .generation_2b_q4_k_m;
+    if (rerankerReceiptMatches(man, receipt)) return .reranker_2b_q8_0;
+    return .none;
+}
+
+fn validatedArtifactContentMatches(
+    receipt: *const managed_receipt.ValidatedReceipt,
+    path: []const u8,
+    expected_sha256: []const u8,
+) bool {
+    const artifact = receipt.find(path) orelse return false;
+    managed_receipt.verifyValidatedArtifactSha256(
+        std.Options.debug_io,
+        artifact,
+        expected_sha256,
+    ) catch return false;
+    return true;
+}
+
+/// The declaration check above protects the source and receipt schema.  This
+/// separate content gate proves that every artifact selected for a promoted
+/// runtime is still the exact byte sequence that was qualified.
+fn qwen3VlPromotionContentMatches(
+    receipt: *const managed_receipt.ValidatedReceipt,
+    promotion: Qwen3VlPromotion,
+) bool {
+    switch (promotion) {
+        .none => return false,
+        .generation_2b_q4_k_m => {
+            const bundle = &qwen3vl_catalog.generation_bundles[0];
+            for (bundle.artifacts()) |artifact| {
+                if (!validatedArtifactContentMatches(receipt, artifact.path, artifact.sha256))
+                    return false;
+            }
+            for (qwen3vl_catalog.promoted_generation_2b_metadata_artifacts) |artifact| {
+                if (!validatedArtifactContentMatches(receipt, artifact.path, artifact.sha256))
+                    return false;
+            }
+            return true;
+        },
+        .reranker_2b_q8_0 => {
+            for (qwen3vl_catalog.promoted_reranker_artifacts) |artifact| {
+                if (!validatedArtifactContentMatches(receipt, artifact.path, artifact.sha256))
+                    return false;
+            }
+            return true;
+        },
+    }
+}
+
+fn inspectQwen3VlPromotion(
+    allocator: std.mem.Allocator,
+    man: *const manifest_mod.ModelManifest,
+    metadata: gguf_format.SupportMetadata,
+) !Qwen3VlPromotion {
+    if (!man.isQwen3VlGgufBundle()) return .none;
+    const gguf_path = man.gguf_path orelse return .none;
+    const model_dir = std.fs.path.dirname(gguf_path) orelse return .none;
+    var receipt = (try managed_receipt.loadValidated(
+        allocator,
+        std.Options.debug_io,
+        model_dir,
+    )) orelse return .none;
+    defer receipt.deinit();
+    const promotion = qwen3VlPromotionFromReceipt(man, metadata, receipt.parsed.value);
+    if (!qwen3VlPromotionContentMatches(&receipt, promotion)) return .none;
+    return promotion;
 }
 
 test "compatibility inspection ignores an unselected colocated GGUF" {
@@ -157,6 +359,7 @@ pub fn assessInspection(
         inspection.architecture,
         inspection.expert_count,
         inspection.qualified_gemma4_a4b,
+        inspection.qwen3vl_promotion,
     );
 }
 
@@ -165,7 +368,7 @@ fn assessWithFacts(
     architecture: []const u8,
     expert_count: u32,
 ) Assessment {
-    return assessWithRuntimeFacts(man, architecture, expert_count, false);
+    return assessWithRuntimeFacts(man, architecture, expert_count, false, .none);
 }
 
 fn assessWithRuntimeFacts(
@@ -173,17 +376,53 @@ fn assessWithRuntimeFacts(
     architecture: []const u8,
     expert_count: u32,
     qualified_gemma4_a4b: bool,
+    qwen3vl_promotion: Qwen3VlPromotion,
 ) Assessment {
     if (man.hasIncompleteGlinerBundle() or
         man.hasIncompleteColqwenBundle() or
         man.hasIncompleteClipclapGgufBundle() or
-        man.hasIncompleteFlorence2GgufBundle())
+        man.hasIncompleteFlorence2GgufBundle() or
+        man.hasIncompleteQwen3VlGgufBundle())
     {
         return makeIncompatible(
             architecture,
             .incomplete_bundle,
             "the model bundle is missing required artifacts or sidecars",
         );
+    }
+
+    if (man.isQwen3VlBundle()) {
+        return switch (qwen3vl_promotion) {
+            .generation_2b_q4_k_m => if (man.model_type == .generator and
+                std.mem.eql(u8, man.inference_bundle_family, manifest_mod.qwen3_vl_gguf_bundle_family))
+                makeCompatible(
+                    architecture,
+                    "qualified Qwen3-VL 2B Q4_K_M decoder and Q8_0 projector bundle",
+                )
+            else
+                makeIncompatible(
+                    architecture,
+                    .unsupported_backend,
+                    "Qwen3-VL promotion receipt does not match the declared serving role",
+                ),
+            .reranker_2b_q8_0 => if (man.model_type == .reranker and
+                man.isQwen3VlRerankerGgufBundle())
+                makeCompatible(
+                    architecture,
+                    "qualified Qwen3-VL Reranker 2B Q8_0 bundle with F16 score head",
+                )
+            else
+                makeIncompatible(
+                    architecture,
+                    .unsupported_backend,
+                    "Qwen3-VL promotion receipt does not match the declared serving role",
+                ),
+            .none => makeIncompatible(
+                architecture,
+                .unsupported_backend,
+                "Qwen3-VL requires an exact production-qualified managed receipt; unqualified sizes, quantizations, and safetensors oracle bundles remain blocked",
+            ),
+        };
     }
 
     if (man.model_type == .generator)
@@ -240,7 +479,17 @@ fn assessWithRuntimeFacts(
                 .unsupported_backend,
                 "standalone CLAP graph conversion is not compatible; use ClipClap",
             ),
-            else => {},
+            else => {
+                // Qwen3-Embedding checkpoints resolve to the qwen3 decoder
+                // arch (unknown to the encoder list below) but serve through
+                // the qualified resident last-token embedding runtime.
+                if (man.embedding_style == .qwen3_embedding and man.isLastTokenDecoderEmbedder()) {
+                    return makeCompatible(
+                        architecture,
+                        "qualified Qwen3-Embedding last-token decoder embedder",
+                    );
+                }
+            },
         },
         .classifier => {
             if (man.native_arch_hint == .layoutlmv3) {
@@ -370,6 +619,11 @@ fn assessGenerator(
         "qwen35",
         "qwen3next",
         "qwen35moe",
+        "qwen3_vl",
+        "qwen3_vl_text",
+        "qwen3_vl_moe",
+        "qwen3vl",
+        "qwen3vlmoe",
         "gpt2",
         "gpt_neo",
         "gpt_neox",
@@ -433,6 +687,21 @@ pub fn makeUnknown(architecture: []const u8, code: Code, message: []const u8) As
 
 pub fn makeIncompatible(architecture: []const u8, code: Code, message: []const u8) Assessment {
     return .{ .level = .incompatible, .code = code, .message = message, .architecture = architecture };
+}
+
+test "qwen3-embedding style embedder is compatible despite decoder arch" {
+    var man = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    man.model_type = .embedder;
+    man.pooling = .last;
+    man.embedding_style = .qwen3_embedding;
+    const result = assess(&man, "qwen3");
+    try std.testing.expectEqual(Level.compatible, result.level);
+
+    // A bare qwen3 embedder without the resolved style stays unknown.
+    var bare = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    bare.model_type = .embedder;
+    const bare_result = assess(&bare, "qwen3");
+    try std.testing.expectEqual(Level.unknown, bare_result.level);
 }
 
 test "unknown generators are unknown and require opt in" {
@@ -665,10 +934,167 @@ test "known Qwen hybrid variants and incompatible Nomic GGUF stay blocked" {
     generator.model_type = .generator;
     try std.testing.expectEqual(Level.incompatible, assess(&generator, "qwen3_5_moe").level);
     try std.testing.expectEqual(Level.incompatible, assess(&generator, "qwen3_next").level);
+    const qwen3_vl = assess(&generator, "qwen3vl");
+    try std.testing.expectEqual(Level.incompatible, qwen3_vl.level);
+    try std.testing.expect(!qwen3_vl.allowed(true));
+    const qwen3_vl_moe = assess(&generator, "qwen3vlmoe");
+    try std.testing.expectEqual(Level.incompatible, qwen3_vl_moe.level);
+    try std.testing.expect(!qwen3_vl_moe.allowed(true));
 
     var embedder = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     embedder.model_type = .embedder;
     try std.testing.expectEqual(Level.incompatible, assess(&embedder, "nomic-bert").level);
+}
+
+test "Qwen3-VL bundles fail closed before runtime qualification" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .model_type_origin = .bundle,
+        .inference_bundle_family = try allocator.dupe(u8, manifest_mod.qwen3_vl_gguf_bundle_family),
+        .gguf_path = try allocator.dupe(u8, "decoder.gguf"),
+        .gguf_projector_path = try allocator.dupe(u8, "mmproj.gguf"),
+    };
+    defer manifest.deinit();
+
+    var assessment = assess(&manifest, "qwen3vl");
+    try std.testing.expectEqual(Code.incomplete_bundle, assessment.code);
+    try std.testing.expect(!assessment.allowed(true));
+
+    manifest.config_path = try allocator.dupe(u8, "config.json");
+    manifest.tokenizer_json_path = try allocator.dupe(u8, "tokenizer.json");
+    manifest.tokenizer_config_path = try allocator.dupe(u8, "tokenizer_config.json");
+    manifest.preprocessor_config_path = try allocator.dupe(u8, "preprocessor_config.json");
+    assessment = assess(&manifest, "qwen3vl");
+    try std.testing.expectEqual(Code.unsupported_backend, assessment.code);
+    try std.testing.expect(!assessment.allowed(true));
+
+    var reranker = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .reranker,
+        .model_type_origin = .bundle,
+        .inference_bundle_family = try allocator.dupe(u8, manifest_mod.qwen3_vl_reranker_safetensors_bundle_family),
+        .safetensors_path = try allocator.dupe(u8, "model.safetensors"),
+        .config_path = try allocator.dupe(u8, "config.json"),
+        .tokenizer_json_path = try allocator.dupe(u8, "tokenizer.json"),
+        .tokenizer_config_path = try allocator.dupe(u8, "tokenizer_config.json"),
+        .preprocessor_config_path = try allocator.dupe(u8, "preprocessor_config.json"),
+    };
+    defer reranker.deinit();
+    assessment = assess(&reranker, "qwen3_vl");
+    try std.testing.expectEqual(Code.unsupported_backend, assessment.code);
+    try std.testing.expect(!assessment.allowed(true));
+}
+
+test "Qwen3-VL promotion accepts only exact 2B generation and calibrated Q8 reranker receipts" {
+    const generation_bundle = &qwen3vl_catalog.generation_bundles[0];
+    const generation_catalog = generation_bundle.artifacts();
+    var generation_artifacts: [10]managed_receipt.ArtifactReceipt = undefined;
+    for (generation_catalog, 0..) |artifact, index| {
+        generation_artifacts[index] = .{
+            .path = artifact.path,
+            .size = artifact.size,
+            .sha256 = artifact.sha256,
+        };
+    }
+    for (qwen3vl_catalog.promoted_generation_2b_metadata_artifacts, 8..) |artifact, index| {
+        generation_artifacts[index] = .{
+            .path = artifact.path,
+            .size = artifact.size,
+        };
+    }
+    const generation_receipt = managed_receipt.DownloadReceipt{
+        .version = 2,
+        .source = .{
+            .owner = "Qwen",
+            .name = "Qwen3-VL-2B-Instruct-GGUF",
+            .variant = qwen3vl_catalog.generation_bundle_variant,
+        },
+        .artifacts = &generation_artifacts,
+    };
+    var generation_manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .generator,
+        .model_type_origin = .bundle,
+        .inference_bundle_family = manifest_mod.qwen3_vl_gguf_bundle_family,
+        .gguf_path = "Qwen3VL-2B-Instruct-Q4_K_M.gguf",
+        .gguf_projector_path = "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf",
+        .config_path = "config.json",
+        .tokenizer_json_path = "tokenizer.json",
+        .tokenizer_config_path = "tokenizer_config.json",
+        .preprocessor_config_path = "preprocessor_config.json",
+    };
+    const metadata = gguf_format.SupportMetadata{
+        .architecture = "qwen3vl",
+        .block_count = 28,
+        .embedding_length = 2048,
+    };
+    try std.testing.expectEqual(
+        Qwen3VlPromotion.generation_2b_q4_k_m,
+        qwen3VlPromotionFromReceipt(&generation_manifest, metadata, generation_receipt),
+    );
+
+    var promoted_inspection = Inspection{
+        .architecture = try std.testing.allocator.dupe(u8, "qwen3vl"),
+        .qwen3vl_promotion = .generation_2b_q4_k_m,
+    };
+    defer promoted_inspection.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        Level.compatible,
+        assessInspection(&generation_manifest, promoted_inspection).level,
+    );
+
+    generation_artifacts[0].sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expectEqual(
+        Qwen3VlPromotion.none,
+        qwen3VlPromotionFromReceipt(&generation_manifest, metadata, generation_receipt),
+    );
+    generation_artifacts[0].sha256 = generation_catalog[0].sha256;
+    generation_manifest.gguf_path = "substituted.gguf";
+    try std.testing.expectEqual(
+        Qwen3VlPromotion.none,
+        qwen3VlPromotionFromReceipt(&generation_manifest, metadata, generation_receipt),
+    );
+
+    var reranker_artifacts: [qwen3vl_catalog.promoted_reranker_artifacts.len]managed_receipt.ArtifactReceipt = undefined;
+    for (qwen3vl_catalog.promoted_reranker_artifacts, 0..) |artifact, index| {
+        reranker_artifacts[index] = .{
+            .path = artifact.path,
+            .size = artifact.size,
+            .sha256 = artifact.sha256,
+        };
+    }
+    var reranker_receipt = managed_receipt.DownloadReceipt{
+        .version = 2,
+        .source = .{
+            .owner = qwen3vl_catalog.promoted_reranker_owner,
+            .name = qwen3vl_catalog.promoted_reranker_name,
+            .variant = qwen3vl_catalog.promoted_reranker_variant,
+        },
+        .artifacts = &reranker_artifacts,
+    };
+    var reranker_manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .reranker,
+        .model_type_origin = .bundle,
+        .inference_bundle_family = manifest_mod.qwen3_vl_reranker_gguf_bundle_family,
+        .gguf_path = "Qwen3-VL-Reranker-2B-Q8_0.gguf",
+        .gguf_projector_path = "mmproj-Qwen3-VL-Reranker-2B-Q8_0.gguf",
+        .config_path = "config.json",
+        .tokenizer_json_path = "tokenizer.json",
+        .tokenizer_config_path = "tokenizer_config.json",
+        .preprocessor_config_path = "preprocessor_config.json",
+    };
+    try std.testing.expectEqual(
+        Qwen3VlPromotion.reranker_2b_q8_0,
+        qwen3VlPromotionFromReceipt(&reranker_manifest, metadata, reranker_receipt),
+    );
+    reranker_receipt.source.?.variant = "q4-k-m-ranking-only";
+    try std.testing.expectEqual(
+        Qwen3VlPromotion.none,
+        qwen3VlPromotionFromReceipt(&reranker_manifest, metadata, reranker_receipt),
+    );
 }
 
 test "known unsafe local site models stay blocked even with unknown opt in" {

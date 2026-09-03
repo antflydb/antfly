@@ -101,6 +101,7 @@ const RuntimeContext = struct {
             pool_id,
             shared_moe_cache,
         );
+        ctx.decode_runtime.configureForGptConfig(gpt_config);
         return ctx;
     }
 
@@ -112,6 +113,7 @@ const RuntimeContext = struct {
             self.pool_id,
             self.shared_moe_cache,
         );
+        self.decode_runtime.configureForGptConfig(self.gpt_config);
     }
 
     fn deinit(self: *RuntimeContext) void {

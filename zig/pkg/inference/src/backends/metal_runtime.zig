@@ -59,7 +59,7 @@ const metal_jit_fixture_safety_margin_bytes = 16 * 1024 * 1024;
 const metal_jit_measure_target_macs: u64 = 128 * 1024 * 1024;
 const metal_jit_measure_target_ns: u64 = 20 * std.time.ns_per_ms;
 const metal_jit_max_measure_iters: u32 = 1024;
-const metal_jit_qualification_policy_identity = "metal-v19:correctness=route-wide-generic+exact-signature-full-bundled-differential+columns8-cpu,cold+repeat-before-timing,pattern-bank29,matrix-fp16-abs-q4k0.002-q6k0.003;benchmark=after-correctness,exact-rows+shape,calibrated-target-ns20000000+macs-fallback134217728,iters2-1024-even,warmup2-every-repeat,shared-input-weight+separate-outputs,selection-interleaved-abba5+independent-confirmation-interleaved-abba5,gpu-timestamps-required,post-output-check;winner=both-phases-median+worst-repeat>=1.02,ranked-confirmation-fallback,candidates<=8;q4_0-exact-2d-rows2-shape-general-tile2or4or8-small-output-nr2;q4_k+q6_k-exact-2d-rows2-plus-nr2or4or8-matrix40or64x64x32-row-tiled+homogeneous-qkv-companion;qualified-coverage=all-eligible-calibrated-denominator+floor2pct+target90pct+attempts<=5-per-regime;fixture-max268435456,margin16777216;scope-max-shapes16";
+const metal_jit_qualification_policy_identity = "metal-v20:correctness=route-wide-generic+exact-signature-full-bundled-differential+columns8-cpu,cold+repeat-before-timing,pattern-bank29,matrix-operands-q4k-fp16-abs0.002+q6k-fp32-abs0.003;benchmark=after-correctness,exact-rows+shape,calibrated-target-ns20000000+macs-fallback134217728,iters2-1024-even,warmup2-every-repeat,shared-input-weight+separate-outputs,selection-interleaved-abba5+independent-confirmation-interleaved-abba5,gpu-timestamps-required,post-output-check;winner=both-phases-median+worst-repeat>=1.02,ranked-confirmation-fallback,candidates<=8;q4_0-exact-2d-rows2-shape-general-tile2or4or8-small-output-nr2;q4_k+q6_k-exact-2d-rows2-plus-nr2or4or8-matrix40or64x64x32-row-tiled+homogeneous-qkv-companion;qualified-coverage=all-eligible-calibrated-denominator+floor2pct+target90pct+attempts<=5-per-regime;fixture-max268435456,margin16777216;scope-max-shapes16";
 
 pub const QuantizedStorage = weight_source_mod.QuantizedStorage;
 const c_file = @import("../util/c_file.zig");
@@ -1619,7 +1619,7 @@ pub fn decoderRuntimePreparedSlotsMatchFamily(self: anytype, gpt_config: anytype
             return decoderRuntimeRmsNormSlotPrepared(self, decoder_bitnet_runtime.finalNormSlot(gpt_config.num_hidden_layers), gpt_config.hidden_size) and
                 decoderRuntimeLinearSlotPrepared(self, decoder_bitnet_runtime.finalLmHeadSlot(gpt_config.num_hidden_layers), gpt_config.hidden_size, gpt_config.vocab_size);
         },
-        .llama, .mistral, .qwen2, .qwen3, .gemma => {
+        .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .gemma => {
             for (0..gpt_config.num_hidden_layers) |layer| {
                 const layer_head_dim = gpt_config.effectiveHeadDimForLayer(layer);
                 const layer_kv_heads = gpt_config.effectiveKVHeadsForLayer(layer);
@@ -1780,7 +1780,7 @@ pub fn supportsDecoderRuntimeConfig(gpt_config: anytype) bool {
     return switch (gpt_config.family) {
         .gpt2 => decoder_gpt_runtime.supportsConfig(gpt_config),
         .bitnet => decoder_bitnet_runtime.supportsConfig(gpt_config),
-        .llama, .mistral, .qwen2, .qwen3 => decoder_gated_runtime.supportsConfig(gpt_config),
+        .llama, .mistral, .qwen2, .qwen3, .qwen3_vl => decoder_gated_runtime.supportsConfig(gpt_config),
         // The Metal whole-model executor can still own text-only runs for
         // multimodal/PLE Gemma variants even when the deepest family-local
         // decoder-runtime fast path declines and falls back to the generic GPT
@@ -1812,7 +1812,7 @@ pub fn prepareDecodeRuntimeFamily(
             kv_tokens,
             configured_layer_count,
         ),
-        .llama, .mistral, .qwen2, .qwen3, .gemma => try decoder_gated_runtime.prepareDecodeRuntime(
+        .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .gemma => try decoder_gated_runtime.prepareDecodeRuntime(
             cb,
             allocator,
             gpt_config,
@@ -2742,6 +2742,82 @@ pub fn decoderRuntimeApplyRope(self: anytype, request: anytype) !?MetalTensor {
     return finishHostOutput(output, request.input.shape(), rc);
 }
 
+/// Applies Qwen3-VL's interleaved three-axis rotary embedding. `positions`
+/// is axis-major (`temporal`, `height`, `width`) with `token_count` values per
+/// axis. Unlike ordinary RoPE, the position is shared by all attention heads
+/// belonging to a token and selected per frequency pair using `sections`.
+pub fn decoderRuntimeApplyMrope(self: anytype, request: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (request.token_count == 0 or request.head_dim == 0 or request.head_dim % 2 != 0) return null;
+    const section_total = std.math.add(usize, @intCast(request.sections[0]), @intCast(request.sections[1])) catch return null;
+    const all_sections = std.math.add(usize, section_total, @intCast(request.sections[2])) catch return null;
+    if (all_sections != request.head_dim / 2) return null;
+    const position_count = std.math.mul(usize, request.token_count, 3) catch return null;
+    if (request.positions.len != position_count) return null;
+    const total_values = request.input.elemCount();
+    if (total_values == 0 or total_values % request.head_dim != 0) return null;
+    const total_chunks = total_values / request.head_dim;
+    if (total_chunks % request.token_count != 0) return null;
+
+    if (!request.input.isDevice()) return null;
+    var output = try MetalTensor.deviceAllocate(runtime, total_values * @sizeOf(f32), .private, request.input.shape());
+    errdefer output.deinit();
+    const device_rc = termite_metal_decode_runtime_apply_mrope_device(
+        runtime,
+        request.input.deviceHandle(),
+        request.input.deviceByteOffset(),
+        request.positions.ptr,
+        total_chunks,
+        request.token_count,
+        request.head_dim,
+        request.sections[0],
+        request.sections[1],
+        request.sections[2],
+        request.theta,
+        request.freq_scale,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (device_rc == 0) return output;
+    output.deinit();
+    return null;
+}
+
+/// Applies Qwen3-VL vision RoPE with axis-major height/width positions.
+/// This is intentionally device-only: the projector must not silently copy
+/// Q/K through host memory on the production Metal route.
+pub fn decoderRuntimeApplyVisionRope(self: anytype, request: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (request.token_count == 0 or request.head_dim == 0 or request.head_dim % 4 != 0 or request.theta <= 0) return null;
+    const position_count = std.math.mul(usize, request.token_count, 2) catch return null;
+    if (request.positions.len != position_count) return null;
+    const total_values = request.input.elemCount();
+    if (total_values == 0 or total_values % request.head_dim != 0) return null;
+    const total_chunks = total_values / request.head_dim;
+    if (total_chunks % request.token_count != 0) return null;
+    if (!request.input.isDevice()) return null;
+
+    var output = try MetalTensor.deviceAllocate(runtime, total_values * @sizeOf(f32), .private, request.input.shape());
+    errdefer output.deinit();
+    const device_rc = termite_metal_decode_runtime_apply_vision_rope_device(
+        runtime,
+        request.input.deviceHandle(),
+        request.input.deviceByteOffset(),
+        request.positions.ptr,
+        total_chunks,
+        request.token_count,
+        request.head_dim,
+        request.theta,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (device_rc == 0) return output;
+    output.deinit();
+    return null;
+}
+
 pub fn decoderRuntimeApplyHeadRmsNormRope(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -3077,6 +3153,75 @@ pub fn decoderRuntimeApplyAttentionF32DeviceBatched(self: anytype, request: anyt
     if (rc != 0) {
         output.deinit();
         return null;
+    }
+    return output;
+}
+
+/// Batched dense causal attention over equal-length sequences: one
+/// single-sequence attention dispatch per batch item, each written directly
+/// into a shared preallocated [batch*q_len, heads*head_dim] output at that
+/// sequence's row offset. Removes the O(batch^2) concatenate-rows blit
+/// traffic of chaining per-sequence outputs while keeping the exact same
+/// per-sequence kernel and dispatch geometry — numerically identical to the
+/// per-sequence path. Device tensors only; callers fall back to the legacy
+/// loop when this declines.
+pub fn decoderRuntimeApplyBatchedAttentionF32DevicePreallocated(self: anytype, request: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!request.q.isDevice() or !request.k.isDevice() or !request.v.isDevice()) return null;
+    if (request.batch == 0 or request.q_len == 0 or request.num_heads == 0 or request.num_kv_heads == 0 or request.head_dim == 0) return null;
+    if (request.num_heads % request.num_kv_heads != 0) return null;
+    if (@hasField(@TypeOf(request), "planned_layer_contract")) {
+        if (!plannedContractAllowsF32Attention(request.planned_layer_contract)) return null;
+    }
+
+    const q_width = std.math.mul(usize, request.num_heads, request.head_dim) catch return null;
+    const kv_width = std.math.mul(usize, request.num_kv_heads, request.head_dim) catch return null;
+    const total_rows = std.math.mul(usize, request.batch, request.q_len) catch return null;
+    const q_elem_count = std.math.mul(usize, total_rows, q_width) catch return null;
+    const kv_elem_count = std.math.mul(usize, total_rows, kv_width) catch return null;
+    if (request.q.elemCount() != q_elem_count) return null;
+    if (request.k.elemCount() != kv_elem_count) return null;
+    if (request.v.elemCount() != kv_elem_count) return null;
+    const max_i32_usize = @as(usize, @intCast(std.math.maxInt(i32)));
+    if (total_rows > max_i32_usize or q_width > max_i32_usize) return null;
+
+    const out_shape = [_]i32{ @intCast(total_rows), @intCast(q_width) };
+    const output_byte_len = std.math.mul(usize, q_elem_count, @sizeOf(f32)) catch return null;
+    var output = try MetalTensor.deviceAllocate(runtime, output_byte_len, .private, &out_shape);
+    errdefer output.deinit();
+
+    const per_seq_q_bytes = request.q_len * q_width * @sizeOf(f32);
+    const per_seq_kv_bytes = request.q_len * kv_width * @sizeOf(f32);
+    for (0..request.batch) |b| {
+        const rc = termite_metal_decode_runtime_apply_attention_f32_device(
+            runtime,
+            request.q.deviceHandle(),
+            request.q.deviceByteOffset() + b * per_seq_q_bytes,
+            request.k.deviceHandle(),
+            request.k.deviceByteOffset() + b * per_seq_kv_bytes,
+            request.v.deviceHandle(),
+            request.v.deviceByteOffset() + b * per_seq_kv_bytes,
+            request.q_len,
+            request.q_len,
+            request.num_heads,
+            request.num_kv_heads,
+            request.head_dim,
+            0,
+            0,
+            0,
+            null,
+            0,
+            null,
+            null,
+            request.q_len,
+            output.deviceHandle(),
+            output.deviceByteOffset() + b * per_seq_q_bytes,
+        );
+        if (rc != 0) {
+            output.deinit();
+            return null;
+        }
     }
     return output;
 }
@@ -6295,6 +6440,7 @@ pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTenso
     const bias_tensor: ?MetalTensor = if (@hasField(@TypeOf(request), "bias")) request.bias else null;
     const mask_tensor: ?MetalTensor = if (@hasField(@TypeOf(request), "mask")) request.mask else null;
     const bias_mode: u32 = if (@hasField(@TypeOf(request), "bias_mode")) request.bias_mode else 0;
+    const qwen3vl_vision_flash: u32 = if (@hasField(@TypeOf(request), "qwen3vl_vision_flash") and request.qwen3vl_vision_flash) 1 else 0;
     if (bias_mode > 3) return null;
     if (bias_mode != 0 and (bias_tensor == null or !bias_tensor.?.isDevice())) return null;
     if (mask_tensor) |mask| {
@@ -6324,6 +6470,7 @@ pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTenso
         bias_mode,
         if (mask_tensor != null) 1 else 0,
         layout,
+        qwen3vl_vision_flash,
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
@@ -10608,12 +10755,14 @@ pub const RawRuntimeMemoryStats = extern struct {
     florence_q4_k_mm_nr4_dispatches: u64 = 0,
     florence_attention_1x_dispatches: u64 = 0,
     florence_window_sdpa_dispatches: u64 = 0,
+    qwen3vl_vision_flash_q32_dispatches: u64 = 0,
     q6_k_linear_reduce: u64 = 0,
     q6_k_linear_reduce_rows_1: u64 = 0,
     q6_k_linear_reduce_rows_2_8: u64 = 0,
     q6_k_linear_reduce_rows_9_64: u64 = 0,
     q6_k_linear_reduce_rows_65_plus: u64 = 0,
     q6_k_linear_reduce_f16_input: u64 = 0,
+    q6_k_high_row_mm_matrix_dispatches: u64 = 0,
     lm_head_q4_q6_refine_dispatches: u64 = 0,
     // Mirrors `uint64_t antfly_generated_dispatch_counts[12][4]` in
     // termite_metal_decode_runtime_memory_stats (metal_kernels.m); the extern
@@ -10635,6 +10784,17 @@ test "metal generated attention and RMS opt-ins are fail-closed and execution-co
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_PREFILL_FLASH_HD512"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "runtime->generated_rms_norm_calls += 1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "return termite_metal_encode_rms_norm_generated("));
+}
+
+test "metal Q6_K high-row matrix route is opt-in, rollback-gated, and counted" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "kernel void termite_q6_k_high_row_mm_matrix_m64_n64"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_Q6_K_HIGH_ROW_MM"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_Q6_K_HIGH_ROW_MM"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simdgroup_float8x8 mw[8]; simdgroup_float8x8 mx"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->q6_k_high_row_mm_matrix_dispatches += 1"));
 }
 
 test "metal top-p sampling retains the crossing token and cutoff ties" {
@@ -10680,10 +10840,16 @@ test "metal prefill direct KV is selected-only, bounded, rollback-safe, and coun
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "apple_gpu_family == 9u && [device.name hasPrefix:@\"Apple M4\"]"));
     try std.testing.expect(std.mem.indexOf(u8, source, "TERMITE_METAL_DISABLE_PREFILL_SG_DIRECT_LOAD").? <
         std.mem.indexOf(u8, source, "TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD").?);
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, source, "return termite_metal_env_flag_enabled(getenv(\"TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD\"));"),
-    );
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD"));
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        source,
+        1,
+        "return termite_metal_env_flag_enabled(getenv(\"TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD\")) ||\n" ++
+            "        termite_metal_env_flag_enabled(getenv(\"TERMITE_METAL_ENABLE_QWEN3VL_PREFILL_SG_ATTENTION\"));",
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, source, "TERMITE_METAL_DISABLE_QWEN3VL_PREFILL_SG_ATTENTION").? <
+        std.mem.indexOf(u8, source, "TERMITE_METAL_ENABLE_QWEN3VL_PREFILL_SG_ATTENTION").?);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->attention_prefill_direct_kv_calls = runtime->attention_prefill_direct_kv_calls"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->attention_prefill_paged_kv_calls = runtime->attention_prefill_paged_kv_calls"));
 }
@@ -15054,7 +15220,7 @@ test "metal exact timing calibration targets twenty milliseconds within bounds" 
     try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "gpu-timestamps-required"));
     try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "interleaved-abba5"));
     try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "small-output-nr2"));
-    try std.testing.expect(std.mem.startsWith(u8, metal_jit_qualification_policy_identity, "metal-v19:"));
+    try std.testing.expect(std.mem.startsWith(u8, metal_jit_qualification_policy_identity, "metal-v20:"));
     try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "q4_k+q6_k-exact-2d-rows2-plus"));
     try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "matrix40or64x64x32-row-tiled+homogeneous-qkv-companion"));
     try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "qualified-coverage=all-eligible-calibrated-denominator+floor2pct+target90pct+attempts<=5-per-regime"));
@@ -17450,6 +17616,34 @@ pub extern fn termite_metal_decode_runtime_apply_rope_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_apply_mrope_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    positions: [*c]const u32,
+    total_chunks: usize,
+    token_count: usize,
+    head_dim: usize,
+    section_t: usize,
+    section_h: usize,
+    section_w: usize,
+    theta: f32,
+    freq_scale: f32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_vision_rope_device(
+    runtime: ?*anyopaque,
+    input_buffer: ?*anyopaque,
+    input_byte_offset: usize,
+    positions: [*]const u32,
+    total_chunks: usize,
+    token_count: usize,
+    head_dim: usize,
+    theta: f32,
+    output_buffer: ?*anyopaque,
+    output_byte_offset: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_apply_head_rms_rope_device(
     runtime: ?*RawMetalDecodeRuntime,
     input_handle: ?*anyopaque,
@@ -19265,6 +19459,7 @@ pub extern fn termite_metal_decode_runtime_sdpa_f32_device(
     bias_mode: u32,
     has_mask: u32,
     layout: u32,
+    qwen3vl_vision_flash: u32,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
@@ -20969,6 +21164,25 @@ pub extern fn termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_slots_d
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    residual_handle: ?*anyopaque,
+    residual_offset: usize,
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    activation_kind: u32,
+    gate_linear_slot: usize,
+    up_linear_slot: usize,
+    post_gate_rms_norm_slot: usize,
+    post_down_rms_norm_slot: usize,
+    eps: f32,
+    down_linear_slot: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q6_k_down_slots_device(
     runtime: ?*RawMetalDecodeRuntime,
     input_handle: ?*anyopaque,
@@ -21924,14 +22138,19 @@ fn ensureRuntimeQuantSlotPreparedPrivateWritable(
     return true;
 }
 
+fn runtimeZeroBiasElisionEnabled() bool {
+    // Skipping an all-zero bias add is numerically an identity, and models
+    // without native biases (e.g. qwen3 GGUF) get zero-filled bias buffers
+    // synthesized at slot prepare, so default the elision on.
+    if (getenvBool("TERMITE_METAL_DISABLE_ZERO_BIAS_ELISION")) return false;
+    return !getenvBool("TERMITE_METAL_DISABLE_A4B_ZERO_BIAS_ELISION") and
+        !getenvBool("TERMITE_METAL_DISABLE_QWEN3VL_ZERO_BIAS_ELISION");
+}
+
 fn applyRuntimeLinearBiasHost(self: anytype, slot: usize, output: []f32, rows: usize, out_dim: usize) bool {
     if (slot >= decoder_runtime_linear_slot_capacity or rows == 0 or out_dim == 0) return false;
     const bias_tensor = self.raw_linear_slot_dense_biases[slot] orelse return true;
-    if (a4bHighMemoryFeatureEnabled(
-        "TERMITE_METAL_ENABLE_A4B_ZERO_BIAS_ELISION",
-        "TERMITE_METAL_DISABLE_A4B_ZERO_BIAS_ELISION",
-    ) and
-        self.raw_linear_slot_bias_is_zero[slot]) return true;
+    if (runtimeZeroBiasElisionEnabled() and self.raw_linear_slot_bias_is_zero[slot]) return true;
     if (bias_tensor.len != out_dim) return false;
     if (output.len != rows * out_dim) return false;
     const bias = bias_tensor.data[0..out_dim];
@@ -21946,11 +22165,7 @@ fn applyRuntimeLinearBiasDevice(self: anytype, slot: usize, output: *MetalTensor
     const runtime = self.raw_decode_runtime orelse return false;
     if (slot >= decoder_runtime_linear_slot_capacity or rows == 0 or out_dim == 0) return false;
     if (self.raw_linear_slot_dense_biases[slot] == null) return true;
-    if (a4bHighMemoryFeatureEnabled(
-        "TERMITE_METAL_ENABLE_A4B_ZERO_BIAS_ELISION",
-        "TERMITE_METAL_DISABLE_A4B_ZERO_BIAS_ELISION",
-    ) and
-        self.raw_linear_slot_bias_is_zero[slot]) return true;
+    if (runtimeZeroBiasElisionEnabled() and self.raw_linear_slot_bias_is_zero[slot]) return true;
     if (!output.isDevice()) return false;
     if (output.elemCount() != rows * out_dim) return false;
     return termite_metal_decode_runtime_apply_linear_bias_device(
@@ -25475,9 +25690,10 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!input.isDevice() or !residual.isDevice()) return null;
-    // Batched Q8_0 gated FFN has diverged from rowwise execution for qLen>1.
-    // Keep device residency by encoding one row at a time until the batched
-    // kernel has parity coverage.
+    // Q8_0 multi-row requests take the batched device encode; qualification
+    // gates (oracle cosine + batch-vs-single) cover its parity. Other quant
+    // formats still encode one row at a time pending their own coverage;
+    // TERMITE_METAL_FORCE_Q8_0_GATED_FFN_ROWWISE restores the row loop.
     if (request.gate_linear_slot >= decoder_runtime_linear_slot_capacity or
         request.up_linear_slot >= decoder_runtime_linear_slot_capacity or
         request.down_linear_slot >= decoder_runtime_linear_slot_capacity)
@@ -25515,10 +25731,16 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
     const all_q8_0 = gate_kind == .q8_0 and up_kind == .q8_0 and down_kind == .q8_0;
     const all_q4_0 = gate_kind == .q4_0 and up_kind == .q4_0 and down_kind == .q4_0;
     const q4_0_q6_k = gate_kind == .q4_0 and up_kind == .q4_0 and down_kind == .q6_k;
+    const all_q4_k_high_row = gate_kind == .q4_k and up_kind == .q4_k and down_kind == .q4_k and
+        request.rows > 64 and request.rows <= 4096 and
+        getenvFlagEnabled("TERMITE_METAL_ENABLE_Q4_K_HIGH_ROW_MM") and
+        !getenvFlagEnabled("TERMITE_METAL_DISABLE_Q4_K_HIGH_ROW_MM") and
+        getenvFlagEnabled("TERMITE_METAL_ENABLE_Q4_K_HIGH_ROW_FUSED_FFN") and
+        !getenvFlagEnabled("TERMITE_METAL_DISABLE_Q4_K_HIGH_ROW_FUSED_FFN");
     if (request.rows == 1 and all_q4_0 and getenvFlagEnabled("TERMITE_METAL_DISABLE_GATED_FFN_RESIDUAL_SINGLE_ROW")) {
         return null;
     }
-    if (!all_q8_0 and !all_q4_0 and !q4_0_q6_k) {
+    if (!all_q8_0 and !all_q4_0 and !q4_0_q6_k and !all_q4_k_high_row) {
         if (gate_kind != up_kind or
             !quantizedRuntimeLinearKindHasPairDeviceKernel(gate_kind) or
             !quantizedRuntimeLinearKindHasSingleStageDeviceKernel(down_kind))
@@ -25615,7 +25837,46 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
     const residual_handle = residual.deviceHandle();
     const output_handle = output.deviceHandle();
     const row_bytes = request.hidden_size * @sizeOf(f32);
-    const rc = if (request.rows > 1) rc_blk: {
+    const rc = if (all_q4_k_high_row) termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots_device(
+        runtime,
+        input_handle,
+        input.deviceByteOffset(),
+        residual_handle,
+        residual.deviceByteOffset(),
+        request.rows,
+        request.hidden_size,
+        request.intermediate_size,
+        @intFromEnum(request.activation),
+        request.gate_linear_slot,
+        request.up_linear_slot,
+        request.post_gate_rms_norm_slot orelse none,
+        request.post_down_rms_norm_slot orelse none,
+        request.eps,
+        request.down_linear_slot,
+        output_handle,
+        output.deviceByteOffset(),
+    ) else if (request.rows > 1 and all_q8_0 and
+        !getenvFlagEnabled("TERMITE_METAL_FORCE_Q8_0_GATED_FFN_ROWWISE"))
+        termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_device(
+            runtime,
+            input_handle,
+            input.deviceByteOffset(),
+            residual_handle,
+            residual.deviceByteOffset(),
+            request.rows,
+            request.hidden_size,
+            request.intermediate_size,
+            @intFromEnum(request.activation),
+            request.gate_linear_slot,
+            request.up_linear_slot,
+            request.post_gate_rms_norm_slot orelse none,
+            request.post_down_rms_norm_slot orelse none,
+            request.eps,
+            request.down_linear_slot,
+            output_handle,
+            output.deviceByteOffset(),
+        )
+    else if (request.rows > 1) rc_blk: {
         var row: usize = 0;
         while (row < request.rows) : (row += 1) {
             const offset = row * row_bytes;
@@ -31972,6 +32233,134 @@ test "metal native decoderRuntimeApplyLinear q8_0 device rows match reference" {
     }
 }
 
+test "metal native q8_0 SG-v2 and M64 high-row routes match host reference" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const m64_disable_env = "TERMITE_METAL_DISABLE_Q8_0_SG_M64";
+    const original_m64_disable = if (std.c.getenv(m64_disable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer {
+        if (original_m64_disable) |value| {
+            _ = setenv(m64_disable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(m64_disable_env);
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(m64_disable_env));
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const in_dim: usize = 64;
+    const out_dim: usize = 64;
+    const row_blocks = in_dim / 32;
+    const block_bytes = 34;
+    var weight_raw: [out_dim * row_blocks * block_bytes]u8 = [_]u8{0} ** (out_dim * row_blocks * block_bytes);
+    for (0..out_dim) |out| {
+        for (0..row_blocks) |block| {
+            const base = (out * row_blocks + block) * block_bytes;
+            weight_raw[base] = 0x00;
+            weight_raw[base + 1] = 0x3C; // f16 1.0
+            for (0..32) |col| {
+                const raw = @as(i16, @intCast((out * 11 + block * 7 + col * 3) % 17)) - 8;
+                weight_raw[base + 2 + col] = @bitCast(@as(i8, @intCast(raw)));
+            }
+        }
+    }
+    const shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
+    const storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q8_0 },
+        .raw_bytes = &weight_raw,
+        .shape = &shape,
+        .raw_owned = false,
+        .allocator = std.testing.allocator,
+    };
+    var bias_data: [out_dim]f32 = undefined;
+    for (&bias_data, 0..) |*value, i| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) / 32.0;
+    }
+    var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(out_dim)});
+    defer bias.deinit();
+    var dummy_weight_value = [_]f32{0.0};
+    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+    var stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .weight = dummy_weight,
+        .bias = bias,
+        .quantized_storage = @as(?*const QuantizedStorage, &storage),
+        .slot = 0,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .retain_dense_fallback = false,
+    }, &stats));
+
+    var weight_host: [out_dim * in_dim]f32 = undefined;
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q8_0 }, &weight_raw, &weight_host);
+    for ([_]usize{ 65, 96, 128 }) |rows| {
+        const input_data = try std.testing.allocator.alloc(f32, rows * in_dim);
+        defer std.testing.allocator.free(input_data);
+        for (input_data, 0..) |*value, i| {
+            const signed = @as(i32, @intCast((i * 5 + 3) % 31)) - 15;
+            value.* = @as(f32, @floatFromInt(signed)) / 64.0;
+        }
+        const expected = try std.testing.allocator.alloc(f32, rows * out_dim);
+        defer std.testing.allocator.free(expected);
+        native.sgemmTransBSync(rows, out_dim, in_dim, 1.0, input_data, &weight_host, 0.0, expected);
+        for (0..rows) |row| {
+            for (0..out_dim) |out| expected[row * out_dim + out] += bias_data[out];
+        }
+        var input = try testDeviceTensorFromSlice(runtime, input_data, &[_]i32{ @intCast(rows), @intCast(in_dim) });
+        defer input.deinit();
+
+        try std.testing.expectEqual(@as(c_int, 0), unsetenv(m64_disable_env));
+        const m64_before = runtimeMemorySnapshot(runtime);
+        var m64_output = (try decoderRuntimeApplyLinear(&provider, .{
+            .slot = 0,
+            .input = input,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+        })) orelse return error.UnexpectedNull;
+        defer m64_output.deinit();
+        const m64_after = runtimeMemorySnapshot(runtime);
+        try std.testing.expect(m64_after.q8_0_linear_dispatch_mm > m64_before.q8_0_linear_dispatch_mm);
+        try std.testing.expect(m64_after.q8_0_linear_rows_65_plus > m64_before.q8_0_linear_rows_65_plus);
+
+        try std.testing.expectEqual(@as(c_int, 0), setenv(m64_disable_env, "1", 1));
+        const sg_v2_before = runtimeMemorySnapshot(runtime);
+        var sg_v2_output = (try decoderRuntimeApplyLinear(&provider, .{
+            .slot = 0,
+            .input = input,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+        })) orelse return error.UnexpectedNull;
+        defer sg_v2_output.deinit();
+        const sg_v2_after = runtimeMemorySnapshot(runtime);
+        try std.testing.expect(sg_v2_after.q8_0_linear_dispatch_mm > sg_v2_before.q8_0_linear_dispatch_mm);
+        try std.testing.expect(sg_v2_after.q8_0_linear_rows_65_plus > sg_v2_before.q8_0_linear_rows_65_plus);
+
+        var m64_output_mut = m64_output;
+        var sg_v2_output_mut = sg_v2_output;
+        const m64_actual = try tensorHostSlice(&m64_output_mut);
+        const sg_v2_actual = try tensorHostSlice(&sg_v2_output_mut);
+        try std.testing.expectEqual(expected.len, m64_actual.len);
+        try std.testing.expectEqual(expected.len, sg_v2_actual.len);
+        for (expected, m64_actual, sg_v2_actual, 0..) |exp, m64, sg_v2, i| {
+            if (!std.math.approxEqAbs(f32, exp, m64, 1e-3) or
+                !std.math.approxEqAbs(f32, exp, sg_v2, 1e-3))
+            {
+                std.debug.print("q8_0 high-row mismatch rows={d} idx={d} expected={d} m64={d} sg_v2={d}\n", .{ rows, i, exp, m64, sg_v2 });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
 test "metal native decoderRuntimeApplyLinear florence q4_k matrix matches reference" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
@@ -36571,6 +36960,21 @@ test "metal native q8_0 gated ffn device frame matches decomposed" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
 
+    const pair_sg_disable_env = "TERMITE_METAL_DISABLE_Q8_PAIR_ACTIVATION_SG_V2";
+    const original_pair_sg_disable = if (std.c.getenv(pair_sg_disable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer {
+        if (original_pair_sg_disable) |value| {
+            _ = setenv(pair_sg_disable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(pair_sg_disable_env);
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(pair_sg_disable_env));
+
     const metal_native_provider = @import("metal_native_provider.zig");
     var provider = try metal_native_provider.MetalNativeProvider.create();
     defer provider.deinitOwned();
@@ -36579,7 +36983,9 @@ test "metal native q8_0 gated ffn device frame matches decomposed" {
 
     const hidden_size: usize = 1536;
     const intermediate_size: usize = 8960;
-    const rows: usize = 10;
+    // First high-row bucket: exercises the fused SG-v2 pair tail and M64
+    // single-linear bulk plus one-row tail on realistic Qwen dimensions.
+    const rows: usize = 65;
 
     const TestQ80Weight = struct {
         bytes: []u8,
@@ -36753,6 +37159,25 @@ test "metal native q8_0 gated ffn device frame matches decomposed" {
         after_direct_dispatch.q8_0_linear_family_dispatch_counts[1][1] > before_direct_dispatch.q8_0_linear_family_dispatch_counts[1][1] or
             after_direct_dispatch.q8_0_linear_family_dispatch_counts[1][3] > before_direct_dispatch.q8_0_linear_family_dispatch_counts[1][3],
     );
+    try std.testing.expect(after_direct_dispatch.q8_0_linear_rows_65_plus > before_direct_dispatch.q8_0_linear_rows_65_plus);
+
+    // The rollback path must be numerically equivalent to the promoted fused
+    // pair kernel, not merely available as a startup-time escape hatch.
+    try std.testing.expectEqual(@as(c_int, 0), setenv(pair_sg_disable_env, "1", 1));
+    var fallback_direct = (try tryDeviceQuantizedGatedFfnResidual(&provider, .{
+        .gate_linear_slot = 0,
+        .up_linear_slot = 1,
+        .down_linear_slot = 2,
+        .rows = rows,
+        .hidden_size = hidden_size,
+        .intermediate_size = intermediate_size,
+        .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
+        .eps = 1e-5,
+        .post_gate_rms_norm_slot = null,
+        .post_down_rms_norm_slot = @as(?usize, 0),
+    }, input, residual, &stats)) orelse return error.UnexpectedNull;
+    defer fallback_direct.deinit();
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(pair_sg_disable_env));
 
     try std.testing.expect(decoderRuntimeReserveGatedFfnScratch(&provider, rows, hidden_size, intermediate_size));
     try beginFrame(runtime);
@@ -36774,13 +37199,19 @@ test "metal native q8_0 gated ffn device frame matches decomposed" {
 
     var decomposed_mut = decomposed;
     var direct_mut = direct;
+    var fallback_direct_mut = fallback_direct;
     var framed_mut = framed;
     const expected = try tensorHostSlice(&decomposed_mut);
     const direct_actual = try tensorHostSlice(&direct_mut);
+    const fallback_direct_actual = try tensorHostSlice(&fallback_direct_mut);
     const framed_actual = try tensorHostSlice(&framed_mut);
     try std.testing.expectEqual(expected.len, direct_actual.len);
+    try std.testing.expectEqual(expected.len, fallback_direct_actual.len);
     try std.testing.expectEqual(expected.len, framed_actual.len);
     for (expected, direct_actual) |exp, got| {
+        try std.testing.expectApproxEqAbs(exp, got, 1e-3);
+    }
+    for (expected, fallback_direct_actual) |exp, got| {
         try std.testing.expectApproxEqAbs(exp, got, 1e-3);
     }
     for (expected, framed_actual) |exp, got| {
@@ -38392,6 +38823,101 @@ test "metal native decoder runtime rope matches partial-rope reference" {
     }
 }
 
+test "metal native decoder runtime Qwen3-VL interleaved M-RoPE matches reference" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const token_count: usize = 2;
+    const heads_per_token: usize = 2;
+    const head_dim: usize = 6;
+    const total_chunks = token_count * heads_per_token;
+    const sections = [3]u32{ 1, 1, 1 };
+    const positions = [_]u32{
+        0, 7, // temporal
+        0, 11, // height
+        0, 13, // width
+    };
+    var input_data: [total_chunks * head_dim]f32 = undefined;
+    for (&input_data, 0..) |*value, i| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 9)) * 0.125;
+    }
+    var expected = input_data;
+    const half = head_dim / 2;
+    for (0..total_chunks) |chunk| {
+        const token = chunk / heads_per_token;
+        for (0..half) |pair| {
+            const axis: usize = switch (pair % 3) {
+                1 => 1,
+                2 => 2,
+                else => 0,
+            };
+            const position = @as(f32, @floatFromInt(positions[axis * token_count + token]));
+            const frequency = 1.0 / std.math.pow(f32, 10_000.0, @as(f32, @floatFromInt(2 * pair)) / @as(f32, @floatFromInt(head_dim)));
+            const angle = position * frequency;
+            const base = chunk * head_dim;
+            const x0 = input_data[base + pair];
+            const x1 = input_data[base + half + pair];
+            expected[base + pair] = x0 * @cos(angle) - x1 * @sin(angle);
+            expected[base + half + pair] = x0 * @sin(angle) + x1 * @cos(angle);
+        }
+    }
+
+    var device_input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ @intCast(total_chunks), @intCast(head_dim) });
+    defer device_input.deinit();
+    var device_result = (try decoderRuntimeApplyMrope(&provider, .{
+        .input = device_input,
+        .token_count = token_count,
+        .head_dim = head_dim,
+        .theta = 10_000.0,
+        .freq_scale = 1.0,
+        .positions = positions[0..],
+        .sections = sections,
+    })) orelse return error.UnexpectedNull;
+    defer device_result.deinit();
+    var device_result_mut = device_result;
+    const device_values = try tensorHostSlice(&device_result_mut);
+    for (expected, device_values) |exp, got| try std.testing.expectApproxEqAbs(exp, got, 2e-5);
+}
+
+test "metal native decoder runtime Qwen3-VL vision RoPE matches reference" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    const native_compute_mod = @import("../ops/native_compute.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const token_count: usize = 2;
+    const heads_per_token: usize = 2;
+    const head_dim: usize = 8;
+    const total_chunks = token_count * heads_per_token;
+    const positions = [_]u32{ 0, 5, 0, 7 };
+    var input_data: [total_chunks * head_dim]f32 = undefined;
+    for (&input_data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i + 1)) * 0.03125;
+    var expected: [input_data.len]f32 = undefined;
+    try native_compute_mod.visionRopeCore(&expected, &input_data, token_count, head_dim, 10_000.0, &positions);
+
+    var device_input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ @intCast(token_count), @intCast(heads_per_token * head_dim) });
+    defer device_input.deinit();
+    var device_result = (try decoderRuntimeApplyVisionRope(&provider, .{
+        .input = device_input,
+        .token_count = token_count,
+        .head_dim = head_dim,
+        .theta = 10_000.0,
+        .positions = &positions,
+    })) orelse return error.UnexpectedNull;
+    defer device_result.deinit();
+    var device_result_mut = device_result;
+    const device_values = try tensorHostSlice(&device_result_mut);
+    for (expected, device_values) |exp, got| try std.testing.expectApproxEqAbs(exp, got, 2e-5);
+}
+
 fn testDeviceTensorFromSlice(runtime: *RawMetalDecodeRuntime, data: []const f32, dims: []const i32) !MetalTensor {
     var tensor = try MetalTensor.deviceAllocate(runtime, data.len * @sizeOf(f32), .private, dims);
     errdefer tensor.deinit();
@@ -39040,6 +39566,79 @@ test "metal native decoder runtime florence window sdpa matches generic device" 
     try std.testing.expectEqual(generic_values.len, specialized_values.len);
     for (generic_values, specialized_values) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+    }
+}
+
+test "metal native decoder runtime qwen3vl vision flash is scoped and matches generic device" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const batch: usize = 1;
+    const seq_len: usize = 300;
+    const num_heads: usize = 2;
+    const head_dim: usize = 64;
+    const hidden = num_heads * head_dim;
+    const total = batch * seq_len * hidden;
+    var q_data: [total]f32 = undefined;
+    var k_data: [total]f32 = undefined;
+    var v_data: [total]f32 = undefined;
+    for (&q_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast((i * 5 + 1) % 37)) - 18;
+        value.* = @as(f32, @floatFromInt(signed)) * 0.015625;
+    }
+    for (&k_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast((i * 7 + 3) % 41)) - 20;
+        value.* = @as(f32, @floatFromInt(signed)) * 0.0125;
+    }
+    for (&v_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast((i * 11 + 5) % 43)) - 21;
+        value.* = @as(f32, @floatFromInt(signed)) * 0.01;
+    }
+
+    const shape = [_]i32{ @intCast(batch * seq_len), @intCast(hidden) };
+    var q = try testDeviceTensorFromSlice(runtime, &q_data, &shape);
+    defer q.deinit();
+    var k = try testDeviceTensorFromSlice(runtime, &k_data, &shape);
+    defer k.deinit();
+    var v = try testDeviceTensorFromSlice(runtime, &v_data, &shape);
+    defer v.deinit();
+
+    var generic = (try decoderRuntimeSdpaF32Device(&provider, .{
+        .q = q,
+        .k = k,
+        .v = v,
+        .batch = batch,
+        .seq_len = seq_len,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+    })) orelse return error.UnexpectedNull;
+    defer generic.deinit();
+    const generic_values = try generic.toHostSlice();
+
+    const before = runtimeMemorySnapshot(runtime);
+    var specialized = (try decoderRuntimeSdpaF32Device(&provider, .{
+        .q = q,
+        .k = k,
+        .v = v,
+        .batch = batch,
+        .seq_len = seq_len,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+        .qwen3vl_vision_flash = true,
+    })) orelse return error.UnexpectedNull;
+    defer specialized.deinit();
+    const specialized_values = try specialized.toHostSlice();
+    const after = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(before.qwen3vl_vision_flash_q32_dispatches + 1, after.qwen3vl_vision_flash_q32_dispatches);
+    try std.testing.expectEqual(generic_values.len, specialized_values.len);
+    for (generic_values, specialized_values) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 2e-3);
     }
 }
 

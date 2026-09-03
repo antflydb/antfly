@@ -24,13 +24,13 @@ const workload_profile_policy = @import("../workload_profile_policy.zig");
 
 pub const schema = "antfly.kernel_jit.v1";
 pub const codegen_abi_version: u32 = 3;
-pub const qualification_policy_version: u32 = 4;
+pub const qualification_policy_version: u32 = 5;
 /// Bump the policy version and update this identity whenever correctness
 /// tolerances, fixtures, warmup/measurement procedure, or eligibility gates
 /// change. It is part of every artifact key, so stale approvals cannot cross
 /// a qualification-policy change.
 pub const qualification_policy_identity =
-    "correctness-first/v4;matrix-fp16-abs=q4k0.002,q6k0.003;min-speedup=1.02;warmups=2;paired-repeats=5;worst-repeat-gate=true;workload-coverage=qualified-weight-80,min-share-2,max-attempts-5";
+    "correctness-first/v5;matrix-operands=q4k-fp16-abs0.002,q6k-fp32-abs0.003;min-speedup=1.02;warmups=2;paired-repeats=5;worst-repeat-gate=true;workload-coverage=qualified-weight-80,min-share-2,max-attempts-5";
 pub const minimum_speedup: f64 = 1.02;
 pub const maximum_candidates: usize = 8;
 pub const warmup_repeats: usize = 2;

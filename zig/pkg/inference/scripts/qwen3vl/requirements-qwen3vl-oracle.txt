@@ -1,0 +1,7 @@
+# Frozen, offline Hugging Face oracle for Qwen3-VL qualification.
+accelerate==1.14.0
+numpy==2.4.2
+pillow==12.1.0
+torch==2.10.0
+torchvision==0.25.0
+transformers==5.1.0

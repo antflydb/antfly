@@ -44,6 +44,7 @@ const gemma3_mm = @import("gemma3_multimodal.zig");
 const gemma4_mm = @import("../architectures/gemma4_multimodal.zig");
 const gemma4_mtp = @import("../architectures/gemma4_mtp.zig");
 const gemma4_projector = @import("../architectures/gemma4_projector.zig");
+const qwen3vl_projector = @import("../architectures/qwen3vl_projector.zig");
 const qwen2vl_mm = @import("qwen2vl_multimodal.zig");
 const projector_format_mod = @import("../architectures/projector_format.zig");
 const hf_tokenizer = tokenizer_mod.hf;
@@ -137,6 +138,47 @@ pub fn nativeGenerationMediaTokenAllowance(messages: []const Message, config: gp
     return nativeGenerationImageCount(messages) *| (@as(usize, config.mm_tokens_per_image) + 1);
 }
 
+pub const NativeGenerationMediaAdmission = struct {
+    token_allowance: usize = 0,
+    host_scratch_bytes: usize = 0,
+    backend_scratch_bytes: usize = 0,
+};
+
+/// One source of truth for multimodal scheduler and process-wide admission.
+/// Qwen3-VL probes encoded image headers and applies the exact smart-resize
+/// geometry used by its projector; no image is decoded or projected here.
+pub fn nativeGenerationMediaAdmission(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    messages: []const Message,
+    config: gpt_mod.Config,
+) !NativeGenerationMediaAdmission {
+    if (config.family == .qwen3_vl) {
+        const images = try collectImagesInPromptOrder(allocator, messages);
+        defer allocator.free(images);
+        if (images.len == 0) return .{};
+        const projector = try qwen3vl_projector.estimateAdmission(images, config, .{});
+        return .{
+            // The text encode already contains an image placeholder. Retaining
+            // one additional token per image preserves the existing
+            // conservative allowance contract while the visual span itself is
+            // exact.
+            .token_allowance = std.math.add(usize, projector.visual_tokens, images.len) catch
+                return error.PromptTooLong,
+            .host_scratch_bytes = projector.host_scratch_bytes,
+            .backend_scratch_bytes = projector.backend_scratch_bytes,
+        };
+    }
+    if (config.family == .qwen3_5) {
+        const image_count = nativeGenerationImageCount(messages);
+        if (image_count == 0) return .{};
+        const prep_config = try qwen2vl_mm.loadPreprocessorConfig(allocator, model_dir);
+        const max_image_tokens = try qwen2vl_mm.maxImageTokenCount(prep_config);
+        return .{ .token_allowance = image_count *| (max_image_tokens +| 1) };
+    }
+    return .{ .token_allowance = nativeGenerationMediaTokenAllowance(messages, config) };
+}
+
 /// Conservative media-token count used for scheduling and memory admission.
 /// Qwen image spans are dynamic, so derive their bound from the same
 /// preprocessor configuration that produces the final visual tokens.
@@ -146,18 +188,13 @@ pub fn nativeGenerationAdmissionMediaTokenAllowance(
     messages: []const Message,
     config: gpt_mod.Config,
 ) !usize {
-    if (config.family != .qwen3_5) return nativeGenerationMediaTokenAllowance(messages, config);
-    const image_count = nativeGenerationImageCount(messages);
-    if (image_count == 0) return 0;
-    const prep_config = try qwen2vl_mm.loadPreprocessorConfig(allocator, model_dir);
-    const max_image_tokens = try qwen2vl_mm.maxImageTokenCount(prep_config);
-    return image_count *| (max_image_tokens +| 1);
+    return (try nativeGenerationMediaAdmission(allocator, model_dir, messages, config)).token_allowance;
 }
 
 /// Media allowance that can safely constrain the text-only encode before
 /// dynamic image preprocessing determines the exact expanded prompt length.
 pub fn nativeGenerationPreliminaryMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
-    if (config.family == .qwen3_5) return 0;
+    if (config.family == .qwen3_5 or config.family == .qwen3_vl) return 0;
     return nativeGenerationMediaTokenAllowance(messages, config);
 }
 
@@ -317,6 +354,15 @@ pub const GenerationConfig = struct {
     /// default; false asks templates that support `enable_thinking` to open a
     /// public/final response channel directly.
     enable_thinking: ?bool = null,
+    /// Writes deterministic Qwen3-VL preprocessing/expansion evidence for an
+    /// offline qualification harness. Ordinary serving must leave this null.
+    qwen3vl_parity_json_path: ?[]const u8 = null,
+    /// Optional canonical little-endian f32 patch payload paired with the
+    /// Qwen3-VL parity JSON. Requires qwen3vl_parity_json_path.
+    qwen3vl_parity_patch_path: ?[]const u8 = null,
+    /// Optional canonical little-endian f32 logits for the final Qwen3-VL
+    /// prefill row. Qualification-only; requires qwen3vl_parity_json_path.
+    qwen3vl_parity_logits_path: ?[]const u8 = null,
 };
 
 pub fn kvSlidingTrimForced() bool {
@@ -411,7 +457,7 @@ pub const ChatTemplate = struct {
         pad_token: []const u8,
     ) !ChatTemplate {
         return .{
-            .template = try jinja.Template.init(allocator, source),
+            .template = try jinja.Template.initHuggingFace(allocator, source),
             .bos_token = bos_token,
             .eos_token = eos_token,
             .unk_token = unk_token,
@@ -501,6 +547,9 @@ pub const GenerationResult = struct {
 pub const GenerationTimingMs = struct {
     prompt_format: u64 = 0,
     tokenize: u64 = 0,
+    /// Image/audio collection, preprocessing, projector execution, and
+    /// construction of the expanded multimodal prompt embeddings.
+    multimodal_prepare: u64 = 0,
     runtime_prepare: u64 = 0,
     prefill: u64 = 0,
     decode: u64 = 0,
@@ -2130,6 +2179,9 @@ pub const NativeDecodeState = struct {
     force_full_recompute: bool = false,
     kv_max_inflight_tokens: usize = 0,
     allow_swa_ring: bool = false,
+    qwen3vl_mrope_position_delta: ?i64 = null,
+    qwen3vl_decode_positions: [3]u32 = .{ 0, 0, 0 },
+    qwen3vl_text_only: bool = false,
 
     pub fn initContiguous(allocator: std.mem.Allocator) NativeDecodeState {
         return .{
@@ -2173,6 +2225,8 @@ pub const NativeDecodeState = struct {
         self.allow_swa_ring = config.supportsSplitSwaGlobalKvRing();
         if (config.family != .gemma) self.gemma4_layer_spec_cache.reset();
         if (!requiresDeepSeekV4CompressedCache(config)) self.clearDeepSeekV4CompressedCache();
+        self.qwen3vl_mrope_position_delta = if (config.family == .qwen3_vl) 0 else null;
+        self.qwen3vl_text_only = config.family == .qwen3_vl;
     }
 
     fn configureKvMaxInflightTokens(self: *NativeDecodeState, token_count: usize, request_allows_ring: bool) void {
@@ -2623,6 +2677,12 @@ pub const NativeDecodeState = struct {
     }
 
     pub fn gptDecodeContext(self: *NativeDecodeState, seq_len: usize, query_seq_len: usize) gpt_arch.DecodeContext {
+        const decode_positions: ?[]const u32 = if (self.qwen3vl_mrope_position_delta != null and query_seq_len == 1 and seq_len > 0) blk: {
+            const position = @as(i64, @intCast(seq_len - 1)) + self.qwen3vl_mrope_position_delta.?;
+            if (position < 0 or position > std.math.maxInt(u32)) break :blk null;
+            @memset(&self.qwen3vl_decode_positions, @intCast(position));
+            break :blk &self.qwen3vl_decode_positions;
+        } else null;
         if (disablePagedKvDebug() or self.force_full_recompute) {
             return .{
                 .attention_mode = .full_recompute,
@@ -2634,6 +2694,8 @@ pub const NativeDecodeState = struct {
                 .qwen35_linear_cache = if (self.qwen35_linear_cache) |*cache| cache else null,
                 .gemma4_layer_spec_cache = &self.gemma4_layer_spec_cache,
                 .deepseek_v4_compressed_cache = if (self.deepseek_v4_compressed_cache) |*cache| cache else null,
+                .mrope_positions = decode_positions,
+                .qwen3vl_text_only = self.qwen3vl_text_only,
             };
         }
         return .{
@@ -2651,6 +2713,8 @@ pub const NativeDecodeState = struct {
             .qwen35_linear_cache = if (self.qwen35_linear_cache) |*cache| cache else null,
             .gemma4_layer_spec_cache = &self.gemma4_layer_spec_cache,
             .deepseek_v4_compressed_cache = if (self.deepseek_v4_compressed_cache) |*cache| cache else null,
+            .mrope_positions = decode_positions,
+            .qwen3vl_text_only = self.qwen3vl_text_only,
             .kv_cache = if (self.kvView()) |view|
                 .{
                     .sequence_id = view.sequence_id,
@@ -3078,6 +3142,122 @@ pub const GenerationPipeline = struct {
     }
 };
 
+const Qwen3VlParityImageJson = struct {
+    source_width: usize,
+    source_height: usize,
+    resized_width: usize,
+    resized_height: usize,
+    grid_thw: [3]u32,
+    patch_rows: usize,
+    patch_columns: usize,
+    spatial_patch_f32le_sha256: []const u8,
+    positioned_embedding_f32le_sha256: []const u8,
+    vision_trace_layer: ?usize,
+    vision_trace_f32le_sha256: ?[]const u8,
+};
+
+const Qwen3VlParityTensorDigestJson = struct {
+    value_count: usize,
+    f32le_sha256: []const u8,
+};
+
+fn writeQwen3VlParityEvidence(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    patch_path: ?[]const u8,
+    placeholder_token_ids: []const i32,
+    prepared: *const qwen3vl_projector.PreparedPrompt,
+    projected: *const qwen3vl_projector.ProjectedImages,
+) !void {
+    if (projected.preprocess_evidence.len != projected.grids.len or
+        projected.preprocess_evidence.len != projected.tokens_per_image.len)
+    {
+        return error.MissingQwen3VlPreprocessEvidence;
+    }
+    const images = try allocator.alloc(Qwen3VlParityImageJson, projected.preprocess_evidence.len);
+    defer allocator.free(images);
+    for (projected.preprocess_evidence, 0..) |*evidence, i| {
+        images[i] = .{
+            .source_width = evidence.source_width,
+            .source_height = evidence.source_height,
+            .resized_width = evidence.resized_width,
+            .resized_height = evidence.resized_height,
+            .grid_thw = .{ evidence.grid.temporal, evidence.grid.height, evidence.grid.width },
+            .patch_rows = evidence.patch_rows,
+            .patch_columns = evidence.patch_columns,
+            .spatial_patch_f32le_sha256 = &evidence.spatial_patch_f32le_sha256,
+            .positioned_embedding_f32le_sha256 = &evidence.positioned_embedding_f32le_sha256,
+            .vision_trace_layer = evidence.vision_trace_layer,
+            .vision_trace_f32le_sha256 = if (evidence.vision_trace_f32le_sha256) |*digest| digest else null,
+        };
+    }
+    var visual_token_count: usize = 0;
+    for (projected.tokens_per_image) |count| {
+        visual_token_count = std.math.add(usize, visual_token_count, count) catch return error.RequestTooLarge;
+    }
+    var patch_value_count: usize = 0;
+    for (projected.preprocess_evidence) |evidence| {
+        const image_values = std.math.mul(usize, evidence.patch_rows, evidence.patch_columns) catch
+            return error.RequestTooLarge;
+        patch_value_count = std.math.add(usize, patch_value_count, image_values) catch return error.RequestTooLarge;
+    }
+    if (projected.preprocess_spatial_patches.len != patch_value_count) {
+        return error.MissingQwen3VlPreprocessEvidence;
+    }
+    const projected_digest = qwen3vl_projector.sha256F32LeHex(projected.embeddings);
+    const deepstack_digest = qwen3vl_projector.sha256F32LeHex(projected.deepstack_embeddings);
+    const deepstack_tap_value_count = std.math.mul(usize, visual_token_count, projected.hidden_size) catch
+        return error.RequestTooLarge;
+    const expected_deepstack_values = std.math.mul(
+        usize,
+        deepstack_tap_value_count,
+        projected.deepstack_layer_count,
+    ) catch return error.RequestTooLarge;
+    if (projected.deepstack_embeddings.len != expected_deepstack_values) {
+        return error.MissingQwen3VlPreprocessEvidence;
+    }
+    const deepstack_tap_hashes = try allocator.alloc([64]u8, projected.deepstack_layer_count);
+    defer allocator.free(deepstack_tap_hashes);
+    const deepstack_taps = try allocator.alloc(Qwen3VlParityTensorDigestJson, projected.deepstack_layer_count);
+    defer allocator.free(deepstack_taps);
+    for (deepstack_taps, deepstack_tap_hashes, 0..) |*tap, *digest, index| {
+        const values = projected.deepstack_embeddings[index * deepstack_tap_value_count ..][0..deepstack_tap_value_count];
+        digest.* = qwen3vl_projector.sha256F32LeHex(values);
+        tap.* = .{ .value_count = values.len, .f32le_sha256 = digest[0..] };
+    }
+    if (patch_path) |raw_path| try writeF32LeFile(allocator, io, raw_path, projected.preprocess_spatial_patches);
+    const json = try std.json.Stringify.valueAlloc(allocator, .{
+        .schema = "antfly.qwen3vl.parity.v1",
+        .placeholder_token_ids = placeholder_token_ids,
+        .expanded_token_ids = prepared.token_ids,
+        .mrope_position_ids = prepared.plan.mrope_positions,
+        .images = images,
+        .visual_token_count = visual_token_count,
+        .deepstack_layer_count = prepared.deepstack_layer_count,
+        .projected_embedding_value_count = projected.embeddings.len,
+        .projected_embedding_f32le_sha256 = projected_digest[0..],
+        .deepstack_embedding_value_count = projected.deepstack_embeddings.len,
+        .deepstack_embedding_f32le_sha256 = deepstack_digest[0..],
+        .deepstack_taps = deepstack_taps,
+        .mrope_position_delta = prepared.plan.mrope_position_delta,
+        .spatial_patch_f32le_path = patch_path,
+        .spatial_patch_value_count = patch_value_count,
+    }, .{});
+    defer allocator.free(json);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+}
+
+fn writeF32LeFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, values: []const f32) !void {
+    const byte_count = std.math.mul(usize, values.len, @sizeOf(f32)) catch return error.RequestTooLarge;
+    const bytes = try allocator.alloc(u8, byte_count);
+    defer allocator.free(bytes);
+    for (values, 0..) |value, i| {
+        std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @bitCast(value), .little);
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+}
+
 /// Prompt tokenization computed before the pipeline runs (e.g. by server
 /// admission). All slices are borrowed; the owner must keep them alive for the
 /// whole generate call and frees them afterwards.
@@ -3291,6 +3471,13 @@ pub const NativeGenerationPipeline = struct {
 
         const has_images = messagesHaveImages(messages);
         const has_audio = messagesHaveAudio(messages);
+        if ((config.qwen3vl_parity_patch_path != null or config.qwen3vl_parity_logits_path != null) and
+            config.qwen3vl_parity_json_path == null or
+            (config.qwen3vl_parity_json_path != null and
+                (self.gpt_config.family != .qwen3_vl or !has_images or has_audio)))
+        {
+            return error.InvalidQwen3VlParityRequest;
+        }
         const requested_max_tokens: usize = @intCast(@max(config.max_tokens, 1));
 
         // Decide whether the loaded draft participates before deriving the
@@ -3404,6 +3591,8 @@ pub const NativeGenerationPipeline = struct {
 
         var prepared_multimodal_prompt: ?gemma3_mm.PreparedPrompt = null;
         defer if (prepared_multimodal_prompt) |*prepared| prepared.deinit(&self.cb);
+        var prepared_qwen3vl_prompt: ?qwen3vl_projector.PreparedPrompt = null;
+        defer if (prepared_qwen3vl_prompt) |*prepared| prepared.deinit(&self.cb);
 
         const prompt_token_count = blk: {
             if (!has_images and !has_audio) break :blk actual_prompt_tokens;
@@ -3415,7 +3604,8 @@ pub const NativeGenerationPipeline = struct {
             debugGenerationStage("multimodal collected images={d} audio={d}", .{ images.len, audio_clips.len });
 
             if (self.gguf_projector_path) |projector_path| {
-                if (projector_format_mod.isAntfly(try projector_format_mod.detectPath(allocator, projector_path))) {
+                const projector_kind = try projector_format_mod.detectPath(allocator, projector_path);
+                if (projector_format_mod.isAntfly(projector_kind)) {
                     if (has_audio) return error.NativeAudioGenerationNotImplemented;
                     if (!self.gpt_config.isMultimodal()) return error.InvalidModelForGeneration;
                     const model_dir = self.model_dir orelse return error.MissingModelDirForMultimodal;
@@ -3444,6 +3634,67 @@ pub const NativeGenerationPipeline = struct {
                         images.len,
                         images,
                     );
+                } else if (projector_kind == .clip_qwen3vl_image) {
+                    if (has_audio or !has_images) return error.NativeAudioGenerationNotImplemented;
+                    if (self.gpt_config.family != .qwen3_vl or !decode_state.isPaged()) return error.InvalidModelForGeneration;
+                    if (images.len == 0 or images.len > 8) return error.ImageLimitExceeded;
+                    const per_image_budget = expanded_prompt_token_limit / images.len;
+                    // The pinned Qwen smart-resize contract has a 64-token
+                    // minimum (65,536 pixels). Reject before media work when
+                    // the text budget cannot hold that geometry.
+                    if (per_image_budget < 64) return error.InputTokenLimitExceeded;
+                    const per_image_limit = @min(@as(usize, 576), per_image_budget);
+                    var projected = if (config.qwen3vl_parity_json_path != null)
+                        try qwen3vl_projector.encodeProjectedImagesForQualification(
+                            &self.cb,
+                            allocator,
+                            projector_path,
+                            images,
+                            .{ .max_images = 8, .max_merged_tokens = per_image_limit },
+                        )
+                    else
+                        try qwen3vl_projector.encodeProjectedImages(
+                            &self.cb,
+                            allocator,
+                            projector_path,
+                            images,
+                            .{ .max_images = 8, .max_merged_tokens = per_image_limit },
+                        );
+                    defer projected.deinit();
+                    var qwen_encoded = try encodeQwenPromptWithImagePlaceholders(
+                        self.tokenizer,
+                        allocator,
+                        prompt,
+                        expanded_prompt_token_limit,
+                        self.add_bos_token,
+                        self.bos_token,
+                        self.gpt_config,
+                    );
+                    defer qwen_encoded.deinit();
+                    var qwen_prompt_tokens: usize = 0;
+                    while (qwen_prompt_tokens < qwen_encoded.attention_mask.len and qwen_encoded.attention_mask[qwen_prompt_tokens] != 0) : (qwen_prompt_tokens += 1) {}
+                    if (qwen_prompt_tokens == 0) return error.EmptyPrompt;
+                    prepared_qwen3vl_prompt = try qwen3vl_projector.prepareExpandedPromptEmbeddings(
+                        &self.cb,
+                        allocator,
+                        self.gpt_config,
+                        qwen_encoded.ids[0..qwen_prompt_tokens],
+                        projected,
+                        expanded_prompt_token_limit,
+                    );
+                    if (config.qwen3vl_parity_json_path) |path| {
+                        try writeQwen3VlParityEvidence(
+                            allocator,
+                            self.io orelse return error.MissingIo,
+                            path,
+                            config.qwen3vl_parity_patch_path,
+                            qwen_encoded.ids[0..qwen_prompt_tokens],
+                            &prepared_qwen3vl_prompt.?,
+                            &projected,
+                        );
+                    }
+                    decode_state.qwen3vl_mrope_position_delta = prepared_qwen3vl_prompt.?.plan.mrope_position_delta;
+                    decode_state.qwen3vl_text_only = false;
                 } else {
                     var projected_images = if (images.len > 0)
                         try gemma4_projector.encodeProjectedImages(&self.cb, allocator, projector_path, images)
@@ -3551,7 +3802,10 @@ pub const NativeGenerationPipeline = struct {
                     );
                 }
             }
-            break :blk prepared_multimodal_prompt.?.token_ids.len;
+            break :blk if (prepared_qwen3vl_prompt) |prepared|
+                prepared.token_ids.len
+            else
+                prepared_multimodal_prompt.?.token_ids.len;
         };
         try validateNativeGenerationPromptTokenCount(
             prompt_token_count,
@@ -3568,7 +3822,9 @@ pub const NativeGenerationPipeline = struct {
         const max_seq = prompt_token_count + max_tokens + spec_slack;
         var token_ids = try allocator.alloc(i64, max_seq);
         defer allocator.free(token_ids);
-        if (prepared_multimodal_prompt) |prepared| {
+        if (prepared_qwen3vl_prompt) |prepared| {
+            @memcpy(token_ids[0..prepared.token_ids.len], prepared.token_ids);
+        } else if (prepared_multimodal_prompt) |prepared| {
             @memcpy(token_ids[0..prepared.token_ids.len], prepared.token_ids);
         } else {
             for (0..actual_prompt_tokens) |i| token_ids[i] = @intCast(encoded_ids[i]);
@@ -3576,7 +3832,7 @@ pub const NativeGenerationPipeline = struct {
         var seq_len = prompt_token_count;
         debugGenerationStage(
             "starting prefill prompt_token_count={d} seq_len={d} multimodal={}",
-            .{ prompt_token_count, seq_len, prepared_multimodal_prompt != null },
+            .{ prompt_token_count, seq_len, prepared_multimodal_prompt != null or prepared_qwen3vl_prompt != null },
         );
 
         const runtime_prepare_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
@@ -3625,6 +3881,7 @@ pub const NativeGenerationPipeline = struct {
                 config.prompt_cache_enabled and
                 config.prompt_cache_key != null and
                 prepared_multimodal_prompt == null and
+                prepared_qwen3vl_prompt == null and
                 !use_speculative and
                 config.cache_compaction_ratio == null and
                 self.compiled_partition_backend == null and
@@ -3665,7 +3922,9 @@ pub const NativeGenerationPipeline = struct {
         try setWorkloadProfileRegime(&self.cb, .prefill);
         const allow_prefill_greedy_token = !use_speculative or (use_speculative and draft_is_gemma4_mtp);
         const capture_mtp_prefill_hidden = use_speculative and draft_is_gemma4_mtp and gemma4MtpTargetHiddenSource() == .final;
-        const prefill_output = if (prepared_multimodal_prompt) |*prepared|
+        const prefill_output = if (prepared_qwen3vl_prompt) |*prepared|
+            PrefillOutput{ .last_logits = try self.executePreparedQwen3VlPrefill(prepared, seq_len, decode_state) }
+        else if (prepared_multimodal_prompt) |*prepared|
             PrefillOutput{ .last_logits = try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state) }
         else
             try self.executePrefill(prefill_ids, seq_len, cached_prompt_tokens, decode_state, config, allow_prefill_greedy_token, capture_mtp_prefill_hidden);
@@ -3676,13 +3935,21 @@ pub const NativeGenerationPipeline = struct {
         const finished_prefill_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         defer if (prefill_last_logits) |logits| allocator.free(logits);
         defer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
+        if (config.qwen3vl_parity_logits_path) |path| {
+            if (prepared_qwen3vl_prompt == null or prefill_last_logits == null or
+                prefill_last_logits.?.len != self.gpt_config.vocab_size)
+            {
+                return error.MissingQwen3VlPrefillLogits;
+            }
+            try writeF32LeFile(allocator, self.io orelse return error.MissingIo, path, prefill_last_logits.?);
+        }
         debugGenerationStage(
             "finished prefill seq_len={d} cached_logits={} greedy_token={}",
             .{ seq_len, prefill_last_logits != null, prefill_greedy_token != null },
         );
 
         if (self.prompt_cache) |cache| {
-            if (config.prompt_cache_enabled and prepared_multimodal_prompt == null and decode_state.kv_manager == cache.managerPtr()) {
+            if (config.prompt_cache_enabled and prepared_multimodal_prompt == null and prepared_qwen3vl_prompt == null and decode_state.kv_manager == cache.managerPtr()) {
                 if (config.prompt_cache_key) |cache_key| {
                     if (decode_state.sequence_id) |sequence_id| {
                         cache.storeFromSequence(cache_key, token_ids[0..seq_len], sequence_id) catch |err| {
@@ -4382,7 +4649,7 @@ pub const NativeGenerationPipeline = struct {
                 const cache_eligible =
                     config.prompt_cache_enabled and
                     config.prompt_cache_key != null and
-                    prepared_multimodal_prompt == null and
+                    prepared_multimodal_prompt == null and prepared_qwen3vl_prompt == null and
                     !use_speculative and
                     config.cache_compaction_ratio == null and
                     self.compiled_partition_backend == null and
@@ -4487,6 +4754,7 @@ pub const NativeGenerationPipeline = struct {
         const timing_ms: ?GenerationTimingMs = if (self.io != null) .{
             .prompt_format = timestampDurationMillis(started_at, formatted_prompt_at),
             .tokenize = timestampDurationMillis(formatted_prompt_at, encoded_prompt_at),
+            .multimodal_prepare = timestampDurationMillis(encoded_prompt_at, runtime_prepare_started_at),
             .runtime_prepare = timestampDurationMillis(runtime_prepare_started_at, prefill_started_at),
             .prefill = timestampDurationMillis(prefill_started_at, finished_prefill_at),
             .decode = timestampDurationMillis(finished_prefill_at, finished_generate_at),
@@ -4496,10 +4764,11 @@ pub const NativeGenerationPipeline = struct {
         if (self.print_timing and timing_ms != null) {
             const timing = timing_ms.?;
             std.debug.print(
-                "generate_timing_ms: prompt_format={d} tokenize={d} runtime_prepare={d} prefill={d} decode={d} text_decode={d} total={d}\n",
+                "generate_timing_ms: prompt_format={d} tokenize={d} multimodal_prepare={d} runtime_prepare={d} prefill={d} decode={d} text_decode={d} total={d}\n",
                 .{
                     timing.prompt_format,
                     timing.tokenize,
+                    timing.multimodal_prepare,
                     timing.runtime_prepare,
                     timing.prefill,
                     timing.decode,
@@ -5351,6 +5620,62 @@ pub const NativeGenerationPipeline = struct {
             if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, seq_len, seq_len);
         }
         return try self.allocator.dupe(f32, logits[(seq_len - 1) * self.gpt_config.vocab_size ..][0..self.gpt_config.vocab_size]);
+    }
+
+    fn executePreparedQwen3VlPrefill(
+        self: *NativeGenerationPipeline,
+        prepared: *qwen3vl_projector.PreparedPrompt,
+        seq_len: usize,
+        decode_state: *NativeDecodeState,
+    ) !?[]f32 {
+        if (prepared.plan.tokenCount() != seq_len or !decode_state.isPaged()) return error.InvalidPreparedPrompt;
+        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+        var direct_prefill_turn_acquired = false;
+        defer if (direct_prefill_turn_acquired) self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
+        if (self.scheduler) |scheduler| {
+            if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, 0, seq_len);
+        }
+        if (self.scheduler) |scheduler| {
+            if (self.scheduler_lease) |lease| {
+                if (self.io == null) {
+                    _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+                } else {
+                    try scheduler.awaitTurn(lease, .prefill, self.io.?);
+                    direct_prefill_turn_acquired = true;
+                    _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+                }
+            } else {
+                _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+            }
+        } else {
+            _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+        }
+
+        const input_embeddings = prepared.input_embeddings orelse return error.InvalidPreparedPrompt;
+        prepared.input_embeddings = null;
+        const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
+        if (direct_execution_mutex) |mutex| platform.sync.lockYielding(mutex);
+        defer if (direct_execution_mutex) |mutex| mutex.unlock();
+        var decode_context = decode_runtime.makeDecodeContext(seq_len, seq_len);
+        decode_context.mrope_positions = prepared.plan.mrope_positions;
+        decode_context.qwen3vl_visual_mask = prepared.plan.visual_token_mask;
+        decode_context.qwen3vl_deepstack_embeddings = prepared.deepstack_embeddings;
+        decode_context.qwen3vl_deepstack_layer_count = prepared.deepstack_layer_count;
+        const logits = try gpt_arch.forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
+            &self.cb,
+            self.allocator,
+            self.gpt_config,
+            input_embeddings,
+            .{},
+            1,
+            seq_len,
+            &decode_context,
+            null,
+        );
+        if (self.scheduler) |scheduler| {
+            if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, seq_len, seq_len);
+        }
+        return logits;
     }
 
     const DecodeResult = struct {
@@ -10669,6 +10994,44 @@ test "native generation prompt limit reserves output media and draft context" {
     );
 }
 
+test "Qwen3-VL media admission uses exact image geometry before scheduling" {
+    var png_header = [_]u8{0} ** 24;
+    @memcpy(png_header[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, png_header[8..12], 13, .big);
+    @memcpy(png_header[12..16], "IHDR");
+    std.mem.writeInt(u32, png_header[16..20], 2048, .big);
+    std.mem.writeInt(u32, png_header[20..24], 1416, .big);
+    const images = [_][]const u8{&png_header};
+    const messages = [_]Message{.{
+        .role = "user",
+        .content = "describe",
+        .image_bytes = &images,
+    }};
+    const config = gpt_mod.Config{
+        .family = .qwen3_vl,
+        .hidden_size = 2048,
+        .vision_hidden_size = 1024,
+        .vision_intermediate_size = 4096,
+        .vision_num_attention_heads = 16,
+        .vision_patch_size = 16,
+        .vision_spatial_merge_size = 2,
+        .vision_deepstack_visual_indexes_len = 3,
+    };
+    const admission = try nativeGenerationMediaAdmission(
+        std.testing.allocator,
+        "unused-for-qwen3-vl",
+        &messages,
+        config,
+    );
+    try std.testing.expectEqual(@as(usize, 533), admission.token_allowance);
+    try std.testing.expect(admission.host_scratch_bytes > 0);
+    try std.testing.expect(admission.backend_scratch_bytes > 0);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        nativeGenerationPreliminaryMediaTokenAllowance(&messages, config),
+    );
+}
+
 test "native generation prefill ceiling only specializes Gemma4 Metal target" {
     const gemma4_target = gpt_mod.Config{
         .family = .gemma,
@@ -10832,6 +11195,42 @@ test "chat template enable_thinking false opens an explicit final channel" {
     try std.testing.expect(!configPromptOpensGemma4FinalChannel(.{
         .family = .gemma,
     }, final_prompt));
+}
+
+test "serving chat templates preserve ChatML Llama and Gemma prompt bytes" {
+    const allocator = std.testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Hello" },
+        .{ .role = "assistant", .content = "Hi" },
+    };
+    const cases = [_]struct {
+        source: []const u8,
+        bos: []const u8,
+        expected: []const u8,
+    }{
+        .{
+            .source = "{%- for message in messages %}\n{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}\n{%- endfor %}\n{%- if add_generation_prompt %}\n{{ '<|im_start|>assistant\\n' }}\n{%- endif %}",
+            .bos = "",
+            .expected = "<|im_start|>user\nHello<|im_end|>\n\n<|im_start|>assistant\nHi<|im_end|>\n<|im_start|>assistant\n",
+        },
+        .{
+            .source = "{{ bos_token }}{%- for message in messages %}\n{{ '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n' + message['content'] + '<|eot_id|>' }}\n{%- endfor %}\n{%- if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}{%- endif %}",
+            .bos = "<|begin_of_text|>",
+            .expected = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|>\n<|start_header_id|>assistant<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+        },
+        .{
+            .source = "{{ bos_token }}{%- for message in messages %}\n{{ '<start_of_turn>' + message['role'] + '\\n' + message['content'] + '<end_of_turn>\\n' }}\n{%- endfor %}\n{%- if add_generation_prompt %}{{ '<start_of_turn>assistant\\n' }}{%- endif %}",
+            .bos = "<bos>",
+            .expected = "<bos><start_of_turn>user\nHello<end_of_turn>\n\n<start_of_turn>assistant\nHi<end_of_turn>\n<start_of_turn>assistant\n",
+        },
+    };
+    for (cases) |case| {
+        var template = try ChatTemplate.init(allocator, case.source, case.bos, "", "", "");
+        defer template.deinit();
+        const prompt = try template.apply(allocator, &messages, true);
+        defer allocator.free(prompt);
+        try std.testing.expectEqualStrings(case.expected, prompt);
+    }
 }
 
 test "final channel projection requires exact header and stops before trailing channels" {

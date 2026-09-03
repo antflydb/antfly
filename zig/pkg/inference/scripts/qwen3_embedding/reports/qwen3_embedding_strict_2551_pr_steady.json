@@ -1,0 +1,239 @@
+{
+  "args": {
+    "antfly_build_file": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/zig-out/bin/antfly-inference",
+    "antfly_build_id": "d90bd83a+dirty-metal-3a0e8f0e",
+    "antfly_model_file": "/Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
+    "antfly_reported_token_offset": -1,
+    "antfly_server_args": "run --host 127.0.0.1 --port 18099 --models-dir /Users/timkaye/.antfly/inference/models --max-loaded-models 1 --max-concurrent-requests 1 --preload-model embedder:metal:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
+    "antfly_server_pid": 76848,
+    "batch_sizes": [
+      1
+    ],
+    "bootstrap_samples": 2000,
+    "corpus": "mixed",
+    "cosine_threshold": 0.995,
+    "fail_below_ratio": 0.9,
+    "fixture": "zig/pkg/inference/scripts/qwen3_embedding/fixtures/qwen3_embedding_0_6b_exact_tokens.json",
+    "fixture_cases": null,
+    "fixture_token_count": 2551,
+    "iters": 20,
+    "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
+    "output": "zig/pkg/inference/scripts/qwen3_embedding/reports/qwen3_embedding_strict_2551_pr_steady.json",
+    "precondition_iters": 8,
+    "reference_build_file": "/opt/homebrew/bin/llama-server",
+    "reference_build_id": "b8990-660b1b4bd",
+    "reference_model": "qwen3-embedding-reference",
+    "reference_model_file": "/Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
+    "reference_reported_token_offset": 0,
+    "reference_server_args": "-m /Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf --alias qwen3-embedding-reference --embeddings --pooling last -c 4096 -b 4096 -ub 4096 --flash-attn on --cache-ram 0 --parallel 1 --host 127.0.0.1 --port 8080",
+    "reference_server_pid": 76861,
+    "reference_url": "http://127.0.0.1:8080/v1/embeddings",
+    "require_comparable": true,
+    "seed": 20260901,
+    "timeout": 300.0,
+    "url": "http://127.0.0.1:18099/ai/v1/embeddings",
+    "warmup": 2
+  },
+  "comparison_contract": {
+    "build_ids": {
+      "antfly": "d90bd83a+dirty-metal-3a0e8f0e",
+      "reference": "b8990-660b1b4bd"
+    },
+    "live_processes": {
+      "antfly": {
+        "argv": [
+          "run",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18099",
+          "--models-dir",
+          "/Users/timkaye/.antfly/inference/models",
+          "--max-loaded-models",
+          "1",
+          "--max-concurrent-requests",
+          "1",
+          "--preload-model",
+          "embedder:metal:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
+        ],
+        "command": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/zig-out/bin/antfly-inference run --host 127.0.0.1 --port 18099 --models-dir /Users/timkaye/.antfly/inference/models --max-loaded-models 1 --max-concurrent-requests 1 --preload-model embedder:metal:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
+        "executable": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/zig-out/bin/antfly-inference",
+        "executable_sha256": "06b0824cd0dfc10e3736d3f3f30af4df2c183728707b358e12a91efdd130afdb",
+        "pid": 76848
+      },
+      "reference": {
+        "argv": [
+          "-m",
+          "/Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
+          "--alias",
+          "qwen3-embedding-reference",
+          "--embeddings",
+          "--pooling",
+          "last",
+          "-c",
+          "4096",
+          "-b",
+          "4096",
+          "-ub",
+          "4096",
+          "--flash-attn",
+          "on",
+          "--cache-ram",
+          "0",
+          "--parallel",
+          "1",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "8080"
+        ],
+        "command": "/opt/homebrew/bin/llama-server -m /Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf --alias qwen3-embedding-reference --embeddings --pooling last -c 4096 -b 4096 -ub 4096 --flash-attn on --cache-ram 0 --parallel 1 --host 127.0.0.1 --port 8080",
+        "executable": "/opt/homebrew/Cellar/llama.cpp/8990/bin/llama-server",
+        "executable_sha256": "8eee1b1fa1c65d919c94116dd286134a4a9498059c21c1ee448c45fb87f2c590",
+        "pid": 76861
+      }
+    },
+    "model_files": {
+      "antfly": {
+        "path": "/Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
+        "sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439"
+      },
+      "identical": true,
+      "reference": {
+        "path": "/Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
+        "sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439"
+      }
+    },
+    "sample_order": "alternating AB/BA",
+    "server_args": {
+      "antfly": "run --host 127.0.0.1 --port 18099 --models-dir /Users/timkaye/.antfly/inference/models --max-loaded-models 1 --max-concurrent-requests 1 --preload-model embedder:metal:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
+      "reference": "-m /Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf --alias qwen3-embedding-reference --embeddings --pooling last -c 4096 -b 4096 -ub 4096 --flash-attn on --cache-ram 0 --parallel 1 --host 127.0.0.1 --port 8080"
+    },
+    "strict": true,
+    "thermal_preconditioning": {
+      "fixture_batches_reserved": 2,
+      "iterations": 8,
+      "measured": false
+    }
+  },
+  "comparisons": [
+    {
+      "batch": 1,
+      "max_abs_error": 0.00091916648671031,
+      "mean_cosine": 0.999995010777929,
+      "min_cosine": 0.9999657908743166,
+      "order": "alternating AB/BA",
+      "parity_iterations": 20,
+      "pass": true,
+      "ratio_gate": {
+        "pass": true,
+        "threshold": 0.9
+      },
+      "threshold": 0.995,
+      "throughput_ratio_antfly_over_reference": {
+        "estimate": 0.9205774025788009,
+        "lower_95": 0.9019909267570749,
+        "upper_95": 0.940615681588061
+      }
+    }
+  ],
+  "pass": true,
+  "results": [
+    {
+      "batch": 1,
+      "corpus": "mixed",
+      "dimensions": 1024,
+      "embeddings_per_second": 0.43405677063182674,
+      "input_tokens": 2551,
+      "iters": 20,
+      "latency": {
+        "max_ms": 2452.308458989137,
+        "mean_ms": 2303.846104149852,
+        "min_ms": 2169.7773750056513,
+        "p50_ms": 2297.5290000031237,
+        "p95_ms": 2444.7405410028296,
+        "p99_ms": 2452.308458989137
+      },
+      "reported_prompt_tokens": 2550,
+      "samples_ms": [
+        2169.7773750056513,
+        2201.2190410023322,
+        2215.6242500059307,
+        2213.5386250010924,
+        2222.1653329906985,
+        2228.1447499990463,
+        2225.289249996422,
+        2297.689625003841,
+        2339.4135830021696,
+        2426.894333009841,
+        2452.308458989137,
+        2268.454874996678,
+        2243.2622500055004,
+        2347.7367919986136,
+        2333.0223340017255,
+        2444.7405410028296,
+        2364.0650839952286,
+        2398.5860829998273,
+        2297.5290000031237,
+        2387.4604999873554
+      ],
+      "target": "antfly",
+      "token_count_source": "exact:zig/pkg/inference/scripts/qwen3_embedding/fixtures/qwen3_embedding_0_6b_exact_tokens.json",
+      "tokens_per_second": 1107.27882188179
+    },
+    {
+      "batch": 1,
+      "corpus": "mixed",
+      "dimensions": 1024,
+      "embeddings_per_second": 0.4715049157364817,
+      "input_tokens": 2551,
+      "iters": 20,
+      "latency": {
+        "max_ms": 2383.399833997828,
+        "mean_ms": 2120.8686624995607,
+        "min_ms": 2018.1952080019983,
+        "p50_ms": 2091.801000002306,
+        "p95_ms": 2322.7844159991946,
+        "p99_ms": 2383.399833997828
+      },
+      "reported_prompt_tokens": 2551,
+      "samples_ms": [
+        2055.4418329993496,
+        2091.801000002306,
+        2089.187082994613,
+        2092.9663340066327,
+        2044.1331659967545,
+        2040.036250007688,
+        2049.3288339930587,
+        2051.993291999679,
+        2031.7299169983016,
+        2050.452084004064,
+        2165.9236660052557,
+        2018.1952080019983,
+        2096.545165986754,
+        2119.533584002056,
+        2115.562624996528,
+        2114.1364159993827,
+        2283.4739579993766,
+        2200.7485840003937,
+        2383.399833997828,
+        2322.7844159991946
+      ],
+      "target": "reference",
+      "token_count_source": "exact:zig/pkg/inference/scripts/qwen3_embedding/fixtures/qwen3_embedding_0_6b_exact_tokens.json",
+      "tokens_per_second": 1202.8090400437648
+    }
+  ],
+  "schema": "antfly.qwen3_embedding.endpoint_benchmark.v2",
+  "servers": {
+    "antfly": {
+      "model_reported": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
+      "url": "http://127.0.0.1:18099/ai/v1/embeddings"
+    },
+    "reference": {
+      "model_reported": "qwen3-embedding-reference",
+      "url": "http://127.0.0.1:8080/v1/embeddings"
+    }
+  },
+  "timestamp": "2026-09-02T23:31:59.932015+00:00"
+}

@@ -3259,7 +3259,7 @@ fn mapDenseTensorNameToGguf(allocator: std.mem.Allocator, config: gpt_mod.Config
 fn denseDecoderExportSupport(config: gpt_mod.Config) DenseDecoderExportSupport {
     return switch (config.family) {
         .llama, .mistral, .qwen2, .qwen3, .qwen3_5, .gemma, .bitnet, .phi, .gpt2, .gpt_neo, .gpt_neox, .gptj => .supported,
-        .deepseek_v4, .falcon, .opt, .bloom, .other => .unsupported_name_mapping,
+        .qwen3_vl, .deepseek_v4, .falcon, .opt, .bloom, .other => .unsupported_name_mapping,
     };
 }
 
@@ -3282,6 +3282,7 @@ fn modelFamilyLabel(family: gpt_mod.ModelFamily) []const u8 {
         .phi => "phi",
         .qwen2 => "qwen2",
         .qwen3 => "qwen3",
+        .qwen3_vl => "qwen3_vl",
         .qwen3_5 => "qwen3_5",
         .deepseek_v4 => "deepseek_v4",
         .gemma => "gemma",

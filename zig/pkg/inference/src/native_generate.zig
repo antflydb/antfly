@@ -141,6 +141,9 @@ const Options = struct {
     require_server: bool = false,
     stream: bool = false,
     json_timing_path: ?[]const u8 = null,
+    qwen3vl_parity_json_path: ?[]const u8 = null,
+    qwen3vl_parity_patch_path: ?[]const u8 = null,
+    qwen3vl_parity_logits_path: ?[]const u8 = null,
     kernel_jit: kernel_jit.Config = .{},
     kernel_jit_options_explicit: bool = false,
     kernel_jit_mode_explicit: bool = false,
@@ -397,6 +400,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .cache_compaction_ratio = opts.cache_compaction_ratio,
         .ignore_eos = opts.ignore_eos,
         .enable_thinking = opts.enable_thinking,
+        .qwen3vl_parity_json_path = opts.qwen3vl_parity_json_path,
+        .qwen3vl_parity_patch_path = opts.qwen3vl_parity_patch_path,
+        .qwen3vl_parity_logits_path = opts.qwen3vl_parity_logits_path,
     };
 
     const artifact_backend = switch (opts.backend) {
@@ -3537,6 +3543,12 @@ fn metalStatsCompactJson(
         \\"prepared_frame":{{
         \\"fast_path":{d},
         \\"fallback":{d}
+        \\}},
+        \\"prepared_gated_ffn":{{
+        \\"direct_success":{d},
+        \\"direct_fallback":{d},
+        \\"backend_fallback":{d},
+        \\"runtime_failure":{d}
         \\}}
     ,
         .{
@@ -3552,6 +3564,10 @@ fn metalStatsCompactJson(
             provider.metal_runtime_decode_gqa_split_below_min_kv_calls,
             provider.metal_runtime_prepared_frame_fast_path_calls,
             provider.metal_runtime_prepared_frame_fallback_calls,
+            provider.quantized_gated_ffn_direct_successes,
+            provider.quantized_gated_ffn_direct_fallbacks,
+            provider.quantized_gated_ffn_backend_fallbacks,
+            provider.quantized_gated_ffn_runtime_failures,
         },
     );
     try appendFmt(
@@ -3634,7 +3650,6 @@ fn metalStatsCompactJson(
         \\"q6_linear_reduce_rows_9_64":{d},
         \\"q6_linear_reduce_rows_65_plus":{d},
         \\"q6_linear_reduce_in_f16":{d}
-        \\}}
     ,
         .{
             provider.metal_runtime_q8_0_linear_dispatch_scalar,
@@ -3675,6 +3690,8 @@ fn metalStatsCompactJson(
         allocator,
         &out,
         \\,
+        \\"q6_high_row_mm_matrix":{d}
+        \\}},
         \\"lm_head_q4_q6_refine":{{"dispatches":{d},"resident_sampling_rejections":{d}}},
         \\"q4_0_policy":{{
         \\"mmv_nr4_nsg2":{d},
@@ -3688,6 +3705,7 @@ fn metalStatsCompactJson(
         \\}}
     ,
         .{
+            provider.metal_runtime_q6_k_high_row_mm_matrix_dispatches,
             provider.metal_runtime_lm_head_q4_q6_refine_dispatches,
             provider.metal_runtime_lm_head_q4_resident_sampling_rejections,
             provider.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches,
@@ -5789,6 +5807,7 @@ fn writeJsonTiming(
         \\"total":{d},
         \\"prompt_format_inner":{d},
         \\"tokenize_inner":{d},
+        \\"multimodal_prepare_inner":{d},
         \\"runtime_prepare_inner":{d},
         \\"prefill_inner":{d},
         \\"decode_inner":{d},
@@ -5822,6 +5841,7 @@ fn writeJsonTiming(
             total_ms,
             inner_timing.prompt_format,
             inner_timing.tokenize,
+            inner_timing.multimodal_prepare,
             inner_timing.runtime_prepare,
             inner_timing.prefill,
             inner_timing.decode,
@@ -6101,7 +6121,7 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d} lm_head_q4_q6_refine_dispatches={d} lm_head_q4_resident_sampling_rejections={d}\n",
+        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d} q6_high_row_mm_matrix={d} lm_head_q4_q6_refine_dispatches={d} lm_head_q4_resident_sampling_rejections={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_q4_k_linear_reduce,
             metal_snapshot.provider.metal_runtime_q4_k_linear_reduce_rows_1,
@@ -6118,6 +6138,7 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_9_64,
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_65_plus,
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_f16_input,
+            metal_snapshot.provider.metal_runtime_q6_k_high_row_mm_matrix_dispatches,
             metal_snapshot.provider.metal_runtime_lm_head_q4_q6_refine_dispatches,
             metal_snapshot.provider.metal_runtime_lm_head_q4_resident_sampling_rejections,
         },
@@ -7906,6 +7927,18 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingJsonTimingPath;
             opts.json_timing_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--qwen3vl-parity-json")) {
+            i += 1;
+            if (i >= args.len) return error.MissingQwen3VlParityJsonPath;
+            opts.qwen3vl_parity_json_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--qwen3vl-parity-patch-f32le")) {
+            i += 1;
+            if (i >= args.len) return error.MissingQwen3VlParityPatchPath;
+            opts.qwen3vl_parity_patch_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--qwen3vl-parity-logits-f32le")) {
+            i += 1;
+            if (i >= args.len) return error.MissingQwen3VlParityLogitsPath;
+            opts.qwen3vl_parity_logits_path = args[i];
         } else if (std.mem.eql(u8, arg, kernel_jit_profile_output.cli_flag)) {
             i += 1;
             if (i >= args.len) return error.MissingKernelJitProfileOut;
@@ -8449,7 +8482,7 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path]... [--audio path] [--backend auto|onnx|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -8532,6 +8565,10 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.metal_runtime_attention_prefill_direct_kv_calls = 42;
     snapshot.provider.metal_runtime_prepared_frame_fast_path_calls = 29;
     snapshot.provider.metal_runtime_prepared_frame_fallback_calls = 2;
+    snapshot.provider.quantized_gated_ffn_direct_successes = 28;
+    snapshot.provider.quantized_gated_ffn_direct_fallbacks = 3;
+    snapshot.provider.quantized_gated_ffn_backend_fallbacks = 4;
+    snapshot.provider.quantized_gated_ffn_runtime_failures = 5;
     snapshot.provider.metal_stage_timing = .{
         .enabled = 1,
         .supported = 1,
@@ -8625,6 +8662,11 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     try std.testing.expectEqual(@as(i64, 17), root.get("decode_gqa_split_policy").?.object.get("below_min_kv").?.integer);
     try std.testing.expectEqual(@as(i64, 29), root.get("prepared_frame").?.object.get("fast_path").?.integer);
     try std.testing.expectEqual(@as(i64, 2), root.get("prepared_frame").?.object.get("fallback").?.integer);
+    const prepared_gated_ffn = root.get("prepared_gated_ffn").?.object;
+    try std.testing.expectEqual(@as(i64, 28), prepared_gated_ffn.get("direct_success").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), prepared_gated_ffn.get("direct_fallback").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), prepared_gated_ffn.get("backend_fallback").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), prepared_gated_ffn.get("runtime_failure").?.integer);
     const stage_timing = root.get("stage_timing_ns").?.object;
     try std.testing.expectEqualStrings("runtime_frame", stage_timing.get("scope").?.string);
     try std.testing.expectEqual(@as(i64, 1), stage_timing.get("complete").?.integer);
@@ -8740,6 +8782,7 @@ test "metal stats compact json derives plan counters from runtime handwritten di
     snapshot.provider.metal_runtime_q4_0_pair_activation_reduce = 5;
     snapshot.provider.metal_runtime_q6_k_linear_reduce = 10;
     snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_1 = 3;
+    snapshot.provider.metal_runtime_q6_k_high_row_mm_matrix_dispatches = 7;
     snapshot.provider.metal_runtime_lm_head_q4_q6_refine_dispatches = 7;
     snapshot.provider.metal_runtime_lm_head_q4_resident_sampling_rejections = 2;
 
@@ -8754,6 +8797,7 @@ test "metal stats compact json derives plan counters from runtime handwritten di
     const k_quant = parsed.value.object.get("k_quant_dispatch").?.object;
     try std.testing.expectEqual(@as(i64, 10), k_quant.get("q6_linear_reduce").?.integer);
     try std.testing.expectEqual(@as(i64, 3), k_quant.get("q6_linear_reduce_rows_1").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), k_quant.get("q6_high_row_mm_matrix").?.integer);
     const refine = parsed.value.object.get("lm_head_q4_q6_refine").?.object;
     try std.testing.expectEqual(@as(i64, 7), refine.get("dispatches").?.integer);
     try std.testing.expectEqual(@as(i64, 2), refine.get("resident_sampling_rejections").?.integer);

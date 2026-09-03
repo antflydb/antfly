@@ -41,12 +41,37 @@ pub const Template = struct {
     nodes: []const *ast.Node,
     parse_arena: std.heap.ArenaAllocator,
 
+    pub const Options = struct {
+        trim_blocks: bool = false,
+        lstrip_blocks: bool = false,
+    };
+
     /// Parse a template string. The template owns the AST memory.
     pub fn init(backing_allocator: std.mem.Allocator, source: []const u8) !Template {
+        return initWithOptions(backing_allocator, source, .{});
+    }
+
+    /// Match the Jinja environment used by Hugging Face chat templates.
+    pub fn initHuggingFace(backing_allocator: std.mem.Allocator, source: []const u8) !Template {
+        return initWithOptions(backing_allocator, source, .{
+            .trim_blocks = true,
+            .lstrip_blocks = true,
+        });
+    }
+
+    pub fn initWithOptions(
+        backing_allocator: std.mem.Allocator,
+        source: []const u8,
+        options: Options,
+    ) !Template {
         var parse_arena = std.heap.ArenaAllocator.init(backing_allocator);
         errdefer parse_arena.deinit();
 
-        const nodes = try Parser.parse(source, parse_arena.allocator());
+        const parse_source = if (options.trim_blocks or options.lstrip_blocks)
+            try normalizeEnvironmentWhitespace(parse_arena.allocator(), source, options)
+        else
+            source;
+        const nodes = try Parser.parse(parse_source, parse_arena.allocator());
         return .{
             .nodes = nodes,
             .parse_arena = parse_arena,
@@ -64,6 +89,78 @@ pub const Template = struct {
         return eval.exec(self.nodes);
     }
 };
+
+fn normalizeEnvironmentWhitespace(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    options: Template.Options,
+) ![]const u8 {
+    var result = std.ArrayListUnmanaged(u8).empty;
+    var cursor: usize = 0;
+    while (cursor < source.len) {
+        const relative_open = std.mem.indexOfPos(u8, source, cursor, "{%") orelse {
+            try result.appendSlice(allocator, source[cursor..]);
+            break;
+        };
+        try result.appendSlice(allocator, source[cursor..relative_open]);
+
+        if (options.lstrip_blocks) {
+            var line_start = result.items.len;
+            while (line_start > 0 and result.items[line_start - 1] != '\n' and result.items[line_start - 1] != '\r') {
+                line_start -= 1;
+            }
+            var whitespace_only = true;
+            for (result.items[line_start..]) |byte| {
+                if (byte != ' ' and byte != '\t') {
+                    whitespace_only = false;
+                    break;
+                }
+            }
+            if (whitespace_only) result.items.len = line_start;
+        }
+
+        const relative_close = findStatementClose(source, relative_open + 2) orelse {
+            try result.appendSlice(allocator, source[relative_open..]);
+            break;
+        };
+        try result.appendSlice(allocator, source[relative_open .. relative_close + 2]);
+        cursor = relative_close + 2;
+
+        if (options.trim_blocks) {
+            if (cursor < source.len and source[cursor] == '\n') {
+                cursor += 1;
+            } else if (cursor + 1 < source.len and source[cursor] == '\r' and source[cursor + 1] == '\n') {
+                cursor += 2;
+            }
+        }
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+fn findStatementClose(source: []const u8, start: usize) ?usize {
+    var quote: ?u8 = null;
+    var escaped = false;
+    var cursor = start;
+    while (cursor + 1 < source.len) : (cursor += 1) {
+        const byte = source[cursor];
+        if (quote) |delimiter| {
+            if (escaped) {
+                escaped = false;
+            } else if (byte == '\\') {
+                escaped = true;
+            } else if (byte == delimiter) {
+                quote = null;
+            }
+            continue;
+        }
+        if (byte == '\'' or byte == '"') {
+            quote = byte;
+        } else if (byte == '%' and source[cursor + 1] == '}') {
+            return cursor;
+        }
+    }
+    return null;
+}
 
 /// Parse and render a template in one call.
 pub fn render(arena: std.mem.Allocator, source: []const u8, context: *ValueMap) ![]const u8 {
@@ -174,6 +271,36 @@ test "Template struct" {
     try ctx.put(arena, "name", Value.str("World"));
     const result = try tpl.render(arena, &ctx);
     try std.testing.expectEqualStrings("Hello, World!", result);
+}
+
+test "Hugging Face template environment trims block lines" {
+    var tpl = try Template.initHuggingFace(
+        std.testing.allocator,
+        "  {%- if enabled %}\n{{ 'assistant\\n' }}\n{%- endif %}\n",
+    );
+    defer tpl.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ctx = ValueMap{};
+    try ctx.put(arena, "enabled", Value.bln(true));
+    const result = try tpl.render(arena, &ctx);
+    try std.testing.expectEqualStrings("assistant\n", result);
+}
+
+test "Hugging Face whitespace scan ignores quoted statement terminators" {
+    var tpl = try Template.initHuggingFace(
+        std.testing.allocator,
+        "{% set marker = '%}' %}\n{{ marker }}",
+    );
+    defer tpl.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = ValueMap{};
+    const result = try tpl.render(arena_state.allocator(), &ctx);
+    try std.testing.expectEqualStrings("%}", result);
 }
 
 test "render chat template pattern" {

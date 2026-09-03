@@ -22,6 +22,8 @@ const std = @import("std");
 const httpx = @import("httpx");
 const builtin = @import("builtin");
 const managed_receipt = @import("managed_receipt.zig");
+const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
+const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
 
 pub const default_max_artifact_bytes: u64 = 64 * 1024 * 1024 * 1024;
 pub const default_max_model_bytes: u64 = 128 * 1024 * 1024 * 1024;
@@ -142,6 +144,7 @@ const always_files = [_][]const u8{
     "modules.json",
     "config_sentence_transformers.json",
     "1_SpladePooling/config.json",
+    "1_Pooling/config.json",
     "added_tokens.json",
     "gliner_config.json",
     "termite_bundle.json",
@@ -1502,6 +1505,207 @@ pub fn managedDownloadPublicationBlocked(
     return managed_receipt.publicationBlocked(allocator, io, dest_dir);
 }
 
+fn downloadPinnedQwenBundleArtifacts(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_owner: []const u8,
+    source_name: []const u8,
+    source_variant: []const u8,
+    artifacts: []const qwen3vl_catalog.Artifact,
+    generated_bundle_manifest: ?[]const u8,
+    dest_dir: []const u8,
+    config: HubConfig,
+    progress: ProgressSink,
+) !void {
+    if (config.max_artifact_bytes == 0 or config.max_model_bytes == 0) return error.InvalidDownloadSizeLimit;
+    var installed_bytes: u64 = 0;
+    for (artifacts) |artifact| {
+        installed_bytes = std.math.add(u64, installed_bytes, artifact.size) catch
+            return error.ModelSizeLimitExceeded;
+    }
+    if (generated_bundle_manifest) |manifest| {
+        installed_bytes = std.math.add(u64, installed_bytes, manifest.len) catch
+            return error.ModelSizeLimitExceeded;
+    }
+    if (installed_bytes > config.max_model_bytes) return error.ModelSizeLimitExceeded;
+
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    var receipts = std.ArrayListUnmanaged(ManagedArtifactReceipt).empty;
+    defer receipts.deinit(allocator);
+    var remaining_model_bytes = config.max_model_bytes;
+
+    for (artifacts, 0..) |artifact, i| {
+        if (artifact.size > config.max_artifact_bytes or artifact.size > remaining_model_bytes) {
+            return error.DownloadSizeLimitExceeded;
+        }
+        const slash = std.mem.indexOfScalar(u8, artifact.repo, '/') orelse return error.InvalidModelRef;
+        const owner = artifact.repo[0..slash];
+        const name = artifact.repo[slash + 1 ..];
+        var artifact_config = config;
+        artifact_config.max_artifact_bytes = @min(config.max_artifact_bytes, remaining_model_bytes);
+        _ = try downloadFileAtRevision(
+            allocator,
+            io,
+            owner,
+            name,
+            artifact.revision,
+            artifact.path,
+            dest_dir,
+            artifact_config,
+            progress,
+            i,
+            artifacts.len,
+            artifact.size,
+            artifact.sha256,
+            null,
+        );
+
+        const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, artifact.path });
+        defer allocator.free(dest_path);
+        const actual_size = try requiredFileSize(std.Io.Dir.cwd(), io, dest_path);
+        if (actual_size != artifact.size) return error.DownloadSizeMismatch;
+        remaining_model_bytes = try consumeModelBudget(remaining_model_bytes, actual_size);
+        try receipts.append(allocator, .{
+            .path = artifact.path,
+            .size = actual_size,
+            .sha256 = artifact.sha256,
+        });
+    }
+
+    if (generated_bundle_manifest) |manifest| {
+        if (manifest.len > remaining_model_bytes or manifest.len > config.max_artifact_bytes) {
+            return error.DownloadSizeLimitExceeded;
+        }
+        const relative_path = "antfly_inference_bundle.json";
+        const manifest_path = try managedPath(allocator, dest_dir, relative_path);
+        defer allocator.free(manifest_path);
+        try writeFileAtomically(allocator, io, manifest_path, manifest);
+        remaining_model_bytes = try consumeModelBudget(remaining_model_bytes, manifest.len);
+        try receipts.append(allocator, .{ .path = relative_path, .size = manifest.len });
+    }
+
+    const receipt_json = try std.json.Stringify.valueAlloc(
+        allocator,
+        ManagedDownloadReceipt{
+            .version = 2,
+            .source = .{ .owner = source_owner, .name = source_name, .variant = source_variant },
+            .artifacts = receipts.items,
+        },
+        .{},
+    );
+    defer allocator.free(receipt_json);
+    if (receipt_json.len > managed_receipt.max_receipt_bytes) return error.InvalidManagedDownload;
+    const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
+    defer allocator.free(plan_path);
+    try writeFileAtomically(allocator, io, plan_path, receipt_json);
+}
+
+/// Download an immutable, cross-repository Qwen3-VL generation bundle.
+///
+/// The decoder/projector and tokenizer/processor sidecars are intentionally
+/// fetched from different official repositories at independent commit SHAs.
+/// The ordinary Hub downloader cannot express that relationship, so this path
+/// writes one receipt only after all eight catalog artifacts pass exact size and
+/// SHA-256 verification.
+pub fn downloadPinnedQwen3VlGenerationBundle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_owner: []const u8,
+    source_name: []const u8,
+    source_variant: []const u8,
+    bundle: *const qwen3vl_catalog.GenerationBundle,
+    dest_dir: []const u8,
+    config: HubConfig,
+    progress: ProgressSink,
+) !void {
+    try qwen3vl_catalog.validate();
+    const artifacts = bundle.artifacts();
+    const bundle_manifest = try qwen3vl_catalog.generationBundleManifestAlloc(allocator, bundle);
+    defer allocator.free(bundle_manifest);
+    return downloadPinnedQwenBundleArtifacts(
+        allocator,
+        io,
+        source_owner,
+        source_name,
+        source_variant,
+        &artifacts,
+        bundle_manifest,
+        dest_dir,
+        config,
+        progress,
+    );
+}
+
+/// Download the immutable official Qwen3-VL-Reranker BF16 oracle bundle. The
+/// generated bundle marker makes its generative yes/no semantics explicit and
+/// prevents it from being discovered as an ordinary CLS cross-encoder.
+pub fn downloadPinnedQwen3VlRerankerBundle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_owner: []const u8,
+    source_name: []const u8,
+    source_variant: []const u8,
+    dest_dir: []const u8,
+    config: HubConfig,
+    progress: ProgressSink,
+) !void {
+    try qwen3vl_catalog.validate();
+    const artifacts = qwen3vl_catalog.rerankerArtifacts();
+    return downloadPinnedQwenBundleArtifacts(
+        allocator,
+        io,
+        source_owner,
+        source_name,
+        source_variant,
+        &artifacts,
+        qwen3vl_catalog.reranker_bundle_manifest,
+        dest_dir,
+        config,
+        progress,
+    );
+}
+
+/// Download an immutable pinned Qwen3-Embedding bundle. GGUF bundles combine
+/// the official GGUF weight artifact with tokenizer sidecars from the
+/// original safetensors repository (the GGUF repo ships weights only) and
+/// write a generated model_manifest.json declaring the last-token embedder
+/// contract. The safetensors bundle carries its own sentence-transformers
+/// detection sidecars and needs no synthetic manifest.
+pub fn downloadPinnedQwen3EmbeddingBundle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_owner: []const u8,
+    source_name: []const u8,
+    source_variant: []const u8,
+    bundle: *const qwen3_embedding_catalog.EmbeddingBundle,
+    dest_dir: []const u8,
+    config: HubConfig,
+    progress: ProgressSink,
+) !void {
+    try qwen3_embedding_catalog.validate();
+    try downloadPinnedQwenBundleArtifacts(
+        allocator,
+        io,
+        source_owner,
+        source_name,
+        source_variant,
+        bundle.artifacts(),
+        null,
+        dest_dir,
+        config,
+        progress,
+    );
+    if (bundle.generated_model_manifest) |manifest| {
+        try writeManagedArtifactAndUpdatePlan(
+            allocator,
+            io,
+            dest_dir,
+            "model_manifest.json",
+            manifest,
+        );
+    }
+}
+
 /// Download a model from HuggingFace Hub.
 pub fn downloadModel(
     allocator: std.mem.Allocator,
@@ -2257,7 +2461,43 @@ fn downloadFile(
     expected_sha256: ?[]const u8,
     expected_git_blob_sha1: ?[]const u8,
 ) !bool {
+    return downloadFileAtRevision(
+        allocator,
+        io,
+        owner,
+        name,
+        "main",
+        filename,
+        dest_dir,
+        config,
+        progress,
+        file_index,
+        files_total,
+        total_bytes,
+        expected_sha256,
+        expected_git_blob_sha1,
+    );
+}
+
+fn downloadFileAtRevision(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    owner: []const u8,
+    name: []const u8,
+    revision: []const u8,
+    filename: []const u8,
+    dest_dir: []const u8,
+    config: HubConfig,
+    progress: ProgressSink,
+    file_index: usize,
+    files_total: usize,
+    total_bytes: ?u64,
+    expected_sha256: ?[]const u8,
+    expected_git_blob_sha1: ?[]const u8,
+) !bool {
     if (!managed_receipt.artifactPathIsSafe(filename)) return error.InvalidModelArtifactPath;
+    if ((!std.mem.eql(u8, revision, "main") and !isSha1Hex(revision)) or
+        std.mem.indexOfAny(u8, revision, "/\\") != null) return error.InvalidHubRevision;
     const max_response_size = try downloadResponseLimit(config);
     if (total_bytes) |total| {
         if (total > config.max_artifact_bytes) return error.DownloadSizeLimitExceeded;
@@ -2288,7 +2528,7 @@ fn downloadFile(
         n_headers += 1;
     }
 
-    const url = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/resolve/main/{s}", .{ config.base_url, owner, name, filename });
+    const url = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/resolve/{s}/{s}", .{ config.base_url, owner, name, revision, filename });
     defer allocator.free(url);
 
     // Create parent dirs if filename has slashes (e.g., "onnx/model.onnx")
@@ -3412,6 +3652,70 @@ test "managed download receipt source identity is exact" {
 
     try std.testing.expect(managedDownloadMatchesSource(allocator, io, dest_dir, "owner", "model", "gguf:Q4_K_M"));
     try std.testing.expect(!managedDownloadMatchesSource(allocator, io, dest_dir, "owner", "model", "gguf:Q8_0"));
+}
+
+test "Qwen3-VL managed bundle descriptor is receipted with exact source identity" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "qwen3vl-bundle-descriptor");
+    defer allocator.free(dest_dir);
+    try beginManagedDownload(allocator, io, dest_dir);
+    const bundle = &qwen3vl_catalog.generation_bundles[0];
+    const descriptor = try qwen3vl_catalog.generationBundleManifestAlloc(allocator, bundle);
+    defer allocator.free(descriptor);
+    const decoder_path = try managedPath(allocator, dest_dir, bundle.decoder.path);
+    defer allocator.free(decoder_path);
+    const projector_path = try managedPath(allocator, dest_dir, bundle.projector.path);
+    defer allocator.free(projector_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = decoder_path, .data = "payload" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = projector_path, .data = "payload" });
+    const cached_artifacts = [_]qwen3vl_catalog.Artifact{
+        .{
+            .repo = bundle.decoder.repo,
+            .revision = bundle.decoder.revision,
+            .path = bundle.decoder.path,
+            .size = 7,
+            .sha256 = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
+        },
+        .{
+            .repo = bundle.projector.repo,
+            .revision = bundle.projector.revision,
+            .path = bundle.projector.path,
+            .size = 7,
+            .sha256 = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
+        },
+    };
+    try downloadPinnedQwenBundleArtifacts(
+        allocator,
+        io,
+        "Qwen",
+        "Qwen3-VL-2B-Instruct-GGUF",
+        qwen3vl_catalog.generation_bundle_variant,
+        &cached_artifacts,
+        descriptor,
+        dest_dir,
+        .{},
+        .{},
+    );
+
+    var plan = try managed_receipt.loadValidatedPlan(allocator, io, dest_dir);
+    defer plan.deinit();
+    const source = plan.parsed.value.source orelse return error.TestExpectedManagedSource;
+    try std.testing.expectEqualStrings("Qwen", source.owner);
+    try std.testing.expectEqualStrings("Qwen3-VL-2B-Instruct-GGUF", source.name);
+    try std.testing.expectEqualStrings(qwen3vl_catalog.generation_bundle_variant, source.variant);
+    const descriptor_receipt = plan.find("antfly_inference_bundle.json") orelse
+        return error.TestExpectedBundleDescriptor;
+    try std.testing.expectEqual(@as(u64, @intCast(descriptor.len)), descriptor_receipt.size);
+
+    const descriptor_path = try managedPath(allocator, dest_dir, "antfly_inference_bundle.json");
+    defer allocator.free(descriptor_path);
+    const saved_descriptor = try std.Io.Dir.cwd().readFileAlloc(io, descriptor_path, allocator, .limited(4096));
+    defer allocator.free(saved_descriptor);
+    try std.testing.expectEqualStrings(descriptor, saved_descriptor);
 }
 
 test "managed staging artifact replacement updates the publication receipt" {

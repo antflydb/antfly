@@ -21,6 +21,8 @@ const build_options = @import("build_options");
 const manifest_mod = @import("../models/manifest.zig");
 const managed_receipt = @import("managed_receipt.zig");
 pub const download = @import("download.zig");
+pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
+pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
 
 pub const ModelKind = enum {
     embedder,
@@ -49,6 +51,8 @@ const DiscoverKindMode = enum {
 
 test {
     _ = download;
+    _ = qwen3vl_catalog;
+    _ = qwen3_embedding_catalog;
 }
 
 /// Friendly short names accepted by user-facing commands (chat) in place of a
@@ -68,6 +72,14 @@ pub const friendly_aliases = [_]FriendlyAlias{
     .{ .alias = "gemma4-e4b", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma-4-e4b", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma4-e4b-it", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
+    .{ .alias = "qwen3-vl-2b", .ref = "Qwen/Qwen3-VL-2B-Instruct-GGUF:q4-k-m-bundle-v1" },
+    .{ .alias = "qwen3-vl-4b", .ref = "Qwen/Qwen3-VL-4B-Instruct-GGUF:q4-k-m-bundle-v1" },
+    .{ .alias = "qwen3-vl-8b", .ref = "Qwen/Qwen3-VL-8B-Instruct-GGUF:q4-k-m-bundle-v1" },
+    .{ .alias = "qwen3-vl-reranker-2b", .ref = "Qwen/Qwen3-VL-Reranker-2B:bf16-safetensors-bundle-v1" },
+    .{ .alias = "qwen3-embedding", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1" },
+    .{ .alias = "qwen3-embedding-0.6b", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1" },
+    .{ .alias = "qwen3-embedding-0.6b-f16", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1" },
+    .{ .alias = "qwen3-embedding-0.6b-safetensors", .ref = "Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1" },
 };
 
 /// Resolve a friendly alias to its pinned `owner/name:variant` reference.
@@ -97,8 +109,34 @@ test "friendly alias refs parse as model refs" {
         const ref = try ModelRef.parse(entry.ref);
         try std.testing.expect(ref.owner.len > 0);
         try std.testing.expect(ref.name.len > 0);
-        try std.testing.expectEqualStrings("gguf", ref.variant);
+        if (std.mem.eql(u8, entry.alias, "qwen3-vl-reranker-2b")) {
+            try std.testing.expectEqualStrings(qwen3vl_catalog.reranker_bundle_variant, ref.variant);
+        } else if (std.mem.startsWith(u8, entry.alias, "qwen3-vl-")) {
+            try std.testing.expectEqualStrings(qwen3vl_catalog.generation_bundle_variant, ref.variant);
+        } else if (std.mem.startsWith(u8, entry.alias, "qwen3-embedding")) {
+            try std.testing.expect(
+                qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant) != null,
+            );
+        } else {
+            try std.testing.expectEqualStrings("gguf", ref.variant);
+        }
     }
+}
+
+fn parseModelRefOrAlias(value: []const u8) !ModelRef {
+    return ModelRef.parse(resolveFriendlyRef(value) orelse value);
+}
+
+test "pull model refs accept friendly Qwen aliases" {
+    const generation = try parseModelRefOrAlias("qwen3-vl-2b");
+    try std.testing.expectEqualStrings("Qwen", generation.owner);
+    try std.testing.expectEqualStrings("Qwen3-VL-2B-Instruct-GGUF", generation.name);
+    try std.testing.expectEqualStrings(qwen3vl_catalog.generation_bundle_variant, generation.variant);
+
+    const reranker = try parseModelRefOrAlias("QWEN3-VL-RERANKER-2B");
+    try std.testing.expectEqualStrings("Qwen", reranker.owner);
+    try std.testing.expectEqualStrings("Qwen3-VL-Reranker-2B", reranker.name);
+    try std.testing.expectEqualStrings(qwen3vl_catalog.reranker_bundle_variant, reranker.variant);
 }
 
 test "gemma4 qat gguf pulls derive the MTP assistant companion ref" {
@@ -426,7 +464,7 @@ pub const ModelRegistry = struct {
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
     ) !void {
-        const ref = try ModelRef.parse(ref_str);
+        const ref = try parseModelRefOrAlias(ref_str);
         const resolved_models_dir = try resolveModelsDirForWriteAlloc(self.allocator, io, self.models_dir);
         defer self.allocator.free(resolved_models_dir);
 
@@ -449,10 +487,58 @@ pub const ModelRegistry = struct {
         defer transaction.deinit(io);
 
         var progress = ProgressPrinter{};
-        try download.downloadModel(self.allocator, io, ref.owner, ref.name, ref.variant, transaction.staging, hub_config, projector_selection, .{
+        const progress_sink: download.ProgressSink = .{
             .callback = ProgressPrinter.onProgress,
             .context = &progress,
-        });
+        };
+        if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedQwen3VlGenerationBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else if (qwen3vl_catalog.isRerankerBundleRef(ref.owner, ref.name, ref.variant)) {
+            try download.downloadPinnedQwen3VlRerankerBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else if (qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedQwen3EmbeddingBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else {
+            try download.downloadModel(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                transaction.staging,
+                hub_config,
+                projector_selection,
+                progress_sink,
+            );
+        }
         try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
         try transaction.commit(io);

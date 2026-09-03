@@ -42,6 +42,7 @@ const metal_compute_mod = @import("../ops/metal_compute.zig");
 const deepseek_v4 = @import("deepseek_v4.zig");
 const deepseek_v4_host = @import("deepseek_v4_host.zig");
 const gemma4_runtime = @import("gemma4_runtime.zig");
+const qwen3vl_reranker = @import("qwen3vl_reranker.zig");
 const tensor_mod = @import("../backends/tensor.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
 
@@ -411,6 +412,76 @@ fn maybePrepareCudaGemmaDecoderOverrides(
     return buildCudaGemmaDecoderOverrides(config, configured_layer_count);
 }
 
+fn qwen3VlMetalPrefillFastPathEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_PREPARED_SLOTS", false) and
+        platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_PREFILL_FRAME", false) and
+        !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_QWEN3VL_PREFILL_FAST_PATH", false);
+}
+
+/// The decoder frame coalesces only the existing eager Metal operations. In
+/// particular, Qwen3-VL still applies its three-axis mRoPE before attention;
+/// it does not reuse the unqualified prepared decoder slots.
+fn qwen3VlMetalDecodeFrameEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_DECODE_FRAME", true) and
+        !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_QWEN3VL_DECODE_FRAME", false);
+}
+
+fn qwen3VlMetalForwardFrameEnabled() bool {
+    return qwen3VlMetalPrefillFastPathEnabled() and
+        platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_FORWARD_FRAME", false) and
+        !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_QWEN3VL_FORWARD_FRAME", false);
+}
+
+fn qwen3VlMetalPreparedFfnEnabled() bool {
+    return qwen3VlMetalPrefillFastPathEnabled() and
+        platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_PREPARED_FFN", false) and
+        !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_QWEN3VL_PREPARED_FFN", false);
+}
+
+fn buildMetalQwen3VlDecoderOverrides(config: Config, configured_layer_count: usize) Layer0DecoderOverrides {
+    const prepared_layer_count = @min(configured_layer_count, @as(usize, @intCast(config.num_hidden_layers)));
+    var overrides = Layer0DecoderOverrides{};
+    for (0..prepared_layer_count) |layer| {
+        overrides.attn_norm_slots[layer] = cudaGemmaNormSlot(layer, .attn_pre);
+        overrides.attn_q_slots[layer] = cudaGemmaLinearSlot(layer, .attn_q);
+        overrides.attn_k_slots[layer] = cudaGemmaLinearSlot(layer, .attn_k);
+        overrides.attn_v_slots[layer] = cudaGemmaLinearSlot(layer, .attn_v);
+        overrides.attn_out_proj_linear_slots[layer] = cudaGemmaLinearSlot(layer, .attn_out_proj);
+        overrides.ffn_norm_slots[layer] = cudaGemmaNormSlot(layer, .ffn_pre);
+        overrides.mlp_gate_slots[layer] = cudaGemmaLinearSlot(layer, .mlp_gate);
+        overrides.mlp_up_slots[layer] = cudaGemmaLinearSlot(layer, .mlp_up);
+        overrides.mlp_down_slots[layer] = cudaGemmaLinearSlot(layer, .mlp_down);
+    }
+    return overrides;
+}
+
+fn maybePrepareMetalQwen3VlDecoderOverrides(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    overrides: Layer0DecoderOverrides,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    trace_sink: ?*ActivationTraceSink,
+) !Layer0DecoderOverrides {
+    if (cb.kind() != .metal or config.family != .qwen3_vl) return overrides;
+    if (!qwen3VlMetalPrefillFastPathEnabled() or trace_sink != null) return overrides;
+    if (!layer0DecoderOverridesEmpty(overrides)) return overrides;
+    const ctx = decode_context orelse return overrides;
+    if (ctx.attention_mode != .paged_prefill or ctx.query_sequence_len <= 1) return overrides;
+
+    const configured_layer_count: usize = @intCast(config.num_hidden_layers);
+    const prepare = try cb.decoderRuntimePrepareOrReuseFamily(
+        allocator,
+        config,
+        ctx.kv_sequence_len,
+        configured_layer_count,
+    );
+    if (!prepare.prepared) return overrides;
+    _ = seq_len;
+    return buildMetalQwen3VlDecoderOverrides(config, configured_layer_count);
+}
+
 pub const GreedyDeviceTokenResult = struct {
     token_id: usize,
     token_tensor: ?CT = null,
@@ -531,6 +602,20 @@ pub const DecodeContext = struct {
     qwen35_linear_cache: ?*Qwen35LinearCache = null,
     gemma4_layer_spec_cache: ?*Gemma4LayerSpecCache = null,
     input_ids: ?[]const i64 = null,
+    /// Qwen3-VL query positions in axis-major temporal/height/width order.
+    /// The slice covers exactly the current query tokens, not the resident KV
+    /// prefix. Cached decode supplies three positions for its single token.
+    mrope_positions: ?[]const u32 = null,
+    /// Authorizes ordinary scalar positions only when the entire Qwen3-VL
+    /// request is text. Multimodal requests must always supply three axes.
+    qwen3vl_text_only: bool = false,
+    /// Qwen3-VL visual positions and projected DeepStack features for the
+    /// current prefill query. Features are tap-major
+    /// [deepstack_layer][visual_token][hidden]. They are intentionally absent
+    /// on cached one-token decode steps.
+    qwen3vl_visual_mask: ?[]const bool = null,
+    qwen3vl_deepstack_embeddings: ?[]const f32 = null,
+    qwen3vl_deepstack_layer_count: usize = 0,
 
     pub fn usesPagedKv(self: DecodeContext) bool {
         return self.kv_cache != null or self.kv_batch != null;
@@ -2715,11 +2800,20 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         );
     }
 
-    const effective_overrides = try maybePrepareCudaGemmaDecoderOverrides(
+    const cuda_overrides = try maybePrepareCudaGemmaDecoderOverrides(
         cb,
         allocator,
         config,
         overrides,
+        seq_len,
+        decode_context,
+        trace_sink,
+    );
+    const effective_overrides = try maybePrepareMetalQwen3VlDecoderOverrides(
+        cb,
+        allocator,
+        config,
+        cuda_overrides,
         seq_len,
         decode_context,
         trace_sink,
@@ -2754,6 +2848,30 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         }
     }
     defer if (owns_a4b_forward_frame) cb.decoderRuntimeCancelFrame() catch {};
+
+    // Optionally keep the complete dense Qwen3-VL decoder prefill in one
+    // command buffer. The ordinary Qwen path below owns one bounded frame per
+    // layer; this separately gated lane measures and removes the intervening
+    // CPU submit/wait bubbles while retaining the alternating hidden-state
+    // carrier. It is deliberately not implied by the prepared-slot gate so it
+    // can be qualified and rolled back independently.
+    var owns_qwen3vl_forward_frame = false;
+    const qwen3vl_forward_context = decode_context;
+    if (cb.kind() == .metal and
+        config.family == .qwen3_vl and
+        qwen3VlMetalForwardFrameEnabled() and
+        trace_sink == null and
+        qwen3vl_forward_context != null and
+        qwen3vl_forward_context.?.attention_mode == .paged_prefill and
+        qwen3vl_forward_context.?.query_sequence_len > 1 and
+        !cb.decoderRuntimeHasActiveFrame())
+    {
+        owns_qwen3vl_forward_frame = try cb.decoderRuntimeBeginFrame();
+        if (owns_qwen3vl_forward_frame) {
+            try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
+        }
+    }
+    defer if (owns_qwen3vl_forward_frame) cb.decoderRuntimeCancelFrame() catch {};
 
     // A long-lived Metal frame may recycle a released buffer immediately for
     // a later encoded layer even though an earlier command still reads it.
@@ -2821,7 +2939,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         }
         const num_kv_heads = config.effectiveKVHeadsForLayer(layer);
         const head_dim = config.effectiveHeadDimForLayer(layer);
-        const new_hidden = try decoderBlock(
+        const block_hidden = try decoderBlock(
             cb,
             allocator,
             config,
@@ -2841,6 +2959,11 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             layer0_v_pending,
             trace_sink,
         );
+        var new_hidden = block_hidden;
+        if (try applyQwen3VlDeepstack(cb, allocator, config, block_hidden, total, layer, decode_context)) |injected| {
+            if (injected != block_hidden and block_hidden != hidden) cb.free(block_hidden);
+            new_hidden = injected;
+        }
         if (layer == 0) layer0_attn_norm_pending = null;
         if (layer == 0) layer0_fused_qkv_pending = null;
         if (layer == 0) layer0_q_pending = null;
@@ -2931,6 +3054,10 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             cb.free(hidden);
     }
     hidden = final_hidden;
+    if (owns_qwen3vl_forward_frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        owns_qwen3vl_forward_frame = false;
+    }
     if (!is_freestanding and prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
         debugPrint("prefill-trace: gpt final norm done\n", .{});
     }
@@ -3012,6 +3139,333 @@ pub fn hiddenForwardResident(
     decode_context: ?*const DecodeContext,
 ) !CT {
     return hiddenForwardResidentWithOverrides(cb, allocator, config, input_ids, batch, seq_len, decode_context, .{});
+}
+
+fn activeFinalRowIndices(
+    allocator: std.mem.Allocator,
+    attention_mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+) ![]i64 {
+    const total = std.math.mul(usize, batch, seq_len) catch
+        return error.InvalidRerankerInputShape;
+    if (batch == 0 or seq_len == 0 or attention_mask.len != total) {
+        return error.InvalidRerankerInputShape;
+    }
+    const rows = try allocator.alloc(i64, batch);
+    errdefer allocator.free(rows);
+    for (0..batch) |batch_index| {
+        const mask = attention_mask[batch_index * seq_len ..][0..seq_len];
+        var active: usize = 0;
+        var saw_padding = false;
+        for (mask) |value| {
+            switch (value) {
+                1 => {
+                    // Right padding is required: causal active tokens must not
+                    // attend to synthetic padding inserted before them.
+                    if (saw_padding) return error.InvalidRerankerAttentionMask;
+                    active += 1;
+                },
+                0 => saw_padding = true,
+                else => return error.InvalidRerankerAttentionMask,
+            }
+        }
+        if (active == 0) return error.InvalidRerankerAttentionMask;
+        const flat_row = std.math.add(
+            usize,
+            std.math.mul(usize, batch_index, seq_len) catch
+                return error.InvalidRerankerInputShape,
+            active - 1,
+        ) catch return error.InvalidRerankerInputShape;
+        rows[batch_index] = std.math.cast(i64, flat_row) orelse
+            return error.InvalidRerankerInputShape;
+    }
+    return rows;
+}
+
+fn qwen3VlTextMropePositions(
+    allocator: std.mem.Allocator,
+    attention_mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+) ![]u32 {
+    const total = std.math.mul(usize, batch, seq_len) catch
+        return error.InvalidRerankerInputShape;
+    if (batch == 0 or seq_len == 0 or attention_mask.len != total) {
+        return error.InvalidRerankerInputShape;
+    }
+    const position_count = std.math.mul(usize, total, 3) catch
+        return error.InvalidRerankerInputShape;
+    const positions = try allocator.alloc(u32, position_count);
+    errdefer allocator.free(positions);
+    @memset(positions, 0);
+
+    for (0..batch) |batch_index| {
+        const row_base = batch_index * seq_len;
+        var logical_position: u32 = 0;
+        var saw_padding = false;
+        for (attention_mask[row_base..][0..seq_len], 0..) |value, column| {
+            switch (value) {
+                1 => {
+                    if (saw_padding) return error.InvalidRerankerAttentionMask;
+                    const flat_row = row_base + column;
+                    inline for (0..3) |axis| {
+                        positions[axis * total + flat_row] = logical_position;
+                    }
+                    logical_position = std.math.add(u32, logical_position, 1) catch
+                        return error.InvalidRerankerInputShape;
+                },
+                0 => saw_padding = true,
+                else => return error.InvalidRerankerAttentionMask,
+            }
+        }
+        if (logical_position == 0) return error.InvalidRerankerAttentionMask;
+    }
+    return positions;
+}
+
+/// Exact Qwen3-VL-Reranker head: select the final active hidden row and keep
+/// only `(W_yes - W_no)` on the backend. This avoids materializing the full
+/// vocabulary logits and preserves the official pointwise scoring contract.
+pub fn qwen3VlRerankerLogits(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+) ![]f32 {
+    if (config.family != .qwen3_vl or
+        qwen3vl_reranker.yes_token_id >= config.vocab_size or
+        qwen3vl_reranker.no_token_id >= config.vocab_size)
+    {
+        return error.UnsupportedRerankerArchitecture;
+    }
+    const total = std.math.mul(usize, batch, seq_len) catch
+        return error.InvalidRerankerInputShape;
+    if (input_ids.len != total) return error.InvalidRerankerInputShape;
+
+    const active_rows = try activeFinalRowIndices(allocator, attention_mask, batch, seq_len);
+    defer allocator.free(active_rows);
+    const mrope_positions = try qwen3VlTextMropePositions(
+        allocator,
+        attention_mask,
+        batch,
+        seq_len,
+    );
+    defer allocator.free(mrope_positions);
+
+    const decode_context = DecodeContext{
+        .attention_mode = .full_recompute,
+        .total_sequence_len = seq_len,
+        .query_sequence_len = seq_len,
+        .kv_sequence_len = seq_len,
+        // Explicit axis-major positions are required for batches. The scalar
+        // rope API cannot infer the head count separately from batch size and
+        // therefore cannot reconstruct per-row positions from a flattened
+        // [batch * sequence, heads * head_dim] tensor.
+        .mrope_positions = mrope_positions,
+    };
+    const hidden = try hiddenForwardResident(
+        cb,
+        allocator,
+        config,
+        input_ids,
+        batch,
+        seq_len,
+        &decode_context,
+    );
+    defer cb.free(hidden);
+    return qwen3VlRerankerLogitsFromHiddenRows(
+        cb,
+        allocator,
+        config,
+        hidden,
+        active_rows,
+    );
+}
+
+/// Score one fully expanded Qwen3-VL reranker prompt. `input_embeddings` is
+/// consumed on every return path, matching the resident decoder forward
+/// ownership contract. The caller must clear its owning optional before the
+/// call so later cleanup cannot free the same backend tensor twice.
+pub fn qwen3VlRerankerLogitFromMultimodalEmbeddings(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_embeddings: CT,
+    seq_len: usize,
+    mrope_positions: []const u32,
+    visual_mask: []const bool,
+    deepstack_embeddings: []const f32,
+    deepstack_layer_count: usize,
+) !f32 {
+    const position_count = std.math.mul(usize, seq_len, 3) catch {
+        cb.free(input_embeddings);
+        return error.InvalidRerankerInputShape;
+    };
+    var visual_tokens: usize = 0;
+    for (visual_mask) |is_visual| {
+        if (is_visual) visual_tokens = std.math.add(usize, visual_tokens, 1) catch {
+            cb.free(input_embeddings);
+            return error.InvalidDeepstackContext;
+        };
+    }
+    const feature_stride = std.math.mul(usize, visual_tokens, config.hidden_size) catch {
+        cb.free(input_embeddings);
+        return error.InvalidDeepstackContext;
+    };
+    const expected_deepstack = std.math.mul(usize, feature_stride, deepstack_layer_count) catch {
+        cb.free(input_embeddings);
+        return error.InvalidDeepstackContext;
+    };
+    if (config.family != .qwen3_vl or seq_len == 0 or
+        mrope_positions.len != position_count or visual_mask.len != seq_len or
+        visual_tokens == 0 or deepstack_layer_count == 0 or
+        deepstack_embeddings.len != expected_deepstack)
+    {
+        cb.free(input_embeddings);
+        return error.InvalidRerankerInputShape;
+    }
+
+    const decode_context = DecodeContext{
+        .attention_mode = .full_recompute,
+        .total_sequence_len = seq_len,
+        .query_sequence_len = seq_len,
+        .kv_sequence_len = seq_len,
+        .mrope_positions = mrope_positions,
+        .qwen3vl_visual_mask = visual_mask,
+        .qwen3vl_deepstack_embeddings = deepstack_embeddings,
+        .qwen3vl_deepstack_layer_count = deepstack_layer_count,
+    };
+    const hidden = try hiddenForwardFromEmbeddingsResident(
+        cb,
+        allocator,
+        config,
+        input_embeddings,
+        1,
+        seq_len,
+        &decode_context,
+        null,
+    );
+    defer cb.free(hidden);
+    const final_row = [_]i64{@intCast(seq_len - 1)};
+    const result = try qwen3VlRerankerLogitsFromHiddenRows(
+        cb,
+        allocator,
+        config,
+        hidden,
+        &final_row,
+    );
+    defer allocator.free(result);
+    if (result.len != 1) return error.InvalidRerankerScoreShape;
+    return result[0];
+}
+
+fn qwen3VlRerankerLogitsFromHiddenRows(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    active_rows: []const i64,
+) ![]f32 {
+    if (active_rows.len == 0) return error.InvalidRerankerScoreShape;
+    const final_hidden = try cb.embeddingLookup(hidden, active_rows, active_rows.len, config.hidden_size);
+    defer cb.free(final_hidden);
+
+    const difference_weight = try qwen3VlRerankerDifferenceWeight(cb, allocator, config);
+    defer cb.free(difference_weight);
+
+    const logits = try cb.linearNoBias(
+        final_hidden,
+        difference_weight,
+        active_rows.len,
+        config.hidden_size,
+        1,
+    );
+    defer cb.free(logits);
+    const result = try cb.toFloat32(logits, allocator);
+    errdefer allocator.free(result);
+    if (result.len != active_rows.len) return error.InvalidRerankerScoreShape;
+    for (result) |value| {
+        if (!std.math.isFinite(value)) return error.NonFiniteRerankerScore;
+    }
+    return result;
+}
+
+fn qwen3VlRerankerDifferenceRows(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    weights: CT,
+    yes_row: i64,
+    no_row: i64,
+    hidden_size: usize,
+) !CT {
+    const yes_id = [_]i64{yes_row};
+    const no_id = [_]i64{no_row};
+    const yes_weight = try cb.embeddingLookup(weights, &yes_id, 1, hidden_size);
+    var free_yes_weight = true;
+    defer if (free_yes_weight) cb.free(yes_weight);
+    const no_weight = try cb.embeddingLookup(weights, &no_id, 1, hidden_size);
+    var free_no_weight = true;
+    defer if (free_no_weight) cb.free(no_weight);
+
+    return if (try cb.subtractConsumeLeft(yes_weight, no_weight)) |difference| blk: {
+        if (difference == yes_weight) free_yes_weight = false;
+        if (difference == no_weight) free_no_weight = false;
+        break :blk difference;
+    } else blk: {
+        const yes_host = try cb.toFloat32(yes_weight, allocator);
+        defer allocator.free(yes_host);
+        const no_host = try cb.toFloat32(no_weight, allocator);
+        defer allocator.free(no_host);
+        if (yes_host.len != hidden_size or no_host.len != hidden_size) {
+            return error.InvalidRerankerScoreShape;
+        }
+        const difference = try allocator.alloc(f32, hidden_size);
+        defer allocator.free(difference);
+        for (difference, yes_host, no_host) |*value, yes, no| value.* = yes - no;
+        const shape = [_]i32{ 1, @intCast(hidden_size) };
+        break :blk try cb.fromFloat32Shape(difference, &shape);
+    };
+}
+
+/// llama.cpp's Qwen3 reranker conversion stores the exact `yes` and `no`
+/// output rows as `cls.output.weight`. Prefer that compact semantic head when
+/// present. Safetensors checkpoints retain the original LM head instead, so
+/// their established token-row path remains the explicit fallback.
+fn qwen3VlRerankerDifferenceWeight(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+) !CT {
+    const classifier = cb.getWeight("cls.output.weight") catch |err| switch (err) {
+        error.MissingWeight => null,
+        else => return err,
+    };
+    if (classifier) |weights| {
+        defer cb.free(weights);
+        return qwen3VlRerankerDifferenceRows(
+            cb,
+            allocator,
+            weights,
+            0,
+            1,
+            config.hidden_size,
+        );
+    }
+
+    const lm_head = try getLmHeadWeight(cb, config);
+    defer cb.free(lm_head);
+    return qwen3VlRerankerDifferenceRows(
+        cb,
+        allocator,
+        lm_head,
+        @intCast(qwen3vl_reranker.yes_token_id),
+        @intCast(qwen3vl_reranker.no_token_id),
+        config.hidden_size,
+    );
 }
 
 pub fn hiddenForwardResidentWithOverrides(
@@ -3112,7 +3566,7 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
         const layer_started_at = monotonicNowNs();
         const num_kv_heads = config.effectiveKVHeadsForLayer(layer);
         const head_dim = config.effectiveHeadDimForLayer(layer);
-        const new_hidden = try decoderBlock(
+        const block_hidden = try decoderBlock(
             cb,
             allocator,
             config,
@@ -3132,6 +3586,11 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
             null,
             null,
         );
+        var new_hidden = block_hidden;
+        if (try applyQwen3VlDeepstack(cb, allocator, config, block_hidden, total, layer, decode_context)) |injected| {
+            if (injected != block_hidden and block_hidden != hidden) cb.free(block_hidden);
+            new_hidden = injected;
+        }
         if (new_hidden != hidden) cb.free(hidden);
         hidden = new_hidden;
         if (cb.kind() == .metal and forceLayerCloneDebug()) {
@@ -4968,6 +5427,43 @@ fn decoderBlock(
     }
     defer if (owns_a4b_layer_frame) cb.decoderRuntimeCancelFrame() catch {};
 
+    // Decode with the established eager Qwen3-VL math but submit the layer as
+    // one bounded Metal frame. This avoids the mRoPE correctness hazard of a
+    // whole-token prepared decoder while removing its per-op submit/wait
+    // bubbles. An explicit disable gate remains available for rollout safety.
+    var owns_qwen3vl_decode_frame = false;
+    if (cb.kind() == .metal and
+        config.family == .qwen3_vl and
+        isDecodeStep(decode_context) and
+        qwen3VlMetalDecodeFrameEnabled() and
+        !cb.decoderRuntimeHasActiveFrame())
+    {
+        owns_qwen3vl_decode_frame = try cb.decoderRuntimeBeginFrame();
+        if (owns_qwen3vl_decode_frame) try cb.decoderRuntimeSetActiveFrameRegime(.decode);
+    }
+    defer if (owns_qwen3vl_decode_frame) cb.decoderRuntimeCancelFrame() catch {};
+
+    // The qualified Qwen3-VL prefill lane uses one command buffer per decoder
+    // layer. This preserves bounded lifetimes while coalescing the 20+ device
+    // dispatches in attention and FFN; the paired slot/frame gate prevents the
+    // independently unqualified slots-only execution from becoming reachable.
+    var owns_qwen3vl_prefill_frame = false;
+    const qwen3vl_prepared_layer = decoderOverrideLayerSlot(raw_overrides.attn_q_slots, layer) != null and
+        decoderOverrideLayerSlot(raw_overrides.mlp_down_slots, layer) != null;
+    if (cb.kind() == .metal and
+        config.family == .qwen3_vl and
+        qwen3VlMetalPrefillFastPathEnabled() and
+        qwen3vl_prepared_layer and
+        decode_context != null and
+        decode_context.?.attention_mode == .paged_prefill and
+        decode_context.?.query_sequence_len > 1 and
+        !cb.decoderRuntimeHasActiveFrame())
+    {
+        owns_qwen3vl_prefill_frame = try cb.decoderRuntimeBeginFrame();
+        if (owns_qwen3vl_prefill_frame) try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
+    }
+    defer if (owns_qwen3vl_prefill_frame) cb.decoderRuntimeCancelFrame() catch {};
+
     const result = try decoderBlockImpl(
         cb,
         allocator,
@@ -4991,6 +5487,14 @@ fn decoderBlock(
     if (owns_a4b_layer_frame) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
         owns_a4b_layer_frame = false;
+    }
+    if (owns_qwen3vl_decode_frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        owns_qwen3vl_decode_frame = false;
+    }
+    if (owns_qwen3vl_prefill_frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        owns_qwen3vl_prefill_frame = false;
     }
     return result;
 }
@@ -5143,7 +5647,7 @@ fn decoderBlockImpl(
     const kv_dim: usize = @as(usize, num_kv_heads) * head_dim;
     const q_dim: usize = @as(usize, num_heads) * head_dim;
     if (!disableDecoderRuntimeActivationDebug() and !shares_kv and config.family != .gpt2 and
-        config.family != .qwen3 and config.family != .qwen3_5 and
+        config.family != .qwen3 and config.family != .qwen3_vl and config.family != .qwen3_5 and
         attn_q_slot != null and attn_k_slot != null and attn_v_slot != null and
         attn_out_proj_linear_slot != null and mlp_gate_slot != null and
         mlp_up_slot != null and mlp_down_slot != null and
@@ -5367,7 +5871,7 @@ fn decoderBlockImpl(
         };
         const k: CT, const v_omitted_local: bool, const v_local: CT = if (shares_kv)
             .{ try createZeroCT(cb, allocator, total * kv_dim), false, try createZeroCT(cb, allocator, total * kv_dim) }
-        else if (attn_k_slot != null and attn_v_slot != null and config.family == .qwen3) blk_kv: {
+        else if (attn_k_slot != null and attn_v_slot != null and (config.family == .qwen3 or config.family == .qwen3_vl)) blk_kv: {
             // The dense K/V pair slot path is not Qwen3-correct for Jina v5;
             // individual prepared slots match the dynamic Metal projections.
             const k_local = (try cb.decoderRuntimeApplyLinear(&.{
@@ -5592,7 +6096,7 @@ fn decoderBlockImpl(
                     }
                 }
             },
-            .llama, .mistral, .qwen2, .qwen3, .bitnet => {
+            .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .bitnet => {
                 if (mlp_gate_slot != null and mlp_up_slot != null and mlp_down_slot != null) {
                     const block_started_at = monotonicNowNs();
                     debug_timing_stats.gated_block_attempts += 1;
@@ -5717,7 +6221,7 @@ fn decoderBlockImpl(
             }
         }
 
-        if (!qk_already_roped and attn_out_proj_linear_slot != null and config.family != .qwen3_5 and config.family != .gemma) {
+        if (!qk_already_roped and attn_out_proj_linear_slot != null and config.family != .qwen3_vl and config.family != .qwen3_5 and config.family != .gemma) {
             const fused_attn_started_at = monotonicNowNs();
             if (try applyAttentionResidual(
                 cb,
@@ -6016,6 +6520,8 @@ fn decoderBlockImpl(
     };
 
     // --- FFN sublayer ---
+    compute_region_scope.deinit();
+    compute_region_scope = try cb.decoderRuntimePushComputeRegion(.ffn_norm);
     const ffn_normed = if (ffn_norm_slot != null) blk: {
         const raw_norm = switch (config.norm_type) {
             .layer_norm => try cb.decoderRuntimeApplyLayerNorm(&.{
@@ -6035,6 +6541,8 @@ fn decoderBlockImpl(
     } else try applyFFNNorm(cb, allocator, config, attn_res, layer, &name_buf);
     defer cb.free(ffn_normed);
     try maybeDebugLayerTensorLastRow(cb, allocator, layer, "ffn_norm", ffn_normed, hidden_size);
+    compute_region_scope.deinit();
+    compute_region_scope = try cb.decoderRuntimePushComputeRegion(.ffn);
     const ffn_started_at = monotonicNowNs();
     var ffn_out_includes_residual = false;
     const ffn_out = if (mlp_fc1_slot != null and mlp_fc2_slot != null) blk: {
@@ -6092,6 +6600,7 @@ fn decoderBlockImpl(
         })) orelse try feedForward(cb, allocator, config, ffn_normed, total, layer, &name_buf, decode_context);
     } else if (mlp_gate_slot != null and mlp_up_slot != null and mlp_down_slot != null and switch (config.family) {
         .llama, .mistral, .qwen2, .gemma => true,
+        .qwen3_vl => qwen3VlMetalPreparedFfnEnabled(),
         else => false,
     }) blk: {
         const inter_size = config.intermediateSize(layer);
@@ -6290,7 +6799,7 @@ pub fn maybeApplyQKHeadNorm(
     buf: *[256]u8,
 ) !?CT {
     switch (config.family) {
-        .gemma, .qwen3, .qwen3_5 => {},
+        .gemma, .qwen3, .qwen3_vl, .qwen3_5 => {},
         else => return null,
     }
 
@@ -6346,7 +6855,7 @@ pub fn maybeApplyQKHeadNormRope(
     buf: *[256]u8,
 ) !?CT {
     switch (config.family) {
-        .gemma, .qwen3, .qwen3_5 => {},
+        .gemma, .qwen3, .qwen3_vl, .qwen3_5 => {},
         else => return null,
     }
     if (config.position_encoding != .rope) return null;
@@ -6534,6 +7043,69 @@ fn isDecodeStep(decode_context: ?*const DecodeContext) bool {
     const dc = decode_context orelse return false;
     return dc.attention_mode == .paged_decode or
         (dc.query_sequence_len == 1 and dc.kv_sequence_len > dc.query_sequence_len);
+}
+
+/// Add one Qwen3-VL DeepStack tap to visual rows after the corresponding text
+/// decoder layer. The dense staging tensor is a correctness fallback shared by
+/// native and accelerator backends; the addition itself remains backend-side.
+/// Admission is strict so a mask/feature mismatch can never shift features
+/// onto ordinary text tokens.
+fn applyQwen3VlDeepstack(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    total_rows: usize,
+    layer: usize,
+    decode_context: ?*const DecodeContext,
+) !?CT {
+    if (config.family != .qwen3_vl) return null;
+    const dc = decode_context orelse return null;
+    const mask = dc.qwen3vl_visual_mask orelse {
+        if (dc.qwen3vl_deepstack_embeddings != null or dc.qwen3vl_deepstack_layer_count != 0)
+            return error.InvalidDeepstackContext;
+        return null;
+    };
+    const features = dc.qwen3vl_deepstack_embeddings orelse return error.InvalidDeepstackContext;
+    if (isDecodeStep(decode_context)) return error.DeepstackProvidedDuringDecode;
+    if (mask.len != total_rows or dc.qwen3vl_deepstack_layer_count == 0 or
+        dc.qwen3vl_deepstack_layer_count > @as(usize, config.vision_deepstack_visual_indexes_len))
+    {
+        return error.InvalidDeepstackContext;
+    }
+    if (layer >= dc.qwen3vl_deepstack_layer_count) return null;
+
+    var visual_rows: usize = 0;
+    for (mask) |is_visual| if (is_visual) {
+        visual_rows += 1;
+    };
+    if (visual_rows == 0) return error.InvalidDeepstackContext;
+    const hidden_size: usize = @intCast(config.hidden_size);
+    const feature_stride = std.math.mul(usize, visual_rows, hidden_size) catch return error.InvalidDeepstackContext;
+    const expected = std.math.mul(usize, feature_stride, dc.qwen3vl_deepstack_layer_count) catch
+        return error.InvalidDeepstackContext;
+    if (features.len != expected) return error.InvalidDeepstackContext;
+    const dense_len = std.math.mul(usize, total_rows, hidden_size) catch return error.InvalidDeepstackContext;
+    const dense = try allocator.alloc(f32, dense_len);
+    defer allocator.free(dense);
+    @memset(dense, 0.0);
+    const layer_features = features[layer * feature_stride ..][0..feature_stride];
+    var visual_index: usize = 0;
+    for (mask, 0..) |is_visual, row| {
+        if (!is_visual) continue;
+        const source = visual_index * hidden_size;
+        const destination = row * hidden_size;
+        for (layer_features[source..][0..hidden_size]) |value| {
+            if (!std.math.isFinite(value)) return error.NonFiniteDeepstackFeature;
+        }
+        @memcpy(dense[destination..][0..hidden_size], layer_features[source..][0..hidden_size]);
+        visual_index += 1;
+    }
+    if (visual_index != visual_rows) return error.InvalidDeepstackContext;
+    const shape = [_]i32{ @intCast(total_rows), @intCast(hidden_size) };
+    const update = try cb.fromFloat32Shape(dense, &shape);
+    defer cb.free(update);
+    return cb.add(hidden, update);
 }
 
 fn decoderLayerEvalStride(config: Config, decode_context: ?*const DecodeContext) usize {
@@ -7512,6 +8084,77 @@ fn attentionQueryRopeScale(global_head_dim: u32, head_dim: u32) ?f32 {
     return @sqrt(@as(f32, @floatFromInt(head_dim)));
 }
 
+fn runPreparedAttentionWithSinkMetadata(
+    cb: *const ComputeBackend,
+    Q: CT,
+    K: CT,
+    V: CT,
+    attention: ops.AttentionContext,
+    sink_metadata: backend_contracts.AttentionSinkMetadata,
+    batch: usize,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+) !CT {
+    if (!sink_metadata.hasMetadata() and attention.mode == .dense_causal and
+        attention.sliding_window == 0 and attention.attn_or_mask == null)
+    {
+        const gqa_started_at = monotonicNowNs();
+        const result = try cb.gqaCausalAttention(Q, K, V, null, batch, attention.query_sequence_len, num_heads, num_kv_heads, head_dim);
+        debug_timing_stats.attention_gqa_nanos += @intCast(monotonicNowNs() - gqa_started_at);
+        return result;
+    }
+    if (try cb.runAttention(&.{
+        .q = Q,
+        .k = K,
+        .v = V,
+        .attention = attention,
+        .attention_sink = sink_metadata,
+        .num_heads = num_heads,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    })) |result| return result;
+
+    if (sink_metadata.hasMetadata()) {
+        if (sink_metadata.per_head_tensor) |sink| {
+            if (attention.mode == .dense_causal and attention.kv_batch == null and
+                attention.kv_cache == null and attention.kv_manager == null and
+                attention.kv_storage == null and attention.query_sequence_len == attention.kv_sequence_len and
+                attention.kv_position_offset == 0)
+            {
+                return deepSeekV4SinkAwareAttentionFallback(
+                    cb,
+                    Q,
+                    K,
+                    V,
+                    sink,
+                    batch,
+                    attention.query_sequence_len,
+                    attention.kv_sequence_len,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    attention.sliding_window,
+                );
+            }
+        }
+        if ((cb.kind() == .native or cb.kind() == .metal) and
+            (attention.kv_batch != null or attention.kv_cache != null or
+                attention.kv_manager != null or attention.kv_storage != null))
+        {
+            const gqa_started_at = monotonicNowNs();
+            const result = try cb.gqaPagedAttention(Q, K, V, null, attention, batch, num_heads, num_kv_heads, head_dim);
+            debug_timing_stats.attention_gqa_nanos += @intCast(monotonicNowNs() - gqa_started_at);
+            return result;
+        }
+        return error.AttentionSinkBackendFeatureRequired;
+    }
+    const gqa_started_at = monotonicNowNs();
+    const result = try cb.gqaPagedAttention(Q, K, V, null, attention, batch, num_heads, num_kv_heads, head_dim);
+    debug_timing_stats.attention_gqa_nanos += @intCast(monotonicNowNs() - gqa_started_at);
+    return result;
+}
+
 fn applyAttentionWithSink(
     cb: *const ComputeBackend,
     config: Config,
@@ -7548,6 +8191,73 @@ fn applyAttentionWithSink(
     const is_mixed = if (decode_context) |dc| dc.isMixedBatch() else false;
 
     if (config.position_encoding == .rope) {
+        if (config.isQwen3Vl()) {
+            if (!config.hasQwen3VlArchitectureContract()) return error.InvalidQwen3VlArchitectureContract;
+            if (is_mixed) return error.Qwen3VlMixedBatchMropeUnsupported;
+            const dc = decode_context orelse return error.Qwen3VlMropePositionsRequired;
+            const token_count = std.math.mul(usize, batch, attention.query_sequence_len) catch
+                return error.InvalidQwen3VlMropeShape;
+            if (dc.mrope_positions == null) {
+                if (!dc.qwen3vl_text_only) return error.Qwen3VlMropePositionsRequired;
+                const offset = positionOffset(seq_len, attention.query_sequence_len, decode_context);
+                const Q_rope = try cb.rope(Q, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, offset, false);
+                defer cb.free(Q_rope);
+                const K_rope = try cb.rope(K, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, offset, false);
+                defer cb.free(K_rope);
+                return runPreparedAttentionWithSinkMetadata(
+                    cb,
+                    Q_rope,
+                    K_rope,
+                    V,
+                    attention,
+                    sink_metadata,
+                    batch,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                );
+            }
+            const positions = dc.mrope_positions.?;
+            const expected_position_count = std.math.mul(usize, token_count, 3) catch
+                return error.InvalidQwen3VlMropeShape;
+            if (positions.len != expected_position_count) return error.InvalidQwen3VlMropeShape;
+            const rope_started_at = monotonicNowNs();
+            const Q_rope = (try cb.mrope(
+                Q,
+                token_count,
+                head_dim,
+                rope_theta,
+                config.rope_freq_scale,
+                positions,
+                config.mrope_section,
+            )) orelse return error.Qwen3VlMropeBackendRequired;
+            defer cb.free(Q_rope);
+            const K_rope = (try cb.mrope(
+                K,
+                token_count,
+                head_dim,
+                rope_theta,
+                config.rope_freq_scale,
+                positions,
+                config.mrope_section,
+            )) orelse return error.Qwen3VlMropeBackendRequired;
+            defer cb.free(K_rope);
+            debug_timing_stats.attention_rope_nanos += @intCast(monotonicNowNs() - rope_started_at);
+            try maybeDebugLayerTensorLastRow(cb, std.heap.page_allocator, layer, "q_mrope", Q_rope, num_heads * head_dim);
+            try maybeDebugLayerTensorLastRow(cb, std.heap.page_allocator, layer, "k_mrope", K_rope, num_kv_heads * head_dim);
+            return runPreparedAttentionWithSinkMetadata(
+                cb,
+                Q_rope,
+                K_rope,
+                V,
+                attention,
+                sink_metadata,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+        }
         if (is_mixed) {
             // Apply RoPE per-item with per-item position offsets, then reassemble.
             const dc = decode_context.?;
@@ -7810,6 +8520,10 @@ pub fn applyAttentionResidual(
     post_linear_rms_norm_slot: ?usize,
     decode_context: ?*const DecodeContext,
 ) !?CT {
+    // The fused residual path currently accepts only scalar 1-D RoPE
+    // positions. Qwen3-VL must route through applyAttentionWithSink so both Q
+    // and K consume the explicit three-axis position tensor.
+    if (config.isQwen3Vl()) return null;
     var attention = attentionContext(seq_len, decode_context);
     attention.layer_index = kv_layer_index;
     attention.skip_kv_write = skip_kv_write;
@@ -8147,7 +8861,7 @@ fn feedForward(
             defer cb.free(down_w);
             return cb.linearNoBias(normed_gated, down_w, total, inter_size, hidden_size);
         },
-        .llama, .mistral, .qwen2, .qwen3, .qwen3_5, .gemma => {
+        .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .qwen3_5, .gemma => {
             // Gated FFN: gate = silu(x @ gate_w), up = x @ up_w, out = (gate * up) @ down_w
             const gate_w = try getFFNWeight(cb, config, layer, "gate", name_buf);
             defer cb.free(gate_w);
@@ -9323,7 +10037,7 @@ fn applyNormAt(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: 
     const is_attn = std.mem.eql(u8, which, "attn");
 
     switch (config.family) {
-        .llama, .mistral, .qwen2, .qwen3, .qwen3_5, .gemma, .bitnet => {
+        .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .qwen3_5, .gemma, .bitnet => {
             const suffix = if (is_attn) "input_layernorm.weight" else "post_attention_layernorm.weight";
             const name = std.fmt.bufPrint(buf, "model.layers.{d}.{s}", .{ layer, suffix }) catch return error.NameTooLong;
             const base_w = try getModelWeight(cb, config, name);
@@ -9407,7 +10121,7 @@ pub fn applyFinalNorm(cb: *const ComputeBackend, allocator: std.mem.Allocator, c
             defer if (w != base_w) cb.free(w);
             return cb.rmsNorm(headed, w, dim, config.norm_eps);
         },
-        .llama, .mistral, .qwen2, .qwen3, .qwen3_5, .gemma, .bitnet => {
+        .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .qwen3_5, .gemma, .bitnet => {
             const base_w = try getModelWeight(cb, config, "model.norm.weight");
             defer cb.free(base_w);
             const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, dim);
@@ -9827,7 +10541,7 @@ fn attnProject(
             defer cb.free(b);
             return cb.linear(input, w, b, total, in_dim, out_dim);
         },
-        .qwen3, .qwen3_5 => {
+        .qwen3, .qwen3_vl, .qwen3_5 => {
             // Qwen3 dropped the q/k/v_proj biases that Qwen2 had. QK-norm is
             // applied separately in maybeApplyQKHeadNorm before RoPE.
             const name = std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.{s}_proj.weight", .{ layer, proj }) catch return error.NameTooLong;
@@ -10001,7 +10715,7 @@ fn attnOutputProject(
     buf: *[256]u8,
 ) !CT {
     switch (config.family) {
-        .llama, .mistral, .qwen2, .qwen3, .qwen3_5, .gemma, .bitnet => {
+        .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .qwen3_5, .gemma, .bitnet => {
             const name = std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.o_proj.weight", .{layer}) catch return error.NameTooLong;
             const w = try getModelWeight(cb, config, name);
             defer cb.free(w);
@@ -10090,7 +10804,7 @@ test "model weight fallback strips model prefix for bare Jina/Qwen backbones" {
 
 pub fn getFFNWeight(cb: *const ComputeBackend, config: Config, layer: usize, proj: []const u8, buf: *[256]u8) !CT {
     switch (config.family) {
-        .llama, .mistral, .qwen2, .qwen3, .qwen3_5, .gemma, .bitnet => {
+        .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .qwen3_5, .gemma, .bitnet => {
             const name = std.fmt.bufPrint(buf, "model.layers.{d}.mlp.{s}_proj.weight", .{ layer, proj }) catch return error.NameTooLong;
             return getModelWeight(cb, config, name);
         },
@@ -10817,6 +11531,103 @@ test "Gemma 4 router independently RMS-normalizes and hidden-scales its source" 
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), actual[3], 1e-6);
 }
 
+test "Qwen3-VL attention requires and consumes explicit M-RoPE positions" {
+    const allocator = std.testing.allocator;
+    var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(allocator, &store);
+    var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
+    defer compute.weight_reservations.deinit(allocator);
+    var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
+
+    const q = try cb.fromFloat32Shape(&.{ 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0 }, &.{ 2, 6 });
+    defer cb.free(q);
+    const k = try cb.fromFloat32Shape(&.{ 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0 }, &.{ 2, 6 });
+    defer cb.free(k);
+    const v = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 6, 5, 4, 3, 2, 1 }, &.{ 2, 6 });
+    defer cb.free(v);
+
+    var config: Config = .{
+        .family = .qwen3_vl,
+        .hidden_size = 6,
+        .num_attention_heads = 1,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 6,
+        .position_encoding = .rope,
+        .image_token_index = 100,
+        .video_token_index = 101,
+        .boi_token_index = 102,
+        .eoi_token_index = 103,
+        .vision_patch_size = 16,
+        .vision_temporal_patch_size = 2,
+        .vision_spatial_merge_size = 2,
+        .vision_hidden_size = 4,
+        .vision_out_hidden_size = 6,
+        .vision_num_hidden_layers = 1,
+        .vision_num_attention_heads = 1,
+        .vision_intermediate_size = 8,
+        .vision_num_position_embeddings = 4,
+        .vision_deepstack_visual_indexes_len = 1,
+        .mrope_interleaved = true,
+        .mrope_section = .{ 1, 1, 1 },
+    };
+    config.vision_deepstack_visual_indexes[0] = 0;
+    const positions = [_]u32{ 0, 4, 0, 7, 0, 9 };
+    const dc: DecodeContext = .{
+        .total_sequence_len = 2,
+        .query_sequence_len = 2,
+        .kv_sequence_len = 2,
+        .mrope_positions = &positions,
+    };
+
+    const output = try applyAttention(&cb, config, q, k, v, 1, 2, 1, 1, 6, 0, 0, false, &dc);
+    defer cb.free(output);
+    const values = try cb.toFloat32(output, allocator);
+    defer allocator.free(values);
+    try std.testing.expectEqual(@as(usize, 12), values.len);
+    for (values) |value| try std.testing.expect(std.math.isFinite(value));
+
+    var missing_positions = dc;
+    missing_positions.mrope_positions = null;
+    try std.testing.expectError(
+        error.Qwen3VlMropePositionsRequired,
+        applyAttention(&cb, config, q, k, v, 1, 2, 1, 1, 6, 0, 0, false, &missing_positions),
+    );
+}
+
+test "Qwen3-VL DeepStack adds features only to visual rows" {
+    const allocator = std.testing.allocator;
+    var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(allocator, &store);
+    var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
+    defer compute.weight_reservations.deinit(allocator);
+    var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
+    const hidden = try cb.fromFloat32Shape(&.{ 1, 2, 10, 20, 100, 200 }, &.{ 3, 2 });
+    defer cb.free(hidden);
+    var config: Config = .{
+        .family = .qwen3_vl,
+        .hidden_size = 2,
+        .vision_deepstack_visual_indexes_len = 1,
+    };
+    config.vision_deepstack_visual_indexes[0] = 5;
+    const dc: DecodeContext = .{
+        .total_sequence_len = 3,
+        .query_sequence_len = 3,
+        .kv_sequence_len = 3,
+        .qwen3vl_visual_mask = &.{ false, true, false },
+        .qwen3vl_deepstack_embeddings = &.{ 0.5, -1.0 },
+        .qwen3vl_deepstack_layer_count = 1,
+    };
+    const result = (try applyQwen3VlDeepstack(&cb, allocator, config, hidden, 3, 0, &dc)) orelse return error.UnexpectedNull;
+    defer cb.free(result);
+    const values = try cb.toFloat32(result, allocator);
+    defer allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 10.5, 19, 100, 200 }, values);
+
+    var bad = dc;
+    bad.qwen3vl_visual_mask = &.{ true, true };
+    try std.testing.expectError(error.InvalidDeepstackContext, applyQwen3VlDeepstack(&cb, allocator, config, hidden, 3, 0, &bad));
+}
+
 test "selectTopExperts picks correct top-k from 8 experts" {
     const allocator = std.testing.allocator;
     const logits = [_]f32{ 1.0, 3.0, 0.5, 2.0, 4.0, 0.1, 0.2, 1.5 };
@@ -10858,10 +11669,76 @@ test "selectTopExperts handles 128 experts with top_k=8" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-5);
 }
 
+test "Qwen3-VL reranker selects only right-padded final active rows" {
+    const mask = [_]i64{
+        1, 1, 1, 0,
+        1, 1, 0, 0,
+    };
+    const rows = try activeFinalRowIndices(
+        std.testing.allocator,
+        &mask,
+        2,
+        4,
+    );
+    defer std.testing.allocator.free(rows);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 5 }, rows);
+
+    const positions = try qwen3VlTextMropePositions(
+        std.testing.allocator,
+        &mask,
+        2,
+        4,
+    );
+    defer std.testing.allocator.free(positions);
+    const expected_axis = [_]u32{ 0, 1, 2, 0, 0, 1, 0, 0 };
+    try std.testing.expectEqualSlices(u32, &expected_axis, positions[0..8]);
+    try std.testing.expectEqualSlices(u32, &expected_axis, positions[8..16]);
+    try std.testing.expectEqualSlices(u32, &expected_axis, positions[16..24]);
+
+    try std.testing.expectError(
+        error.InvalidRerankerAttentionMask,
+        activeFinalRowIndices(std.testing.allocator, &.{ 0, 1 }, 1, 2),
+    );
+    try std.testing.expectError(
+        error.InvalidRerankerAttentionMask,
+        qwen3VlTextMropePositions(std.testing.allocator, &.{ 0, 1 }, 1, 2),
+    );
+    try std.testing.expectError(
+        error.InvalidRerankerAttentionMask,
+        activeFinalRowIndices(std.testing.allocator, &.{ 0, 0 }, 1, 2),
+    );
+}
+
+test "Qwen3-VL reranker prefers converted two-row classifier head" {
+    const allocator = std.testing.allocator;
+    var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(allocator, &store);
+    var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
+    defer compute.weight_reservations.deinit(allocator);
+    var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
+
+    try putDeepSeekV4TestWeight(
+        allocator,
+        &store,
+        "cls.output.weight",
+        &.{ 2, 3 },
+        &.{ 4.0, 6.0, 8.0, 1.0, 2.0, 3.0 },
+    );
+    const difference = try qwen3VlRerankerDifferenceWeight(
+        &cb,
+        allocator,
+        .{ .family = .qwen3_vl, .hidden_size = 3 },
+    );
+    defer cb.free(difference);
+    const actual = try cb.toFloat32(difference, allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 3.0, 4.0, 5.0 }, actual);
+}
+
 pub fn getEmbeddingWeight(cb: *const ComputeBackend, config: Config) !CT {
     return switch (config.family) {
         .gpt2 => cb.getWeight("wte.weight"),
-        .llama, .mistral, .qwen2, .qwen3, .qwen3_5, .gemma, .bitnet, .phi => getModelWeight(cb, config, "model.embed_tokens.weight"),
+        .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .qwen3_5, .gemma, .bitnet, .phi => getModelWeight(cb, config, "model.embed_tokens.weight"),
         else => getModelWeight(cb, config, "model.embed_tokens.weight") catch try cb.getWeight("wte.weight"),
     };
 }

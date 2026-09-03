@@ -124,7 +124,7 @@ const Geometry = struct {
     }
 };
 
-const LoadedF32 = struct {
+pub const LoadedF32 = struct {
     store: *tensor_store_mod.GgufStore,
     name: []const u8,
     weight: weight_source_mod.LoadedWeight,
@@ -132,7 +132,7 @@ const LoadedF32 = struct {
     data: []const f32,
     shape: []const i64,
 
-    fn deinit(self: *LoadedF32) void {
+    pub fn deinit(self: *LoadedF32) void {
         if (self.converted) |*converted| converted.deinit();
         self.weight.deinit();
         self.store.discardTensorFileCache(self.name);
@@ -2119,7 +2119,7 @@ fn applyOptionalStandardization(
     }
 }
 
-fn loadWeightCt(
+pub fn loadWeightCt(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     store: *tensor_store_mod.GgufStore,
@@ -2216,7 +2216,7 @@ fn clampValue(values: []const f32, row: usize, col: usize, dim: usize) f32 {
     return values[row * dim + col];
 }
 
-fn loadLinearWeightCt(
+pub fn loadLinearWeightCt(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     store: *tensor_store_mod.GgufStore,
@@ -2249,7 +2249,7 @@ fn loadOptionalTensorF32(store: *tensor_store_mod.GgufStore, name: []const u8) !
     };
 }
 
-fn loadTensorF32(store: *tensor_store_mod.GgufStore, name: []const u8) !LoadedF32 {
+pub fn loadTensorF32(store: *tensor_store_mod.GgufStore, name: []const u8) !LoadedF32 {
     var tensor_ref = try store.tensorStore().describeTensor(store.allocator, name);
     defer tensor_ref.deinit(store.allocator);
     var loaded = try store.tensorStore().loadTensorRef(&tensor_ref);

@@ -29,6 +29,10 @@ const managed_receipt = @import("../registry/managed_receipt.zig");
 const build_options = @import("build_options");
 const jinja = @import("jinja");
 
+pub const qwen3_vl_gguf_bundle_family = "qwen3_vl_gguf_bundle/v1";
+pub const qwen3_vl_reranker_gguf_bundle_family = "qwen3_vl_reranker_gguf_bundle/v1";
+pub const qwen3_vl_reranker_safetensors_bundle_family = "qwen3_vl_reranker_safetensors_bundle/v1";
+
 /// Built-in chat template for Gemma 4 models (uses <|turn>/<turn|> tokens).
 /// Applied when tokenizer_config.json has sot_token=<|turn> but no
 /// chat_template, and when GGUF metadata carries the upstream tool template
@@ -114,6 +118,27 @@ pub const PoolingStrategy = enum {
     last,
 };
 
+/// Qwen3-Embedding model-card default retrieval instruction, used for
+/// query-side inputs when the checkpoint ships no sentence-transformers
+/// prompts (matches sentence-transformers' `prompts.query` for the official
+/// repo, so GGUF and safetensors deployments embed queries identically).
+pub const qwen3_embedding_default_query_prefix =
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:";
+
+/// Which decoder-embedder convention the manifest resolved to. Styles drive
+/// the resident Qwen3 embedding path, query/document prefix semantics, and
+/// suppress the generative-arch model-type flip for checkpoints whose
+/// config.json says `Qwen3ForCausalLM` but which serve embeddings.
+pub const EmbeddingStyle = enum {
+    none,
+    /// Jina embeddings v5: "Query: " / "Document: " prefixes.
+    jina_v5,
+    /// Qwen3-Embedding: instruction-wrapped queries
+    /// ("Instruct: {task}\nQuery:{text}"), raw documents, trailing-EOS
+    /// last-token pooling.
+    qwen3_embedding,
+};
+
 pub const Sparse3DOutputLayout = enum {
     batch_seq,
     seq_batch,
@@ -161,6 +186,9 @@ pub const listing_compatibility_sidecars = [_][]const u8{
     "clip_config.json",
     "special_tokens_map.json",
     "1_SpladePooling/config.json",
+    "modules.json",
+    "1_Pooling/config.json",
+    "config_sentence_transformers.json",
 };
 
 /// Resolved model configuration loaded from a model directory.
@@ -213,6 +241,11 @@ pub const ModelManifest = struct {
     pooling: PoolingStrategy = .mean,
     normalize: bool = true,
     embedding_text_prefix: []const u8 = "",
+    /// Prefix applied to query-side inputs (task_type retrieval-query
+    /// requests). Documents use `embedding_text_prefix`. For Qwen3-Embedding
+    /// this holds the full default instruction wrapper up to the text.
+    embedding_query_prefix: []const u8 = "",
+    embedding_style: EmbeddingStyle = .none,
     sparse_3d_output_layout: ?Sparse3DOutputLayout = null,
     native_arch_hint: NativeArchHint = .none,
 
@@ -294,6 +327,7 @@ pub const ModelManifest = struct {
         }
         if (self.chat_template) |t| self.allocator.free(t);
         if (self.embedding_text_prefix.len > 0) self.allocator.free(self.embedding_text_prefix);
+        if (self.embedding_query_prefix.len > 0) self.allocator.free(self.embedding_query_prefix);
         if (self.gliner_model_type.len > 0) self.allocator.free(self.gliner_model_type);
         if (self.config_model_arch.len > 0) self.allocator.free(self.config_model_arch);
         if (self.gliner_default_labels.len > 0) {
@@ -320,6 +354,26 @@ pub const ModelManifest = struct {
         if (self.eos_token.len > 0) self.allocator.free(self.eos_token);
         if (self.unk_token.len > 0) self.allocator.free(self.unk_token);
         if (self.pad_token.len > 0) self.allocator.free(self.pad_token);
+    }
+
+    /// True when this manifest resolves to a decoder-style last-token
+    /// embedder (Qwen3-Embedding, Jina v5) eligible for the resident Qwen3
+    /// embedding path and query/document prefix handling.
+    pub fn isLastTokenDecoderEmbedder(self: *const ModelManifest) bool {
+        if (self.embedding_style != .none) return self.model_type == .embedder;
+        // Legacy heuristic kept for manifests written before embedding_style
+        // existed: Jina v5's last pooling + document prefix pairing.
+        return self.pooling == .last and
+            std.mem.eql(u8, self.embedding_text_prefix, "Document: ");
+    }
+
+    /// Query-side prefix for retrieval-query task types. Qwen3-Embedding
+    /// manifests without sentence-transformers prompts (e.g. bare GGUF
+    /// bundles) fall back to the model card's default retrieval instruction.
+    pub fn queryPrefix(self: *const ModelManifest) []const u8 {
+        if (self.embedding_query_prefix.len > 0) return self.embedding_query_prefix;
+        if (self.embedding_style == .qwen3_embedding) return qwen3_embedding_default_query_prefix;
+        return "";
     }
 
     pub fn hasCapability(self: *const ModelManifest, cap: []const u8) bool {
@@ -353,7 +407,8 @@ pub const ModelManifest = struct {
         return self.isSplitGlinerBundle() or
             std.mem.eql(u8, self.inference_bundle_family, "colqwen2_gguf_bundle/v1") or
             self.isClipclapGgufBundle() or
-            self.isFlorence2GgufBundle();
+            self.isFlorence2GgufBundle() or
+            self.isQwen3VlGgufBundle();
     }
 
     pub fn prefersGenerationEncodingForLateInteraction(self: *const ModelManifest) bool {
@@ -413,6 +468,48 @@ pub const ModelManifest = struct {
         return self.gguf_path == null or
             self.config_path == null or
             self.model_manifest_path == null or
+            self.tokenizer_json_path == null or
+            self.tokenizer_config_path == null or
+            self.preprocessor_config_path == null;
+    }
+
+    pub fn isQwen3VlGgufBundle(self: *const ModelManifest) bool {
+        return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_gguf_bundle_family) or
+            self.isQwen3VlRerankerGgufBundle();
+    }
+
+    pub fn isQwen3VlRerankerGgufBundle(self: *const ModelManifest) bool {
+        return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_reranker_gguf_bundle_family);
+    }
+
+    pub fn isQwen3VlRerankerSafetensorsBundle(self: *const ModelManifest) bool {
+        return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_reranker_safetensors_bundle_family);
+    }
+
+    pub fn isQwen3VlReranker(self: *const ModelManifest) bool {
+        return self.isQwen3VlRerankerGgufBundle() or
+            self.isQwen3VlRerankerSafetensorsBundle() or
+            (self.model_type == .reranker and
+                (std.mem.eql(u8, self.config_model_arch, "qwen3_vl") or
+                    std.mem.eql(u8, self.config_model_arch, "qwen3vl")));
+    }
+
+    pub fn isQwen3VlBundle(self: *const ModelManifest) bool {
+        return self.isQwen3VlGgufBundle() or self.isQwen3VlRerankerSafetensorsBundle();
+    }
+
+    pub fn hasIncompleteQwen3VlGgufBundle(self: *const ModelManifest) bool {
+        if (self.isQwen3VlRerankerSafetensorsBundle()) {
+            return self.safetensors_path == null or
+                self.config_path == null or
+                self.tokenizer_json_path == null or
+                self.tokenizer_config_path == null or
+                self.preprocessor_config_path == null;
+        }
+        if (!self.isQwen3VlGgufBundle()) return false;
+        return self.gguf_path == null or
+            self.gguf_projector_path == null or
+            self.config_path == null or
             self.tokenizer_json_path == null or
             self.tokenizer_config_path == null or
             self.preprocessor_config_path == null;
@@ -837,6 +934,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     }
 
     applyImplicitSparseOutputLayout(&manifest, catalog);
+    try ignoreNonResourceMetadataError(applySentenceTransformersPoolingSidecars(&manifest, allocator, catalog));
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
 
     return manifest;
@@ -920,6 +1018,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     try fillAutoDetectedGgufPaths(&manifest, allocator, &catalog);
 
     applyImplicitSparseOutputLayout(&manifest, &catalog);
+    try ignoreNonResourceMetadataError(applySentenceTransformersPoolingSidecars(&manifest, allocator, &catalog));
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
 
     return manifest;
@@ -954,6 +1053,107 @@ fn applyImplicitSparseOutputLayout(manifest: *ModelManifest, catalog: *const Art
     }
 }
 
+/// Detect sentence-transformers-format decoder embedders from their sidecar
+/// files. Qwen3-Embedding ships `config.json` saying `Qwen3ForCausalLM` —
+/// indistinguishable from the generative chat checkpoint — but its ST
+/// sidecars are unambiguous: `modules.json` declares a Pooling module whose
+/// `1_Pooling/config.json` has `pooling_mode_lasttoken: true`, and
+/// `config_sentence_transformers.json` carries the query/document prompts.
+/// Scoped to the qwen3 decoder family; BERT-family ST repos keep their
+/// existing detection paths untouched.
+fn applySentenceTransformersPoolingSidecars(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    catalog: *const ArtifactCatalog,
+) !void {
+    if (manifest.embedding_style != .none) return;
+    if (!std.mem.eql(u8, manifest.config_model_arch, "qwen3")) return;
+
+    const modules_bytes = (try catalog.readOptional("modules.json")) orelse return;
+    defer allocator.free(modules_bytes);
+    const modules_parsed = std.json.parseFromSlice(std.json.Value, allocator, modules_bytes, .{}) catch return;
+    defer modules_parsed.deinit();
+    if (modules_parsed.value != .array) return;
+
+    var pooling_dir: ?[]const u8 = null;
+    var has_normalize_module = false;
+    for (modules_parsed.value.array.items) |module| {
+        if (module != .object) continue;
+        const type_val = module.object.get("type") orelse continue;
+        if (type_val != .string) continue;
+        if (std.mem.eql(u8, type_val.string, "sentence_transformers.models.Pooling")) {
+            if (module.object.get("path")) |path_val| {
+                if (path_val == .string and path_val.string.len > 0) {
+                    pooling_dir = path_val.string;
+                }
+            }
+        } else if (std.mem.eql(u8, type_val.string, "sentence_transformers.models.Normalize")) {
+            has_normalize_module = true;
+        }
+    }
+    const dir = pooling_dir orelse return;
+
+    var pooling_path_buf: [256]u8 = undefined;
+    const pooling_path = std.fmt.bufPrint(&pooling_path_buf, "{s}/config.json", .{dir}) catch return;
+    const pooling_bytes = (try catalog.readOptional(pooling_path)) orelse return;
+    defer allocator.free(pooling_bytes);
+    const pooling_parsed = std.json.parseFromSlice(std.json.Value, allocator, pooling_bytes, .{}) catch return;
+    defer pooling_parsed.deinit();
+    if (pooling_parsed.value != .object) return;
+    const pooling_obj = pooling_parsed.value.object;
+
+    const pooling: PoolingStrategy = if (poolingModeEnabled(pooling_obj, "pooling_mode_lasttoken"))
+        .last
+    else if (poolingModeEnabled(pooling_obj, "pooling_mode_mean_tokens"))
+        .mean
+    else if (poolingModeEnabled(pooling_obj, "pooling_mode_cls_token"))
+        .cls
+    else if (poolingModeEnabled(pooling_obj, "pooling_mode_max_tokens"))
+        .max
+    else
+        return;
+
+    manifest.model_type = .embedder;
+    manifest.model_type_origin = .config;
+    manifest.pooling = pooling;
+    if (has_normalize_module) manifest.normalize = true;
+    manifest.embedding_style = .qwen3_embedding;
+
+    if (try catalog.readOptional("config_sentence_transformers.json")) |st_bytes| {
+        defer allocator.free(st_bytes);
+        applySentenceTransformersPrompts(manifest, allocator, st_bytes) catch {};
+    }
+}
+
+fn poolingModeEnabled(obj: std.json.ObjectMap, key: []const u8) bool {
+    const value = obj.get(key) orelse return false;
+    return value == .bool and value.bool;
+}
+
+fn applySentenceTransformersPrompts(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    json_bytes: []const u8,
+) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const prompts = parsed.value.object.get("prompts") orelse return;
+    if (prompts != .object) return;
+    if (prompts.object.get("query")) |q| {
+        if (q == .string) {
+            if (manifest.embedding_query_prefix.len > 0) allocator.free(manifest.embedding_query_prefix);
+            manifest.embedding_query_prefix = try allocator.dupe(u8, q.string);
+        }
+    }
+    if (prompts.object.get("document")) |d| {
+        if (d == .string) {
+            if (manifest.embedding_text_prefix.len > 0) allocator.free(manifest.embedding_text_prefix);
+            manifest.embedding_text_prefix = try allocator.dupe(u8, d.string);
+        }
+    }
+}
+
 fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const u8) !void {
     if (inferGlinerModelType(manifest, model_dir_path)) |gliner_type| {
         if (manifest.gliner_model_type.len > 0 and !std.mem.eql(u8, manifest.gliner_model_type, gliner_type)) {
@@ -965,7 +1165,11 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         }
     }
 
-    if (hasRerankPathHint(model_dir_path) and (manifest.model_type == .embedder or manifest.model_type == .classifier)) {
+    if (hasRerankPathHint(model_dir_path) and
+        (manifest.model_type == .embedder or manifest.model_type == .classifier or
+            std.mem.eql(u8, manifest.config_model_arch, "qwen3_vl") or
+            std.mem.eql(u8, manifest.config_model_arch, "qwen3vl")))
+    {
         manifest.model_type = .reranker;
         manifest.model_type_origin = .path;
         return;
@@ -1000,6 +1204,11 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         manifest.model_type_origin = .config;
         return;
     }
+    // A resolved embedding style pins the model as an embedder even when the
+    // backbone arch is generative. Qwen3-Embedding's config.json declares
+    // `Qwen3ForCausalLM`/`qwen3` — without this guard the generative-arch
+    // flip below would reclassify it as a generator.
+    if (manifest.embedding_style != .none) return;
     if (manifest.config_model_arch.len > 0 and gpt.isGenerativeModel(manifest.config_model_arch)) {
         manifest.model_type = .generator;
         manifest.model_type_origin = .config;
@@ -1139,6 +1348,42 @@ fn applyGgufTokenizerMetadata(
                 3 => .last,
                 else => manifest.pooling,
             };
+        }
+        // Decoder-embedder GGUFs advertise their pooling under the model
+        // architecture key (llama.cpp convention: 1=mean, 2=cls, 3=last).
+        // The official Qwen3-Embedding GGUF carries `qwen3.pooling_type = 3`
+        // — the only signal distinguishing it from a generative qwen3
+        // checkpoint, so it also resolves the embedding style here.
+        if (view.getString("general.architecture")) |arch| {
+            if (std.mem.eql(u8, arch, "qwen3")) {
+                var key_buf: [64]u8 = undefined;
+                // Without this the manifest keeps its BERT-era default of 512
+                // and maxTextSequenceLength() silently truncates long
+                // embedding inputs to 512 tokens.
+                const ctx_key = std.fmt.bufPrint(&key_buf, "{s}.context_length", .{arch}) catch unreachable;
+                if (view.getU64(ctx_key)) |context_length| {
+                    if (context_length > 0 and context_length <= std.math.maxInt(u32)) {
+                        manifest.max_position_embeddings = @intCast(context_length);
+                    }
+                }
+                const key = std.fmt.bufPrint(&key_buf, "{s}.pooling_type", .{arch}) catch unreachable;
+                if (view.getU64(key)) |pooling_type| {
+                    manifest.pooling = switch (pooling_type) {
+                        1 => .mean,
+                        2 => .cls,
+                        3 => .last,
+                        else => manifest.pooling,
+                    };
+                    if (pooling_type >= 1 and pooling_type <= 3) {
+                        manifest.model_type = .embedder;
+                        manifest.model_type_origin = .config;
+                        manifest.normalize = true;
+                        if (manifest.embedding_style == .none) {
+                            manifest.embedding_style = .qwen3_embedding;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1699,8 +1944,11 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
         manifest.model_type_origin = .config;
         manifest.pooling = .last;
         manifest.normalize = true;
+        manifest.embedding_style = .jina_v5;
         if (manifest.embedding_text_prefix.len > 0) allocator.free(manifest.embedding_text_prefix);
         manifest.embedding_text_prefix = try allocator.dupe(u8, "Document: ");
+        if (manifest.embedding_query_prefix.len > 0) allocator.free(manifest.embedding_query_prefix);
+        manifest.embedding_query_prefix = try allocator.dupe(u8, "Query: ");
     }
 
     // For CLIP/CLAP/multimodal models, text_config contains the text encoder's
@@ -1769,6 +2017,7 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     if (isJinaV5TextEmbeddingConfig(&obj)) {
         manifest.model_type = .embedder;
         manifest.model_type_origin = .config;
+        manifest.embedding_style = .jina_v5;
     }
 }
 
@@ -1879,6 +2128,42 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
         if (v == .string) manifest.sparse_3d_output_layout = parseSparse3DOutputLayout(v.string);
     } else if (obj.get("sparse_output_layout")) |v| {
         if (v == .string) manifest.sparse_3d_output_layout = parseSparse3DOutputLayout(v.string);
+    }
+
+    // Embedding-pipeline overrides. These are the escape hatch for bare GGUF
+    // bundles (no sentence-transformers sidecars) and operator overrides.
+    if (obj.get("pooling")) |v| {
+        if (v == .string) {
+            inline for (.{ "mean", "cls", "max", "last" }) |name| {
+                if (std.mem.eql(u8, v.string, name)) {
+                    manifest.pooling = @field(PoolingStrategy, name);
+                }
+            }
+        }
+    }
+    if (obj.get("normalize")) |v| {
+        if (v == .bool) manifest.normalize = v.bool;
+    }
+    if (obj.get("query_prefix")) |v| {
+        if (v == .string) {
+            if (manifest.embedding_query_prefix.len > 0) allocator.free(manifest.embedding_query_prefix);
+            manifest.embedding_query_prefix = try allocator.dupe(u8, v.string);
+        }
+    }
+    if (obj.get("document_prefix")) |v| {
+        if (v == .string) {
+            if (manifest.embedding_text_prefix.len > 0) allocator.free(manifest.embedding_text_prefix);
+            manifest.embedding_text_prefix = try allocator.dupe(u8, v.string);
+        }
+    }
+    if (obj.get("embedding_style")) |v| {
+        if (v == .string) {
+            inline for (.{ "none", "jina_v5", "qwen3_embedding" }) |name| {
+                if (std.mem.eql(u8, v.string, name)) {
+                    manifest.embedding_style = @field(EmbeddingStyle, name);
+                }
+            }
+        }
     }
 }
 
@@ -2065,6 +2350,76 @@ fn parseInferenceBundleJsonInternal(
                 try resolveBundlePath(allocator, catalog, model_dir_path, model.string),
             );
         }
+        return;
+    }
+    if (std.mem.eql(u8, bundle_family, qwen3_vl_reranker_safetensors_bundle_family)) {
+        const model = obj.get("model") orelse obj.get("safetensors");
+        if (model == null or model.? != .string or model.?.string.len == 0) {
+            if (catalog != null) return;
+            const owned_family = try allocator.dupe(u8, bundle_family);
+            errdefer allocator.free(owned_family);
+            const owned_arch = try allocator.dupe(u8, "qwen3_vl");
+            errdefer allocator.free(owned_arch);
+            try setManifestInputs(allocator, manifest, &.{ "text", "image" });
+            replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
+            replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
+            manifest.model_type = .reranker;
+            manifest.model_type_origin = .bundle;
+            return;
+        }
+        const model_path = try resolveBundlePath(allocator, catalog, model_dir_path, model.?.string);
+        errdefer allocator.free(model_path);
+        const owned_family = try allocator.dupe(u8, bundle_family);
+        errdefer allocator.free(owned_family);
+        const owned_arch = try allocator.dupe(u8, "qwen3_vl");
+        errdefer allocator.free(owned_arch);
+        try setManifestInputs(allocator, manifest, &.{ "text", "image" });
+        replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
+        replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
+        setOptionalPath(allocator, &manifest.safetensors_path, model_path);
+        manifest.model_type = .reranker;
+        manifest.model_type_origin = .bundle;
+        return;
+    }
+    if (std.mem.eql(u8, bundle_family, qwen3_vl_gguf_bundle_family) or
+        std.mem.eql(u8, bundle_family, qwen3_vl_reranker_gguf_bundle_family))
+    {
+        const decoder = obj.get("decoder") orelse obj.get("model");
+        const projector = obj.get("projector") orelse obj.get("mmproj");
+        const is_reranker = std.mem.eql(u8, bundle_family, qwen3_vl_reranker_gguf_bundle_family);
+        if (decoder == null or projector == null or
+            decoder.? != .string or decoder.?.string.len == 0 or
+            projector.? != .string or projector.?.string.len == 0)
+        {
+            if (catalog != null) return;
+            const owned_family = try allocator.dupe(u8, bundle_family);
+            errdefer allocator.free(owned_family);
+            const owned_arch = try allocator.dupe(u8, "qwen3_vl");
+            errdefer allocator.free(owned_arch);
+            try setManifestInputs(allocator, manifest, &.{ "text", "image" });
+            replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
+            replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
+            manifest.model_type = if (is_reranker) .reranker else .generator;
+            manifest.model_type_origin = .bundle;
+            return;
+        }
+
+        const decoder_path = try resolveBundlePath(allocator, catalog, model_dir_path, decoder.?.string);
+        errdefer allocator.free(decoder_path);
+        const projector_path = try resolveBundlePath(allocator, catalog, model_dir_path, projector.?.string);
+        errdefer allocator.free(projector_path);
+        const owned_family = try allocator.dupe(u8, bundle_family);
+        errdefer allocator.free(owned_family);
+        const owned_arch = try allocator.dupe(u8, "qwen3_vl");
+        errdefer allocator.free(owned_arch);
+        try setManifestInputs(allocator, manifest, &.{ "text", "image" });
+
+        replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
+        replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
+        setOptionalPath(allocator, &manifest.gguf_path, decoder_path);
+        setOptionalPath(allocator, &manifest.gguf_projector_path, projector_path);
+        manifest.model_type = if (is_reranker) .reranker else .generator;
+        manifest.model_type_origin = .bundle;
         return;
     }
 
@@ -2591,6 +2946,19 @@ test "rerank model name overrides sequence classifier config" {
     try std.testing.expectEqual(ModelTypeOrigin.path, manifest.model_type_origin);
 }
 
+test "Qwen3-VL reranker path overrides its conditional-generation base role" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+    try parseConfigJson(&manifest, allocator,
+        \\{"architectures":["Qwen3VLForConditionalGeneration"],"model_type":"qwen3_vl"}
+    );
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+    try applyImplicitModelTypeHints(&manifest, "/models/Qwen/Qwen3-VL-Reranker-2B");
+    try std.testing.expectEqual(ModelType.reranker, manifest.model_type);
+    try std.testing.expect(manifest.isQwen3VlReranker());
+}
+
 test "Whisper conditional generation config remains a transcriber" {
     const allocator = std.testing.allocator;
     var manifest = ModelManifest{ .allocator = allocator };
@@ -2795,6 +3163,125 @@ test "manifest treats merged jina qwen3 task repo as embedder" {
     try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
     try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
     try std.testing.expectEqualStrings("Document: ", manifest.embedding_text_prefix);
+}
+
+test "loadFromDir detects qwen3-embedding sentence-transformers sidecars" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "model/1_Pooling");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/config.json",
+        .data =
+        \\{
+        \\  "architectures": ["Qwen3ForCausalLM"],
+        \\  "model_type": "qwen3",
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 28,
+        \\  "num_attention_heads": 16,
+        \\  "max_position_embeddings": 32768,
+        \\  "tie_word_embeddings": true
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/modules.json",
+        .data =
+        \\[
+        \\  {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+        \\  {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+        \\  {"idx": 2, "name": "2", "path": "2_Normalize", "type": "sentence_transformers.models.Normalize"}
+        \\]
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/1_Pooling/config.json",
+        .data =
+        \\{"word_embedding_dimension": 1024, "pooling_mode_cls_token": false,
+        \\ "pooling_mode_mean_tokens": false, "pooling_mode_lasttoken": true,
+        \\ "include_prompt": true}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/config_sentence_transformers.json",
+        .data =
+        \\{"prompts": {"query": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:", "document": ""},
+        \\ "default_prompt_name": null, "similarity_fn_name": "cosine"}
+        ,
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(dir_path);
+
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
+    try std.testing.expectEqual(EmbeddingStyle.qwen3_embedding, manifest.embedding_style);
+    try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
+    try std.testing.expect(manifest.normalize);
+    try std.testing.expectEqualStrings("", manifest.embedding_text_prefix);
+    try std.testing.expectEqualStrings(
+        "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:",
+        manifest.embedding_query_prefix,
+    );
+    try std.testing.expect(manifest.isLastTokenDecoderEmbedder());
+    try std.testing.expectEqual(@as(u32, 32768), manifest.max_position_embeddings);
+}
+
+test "bare qwen3 config without sidecars stays generative" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/config.json",
+        .data =
+        \\{"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", "hidden_size": 1024}
+        ,
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(dir_path);
+
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+    try std.testing.expectEqual(EmbeddingStyle.none, manifest.embedding_style);
+    try std.testing.expect(!manifest.isLastTokenDecoderEmbedder());
+}
+
+test "model_manifest.json embedding overrides configure a gguf qwen3 embedder" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    const manifest_json =
+        \\{
+        \\  "type": "embedder",
+        \\  "pooling": "last",
+        \\  "normalize": true,
+        \\  "document_prefix": "",
+        \\  "embedding_style": "qwen3_embedding"
+        \\}
+    ;
+    try parseModelManifestJson(&manifest, allocator, manifest_json);
+
+    try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
+    try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
+    try std.testing.expectEqual(EmbeddingStyle.qwen3_embedding, manifest.embedding_style);
+    try std.testing.expect(manifest.isLastTokenDecoderEmbedder());
+    // No explicit query prefix: falls back to the model-card default
+    // instruction so GGUF bundles match sentence-transformers queries.
+    try std.testing.expectEqualStrings(
+        qwen3_embedding_default_query_prefix,
+        manifest.queryPrefix(),
+    );
 }
 
 test "load sparse fixture preserves max position embeddings" {
@@ -3021,6 +3508,64 @@ test "manifest parses florence2 gguf bundle marker" {
     try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_path.?, "/florence2-q4_k/florence-2-base.Q4_K.gguf"));
     try std.testing.expect(manifest.hasInput("text"));
     try std.testing.expect(manifest.hasInput("image"));
+}
+
+test "manifest parses fail-closed Qwen3-VL decoder projector bundles" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "qwen3-vl");
+    try tmp.dir.writeFile(io, .{ .sub_path = "qwen3-vl/decoder.gguf", .data = "decoder" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "qwen3-vl/mmproj-Q8_0.gguf", .data = "projector" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "qwen3-vl/model.safetensors", .data = "weights" });
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "qwen3-vl" });
+    defer allocator.free(model_dir);
+
+    var generation = ModelManifest{ .allocator = allocator };
+    defer generation.deinit();
+    try parseInferenceBundleJson(&generation, allocator, model_dir,
+        \\{"family":"qwen3_vl_gguf_bundle/v1","decoder":"decoder.gguf","projector":"mmproj-Q8_0.gguf"}
+    );
+    try std.testing.expect(generation.isQwen3VlGgufBundle());
+    try std.testing.expect(!generation.isQwen3VlRerankerGgufBundle());
+    try std.testing.expectEqual(ModelType.generator, generation.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.bundle, generation.model_type_origin);
+    try std.testing.expectEqualStrings("qwen3_vl", generation.config_model_arch);
+    try std.testing.expect(generation.hasInput("text"));
+    try std.testing.expect(generation.hasInput("image"));
+    try std.testing.expect(generation.gguf_path != null);
+    try std.testing.expect(generation.gguf_projector_path != null);
+    try std.testing.expect(generation.hasIncompleteQwen3VlGgufBundle());
+    try std.testing.expectEqual(NativeWeightArtifactKind.gguf, generation.nativeWeightArtifactKind().?);
+
+    generation.config_path = try allocator.dupe(u8, "config.json");
+    generation.tokenizer_json_path = try allocator.dupe(u8, "tokenizer.json");
+    generation.tokenizer_config_path = try allocator.dupe(u8, "tokenizer_config.json");
+    generation.preprocessor_config_path = try allocator.dupe(u8, "preprocessor_config.json");
+    try std.testing.expect(!generation.hasIncompleteQwen3VlGgufBundle());
+
+    var reranker = ModelManifest{ .allocator = allocator };
+    defer reranker.deinit();
+    try parseInferenceBundleJson(&reranker, allocator, model_dir,
+        \\{"family":"qwen3_vl_reranker_gguf_bundle/v1","model":"decoder.gguf","mmproj":"mmproj-Q8_0.gguf"}
+    );
+    try std.testing.expect(reranker.isQwen3VlGgufBundle());
+    try std.testing.expect(reranker.isQwen3VlRerankerGgufBundle());
+    try std.testing.expect(reranker.isQwen3VlReranker());
+    try std.testing.expectEqual(ModelType.reranker, reranker.model_type);
+
+    var safetensors_reranker = ModelManifest{ .allocator = allocator };
+    defer safetensors_reranker.deinit();
+    try parseInferenceBundleJson(&safetensors_reranker, allocator, model_dir,
+        \\{"family":"qwen3_vl_reranker_safetensors_bundle/v1","model":"model.safetensors"}
+    );
+    try std.testing.expect(safetensors_reranker.isQwen3VlRerankerSafetensorsBundle());
+    try std.testing.expect(safetensors_reranker.isQwen3VlReranker());
+    try std.testing.expect(safetensors_reranker.isQwen3VlBundle());
+    try std.testing.expectEqual(ModelType.reranker, safetensors_reranker.model_type);
+    try std.testing.expectEqual(NativeWeightArtifactKind.safetensors, safetensors_reranker.nativeWeightArtifactKind().?);
+    try std.testing.expect(safetensors_reranker.hasIncompleteQwen3VlGgufBundle());
 }
 
 test "manifest discovers clip onnx variants and prefers f16 over i8" {
@@ -4308,6 +4853,32 @@ test "manifest applies BERT and T5 tokenizer metadata from GGUF" {
     try std.testing.expectEqual(bert.ModelType.roberta, manifest.bert_model_type);
 }
 
+test "qwen3 embedding GGUF metadata configures last pooling and full context" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gguf_bytes = try buildTestGgufWithQwen3Embedding(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "qwen3-embedding-q8_0.gguf", .data = gguf_bytes });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
+    try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
+    try std.testing.expectEqual(EmbeddingStyle.qwen3_embedding, manifest.embedding_style);
+    try std.testing.expect(manifest.normalize);
+    // qwen3.context_length must reach maxTextSequenceLength(); the BERT-era
+    // 512 default would silently truncate long embedding inputs.
+    try std.testing.expectEqual(@as(u32, 32768), manifest.max_position_embeddings);
+    try std.testing.expectEqual(@as(usize, 32768), manifest.maxTextSequenceLength());
+}
+
 test "colocated GGUF does not overwrite selected safetensors BERT config" {
     const allocator = std.testing.allocator;
 
@@ -4422,6 +4993,32 @@ fn buildTestGgufWithBertT5Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 2);
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.padding_token_id", 1);
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.unknown_token_id", 3);
+
+    return data.toOwnedSlice(allocator);
+}
+
+fn buildTestGgufWithQwen3Embedding(allocator: std.mem.Allocator) ![]u8 {
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, gguf_format.magic);
+    try appendTestLe(u32, allocator, &data, 3);
+    try appendTestLe(u64, allocator, &data, 0);
+    try appendTestLe(u64, allocator, &data, 9);
+
+    try appendTestMetadataString(allocator, &data, "general.architecture", "qwen3");
+    try appendTestMetadataU32(allocator, &data, "qwen3.context_length", 32768);
+    try appendTestMetadataU32(allocator, &data, "qwen3.pooling_type", 3);
+    try appendTestMetadataString(allocator, &data, "tokenizer.ggml.model", "gpt2");
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.tokens", &.{
+        "<|endoftext|>",
+        "hello",
+        "world",
+    });
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.merges", &.{});
+    try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 1, 1 });
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 0);
+    try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_eos_token", true);
 
     return data.toOwnedSlice(allocator);
 }

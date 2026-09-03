@@ -105,12 +105,16 @@ pub fn preprocessDecodedRectScaledWithResample(
     rescale_factor: f32,
     resample: Resample,
 ) ![]f32 {
-    const expected_min = @as(usize, img.width) * @as(usize, img.height) * img.channels();
+    const source_pixels = std.math.mul(usize, img.width, img.height) catch return error.InvalidImageDimensions;
+    const expected_min = std.math.mul(usize, source_pixels, img.channels()) catch return error.InvalidImageDimensions;
     if (img.data.len < expected_min) return error.InvalidImageBuffer;
 
     const tw: usize = target_width;
     const th: usize = target_height;
-    const result = try allocator.alloc(f32, 3 * tw * th);
+    if (tw == 0 or th == 0) return error.InvalidImageDimensions;
+    const target_pixels = std.math.mul(usize, tw, th) catch return error.InvalidImageDimensions;
+    const result_len = std.math.mul(usize, 3, target_pixels) catch return error.InvalidImageDimensions;
+    const result = try allocator.alloc(f32, result_len);
     errdefer allocator.free(result);
 
     if (solidRgb(img)) |rgb| {
@@ -125,6 +129,20 @@ pub fn preprocessDecodedRectScaledWithResample(
 
     if (resample == .bilinear) {
         preprocessDecodedRectBilinearInterleaved(img, result, tw, th, mean, std_dev, rescale_factor, scale_x, scale_y);
+        return result;
+    }
+
+    if (resample == .bicubic) {
+        try preprocessDecodedRectPillowBicubic(
+            allocator,
+            img,
+            result,
+            tw,
+            th,
+            mean,
+            std_dev,
+            rescale_factor,
+        );
         return result;
     }
 
@@ -525,8 +543,145 @@ fn sampleBicubic(
     return std.math.clamp(accum, 0.0, 255.0);
 }
 
+const BicubicAxis = struct {
+    allocator: std.mem.Allocator,
+    starts: []usize,
+    offsets: []usize,
+    weights: []i32,
+
+    fn deinit(self: *@This()) void {
+        self.allocator.free(self.starts);
+        self.allocator.free(self.offsets);
+        self.allocator.free(self.weights);
+    }
+};
+
+/// Build Pillow-compatible antialiased bicubic coefficients. Downsampling
+/// widens the cubic support by the reduction factor and renormalizes the
+/// surviving in-bounds taps instead of clamping out-of-bounds samples.
+fn buildPillowBicubicAxis(
+    allocator: std.mem.Allocator,
+    source_size: usize,
+    target_size: usize,
+) !BicubicAxis {
+    if (source_size == 0 or target_size == 0) return error.InvalidImageDimensions;
+    const starts = try allocator.alloc(usize, target_size);
+    errdefer allocator.free(starts);
+    const offsets = try allocator.alloc(usize, target_size + 1);
+    errdefer allocator.free(offsets);
+    var float_weights = std.ArrayListUnmanaged(f64).empty;
+    defer float_weights.deinit(allocator);
+    var weights = std.ArrayListUnmanaged(i32).empty;
+    errdefer weights.deinit(allocator);
+
+    const scale = @as(f64, @floatFromInt(source_size)) / @as(f64, @floatFromInt(target_size));
+    const filter_scale = @max(scale, 1.0);
+    const support = 2.0 * filter_scale;
+    for (0..target_size) |target| {
+        const center = (@as(f64, @floatFromInt(target)) + 0.5) * scale;
+        var first: isize = @intFromFloat(center - support + 0.5);
+        var last: isize = @intFromFloat(center + support + 0.5);
+        first = @max(first, 0);
+        last = @min(last, @as(isize, @intCast(source_size)));
+        if (last <= first) return error.InvalidImageDimensions;
+        starts[target] = @intCast(first);
+        offsets[target] = weights.items.len;
+        const float_start = float_weights.items.len;
+        var total: f64 = 0.0;
+        var source = first;
+        while (source < last) : (source += 1) {
+            const distance = (@as(f64, @floatFromInt(source)) - center + 0.5) / filter_scale;
+            const weight = cubicWeightF64(distance);
+            try float_weights.append(allocator, weight);
+            total += weight;
+        }
+        if (total == 0.0 or !std.math.isFinite(total)) return error.InvalidImageDimensions;
+        for (float_weights.items[float_start..]) |weight| {
+            const normalized = weight / total;
+            const scaled = normalized * @as(f64, 1 << pillow_precision_bits);
+            const rounded = if (scaled < 0.0) scaled - 0.5 else scaled + 0.5;
+            try weights.append(allocator, @intFromFloat(rounded));
+        }
+    }
+    offsets[target_size] = weights.items.len;
+    return .{
+        .allocator = allocator,
+        .starts = starts,
+        .offsets = offsets,
+        .weights = try weights.toOwnedSlice(allocator),
+    };
+}
+
+const pillow_precision_bits = 22;
+
+fn clipPillowAccumulator(value: i64) u8 {
+    return @intCast(std.math.clamp(value >> pillow_precision_bits, 0, 255));
+}
+
+/// Pillow resizes 8-bit images in two passes, materializing an 8-bit
+/// horizontal intermediate before the vertical pass. Preserving that
+/// quantization boundary is required for Transformers pixel parity.
+fn preprocessDecodedRectPillowBicubic(
+    allocator: std.mem.Allocator,
+    img: ImageU8,
+    result: []f32,
+    target_width: usize,
+    target_height: usize,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    rescale_factor: f32,
+) !void {
+    var horizontal_axis = try buildPillowBicubicAxis(allocator, img.width, target_width);
+    defer horizontal_axis.deinit();
+    var vertical_axis = try buildPillowBicubicAxis(allocator, img.height, target_height);
+    defer vertical_axis.deinit();
+
+    const horizontal_pixels = std.math.mul(usize, target_width, img.height) catch
+        return error.InvalidImageDimensions;
+    const horizontal_len = std.math.mul(usize, horizontal_pixels, 3) catch
+        return error.InvalidImageDimensions;
+    const horizontal = try allocator.alloc(u8, horizontal_len);
+    defer allocator.free(horizontal);
+    for (0..img.height) |source_y| {
+        for (0..target_width) |target_x| {
+            const start = horizontal_axis.starts[target_x];
+            const begin = horizontal_axis.offsets[target_x];
+            const end = horizontal_axis.offsets[target_x + 1];
+            for (0..3) |channel| {
+                var value: i64 = 1 << (pillow_precision_bits - 1);
+                for (horizontal_axis.weights[begin..end], 0..) |weight, offset| {
+                    value += @as(i64, @intFromFloat(pixelAt(img, @intCast(start + offset), @intCast(source_y), channel))) * weight;
+                }
+                horizontal[(source_y * target_width + target_x) * 3 + channel] = clipPillowAccumulator(value);
+            }
+        }
+    }
+
+    for (0..target_height) |target_y| {
+        const start = vertical_axis.starts[target_y];
+        const begin = vertical_axis.offsets[target_y];
+        const end = vertical_axis.offsets[target_y + 1];
+        for (0..target_width) |target_x| {
+            for (0..3) |channel| {
+                var value: i64 = 1 << (pillow_precision_bits - 1);
+                for (vertical_axis.weights[begin..end], 0..) |weight, offset| {
+                    const source_y = start + offset;
+                    value += @as(i64, horizontal[(source_y * target_width + target_x) * 3 + channel]) * weight;
+                }
+                const sample: f32 = @floatFromInt(clipPillowAccumulator(value));
+                result[channel * target_height * target_width + target_y * target_width + target_x] =
+                    normalizeSample(sample, mean[channel], std_dev[channel], rescale_factor);
+            }
+        }
+    }
+}
+
 fn cubicWeight(x: f32) f32 {
-    const a: f32 = -0.5;
+    return @floatCast(cubicWeightF64(x));
+}
+
+fn cubicWeightF64(x: f64) f64 {
+    const a: f64 = -0.5;
     const t = @abs(x);
     if (t <= 1.0) {
         return ((a + 2.0) * t - (a + 3.0)) * t * t + 1.0;
@@ -659,4 +814,42 @@ test "preprocess decoded rect scaled applies explicit rescale factor" {
     try std.testing.expectApproxEqAbs(@as(f32, 128.0), out[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 64.0), out[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 32.0), out[2], 1e-6);
+}
+
+test "bicubic downsampling matches Pillow RGB pixels" {
+    const alloc = std.testing.allocator;
+    var rgb: [8 * 6 * 3]u8 = undefined;
+    for (0..6) |y| {
+        for (0..8) |x| {
+            const offset = (y * 8 + x) * 3;
+            rgb[offset] = @intCast((y * 8 + x) * 5);
+            rgb[offset + 1] = @intCast(x * 30);
+            rgb[offset + 2] = @intCast(y * 40);
+        }
+    }
+
+    const out = try preprocessDecodedRectScaledWithResample(
+        alloc,
+        .{
+            .data = &rgb,
+            .width = 8,
+            .height = 6,
+            .format = .rgb8,
+        },
+        3,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        1.0,
+        .bicubic,
+    );
+    defer alloc.free(out);
+
+    // Pillow 12.1.0: Image.fromarray(rgb).resize((3, 2), Image.Resampling.BICUBIC).
+    const expected = [_]f32{
+        49, 62,  76,  159, 172, 186,
+        27, 105, 183, 27,  105, 183,
+        45, 45,  45,  155, 155, 155,
+    };
+    try std.testing.expectEqualSlices(f32, &expected, out);
 }

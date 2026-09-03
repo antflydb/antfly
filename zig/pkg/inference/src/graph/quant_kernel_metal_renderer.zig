@@ -1024,30 +1024,42 @@ fn renderSimdgroupMatrixBody(
     const threads: usize = schedule.threads_per_threadgroup;
     const input_elements = tile_rows * 32;
     const result_elements = tile_rows * 64;
-    const shared_bytes = @max((2048 + input_elements) * @sizeOf(f16), result_elements * @sizeOf(f32));
+    // Q6_K's wider blocks make high-row projections precision-sensitive at
+    // production K dimensions. Apple family 9 supports float simdgroup
+    // operands at effectively the same throughput for this schedule, so keep
+    // Q6_K fully f32 while retaining the established f16 Q4_K matrix path.
+    const f32_operands = decoder.format == .q6_k;
+    const operand_bytes: usize = if (f32_operands) @sizeOf(f32) else @sizeOf(f16);
+    const operand_scalar = if (f32_operands) "float" else "half";
+    const operand_matrix = if (f32_operands) "simdgroup_float8x8" else "simdgroup_half8x8";
+    const operand_zero = if (f32_operands) "0.0f" else "half(0.0f)";
+    const cast_prefix = if (f32_operands) "" else "half(";
+    const cast_suffix = if (f32_operands) "" else ")";
+    const shared_bytes = @max((2048 + input_elements) * operand_bytes, result_elements * @sizeOf(f32));
     try appendFmt(
         allocator,
         out,
         "    const uint tid = thread_pos.x; const uint first_o = group_pos.x * 64u; const uint first_r = group_pos.y * {d}u;\n" ++
             "    if (rows < 2 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return;\n" ++
-            "    threadgroup uchar shared[{d}]; threadgroup half *weight_tile = (threadgroup half *)shared; threadgroup half *input_tile = weight_tile + 2048;\n" ++
-            "    simdgroup_half8x8 mw[8]; simdgroup_half8x8 mx; simdgroup_float8x8 acc[8];\n" ++
+            "    threadgroup uchar shared[{d}]; threadgroup {s} *weight_tile = (threadgroup {s} *)shared; threadgroup {s} *input_tile = weight_tile + 2048;\n" ++
+            "    {s} mw[8]; {s} mx; simdgroup_float8x8 acc[8];\n" ++
             "    for (uint i = 0u; i < 8u; ++i) acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n" ++
             "    const uint block_count = uint(in_dim) >> 8; const uint sg_row = uint(simdgroup_id) * 8u;\n" ++
             "    for (uint k0 = 0u; k0 < uint(in_dim); k0 += 32u) {{\n" ++
-            "        for (uint index = tid; index < 2048u; index += {d}u) {{ uint k = index >> 6; uint col = index & 63u; uint global_col = first_o + col; uint global_k = k0 + k; half value = half(0.0f); if (global_col < uint(out_dim)) {{ device const uchar *block = ",
-        .{ tile_rows, shared_bytes, threads },
+            "        for (uint index = tid; index < 2048u; index += {d}u) {{ uint k = index >> 6; uint col = index & 63u; uint global_col = first_o + col; uint global_k = k0 + k; {s} value = {s}; if (global_col < uint(out_dim)) {{ device const uchar *block = ",
+        .{ tile_rows, shared_bytes, operand_scalar, operand_scalar, operand_scalar, operand_matrix, operand_matrix, threads, operand_scalar, operand_zero },
     );
     try out.appendSlice(allocator, decoder.weight_param);
     try out.appendSlice(allocator, " + (global_col * block_count + (global_k >> 8)) * ");
     try appendFmt(allocator, out, "{d}u", .{decoder.format.bytesPerBlock().?});
-    try out.appendSlice(allocator, "; value = half(");
+    try out.appendSlice(allocator, "; value = ");
+    try out.appendSlice(allocator, cast_prefix);
     try out.appendSlice(allocator, decoder.lane_decode_fn);
     try appendFmt(
         allocator,
         out,
-        "(block, int(global_k & 255u))); }} weight_tile[k * 64u + col] = value; }}\n" ++
-            "        for (uint index = tid; index < {d}u; index += {d}u) {{ uint row = index >> 5; uint k = index & 31u; uint global_row = first_r + row; input_tile[row * 32u + k] = global_row < uint(rows) ? half(input[global_row * uint(in_dim) + k0 + k]) : half(0.0f); }}\n" ++
+        "(block, int(global_k & 255u)){s}; }} weight_tile[k * 64u + col] = value; }}\n" ++
+            "        for (uint index = tid; index < {d}u; index += {d}u) {{ uint row = index >> 5; uint k = index & 31u; uint global_row = first_r + row; input_tile[row * 32u + k] = global_row < uint(rows) ? {s}input[global_row * uint(in_dim) + k0 + k]{s} : {s}; }}\n" ++
             "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" ++
             "        for (uint k = 0u; k < 32u; k += 8u) {{ for (uint i = 0u; i < 8u; ++i) simdgroup_load(mw[i], weight_tile + k * 64u + i * 8u, 64u); simdgroup_load(mx, input_tile + sg_row * 32u + k, 32u); for (uint i = 0u; i < 8u; ++i) simdgroup_multiply_accumulate(acc[i], mx, mw[i], acc[i]); }}\n" ++
             "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" ++
@@ -1055,7 +1067,7 @@ fn renderSimdgroupMatrixBody(
             "    threadgroup float *result_tile = (threadgroup float *)shared; for (uint i = 0u; i < 8u; ++i) simdgroup_store(acc[i], result_tile + sg_row * 64u + i * 8u, 64u);\n" ++
             "    threadgroup_barrier(mem_flags::mem_threadgroup);\n" ++
             "    for (uint index = tid; index < {d}u; index += {d}u) {{ uint row = index >> 6; uint col = index & 63u; uint global_row = first_r + row; if (global_row < uint(rows) && first_o + col < uint(out_dim)) output[global_row * uint(out_dim) + first_o + col] = result_tile[index]; }}\n",
-        .{ input_elements, threads, result_elements, threads },
+        .{ cast_suffix, input_elements, threads, cast_prefix, cast_suffix, operand_zero, result_elements, threads },
     );
 }
 
@@ -1369,12 +1381,21 @@ test "metal renderer emits a Q4_K and Q6_K simdgroup matrix tile" {
         }) |case| {
             const source = try renderKernel(allocator, "antfly_quant_matrix", decoder, case[0], .none);
             defer allocator.free(source);
-            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, case[1]));
+            const shared_marker = if (decoder.format == .q6_k and case[0].rows_per_threadgroup == 40)
+                "threadgroup uchar shared[13312]"
+            else
+                case[1];
+            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, shared_marker));
             try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simdgroup_multiply_accumulate"));
             try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "group_pos.x * 64u"));
             try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, case[2]));
             try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "global_row < uint(rows)"));
             try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, decoder.lane_decode_fn));
+            const operand_marker = if (decoder.format == .q6_k)
+                "simdgroup_float8x8 mw[8]; simdgroup_float8x8 mx"
+            else
+                "simdgroup_half8x8 mw[8]; simdgroup_half8x8 mx";
+            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, operand_marker));
         }
     }
 }

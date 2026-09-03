@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const platform = @import("antfly_platform");
 const gemma4_runtime = @import("../architectures/gemma4_runtime.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const contracts = @import("../graph/backend_contracts.zig");
@@ -1427,6 +1428,14 @@ pub fn supportsConfig(gpt_config: gpt_mod.Config) bool {
         // the retained KV. The remaining unsupported cases are the extra
         // decoder-side sublayers that still branch the block structure.
         .llama, .mistral, .qwen2, .qwen3 => !gpt_config.usesMoe() and !gpt_config.hasPle(),
+        // Qwen3-VL shares the dense Qwen3 decoder block. Keep its prepared
+        // slots unavailable unless the paired per-layer frame is explicitly
+        // enabled: using the slots through the generic synchronous path has
+        // not passed the model-token gate independently.
+        .qwen3_vl => platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_PREPARED_SLOTS", false) and
+            platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_PREFILL_FRAME", false) and
+            !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_QWEN3VL_PREFILL_FAST_PATH", false) and
+            !gpt_config.usesMoe() and !gpt_config.hasPle(),
         .gemma => gemma4_runtime.supportsPreparedDenseRuntimeConfig(gpt_config),
         else => false,
     };
@@ -5135,7 +5144,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.norm_prep_nanos += finished_at - started_at;
 
-        if (gpt_config.family == .gemma or gpt_config.family == .qwen3) {
+        if (gpt_config.family == .gemma or gpt_config.family == .qwen3 or gpt_config.family == .qwen3_vl) {
             var primary_buf: [256]u8 = undefined;
 
             if (gpt_config.family == .gemma) {

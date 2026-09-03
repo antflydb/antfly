@@ -65,6 +65,7 @@ pub const audio = @import("audio.zig");
 pub const grammar = @import("grammar.zig");
 pub const tool_parser = @import("tool_parser.zig");
 pub const multimodal_reranker = tasks.multimodal_reranker;
+pub const qwen3vl_multimodal_reranker = @import("qwen3vl_multimodal_reranker.zig");
 pub const document_preprocessing = documents.preprocessing;
 pub const document_classification = documents.classification;
 pub const document_token_classification = documents.token_classification;
@@ -95,6 +96,7 @@ test {
     _ = @import("tasks.zig");
     _ = @import("documents.zig");
     _ = @import("multimodal_reranker.zig");
+    _ = @import("qwen3vl_multimodal_reranker.zig");
     _ = @import("document_preprocessing.zig");
     _ = @import("document_classification.zig");
     _ = @import("document_token_classification.zig");

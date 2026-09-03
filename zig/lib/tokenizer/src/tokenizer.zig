@@ -80,6 +80,9 @@ pub const Tokenizer = struct {
         decode: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, ids: []const i32) anyerror![]u8,
         /// Get special token IDs.
         specialTokens: *const fn (ptr: *anyopaque) SpecialTokens,
+        /// Return every tokenizer-declared special token ID. Implementations
+        /// with only the legacy five-token contract may leave this null.
+        allSpecialTokenIds: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]u32 = null,
         /// Get vocabulary size.
         vocabSize: *const fn (ptr: *anyopaque) usize,
         /// Free resources.
@@ -158,6 +161,26 @@ pub const Tokenizer = struct {
 
     pub fn specialTokens(self: Tokenizer) SpecialTokens {
         return self.vtable.specialTokens(self.ptr);
+    }
+
+    pub fn allSpecialTokenIds(self: Tokenizer, allocator: std.mem.Allocator) ![]u32 {
+        if (self.vtable.allSpecialTokenIds) |get_all| return get_all(self.ptr, allocator);
+        var ids: [5]u32 = undefined;
+        var count: usize = 0;
+        const special = self.specialTokens();
+        for ([_]i32{ special.cls_id, special.sep_id, special.pad_id, special.unk_id, special.mask_id }) |id| {
+            if (id < 0 or @as(usize, @intCast(id)) >= self.vocabSize()) continue;
+            const unsigned: u32 = @intCast(id);
+            var duplicate = false;
+            for (ids[0..count]) |existing| {
+                if (existing == unsigned) duplicate = true;
+            }
+            if (!duplicate) {
+                ids[count] = unsigned;
+                count += 1;
+            }
+        }
+        return allocator.dupe(u32, ids[0..count]);
     }
 
     pub fn vocabSize(self: Tokenizer) usize {

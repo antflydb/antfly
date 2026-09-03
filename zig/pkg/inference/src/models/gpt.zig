@@ -36,6 +36,7 @@ pub const ModelFamily = enum {
     phi,
     qwen2,
     qwen3,
+    qwen3_vl,
     qwen3_5,
     deepseek_v4,
     gemma,
@@ -93,6 +94,7 @@ pub const DeepseekV4MlpKind = enum {
 pub const deepseek_v4_max_layers = 256;
 pub const max_extra_eos_token_ids = 16;
 pub const max_suppress_token_ids = 64;
+pub const max_vision_deepstack_layers = 64;
 
 pub const Config = struct {
     family: ModelFamily = .gpt2,
@@ -183,6 +185,7 @@ pub const Config = struct {
     suppress_token_ids: [max_suppress_token_ids]i32 = [_]i32{-1} ** max_suppress_token_ids,
     pad_token_id: i32 = -1,
     image_token_index: i32 = -1,
+    video_token_index: i32 = -1,
     boi_token_index: i32 = -1,
     eoi_token_index: i32 = -1,
     mm_tokens_per_image: u32 = 0,
@@ -196,9 +199,20 @@ pub const Config = struct {
     vision_patch_size: u32 = 0,
     vision_embed_dim: u32 = 0,
     vision_mlp_ratio: u32 = 0,
+    vision_num_position_embeddings: u32 = 0,
+    vision_out_hidden_size: u32 = 0,
     vision_spatial_merge_size: u32 = 1,
     vision_temporal_patch_size: u32 = 1,
     vision_use_quick_gelu: bool = false,
+    vision_deepstack_visual_indexes_len: u8 = 0,
+    vision_deepstack_visual_indexes: [max_vision_deepstack_layers]u32 = [_]u32{0} ** max_vision_deepstack_layers,
+    vision_deepstack_visual_indexes_truncated: bool = false,
+
+    // Multi-axis RoPE metadata shared by Qwen multimodal families. Keeping the
+    // representation family-neutral avoids duplicating position planning for
+    // Qwen3-VL and Qwen3.5.
+    mrope_interleaved: bool = false,
+    mrope_section: [3]u32 = .{ 0, 0, 0 },
 
     // Qwen3.5 hybrid attention metadata. Qwen3.5 alternates linear-attention
     // layers with full-attention layers; linear layers require recurrent state
@@ -211,8 +225,6 @@ pub const Config = struct {
     qwen35_linear_num_key_heads: u32 = 0,
     qwen35_linear_num_value_heads: u32 = 0,
     qwen35_attn_output_gate: bool = false,
-    qwen35_mrope_interleaved: bool = false,
-    qwen35_mrope_section: [3]u32 = .{ 0, 0, 0 },
 
     // RoPE parameters
     rope_theta: f32 = 10000.0,
@@ -278,6 +290,36 @@ pub const Config = struct {
             self.vision_num_attention_heads > 0 and
             self.vision_spatial_merge_size > 0 and
             self.hidden_size > 0;
+    }
+
+    pub fn isQwen3Vl(self: Config) bool {
+        return self.family == .qwen3_vl;
+    }
+
+    pub fn visionDeepstackVisualIndexes(self: *const Config) []const u32 {
+        return self.vision_deepstack_visual_indexes[0..self.vision_deepstack_visual_indexes_len];
+    }
+
+    /// Structural readiness only. Runtime compatibility remains separately
+    /// gated until tensor mapping and strict Metal execution are qualified.
+    pub fn hasQwen3VlArchitectureContract(self: Config) bool {
+        if (!self.isQwen3Vl() or !self.isMultimodal() or self.usesMoe()) return false;
+        if (self.video_token_index < 0 or self.boi_token_index < 0 or self.eoi_token_index < 0) return false;
+        if (self.vision_patch_size == 0 or self.vision_temporal_patch_size == 0 or self.vision_spatial_merge_size == 0) return false;
+        if (self.vision_hidden_size == 0 or self.vision_out_hidden_size != self.hidden_size) return false;
+        if (self.vision_num_hidden_layers == 0 or self.vision_num_attention_heads == 0 or self.vision_intermediate_size == 0) return false;
+        if (self.vision_num_position_embeddings == 0 or self.vision_deepstack_visual_indexes_len == 0) return false;
+        if (self.vision_deepstack_visual_indexes_truncated or !self.mrope_interleaved) return false;
+        if (self.mrope_section[0] == 0 or self.mrope_section[1] == 0 or self.mrope_section[2] == 0) return false;
+        // M-RoPE sections count rotary pairs; together they cover head_dim / 2.
+        if (self.headDim() != 2 * (self.mrope_section[0] + self.mrope_section[1] + self.mrope_section[2])) return false;
+        var previous: ?u32 = null;
+        for (self.visionDeepstackVisualIndexes()) |index| {
+            if (index >= self.vision_num_hidden_layers) return false;
+            if (previous) |value| if (index <= value) return false;
+            previous = index;
+        }
+        return true;
     }
 
     pub fn tokenEmbeddingScale(self: Config) f32 {
@@ -623,7 +665,11 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (!has_vlm_wrapper) {
         if (obj.get("model_type")) |v| {
             if (v == .string and obj.get("text_config") != null) {
-                if (isGemma4ModelType(v.string) or std.mem.eql(u8, v.string, "qwen3_5")) {
+                if (isGemma4ModelType(v.string) or
+                    std.mem.eql(u8, v.string, "qwen3_5") or
+                    std.mem.eql(u8, v.string, "qwen3_vl") or
+                    std.mem.eql(u8, v.string, "qwen3_vl_moe"))
+                {
                     config.weight_prefix = "model.language_model";
                 }
             }
@@ -931,6 +977,9 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (model_obj.get("image_token_id")) |v| if (jsonI32(v)) |val| {
         config.image_token_index = val;
     };
+    if (model_obj.get("video_token_id")) |v| if (jsonI32(v)) |val| {
+        config.video_token_index = val;
+    };
     if (model_obj.get("boi_token_index")) |v| if (jsonI32(v)) |val| {
         config.boi_token_index = val;
     };
@@ -984,10 +1033,10 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
                 config.rope_partial_factor = val;
             };
             if (v.object.get("mrope_interleaved")) |mrope| if (jsonBool(mrope)) |val| {
-                config.qwen35_mrope_interleaved = val;
+                config.mrope_interleaved = val;
             };
             if (v.object.get("mrope_section")) |section| if (parseU32Triple(section)) |val| {
-                config.qwen35_mrope_section = val;
+                config.mrope_section = val;
             };
             if (v.object.get("full_attention")) |full_value| {
                 if (full_value == .object) {
@@ -1012,6 +1061,12 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (text_obj.get("rope_scaling")) |v| {
         if (v == .object) {
             const rope_obj = v.object;
+            if (rope_obj.get("mrope_interleaved")) |mrope| if (jsonBool(mrope)) |val| {
+                config.mrope_interleaved = val;
+            };
+            if (rope_obj.get("mrope_section")) |section| if (parseU32Triple(section)) |val| {
+                config.mrope_section = val;
+            };
             if (rope_obj.get("rope_type")) |rope_type| {
                 if (rope_type == .string and std.mem.eql(u8, rope_type.string, "linear")) {
                     if (rope_obj.get("factor")) |factor_value| if (jsonF32(factor_value)) |factor| {
@@ -1117,6 +1172,12 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
             if (vision_obj.get("mlp_ratio")) |vv| if (jsonU32(vv)) |val| {
                 config.vision_mlp_ratio = val;
             };
+            if (vision_obj.get("num_position_embeddings")) |vv| if (jsonU32(vv)) |val| {
+                config.vision_num_position_embeddings = val;
+            };
+            if (vision_obj.get("out_hidden_size")) |vv| if (jsonU32(vv)) |val| {
+                config.vision_out_hidden_size = val;
+            };
             if (vision_obj.get("image_size")) |vv| if (jsonU32(vv)) |val| {
                 config.vision_image_size = val;
             };
@@ -1135,6 +1196,9 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
             if (vision_obj.get("hidden_act")) |vv| if (vv == .string) {
                 config.vision_use_quick_gelu = std.mem.eql(u8, vv.string, "quick_gelu");
             };
+            if (vision_obj.get("deepstack_visual_indexes")) |vv| {
+                parseVisionDeepstackVisualIndexes(&config, vv);
+            }
         }
     }
 
@@ -1228,6 +1292,16 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
     if (metaF32(view, &key_buf, arch, "final_logit_softcapping")) |value| config.final_logit_softcapping = value;
 
     if (metaF32(view, &key_buf, arch, "rope.freq_base_swa")) |value| config.rope_local_theta = value;
+    if (config.family == .qwen3_vl) {
+        config.mrope_interleaved = true;
+        if (metaU32TripleFromArray(view, &key_buf, arch, "rope.dimension_sections")) |sections| {
+            config.mrope_section = sections;
+        }
+        if (metaU32(view, &key_buf, arch, "n_deepstack_layers")) |count| {
+            config.vision_deepstack_visual_indexes_len = @intCast(@min(count, max_vision_deepstack_layers));
+            config.vision_deepstack_visual_indexes_truncated = count > max_vision_deepstack_layers;
+        }
+    }
     applyAntflyMultimodalGgufMetadata(view, &config);
 
     // DeepSeek V4. Every field below was previously reachable only from an HF
@@ -1419,6 +1493,37 @@ fn metaBool(view: gguf_metadata.View, buf: *[96]u8, arch: []const u8, suffix: []
     return view.getBool(key);
 }
 
+fn metaU32TripleFromArray(view: gguf_metadata.View, buf: *[96]u8, arch: []const u8, suffix: []const u8) ?[3]u32 {
+    const key = std.fmt.bufPrint(buf, "{s}.{s}", .{ arch, suffix }) catch return null;
+    const entry = view.find(key) orelse return null;
+    const array = switch (entry.value) {
+        .array => |value| value,
+        else => return null,
+    };
+    if (array.values.len < 3) return null;
+    var result: [3]u32 = undefined;
+    for (0..3) |index| {
+        result[index] = metadataU32(array.values[index]) orelse return null;
+    }
+    return result;
+}
+
+fn metadataU32(value: gguf_format.MetadataValue) ?u32 {
+    const raw: u64 = switch (value) {
+        .u8 => |v| v,
+        .u16 => |v| v,
+        .u32 => |v| v,
+        .u64 => |v| v,
+        .i8 => |v| if (v >= 0) @intCast(v) else return null,
+        .i16 => |v| if (v >= 0) @intCast(v) else return null,
+        .i32 => |v| if (v >= 0) @intCast(v) else return null,
+        .i64 => |v| if (v >= 0) @intCast(v) else return null,
+        else => return null,
+    };
+    if (raw > std.math.maxInt(u32)) return null;
+    return @intCast(raw);
+}
+
 /// Read element at index from an i32/u32 metadata array.
 /// Populate the DeepSeek V4 per-layer attention schedule from the GGUF
 /// `attention.compress_ratios` array.
@@ -1535,6 +1640,11 @@ pub fn detectFamily(model_type: []const u8) ModelFamily {
         .{ "qwen2_vl", ModelFamily.qwen2 },
         .{ "colqwen2", ModelFamily.qwen2 },
         .{ "qwen3", ModelFamily.qwen3 },
+        .{ "qwen3_vl", ModelFamily.qwen3_vl },
+        .{ "qwen3_vl_text", ModelFamily.qwen3_vl },
+        .{ "qwen3_vl_moe", ModelFamily.qwen3_vl },
+        .{ "qwen3vl", ModelFamily.qwen3_vl },
+        .{ "qwen3vlmoe", ModelFamily.qwen3_vl },
         .{ "jina_embeddings_v5", ModelFamily.qwen3 },
         .{ "qwen3_5", ModelFamily.qwen3_5 },
         .{ "qwen3_5_text", ModelFamily.qwen3_5 },
@@ -1595,17 +1705,17 @@ fn isGemma4AssistantModelType(model_type: []const u8) bool {
 
 fn applyFamilyDefaults(config: *Config) void {
     switch (config.family) {
-        .llama, .mistral, .qwen2, .qwen3, .qwen3_5, .deepseek_v4 => {
+        .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .qwen3_5, .deepseek_v4 => {
             config.norm_type = .rms_norm;
             config.position_encoding = .rope;
             config.activation = .silu;
             config.norm_eps = switch (config.family) {
-                .qwen3, .qwen3_5, .deepseek_v4 => 1e-6,
+                .qwen3, .qwen3_vl, .qwen3_5, .deepseek_v4 => 1e-6,
                 else => 1e-5,
             };
             config.rope_layout = switch (config.family) {
                 .llama, .mistral => .consecutive_pairs,
-                .qwen2, .qwen3, .qwen3_5 => .half_split,
+                .qwen2, .qwen3, .qwen3_vl, .qwen3_5 => .half_split,
                 .deepseek_v4 => .consecutive_pairs,
                 else => config.rope_layout,
             };
@@ -1684,7 +1794,7 @@ pub fn isGenerativeModel(model_type: []const u8) bool {
 /// demoting a family silently disabled its tensor names too.
 pub fn ggufWeightMappingSupported(family: ModelFamily) bool {
     return switch (family) {
-        .llama, .mistral, .qwen2, .qwen3, .gemma, .bitnet, .phi, .deepseek_v4 => true,
+        .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .gemma, .bitnet, .phi, .deepseek_v4 => true,
         .qwen3_5, .gpt2, .gpt_neo, .gpt_neox, .gptj, .falcon, .opt, .bloom, .other => false,
     };
 }
@@ -1771,6 +1881,21 @@ fn parseU32Triple(v: std.json.Value) ?[3]u32 {
         result[idx] = jsonU32(item) orelse return null;
     }
     return result;
+}
+
+fn parseVisionDeepstackVisualIndexes(config: *Config, value: std.json.Value) void {
+    if (value != .array) return;
+    config.vision_deepstack_visual_indexes_len = 0;
+    config.vision_deepstack_visual_indexes_truncated = value.array.items.len > max_vision_deepstack_layers;
+    for (value.array.items, 0..) |item, index| {
+        if (index >= max_vision_deepstack_layers) break;
+        const layer_index = jsonU32(item) orelse {
+            config.vision_deepstack_visual_indexes_truncated = true;
+            continue;
+        };
+        config.vision_deepstack_visual_indexes[config.vision_deepstack_visual_indexes_len] = layer_index;
+        config.vision_deepstack_visual_indexes_len += 1;
+    }
 }
 
 fn jsonI32(val: std.json.Value) ?i32 {
@@ -3315,8 +3440,8 @@ test "parse qwen3.5 chandra-style hybrid multimodal config" {
     try std.testing.expectEqual(@as(u32, 16), config.qwen35_linear_num_key_heads);
     try std.testing.expectEqual(@as(u32, 32), config.qwen35_linear_num_value_heads);
     try std.testing.expect(config.qwen35_attn_output_gate);
-    try std.testing.expect(config.qwen35_mrope_interleaved);
-    try std.testing.expectEqualSlices(u32, &.{ 11, 11, 10 }, &config.qwen35_mrope_section);
+    try std.testing.expect(config.mrope_interleaved);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11, 10 }, &config.mrope_section);
     try std.testing.expectApproxEqAbs(@as(f32, 10000000.0), config.rope_theta, 1.0);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), config.rope_partial_factor, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), config.norm_weight_offset, 1e-6);
@@ -3327,6 +3452,71 @@ test "parse qwen3.5 chandra-style hybrid multimodal config" {
     try std.testing.expectEqual(@as(u32, 4096), config.vision_intermediate_size);
     try std.testing.expectEqual(@as(u32, 16), config.vision_patch_size);
     try std.testing.expect(config.supportsNativeQwen2VlVision());
+}
+
+test "parse Qwen3-VL dense architecture contract" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "architectures": ["Qwen3VLForConditionalGeneration"],
+        \\  "image_token_id": 151655,
+        \\  "model_type": "qwen3_vl",
+        \\  "text_config": {
+        \\    "bos_token_id": 151643,
+        \\    "eos_token_id": 151645,
+        \\    "head_dim": 128,
+        \\    "hidden_act": "silu",
+        \\    "hidden_size": 2560,
+        \\    "intermediate_size": 9728,
+        \\    "max_position_embeddings": 262144,
+        \\    "model_type": "qwen3_vl_text",
+        \\    "num_attention_heads": 32,
+        \\    "num_hidden_layers": 36,
+        \\    "num_key_value_heads": 8,
+        \\    "rms_norm_eps": 1e-6,
+        \\    "rope_scaling": {
+        \\      "mrope_interleaved": true,
+        \\      "mrope_section": [24, 20, 20],
+        \\      "rope_type": "default"
+        \\    },
+        \\    "rope_theta": 5000000,
+        \\    "tie_word_embeddings": true,
+        \\    "vocab_size": 151936
+        \\  },
+        \\  "video_token_id": 151656,
+        \\  "vision_config": {
+        \\    "deepstack_visual_indexes": [5, 11, 17],
+        \\    "depth": 24,
+        \\    "hidden_act": "gelu_pytorch_tanh",
+        \\    "hidden_size": 1024,
+        \\    "intermediate_size": 4096,
+        \\    "num_heads": 16,
+        \\    "num_position_embeddings": 2304,
+        \\    "out_hidden_size": 2560,
+        \\    "patch_size": 16,
+        \\    "spatial_merge_size": 2,
+        \\    "temporal_patch_size": 2
+        \\  },
+        \\  "vision_end_token_id": 151653,
+        \\  "vision_start_token_id": 151652
+        \\}
+    ;
+    var config = try parseConfig(allocator, json);
+    try std.testing.expectEqual(ModelFamily.qwen3_vl, config.family);
+    try std.testing.expectEqualStrings("model.language_model", config.weight_prefix);
+    try std.testing.expectEqual(@as(i32, 151655), config.image_token_index);
+    try std.testing.expectEqual(@as(i32, 151656), config.video_token_index);
+    try std.testing.expectEqual(@as(u32, 128), config.headDim());
+    try std.testing.expectEqualSlices(u32, &.{ 24, 20, 20 }, &config.mrope_section);
+    try std.testing.expect(config.mrope_interleaved);
+    try std.testing.expectEqual(@as(u32, 2304), config.vision_num_position_embeddings);
+    try std.testing.expectEqual(@as(u32, 2560), config.vision_out_hidden_size);
+    try std.testing.expectEqualSlices(u32, &.{ 5, 11, 17 }, config.visionDeepstackVisualIndexes());
+    try std.testing.expect(config.hasQwen3VlArchitectureContract());
+    try std.testing.expect(ggufWeightMappingSupported(config.family));
+
+    config.vision_deepstack_visual_indexes[1] = 5;
+    try std.testing.expect(!config.hasQwen3VlArchitectureContract());
 }
 
 test "parse colqwen2 vlm_config wrapper" {

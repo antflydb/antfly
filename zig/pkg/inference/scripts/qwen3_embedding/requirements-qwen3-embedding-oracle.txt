@@ -1,0 +1,4 @@
+# Frozen, offline Hugging Face oracle for Qwen3-Embedding qualification.
+numpy==2.4.2
+torch==2.10.0
+transformers==5.1.0

@@ -300,7 +300,7 @@ pub fn printBackendTimingDetails(
         },
     );
     std.debug.print(
-        "{s}_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d}\n",
+        "{s}_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d} q6_high_row_mm_matrix={d}\n",
         .{
             prefix,
             provider_stats.metal_runtime_q4_k_linear_reduce,
@@ -318,6 +318,7 @@ pub fn printBackendTimingDetails(
             provider_stats.metal_runtime_q6_k_linear_reduce_rows_9_64,
             provider_stats.metal_runtime_q6_k_linear_reduce_rows_65_plus,
             provider_stats.metal_runtime_q6_k_linear_reduce_f16_input,
+            provider_stats.metal_runtime_q6_k_high_row_mm_matrix_dispatches,
         },
     );
     std.debug.print(

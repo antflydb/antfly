@@ -968,6 +968,22 @@ pub fn build(b: *std.Build) void {
     metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_ab_benchmark_contract_test_step);
     metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_lm_head_repack_quality_contract_test_step);
 
+    const qwen3vl_python_contracts = b.addSystemCommand(&.{
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "scripts/qwen3vl",
+        "-p",
+        "test_*.py",
+    });
+    const qwen3vl_python_contracts_step = b.step(
+        "test-qwen3vl-python-contracts",
+        "Test Qwen3-VL oracle, qualification, high-precision, MPS, and MLX benchmark contracts",
+    );
+    qwen3vl_python_contracts_step.dependOn(&qwen3vl_python_contracts.step);
+
     const metal_gemma4_tool_calling_test = b.addSystemCommand(&.{
         "bash",
         "scripts/gemma4/test_metal_gemma4_tool_calling.sh",
@@ -1445,6 +1461,34 @@ pub fn build(b: *std.Build) void {
     }
     const bge_m3_e2e_bench_step = b.step("bench-bge-m3-e2e", "Run pretokenized BGE-M3 encoder E2E benchmarks");
     bge_m3_e2e_bench_step.dependOn(&run_bge_m3_e2e_bench.step);
+
+    const qwen3_embedding_e2e_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-qwen3-embedding-e2e-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/qwen3_embedding_e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    qwen3_embedding_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
+    qwen3_embedding_e2e_bench_exe.root_module.addImport("ml", ml_mod);
+    qwen3_embedding_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
+    qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    qwen3_embedding_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
+    qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
+    qwen3_embedding_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
+    qwen3_embedding_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    // inference_internal already owns the Metal source and frameworks.
+    configureNativeTool(b, qwen3_embedding_e2e_bench_exe, target, enable_system_blas, blas_root, false);
+    configureOnnxRuntime(b, qwen3_embedding_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    const run_qwen3_embedding_e2e_bench = b.addRunArtifact(qwen3_embedding_e2e_bench_exe);
+    if (b.args) |args| {
+        run_qwen3_embedding_e2e_bench.addArgs(args);
+    }
+    const qwen3_embedding_e2e_bench_step = b.step("bench-qwen3-embedding-e2e", "Run pretokenized Qwen3-Embedding encoder E2E benchmarks");
+    qwen3_embedding_e2e_bench_step.dependOn(&run_qwen3_embedding_e2e_bench.step);
 
     const reranker_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-reranker-e2e-bench",
