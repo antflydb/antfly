@@ -723,6 +723,10 @@ fn validateSchemaValue(value: std.json.Value) !void {
 
     if (root.get("version")) |version| if (version != .null) try validateNonNegativeInteger(version);
     if (root.get("default_type")) |default_type| if (default_type != .null and default_type != .string) return error.InvalidSchemaUpdateRequest;
+    const has_ttl = root.get("ttl") != null;
+    const has_legacy_ttl = root.get("ttl_duration") != null or root.get("ttl_duration_ns") != null or root.get("ttl_field") != null;
+    if (has_ttl and has_legacy_ttl) return error.InvalidSchemaUpdateRequest;
+    if (root.get("ttl")) |ttl| try validateTtlConfig(ttl);
     if (root.get("ttl_duration") != null and root.get("ttl_duration_ns") != null) return error.InvalidSchemaUpdateRequest;
     if (root.get("ttl_duration")) |ttl_duration| if (ttl_duration != .null) switch (ttl_duration) {
         .string => |text| _ = try parseTtlDurationNs(text),
@@ -739,6 +743,32 @@ fn validateSchemaValue(value: std.json.Value) !void {
     if (root.get("document_schemas")) |document_schemas| if (document_schemas != .null) try validateDocumentSchemas(document_schemas);
     if (root.get("dynamic_templates")) |dynamic_templates| if (dynamic_templates != .null) try validateDynamicTemplates(dynamic_templates);
     if (root.get("index_sort")) |index_sort| if (index_sort != .null) try validateIndexSort(index_sort);
+}
+
+fn validateTtlConfig(value: std.json.Value) !void {
+    if (value == .null) return;
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "duration") and !std.mem.eql(u8, entry.key_ptr.*, "field")) {
+            return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    const duration_value = object.get("duration") orelse return error.InvalidSchemaUpdateRequest;
+    const duration = switch (duration_value) {
+        .string => |text| try parseTtlDurationNs(text),
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    if (duration == 0) return error.InvalidSchemaUpdateRequest;
+    if (object.get("field")) |field| switch (field) {
+        .string => |text| {
+            if (text.len == 0) return error.InvalidSchemaUpdateRequest;
+        },
+        else => return error.InvalidSchemaUpdateRequest,
+    };
 }
 
 fn validateDocumentSchemas(value: std.json.Value) !void {
@@ -1820,16 +1850,30 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
             parsed.default_type = try alloc.dupe(u8, default_type.string);
         }
     }
-    if (root.get("ttl_duration_ns")) |ttl_duration_ns| {
-        if (ttl_duration_ns != .null) parsed.ttl_duration_ns = std.math.cast(u64, ttl_duration_ns.integer) orelse return error.InvalidSchemaUpdateRequest;
-    } else if (root.get("ttl_duration")) |ttl_duration| {
-        if (ttl_duration != .null) parsed.ttl_duration_ns = try parseTtlDurationNs(ttl_duration.string);
-    }
-    if (root.get("ttl_field")) |ttl_field| {
-        if (ttl_field != .null) {
-            if (ttl_field.string.len == 0) return error.InvalidSchemaUpdateRequest;
-            alloc.free(parsed.ttl_field);
-            parsed.ttl_field = try alloc.dupe(u8, ttl_field.string);
+    if (root.get("ttl")) |ttl| {
+        switch (ttl) {
+            .null => {},
+            .object => |ttl_object| {
+                parsed.ttl_duration_ns = try parseTtlDurationNs(ttl_object.get("duration").?.string);
+                if (ttl_object.get("field")) |ttl_field| {
+                    alloc.free(parsed.ttl_field);
+                    parsed.ttl_field = try alloc.dupe(u8, ttl_field.string);
+                }
+            },
+            else => unreachable,
+        }
+    } else {
+        if (root.get("ttl_duration_ns")) |ttl_duration_ns| {
+            if (ttl_duration_ns != .null) parsed.ttl_duration_ns = std.math.cast(u64, ttl_duration_ns.integer) orelse return error.InvalidSchemaUpdateRequest;
+        } else if (root.get("ttl_duration")) |ttl_duration| {
+            if (ttl_duration != .null) parsed.ttl_duration_ns = try parseTtlDurationNs(ttl_duration.string);
+        }
+        if (root.get("ttl_field")) |ttl_field| {
+            if (ttl_field != .null) {
+                if (ttl_field.string.len == 0) return error.InvalidSchemaUpdateRequest;
+                alloc.free(parsed.ttl_field);
+                parsed.ttl_field = try alloc.dupe(u8, ttl_field.string);
+            }
         }
     }
     if (root.get("enforce_types")) |enforce_types| {
@@ -4925,6 +4969,22 @@ test "table schema parses public ttl duration strings" {
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"ttl_duration\":\"1.5h\"}"));
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"ttl_duration\":\"forever\"}"));
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"ttl_duration\":\"18446744073709551615h\"}"));
+}
+
+test "table schema parses canonical ttl policy and explicit removal" {
+    var canonical = try parseSchema(std.testing.allocator, "{\"ttl\":{\"duration\":\"1h30m\",\"field\":\"created_at\"}}");
+    defer canonical.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 90 * 60 * std.time.ns_per_s), canonical.ttl_duration_ns);
+    try std.testing.expectEqualStrings("created_at", canonical.ttl_field);
+
+    var removed = try parseSchema(std.testing.allocator, "{\"ttl\":null}");
+    defer removed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 0), removed.ttl_duration_ns);
+    try std.testing.expectEqualStrings("_timestamp", removed.ttl_field);
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"ttl\":{\"duration\":\"0s\"}}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"ttl\":{\"duration\":\"1h\",\"unknown\":true}}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"ttl\":{\"duration\":\"1h\"},\"ttl_duration\":\"1h\"}"));
 }
 
 test "validate escaped ref tokens and direct fragment refs" {

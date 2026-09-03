@@ -17,6 +17,9 @@ components:
       type: object
       description: "Configuration for the Antfly inference reranking provider."
       properties:
+        provider:
+          type: string
+          enum: [antfly]
         model:
           type: string
           description: "The name of the reranking model (e.g., cross-encoder model name)."
@@ -25,6 +28,7 @@ components:
           format: uri
           description: "The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable."
       required:
+        - provider
         - model
       example:
         provider: "antfly"
@@ -42,6 +46,9 @@ components:
 
         **Docs:** https://docs.cohere.com/reference/rerank
       properties:
+        provider:
+          type: string
+          enum: [cohere]
         model:
           type: string
           description: "The name of the Cohere reranking model to use."
@@ -50,13 +57,8 @@ components:
         api_key:
           type: string
           description: "The Cohere API key. Can also be set via COHERE_API_KEY environment variable."
-        top_n:
-          type: integer
-          description: "Number of most relevant documents to return. If not specified, returns all documents with scores."
-        max_chunks_per_doc:
-          type: integer
-          description: "Maximum number of chunks per document for long document handling."
       required:
+        - provider
         - model
       example:
         provider: "cohere"
@@ -79,6 +81,9 @@ components:
 
         **IAM:** https://cloud.google.com/generative-ai-app-builder/docs/access-control
       properties:
+        provider:
+          type: string
+          enum: [vertex]
         model:
           type: string
           description: "The ranking model to use."
@@ -90,10 +95,8 @@ components:
         credentials_path:
           type: string
           description: "Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable."
-        top_n:
-          type: integer
-          description: "Maximum number of records to return. If not specified, returns all documents with scores."
       required:
+        - provider
         - model
       example:
         provider: "vertex"
@@ -114,6 +117,14 @@ components:
             template:
               type: string
               description: "Handlebars template to render document text for reranking."
+            candidate_count:
+              type: integer
+              minimum: 1
+              description: "Maximum number of highest-ranked retrieval candidates to send to the reranker. Defaults to all candidates returned by retrieval; candidates outside this window are not returned."
+            top_n:
+              type: integer
+              minimum: 1
+              description: "Number of reranked documents to return after candidate_count documents have been scored. Defaults to candidate_count and cannot exceed it."
           required:
             - provider
         - oneOf:

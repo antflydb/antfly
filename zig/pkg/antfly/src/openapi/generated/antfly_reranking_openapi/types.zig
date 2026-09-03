@@ -5,6 +5,7 @@ const std = @import("std");
 
 /// Configuration for the Antfly inference reranking provider.
 pub const AntflyRerankerConfig = struct {
+    provider: []const u8,
     /// The name of the reranking model (e.g., cross-encoder model name).
     model: []const u8,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
@@ -12,6 +13,7 @@ pub const AntflyRerankerConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "url", "url", true },
     };
@@ -26,6 +28,8 @@ pub const AntflyRerankerConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.url) |value| {
@@ -38,21 +42,17 @@ pub const AntflyRerankerConfig = struct {
 
 /// Configuration for the Cohere reranking provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** rerank-english-v3.0 (default), rerank-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/rerank
 pub const CohereRerankerConfig = struct {
+    provider: []const u8,
     /// The name of the Cohere reranking model to use.
     model: []const u8,
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
     api_key: ?[]const u8 = null,
-    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
-    top_n: ?i64 = null,
-    /// Maximum number of chunks per document for long document handling.
-    max_chunks_per_doc: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
-        .{ "top_n", "top_n", true },
-        .{ "max_chunks_per_doc", "max_chunks_per_doc", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -65,18 +65,12 @@ pub const CohereRerankerConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.api_key) |value| {
             try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.top_n) |value| {
-            try jw.objectField("top_n");
-            try jw.write(value);
-        }
-        if (self.max_chunks_per_doc) |value| {
-            try jw.objectField("max_chunks_per_doc");
             try jw.write(value);
         }
         try jw.endObject();
@@ -90,16 +84,16 @@ pub const RerankerConfig = struct {
     field: ?[]const u8 = null,
     /// Handlebars template to render document text for reranking.
     template: ?[]const u8 = null,
+    /// Maximum number of highest-ranked retrieval candidates to send to the reranker. Defaults to all candidates returned by retrieval; candidates outside this window are not returned.
+    candidate_count: ?i64 = null,
+    /// Number of reranked documents to return after candidate_count documents have been scored. Defaults to candidate_count and cannot exceed it.
+    top_n: ?i64 = null,
     /// The name of the reranking model (e.g., cross-encoder model name).
     model: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
     api_key: ?[]const u8 = null,
-    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
-    top_n: ?i64 = null,
-    /// Maximum number of chunks per document for long document handling.
-    max_chunks_per_doc: ?i64 = null,
     /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
     /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
@@ -107,14 +101,14 @@ pub const RerankerConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "provider", "provider", false },
+        .{ "provider", "provider", true },
         .{ "field", "field", true },
         .{ "template", "template", true },
+        .{ "candidate_count", "candidate_count", true },
+        .{ "top_n", "top_n", true },
         .{ "model", "model", true },
         .{ "url", "url", true },
         .{ "api_key", "api_key", true },
-        .{ "top_n", "top_n", true },
-        .{ "max_chunks_per_doc", "max_chunks_per_doc", true },
         .{ "project_id", "project_id", true },
         .{ "credentials_path", "credentials_path", true },
     };
@@ -139,6 +133,14 @@ pub const RerankerConfig = struct {
             try jw.objectField("template");
             try jw.write(value);
         }
+        if (self.candidate_count) |value| {
+            try jw.objectField("candidate_count");
+            try jw.write(value);
+        }
+        if (self.top_n) |value| {
+            try jw.objectField("top_n");
+            try jw.write(value);
+        }
         if (self.model) |value| {
             try jw.objectField("model");
             try jw.write(value);
@@ -149,14 +151,6 @@ pub const RerankerConfig = struct {
         }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.top_n) |value| {
-            try jw.objectField("top_n");
-            try jw.write(value);
-        }
-        if (self.max_chunks_per_doc) |value| {
-            try jw.objectField("max_chunks_per_doc");
             try jw.write(value);
         }
         if (self.project_id) |value| {
@@ -202,21 +196,20 @@ pub const RerankerProvider = enum {
 
 /// Configuration for the Google Vertex AI Ranking API. Uses Application Default Credentials (ADC) or explicit credentials path. **Prerequisites:** - Enable Discovery Engine API: `gcloud services enable discoveryengine.googleapis.com` - Grant IAM role: `roles/discoveryengine.admin` (includes `discoveryengine.rankingConfigs.rank` permission) **Models:** semantic-ranker-default@latest (default), semantic-ranker-fast-004 **Docs:** https://cloud.google.com/generative-ai-app-builder/docs/ranking **IAM:** https://cloud.google.com/generative-ai-app-builder/docs/access-control
 pub const VertexRerankerConfig = struct {
+    provider: []const u8,
     /// The ranking model to use.
     model: []const u8,
     /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
     /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
     credentials_path: ?[]const u8 = null,
-    /// Maximum number of records to return. If not specified, returns all documents with scores.
-    top_n: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "project_id", "project_id", true },
         .{ "credentials_path", "credentials_path", true },
-        .{ "top_n", "top_n", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -229,6 +222,8 @@ pub const VertexRerankerConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.project_id) |value| {
@@ -237,10 +232,6 @@ pub const VertexRerankerConfig = struct {
         }
         if (self.credentials_path) |value| {
             try jw.objectField("credentials_path");
-            try jw.write(value);
-        }
-        if (self.top_n) |value| {
-            try jw.objectField("top_n");
             try jw.write(value);
         }
         try jw.endObject();

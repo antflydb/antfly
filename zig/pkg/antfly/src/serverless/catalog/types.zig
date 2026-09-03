@@ -175,7 +175,7 @@ pub const NamespacePolicy = struct {
     compaction_trigger_version_count: usize = 8,
     vector_compaction_max_cluster_imbalance: f32 = 0.5,
     vector_compaction_max_distance_span: f32 = 0.75,
-    vector_distance_metric: vector_types.DistanceMetric = .cosine,
+    vector_distance_metric: vector_types.DistanceMetric = vector_types.default_distance_metric,
     enrichment_enabled: bool = false,
     lexical_sparse_model_preference: EnrichmentModelPreference = .prefer_model,
     enrichment_batch_size: usize = 32,
@@ -421,7 +421,7 @@ test "namespace policy defaults to published queries and two retained versions" 
     try std.testing.expectEqual(@as(usize, 8), policy.compaction_trigger_version_count);
     try std.testing.expectEqual(@as(f32, 0.5), policy.vector_compaction_max_cluster_imbalance);
     try std.testing.expectEqual(@as(f32, 0.75), policy.vector_compaction_max_distance_span);
-    try std.testing.expectEqual(vector_types.DistanceMetric.cosine, policy.vector_distance_metric);
+    try std.testing.expectEqual(vector_types.default_distance_metric, policy.vector_distance_metric);
     try std.testing.expectEqual(false, policy.enrichment_enabled);
     try std.testing.expectEqual(EnrichmentModelPreference.prefer_model, policy.lexical_sparse_model_preference);
     try std.testing.expectEqual(@as(usize, 32), policy.enrichment_batch_size);

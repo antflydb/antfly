@@ -1,9 +1,8 @@
 from enum import Enum
 
 
-class MergeStrategy(str, Enum):
-    RRF = "rrf"
-    RSF = "rsf"
+class CohereRerankerConfigProvider(str, Enum):
+    COHERE = "cohere"
 
     def __str__(self) -> str:
         return str(self.value)

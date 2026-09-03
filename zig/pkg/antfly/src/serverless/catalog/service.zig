@@ -353,7 +353,7 @@ pub const CatalogService = struct {
         var vector_compaction = try vectorCompactionSignalAlloc(self.alloc, self.artifacts, self.manifests, namespace, head_version);
         defer vector_compaction.deinit(self.alloc);
         const vector_compaction_policy = builder_mod.adaptiveVectorBuildPolicyForPolicy(.{
-            .metric = vector_compaction.metric orelse .cosine,
+            .metric = vector_compaction.metric orelse effective_policy.vector_distance_metric,
             .cluster_count = vector_compaction.cluster_count,
             .base_probe_count = vector_compaction.base_probe_count,
             .shortlist_multiplier = vector_compaction.shortlist_multiplier,

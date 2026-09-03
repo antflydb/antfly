@@ -1790,6 +1790,7 @@ pub const AntflyGeneratorConfig = struct {
 
 /// Configuration for the Antfly inference reranking provider.
 pub const AntflyRerankerConfig = struct {
+    provider: []const u8,
     /// The name of the reranking model (e.g., cross-encoder model name).
     model: []const u8,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
@@ -1797,6 +1798,7 @@ pub const AntflyRerankerConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "url", "url", true },
     };
@@ -1811,6 +1813,8 @@ pub const AntflyRerankerConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.url) |value| {
@@ -3461,28 +3465,19 @@ pub const ChunkerProvider = enum {
 pub const ClassificationStepConfig = struct {
     /// Enable query classification and strategy selection
     enabled: ?bool = null,
-    /// Generator to use for classification. If not specified, uses the default summarizer.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
     /// Include pre-retrieval reasoning explaining query analysis and strategy selection
     with_reasoning: ?bool = null,
     /// Override LLM strategy selection. If not set, the LLM chooses optimal strategy.
     force_strategy: ?QueryStrategy = null,
     /// Override semantic query mode selection.
     force_semantic_mode: ?SemanticQueryMode = null,
-    /// Number of alternative query phrasings to generate
-    multi_phrase_count: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", true },
-        .{ "chain", "chain", true },
         .{ "with_reasoning", "with_reasoning", true },
         .{ "force_strategy", "force_strategy", true },
         .{ "force_semantic_mode", "force_semantic_mode", true },
-        .{ "multi_phrase_count", "multi_phrase_count", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -3499,14 +3494,6 @@ pub const ClassificationStepConfig = struct {
             try jw.objectField("enabled");
             try jw.write(value);
         }
-        if (self.generator) |value| {
-            try jw.objectField("generator");
-            try jw.write(value);
-        }
-        if (self.chain) |value| {
-            try jw.objectField("chain");
-            try jw.write(value);
-        }
         if (self.with_reasoning) |value| {
             try jw.objectField("with_reasoning");
             try jw.write(value);
@@ -3517,10 +3504,6 @@ pub const ClassificationStepConfig = struct {
         }
         if (self.force_semantic_mode) |value| {
             try jw.objectField("force_semantic_mode");
-            try jw.write(value);
-        }
-        if (self.multi_phrase_count) |value| {
-            try jw.objectField("multi_phrase_count");
             try jw.write(value);
         }
         try jw.endObject();
@@ -4328,21 +4311,17 @@ pub const ClusterTopology = struct {
 
 /// Configuration for the Cohere reranking provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** rerank-english-v3.0 (default), rerank-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/rerank
 pub const CohereRerankerConfig = struct {
+    provider: []const u8,
     /// The name of the Cohere reranking model to use.
     model: []const u8,
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
     api_key: ?[]const u8 = null,
-    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
-    top_n: ?i64 = null,
-    /// Maximum number of chunks per document for long document handling.
-    max_chunks_per_doc: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
-        .{ "top_n", "top_n", true },
-        .{ "max_chunks_per_doc", "max_chunks_per_doc", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -4355,18 +4334,12 @@ pub const CohereRerankerConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.api_key) |value| {
             try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.top_n) |value| {
-            try jw.objectField("top_n");
-            try jw.write(value);
-        }
-        if (self.max_chunks_per_doc) |value| {
-            try jw.objectField("max_chunks_per_doc");
             try jw.write(value);
         }
         try jw.endObject();
@@ -4377,19 +4350,10 @@ pub const CohereRerankerConfig = struct {
 pub const ConfidenceStepConfig = struct {
     /// Enable confidence scoring
     enabled: ?bool = null,
-    /// Generator for confidence assessment. If not specified, uses the answer step's generator.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Custom guidance for confidence assessment approach
-    context: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", true },
-        .{ "chain", "chain", true },
-        .{ "context", "context", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -4404,18 +4368,6 @@ pub const ConfidenceStepConfig = struct {
         try jw.beginObject();
         if (self.enabled) |value| {
             try jw.objectField("enabled");
-            try jw.write(value);
-        }
-        if (self.generator) |value| {
-            try jw.objectField("generator");
-            try jw.write(value);
-        }
-        if (self.chain) |value| {
-            try jw.objectField("chain");
-            try jw.write(value);
-        }
-        if (self.context) |value| {
-            try jw.objectField("context");
             try jw.write(value);
         }
         try jw.endObject();
@@ -5394,7 +5346,7 @@ pub const CreateTableRequest = struct {
     description: ?[]const u8 = null,
     /// Map of index name to create-index configuration. The map key owns the index name; do not repeat `name` inside the configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
     indexes: ?std.json.ArrayHashMap(CreateIndexRequest) = null,
-    /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field` - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl_duration": "7d", "ttl_field": "_timestamp", "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
+    /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration with a `ttl` policy - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl": {"duration": "7d", "field": "_timestamp"}, "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
     schema: ?TableSchema = null,
     /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
     replication_sources: ?[]const ReplicationSource = null,
@@ -22293,17 +22245,15 @@ pub const MergeProfile = struct {
     }
 };
 
-/// Merge strategy for combining results from the semantic_search and full_text_search. rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores failover: Use full_text_search if embedding generation fails
+/// Merge strategy for combining results from the semantic_search and full_text_search. rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores
 pub const MergeStrategy = enum {
     rrf,
     rsf,
-    failover,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .rrf => "rrf",
             .rsf => "rsf",
-            .failover => "failover",
         };
         try jw.write(s);
     }
@@ -22316,7 +22266,6 @@ pub const MergeStrategy = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "rrf", .rrf },
             .{ "rsf", .rsf },
-            .{ "failover", .failover },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -25907,16 +25856,16 @@ pub const RerankerConfig = struct {
     field: ?[]const u8 = null,
     /// Handlebars template to render document text for reranking.
     template: ?[]const u8 = null,
+    /// Maximum number of highest-ranked retrieval candidates to send to the reranker. Defaults to all candidates returned by retrieval; candidates outside this window are not returned.
+    candidate_count: ?i64 = null,
+    /// Number of reranked documents to return after candidate_count documents have been scored. Defaults to candidate_count and cannot exceed it.
+    top_n: ?i64 = null,
     /// The name of the reranking model (e.g., cross-encoder model name).
     model: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
     api_key: ?[]const u8 = null,
-    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
-    top_n: ?i64 = null,
-    /// Maximum number of chunks per document for long document handling.
-    max_chunks_per_doc: ?i64 = null,
     /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
     /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
@@ -25924,14 +25873,14 @@ pub const RerankerConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "provider", "provider", false },
+        .{ "provider", "provider", true },
         .{ "field", "field", true },
         .{ "template", "template", true },
+        .{ "candidate_count", "candidate_count", true },
+        .{ "top_n", "top_n", true },
         .{ "model", "model", true },
         .{ "url", "url", true },
         .{ "api_key", "api_key", true },
-        .{ "top_n", "top_n", true },
-        .{ "max_chunks_per_doc", "max_chunks_per_doc", true },
         .{ "project_id", "project_id", true },
         .{ "credentials_path", "credentials_path", true },
     };
@@ -25956,6 +25905,14 @@ pub const RerankerConfig = struct {
             try jw.objectField("template");
             try jw.write(value);
         }
+        if (self.candidate_count) |value| {
+            try jw.objectField("candidate_count");
+            try jw.write(value);
+        }
+        if (self.top_n) |value| {
+            try jw.objectField("top_n");
+            try jw.write(value);
+        }
         if (self.model) |value| {
             try jw.objectField("model");
             try jw.write(value);
@@ -25966,14 +25923,6 @@ pub const RerankerConfig = struct {
         }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.top_n) |value| {
-            try jw.objectField("top_n");
-            try jw.write(value);
-        }
-        if (self.max_chunks_per_doc) |value| {
-            try jw.objectField("max_chunks_per_doc");
             try jw.write(value);
         }
         if (self.project_id) |value| {
@@ -29431,9 +29380,11 @@ pub const TableSchema = struct {
     enforce_types: ?bool = null,
     /// A map of type names to their document json schemas.
     document_schemas: ?std.json.ArrayHashMap(DocumentSchema) = null,
-    /// The field containing the timestamp for TTL expiration (optional). Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
+    /// Automatic document expiration. Set this object to enable TTL and set it to null to disable an existing TTL policy.
+    ttl: OpenApiOptionalNullable(TtlConfig) = .absent,
+    /// Deprecated compatibility alias for `ttl.field`. Cannot be combined with `ttl`.
     ttl_field: ?[]const u8 = null,
-    /// The duration after which documents should expire, based on the ttl_field timestamp (optional). Uses integer duration components with `ns`, `us`, `ms`, `s`, `m`, `h`, or `d` units (for example, `90m`, `1h30m`, or `7d`).
+    /// Deprecated compatibility alias for `ttl.duration`. Cannot be combined with `ttl`.
     ttl_duration: ?[]const u8 = null,
     /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
     dynamic_templates: ?[]const DynamicTemplate = null,
@@ -29444,6 +29395,7 @@ pub const TableSchema = struct {
         .{ "default_type", "default_type", true },
         .{ "enforce_types", "enforce_types", true },
         .{ "document_schemas", "document_schemas", true },
+        .{ "ttl", "ttl", false },
         .{ "ttl_field", "ttl_field", true },
         .{ "ttl_duration", "ttl_duration", true },
         .{ "dynamic_templates", "dynamic_templates", true },
@@ -29474,6 +29426,17 @@ pub const TableSchema = struct {
         if (self.document_schemas) |value| {
             try jw.objectField("document_schemas");
             try jw.write(value);
+        }
+        switch (self.ttl) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("ttl");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("ttl");
+                try jw.write(value);
+            },
         }
         if (self.ttl_field) |value| {
             try jw.objectField("ttl_field");
@@ -31122,6 +31085,39 @@ pub const TreeSearchConfig = struct {
     }
 };
 
+/// Automatic document-expiration policy for a table.
+pub const TtlConfig = struct {
+    /// Expiration duration using Antfly's integer-component duration format. Supported units are `ns`, `us`, `ms`, `s`, `m`, `h`, and `d`; examples include `90m`, `1h30m`, and `7d`.
+    duration: []const u8,
+    /// Timestamp field used as the expiration reference.
+    field: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "duration", "duration", false },
+        .{ "field", "field", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("duration");
+        try jw.write(self.duration);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity.
 pub const UnsupportedHierarchyGroupingError = struct {
     status: i32,
@@ -31389,21 +31385,20 @@ pub const VertexGeneratorConfig = struct {
 
 /// Configuration for the Google Vertex AI Ranking API. Uses Application Default Credentials (ADC) or explicit credentials path. **Prerequisites:** - Enable Discovery Engine API: `gcloud services enable discoveryengine.googleapis.com` - Grant IAM role: `roles/discoveryengine.admin` (includes `discoveryengine.rankingConfigs.rank` permission) **Models:** semantic-ranker-default@latest (default), semantic-ranker-fast-004 **Docs:** https://cloud.google.com/generative-ai-app-builder/docs/ranking **IAM:** https://cloud.google.com/generative-ai-app-builder/docs/access-control
 pub const VertexRerankerConfig = struct {
+    provider: []const u8,
     /// The ranking model to use.
     model: []const u8,
     /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
     /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
     credentials_path: ?[]const u8 = null,
-    /// Maximum number of records to return. If not specified, returns all documents with scores.
-    top_n: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "project_id", "project_id", true },
         .{ "credentials_path", "credentials_path", true },
-        .{ "top_n", "top_n", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -31416,6 +31411,8 @@ pub const VertexRerankerConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.project_id) |value| {
@@ -31424,10 +31421,6 @@ pub const VertexRerankerConfig = struct {
         }
         if (self.credentials_path) |value| {
             try jw.objectField("credentials_path");
-            try jw.write(value);
-        }
-        if (self.top_n) |value| {
-            try jw.objectField("top_n");
             try jw.write(value);
         }
         try jw.endObject();

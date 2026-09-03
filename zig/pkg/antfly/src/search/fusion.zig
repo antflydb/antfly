@@ -26,7 +26,7 @@ const Allocator = std.mem.Allocator;
 // Types
 // ============================================================================
 
-pub const FusionStrategy = enum { rrf, rsf, failover };
+pub const FusionStrategy = enum { rrf, rsf };
 
 pub const FusionConfig = struct {
     strategy: FusionStrategy = .rrf,
@@ -70,7 +70,7 @@ pub const FusionHit = struct {
 /// Caller owns the returned slice and all nested allocations (use freeHits).
 pub fn fuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig) ![]FusionHit {
     return switch (config.strategy) {
-        .rrf, .failover => rrfFuse(alloc, results, config),
+        .rrf => rrfFuse(alloc, results, config),
         .rsf => rsfFuse(alloc, results, config),
     };
 }

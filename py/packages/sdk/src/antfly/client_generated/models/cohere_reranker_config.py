@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.cohere_reranker_config_provider import CohereRerankerConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="CohereRerankerConfig")
@@ -25,61 +26,50 @@ class CohereRerankerConfig:
             {'provider': 'cohere', 'model': 'rerank-english-v3.0'}
 
         Attributes:
+            provider (CohereRerankerConfigProvider):
             model (str): The name of the Cohere reranking model to use. Default: 'rerank-english-v3.0'. Example: rerank-
                 english-v3.0.
             api_key (str | Unset): The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
-            top_n (int | Unset): Number of most relevant documents to return. If not specified, returns all documents with
-                scores.
-            max_chunks_per_doc (int | Unset): Maximum number of chunks per document for long document handling.
     """
 
+    provider: CohereRerankerConfigProvider
     model: str = "rerank-english-v3.0"
     api_key: str | Unset = UNSET
-    top_n: int | Unset = UNSET
-    max_chunks_per_doc: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         api_key = self.api_key
-
-        top_n = self.top_n
-
-        max_chunks_per_doc = self.max_chunks_per_doc
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
         if api_key is not UNSET:
             field_dict["api_key"] = api_key
-        if top_n is not UNSET:
-            field_dict["top_n"] = top_n
-        if max_chunks_per_doc is not UNSET:
-            field_dict["max_chunks_per_doc"] = max_chunks_per_doc
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = CohereRerankerConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         api_key = d.pop("api_key", UNSET)
 
-        top_n = d.pop("top_n", UNSET)
-
-        max_chunks_per_doc = d.pop("max_chunks_per_doc", UNSET)
-
         cohere_reranker_config = cls(
+            provider=provider,
             model=model,
             api_key=api_key,
-            top_n=top_n,
-            max_chunks_per_doc=max_chunks_per_doc,
         )
 
         cohere_reranker_config.additional_properties = d

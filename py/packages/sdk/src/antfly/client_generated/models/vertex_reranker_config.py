@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.vertex_reranker_config_provider import VertexRerankerConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="VertexRerankerConfig")
@@ -31,6 +32,7 @@ class VertexRerankerConfig:
             {'provider': 'vertex', 'model': 'semantic-ranker-default@latest', 'project_id': 'my-gcp-project'}
 
         Attributes:
+            provider (VertexRerankerConfigProvider):
             model (str): The ranking model to use. Default: 'semantic-ranker-default@latest'. Example: semantic-ranker-
                 default@latest.
             project_id (str | Unset): Google Cloud project ID. Shared Vertex credential field; see
@@ -38,28 +40,28 @@ class VertexRerankerConfig:
             credentials_path (str | Unset): Path to service account JSON file. Shared Vertex credential field; see
                 vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment
                 variable.
-            top_n (int | Unset): Maximum number of records to return. If not specified, returns all documents with scores.
     """
 
+    provider: VertexRerankerConfigProvider
     model: str = "semantic-ranker-default@latest"
     project_id: str | Unset = UNSET
     credentials_path: str | Unset = UNSET
-    top_n: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         project_id = self.project_id
 
         credentials_path = self.credentials_path
 
-        top_n = self.top_n
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -67,27 +69,25 @@ class VertexRerankerConfig:
             field_dict["project_id"] = project_id
         if credentials_path is not UNSET:
             field_dict["credentials_path"] = credentials_path
-        if top_n is not UNSET:
-            field_dict["top_n"] = top_n
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = VertexRerankerConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         project_id = d.pop("project_id", UNSET)
 
         credentials_path = d.pop("credentials_path", UNSET)
 
-        top_n = d.pop("top_n", UNSET)
-
         vertex_reranker_config = cls(
+            provider=provider,
             model=model,
             project_id=project_id,
             credentials_path=credentials_path,
-            top_n=top_n,
         )
 
         vertex_reranker_config.additional_properties = d

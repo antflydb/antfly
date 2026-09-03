@@ -395,9 +395,11 @@ pub const TableSchema = struct {
     enforce_types: ?bool = null,
     /// A map of type names to their document json schemas.
     document_schemas: ?std.json.ArrayHashMap(DocumentSchema) = null,
-    /// The field containing the timestamp for TTL expiration (optional). Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
+    /// Automatic document expiration. Set this object to enable TTL and set it to null to disable an existing TTL policy.
+    ttl: OpenApiOptionalNullable(TtlConfig) = .absent,
+    /// Deprecated compatibility alias for `ttl.field`. Cannot be combined with `ttl`.
     ttl_field: ?[]const u8 = null,
-    /// The duration after which documents should expire, based on the ttl_field timestamp (optional). Uses integer duration components with `ns`, `us`, `ms`, `s`, `m`, `h`, or `d` units (for example, `90m`, `1h30m`, or `7d`).
+    /// Deprecated compatibility alias for `ttl.duration`. Cannot be combined with `ttl`.
     ttl_duration: ?[]const u8 = null,
     /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
     dynamic_templates: ?[]const DynamicTemplate = null,
@@ -408,6 +410,7 @@ pub const TableSchema = struct {
         .{ "default_type", "default_type", true },
         .{ "enforce_types", "enforce_types", true },
         .{ "document_schemas", "document_schemas", true },
+        .{ "ttl", "ttl", false },
         .{ "ttl_field", "ttl_field", true },
         .{ "ttl_duration", "ttl_duration", true },
         .{ "dynamic_templates", "dynamic_templates", true },
@@ -438,6 +441,17 @@ pub const TableSchema = struct {
         if (self.document_schemas) |value| {
             try jw.objectField("document_schemas");
             try jw.write(value);
+        }
+        switch (self.ttl) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("ttl");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("ttl");
+                try jw.write(value);
+            },
         }
         if (self.ttl_field) |value| {
             try jw.objectField("ttl_field");
@@ -523,6 +537,84 @@ pub const TemplateFieldMapping = struct {
         try jw.endObject();
     }
 };
+
+/// Automatic document-expiration policy for a table.
+pub const TtlConfig = struct {
+    /// Expiration duration using Antfly's integer-component duration format. Supported units are `ns`, `us`, `ms`, `s`, `m`, `h`, and `d`; examples include `90m`, `1h30m`, and `7d`.
+    duration: []const u8,
+    /// Timestamp field used as the expiration reference.
+    field: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "duration", "duration", false },
+        .{ "field", "field", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("duration");
+        try jw.write(self.duration);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+            if (source == .null) return .null_value;
+            return .{ .value = try std.json.parseFromValueLeaky(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}
 
 /// Parse an OpenAPI object without materializing a second JSON tree while
 /// rejecting explicit null for optional properties whose schemas are non-nullable.

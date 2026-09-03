@@ -7667,17 +7667,15 @@ pub const MergeConfig = struct {
     }
 };
 
-/// Merge strategy for combining results from the semantic_search and full_text_search. rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores failover: Use full_text_search if embedding generation fails
+/// Merge strategy for combining results from the semantic_search and full_text_search. rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores
 pub const MergeStrategy = enum {
     rrf,
     rsf,
-    failover,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .rrf => "rrf",
             .rsf => "rsf",
-            .failover => "failover",
         };
         try jw.write(s);
     }
@@ -7690,7 +7688,6 @@ pub const MergeStrategy = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "rrf", .rrf },
             .{ "rsf", .rsf },
-            .{ "failover", .failover },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

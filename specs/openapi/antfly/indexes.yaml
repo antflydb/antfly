@@ -1943,13 +1943,11 @@ components:
       enum:
         - rrf
         - rsf
-        - failover
       default: rrf
       description: |
         Merge strategy for combining results from the semantic_search and full_text_search.
         rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
         rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores
-        failover: Use full_text_search if embedding generation fails
     MergeConfig:
       type: object
       description: Configuration for result fusion when combining multiple search indexes.

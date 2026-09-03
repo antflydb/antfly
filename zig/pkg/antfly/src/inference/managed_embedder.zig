@@ -48,6 +48,7 @@ const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const enrichment_types = @import("../storage/db/enrichment/enrichment_types.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
+const shared_vector = @import("antfly_vector").vector;
 
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
@@ -1677,7 +1678,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         return try out.toOwnedSlice(alloc);
     }
 
-    const metric = if (cfg.distance_metric) |distance_metric| @tagName(distance_metric) else "l2_squared";
+    const metric = if (cfg.distance_metric) |distance_metric| @tagName(distance_metric) else @tagName(shared_vector.default_distance_metric);
 
     const embedder_value = root.get("embedder");
     const embedder_json = if (embedder_value) |embedder| blk: {

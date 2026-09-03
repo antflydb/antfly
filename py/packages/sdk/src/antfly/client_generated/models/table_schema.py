@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.dynamic_template import DynamicTemplate
     from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
+    from ..models.ttl_config import TtlConfig
 
 
 T = TypeVar("T", bound="TableSchema")
@@ -27,12 +28,10 @@ class TableSchema:
         enforce_types (bool | Unset): Whether to enforce that documents must match one of the provided document types.
             If false, documents not matching any type will be accepted but not indexed.
         document_schemas (TableSchemaDocumentSchemas | Unset): A map of type names to their document json schemas.
-        ttl_field (str | Unset): The field containing the timestamp for TTL expiration (optional).
-            Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
-        ttl_duration (str | Unset): The duration after which documents should expire, based on the ttl_field timestamp
-            (optional).
-            Uses integer duration components with `ns`, `us`, `ms`, `s`, `m`, `h`,
-            or `d` units (for example, `90m`, `1h30m`, or `7d`).
+        ttl (None | TtlConfig | Unset): Automatic document expiration. Set this object to enable TTL and
+            set it to null to disable an existing TTL policy.
+        ttl_field (str | Unset): Deprecated compatibility alias for `ttl.field`. Cannot be combined with `ttl`.
+        ttl_duration (str | Unset): Deprecated compatibility alias for `ttl.duration`. Cannot be combined with `ttl`.
         dynamic_templates (list[DynamicTemplate] | Unset): Rules for mapping dynamically detected fields. When a
             document contains fields
             that don't have explicit mappings and dynamic mapping is enabled, templates are
@@ -43,12 +42,15 @@ class TableSchema:
     default_type: str | Unset = UNSET
     enforce_types: bool | Unset = UNSET
     document_schemas: TableSchemaDocumentSchemas | Unset = UNSET
+    ttl: None | TtlConfig | Unset = UNSET
     ttl_field: str | Unset = UNSET
     ttl_duration: str | Unset = UNSET
     dynamic_templates: list[DynamicTemplate] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.ttl_config import TtlConfig
+
         version = self.version
 
         default_type = self.default_type
@@ -58,6 +60,14 @@ class TableSchema:
         document_schemas: dict[str, Any] | Unset = UNSET
         if not isinstance(self.document_schemas, Unset):
             document_schemas = self.document_schemas.to_dict()
+
+        ttl: dict[str, Any] | None | Unset
+        if isinstance(self.ttl, Unset):
+            ttl = UNSET
+        elif isinstance(self.ttl, TtlConfig):
+            ttl = self.ttl.to_dict()
+        else:
+            ttl = self.ttl
 
         ttl_field = self.ttl_field
 
@@ -81,6 +91,8 @@ class TableSchema:
             field_dict["enforce_types"] = enforce_types
         if document_schemas is not UNSET:
             field_dict["document_schemas"] = document_schemas
+        if ttl is not UNSET:
+            field_dict["ttl"] = ttl
         if ttl_field is not UNSET:
             field_dict["ttl_field"] = ttl_field
         if ttl_duration is not UNSET:
@@ -94,6 +106,7 @@ class TableSchema:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.dynamic_template import DynamicTemplate
         from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
+        from ..models.ttl_config import TtlConfig
 
         d = dict(src_dict)
         version = d.pop("version", UNSET)
@@ -108,6 +121,23 @@ class TableSchema:
             document_schemas = UNSET
         else:
             document_schemas = TableSchemaDocumentSchemas.from_dict(_document_schemas)
+
+        def _parse_ttl(data: object) -> None | TtlConfig | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                ttl_type_1 = TtlConfig.from_dict(data)
+
+                return ttl_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | TtlConfig | Unset, data)
+
+        ttl = _parse_ttl(d.pop("ttl", UNSET))
 
         ttl_field = d.pop("ttl_field", UNSET)
 
@@ -127,6 +157,7 @@ class TableSchema:
             default_type=default_type,
             enforce_types=enforce_types,
             document_schemas=document_schemas,
+            ttl=ttl,
             ttl_field=ttl_field,
             ttl_duration=ttl_duration,
             dynamic_templates=dynamic_templates,

@@ -649,9 +649,8 @@ const (
 	ChunkerProviderAntfly      = oapi.ChunkerProviderAntfly
 
 	// MergeStrategy values
-	MergeStrategyRrf      = oapi.MergeStrategyRrf
-	MergeStrategyRsf      = oapi.MergeStrategyRsf
-	MergeStrategyFailover = oapi.MergeStrategyFailover
+	MergeStrategyRrf = oapi.MergeStrategyRrf
+	MergeStrategyRsf = oapi.MergeStrategyRsf
 
 	// LinearMergePageStatus values
 	LinearMergePageStatusSuccess = oapi.LinearMergePageStatusSuccess

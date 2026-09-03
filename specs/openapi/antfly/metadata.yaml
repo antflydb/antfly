@@ -317,12 +317,12 @@ tags:
 
       ### Basic Configuration
 
-      Configure TTL when creating a table using `ttl_duration`:
+      Configure TTL when creating a table using a `ttl` policy:
 
       ```json
       {
         "name": "sessions",
-        "ttl_duration": "24h",
+        "ttl": {"duration": "24h"},
         "document_schemas": {
           "session": {
             "schema": {
@@ -351,8 +351,10 @@ tags:
       ```json
       {
         "name": "events",
-        "ttl_duration": "7d",
-        "ttl_field": "created_at",
+        "ttl": {
+          "duration": "7d",
+          "field": "created_at"
+        },
         "document_schemas": {
           "event": {
             "schema": {
@@ -375,7 +377,8 @@ tags:
 
       ### Duration Format
 
-      TTL durations use Go duration format:
+      TTL durations use Antfly's integer-component duration format. Supported
+      units are `ns`, `us`, `ms`, `s`, `m`, `h`, and `d`:
       - `30s` - 30 seconds
       - `5m` - 5 minutes
       - `24h` - 24 hours
@@ -387,8 +390,7 @@ tags:
       **Session Management:**
       ```json
       {
-        "ttl_duration": "1h",
-        "ttl_field": "last_accessed"
+        "ttl": {"duration": "1h", "field": "last_accessed"}
       }
       ```
       Sessions expire 1 hour after `last_accessed`. Update the timestamp on each access to extend the session.
@@ -396,7 +398,7 @@ tags:
       **Temporary Caching:**
       ```json
       {
-        "ttl_duration": "24h"
+        "ttl": {"duration": "24h"}
       }
       ```
       Cache entries expire 24 hours after insertion.
@@ -404,7 +406,7 @@ tags:
       **Log Rotation:**
       ```json
       {
-        "ttl_duration": "30d"
+        "ttl": {"duration": "30d"}
       }
       ```
       Logs are automatically deleted after 30 days.
@@ -439,17 +441,17 @@ tags:
       ### Modifying TTL Configuration
 
       **Adding TTL to existing table:**
-      - Update schema with `ttl_duration` field
+      - Update the schema with a `ttl` policy
       - Applies retroactively to all documents
       - Documents already expired are marked for immediate deletion
 
       **Removing TTL:**
-      - Set `ttl_duration` to empty string
+      - Set `ttl` to `null`
       - All expiration processing stops
       - Previously expired documents remain
 
       **Changing duration:**
-      - Update schema with new `ttl_duration`
+      - Update `ttl.duration`
       - New duration applies immediately to all documents
       - Expiration recalculated using existing timestamps
 
@@ -686,7 +688,6 @@ tags:
       Choose how full-text and semantic results are combined:
       - `rrf` (default): Reciprocal Rank Fusion - balanced, works well in most cases
       - `rsf`: Relative Score Fusion - normalizes and weights scores differently
-      - `failover`: Use full-text if embedding generation fails
 
       ### 5. Query Filtering
       Use `filter_query` and `filter_prefix` to pre-filter before scoring, improving
@@ -1224,21 +1225,6 @@ tags:
          - Retries stop after max attempts
          - Document remains in table without enrichment
 
-      **Fallback Strategy:**
-
-      For critical workloads, use the `failover` merge strategy to fall back to full-text search
-      when embedding generation fails:
-
-      ```json
-      {
-        "full_text_search": {"query": "search term"},
-        "semantic_search": "search term",
-        "merge_config": {"strategy": "failover"}
-      }
-      ```
-
-      This ensures queries always return results even if embeddings are unavailable.
-
       ### Changing Index Configuration
 
       To change index configuration:
@@ -1302,9 +1288,9 @@ tags:
       ### Edge TTL vs Document TTL
 
       **Document TTL** (table-level):
-      - Configured via `ttl_duration` in table schema
+      - Configured via the `ttl` policy in the table schema
       - Applies to all documents in the table
-      - Uses `_timestamp` or custom `ttl_field`
+      - Uses `_timestamp` or a custom `ttl.field`
 
       **Edge TTL** (index-level):
       - Configured via `ttl_duration` in graph index config
@@ -1314,7 +1300,7 @@ tags:
 
       ### Duration Format
 
-      Edge TTL uses the same Go duration format as document TTL:
+      Edge TTL uses the same Antfly integer-component duration format as document TTL:
       - `30s` - 30 seconds
       - `5m` - 5 minutes
       - `24h` - 24 hours
@@ -3881,15 +3867,14 @@ components:
 
             **Schema Features:**
             - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions
-            - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field`
+            - **Document TTL**: Configure automatic expiration with a `ttl` policy
             - **Primary Keys**: Specify unique identifier fields
             - **Validation**: Enforce schema constraints on writes
 
             **TTL Example:**
             ```json
             {
-              "ttl_duration": "7d",
-              "ttl_field": "_timestamp",
+              "ttl": {"duration": "7d", "field": "_timestamp"},
               "document_schemas": {...}
             }
             ```

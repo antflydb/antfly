@@ -168,28 +168,19 @@ pub const ClarificationRequest = struct {
 pub const ClassificationStepConfig = struct {
     /// Enable query classification and strategy selection
     enabled: ?bool = null,
-    /// Generator to use for classification. If not specified, uses the default summarizer.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
     /// Include pre-retrieval reasoning explaining query analysis and strategy selection
     with_reasoning: ?bool = null,
     /// Override LLM strategy selection. If not set, the LLM chooses optimal strategy.
     force_strategy: ?QueryStrategy = null,
     /// Override semantic query mode selection.
     force_semantic_mode: ?SemanticQueryMode = null,
-    /// Number of alternative query phrasings to generate
-    multi_phrase_count: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", true },
-        .{ "chain", "chain", true },
         .{ "with_reasoning", "with_reasoning", true },
         .{ "force_strategy", "force_strategy", true },
         .{ "force_semantic_mode", "force_semantic_mode", true },
-        .{ "multi_phrase_count", "multi_phrase_count", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -206,14 +197,6 @@ pub const ClassificationStepConfig = struct {
             try jw.objectField("enabled");
             try jw.write(value);
         }
-        if (self.generator) |value| {
-            try jw.objectField("generator");
-            try jw.write(value);
-        }
-        if (self.chain) |value| {
-            try jw.objectField("chain");
-            try jw.write(value);
-        }
         if (self.with_reasoning) |value| {
             try jw.objectField("with_reasoning");
             try jw.write(value);
@@ -224,10 +207,6 @@ pub const ClassificationStepConfig = struct {
         }
         if (self.force_semantic_mode) |value| {
             try jw.objectField("force_semantic_mode");
-            try jw.write(value);
-        }
-        if (self.multi_phrase_count) |value| {
-            try jw.objectField("multi_phrase_count");
             try jw.write(value);
         }
         try jw.endObject();
@@ -314,19 +293,10 @@ pub const ClassificationTransformationResult = struct {
 pub const ConfidenceStepConfig = struct {
     /// Enable confidence scoring
     enabled: ?bool = null,
-    /// Generator for confidence assessment. If not specified, uses the answer step's generator.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Custom guidance for confidence assessment approach
-    context: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", true },
-        .{ "chain", "chain", true },
-        .{ "context", "context", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -341,18 +311,6 @@ pub const ConfidenceStepConfig = struct {
         try jw.beginObject();
         if (self.enabled) |value| {
             try jw.objectField("enabled");
-            try jw.write(value);
-        }
-        if (self.generator) |value| {
-            try jw.objectField("generator");
-            try jw.write(value);
-        }
-        if (self.chain) |value| {
-            try jw.objectField("chain");
-            try jw.write(value);
-        }
-        if (self.context) |value| {
-            try jw.objectField("context");
             try jw.write(value);
         }
         try jw.endObject();
@@ -470,7 +428,7 @@ pub const GenerationStepConfig = struct {
     /// Enable generation from retrieved documents
     enabled: ?bool = null,
     /// Generator to use for generation. If not specified, uses the default summarizer.
-    generator: ?GeneratorConfig = null,
+    generator: ?antfly_generating_openapi.GeneratorConfig = null,
     /// Chain of generators to try in order. Mutually exclusive with 'generator'.
     chain: ?[]const ChainLink = null,
     /// Custom system prompt for answer generation
@@ -481,7 +439,7 @@ pub const GenerationStepConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", true },
+        .{ "generator", "generator", false },
         .{ "chain", "chain", true },
         .{ "system_prompt", "system_prompt", true },
         .{ "generation_context", "generation_context", true },
@@ -504,6 +462,9 @@ pub const GenerationStepConfig = struct {
         if (self.generator) |value| {
             try jw.objectField("generator");
             try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("generator");
+            try jw.write(@as(?u8, null));
         }
         if (self.chain) |value| {
             try jw.objectField("chain");
@@ -518,139 +479,6 @@ pub const GenerationStepConfig = struct {
             try jw.write(value);
         }
         try jw.endObject();
-    }
-};
-
-/// Generator configuration accepted by retrieval and query-builder agents.
-pub const GeneratorConfig = struct {
-    provider: GeneratorProvider,
-    /// The model name or identifier.
-    model: ?[]const u8 = null,
-    temperature: ?f32 = null,
-    max_tokens: ?i64 = null,
-    top_p: ?f32 = null,
-    top_k: ?i64 = null,
-    api_key: ?[]const u8 = null,
-    url: ?[]const u8 = null,
-    api_url: ?[]const u8 = null,
-    project_id: ?[]const u8 = null,
-    location: ?[]const u8 = null,
-    credentials_path: ?[]const u8 = null,
-    timeout: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "provider", "provider", false },
-        .{ "model", "model", true },
-        .{ "temperature", "temperature", true },
-        .{ "max_tokens", "max_tokens", true },
-        .{ "top_p", "top_p", true },
-        .{ "top_k", "top_k", true },
-        .{ "api_key", "api_key", true },
-        .{ "url", "url", true },
-        .{ "api_url", "api_url", true },
-        .{ "project_id", "project_id", true },
-        .{ "location", "location", true },
-        .{ "credentials_path", "credentials_path", true },
-        .{ "timeout", "timeout", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("provider");
-        try jw.write(self.provider);
-        if (self.model) |value| {
-            try jw.objectField("model");
-            try jw.write(value);
-        }
-        if (self.temperature) |value| {
-            try jw.objectField("temperature");
-            try jw.write(value);
-        }
-        if (self.max_tokens) |value| {
-            try jw.objectField("max_tokens");
-            try jw.write(value);
-        }
-        if (self.top_p) |value| {
-            try jw.objectField("top_p");
-            try jw.write(value);
-        }
-        if (self.top_k) |value| {
-            try jw.objectField("top_k");
-            try jw.write(value);
-        }
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.url) |value| {
-            try jw.objectField("url");
-            try jw.write(value);
-        }
-        if (self.api_url) |value| {
-            try jw.objectField("api_url");
-            try jw.write(value);
-        }
-        if (self.project_id) |value| {
-            try jw.objectField("project_id");
-            try jw.write(value);
-        }
-        if (self.location) |value| {
-            try jw.objectField("location");
-            try jw.write(value);
-        }
-        if (self.credentials_path) |value| {
-            try jw.objectField("credentials_path");
-            try jw.write(value);
-        }
-        if (self.timeout) |value| {
-            try jw.objectField("timeout");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// Generator providers executable by retrieval and query-builder agents.
-pub const GeneratorProvider = enum {
-    gemini,
-    vertex,
-    ollama,
-    openai,
-    antfly,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .gemini => "gemini",
-            .vertex => "vertex",
-            .ollama => "ollama",
-            .openai => "openai",
-            .antfly => "antfly",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "gemini", .gemini },
-            .{ "vertex", .vertex },
-            .{ "ollama", .ollama },
-            .{ "openai", .openai },
-            .{ "antfly", .antfly },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 

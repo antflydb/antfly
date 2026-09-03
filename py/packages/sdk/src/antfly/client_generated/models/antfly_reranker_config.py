@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.antfly_reranker_config_provider import AntflyRerankerConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="AntflyRerankerConfig")
@@ -19,16 +20,20 @@ class AntflyRerankerConfig:
         {'provider': 'antfly', 'model': 'mixedbread-ai/mxbai-rerank-base-v1', 'url': 'http://localhost:8080'}
 
     Attributes:
+        provider (AntflyRerankerConfigProvider):
         model (str): The name of the reranking model (e.g., cross-encoder model name).
         url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment
             variable.
     """
 
+    provider: AntflyRerankerConfigProvider
     model: str
     url: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         url = self.url
@@ -37,6 +42,7 @@ class AntflyRerankerConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -48,11 +54,14 @@ class AntflyRerankerConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = AntflyRerankerConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         url = d.pop("url", UNSET)
 
         antfly_reranker_config = cls(
+            provider=provider,
             model=model,
             url=url,
         )

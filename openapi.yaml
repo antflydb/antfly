@@ -408,14 +408,14 @@ tags:
       ### Basic Configuration
 
 
-      Configure TTL when creating a table using `ttl_duration`:
+      Configure TTL when creating a table using a `ttl` policy:
 
 
       ```json
 
       {
         "name": "sessions",
-        "ttl_duration": "24h",
+        "ttl": {"duration": "24h"},
         "document_schemas": {
           "session": {
             "schema": {
@@ -455,8 +455,10 @@ tags:
 
       {
         "name": "events",
-        "ttl_duration": "7d",
-        "ttl_field": "created_at",
+        "ttl": {
+          "duration": "7d",
+          "field": "created_at"
+        },
         "document_schemas": {
           "event": {
             "schema": {
@@ -486,7 +488,9 @@ tags:
       ### Duration Format
 
 
-      TTL durations use Go duration format:
+      TTL durations use Antfly's integer-component duration format. Supported
+
+      units are `ns`, `us`, `ms`, `s`, `m`, `h`, and `d`:
 
       - `30s` - 30 seconds
 
@@ -507,8 +511,7 @@ tags:
       ```json
 
       {
-        "ttl_duration": "1h",
-        "ttl_field": "last_accessed"
+        "ttl": {"duration": "1h", "field": "last_accessed"}
       }
 
       ```
@@ -522,7 +525,7 @@ tags:
       ```json
 
       {
-        "ttl_duration": "24h"
+        "ttl": {"duration": "24h"}
       }
 
       ```
@@ -535,7 +538,7 @@ tags:
       ```json
 
       {
-        "ttl_duration": "30d"
+        "ttl": {"duration": "30d"}
       }
 
       ```
@@ -596,7 +599,7 @@ tags:
 
       **Adding TTL to existing table:**
 
-      - Update schema with `ttl_duration` field
+      - Update the schema with a `ttl` policy
 
       - Applies retroactively to all documents
 
@@ -605,7 +608,7 @@ tags:
 
       **Removing TTL:**
 
-      - Set `ttl_duration` to empty string
+      - Set `ttl` to `null`
 
       - All expiration processing stops
 
@@ -614,7 +617,7 @@ tags:
 
       **Changing duration:**
 
-      - Update schema with new `ttl_duration`
+      - Update `ttl.duration`
 
       - New duration applies immediately to all documents
 
@@ -985,8 +988,6 @@ tags:
       - `rrf` (default): Reciprocal Rank Fusion - balanced, works well in most cases
 
       - `rsf`: Relative Score Fusion - normalizes and weights scores differently
-
-      - `failover`: Use full-text if embedding generation fails
 
 
       ### 5. Query Filtering
@@ -1754,28 +1755,6 @@ tags:
          - Retries stop after max attempts
          - Document remains in table without enrichment
 
-      **Fallback Strategy:**
-
-
-      For critical workloads, use the `failover` merge strategy to fall back to full-text search
-
-      when embedding generation fails:
-
-
-      ```json
-
-      {
-        "full_text_search": {"query": "search term"},
-        "semantic_search": "search term",
-        "merge_config": {"strategy": "failover"}
-      }
-
-      ```
-
-
-      This ensures queries always return results even if embeddings are unavailable.
-
-
       ### Changing Index Configuration
 
 
@@ -1879,11 +1858,11 @@ tags:
 
       **Document TTL** (table-level):
 
-      - Configured via `ttl_duration` in table schema
+      - Configured via the `ttl` policy in the table schema
 
       - Applies to all documents in the table
 
-      - Uses `_timestamp` or custom `ttl_field`
+      - Uses `_timestamp` or a custom `ttl.field`
 
 
       **Edge TTL** (index-level):
@@ -1900,7 +1879,7 @@ tags:
       ### Duration Format
 
 
-      Edge TTL uses the same Go duration format as document TTL:
+      Edge TTL uses the same Antfly integer-component duration format as document TTL:
 
       - `30s` - 30 seconds
 
@@ -10735,7 +10714,7 @@ components:
 
             - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions
 
-            - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field`
+            - **Document TTL**: Configure automatic expiration with a `ttl` policy
 
             - **Primary Keys**: Specify unique identifier fields
 
@@ -10747,8 +10726,7 @@ components:
             ```json
 
             {
-              "ttl_duration": "7d",
-              "ttl_field": "_timestamp",
+              "ttl": {"duration": "7d", "field": "_timestamp"},
               "document_schemas": {...}
             }
 
@@ -19012,6 +18990,26 @@ components:
             This is used to infer indexing rules and field types.
           x-antfly-field-mapping-schema:
             $ref: '#/components/schemas/DocumentFieldMapping'
+    TtlConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - duration
+      description: Automatic document-expiration policy for a table.
+      properties:
+        duration:
+          type: string
+          description: >
+            Expiration duration using Antfly's integer-component duration format.
+
+            Supported units are `ns`, `us`, `ms`, `s`, `m`, `h`, and `d`;
+
+            examples include `90m`, `1h30m`, and `7d`.
+        field:
+          type: string
+          default: _timestamp
+          minLength: 1
+          description: Timestamp field used as the expiration reference.
     TemplateFieldMapping:
       type: object
       additionalProperties: false
@@ -19136,20 +19134,24 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/DocumentSchema'
           description: A map of type names to their document json schemas.
+        ttl:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/TtlConfig'
+          description: >
+            Automatic document expiration. Set this object to enable TTL and
+
+            set it to null to disable an existing TTL policy.
         ttl_field:
           type: string
+          deprecated: true
           description: >
-            The field containing the timestamp for TTL expiration (optional).
-
-            Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
+            Deprecated compatibility alias for `ttl.field`. Cannot be combined with `ttl`.
         ttl_duration:
           type: string
+          deprecated: true
           description: >
-            The duration after which documents should expire, based on the ttl_field timestamp (optional).
-
-            Uses integer duration components with `ns`, `us`, `ms`, `s`, `m`, `h`,
-
-            or `d` units (for example, `90m`, `1h30m`, or `7d`).
+            Deprecated compatibility alias for `ttl.duration`. Cannot be combined with `ttl`.
         dynamic_templates:
           type: array
           items:
@@ -21526,6 +21528,60 @@ components:
             Maximum number of tool call iterations per turn.
 
             Prevents infinite loops in tool execution.
+    QueryStrategy:
+      type: string
+      enum:
+        - simple
+        - decompose
+        - step_back
+        - hyde
+      description: >
+        Strategy for query transformation and retrieval:
+
+        - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries.
+
+        - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part
+        questions.
+
+        - step_back: Generate broader background query first, then specific query. Best for questions
+        needing context.
+
+        - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual
+        questions.
+    SemanticQueryMode:
+      type: string
+      enum:
+        - rewrite
+        - hypothetical
+      description: >
+        Mode for semantic query generation:
+
+        - rewrite: Transform query into expanded keywords/concepts optimized for vector search (Level
+        2 optimization)
+
+        - hypothetical: Generate a hypothetical answer that would appear in relevant documents (HyDE -
+        Level 3 optimization)
+    ClassificationStepConfig:
+      type: object
+      description: >
+        Configuration for the classification step. This step analyzes the query,
+
+        selects the optimal retrieval strategy, and generates semantic transformations.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+          description: Enable query classification and strategy selection
+        with_reasoning:
+          type: boolean
+          default: false
+          description: Include pre-retrieval reasoning explaining query analysis and strategy selection
+        force_strategy:
+          $ref: '#/components/schemas/QueryStrategy'
+          description: Override LLM strategy selection. If not set, the LLM chooses optimal strategy.
+        force_semantic_mode:
+          $ref: '#/components/schemas/SemanticQueryMode'
+          description: Override semantic query mode selection.
     RetryConfig:
       type: object
       description: Retry configuration for generator calls
@@ -21584,74 +21640,6 @@ components:
         condition:
           $ref: '#/components/schemas/ChainCondition'
           description: When to try the next generator in chain
-    QueryStrategy:
-      type: string
-      enum:
-        - simple
-        - decompose
-        - step_back
-        - hyde
-      description: >
-        Strategy for query transformation and retrieval:
-
-        - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries.
-
-        - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part
-        questions.
-
-        - step_back: Generate broader background query first, then specific query. Best for questions
-        needing context.
-
-        - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual
-        questions.
-    SemanticQueryMode:
-      type: string
-      enum:
-        - rewrite
-        - hypothetical
-      description: >
-        Mode for semantic query generation:
-
-        - rewrite: Transform query into expanded keywords/concepts optimized for vector search (Level
-        2 optimization)
-
-        - hypothetical: Generate a hypothetical answer that would appear in relevant documents (HyDE -
-        Level 3 optimization)
-    ClassificationStepConfig:
-      type: object
-      description: >
-        Configuration for the classification step. This step analyzes the query,
-
-        selects the optimal retrieval strategy, and generates semantic transformations.
-      properties:
-        enabled:
-          type: boolean
-          default: false
-          description: Enable query classification and strategy selection
-        generator:
-          $ref: '#/components/schemas/GeneratorConfig'
-          description: Generator to use for classification. If not specified, uses the default summarizer.
-        chain:
-          type: array
-          items:
-            $ref: '#/components/schemas/ChainLink'
-          description: Chain of generators to try in order. Mutually exclusive with 'generator'.
-        with_reasoning:
-          type: boolean
-          default: false
-          description: Include pre-retrieval reasoning explaining query analysis and strategy selection
-        force_strategy:
-          $ref: '#/components/schemas/QueryStrategy'
-          description: Override LLM strategy selection. If not set, the LLM chooses optimal strategy.
-        force_semantic_mode:
-          $ref: '#/components/schemas/SemanticQueryMode'
-          description: Override semantic query mode selection.
-        multi_phrase_count:
-          type: integer
-          default: 3
-          minimum: 1
-          maximum: 10
-          description: Number of alternative query phrasings to generate
     GenerationStepConfig:
       type: object
       description: >
@@ -21706,18 +21694,6 @@ components:
           type: boolean
           default: false
           description: Enable confidence scoring
-        generator:
-          $ref: '#/components/schemas/GeneratorConfig'
-          description: Generator for confidence assessment. If not specified, uses the answer step's generator.
-        chain:
-          type: array
-          items:
-            $ref: '#/components/schemas/ChainLink'
-          description: Chain of generators to try in order. Mutually exclusive with 'generator'.
-        context:
-          type: string
-          description: Custom guidance for confidence assessment approach
-          example: Be conservative - only give high confidence if resources directly address the question
     EvaluatorName:
       type: string
       enum:
@@ -22640,7 +22616,6 @@ components:
       enum:
         - rrf
         - rsf
-        - failover
       default: rrf
       description: >
         Merge strategy for combining results from the semantic_search and full_text_search.
@@ -22649,8 +22624,6 @@ components:
 
         rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted
         scores
-
-        failover: Use full_text_search if embedding generation fails
     MergeConfig:
       type: object
       description: Configuration for result fusion when combining multiple search indexes.
@@ -22692,6 +22665,10 @@ components:
       type: object
       description: Configuration for the Antfly inference reranking provider.
       properties:
+        provider:
+          type: string
+          enum:
+            - antfly
         model:
           type: string
           description: The name of the reranking model (e.g., cross-encoder model name).
@@ -22701,6 +22678,7 @@ components:
           description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
             environment variable.
       required:
+        - provider
         - model
       example:
         provider: antfly
@@ -22720,6 +22698,10 @@ components:
 
         **Docs:** https://docs.cohere.com/reference/rerank
       properties:
+        provider:
+          type: string
+          enum:
+            - cohere
         model:
           type: string
           description: The name of the Cohere reranking model to use.
@@ -22728,14 +22710,8 @@ components:
         api_key:
           type: string
           description: The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
-        top_n:
-          type: integer
-          description: Number of most relevant documents to return. If not specified, returns all documents
-            with scores.
-        max_chunks_per_doc:
-          type: integer
-          description: Maximum number of chunks per document for long document handling.
       required:
+        - provider
         - model
       example:
         provider: cohere
@@ -22765,6 +22741,10 @@ components:
 
         **IAM:** https://cloud.google.com/generative-ai-app-builder/docs/access-control
       properties:
+        provider:
+          type: string
+          enum:
+            - vertex
         model:
           type: string
           description: The ranking model to use.
@@ -22778,11 +22758,8 @@ components:
           type: string
           description: Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
             Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
-        top_n:
-          type: integer
-          description: Maximum number of records to return. If not specified, returns all documents with
-            scores.
       required:
+        - provider
         - model
       example:
         provider: vertex
@@ -22802,6 +22779,17 @@ components:
             template:
               type: string
               description: Handlebars template to render document text for reranking.
+            candidate_count:
+              type: integer
+              minimum: 1
+              description: Maximum number of highest-ranked retrieval candidates to send to the reranker.
+                Defaults to all candidates returned by retrieval; candidates outside this window are not
+                returned.
+            top_n:
+              type: integer
+              minimum: 1
+              description: Number of reranked documents to return after candidate_count documents have
+                been scored. Defaults to candidate_count and cannot exceed it.
           required:
             - provider
         - oneOf:

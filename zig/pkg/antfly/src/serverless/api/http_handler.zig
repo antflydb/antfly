@@ -11164,7 +11164,7 @@ test "http handler query publication exposes vector compaction targets" {
     defer parsed_build_status.deinit();
     try std.testing.expectEqualStrings("docs", parsed_build_status.value.table_name);
     try std.testing.expectEqualStrings("semantic_idx", parsed_build_status.value.vector_compaction_driver_index_name.?);
-    try std.testing.expectEqual(shared_vector.DistanceMetric.cosine, parsed_build_status.value.vector_compaction_distance_metric.?);
+    try std.testing.expectEqual(shared_vector.default_distance_metric, parsed_build_status.value.vector_compaction_distance_metric.?);
     try std.testing.expectEqual(@as(bool, true), parsed_build_status.value.compaction_recommended);
     try std.testing.expectEqual(@as(bool, false), parsed_build_status.value.mutation_tail_compaction_recommended);
     try std.testing.expectEqual(@as(bool, true), parsed_build_status.value.vector_compaction_recommended);
@@ -11179,7 +11179,7 @@ test "http handler query publication exposes vector compaction targets" {
     defer parsed_query_published.deinit();
     try std.testing.expectEqualStrings("semantic_idx", parsed_query_published.value.publication.vector_compaction_driver_index_name.?);
     try std.testing.expectEqual(@as(bool, false), parsed_query_published.value.publication.mutation_tail_compaction_recommended);
-    try std.testing.expectEqual(shared_vector.DistanceMetric.cosine, parsed_query_published.value.publication.vector_distance_metric.?);
+    try std.testing.expectEqual(shared_vector.default_distance_metric, parsed_query_published.value.publication.vector_distance_metric.?);
     try std.testing.expectEqual(@as(bool, true), parsed_query_published.value.publication.vector_compaction_recommended);
     try std.testing.expect(parsed_query_published.value.publication.vector_cluster_count != null);
     try std.testing.expect(parsed_query_published.value.publication.vector_base_probe_count != null);
@@ -11199,7 +11199,7 @@ test "http handler query publication exposes vector compaction targets" {
     var parsed_semantic_index = try parseServerlessIndexStatusTestResponse(alloc, semantic_index.body, "semantic_idx");
     defer parsed_semantic_index.deinit();
     try std.testing.expectEqual(@as(?bool, true), parsed_semantic_index.value.status.vector_compaction_driver);
-    try std.testing.expectEqualStrings("cosine", parsed_semantic_index.value.status.vector_distance_metric.?);
+    try std.testing.expectEqualStrings(@tagName(shared_vector.default_distance_metric), parsed_semantic_index.value.status.vector_distance_metric.?);
     try std.testing.expectEqual(@as(?bool, true), parsed_semantic_index.value.status.vector_compaction_recommended);
     try std.testing.expect(parsed_semantic_index.value.status.vector_cluster_count != null);
     try std.testing.expect(parsed_semantic_index.value.status.vector_base_probe_count != null);

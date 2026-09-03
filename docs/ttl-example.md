@@ -10,12 +10,12 @@ The TTL feature allows you to configure automatic expiration for documents in a 
 
 ### Basic TTL Configuration
 
-Configure TTL when creating a table by setting the `ttl_duration` field:
+Configure TTL when creating a table with a `ttl` policy:
 
 ```json
 {
   "name": "my_table",
-  "ttl_duration": "7d",
+  "ttl": {"duration": "7d"},
   "document_schemas": {
     "default": {
       "type": "object",
@@ -39,8 +39,10 @@ You can specify a custom timestamp field as the TTL reference:
 ```json
 {
   "name": "my_table",
-  "ttl_duration": "24h",
-  "ttl_field": "created_at",
+  "ttl": {
+    "duration": "24h",
+    "field": "created_at"
+  },
   "document_schemas": {
     "default": {
       "type": "object",
@@ -61,7 +63,8 @@ In this example:
 
 ## TTL Duration Format
 
-TTL durations use Go's duration format:
+TTL durations use Antfly's integer-component duration format. Supported units
+are `ns`, `us`, `ms`, `s`, `m`, `h`, and `d`:
 - `30s` - 30 seconds
 - `5m` - 5 minutes
 - `24h` - 24 hours
@@ -136,8 +139,10 @@ Use TTL for automatic session cleanup:
 ```json
 {
   "name": "sessions",
-  "ttl_duration": "1h",
-  "ttl_field": "last_accessed",
+  "ttl": {
+    "duration": "1h",
+    "field": "last_accessed"
+  },
   "document_schemas": {
     "session": {
       "type": "object",
@@ -161,7 +166,7 @@ Use TTL for automatic log rotation:
 ```json
 {
   "name": "events",
-  "ttl_duration": "30d",
+  "ttl": {"duration": "30d"},
   "document_schemas": {
     "event": {
       "type": "object",
@@ -202,7 +207,13 @@ TTL can be added to an existing table through schema updates:
 
 ### Removing TTL
 
-TTL can be removed by setting `ttl_duration` to empty:
+TTL can be removed explicitly by setting `ttl` to `null` in the table schema:
+
+```json
+{"ttl": null}
+```
+
+After removal:
 - All expiration processing stops immediately
 - All documents become permanent
 - Previously expired documents remain (are not deleted)

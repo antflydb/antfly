@@ -414,7 +414,7 @@ test "provider registry parses named generators rerankers and chains" {
         \\  "chains": {
         \\    "default": [
         \\      { "generator": "primary", "retry": { "max_attempts": 2 } },
-        \\      { "generator_config": { "provider": "mock" }, "condition": "always" }
+        \\      { "generator_config": { "provider": "antfly", "model": "embedded-fallback" }, "condition": "always" }
         \\    ]
         \\  },
         \\  "rerankers": {
@@ -496,7 +496,7 @@ test "provider registry rejects unknown named generators in chains" {
     const raw =
         \\{
         \\  "generators": {
-        \\    "primary": { "provider": "mock" }
+        \\    "primary": { "provider": "antfly", "model": "m1" }
         \\  },
         \\  "chains": {
         \\    "default": [
@@ -517,7 +517,7 @@ test "provider registry rejects invalid chain link sources" {
         \\    "default": [
         \\      {
         \\        "generator": "primary",
-        \\        "generator_config": { "provider": "mock" }
+        \\        "generator_config": { "provider": "antfly", "model": "m2" }
         \\      }
         \\    ]
         \\  }

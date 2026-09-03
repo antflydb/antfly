@@ -17188,10 +17188,7 @@ fn applyReranker(
         try std.fmt.allocPrint(alloc, "{{{{{s}}}}}", .{cfg.field});
     defer alloc.free(doc_template);
 
-    const rerank_count: usize = if (cfg.top_n) |top_n|
-        @min(result.hits.len, top_n)
-    else
-        result.hits.len;
+    const rerank_count = rerankerCandidateCount(result.hits.len, cfg.candidate_count);
 
     const documents = try alloc.alloc([]const u8, rerank_count);
     defer alloc.free(documents);
@@ -17237,16 +17234,30 @@ fn applyReranker(
         }
     }.lessThan);
 
-    if (cfg.top_n) |top_n| {
-        try truncateSearchHits(alloc, result, @min(top_n, result.hits.len));
-        result.total_hits = @min(result.total_hits, top_n);
-    }
+    const output_count = rerankerOutputCount(rerank_count, cfg.top_n);
+    try truncateSearchHits(alloc, result, output_count);
+    result.total_hits = @min(result.total_hits, output_count);
 
     meta.reranker = .{
         .model = cfg.model,
         .documents_reranked = @intCast(scores.len),
         .duration_ms = @intCast(@divTrunc(platform_time.monotonicNs() - rerank_start_ns, std.time.ns_per_ms)),
     };
+}
+
+fn rerankerCandidateCount(hit_count: usize, candidate_count: ?u32) usize {
+    return if (candidate_count) |count| @min(hit_count, count) else hit_count;
+}
+
+fn rerankerOutputCount(candidate_count: usize, top_n: ?u32) usize {
+    return if (top_n) |count| @min(candidate_count, count) else candidate_count;
+}
+
+test "reranker candidate and output windows have distinct bounds" {
+    try std.testing.expectEqual(@as(usize, 50), rerankerCandidateCount(100, 50));
+    try std.testing.expectEqual(@as(usize, 100), rerankerCandidateCount(100, null));
+    try std.testing.expectEqual(@as(usize, 10), rerankerOutputCount(50, 10));
+    try std.testing.expectEqual(@as(usize, 50), rerankerOutputCount(50, null));
 }
 
 fn renderRerankerDocument(
@@ -18311,7 +18322,6 @@ fn appendMergeConfigField(
     try appendJsonFieldString(alloc, out, &merge_first, "strategy", switch (merge_config.strategy) {
         .rrf => "rrf",
         .rsf => "rsf",
-        .failover => "failover",
     });
     if (merge_config.rank_constant != 60.0) {
         try appendJsonFieldF64(alloc, out, &merge_first, "rank_constant", merge_config.rank_constant);

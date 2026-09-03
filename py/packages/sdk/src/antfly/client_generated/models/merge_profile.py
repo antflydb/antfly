@@ -21,7 +21,6 @@ class MergeProfile:
             full_text_search.
             rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
             rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores
-            failover: Use full_text_search if embedding generation fails
         full_text_hits (int | Unset): Number of hits from full-text search before merge.
         semantic_hits (int | Unset): Number of hits from semantic search before merge.
         duration_ms (int | Unset): Time spent merging results in milliseconds.

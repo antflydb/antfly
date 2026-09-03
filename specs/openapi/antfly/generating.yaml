@@ -5,55 +5,6 @@ info:
   version: "0.0.1"
 components:
   schemas:
-    GeneratorProvider:
-      type: string
-      enum: [gemini, vertex, ollama, openai, antfly]
-      description: "Generator providers executable by retrieval and query-builder agents."
-
-    GeneratorConfig:
-      type: object
-      description: "Generator configuration accepted by retrieval and query-builder agents."
-      required: [provider]
-      properties:
-        provider:
-          $ref: "#/components/schemas/GeneratorProvider"
-        model:
-          type: string
-          description: "The model name or identifier."
-        temperature:
-          type: number
-          format: float
-          minimum: 0.0
-          maximum: 2.0
-        max_tokens:
-          type: integer
-        top_p:
-          type: number
-          format: float
-          minimum: 0.0
-          maximum: 1.0
-        top_k:
-          type: integer
-        api_key:
-          type: string
-          writeOnly: true
-        url:
-          type: string
-          format: uri
-        api_url:
-          type: string
-          format: uri
-        project_id:
-          type: string
-        location:
-          type: string
-        credentials_path:
-          type: string
-          writeOnly: true
-        timeout:
-          type: integer
-          minimum: 1
-
     GenerateResult:
       type: object
       description: "Result of a generate operation. Formatted as markdown by default with inline resource references using [resource_id <id>] or [resource_id <id1>, <id2>] format."
@@ -215,14 +166,6 @@ components:
           type: boolean
           default: false
           description: "Enable query classification and strategy selection"
-        generator:
-          $ref: "#/components/schemas/GeneratorConfig"
-          description: "Generator to use for classification. If not specified, uses the default summarizer."
-        chain:
-          type: array
-          items:
-            $ref: "#/components/schemas/ChainLink"
-          description: "Chain of generators to try in order. Mutually exclusive with 'generator'."
         with_reasoning:
           type: boolean
           default: false
@@ -233,12 +176,6 @@ components:
         force_semantic_mode:
           $ref: "#/components/schemas/SemanticQueryMode"
           description: "Override semantic query mode selection."
-        multi_phrase_count:
-          type: integer
-          default: 3
-          minimum: 1
-          maximum: 10
-          description: "Number of alternative query phrasings to generate"
 
     GenerationStepConfig:
       type: object
@@ -251,7 +188,7 @@ components:
           default: false
           description: "Enable generation from retrieved documents"
         generator:
-          $ref: "#/components/schemas/GeneratorConfig"
+          $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
           description: "Generator to use for generation. If not specified, uses the default summarizer."
         chain:
           type: array
@@ -293,18 +230,6 @@ components:
           type: boolean
           default: false
           description: "Enable confidence scoring"
-        generator:
-          $ref: "#/components/schemas/GeneratorConfig"
-          description: "Generator for confidence assessment. If not specified, uses the answer step's generator."
-        chain:
-          type: array
-          items:
-            $ref: "#/components/schemas/ChainLink"
-          description: "Chain of generators to try in order. Mutually exclusive with 'generator'."
-        context:
-          type: string
-          description: "Custom guidance for confidence assessment approach"
-          example: "Be conservative - only give high confidence if resources directly address the question"
 
     # Shared retrieval-agent message and tool types.
 

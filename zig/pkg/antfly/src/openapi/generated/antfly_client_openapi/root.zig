@@ -644,6 +644,7 @@ pub const TraversalResult = types.TraversalResult;
 pub const TraversalRules = types.TraversalRules;
 pub const TraverseResponse = types.TraverseResponse;
 pub const TreeSearchConfig = types.TreeSearchConfig;
+pub const TtlConfig = types.TtlConfig;
 pub const UnsupportedHierarchyGroupingError = types.UnsupportedHierarchyGroupingError;
 pub const UnsupportedIndexCapabilityError = types.UnsupportedIndexCapabilityError;
 pub const UnsupportedQueryError = types.UnsupportedQueryError;

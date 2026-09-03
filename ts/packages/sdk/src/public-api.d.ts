@@ -4376,15 +4376,14 @@ export interface components {
              *
              *     **Schema Features:**
              *     - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions
-             *     - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field`
+             *     - **Document TTL**: Configure automatic expiration with a `ttl` policy
              *     - **Primary Keys**: Specify unique identifier fields
              *     - **Validation**: Enforce schema constraints on writes
              *
              *     **TTL Example:**
              *     ```json
              *     {
-             *       "ttl_duration": "7d",
-             *       "ttl_field": "_timestamp",
+             *       "ttl": {"duration": "7d", "field": "_timestamp"},
              *       "document_schemas": {...}
              *     }
              *     ```
@@ -9550,6 +9549,20 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description Automatic document-expiration policy for a table. */
+        TtlConfig: {
+            /**
+             * @description Expiration duration using Antfly's integer-component duration format.
+             *     Supported units are `ns`, `us`, `ms`, `s`, `m`, `h`, and `d`;
+             *     examples include `90m`, `1h30m`, and `7d`.
+             */
+            duration: string;
+            /**
+             * @description Timestamp field used as the expiration reference.
+             * @default _timestamp
+             */
+            field?: string;
+        };
         /** @description Field mapping used by a dynamic template. Dynamic templates match one physical field at a time and therefore do not accept multifields; use a DocumentFieldMapping in a document property's `x-antfly-field` annotation when named subfields are required. */
         TemplateFieldMapping: {
             type?: components["schemas"]["FieldMappingType"];
@@ -9641,14 +9654,18 @@ export interface components {
                 [key: string]: components["schemas"]["DocumentSchema"];
             };
             /**
-             * @description The field containing the timestamp for TTL expiration (optional).
-             *     Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
+             * @description Automatic document expiration. Set this object to enable TTL and
+             *     set it to null to disable an existing TTL policy.
+             */
+            ttl?: components["schemas"]["TtlConfig"] | null;
+            /**
+             * @deprecated
+             * @description Deprecated compatibility alias for `ttl.field`. Cannot be combined with `ttl`.
              */
             ttl_field?: string;
             /**
-             * @description The duration after which documents should expire, based on the ttl_field timestamp (optional).
-             *     Uses integer duration components with `ns`, `us`, `ms`, `s`, `m`, `h`,
-             *     or `d` units (for example, `90m`, `1h30m`, or `7d`).
+             * @deprecated
+             * @description Deprecated compatibility alias for `ttl.duration`. Cannot be combined with `ttl`.
              */
             ttl_duration?: string;
             /**
@@ -11138,6 +11155,42 @@ export interface components {
              */
             max_tool_iterations?: number;
         };
+        /**
+         * @description Strategy for query transformation and retrieval:
+         *     - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries.
+         *     - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part questions.
+         *     - step_back: Generate broader background query first, then specific query. Best for questions needing context.
+         *     - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual questions.
+         * @enum {string}
+         */
+        QueryStrategy: "simple" | "decompose" | "step_back" | "hyde";
+        /**
+         * @description Mode for semantic query generation:
+         *     - rewrite: Transform query into expanded keywords/concepts optimized for vector search (Level 2 optimization)
+         *     - hypothetical: Generate a hypothetical answer that would appear in relevant documents (HyDE - Level 3 optimization)
+         * @enum {string}
+         */
+        SemanticQueryMode: "rewrite" | "hypothetical";
+        /**
+         * @description Configuration for the classification step. This step analyzes the query,
+         *     selects the optimal retrieval strategy, and generates semantic transformations.
+         */
+        ClassificationStepConfig: {
+            /**
+             * @description Enable query classification and strategy selection
+             * @default false
+             */
+            enabled?: boolean;
+            /**
+             * @description Include pre-retrieval reasoning explaining query analysis and strategy selection
+             * @default false
+             */
+            with_reasoning?: boolean;
+            /** @description Override LLM strategy selection. If not set, the LLM chooses optimal strategy. */
+            force_strategy?: components["schemas"]["QueryStrategy"];
+            /** @description Override semantic query mode selection. */
+            force_semantic_mode?: components["schemas"]["SemanticQueryMode"];
+        };
         /** @description Retry configuration for generator calls */
         RetryConfig: {
             /**
@@ -11179,51 +11232,6 @@ export interface components {
             retry?: components["schemas"]["RetryConfig"];
             /** @description When to try the next generator in chain */
             condition?: components["schemas"]["ChainCondition"];
-        };
-        /**
-         * @description Strategy for query transformation and retrieval:
-         *     - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries.
-         *     - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part questions.
-         *     - step_back: Generate broader background query first, then specific query. Best for questions needing context.
-         *     - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual questions.
-         * @enum {string}
-         */
-        QueryStrategy: "simple" | "decompose" | "step_back" | "hyde";
-        /**
-         * @description Mode for semantic query generation:
-         *     - rewrite: Transform query into expanded keywords/concepts optimized for vector search (Level 2 optimization)
-         *     - hypothetical: Generate a hypothetical answer that would appear in relevant documents (HyDE - Level 3 optimization)
-         * @enum {string}
-         */
-        SemanticQueryMode: "rewrite" | "hypothetical";
-        /**
-         * @description Configuration for the classification step. This step analyzes the query,
-         *     selects the optimal retrieval strategy, and generates semantic transformations.
-         */
-        ClassificationStepConfig: {
-            /**
-             * @description Enable query classification and strategy selection
-             * @default false
-             */
-            enabled?: boolean;
-            /** @description Generator to use for classification. If not specified, uses the default summarizer. */
-            generator?: components["schemas"]["GeneratorConfig"];
-            /** @description Chain of generators to try in order. Mutually exclusive with 'generator'. */
-            chain?: components["schemas"]["ChainLink"][];
-            /**
-             * @description Include pre-retrieval reasoning explaining query analysis and strategy selection
-             * @default false
-             */
-            with_reasoning?: boolean;
-            /** @description Override LLM strategy selection. If not set, the LLM chooses optimal strategy. */
-            force_strategy?: components["schemas"]["QueryStrategy"];
-            /** @description Override semantic query mode selection. */
-            force_semantic_mode?: components["schemas"]["SemanticQueryMode"];
-            /**
-             * @description Number of alternative query phrasings to generate
-             * @default 3
-             */
-            multi_phrase_count?: number;
         };
         /**
          * @description Configuration for the generation step. This step generates the final
@@ -11273,15 +11281,6 @@ export interface components {
              * @default false
              */
             enabled?: boolean;
-            /** @description Generator for confidence assessment. If not specified, uses the answer step's generator. */
-            generator?: components["schemas"]["GeneratorConfig"];
-            /** @description Chain of generators to try in order. Mutually exclusive with 'generator'. */
-            chain?: components["schemas"]["ChainLink"][];
-            /**
-             * @description Custom guidance for confidence assessment approach
-             * @example Be conservative - only give high confidence if resources directly address the question
-             */
-            context?: string;
         };
         /**
          * @description Available evaluator types:
@@ -11732,11 +11731,10 @@ export interface components {
          * @description Merge strategy for combining results from the semantic_search and full_text_search.
          *     rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
          *     rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores
-         *     failover: Use full_text_search if embedding generation fails
          * @default rrf
          * @enum {string}
          */
-        MergeStrategy: "rrf" | "rsf" | "failover";
+        MergeStrategy: "rrf" | "rsf";
         /** @description Configuration for result fusion when combining multiple search indexes. */
         MergeConfig: {
             strategy?: components["schemas"]["MergeStrategy"];
@@ -11774,6 +11772,8 @@ export interface components {
          *     }
          */
         AntflyRerankerConfig: {
+            /** @enum {string} */
+            provider: "antfly";
             /** @description The name of the reranking model (e.g., cross-encoder model name). */
             model: string;
             /**
@@ -11796,6 +11796,8 @@ export interface components {
          *     }
          */
         CohereRerankerConfig: {
+            /** @enum {string} */
+            provider: "cohere";
             /**
              * @description The name of the Cohere reranking model to use.
              * @default rerank-english-v3.0
@@ -11804,10 +11806,6 @@ export interface components {
             model: string;
             /** @description The Cohere API key. Can also be set via COHERE_API_KEY environment variable. */
             api_key?: string;
-            /** @description Number of most relevant documents to return. If not specified, returns all documents with scores. */
-            top_n?: number;
-            /** @description Maximum number of chunks per document for long document handling. */
-            max_chunks_per_doc?: number;
         };
         /**
          * @description Configuration for the Google Vertex AI Ranking API.
@@ -11830,6 +11828,8 @@ export interface components {
          *     }
          */
         VertexRerankerConfig: {
+            /** @enum {string} */
+            provider: "vertex";
             /**
              * @description The ranking model to use.
              * @default semantic-ranker-default@latest
@@ -11840,8 +11840,6 @@ export interface components {
             project_id?: string;
             /** @description Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable. */
             credentials_path?: string;
-            /** @description Maximum number of records to return. If not specified, returns all documents with scores. */
-            top_n?: number;
         };
         /**
          * @description A unified configuration for a reranking provider.
@@ -11857,6 +11855,10 @@ export interface components {
             field?: string;
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
+            /** @description Maximum number of highest-ranked retrieval candidates to send to the reranker. Defaults to all candidates returned by retrieval; candidates outside this window are not returned. */
+            candidate_count?: number;
+            /** @description Number of reranked documents to return after candidate_count documents have been scored. Defaults to candidate_count and cannot exceed it. */
+            top_n?: number;
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
         /** @description User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes. */
         GraphIdentifier: string;

@@ -30,8 +30,8 @@ pub const Config = struct {
     api_key: ?[]const u8 = null,
     project_id: []const u8 = "",
     credentials_path: []const u8 = "",
+    candidate_count: ?u32 = null,
     top_n: ?u32 = null,
-    max_chunks_per_doc: ?u32 = null,
 
     pub fn clone(self: Config, alloc: Allocator) !Config {
         return .{
@@ -43,8 +43,8 @@ pub const Config = struct {
             .api_key = if (self.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
             .project_id = if (self.project_id.len > 0) try alloc.dupe(u8, self.project_id) else "",
             .credentials_path = if (self.credentials_path.len > 0) try alloc.dupe(u8, self.credentials_path) else "",
+            .candidate_count = self.candidate_count,
             .top_n = self.top_n,
-            .max_chunks_per_doc = self.max_chunks_per_doc,
         };
     }
 
@@ -67,11 +67,14 @@ pub const Config = struct {
                 if (self.model.len == 0) return error.InvalidRerankerConfig;
             },
         }
+        if (self.candidate_count) |candidate_count| {
+            if (candidate_count == 0) return error.InvalidRerankerConfig;
+        }
         if (self.top_n) |top_n| {
             if (top_n == 0) return error.InvalidRerankerConfig;
         }
-        if (self.max_chunks_per_doc) |max_chunks_per_doc| {
-            if (max_chunks_per_doc == 0) return error.InvalidRerankerConfig;
+        if (self.candidate_count != null and self.top_n != null and self.top_n.? > self.candidate_count.?) {
+            return error.InvalidRerankerConfig;
         }
     }
 
@@ -111,12 +114,12 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.RerankerConfig) !C
         .api_key = if (generated.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
         .project_id = if (generated.project_id) |project_id| try alloc.dupe(u8, project_id) else "",
         .credentials_path = if (generated.credentials_path) |credentials_path| try alloc.dupe(u8, credentials_path) else "",
-        .top_n = if (generated.top_n) |top_n|
-            std.math.cast(u32, top_n) orelse return error.InvalidRerankerConfig
+        .candidate_count = if (generated.candidate_count) |candidate_count|
+            std.math.cast(u32, candidate_count) orelse return error.InvalidRerankerConfig
         else
             null,
-        .max_chunks_per_doc = if (generated.max_chunks_per_doc) |max_chunks_per_doc|
-            std.math.cast(u32, max_chunks_per_doc) orelse return error.InvalidRerankerConfig
+        .top_n = if (generated.top_n) |top_n|
+            std.math.cast(u32, top_n) orelse return error.InvalidRerankerConfig
         else
             null,
     };
@@ -135,15 +138,15 @@ pub fn openApiFromConfig(cfg: Config) openapi.RerankerConfig {
         .api_key = cfg.api_key,
         .project_id = if (cfg.project_id.len > 0) cfg.project_id else null,
         .credentials_path = if (cfg.credentials_path.len > 0) cfg.credentials_path else null,
+        .candidate_count = if (cfg.candidate_count) |candidate_count| candidate_count else null,
         .top_n = if (cfg.top_n) |top_n| top_n else null,
-        .max_chunks_per_doc = if (cfg.max_chunks_per_doc) |max_chunks_per_doc| max_chunks_per_doc else null,
     };
 }
 
 test "reranker config round trip" {
     const alloc = std.testing.allocator;
     const raw =
-        \\{"provider":"antfly","model":"cross-encoder/ms-marco-MiniLM-L-6-v2","url":"http://localhost:8082","field":"body","top_n":8}
+        \\{"provider":"antfly","model":"cross-encoder/ms-marco-MiniLM-L-6-v2","url":"http://localhost:8082","field":"body","candidate_count":16,"top_n":8}
     ;
     var cfg = try parseConfigFromSlice(alloc, raw);
     defer cfg.deinit(alloc);
@@ -151,6 +154,7 @@ test "reranker config round trip" {
     try std.testing.expectEqual(.antfly, cfg.provider);
     try std.testing.expectEqualStrings("body", cfg.field);
     try std.testing.expectEqualStrings("cross-encoder/ms-marco-MiniLM-L-6-v2", cfg.model);
+    try std.testing.expectEqual(@as(?u32, 16), cfg.candidate_count);
     try std.testing.expectEqual(@as(?u32, 8), cfg.top_n);
 
     const encoded = try stringifyAlloc(alloc, cfg);
@@ -159,6 +163,17 @@ test "reranker config round trip" {
     defer reparsed.deinit(alloc);
     try std.testing.expectEqual(.antfly, reparsed.provider);
     try std.testing.expectEqualStrings("body", reparsed.field);
+}
+
+test "reranker output count cannot exceed candidate count" {
+    const cfg = Config{
+        .provider = .antfly,
+        .field = "body",
+        .model = "reranker",
+        .candidate_count = 4,
+        .top_n = 5,
+    };
+    try std.testing.expectError(error.InvalidRerankerConfig, cfg.validate());
 }
 
 test "reranker config requires field or template" {
