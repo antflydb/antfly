@@ -99,12 +99,14 @@ fn classifyFailedDiscovery(
     // allowing independent waiters to retry with their own contexts.
     if (owner_context_error != null)
         return .{ .err = error.CapabilityDiscoveryOwnerAbandoned };
-    if (stale) |entry| {
-        if (now_ns < entry.stale_until_ns) return .{
-            .value = entry.value,
-            .routing_token = entry.routing_token,
-            .descriptor_revision = entry.descriptor_revision,
-        };
+    if (discovery_error == error.RemoteCapabilityDiscoveryTransient) {
+        if (stale) |entry| {
+            if (now_ns < entry.stale_until_ns) return .{
+                .value = entry.value,
+                .routing_token = entry.routing_token,
+                .descriptor_revision = entry.descriptor_revision,
+            };
+        }
     }
     return .{ .err = discovery_error };
 }
@@ -303,7 +305,15 @@ pub const Cache = struct {
             };
             self.mutex.unlock(self.io);
 
-            const discovered = discoverWithContext(self.alloc, self.io, http, inference_url, model, operation, headers, wait_context);
+            const discovered = self.discoverWithStaleRefresh(
+                http,
+                inference_url,
+                model,
+                operation,
+                headers,
+                key,
+                wait_context,
+            );
             if (discovered) |value| {
                 const owner_context_error: ?anyerror = blk: {
                     wait_context.check(monotonicNowNs(self.io)) catch |err| break :blk err;
@@ -350,6 +360,11 @@ pub const Cache = struct {
                     break :blk null;
                 };
                 self.mutex.lockUncancelable(self.io);
+                // Authoritative rejection, routing-stale responses, and invalid
+                // contracts revoke the cached plan. Only explicitly transient
+                // discovery failures are eligible for stale-if-error behavior.
+                if (err != error.RemoteCapabilityDiscoveryTransient)
+                    self.removeEntryLocked(key);
                 const completion = classifyFailedDiscovery(
                     self.entries.get(key),
                     monotonicNowNs(self.io),
@@ -404,6 +419,47 @@ pub const Cache = struct {
         try self.entries.put(self.alloc, owned_key, cached);
     }
 
+    fn discoverWithStaleRefresh(
+        self: *Cache,
+        http: *httpx.Client,
+        inference_url: []const u8,
+        model: []const u8,
+        operation: work.Operation,
+        headers: []const [2][]const u8,
+        key: []const u8,
+        context: WaitContext,
+    ) !DiscoveredCapability {
+        return discoverWithContext(
+            self.alloc,
+            self.io,
+            http,
+            inference_url,
+            model,
+            operation,
+            headers,
+            context,
+        ) catch |err| {
+            if (err != error.InferenceCapabilitiesStale) return err;
+            // Revoke before retrying. If rediscovery then hits a transient
+            // outage, classifyFailedDiscovery must not resurrect the tuple the
+            // proxy has already authoritatively declared stale.
+            self.mutex.lockUncancelable(self.io);
+            self.removeEntryLocked(key);
+            self.mutex.unlock(self.io);
+            try context.check(monotonicNowNs(self.io));
+            return try discoverWithContext(
+                self.alloc,
+                self.io,
+                http,
+                inference_url,
+                model,
+                operation,
+                headers,
+                context,
+            );
+        };
+    }
+
     pub fn routingToken(
         self: *Cache,
         inference_url: []const u8,
@@ -434,6 +490,10 @@ pub const Cache = struct {
         defer self.alloc.free(key);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        self.removeEntryLocked(key);
+    }
+
+    fn removeEntryLocked(self: *Cache, key: []const u8) void {
         if (self.entries.fetchRemove(key)) |removed| self.alloc.free(@constCast(removed.key));
     }
 
@@ -903,7 +963,41 @@ pub fn parseModelCapabilities(
     return result;
 }
 
+fn capabilityStaleResponse(response: httpx.Response) bool {
+    if (response.status.code != 409) return false;
+    const value = response.headers.get(capability_stale_header) orelse return false;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "true");
+}
+
+fn discoveryResponseError(response: httpx.Response) anyerror {
+    return discoveryStatusError(response.status.code, capabilityStaleResponse(response));
+}
+
+fn discoveryStatusError(status: u16, capability_stale: bool) anyerror {
+    if (status == 409 and capability_stale) return error.InferenceCapabilitiesStale;
+    if (status == 408 or status == 425 or status == 429 or (status >= 500 and status <= 599))
+        return error.RemoteCapabilityDiscoveryTransient;
+    return error.RemoteCapabilityDiscoveryRejected;
+}
+
 pub fn discover(
+    alloc: std.mem.Allocator,
+    http: *httpx.Client,
+    inference_url: []const u8,
+    model: []const u8,
+    operation: work.Operation,
+    headers: []const [2][]const u8,
+) !?work.InferenceCapabilities {
+    return discoverOnce(alloc, http, inference_url, model, operation, headers) catch |err| {
+        if (err != error.InferenceCapabilitiesStale) return err;
+        // A route may change while the proxy fans out catalog requests. Retry
+        // once immediately so callers do not have to fail an admitted job just
+        // to refresh the distributed routing plan.
+        return try discoverOnce(alloc, http, inference_url, model, operation, headers);
+    };
+}
+
+fn discoverOnce(
     alloc: std.mem.Allocator,
     http: *httpx.Client,
     inference_url: []const u8,
@@ -913,13 +1007,16 @@ pub fn discover(
 ) !?work.InferenceCapabilities {
     const url = try scopedModelsUrlAlloc(alloc, inference_url, model, operation);
     defer alloc.free(url);
-    var response = try http.get(url, .{
+    var response = http.get(url, .{
         .headers = headers,
         .max_response_size = capability_catalog_response_bytes,
-    });
+    }) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.RemoteCapabilityDiscoveryTransient;
+    };
     defer response.deinit();
-    if (!response.ok()) return error.RemoteCapabilityDiscoveryFailed;
-    return try parseModelCapabilities(alloc, response.body orelse return error.RemoteCapabilityDiscoveryFailed, model, operation.task());
+    if (!response.ok()) return discoveryResponseError(response);
+    return try parseModelCapabilities(alloc, response.body orelse return error.InvalidInferenceCapabilities, model, operation.task());
 }
 
 fn discoverWithContext(
@@ -946,7 +1043,7 @@ fn discoverWithContext(
     ));
     const url = try scopedModelsUrlAlloc(alloc, inference_url, model, operation);
     defer alloc.free(url);
-    var response = try http.get(url, .{
+    var response = http.get(url, .{
         .headers = headers,
         .timeout_ms = timeout_ms,
         .cancellation = httpx.CancellationToken.fromCallback(
@@ -954,9 +1051,13 @@ fn discoverWithContext(
             context.cancellation.is_cancelled_fn,
         ),
         .max_response_size = capability_catalog_response_bytes,
-    });
+    }) catch |err| {
+        try context.check(monotonicNowNs(io));
+        if (err == error.OutOfMemory) return err;
+        return error.RemoteCapabilityDiscoveryTransient;
+    };
     defer response.deinit();
-    if (!response.ok()) return error.RemoteCapabilityDiscoveryFailed;
+    if (!response.ok()) return discoveryResponseError(response);
     const routing_token = if (response.headers.get(capability_token_header)) |value|
         try RoutingToken.init(value)
     else
@@ -968,7 +1069,7 @@ fn discoverWithContext(
     if ((routing_token == null) != (descriptor_revision == null))
         return error.IncompleteCapabilityLease;
     return .{
-        .value = try parseModelCapabilities(alloc, response.body orelse return error.RemoteCapabilityDiscoveryFailed, model, operation.task()),
+        .value = try parseModelCapabilities(alloc, response.body orelse return error.InvalidInferenceCapabilities, model, operation.task()),
         .routing_token = routing_token,
         .descriptor_revision = descriptor_revision,
     };
@@ -1247,8 +1348,65 @@ test "canceled capability owner cannot publish stale success to waiters" {
         stale,
         1,
         error.Canceled,
-        error.RemoteCapabilityDiscoveryFailed,
+        error.RemoteCapabilityDiscoveryTransient,
     );
     try std.testing.expect(completion.value == null);
     try std.testing.expectEqual(error.CapabilityDiscoveryOwnerAbandoned, completion.err.?);
+}
+
+test "capability stale-if-error is limited to transient discovery failures" {
+    const stale = CachedCapability{
+        .value = null,
+        .expires_at_ns = 0,
+        .stale_until_ns = 10_000,
+    };
+    const transient = classifyFailedDiscovery(
+        stale,
+        1,
+        null,
+        error.RemoteCapabilityDiscoveryTransient,
+    );
+    try std.testing.expect(transient.err == null);
+
+    for ([_]anyerror{
+        error.InferenceCapabilitiesStale,
+        error.RemoteCapabilityDiscoveryRejected,
+        error.InvalidInferenceCapabilities,
+    }) |authoritative_error| {
+        const completion = classifyFailedDiscovery(stale, 1, null, authoritative_error);
+        try std.testing.expectEqual(authoritative_error, completion.err.?);
+    }
+}
+
+test "capability discovery HTTP failures retain authoritative status semantics" {
+    try std.testing.expectEqual(error.InferenceCapabilitiesStale, discoveryStatusError(409, true));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, discoveryStatusError(409, false));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, discoveryStatusError(401, false));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, discoveryStatusError(403, false));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, discoveryStatusError(408, false));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, discoveryStatusError(429, false));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, discoveryStatusError(503, false));
+}
+
+test "capability stale revocation prevents transient rediscovery fallback" {
+    var cache = Cache.init(std.testing.allocator, std.Options.debug_io);
+    defer cache.deinit();
+    const lookup_key = "proxy\x1fmodel\x1fread\x1fauth";
+    const owned_key = try std.testing.allocator.dupe(u8, lookup_key);
+    cache.entries.put(std.testing.allocator, owned_key, .{
+        .value = null,
+        .expires_at_ns = 0,
+        .stale_until_ns = 10_000,
+    }) catch |err| {
+        std.testing.allocator.free(owned_key);
+        return err;
+    };
+    cache.removeEntryLocked(lookup_key);
+    const completion = classifyFailedDiscovery(
+        cache.entries.get(lookup_key),
+        1,
+        null,
+        error.RemoteCapabilityDiscoveryTransient,
+    );
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, completion.err.?);
 }

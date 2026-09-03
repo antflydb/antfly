@@ -121,6 +121,10 @@ type Endpoint struct {
 	LastSeen     time.Time
 	Healthy      bool
 	Connections  int32 // Active connections
+	// incarnation is assigned by the registry and changes whenever an address is
+	// replaced or its routing topology changes. It is the authority captured by
+	// distributed capability discovery and execution leases.
+	incarnation uint64
 }
 
 // ModelInfo contains information about a loaded model
@@ -256,6 +260,7 @@ type ModelRegistry struct {
 	pools     map[string][]*Endpoint // pool -> endpoints in pool
 
 	circuitBreakers map[string]*CircuitBreaker
+	nextIncarnation uint64
 
 	refreshInterval       time.Duration
 	client                *http.Client
@@ -319,11 +324,15 @@ func (r *ModelRegistry) RegisterEndpointWithHealth(address, healthURL, pool stri
 			Models:       make(map[string]*ModelInfo),
 			Healthy:      true,
 			LastSeen:     time.Now(),
+			incarnation:  r.nextEndpointIncarnationLocked(),
 		}
 		r.endpoints[address] = ep
 		r.circuitBreakers[address] = NewCircuitBreaker(5, 30*time.Second)
 	} else {
 		oldPool := ep.Pool
+		if ep.HealthURL != healthURL || ep.Pool != pool || ep.WorkloadType != workloadType {
+			ep.incarnation = r.nextEndpointIncarnationLocked()
+		}
 		ep.HealthURL = healthURL
 		ep.Pool = pool
 		ep.WorkloadType = workloadType
@@ -347,6 +356,14 @@ func (r *ModelRegistry) RegisterEndpointWithHealth(address, healthURL, pool stri
 	if !found {
 		r.pools[pool] = append(r.pools[pool], ep)
 	}
+}
+
+func (r *ModelRegistry) nextEndpointIncarnationLocked() uint64 {
+	r.nextIncarnation++
+	if r.nextIncarnation == 0 {
+		r.nextIncarnation++
+	}
+	return r.nextIncarnation
 }
 
 func (r *ModelRegistry) removeEndpointFromPoolLocked(address, pool string) {
@@ -412,46 +429,44 @@ func (r *ModelRegistry) UpdateModels(address string, models []string) {
 // task inventory. Routing uses this snapshot so a generator-only node cannot be
 // selected for reads merely because it loads a model with the same name.
 func (r *ModelRegistry) UpdateModelOperations(address string, operations map[string]map[OperationType]bool) {
-	r.updateModelOperationsForEndpoint(address, nil, operations)
+	r.updateModelOperationsForEndpoint(address, nil, 0, operations)
 }
 
-func (r *ModelRegistry) endpointIncarnationMatches(address string, expected *Endpoint) bool {
+func (r *ModelRegistry) endpointAtIncarnation(address string, incarnation uint64) *Endpoint {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	endpoint := r.endpoints[address]
-	return endpoint != nil && endpoint == expected
-}
-
-func (r *ModelRegistry) endpointModelOperations(address string, expected *Endpoint, model string) map[OperationType]bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	endpoint := r.endpoints[address]
-	if endpoint == nil || endpoint != expected {
+	if endpoint == nil || endpoint.incarnation != incarnation {
 		return nil
 	}
-	info := endpoint.Models[model]
-	if info == nil || info.OperationState != ModelOperationsKnown {
-		return nil
-	}
-	return cloneOperations(info.Operations)
+	return endpoint
 }
 
-func (r *ModelRegistry) updateModelOperationsForEndpoint(address string, expected *Endpoint, operations map[string]map[OperationType]bool) {
+func (r *ModelRegistry) endpointIncarnationSnapshotLocked() map[string]uint64 {
+	snapshot := make(map[string]uint64, len(r.endpoints))
+	for address, endpoint := range r.endpoints {
+		snapshot[address] = endpoint.incarnation
+	}
+	return snapshot
+}
+
+func (r *ModelRegistry) updateModelOperationsForEndpoint(address string, expected *Endpoint, expectedIncarnation uint64, operations map[string]map[OperationType]bool) {
 	models := make([]string, 0, len(operations))
 	for model := range operations {
 		models = append(models, model)
 	}
 	sort.Strings(models)
-	r.updateModelsForEndpoint(address, expected, models, operations, true)
+	r.updateModelsForEndpoint(address, expected, expectedIncarnation, models, operations, true)
 }
 
 func (r *ModelRegistry) updateModels(address string, models []string, operations map[string]map[OperationType]bool, catalogKnown bool) {
-	r.updateModelsForEndpoint(address, nil, models, operations, catalogKnown)
+	r.updateModelsForEndpoint(address, nil, 0, models, operations, catalogKnown)
 }
 
 func (r *ModelRegistry) updateModelsForEndpoint(
 	address string,
 	expected *Endpoint,
+	expectedIncarnation uint64,
 	models []string,
 	operations map[string]map[OperationType]bool,
 	catalogKnown bool,
@@ -460,7 +475,7 @@ func (r *ModelRegistry) updateModelsForEndpoint(
 	defer r.mu.Unlock()
 
 	ep, exists := r.endpoints[address]
-	if !exists || (expected != nil && ep != expected) {
+	if !exists || (expected != nil && (ep != expected || ep.incarnation != expectedIncarnation)) {
 		return
 	}
 
@@ -747,8 +762,10 @@ func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) err
 	r.mu.RLock()
 	expected := r.endpoints[address]
 	var healthURL string
+	var expectedIncarnation uint64
 	if expected != nil {
 		healthURL = expected.HealthURL
+		expectedIncarnation = expected.incarnation
 	}
 	r.mu.RUnlock()
 	if expected == nil {
@@ -758,7 +775,7 @@ func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) err
 	if healthURL != "" {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
 		if err != nil {
-			r.markEndpointHealth(address, expected, false)
+			r.markEndpointHealth(address, expected, expectedIncarnation, false)
 			return err
 		}
 		if authorization != "" {
@@ -766,19 +783,19 @@ func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) err
 		}
 		resp, err := r.client.Do(req)
 		if err != nil {
-			r.markEndpointHealth(address, expected, false)
+			r.markEndpointHealth(address, expected, expectedIncarnation, false)
 			return err
 		}
 		_ = resp.Body.Close()
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest {
-			r.markEndpointHealth(address, expected, false)
+			r.markEndpointHealth(address, expected, expectedIncarnation, false)
 			return fmt.Errorf("health check returned %d", resp.StatusCode)
 		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address+"/ai/v1/models", nil)
 	if err != nil {
-		r.markEndpointHealth(address, expected, false)
+		r.markEndpointHealth(address, expected, expectedIncarnation, false)
 		return err
 	}
 	if authorization != "" {
@@ -787,28 +804,28 @@ func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) err
 
 	resp, err := r.client.Do(req)
 	if err != nil {
-		r.markEndpointHealth(address, expected, false)
+		r.markEndpointHealth(address, expected, expectedIncarnation, false)
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		r.markEndpointHealth(address, expected, false)
+		r.markEndpointHealth(address, expected, expectedIncarnation, false)
 		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxModelCatalogBytes+1))
 	if err != nil || len(body) > maxModelCatalogBytes {
-		r.markEndpointHealth(address, expected, false)
+		r.markEndpointHealth(address, expected, expectedIncarnation, false)
 		return errors.New("upstream model catalog is unreadable or too large")
 	}
 	models, err := extractModelOperations(bytes.NewReader(body))
 	if err != nil {
-		r.markEndpointHealth(address, expected, false)
+		r.markEndpointHealth(address, expected, expectedIncarnation, false)
 		return err
 	}
-	r.updateModelOperationsForEndpoint(address, expected, models)
-	r.markEndpointHealth(address, expected, true)
+	r.updateModelOperationsForEndpoint(address, expected, expectedIncarnation, models)
+	r.markEndpointHealth(address, expected, expectedIncarnation, true)
 	return nil
 }
 
@@ -904,19 +921,19 @@ func extractModelOperations(r io.Reader) (map[string]map[OperationType]bool, err
 }
 
 func (r *ModelRegistry) markHealthy(address string) {
-	r.markEndpointHealth(address, nil, true)
+	r.markEndpointHealth(address, nil, 0, true)
 }
 
 func (r *ModelRegistry) markUnhealthy(address string) {
-	r.markEndpointHealth(address, nil, false)
+	r.markEndpointHealth(address, nil, 0, false)
 }
 
-func (r *ModelRegistry) markEndpointHealth(address string, expected *Endpoint, healthy bool) {
+func (r *ModelRegistry) markEndpointHealth(address string, expected *Endpoint, expectedIncarnation uint64, healthy bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if ep, exists := r.endpoints[address]; exists {
-		if expected != nil && ep != expected {
+		if expected != nil && (ep != expected || ep.incarnation != expectedIncarnation) {
 			return
 		}
 		ep.Healthy = healthy
@@ -1242,8 +1259,8 @@ const capabilityRevisionHeader = "X-Antfly-Capability-Revision"
 const capabilityStaleHeader = "X-Antfly-Capability-Stale"
 
 type leasedEndpoint struct {
-	endpoint   *Endpoint
-	operations map[OperationType]bool
+	incarnation uint64
+	operations  map[OperationType]bool
 }
 
 type proxyCapabilityLease struct {
@@ -1593,11 +1610,25 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	} else {
 		endpoints = p.registry.GetEndpointsForPool(pool)
 	}
-	addresses := make([]string, 0, len(endpoints))
-	for _, endpoint := range endpoints {
-		addresses = append(addresses, endpoint.Address)
+	type catalogTarget struct {
+		endpoint    *Endpoint
+		address     string
+		incarnation uint64
 	}
-	if len(addresses) == 0 {
+	targets := make([]catalogTarget, 0, len(endpoints))
+	p.registry.mu.RLock()
+	for _, endpoint := range endpoints {
+		current := p.registry.endpoints[endpoint.Address]
+		if current == endpoint {
+			targets = append(targets, catalogTarget{
+				endpoint:    endpoint,
+				address:     endpoint.Address,
+				incarnation: endpoint.incarnation,
+			})
+		}
+	}
+	p.registry.mu.RUnlock()
+	if len(targets) == 0 {
 		http.Error(w, "no operation-eligible inference endpoints", http.StatusServiceUnavailable)
 		return
 	}
@@ -1605,7 +1636,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	// catalog and each active worker's raw body, RawMessage copy, and transient
 	// task-inventory parse can coexist; endpoints beyond the admitted worker count
 	// are processed by those same workers sequentially.
-	workerCount, catalogBytes, planErr := modelCatalogFanoutPlan(len(addresses), p.catalogAdmission.Limit())
+	workerCount, catalogBytes, planErr := modelCatalogFanoutPlan(len(targets), p.catalogAdmission.Limit())
 	if planErr != nil {
 		http.Error(w, "inference model catalog memory limit cannot admit one worker", http.StatusServiceUnavailable)
 		return
@@ -1621,21 +1652,21 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	defer p.catalogAdmission.Release(catalogBytes)
 
 	type catalogResult struct {
-		endpoint *Endpoint
+		target   catalogTarget
 		catalog  map[string]json.RawMessage
 		eligible bool
 		err      error
 	}
 	results := make(chan catalogResult)
-	jobs := make(chan *Endpoint, len(endpoints))
-	for _, endpoint := range endpoints {
-		jobs <- endpoint
+	jobs := make(chan catalogTarget, len(targets))
+	for _, target := range targets {
+		jobs <- target
 	}
 	close(jobs)
 	for range workerCount {
 		go func() {
-			for endpoint := range jobs {
-				address := endpoint.Address
+			for target := range jobs {
+				address := target.address
 				request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(address, "/")+"/ai/v1/models", nil)
 				if err != nil {
 					results <- catalogResult{err: err}
@@ -1666,10 +1697,10 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				if model != "" && !catalogContainsTaskModel(catalog, taskScope, model) {
-					results <- catalogResult{endpoint: endpoint}
+					results <- catalogResult{target: target}
 					continue
 				}
-				results <- catalogResult{endpoint: endpoint, catalog: catalog, eligible: true}
+				results <- catalogResult{target: target, catalog: catalog, eligible: true}
 			}
 		}()
 	}
@@ -1679,7 +1710,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	failures := 0
 	mergedTooLarge := false
 	leaseEndpoints := make(map[string]leasedEndpoint, len(endpoints))
-	for range addresses {
+	for range targets {
 		result := <-results
 		if result.err != nil {
 			failures++
@@ -1688,7 +1719,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		if !result.eligible {
 			continue
 		}
-		if !p.registry.endpointIncarnationMatches(result.endpoint.Address, result.endpoint) {
+		if p.registry.endpointAtIncarnation(result.target.address, result.target.incarnation) != result.target.endpoint {
 			failures++
 			continue
 		}
@@ -1697,7 +1728,10 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		// lease deliberately authorizes only the concrete operation requested by
 		// the planner, never every compatibility alias in the family.
 		operations := map[OperationType]bool{taskScope.Operation: true}
-		leaseEndpoints[result.endpoint.Address] = leasedEndpoint{endpoint: result.endpoint, operations: operations}
+		leaseEndpoints[result.target.address] = leasedEndpoint{
+			incarnation: result.target.incarnation,
+			operations:  operations,
+		}
 		if !mergedTooLarge {
 			if model != "" {
 				mergeScopedModelCatalog(categories, result.catalog, taskScope, model)
@@ -1786,11 +1820,20 @@ func (p *Proxy) issueCapabilityLease(model, task string, operation OperationType
 	allowed := make(map[string]leasedEndpoint, len(endpoints))
 	for address, endpoint := range endpoints {
 		allowed[address] = leasedEndpoint{
-			endpoint:   endpoint.endpoint,
-			operations: cloneOperations(endpoint.operations),
+			incarnation: endpoint.incarnation,
+			operations:  cloneOperations(endpoint.operations),
 		}
 	}
 	now := time.Now()
+	// Registry topology is the outer lock for lease issuance. This establishes a
+	// real linearization point: every endpoint in the published lease is still
+	// the exact incarnation that answered discovery when the token is minted.
+	p.registry.mu.RLock()
+	defer p.registry.mu.RUnlock()
+	endpointIncarnations := p.registry.endpointIncarnationSnapshotLocked()
+	if !leasedEndpointsMatchIncarnations(allowed, endpointIncarnations) {
+		return "", staleCapabilityResolutionError("inference endpoint topology changed during capability discovery")
+	}
 	p.capabilityLeaseMu.Lock()
 	defer p.capabilityLeaseMu.Unlock()
 	// Recheck after acquiring the table lock. An old discovery waiter must not
@@ -1799,7 +1842,8 @@ func (p *Proxy) issueCapabilityLease(model, task string, operation OperationType
 		return "", staleCapabilityResolutionError("inference routing policy changed during capability discovery")
 	}
 	for token, lease := range p.capabilityLeases {
-		if !now.Before(lease.expiresAt) || lease.routeGeneration != routeGeneration {
+		if !now.Before(lease.expiresAt) || lease.routeGeneration != routeGeneration ||
+			!capabilityLeaseEndpointIncarnationsMatch(lease, endpointIncarnations) {
 			p.deleteCapabilityLeaseLocked(token, lease)
 		}
 	}
@@ -1877,9 +1921,7 @@ func capabilityLeaseIdentity(model, task string, operation OperationType, routeG
 	for _, address := range addresses {
 		endpoint := endpoints[address]
 		writeField(address)
-		// Pointer identity is the registry's endpoint-incarnation authority. An
-		// address-reused replacement must produce a different immutable lease.
-		writeField(fmt.Sprintf("%p", endpoint.endpoint))
+		writeField(strconv.FormatUint(endpoint.incarnation, 10))
 		operations := make([]string, 0, len(endpoint.operations))
 		for operation, enabled := range endpoint.operations {
 			if enabled {
@@ -1894,6 +1936,19 @@ func capabilityLeaseIdentity(model, task string, operation OperationType, routeG
 	var identity [sha256.Size]byte
 	copy(identity[:], h.Sum(nil))
 	return identity
+}
+
+func capabilityLeaseEndpointIncarnationsMatch(lease proxyCapabilityLease, live map[string]uint64) bool {
+	return leasedEndpointsMatchIncarnations(lease.endpoints, live)
+}
+
+func leasedEndpointsMatchIncarnations(endpoints map[string]leasedEndpoint, live map[string]uint64) bool {
+	for address, expected := range endpoints {
+		if live[address] != expected.incarnation || expected.incarnation == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *Proxy) validateCapabilityLease(token, revision, model string, operation OperationType, authorization string) error {
@@ -1933,6 +1988,7 @@ func (p *Proxy) validatedCapabilityLease(token, revision, model string, operatio
 		return validatedCapabilityLease{}, staleCapabilityResolutionError("inference capability lease is stale")
 	}
 	if lease.routeGeneration != p.router.RouteManager().Generation() {
+		p.deleteCapabilityLeaseIfIdentityMatches(token, lease.identity)
 		return validatedCapabilityLease{}, staleCapabilityResolutionError("inference capability lease is stale")
 	}
 	allowed := make(map[string]*Endpoint, len(lease.endpoints))
@@ -1940,16 +1996,27 @@ func (p *Proxy) validatedCapabilityLease(token, revision, model string, operatio
 		if !expected.operations[operation] {
 			continue
 		}
-		if !p.registry.endpointIncarnationMatches(address, expected.endpoint) {
+		endpoint := p.registry.endpointAtIncarnation(address, expected.incarnation)
+		if endpoint == nil {
+			p.deleteCapabilityLeaseIfIdentityMatches(token, lease.identity)
 			return validatedCapabilityLease{}, staleCapabilityResolutionError("inference capability lease is stale")
 		}
-		allowed[address] = expected.endpoint
+		allowed[address] = endpoint
 	}
 	return validatedCapabilityLease{
 		endpoints:       allowed,
 		routeGeneration: lease.routeGeneration,
 		scoped:          true,
 	}, nil
+}
+
+func (p *Proxy) deleteCapabilityLeaseIfIdentityMatches(token string, identity [sha256.Size]byte) {
+	p.capabilityLeaseMu.Lock()
+	defer p.capabilityLeaseMu.Unlock()
+	lease, ok := p.capabilityLeases[token]
+	if ok && lease.identity == identity {
+		p.deleteCapabilityLeaseLocked(token, lease)
+	}
 }
 
 func semanticTaskForOperation(operation OperationType) string {

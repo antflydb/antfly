@@ -126,6 +126,39 @@ func TestRefreshCompletionCannotMutateReregisteredEndpoint(t *testing.T) {
 	}
 }
 
+func TestRefreshCompletionCannotMutateChangedEndpointTopology(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		close(started)
+		<-release
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"readers":{"old-model":{}}}`)),
+			Request:    req,
+		}, nil
+	})}
+	const address = "http://stable.internal"
+	p.registry.RegisterEndpointWithHealth(address, "", "old-pool", WorkloadTypeGeneral)
+	done := make(chan error, 1)
+	go func() { done <- p.registry.RefreshEndpoint(context.Background(), address) }()
+	<-started
+	// This updates the same Endpoint allocation. The captured incarnation, not
+	// pointer identity, must prevent the old catalog response from publishing.
+	p.registry.RegisterEndpointWithHealth(address, "", "new-pool", WorkloadTypeReadHeavy)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if endpoints := p.registry.GetEndpointsForModel("old-model"); len(endpoints) != 0 {
+		t.Fatalf("stale refresh published across an in-place topology change: %#v", endpoints)
+	}
+}
+
 func TestSelectDestinationUsesWeights(t *testing.T) {
 	t.Parallel()
 
@@ -200,7 +233,7 @@ func TestProxyRequestRetriesRetryableStatus(t *testing.T) {
 	}
 	p.RegisterEndpoint("http://inference.internal", "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://inference.internal", "embed", "bge-small-en-v1.5")
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:       "default/retry",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{
@@ -259,7 +292,7 @@ func TestProxyRequestRetryFailsOverToDifferentEndpoint(t *testing.T) {
 	advertiseModelOperation(p.registry, "http://primary-a.internal", "embed", "bge-small-en-v1.5")
 	advertiseModelOperation(p.registry, "http://primary-b.internal", "embed", "bge-small-en-v1.5")
 	atomic.StoreInt32(&p.registry.endpoints["http://primary-b.internal"].Connections, 1)
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:       "default/retry-failover",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{
@@ -305,7 +338,7 @@ func TestProxyRequestRetryPreservesCapabilityStaleResponse(t *testing.T) {
 		RetryOnStatuses:    map[int]bool{http.StatusInternalServerError: true},
 		RetryOnRequestErrs: true,
 	}
-	p.Router().RouteManager().AddRoute(route)
+	p.Router().RouteManager().UpsertRoute(route)
 	revision := "revision-a"
 	endpoints := p.router.ResolveEndpointCandidates("model-a", "primary", nil, "embed")
 	token, err := p.issueCapabilityLease(
@@ -326,7 +359,7 @@ func TestProxyRequestRetryPreservesCapabilityStaleResponse(t *testing.T) {
 		atomic.AddInt32(&attempts, 1)
 		// Simulate a policy update after the first attempt has already been
 		// admitted. The retry must tell the client to discard the old plan.
-		p.Router().RouteManager().AddRoute(&Route{
+		p.Router().RouteManager().UpsertRoute(&Route{
 			Name:            route.Name,
 			Priority:        1,
 			Operations:      route.Operations,
@@ -379,7 +412,7 @@ func TestProxyRequestRecordsFailureOnStreamCopyError(t *testing.T) {
 	}
 	p.RegisterEndpoint("http://primary.internal", "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://primary.internal", "embed", "bge-small-en-v1.5")
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:       "default/stream-error",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{
@@ -424,7 +457,7 @@ func TestResolveRequestUsesVerifiedHostedSource(t *testing.T) {
 	p.RegisterEndpoint("http://default.internal", "default", WorkloadTypeGeneral)
 	p.RegisterEndpoint("http://source.internal", "source-pool", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://source.internal", "embed", "bge-small-en-v1.5")
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:                "default/source-context",
 		Operations:          map[OperationType]bool{OperationType("embed"): true},
 		SourceOrganizations: map[string]bool{"org-1": true},
@@ -468,7 +501,7 @@ func TestResolveRequestStaysInSelectedPoolWhenModelIsLoadedElsewhere(t *testing.
 	advertiseModelOperation(p.registry, "http://default.internal", "embed", "bge-small-en-v1.5")
 	advertiseModelOperation(p.registry, "http://source.internal", "embed", "bge-small-en-v1.5")
 
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:                "default/source-context",
 		Operations:          map[OperationType]bool{OperationType("embed"): true},
 		SourceOrganizations: map[string]bool{"org-1": true},
@@ -516,7 +549,7 @@ func TestProxyRequestDoesNotMatchHostedSourceRouteFromHeadersAlone(t *testing.T)
 	p.RegisterEndpoint("http://default.internal", "default", WorkloadTypeGeneral)
 	p.RegisterEndpoint("http://source.internal", "source-pool", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://default.internal", "embed", "bge-small-en-v1.5")
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:                "default/source-context",
 		Operations:          map[OperationType]bool{OperationType("embed"): true},
 		SourceOrganizations: map[string]bool{"org-1": true},
@@ -567,7 +600,7 @@ func TestProxyQueueFallbackWaitsForEligibleDestination(t *testing.T) {
 	}
 
 	p.RegisterEndpoint("http://default.internal", "default", WorkloadTypeGeneral)
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:       "default/queue",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{
@@ -801,7 +834,7 @@ func TestResolveRequestDoesNotFallThroughToDefaultPoolAfterMatchedRoute(t *testi
 		Logger:          zap.NewNop(),
 	})
 	p.RegisterEndpoint("http://default.internal", "default", WorkloadTypeGeneral)
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:                "default/matched-no-dest",
 		Operations:          map[OperationType]bool{OperationType("embed"): true},
 		SourceOrganizations: map[string]bool{"org-1": true},
@@ -1025,7 +1058,7 @@ func TestResolveRequestDoesNotConsumeRouteRateLimit(t *testing.T) {
 		Destinations: []Destination{{Pool: "primary", Weight: 100}},
 		RateLimiter:  NewRateLimiter(1, 1, false),
 	}
-	p.Router().RouteManager().AddRoute(route)
+	p.Router().RouteManager().UpsertRoute(route)
 
 	for i := 0; i < 2; i++ {
 		if _, err := p.ResolveRequest(context.Background(), ResolveRequest{
@@ -1082,7 +1115,7 @@ func TestAcquireRequestResolutionUsesResolvedModelForPerModelRateLimit(t *testin
 		Destinations: []Destination{{Pool: "primary", Weight: 100}},
 		RateLimiter:  NewRateLimiter(1, 1, true),
 	}
-	p.Router().RouteManager().AddRoute(route)
+	p.Router().RouteManager().UpsertRoute(route)
 
 	modelALease, err := p.AcquireRequestResolution(context.Background(), ResolveRequest{
 		Operation: OperationType("embed"),
@@ -1188,7 +1221,7 @@ func TestResolutionLeaseNextAttemptSharesAdmissionDecision(t *testing.T) {
 		RateLimiter:   NewRateLimiter(1, 1, false),
 		RetryAttempts: 2,
 	}
-	p.Router().RouteManager().AddRoute(route)
+	p.Router().RouteManager().UpsertRoute(route)
 
 	firstLease, err := p.AcquireRequestResolution(context.Background(), ResolveRequest{
 		Operation: OperationType("embed"),
@@ -1239,7 +1272,7 @@ func TestResolutionLeaseNextAttemptRequiresCompletedCurrentAttempt(t *testing.T)
 	p.RegisterEndpoint("http://primary-b.internal", "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://primary-a.internal", "embed", "model-a")
 	advertiseModelOperation(p.registry, "http://primary-b.internal", "embed", "model-a")
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:       "default/retry-ordering",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{
@@ -1290,7 +1323,7 @@ func TestResolutionLeaseNextAttemptExcludesFailedEndpoint(t *testing.T) {
 	advertiseModelOperation(p.registry, "http://primary-a.internal", "embed", "model-a")
 	advertiseModelOperation(p.registry, "http://primary-b.internal", "embed", "model-a")
 	atomic.StoreInt32(&p.registry.endpoints["http://primary-b.internal"].Connections, 1)
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:       "default/retry-endpoints",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
 		Destinations: []Destination{
@@ -1841,7 +1874,7 @@ func TestScopedCatalogUsesRouteCapabilityCohort(t *testing.T) {
 	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	p.registry.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "default/gemma-reader",
 		Operations:    map[OperationType]bool{"read": true},
 		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reader$`)},
@@ -1873,7 +1906,7 @@ func TestScopedCatalogIncludesUnknownConditionalRouteContext(t *testing.T) {
 	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	p.registry.RegisterEndpoint("http://tenant-gpu.internal", "tenant-gpu", WorkloadTypeGeneral)
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:                "tenant-reader",
 		Priority:            100,
 		Operations:          map[OperationType]bool{"read": true},
@@ -1881,7 +1914,7 @@ func TestScopedCatalogIncludesUnknownConditionalRouteContext(t *testing.T) {
 		SourceOrganizations: map[string]bool{"tenant-a": true},
 		Destinations:        []Destination{{Pool: "tenant-gpu", Weight: 1}},
 	})
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "general-reader",
 		Operations:    map[OperationType]bool{"read": true},
 		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reader$`)},
@@ -1950,7 +1983,7 @@ func TestRoutesPrecedeExplicitPoolForDiscoveryAndExecution(t *testing.T) {
 	p.registry.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://cpu.internal", "read", "owner/reader")
 	advertiseModelOperation(p.registry, "http://gpu.internal", "read", "owner/reader")
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "force-gpu",
 		Operations:    map[OperationType]bool{"read": true},
 		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reader$`)},
@@ -1995,7 +2028,7 @@ func TestTerminalRejectRouteDoesNotExposeDefaultPool(t *testing.T) {
 	t.Parallel()
 	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "reject-reader",
 		Operations:    map[OperationType]bool{"read": true},
 		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reader$`)},
@@ -2016,7 +2049,7 @@ func TestCatalogCohortIsBoundToConcreteOperation(t *testing.T) {
 	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
 	p.registry.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "batch-generator",
 		Operations:    map[OperationType]bool{"generate.batch": true},
 		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/generator$`)},
@@ -2038,7 +2071,7 @@ func TestTerminalAliasRejectDoesNotFallThroughViaSemanticTask(t *testing.T) {
 	t.Parallel()
 	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
 	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "reject-batch-generator",
 		Operations:    map[OperationType]bool{"generate.batch": true},
 		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/generator$`)},
@@ -2057,7 +2090,7 @@ func TestCapabilityLeaseRejectsRoutePolicyGenerationChange(t *testing.T) {
 	for _, address := range []string{"http://gpu-a.internal", "http://gpu-b.internal"} {
 		advertiseModelOperation(p.registry, address, "generate", "owner/generator")
 	}
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "generator",
 		Operations:    map[OperationType]bool{"generate": true},
 		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/generator$`)},
@@ -2077,7 +2110,7 @@ func TestCapabilityLeaseRejectsRoutePolicyGenerationChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "generator",
 		Operations:    map[OperationType]bool{"generate": true},
 		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/generator$`)},
@@ -2100,7 +2133,7 @@ func TestMultimodalRerankHandlerPreservesConcreteOperation(t *testing.T) {
 	p.registry.RegisterEndpoint("http://multimodal.internal", "gpu", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://cpu.internal", "rerank", "owner/reranker")
 	advertiseModelOperation(p.registry, "http://multimodal.internal", "rerank_multimodal", "owner/reranker")
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "multimodal-rerank",
 		Operations:    map[OperationType]bool{"rerank_multimodal": true},
 		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reranker$`)},
@@ -2170,7 +2203,7 @@ func TestCapabilityLeaseFiltersWeightedRouteDestinationsBeforeSelection(t *testi
 		p.registry.RegisterEndpoint(endpoint.address, endpoint.pool, WorkloadTypeGeneral)
 		advertiseModelOperation(p.registry, endpoint.address, "generate", "gemma4")
 	}
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "default/generator",
 		Operations:    map[OperationType]bool{"generate": true},
 		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^gemma4$`)},
@@ -2221,6 +2254,74 @@ func TestCapabilityLeaseRejectsReregisteredEndpointAtSameAddress(t *testing.T) {
 	var resolutionErr *ResolutionError
 	if !errors.As(err, &resolutionErr) || resolutionErr.StatusCode != http.StatusConflict {
 		t.Fatalf("re-registered endpoint error = %#v, want capability-stale conflict", err)
+	}
+	p.capabilityLeaseMu.Lock()
+	_, retained := p.capabilityLeases[token]
+	p.capabilityLeaseMu.Unlock()
+	if retained {
+		t.Fatal("endpoint-incarnation-stale lease was retained after validation")
+	}
+}
+
+func TestCapabilityLeaseIssuanceReclaimsReplacedEndpointIncarnations(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	const address = "http://reader.internal"
+	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, address, "read", "owner/reader")
+	firstEndpoints := p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read")
+	oldToken, err := issueReaderCapabilityLease(p, "owner/reader", "revision-a", "", capabilityEndpointSet(p.registry, firstEndpoints))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p.registry.UnregisterEndpoint(address)
+	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, address, "read", "owner/reader")
+	secondEndpoints := p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read")
+	newToken, err := issueReaderCapabilityLease(p, "owner/reader", "revision-a", "", capabilityEndpointSet(p.registry, secondEndpoints))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newToken == oldToken {
+		t.Fatal("replacement endpoint incarnation reused the old lease token")
+	}
+	p.capabilityLeaseMu.Lock()
+	_, oldRetained := p.capabilityLeases[oldToken]
+	leaseCount := len(p.capabilityLeases)
+	p.capabilityLeaseMu.Unlock()
+	if oldRetained || leaseCount != 1 {
+		t.Fatalf("stale incarnation reclamation retained_old=%v lease_count=%d, want false/1", oldRetained, leaseCount)
+	}
+}
+
+func TestCapabilityLeaseRejectsInPlaceEndpointTopologyChange(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	const address = "http://reader.internal"
+	p.registry.RegisterEndpointWithHealth(address, address+"/ready", "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, address, "read", "owner/reader")
+	endpoints := p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read")
+	token, err := issueReaderCapabilityLease(p, "owner/reader", "revision-a", "", capabilityEndpointSet(p.registry, endpoints))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The address and Endpoint allocation remain stable, but routing semantics
+	// changed. The explicit incarnation must still fence the old capability plan.
+	p.registry.RegisterEndpointWithHealth(address, address+"/ready", "secondary", WorkloadTypeReadHeavy)
+	err = p.validateCapabilityLease(token, "revision-a", "owner/reader", "read", "")
+	var resolutionErr *ResolutionError
+	if !errors.As(err, &resolutionErr) || resolutionErr.StatusCode != http.StatusConflict {
+		t.Fatalf("topology-change error = %#v, want capability-stale conflict", err)
+	}
+	p.capabilityLeaseMu.Lock()
+	_, retained := p.capabilityLeases[token]
+	p.capabilityLeaseMu.Unlock()
+	if retained {
+		t.Fatal("topology-stale lease was retained after validation")
 	}
 }
 
@@ -2386,7 +2487,7 @@ func TestScopedCatalogLeaseFollowsNonDefaultRouteAndCallerCatalog(t *testing.T) 
 	p.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
 	// The service-credential inventory intentionally does not advertise this
 	// tenant-visible model. The caller-authorized scoped catalog is authoritative.
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "default/tenant-generator",
 		Operations:    map[OperationType]bool{"generate": true},
 		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^tenant/gemma4$`)},
@@ -2500,7 +2601,7 @@ func TestCapabilityLeaseIssuancePurgesObsoleteRouteGenerations(t *testing.T) {
 	const address = "http://reader.internal"
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:         "reader",
 		Operations:   map[OperationType]bool{"read": true},
 		Destinations: []Destination{{Pool: "primary", Weight: 1}},
@@ -2518,7 +2619,7 @@ func TestCapabilityLeaseIssuancePurgesObsoleteRouteGenerations(t *testing.T) {
 		}
 	}
 
-	p.Router().RouteManager().AddRoute(&Route{
+	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:         "reader",
 		Priority:     1,
 		Operations:   map[OperationType]bool{"read": true},
@@ -2596,17 +2697,10 @@ func TestRouteManagerEquivalentUpdatePreservesGenerationAndState(t *testing.T) {
 
 	rm := NewRouteManager()
 	first := newRoute()
-	if !rm.AddRoute(first) {
+	if !rm.UpsertRoute(first) {
 		t.Fatal("initial route was not added")
 	}
-	generation := rm.Generation()
-	if rm.AddRoute(newRoute()) {
-		t.Fatal("equivalent declarative update was treated as a policy change")
-	}
-	if got := rm.Generation(); got != generation {
-		t.Fatalf("generation = %d after no-op update, want %d", got, generation)
-	}
-	matched := rm.Match(&RouteRequest{
+	routeRequest := &RouteRequest{
 		Operation:          "generate.batch",
 		Model:              "gemma4",
 		Headers:            map[string]string{"x-tenant": "tenant-1"},
@@ -2615,17 +2709,91 @@ func TestRouteManagerEquivalentUpdatePreservesGenerationAndState(t *testing.T) {
 		SourceProject:      "project",
 		SourceAPIKey:       "prefix",
 		Timestamp:          time.Date(2026, time.January, 5, 1, 30, 0, 0, time.UTC),
-	})
-	if matched != first {
-		t.Fatal("equivalent update replaced the live route and its rate-limiter state")
+	}
+	installed := rm.Match(routeRequest)
+	if installed == nil || installed == first {
+		t.Fatal("route manager did not install an owned policy snapshot")
+	}
+	if installed.RateLimiter == first.RateLimiter {
+		t.Fatal("route manager retained caller-owned rate-limiter runtime")
+	}
+	generation := rm.Generation()
+	if rm.UpsertRoute(newRoute()) {
+		t.Fatal("equivalent declarative update was treated as a policy change")
+	}
+	if got := rm.Generation(); got != generation {
+		t.Fatalf("generation = %d after no-op update, want %d", got, generation)
+	}
+	matched := rm.Match(routeRequest)
+	if matched == nil || matched.RateLimiter != installed.RateLimiter {
+		t.Fatal("equivalent update replaced the live rate-limiter state")
 	}
 	changed := newRoute()
 	changed.Priority++
-	if !rm.AddRoute(changed) {
+	if !rm.UpsertRoute(changed) {
 		t.Fatal("real route policy change was ignored")
 	}
 	if got := rm.Generation(); got != generation+1 {
 		t.Fatalf("generation = %d after policy change, want %d", got, generation+1)
+	}
+	changedInstalled := rm.Match(routeRequest)
+	if changedInstalled == nil || changedInstalled.RateLimiter != installed.RateLimiter {
+		t.Fatal("unrelated policy change reset equivalent rate-limiter runtime")
+	}
+}
+
+func TestRouteManagerOwnsImmutablePolicySnapshots(t *testing.T) {
+	t.Parallel()
+
+	rm := NewRouteManager()
+	source := &Route{
+		Name:               "default/reader",
+		Operations:         map[OperationType]bool{"read": true},
+		ModelPatterns:      []*regexp.Regexp{regexp.MustCompile(`^reader$`)},
+		HeaderMatchers:     map[string]*StringMatcher{"x-tenant": {Exact: "tenant-a"}},
+		SourceTables:       map[string]bool{"documents": true},
+		Destinations:       []Destination{{Pool: "gpu", Weight: 1, QueueDepthCondition: &ThresholdCondition{Operator: "<", Value: 10}}},
+		Fallback:           &Fallback{Action: "redirect", RedirectPool: "backup"},
+		RetryOnStatuses:    map[int]bool{503: true},
+		RateLimiter:        NewRateLimiter(10, 10, false),
+		RetryOnRequestErrs: true,
+	}
+	if !rm.UpsertRoute(source) {
+		t.Fatal("initial route was not installed")
+	}
+	generation := rm.Generation()
+
+	// Mutating the object supplied by the caller must not alter installed policy.
+	source.Operations["read"] = false
+	source.HeaderMatchers["x-tenant"].Exact = "tenant-b"
+	source.SourceTables["documents"] = false
+	source.Destinations[0].Pool = "mutated"
+	source.Destinations[0].QueueDepthCondition.Value = 0
+	source.Fallback.RedirectPool = "mutated"
+	source.RetryOnStatuses[503] = false
+
+	req := &RouteRequest{
+		Operation:   "read",
+		Model:       "reader",
+		Headers:     map[string]string{"x-tenant": "tenant-a"},
+		SourceTable: "documents",
+		Timestamp:   time.Now(),
+	}
+	matched := rm.Match(req)
+	if matched == nil || matched.Destinations[0].Pool != "gpu" || matched.Fallback.RedirectPool != "backup" {
+		t.Fatalf("caller mutation changed installed route: %#v", matched)
+	}
+
+	// Mutating a returned snapshot must likewise not alter future matches.
+	matched.Operations["read"] = false
+	matched.Destinations[0].Pool = "returned-mutation"
+	matched.Fallback.RedirectPool = "returned-mutation"
+	again := rm.Match(req)
+	if again == nil || again.Destinations[0].Pool != "gpu" || again.Fallback.RedirectPool != "backup" {
+		t.Fatalf("returned route mutation changed installed policy: %#v", again)
+	}
+	if rm.Generation() != generation {
+		t.Fatalf("snapshot-only mutations changed generation: got %d want %d", rm.Generation(), generation)
 	}
 }
 
@@ -2643,6 +2811,7 @@ func TestCapabilityLeaseKeepsImmutableSnapshotAcrossCatalogRefresh(t *testing.T)
 	p.registry.updateModelOperationsForEndpoint(
 		address,
 		endpoints[0],
+		endpoints[0].incarnation,
 		map[string]map[OperationType]bool{"owner/reader": {"read": true}},
 	)
 	err = p.validateCapabilityLease(token, "revision-a", "owner/reader", "read", "")
@@ -2661,7 +2830,10 @@ func capabilityEndpointSet(registry *ModelRegistry, endpoints []*Endpoint) map[s
 				operations[operation] = true
 			}
 		}
-		result[endpoint.Address] = leasedEndpoint{endpoint: endpoint, operations: operations}
+		result[endpoint.Address] = leasedEndpoint{
+			incarnation: endpoint.incarnation,
+			operations:  operations,
+		}
 	}
 	return result
 }

@@ -131,7 +131,7 @@ func (w *RouteWatcher) onRouteAdd(obj any) {
 		return
 	}
 
-	if !w.routeManager.AddRoute(route) {
+	if !w.routeManager.UpsertRoute(route) {
 		w.logger.Debug("route policy already installed", zap.String("name", route.Name))
 		return
 	}
@@ -153,7 +153,7 @@ func (w *RouteWatcher) onRouteUpdate(oldObj, newObj any) {
 		return
 	}
 
-	if !w.routeManager.AddRoute(route) { // AddRoute handles updates by name.
+	if !w.routeManager.UpsertRoute(route) { // UpsertRoute handles updates by name.
 		w.logger.Debug("route update did not change policy", zap.String("name", route.Name))
 		return
 	}

@@ -1316,9 +1316,12 @@ document. They are architectural requirements, not Florence-specific cleanup:
 138. **Informer resyncs looked like route-policy changes.** The watcher now
     drops same-resource-version resync notifications before conversion, and the
     route manager independently compares the complete compiled policy before
-    replacing it. Equivalent declarative updates preserve the generation, the
-    installed route object, and its live rate-limiter state. Only a semantic
-    policy change invalidates capability plans.
+    replacing it. `UpsertRoute` owns a deep immutable copy of every declarative
+    map, matcher, time window, destination condition, fallback, and retry rule;
+    neither the submitted object nor a returned match can mutate installed
+    policy behind the generation fence. Equivalent updates preserve the
+    generation and synchronized rate-limiter runtime. Only a semantic policy
+    change invalidates capability plans.
 139. **Retry-time resolution discarded stale-plan semantics.** Initial
     resolution, admission, and every retry now share one typed
     `ResolutionError` response path. Capability staleness is an explicit error
@@ -1336,6 +1339,34 @@ document. They are architectural requirements, not Florence-specific cleanup:
     entries before applying the capacity limit. Real route changes therefore
     invalidate execution without turning already-dead safety state into a
     five-minute availability leak.
+142. **Authoritative discovery failures could resurrect an obsolete plan.**
+    Model-catalog discovery now distinguishes capability-stale conflicts,
+    permanent HTTP rejection or invalid contracts, and retryable transport or
+    server failure. A routing-stale conflict revokes the exact cache entry
+    before one retry inside the same single-flight, so a transient retry failure
+    cannot resurrect the already-invalid tuple. Permanent failures never use
+    stale data. Only explicitly transient discovery failure may reuse a
+    still-bounded stale descriptor/token/revision tuple.
+143. **Endpoint replacement left unusable leases consuming bounded capacity.**
+    The registry now assigns a monotonic incarnation ID whenever an address is
+    newly registered or its pool, health target, or workload class changes.
+    Catalog fan-out captures that identity before network I/O. Lease identity
+    and background model-refresh publication both fence on it, rather than on
+    Go pointer formatting alone. Issuance linearizes against the registry
+    topology, sweeps every lease containing a dead incarnation before its
+    capacity check, and validation deletes a stale lease as soon as it observes
+    replacement.
+144. **The routing API obscured replacement semantics.** The route manager now
+    exposes the deliberate breaking API `UpsertRoute(*Route) bool`; the result
+    is true only for an installed semantic change. Watchers and direct callers
+    use that contract explicitly, so no compatibility shim can accidentally
+    discard change detection or imply append-only behavior.
+145. **PDF stale-page cleanup retained a superseded vector-delete shape.**
+    Embedding artifacts now remain the sole owner of their projection cleanup:
+    stale PDF-page scans return bounded artifact keys only, and replay applies
+    those deletes atomically. The old parallel `vector_keys` list is neither
+    constructed nor freed, matching the artifact-backed chunk path and avoiding
+    duplicate or prematurely visible projection deletion.
 
 ### Post-review implementation contract
 
@@ -1345,11 +1376,14 @@ The hardening above follows these long-term rules:
   resolved atomically once per runtime/model/task/operation/auth scope and reused by
   planning and execution. The current implementation uses a bounded
   30-second fresh cache, five-minute stale-if-error interval, and single-flight
-  refresh. Discovery failure falls back to compatibility execution; it never
-  upgrades an unknown model to native batching. Discovery and single-flight
-  waits are deadline-bounded and cancelable; runtime shutdown drains owners.
-  Valid catalog failures may use stale or conservative capabilities, but an
-  expired or canceled caller never does.
+  refresh. A valid legacy catalog without an exact contract falls back to
+  conservative compatibility execution; it never upgrades an unknown model to
+  native batching. Discovery and single-flight waits are deadline-bounded and
+  cancelable; runtime shutdown drains owners.
+  Only retryable transport, overload, and 5xx catalog failures may use a
+  still-bounded stale capability lease. Capability-stale conflicts retry once
+  within the owning single-flight; authoritative 4xx responses, invalid
+  contracts, expired contexts, and canceled callers never publish stale data.
 - Capability caches and concurrent I/O executors are runtime-owned services,
   not document-owned implementation details. Read and write enrichment borrow
   them for their invocation lifetimes; shutdown destroys them only after their
@@ -1382,9 +1416,10 @@ The hardening above follows these long-term rules:
   which precedes the process default. Execution then intersects the selected
   pool and concrete operation with the leased endpoints. Equivalent immutable
   snapshots renew and reuse their token rather than consuming another bounded
-  table slot. Issuance purges leases from obsolete route generations before its
-  capacity check and refuses to publish a token if discovery raced a policy
-  replacement.
+  table slot. Issuance purges leases from obsolete route generations and dead
+  endpoint incarnations before its capacity check, and refuses to publish a
+  token if discovery raced a policy or endpoint replacement. Validation also
+  removes a lease immediately after detecting either lifecycle mismatch.
   Antfly clients attach both values to read,
   generation, embedding, reranking, chunking, extraction, and transcription
   transports; rewrite and classification use the same task contract when their

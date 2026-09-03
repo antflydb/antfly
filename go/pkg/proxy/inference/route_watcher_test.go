@@ -19,7 +19,7 @@ func TestRouteWatcherIgnoresInformerResyncUpdate(t *testing.T) {
 	t.Parallel()
 
 	routes := NewRouteManager()
-	routes.AddRoute(&Route{Name: "default/reader", Priority: 1})
+	routes.UpsertRoute(&Route{Name: "default/reader", Priority: 1})
 	generation := routes.Generation()
 	watcher := &RouteWatcher{routeManager: routes, logger: zap.NewNop()}
 	oldObject := &unstructured.Unstructured{Object: map[string]any{

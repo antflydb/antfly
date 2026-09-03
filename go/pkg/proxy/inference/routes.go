@@ -250,25 +250,38 @@ func NewRouteManager() *RouteManager {
 	}
 }
 
-// AddRoute adds or replaces a route (routes are re-sorted by priority). It is
-// deliberately idempotent: informer resyncs and equivalent declarative updates
-// preserve both the routing generation and live rate-limiter state.
-func (rm *RouteManager) AddRoute(route *Route) bool {
+// UpsertRoute adds or replaces a route (routes are re-sorted by priority). It
+// deliberately owns an immutable copy of the declarative policy: informer
+// resyncs and equivalent updates preserve both the routing generation and live
+// rate-limiter state, while later caller mutations cannot alter installed
+// routing policy behind the generation fence.
+func (rm *RouteManager) UpsertRoute(route *Route) bool {
+	if route == nil {
+		return false
+	}
+	candidate := cloneRoute(route, true)
+
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
 	// Remove existing route with same name
 	newRoutes := make([]*Route, 0, len(rm.routes)+1)
 	for _, r := range rm.routes {
-		if r.Name == route.Name {
-			if routePolicyEqual(r, route) {
+		if r.Name == candidate.Name {
+			if routePolicyEqual(r, candidate) {
 				return false
+			}
+			// The token bucket is mutable runtime state, not declarative policy.
+			// Preserve it across unrelated policy changes when its configuration
+			// is unchanged.
+			if rateLimiterPolicyEqual(r.RateLimiter, candidate.RateLimiter) {
+				candidate.RateLimiter = r.RateLimiter
 			}
 			continue
 		}
 		newRoutes = append(newRoutes, r)
 	}
-	newRoutes = append(newRoutes, route)
+	newRoutes = append(newRoutes, candidate)
 
 	// Sort by priority (descending), then by name (ascending) for stable ordering
 	sort.Slice(newRoutes, func(i, j int) bool {
@@ -281,6 +294,129 @@ func (rm *RouteManager) AddRoute(route *Route) bool {
 	rm.routes = newRoutes
 	rm.generation++
 	return true
+}
+
+func cloneRoute(route *Route, ownRateLimiter bool) *Route {
+	if route == nil {
+		return nil
+	}
+	cloned := *route
+	cloned.Operations = cloneBoolMap(route.Operations)
+	cloned.ModelPatterns = cloneRegexps(route.ModelPatterns)
+	cloned.HeaderMatchers = cloneStringMatchers(route.HeaderMatchers)
+	cloned.SourceTables = cloneBoolMap(route.SourceTables)
+	cloned.SourceOrganizations = cloneBoolMap(route.SourceOrganizations)
+	cloned.SourceProjects = cloneBoolMap(route.SourceProjects)
+	cloned.SourceAPIKeys = cloneBoolMap(route.SourceAPIKeys)
+	cloned.TimeWindow = cloneTimeWindow(route.TimeWindow)
+	cloned.Destinations = cloneDestinations(route.Destinations)
+	cloned.Fallback = cloneFallback(route.Fallback)
+	cloned.RetryOnStatuses = cloneBoolMap(route.RetryOnStatuses)
+	if ownRateLimiter && route.RateLimiter != nil {
+		cloned.RateLimiter = cloneRateLimiterPolicy(route.RateLimiter)
+	}
+	// Match snapshots share only the synchronized token-bucket runtime. Every
+	// declarative map, slice, matcher, and condition is independently owned.
+	return &cloned
+}
+
+func cloneRateLimiterPolicy(source *RateLimiter) *RateLimiter {
+	if source == nil {
+		return nil
+	}
+	return &RateLimiter{
+		rate:        source.rate,
+		burstSize:   source.burstSize,
+		tokens:      float64(source.burstSize),
+		lastUpdate:  time.Now(),
+		perModel:    source.perModel,
+		modelLimits: make(map[string]*modelLimit),
+	}
+}
+
+func cloneBoolMap[K comparable](source map[K]bool) map[K]bool {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[K]bool, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneRegexps(source []*regexp.Regexp) []*regexp.Regexp {
+	if source == nil {
+		return nil
+	}
+	cloned := make([]*regexp.Regexp, len(source))
+	for i, pattern := range source {
+		if pattern != nil {
+			// Copy preserves POSIX/Longest compilation semantics while isolating
+			// the one mutating Regexp operation, Longest, from installed policy.
+			cloned[i] = pattern.Copy()
+		}
+	}
+	return cloned
+}
+
+func cloneStringMatchers(source map[string]*StringMatcher) map[string]*StringMatcher {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]*StringMatcher, len(source))
+	for name, matcher := range source {
+		if matcher == nil {
+			cloned[name] = nil
+			continue
+		}
+		matcherCopy := *matcher
+		if matcher.Regex != nil {
+			matcherCopy.Regex = matcher.Regex.Copy()
+		}
+		cloned[name] = &matcherCopy
+	}
+	return cloned
+}
+
+func cloneTimeWindow(source *TimeWindow) *TimeWindow {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	cloned.Days = cloneBoolMap(source.Days)
+	return &cloned
+}
+
+func cloneDestinations(source []Destination) []Destination {
+	if source == nil {
+		return nil
+	}
+	cloned := make([]Destination, len(source))
+	for i := range source {
+		cloned[i] = source[i]
+		cloned[i].QueueDepthCondition = cloneThreshold(source[i].QueueDepthCondition)
+		cloned[i].ReplicaCondition = cloneThreshold(source[i].ReplicaCondition)
+		cloned[i].LatencyCondition = cloneThreshold(source[i].LatencyCondition)
+		cloned[i].TimeCondition = cloneTimeWindow(source[i].TimeCondition)
+	}
+	return cloned
+}
+
+func cloneThreshold(source *ThresholdCondition) *ThresholdCondition {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	return &cloned
+}
+
+func cloneFallback(source *Fallback) *Fallback {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	return &cloned
 }
 
 func routePolicyEqual(left, right *Route) bool {
@@ -443,7 +579,7 @@ func (rm *RouteManager) Match(req *RouteRequest) *Route {
 
 	for _, route := range rm.routes {
 		if rm.matchRoute(route, req) {
-			return route
+			return cloneRoute(route, false)
 		}
 	}
 	return nil
@@ -460,7 +596,7 @@ func (rm *RouteManager) MatchAtGeneration(req *RouteRequest, generation uint64) 
 	}
 	for _, route := range rm.routes {
 		if rm.matchRoute(route, req) {
-			return route, true
+			return cloneRoute(route, false), true
 		}
 	}
 	return nil, true

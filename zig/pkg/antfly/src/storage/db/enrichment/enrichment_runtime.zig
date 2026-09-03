@@ -11647,8 +11647,6 @@ test "durable enrichment PDF page embedding queues complete staged generations w
         2,
     );
     defer stale.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), stale.vector_keys.len);
-    try std.testing.expectEqualStrings(page_three, stale.vector_keys[0]);
     try std.testing.expectEqual(@as(usize, 1), stale.artifact_delete_keys.len);
     try std.testing.expectEqualStrings(final_three, stale.artifact_delete_keys[0]);
     try std.testing.expectError(
@@ -13995,8 +13993,6 @@ fn deleteStalePageEmbeddingArtifactsWithLimit(
 ) !StaleEmbeddingDeletes {
     const prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "asset", page_artifact_name);
     defer runtime.alloc.free(prefix);
-    var stale_vector_keys = std.ArrayListUnmanaged([]u8).empty;
-    errdefer freeKeyList(runtime.alloc, stale_vector_keys.items);
     var artifact_delete_keys = std.ArrayListUnmanaged([]u8).empty;
     errdefer freeKeyList(runtime.alloc, artifact_delete_keys.items);
     var desired_page_key_set = std.StringHashMapUnmanaged(void).empty;
@@ -14014,7 +14010,6 @@ fn deleteStalePageEmbeddingArtifactsWithLimit(
         max_matching_artifacts: usize,
         scanned_artifacts: usize = 0,
         matching_artifacts: usize = 0,
-        stale_vector_keys: *std.ArrayListUnmanaged([]u8),
         artifact_delete_keys: *std.ArrayListUnmanaged([]u8),
 
         fn visit(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!backend_scan.ScanAction {
@@ -14033,15 +14028,6 @@ fn deleteStalePageEmbeddingArtifactsWithLimit(
                 return error.PdfEmbeddingArtifactFanoutExceeded;
             if (try derivedEmbeddingBelongsToDesiredChunkSet(state.alloc, key, state.desired_page_key_set))
                 return .@"continue";
-            if (try internal_keys.derivedEmbeddingBaseKeyAlloc(state.alloc, key)) |base_key| {
-                // A store scan visits each canonical artifact key exactly once,
-                // and the selected embedding name has one key per page. Avoid
-                // quadratic list de-duplication at the admitted page ceiling.
-                state.stale_vector_keys.append(state.alloc, base_key) catch |err| {
-                    state.alloc.free(base_key);
-                    return err;
-                };
-            }
             const owned_artifact_key = try state.alloc.dupe(u8, key);
             state.artifact_delete_keys.append(state.alloc, owned_artifact_key) catch |err| {
                 state.alloc.free(owned_artifact_key);
@@ -14056,12 +14042,10 @@ fn deleteStalePageEmbeddingArtifactsWithLimit(
         .embedding_artifact_name = embedding_artifact_name,
         .desired_page_key_set = &desired_page_key_set,
         .max_matching_artifacts = max_matching_artifacts,
-        .stale_vector_keys = &stale_vector_keys,
         .artifact_delete_keys = &artifact_delete_keys,
     };
     try backend_scan.scanWithContext(&runtime.store, prefix, "", .{}, &state, ScanState.visit);
     return .{
-        .vector_keys = try stale_vector_keys.toOwnedSlice(runtime.alloc),
         .artifact_delete_keys = try artifact_delete_keys.toOwnedSlice(runtime.alloc),
     };
 }
