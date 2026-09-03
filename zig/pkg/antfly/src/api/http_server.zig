@@ -2691,8 +2691,8 @@ pub const ApiHttpServer = struct {
     session_lease_renewal_owner_id: u64 = 0,
     session_lease_renewal_in_flight: std.atomic.Value(bool) = .init(false),
     session_maintenance_pause_for_test: std.atomic.Value(bool) = .init(false),
-    session_maintenance_entered_for_test: std.atomic.Value(bool) = .init(false),
-    session_maintenance_release_for_test: std.atomic.Value(bool) = .init(false),
+    session_maintenance_entered_for_test: std.Io.Event = .unset,
+    session_maintenance_release_for_test: std.Io.Event = .unset,
     backup_maintenance_owner_id: u64 = 0,
     index_installation_owner_id: u64 = 0,
     index_installation_closing: std.atomic.Value(bool) = .init(false),
@@ -3638,9 +3638,9 @@ pub const ApiHttpServer = struct {
         // The inline call is a fallback for manual runtimes and direct users.
         try self.maybeRenewOwnedSessionLeases();
         if (comptime builtin.is_test) if (self.session_maintenance_pause_for_test.load(.acquire)) {
-            self.session_maintenance_entered_for_test.store(true, .release);
-            while (!self.session_maintenance_release_for_test.load(.acquire))
-                sleepNs(std.time.ns_per_ms);
+            const io = self.sharedApiIo() orelse std.testing.io;
+            self.session_maintenance_entered_for_test.set(io);
+            self.session_maintenance_release_for_test.waitUncancelable(io);
         };
         // Queue insertion is durable in server memory even when the bounded
         // executor temporarily rejects the worker submission. The periodic
@@ -26705,7 +26705,7 @@ test "standalone durable receipt is recovered after owner process restart withou
         // execution marker and before any terminal receipt is written.
     }
 
-    sleepNs(70 * std.time.ns_per_ms);
+    try cleanup_io.io().sleep(.fromMilliseconds(70), .awake);
     var successor = try ApiHttpServer.initWithConfig(alloc, .{
         .deployment_mode = .standalone,
         .session_store_path = session_path,
@@ -26741,6 +26741,8 @@ test "stable transaction recovery retains bare decision conflict ambiguity and h
         }
     };
     const FakeWrites = struct {
+        io: std.Io,
+
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{ .ptr = self, .vtable = &.{
                 .batch = batch,
@@ -26751,14 +26753,15 @@ test "stable transaction recovery retains bare decision conflict ambiguity and h
             return error.TestUnexpectedResult;
         }
         fn commitTransactionWithId(
-            _: *anyopaque,
+            ptr: *anyopaque,
             _: std.mem.Allocator,
             _: db_mod.types.TxnId,
             _: u64,
             _: []const distributed_txn.TableCommitRequest,
             _: db_mod.types.SyncLevel,
         ) anyerror!?distributed_txn.CommitOutcome {
-            sleepNs(80 * std.time.ns_per_ms);
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.io.sleep(.fromMilliseconds(80), .awake);
             // DecisionConflict reports contradictory/torn decision evidence;
             // it does not prove that abort rather than commit won.
             return error.DecisionConflict;
@@ -26766,7 +26769,7 @@ test "stable transaction recovery retains bare decision conflict ambiguity and h
     };
 
     var source = FakeSource{};
-    var writes = FakeWrites{};
+    var writes = FakeWrites{ .io = cleanup_io.io() };
     var server = try ApiHttpServer.initWithConfig(alloc, .{
         .session_store_path = session_path,
         .session_owner_lease_ttl_ns = 20 * std.time.ns_per_ms,
@@ -33451,7 +33454,7 @@ test "session lease renewal remains independent while recovery is blocked" {
         .session_owner_lease_renew_interval_ns = 5 * std.time.ns_per_ms,
     }, source.iface(), null, null);
     defer {
-        server.session_maintenance_release_for_test.store(true, .release);
+        server.session_maintenance_release_for_test.set(server.sharedApiIo().?);
         server.deinit();
     }
 
@@ -33460,30 +33463,31 @@ test "session lease renewal remains independent while recovery is blocked" {
     server.session_maintenance_pause_for_test.store(true, .release);
     server.last_session_lease_renew_ns.store(0, .release);
     try server.scheduleSessionMaintenance();
-    const wait_deadline = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
-    while (!server.session_maintenance_entered_for_test.load(.acquire) and platform_time.monotonicNs() < wait_deadline)
-        sleepNs(std.time.ns_per_ms);
-    try std.testing.expect(server.session_maintenance_entered_for_test.load(.acquire));
+    const io = server.sharedApiIo().?;
+    try server.session_maintenance_entered_for_test.waitTimeout(io, .{
+        .duration = .{ .raw = .fromSeconds(2), .clock = .awake },
+    });
 
     var first_expiry = initial_expiry;
+    const wait_deadline = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
     while (first_expiry <= initial_expiry and platform_time.monotonicNs() < wait_deadline) {
-        sleepNs(std.time.ns_per_ms);
+        try io.sleep(.fromMilliseconds(1), .awake);
         first_expiry = (try server.txn_sessions.getStatus(alloc, idle.txn_id)).?.lease_expires_at;
     }
     try std.testing.expect(first_expiry > initial_expiry);
 
-    sleepNs(8 * std.time.ns_per_ms);
+    try io.sleep(.fromMilliseconds(8), .awake);
     try server.scheduleSessionMaintenance();
     var second_expiry = first_expiry;
     while (second_expiry <= first_expiry and platform_time.monotonicNs() < wait_deadline) {
-        sleepNs(std.time.ns_per_ms);
+        try io.sleep(.fromMilliseconds(1), .awake);
         second_expiry = (try server.txn_sessions.getStatus(alloc, idle.txn_id)).?.lease_expires_at;
     }
     try std.testing.expect(second_expiry > first_expiry);
     try std.testing.expect(server.session_maintenance_in_flight.load(.acquire));
-    server.session_maintenance_release_for_test.store(true, .release);
+    server.session_maintenance_release_for_test.set(io);
     while (server.session_maintenance_in_flight.load(.acquire) and platform_time.monotonicNs() < wait_deadline)
-        sleepNs(std.time.ns_per_ms);
+        try io.sleep(.fromMilliseconds(1), .awake);
     try std.testing.expect(!server.session_maintenance_in_flight.load(.acquire));
 }
 

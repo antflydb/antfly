@@ -408,7 +408,6 @@ pub const TerminalCommit = struct {
 pub const IdempotentTerminalCommitSnapshot = struct {
     request: OwnedTransactionCommitRequest,
     terminal: TerminalCommit,
-    owns_mutation_lease: bool,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.request.deinit(alloc);
@@ -2465,7 +2464,6 @@ pub const SessionRegistry = struct {
         var snapshot: IdempotentTerminalCommitSnapshot = .{
             .request = try sealed_request.clone(alloc),
             .terminal = undefined,
-            .owns_mutation_lease = session.owner_incarnation == self.owner_incarnation,
         };
         errdefer snapshot.request.deinit(alloc);
         snapshot.terminal = try terminal.clone(alloc);
@@ -6543,7 +6541,6 @@ test "terminal idempotent receipt replay does not require mutation lease ownersh
     var snapshot = (try restarted.getIdempotentTerminalCommitSnapshot(alloc, txn_id, &request)).?;
     defer snapshot.deinit(alloc);
     try std.testing.expect(snapshot.terminal.coordinator_acknowledged);
-    try std.testing.expect(!snapshot.owns_mutation_lease);
     try std.testing.expectEqual(@as(usize, 1), snapshot.request.tables.len);
     try std.testing.expectError(
         error.SessionLeaseLost,
