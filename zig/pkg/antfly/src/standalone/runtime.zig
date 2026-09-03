@@ -6265,9 +6265,10 @@ test "standalone encoded reader ABI round trips borrowed payloads" {
     const empty_metadata = encodedImageProviderMetadata("florence2", empty_request);
     const empty_json = try std.json.Stringify.valueAlloc(alloc, empty_metadata, .{});
     defer alloc.free(empty_json);
-    var empty_decoded = try inference_host.decodeReadEncodedImagesProviderRequest(alloc, empty_json, null, 0, null, 0);
-    defer empty_decoded.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), empty_decoded.images.len);
+    try std.testing.expectError(
+        error.ReadBatchTooLarge,
+        inference_host.decodeReadEncodedImagesProviderRequest(alloc, empty_json, null, 0, null, 0),
+    );
 
     const unused_handle: *anyopaque = @ptrFromInt(1);
     try std.testing.expectError(

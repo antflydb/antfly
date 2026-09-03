@@ -1793,6 +1793,24 @@ The hardening above follows these long-term rules:
     merged catalog plus each concurrent raw body, decoded catalog, and task
     inventory parse, rejects an impossible request immediately, and observes
     request cancellation while queued.
+47. **Implemented after completed-flight invalidation review:** capability
+    invalidation poisons both active discovery owners and completed flights
+    retained by existing waiters. A completed flight keeps its reference-counted
+    allocation until those waiters release it, but its capability value, routing
+    token, and descriptor revision are cleared immediately. New callers cannot
+    join the tracked completion and resurrect a tuple that execution has
+    authoritatively revoked.
+48. **Implemented after route-input validation review:** route installation is
+    a strict compile boundary. Nil model patterns and header matchers are
+    rejected before publication, invalid declarative regular expressions remain
+    errors, and a rejected route does not advance the routing-policy generation.
+    Matching can therefore operate on immutable, fully compiled policy without
+    defensive hot-path allocation or nil-dependent semantics.
+49. **Implemented after linked-runtime verification review:** the encoded-reader
+    ABI enforces the same non-empty batch invariant at structural decode and at
+    execution. Its production-linked round-trip test now expects the decoder to
+    reject an empty attachment set instead of treating an invalid batch as a
+    valid codec-only value.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

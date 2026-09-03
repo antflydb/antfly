@@ -506,8 +506,29 @@ pub const Cache = struct {
         defer self.mutex.unlock(self.io);
         self.removeEntryLocked(key);
         if (self.flights.get(key)) |flight| {
-            if (!flight.done) flight.invalidated = true;
+            self.invalidateFlightLocked(flight);
         }
+    }
+
+    /// Revoke every tracked completion for this key, not just an owner that is
+    /// still performing discovery. Completed flights remain in the map while
+    /// existing waiters hold references; poisoning their result prevents a new
+    /// caller from joining that flight and resurrecting the tuple removed from
+    /// `entries`. The flight stays allocated until its existing references
+    /// release through the normal lifecycle.
+    fn invalidateFlightLocked(self: *Cache, flight: *CapabilityFlight) void {
+        flight.invalidated = true;
+        if (!flight.done) return;
+        self.completeFlightInvalidationLocked(flight);
+    }
+
+    fn completeFlightInvalidationLocked(self: *Cache, flight: *CapabilityFlight) void {
+        flight.value = null;
+        flight.routing_token = null;
+        flight.descriptor_revision = null;
+        flight.err = error.CapabilityDiscoveryInvalidated;
+        flight.done = true;
+        flight.ready.set(self.io);
     }
 
     fn removeEntryLocked(self: *Cache, key: []const u8) void {
@@ -534,12 +555,7 @@ pub const Cache = struct {
     // discovery result. The caller holds mutex and must unlock before retrying.
     fn retireInvalidatedFlightLocked(self: *Cache, flight: *CapabilityFlight) bool {
         if (!flight.invalidated) return false;
-        flight.value = null;
-        flight.routing_token = null;
-        flight.descriptor_revision = null;
-        flight.err = error.CapabilityDiscoveryInvalidated;
-        flight.done = true;
-        flight.ready.set(self.io);
+        self.completeFlightInvalidationLocked(flight);
         self.releaseFlightLocked(flight);
         return true;
     }
@@ -1480,4 +1496,64 @@ pub fn testCapabilityInvalidationFencesActiveFlight() !void {
 
 test "capability invalidation fences an active discovery flight" {
     try testCapabilityInvalidationFencesActiveFlight();
+}
+
+pub fn testCapabilityInvalidationFencesCompletedFlight() !void {
+    const alloc = std.testing.allocator;
+    var cache = Cache.init(alloc, std.Options.debug_io);
+    defer cache.deinit();
+    const headers: []const [2][]const u8 = &.{};
+    const key = try capabilityCacheKeyAlloc(alloc, "http://proxy", "model", .read, headers);
+    var key_owned = true;
+    defer if (key_owned) alloc.free(key);
+    const flight = try alloc.create(CapabilityFlight);
+    var flight_owned = true;
+    defer if (flight_owned) alloc.destroy(flight);
+    flight.* = .{
+        .key = key,
+        .done = true,
+        .value = .{
+            .task = .read,
+            .input_modalities = .{ .image = true },
+            .accepted_mime_types = .{ .image_png = true },
+            .input_granularity = .page,
+            .output = .read_result,
+        },
+        .routing_token = try RoutingToken.init("revoked-token"),
+        .descriptor_revision = try CapabilityRevision.init("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+    };
+    try cache.flights.put(alloc, flight.key, flight);
+    key_owned = false;
+    flight_owned = false;
+    defer {
+        cache.mutex.lockUncancelable(cache.io);
+        cache.releaseFlightLocked(flight);
+        cache.mutex.unlock(cache.io);
+    }
+
+    try cache.invalidate("http://proxy", "model", .read, headers);
+
+    cache.mutex.lockUncancelable(cache.io);
+    const invalidated = flight.invalidated;
+    const done = flight.done;
+    const flight_err = flight.err;
+    const capabilities = flight.value;
+    const routing_token = flight.routing_token;
+    const descriptor_revision = flight.descriptor_revision;
+    const tracked = cache.flights.get(flight.key) == flight;
+    const refs = flight.refs;
+    cache.mutex.unlock(cache.io);
+
+    try std.testing.expect(invalidated);
+    try std.testing.expect(done);
+    try std.testing.expectEqual(error.CapabilityDiscoveryInvalidated, flight_err.?);
+    try std.testing.expect(capabilities == null);
+    try std.testing.expect(routing_token == null);
+    try std.testing.expect(descriptor_revision == null);
+    try std.testing.expect(tracked);
+    try std.testing.expectEqual(@as(usize, 1), refs);
+}
+
+test "capability invalidation poisons a completed discovery flight" {
+    try testCapabilityInvalidationFencesCompletedFlight();
 }

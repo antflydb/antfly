@@ -365,9 +365,9 @@ func (rm *RouteManager) UpsertRoute(route *Route) (bool, error) {
 
 func prepareRoute(route *Route, ownRateLimiter bool) (*Route, error) {
 	cloned := cloneRoute(route, ownRateLimiter)
-	for _, pattern := range cloned.ModelPatterns {
+	for index, pattern := range cloned.ModelPatterns {
 		if pattern == nil {
-			continue
+			return nil, fmt.Errorf("model pattern %d must not be nil", index)
 		}
 		if pattern.Syntax == "" {
 			pattern.Syntax = RegexLeftmostFirst
@@ -379,7 +379,10 @@ func prepareRoute(route *Route, ownRateLimiter bool) (*Route, error) {
 		pattern.compiled = compiled
 	}
 	for name, matcher := range cloned.HeaderMatchers {
-		if matcher == nil || matcher.Regex == nil {
+		if matcher == nil {
+			return nil, fmt.Errorf("header matcher for %q must not be nil", name)
+		}
+		if matcher.Regex == nil {
 			continue
 		}
 		if matcher.Regex.Syntax == "" {

@@ -56,6 +56,7 @@ test "inference module compiles" {
 
 test "remote capability invalidation fences active discovery" {
     try remote_capabilities.testCapabilityInvalidationFencesActiveFlight();
+    try remote_capabilities.testCapabilityInvalidationFencesCompletedFlight();
 }
 
 test "bedrock provider request helpers" {

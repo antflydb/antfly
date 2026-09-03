@@ -2913,6 +2913,32 @@ func TestRouteManagerOwnsDeclarativeRegexSemantics(t *testing.T) {
 	}
 }
 
+func TestRouteManagerRejectsNilDeclarativeMatchers(t *testing.T) {
+	t.Parallel()
+	rm := NewRouteManager()
+
+	for name, route := range map[string]*Route{
+		"model pattern": {
+			Name:          "nil-model-pattern",
+			ModelPatterns: []*RegexPattern{nil},
+		},
+		"header matcher": {
+			Name:           "nil-header-matcher",
+			HeaderMatchers: map[string]*StringMatcher{"x-tenant": nil},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if changed, err := rm.UpsertRoute(route); err == nil || changed {
+				t.Fatalf("malformed route changed=%v err=%v, want rejection", changed, err)
+			}
+		})
+	}
+
+	if got := rm.Generation(); got != 0 {
+		t.Fatalf("rejected routes changed generation to %d", got)
+	}
+}
+
 func TestRouteManagerInstalledMatchDoesNotAllocate(t *testing.T) {
 	rm := NewRouteManager()
 	if changed, err := rm.UpsertRoute(&Route{
