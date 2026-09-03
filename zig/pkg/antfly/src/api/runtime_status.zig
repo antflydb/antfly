@@ -504,6 +504,21 @@ pub const TableRuntimeSnapshotCache = struct {
         };
     }
 
+    /// Reports whether a previously captured observation still belongs to the
+    /// current table/root lifetime. This is intentionally read-only: resource
+    /// retirement can use it to preserve an already-published immutable
+    /// snapshot without advancing the observation ordering boundary.
+    pub fn publicationTableEpochCurrent(
+        self: *@This(),
+        table_name: []const u8,
+        token: PublicationToken,
+    ) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.tables.getPtr(table_name) orelse return false;
+        return std.meta.eql(state.epoch, token.table_epoch);
+    }
+
     /// Captures all catalog tables in one lock acquisition before refresh DB
     /// inspection begins. `table_names` need only live for this call.
     pub fn captureCatalogToken(
@@ -574,6 +589,52 @@ pub const TableRuntimeSnapshotCache = struct {
                 owned.deinit(self.alloc);
                 return .stale_observation;
             }
+            preserveArtifactVisibilityOnReplayRegression(
+                previous.*,
+                &owned,
+                &state.targeted_index_fences,
+            );
+            previous.deinit(self.alloc);
+            previous.* = owned;
+        } else {
+            try state.groups.put(self.alloc, status.group_id, owned);
+        }
+        self.advanceTargetedIndexAuthorityLocked(state);
+        self.settleReleasedTargetedIndexFencesLocked(state);
+        return .published;
+    }
+
+    /// Publishes a group observation whose caller owns the table/group
+    /// operation through status collection and publication. Visibility-only
+    /// invalidations from that operation may advance `invalidation_epoch`, but
+    /// a drop/recreate or storage-root replacement advances `root_generation`
+    /// and must still fence the old owner. Observation ordering is assigned
+    /// while holding the cache lock so an overlapping cache-only refresh cannot
+    /// make an older materialization win merely because it reserved an
+    /// observation number later.
+    pub fn publishGroupAtConsistentBoundary(
+        self: *@This(),
+        token: PublicationToken,
+        table_name: []const u8,
+        status: LocalTableRuntimeStatus,
+    ) !PublishResult {
+        var owned = try status.clone(self.alloc);
+        errdefer owned.deinit(self.alloc);
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.tables.getPtr(table_name) orelse {
+            owned.deinit(self.alloc);
+            return .stale_table;
+        };
+        if (state.epoch.root_generation != token.table_epoch.root_generation) {
+            owned.deinit(self.alloc);
+            return .stale_table;
+        }
+
+        owned.cache_observation_generation = self.takeObservationGenerationLocked();
+        owned.withMetadataDefaults(.live_writer_publish, platform_time.monotonicNs());
+        if (state.groups.getPtr(status.group_id)) |previous| {
             preserveArtifactVisibilityOnReplayRegression(
                 previous.*,
                 &owned,
@@ -848,8 +909,10 @@ pub const TableRuntimeSnapshotCache = struct {
             status.* = cloned;
             return;
         }
-        if (status.metadata.source == .synthetic_config and runtimeStatusWorthPreserving(cached.*)) {
-            const merged = try mergeCachedStatusWithSyntheticPlaceholder(
+        if (runtimeStatusSourceIsNonAuthoritativeRefresh(status.metadata.source) and
+            runtimeStatusWorthPreserving(cached.*))
+        {
+            const merged = try mergeCachedStatusWithNonAuthoritativePlaceholder(
                 self.alloc,
                 cached.*,
                 status.*,
@@ -1341,7 +1404,11 @@ fn preserveIndexArtifactVisibility(dst: *db_mod.types.DBIndexStats, cached: db_m
     dst.hbc_posting = cached.hbc_posting;
 }
 
-fn mergeCachedStatusWithSyntheticPlaceholder(
+fn runtimeStatusSourceIsNonAuthoritativeRefresh(source: RuntimeStatusSource) bool {
+    return source == .synthetic_config or source == .cached_snapshot;
+}
+
+fn mergeCachedStatusWithNonAuthoritativePlaceholder(
     alloc: std.mem.Allocator,
     previous: LocalTableRuntimeStatus,
     placeholder: LocalTableRuntimeStatus,
@@ -1413,11 +1480,28 @@ fn cachedSnapshotMetadata(
 ) RuntimeStatusMetadata {
     var metadata = previous;
     metadata.source = .cached_snapshot;
-    metadata.freshness = switch (placeholder.freshness) {
-        .unknown, .missing => .stale,
-        else => placeholder.freshness,
-    };
-    metadata.updated_at_ns = now_ns;
+    const placeholder_has_no_runtime_authority = runtimeStatusSourceIsNonAuthoritativeRefresh(placeholder.source) and
+        (placeholder.freshness == .unknown or
+            placeholder.freshness == .missing or
+            placeholder.freshness == .stale);
+    if (previous.freshness == .fresh and placeholder_has_no_runtime_authority) {
+        // A catalog/config placeholder or a cache-derived status is not a
+        // contrary runtime observation. The table epoch already fences
+        // drop/recreate and root replacement, while per-index fences mark an
+        // affected incarnation explicitly. Preserve the last proven runtime
+        // freshness and its observation timestamp so a quiescent table does
+        // not become permanently stale merely because its short-lived startup
+        // writer retired or a refresh round-tripped the cache itself. The
+        // normal age-based writer refresh may still sample an already-resident
+        // writer without opening one on demand.
+        metadata.freshness = .fresh;
+    } else {
+        metadata.freshness = switch (placeholder.freshness) {
+            .unknown, .missing => .stale,
+            else => placeholder.freshness,
+        };
+        metadata.updated_at_ns = now_ns;
+    }
     return metadata;
 }
 
@@ -2424,6 +2508,10 @@ test "table runtime snapshot cache does not replace published live status with s
             .source = .live_writer_publish,
             .freshness = .fresh,
             .status_generation = 12,
+            // Synthetic status-only construction can use a different
+            // metadata sentinel even though cache publication already proved
+            // the same table/root epoch.
+            .lsm_root_generation = 7,
         },
         .stats = .{
             .doc_count = 1_000_000,
@@ -2462,6 +2550,7 @@ test "table runtime snapshot cache does not replace published live status with s
         .metadata = .{
             .source = .synthetic_config,
             .freshness = .stale,
+            .lsm_root_generation = 8,
         },
         .stats = .{
             .doc_count = 0,
@@ -2486,7 +2575,7 @@ test "table runtime snapshot cache does not replace published live status with s
 
     try std.testing.expectEqual(@as(usize, 1), docs.items.len);
     try std.testing.expectEqual(RuntimeStatusSource.cached_snapshot, docs.items[0].metadata.source);
-    try std.testing.expectEqual(RuntimeStatusFreshness.stale, docs.items[0].metadata.freshness);
+    try std.testing.expectEqual(RuntimeStatusFreshness.fresh, docs.items[0].metadata.freshness);
     try std.testing.expectEqual(@as(u64, 1_000_000), docs.items[0].stats.doc_count);
     try std.testing.expectEqual(@as(u32, 1), docs.items[0].stats.index_count);
     try std.testing.expectEqual(@as(usize, 1), docs.items[0].stats.indexes.len);
@@ -2569,7 +2658,7 @@ test "table runtime snapshot cache preserving replacement does not replace live 
 
     try std.testing.expectEqual(@as(usize, 1), docs.items.len);
     try std.testing.expectEqual(RuntimeStatusSource.cached_snapshot, docs.items[0].metadata.source);
-    try std.testing.expectEqual(RuntimeStatusFreshness.stale, docs.items[0].metadata.freshness);
+    try std.testing.expectEqual(RuntimeStatusFreshness.fresh, docs.items[0].metadata.freshness);
     try std.testing.expectEqual(@as(u64, 250_000), docs.items[0].stats.doc_count);
     try std.testing.expectEqual(@as(u64, 250_000), docs.items[0].stats.indexes[0].doc_count);
     try std.testing.expectEqual(@as(u64, 2048), docs.items[0].stats.indexes[0].node_count);
@@ -2577,6 +2666,48 @@ test "table runtime snapshot cache preserving replacement does not replace live 
     try std.testing.expectEqual(@as(u64, 4000), docs.items[0].stats.indexes[0].replay_target_sequence);
     try std.testing.expect(docs.items[0].stats.indexes[0].replay_catch_up_required);
     try std.testing.expect(docs.items[0].stats.indexes[0].catch_up_active);
+}
+
+test "table runtime snapshot cache round trip cannot stale a fresh live observation" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(token, "docs", .{
+        .group_id = 7,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .updated_at_ns = 42,
+        },
+        .stats = .{ .doc_count = 24, .source_doc_count = 24 },
+    }));
+
+    const cached_items = try alloc.alloc(LocalTableRuntimeStatus, 1);
+    cached_items[0] = .{
+        .group_id = 7,
+        .metadata = .{
+            .source = .cached_snapshot,
+            .freshness = .stale,
+        },
+        .stats = .{},
+    };
+    const refresh = try alloc.alloc(TableRuntimeSnapshot, 1);
+    defer alloc.free(refresh);
+    refresh[0] = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .statuses = .{ .items = cached_items },
+    };
+    try publishRefreshForTest(&cache, refresh);
+
+    var docs = (try cache.snapshot(alloc, "docs")).?;
+    defer docs.deinit(alloc);
+    try std.testing.expectEqual(RuntimeStatusSource.cached_snapshot, docs.items[0].metadata.source);
+    try std.testing.expectEqual(RuntimeStatusFreshness.fresh, docs.items[0].metadata.freshness);
+    try std.testing.expectEqual(@as(u64, 42), docs.items[0].metadata.updated_at_ns);
+    try std.testing.expectEqual(@as(u64, 24), docs.items[0].stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 24), docs.items[0].stats.source_doc_count);
 }
 
 test "table runtime snapshot cache can clone a single group status" {
@@ -2788,6 +2919,45 @@ test "table runtime snapshot cache rejects a late stale live observation" {
     defer docs.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 12), docs.items[0].stats.doc_count);
     try std.testing.expectEqual(current_token.observation_generation, docs.items[0].cache_observation_generation);
+}
+
+test "consistent boundary publication supersedes later-reserved stale observation" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const completion_epoch = try cache.capturePublicationToken("docs");
+    const stale_refresh = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(stale_refresh, "docs", .{
+        .group_id = 7,
+        .stats = .{ .doc_count = 0 },
+    }));
+    // A visibility edge produced by the same admitted operation may advance
+    // the status epoch while its DB/root authority remains unchanged.
+    cache.fenceTablePublications("docs");
+
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroupAtConsistentBoundary(
+        completion_epoch,
+        "docs",
+        .{
+            .group_id = 7,
+            .stats = .{ .doc_count = 24 },
+        },
+    ));
+    var snapshot = (try cache.snapshot(alloc, "docs")).?;
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 24), snapshot.items[0].stats.doc_count);
+
+    const retired_epoch = try cache.capturePublicationToken("docs");
+    cache.invalidateTable("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.stale_table, try cache.publishGroupAtConsistentBoundary(
+        retired_epoch,
+        "docs",
+        .{
+            .group_id = 7,
+            .stats = .{ .doc_count = 25 },
+        },
+    ));
 }
 
 test "table runtime snapshot cache preserves active managed admission proof" {
@@ -3448,7 +3618,7 @@ test "synthetic relabel cannot reuse cached catch up serviceability" {
             .stats = .{ .index_count = 1, .indexes = placeholder_indexes[0..] },
         };
 
-        var merged = try mergeCachedStatusWithSyntheticPlaceholder(std.testing.allocator, previous, placeholder, 100, null);
+        var merged = try mergeCachedStatusWithNonAuthoritativePlaceholder(std.testing.allocator, previous, placeholder, 100, null);
         defer merged.deinit(std.testing.allocator);
         try std.testing.expectEqual(freshness, merged.metadata.freshness);
         try std.testing.expect(!merged.stats.indexes[0].runtime_observation_serviceable);

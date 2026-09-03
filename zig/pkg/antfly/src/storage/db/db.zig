@@ -19639,6 +19639,19 @@ pub const DB = struct {
 
             const dense_rebuild = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsOutcomeWithProgress(alloc, null, null);
             if (dense_rebuild.dense_visibility_changed) self.clearDenseHbcCaches();
+            // Portable restores can legitimately rediscover a non-artifact
+            // projection intent here. In particular, opening a restored v1
+            // dense index under a v2-capable catalog creates a durable storage
+            // migration intent only after the artifact repair pass has
+            // established complete source coverage. The staged DB is not yet
+            // published and therefore has no managed scheduler owner which can
+            // advance that intent. Drive one bounded quantum from the restore
+            // owner itself, using the same cancellation and capacity fences as
+            // native selective restore repair. Otherwise sync_indexes waits
+            // forever for an external owner that cannot open the staged root.
+            if (!try self.repairNativeRestoreProjectionIntentsStep(alloc, repair_options)) {
+                return error.RestoreRuntimeRepairIncomplete;
+            }
             if (try self.hasPendingDenseArtifactRebuild(alloc) or
                 try self.denseArtifactWatermarkRepairNeeded(alloc))
             {

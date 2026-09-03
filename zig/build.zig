@@ -6530,6 +6530,8 @@ pub fn build(b: *std.Build) void {
             "targeted publication fence waits for every overlapping owner",
             "table runtime snapshot cache lifecycle transition replaces and fences observations",
             "table runtime snapshot cache batch preserves newer group observations",
+            "consistent boundary publication supersedes later-reserved stale observation",
+            "table runtime snapshot cache round trip cannot stale a fresh live observation",
             "runtime status cache stable absence removal retires the old table epoch",
             "partial coverage embeddings readiness counts skipped source units",
             "partial coverage embeddings readiness does not mask pending enrichment",

@@ -7597,6 +7597,15 @@ pub const ProvisionedTableWriteSource = struct {
     structural_reconcile_scheduled: std.atomic.Value(bool) = .init(false),
     structural_reconcile_tables: std.ArrayListUnmanaged(StructuralReconcileRequest) = .empty,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
+    // Set only while retiring the short-lived startup cache after this owner
+    // has published an authoritative final status under the group-operation
+    // fence. The eviction hook must still retire readers and dirty ownership,
+    // but invalidating that exact status would immediately replace a proven
+    // completion with a cold, stale observation.
+    startup_eviction_status_preservation: ?struct {
+        table_name: []const u8,
+        token: runtime_status.TableRuntimeSnapshotCache.PublicationToken,
+    } = null,
     local_change_hook: ?LocalChangeHook = null,
     local_index_repair_debt_hook: ?LocalIndexRepairDebtHook = null,
     raft_batcher: ?RaftBatcher = null,
@@ -7981,9 +7990,21 @@ pub const ProvisionedTableWriteSource = struct {
         if (sibling_owns_table) return;
 
         // No cached owner can provide a fresher status after this retirement.
-        // Remove cached observations instead of letting them masquerade as
-        // fresh, and let the next status request recover from durable storage.
-        self.invalidateRuntimeStatusCache(table_name);
+        // Ordinarily remove cached observations instead of letting them
+        // masquerade as fresh. Startup completion is the one exception: its
+        // owner has just taken a consistent observation under the same group
+        // fence, and the following eviction is only a resource-lifetime
+        // transition. Preserve that exact publication so retirement cannot
+        // regress ready status to an older durable control snapshot.
+        const preserve_published_status = if (self.startup_eviction_status_preservation) |preservation|
+            std.mem.eql(u8, preservation.table_name, table_name) and
+                (if (self.runtime_status_cache) |snapshot_cache|
+                    snapshot_cache.publicationTableEpochCurrent(table_name, preservation.token)
+                else
+                    false)
+        else
+            false;
+        if (!preserve_published_status) self.invalidateRuntimeStatusCache(table_name);
         self.clearDirtyWriteTable(table_name);
     }
 
@@ -12959,6 +12980,34 @@ pub const ProvisionedTableWriteSource = struct {
         locks.drainAndRelease();
     }
 
+    fn clearStartupWriteCachePreservingPublishedStatus(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        token: runtime_status.TableRuntimeSnapshotCache.PublicationToken,
+    ) !void {
+        var locks = WriteCacheTransitionLocks.init(self, false, true);
+        defer locks.deinit();
+        try locks.reserveClearCapacity();
+        std.debug.assert(self.startup_eviction_status_preservation == null);
+        self.startup_eviction_status_preservation = .{
+            .table_name = table_name,
+            .token = token,
+        };
+        defer self.startup_eviction_status_preservation = null;
+        locks.clearCaches(true);
+        locks.drainAndRelease();
+    }
+
+    fn capturePublishedRuntimeStatusPreservation(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        published: bool,
+    ) ?runtime_status.TableRuntimeSnapshotCache.PublicationToken {
+        if (!published) return null;
+        const snapshot_cache = self.runtime_status_cache orelse return null;
+        return snapshot_cache.capturePublicationToken(table_name) catch null;
+    }
+
     pub fn clearWriteCache(self: *ProvisionedTableWriteSource) !void {
         var locks = WriteCacheTransitionLocks.init(self, true, true);
         defer locks.deinit();
@@ -13389,12 +13438,16 @@ pub const ProvisionedTableWriteSource = struct {
         defer if (live_repair_guard) |*guard| guard.deinit(alloc);
         var group_operation_active = true;
         var preserve_startup_cache = false;
+        var startup_retirement_status_token: ?runtime_status.TableRuntimeSnapshotCache.PublicationToken = null;
         errdefer {
             var failed_result = StartupCatchUpResult{ .had_debt = true };
             self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), backoff_epoch, &failed_result);
         }
         defer {
-            if (!use_live_repair_cache and !preserve_startup_cache) self.clearStartupWriteCache() catch |err| {
+            if (!use_live_repair_cache and !preserve_startup_cache) (if (startup_retirement_status_token) |token|
+                self.clearStartupWriteCachePreservingPublishedStatus(table_name, token)
+            else
+                self.clearStartupWriteCache()) catch |err| {
                 std.log.warn("startup writer cache retirement deferred table={s} group_id={} err={s}", .{
                     table_name,
                     group_id,
@@ -13747,6 +13800,7 @@ pub const ProvisionedTableWriteSource = struct {
             result.had_debt = true;
             result.terminal_degraded = true;
             const terminal_status_published = try publishTerminalStartupRuntimeStatusSnapshot(self, alloc, table_name, group_id, db);
+            startup_retirement_status_token = self.capturePublishedRuntimeStatusPreservation(table_name, terminal_status_published);
             result.index_repair_pending = final_automatic_discovery_pending or !terminal_status_published;
             startup_status_active = false;
         } else if (final_repair_summary.runnable != 0) {
@@ -13756,6 +13810,7 @@ pub const ProvisionedTableWriteSource = struct {
             result.had_debt = true;
             result.terminal_degraded = true;
             const terminal_status_published = try publishTerminalStartupRuntimeStatusSnapshot(self, alloc, table_name, group_id, db);
+            startup_retirement_status_token = self.capturePublishedRuntimeStatusPreservation(table_name, terminal_status_published);
             result.index_repair_pending = final_automatic_discovery_pending or !terminal_status_published;
             startup_status_active = false;
         } else if (final_broad_debt) {
@@ -13767,28 +13822,43 @@ pub const ProvisionedTableWriteSource = struct {
             if (result.index_repair_paused) result.had_debt = true;
             self.markRepairHandoffOwnerAuditCompleteBestEffort(table_name, group_id);
         }
-        self.retireReadersAfterIndexRepairCompletion(table_name, result);
+        self.retireCachesAfterIndexRepairCompletion(table_name, result, !use_live_repair_cache);
         if (result.terminal_degraded) {
             // The terminal observation was published from the final durable
             // audit above. Do not relabel it as a fresh live-writer snapshot.
             startup_status_active = false;
-        } else if (result.index_repair_attempted or result.index_repair_repaired) {
-            // Repair completion changes durable lifecycle fields that the
-            // bounded best-effort overlay intentionally does not reload. Take
-            // one authoritative snapshot at that boundary so a removed repair
-            // intent cannot remain operator-visible in the cached status.
-            try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhaseMode(
+        } else if (result.index_repair_attempted or result.index_repair_repaired or result.cleared_debt) {
+            // Repair and broad replay completion change durable lifecycle
+            // fields that the bounded best-effort overlay intentionally does
+            // not reload. Take one authoritative snapshot at that boundary so
+            // a removed repair intent, newly published native generation, or
+            // completed restart replay cannot remain operator-visible as the
+            // stale pre-catch-up status. This is paid once per completion, not
+            // on progressive repair quanta.
+            const published = try finishManagedMaintenanceStatusPublicationReported(publishRuntimeStatusSnapshotWithStartupPhaseMode(
                 self,
                 alloc,
                 table_name,
                 group_id,
                 .idle,
-                .consistent,
+                .owned_consistent,
                 db,
             ));
+            startup_retirement_status_token = self.capturePublishedRuntimeStatusPreservation(table_name, published);
             startup_status_active = false;
         } else {
-            try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db));
+            const published = try finishManagedMaintenanceStatusPublicationReported(
+                publishRuntimeStatusSnapshotWithStartupPhaseMode(
+                    self,
+                    alloc,
+                    table_name,
+                    group_id,
+                    .idle,
+                    .owned_consistent,
+                    db,
+                ),
+            );
+            startup_retirement_status_token = self.capturePublishedRuntimeStatusPreservation(table_name, published);
             startup_status_active = false;
         }
         // A fenced status observation cannot carry its clear authorization
@@ -13809,16 +13879,24 @@ pub const ProvisionedTableWriteSource = struct {
             !result.index_repair_pending;
     }
 
-    fn retireReadersAfterIndexRepairCompletion(
+    fn retireCachesAfterIndexRepairCompletion(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         result: StartupCatchUpResult,
+        isolated_owner: bool,
     ) void {
         if (!result.index_repair_repaired and !result.cleared_debt) return;
-        // The isolated startup/repair owner is deliberately short-lived and
-        // may not carry the cached writer's visibility hook. Retire readers
-        // before publishing clean status so readiness can never race ahead of
-        // the query generation that observes that proof.
+        // An isolated startup/repair owner is deliberately short-lived. A
+        // resident writer can be reopened while that owner performs its last
+        // replay/compaction quantum and retain the previous in-memory native
+        // generation. Retire that sibling under the still-held group
+        // operation before publishing clean status; otherwise the one-second
+        // status refresh can let its older zero-cardinality observation
+        // replace the just-published durable completion. Live repair already
+        // mutates the resident writer and must preserve its warm ownership.
+        if (isolated_owner) self.invalidateWriteCacheForTable(table_name);
+        // Readers also must reopen before readiness can describe the newly
+        // published query generation.
         self.invalidateReadCache(table_name);
     }
 
@@ -27490,6 +27568,10 @@ fn publishRuntimeStatusSnapshotWithStartupPhase(
 const RuntimeStatusSnapshotMode = enum {
     best_effort,
     consistent,
+    // The caller holds the table/group operation lease across collection and
+    // publication, so visibility-only cache fences from its own durable work
+    // may be crossed. Storage-root replacement remains a hard fence.
+    owned_consistent,
     consistent_if_available,
     diagnostic,
 };
@@ -27593,7 +27675,7 @@ fn publishTerminalStartupRuntimeStatusSnapshot(
         opened_root_generation,
         publication_token,
         .idle,
-        .consistent,
+        .owned_consistent,
         .terminal_startup,
         db,
     ) catch |err| switch (err) {
@@ -27659,7 +27741,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
-            try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, status);
+            try publishRuntimeStatusGroupAfterObservationMode(snapshot_cache, publication_token, table_name, status, mode);
         } else {
             var status = runtime_status.LocalTableRuntimeStatus{
                 .group_id = group_id,
@@ -27670,7 +27752,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
-            try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, status);
+            try publishRuntimeStatusGroupAfterObservationMode(snapshot_cache, publication_token, table_name, status, mode);
         }
         return;
     }
@@ -27704,7 +27786,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
                 if (!try refreshRuntimeStatusStatsIfAvailable(alloc, &status, db)) return error.WriterLocked;
                 status_from_cached_best_effort = false;
             },
-            .consistent => {
+            .consistent, .owned_consistent => {
                 const disk_bytes = cached_status.disk_bytes;
                 const created_at_millis = cached_status.created_at_millis;
                 var discard = cached_status;
@@ -27755,7 +27837,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
                 // WriterLocked as a retryable status-publication miss, and the
                 // next targeted read can sample the resident writer exactly.
                 .best_effort => (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse return error.WriterLocked,
-                .consistent => try db.runtimeStatusStatsConsistent(alloc),
+                .consistent, .owned_consistent => try db.runtimeStatusStatsConsistent(alloc),
                 .consistent_if_available => (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse return error.WriterLocked,
                 .diagnostic => try db.diagnosticStats(alloc),
             },
@@ -27774,15 +27856,35 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         !statusHasRuntimeFactsIgnoringMetadataSource(status))
     {
         markClearedStartupRuntimeStatus(&status);
-        try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, status);
+        try publishRuntimeStatusGroupAfterObservationMode(snapshot_cache, publication_token, table_name, status, mode);
     } else {
         if (publication_kind == .terminal_startup)
             markStartupRuntimeStatus(&status, startup)
         else
             markRuntimeStatusFromDb(&status, phase);
         status.metadata.lsm_root_generation = lsm_root_generation;
-        try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, status);
+        try publishRuntimeStatusGroupAfterObservationMode(snapshot_cache, publication_token, table_name, status, mode);
     }
+}
+
+fn publishRuntimeStatusGroupAfterObservationMode(
+    snapshot_cache: *runtime_status.TableRuntimeSnapshotCache,
+    publication_fence: runtime_status.TableRuntimeSnapshotCache.PublicationToken,
+    table_name: []const u8,
+    status: runtime_status.LocalTableRuntimeStatus,
+    mode: RuntimeStatusSnapshotMode,
+) !void {
+    if (mode != .owned_consistent) {
+        return publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_fence, table_name, status);
+    }
+
+    runTestBeforeRuntimeStatusPublishHook();
+    try acceptRuntimeStatusPublication(try snapshot_cache.publishGroupAtConsistentBoundary(
+        publication_fence,
+        table_name,
+        status,
+    ));
+    runTestAfterRuntimeStatusPublishHook();
 }
 
 fn publishRuntimeStatusGroupAfterObservation(
@@ -28553,13 +28655,18 @@ fn publishTerminalStartupCatchUpRuntimeStatus(
 }
 
 fn finishManagedMaintenanceStatusPublication(publication: anyerror!void) !void {
+    _ = try finishManagedMaintenanceStatusPublicationReported(publication);
+}
+
+fn finishManagedMaintenanceStatusPublicationReported(publication: anyerror!void) !bool {
     publication catch |err| switch (err) {
         // Runtime status is an observation of repair, never its commit point.
         // A table-epoch change must reject the stale snapshot without aborting
         // durable replay/generation progress or stranding its active intent.
-        error.RuntimeStatusPublicationFenced => return,
+        error.RuntimeStatusPublicationFenced => return false,
         else => return err,
     };
+    return true;
 }
 
 const ManagedCatchUpOwner = enum {
@@ -43076,7 +43183,7 @@ test "managed repair visibility edges retire cached readers and runtime status" 
     );
     try std.testing.expectEqual(changes_before_progress, hooks.changes);
 
-    source.retireReadersAfterIndexRepairCompletion("docs", .{ .cleared_debt = true });
+    source.retireCachesAfterIndexRepairCompletion("docs", .{ .cleared_debt = true }, false);
     try std.testing.expectEqual(@as(u64, 10), read_cache.table_epochs.get("docs").?);
 }
 
@@ -46931,7 +47038,10 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
     defer startup_write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
     source.runtime_status_cache = &snapshot_cache;
-    source.startup_write_cache = &startup_write_cache;
+    // Exercise the production eviction hook. Startup retirement must retain
+    // the final fenced status publication rather than replacing it with a
+    // cold stale observation.
+    source.bindWriteCaches(null, &startup_write_cache);
     const result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
         .indexes_json = indexes_json,
         .schema_json = "",
@@ -46950,6 +47060,19 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
     try std.testing.expect(!statuses.items[0].stats.async_indexing.startup.active);
     try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, statuses.items[0].metadata.source);
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
+
+    const stale_token = try snapshot_cache.capturePublicationToken("docs");
+    snapshot_cache.invalidateTable("docs");
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", .{
+        .group_id = 7001,
+        .stats = .{ .doc_count = 2 },
+    });
+    try startup_write_cache.replaceTableMetadataLocked("docs", "{}", "{}");
+    try source.clearStartupWriteCachePreservingPublishedStatus("docs", stale_token);
+    // A catalog/storage epoch newer than the preserved publication always
+    // wins, even if another observation repopulated the cache before the old
+    // startup writer retired.
+    try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
 }
 
 test "busy startup open preserves fresh writer runtime status" {
