@@ -720,17 +720,17 @@ func (rm *RouteManager) matchInstalledAtGeneration(req *RouteRequest, generation
 // lower-priority route unreachable. A terminal route may intentionally expose
 // no pools (for example, a reject fallback).
 type RouteCohort struct {
-	Pools             []string
-	ActivationTargets []RoutePoolTarget
-	Matched           bool
-	Terminal          bool
-	Generation        uint64
+	Pools       []string
+	PoolTargets []RoutePoolTarget
+	Matched     bool
+	Terminal    bool
+	Generation  uint64
 }
 
-// RoutePoolTarget retains the namespace required to activate a routed pool.
-// Pools remains on RouteCohort as the registry lookup projection; activation
-// must not discard namespace identity because Kubernetes pool names are only
-// unique within a namespace.
+// RoutePoolTarget is the namespace-qualified identity of a routed pool. Pools
+// remains on RouteCohort as a legacy name-only projection; discovery,
+// activation, and execution must use PoolTargets because Kubernetes pool names
+// are only unique within a namespace.
 type RoutePoolTarget struct {
 	Namespace string
 	Pool      string
@@ -758,7 +758,7 @@ func (rm *RouteManager) PotentialCohortFor(req *RouteRequest) RouteCohort {
 			target := RoutePoolTarget{Namespace: namespace, Pool: destination.Pool}
 			if target.Pool != "" && !seenTargets[target] {
 				seenTargets[target] = true
-				cohort.ActivationTargets = append(cohort.ActivationTargets, target)
+				cohort.PoolTargets = append(cohort.PoolTargets, target)
 			}
 		}
 		if route.Fallback != nil && route.Fallback.Action == "redirect" && route.Fallback.RedirectPool != "" && !seen[route.Fallback.RedirectPool] {
@@ -769,7 +769,7 @@ func (rm *RouteManager) PotentialCohortFor(req *RouteRequest) RouteCohort {
 			target := RoutePoolTarget{Namespace: namespace, Pool: route.Fallback.RedirectPool}
 			if !seenTargets[target] {
 				seenTargets[target] = true
-				cohort.ActivationTargets = append(cohort.ActivationTargets, target)
+				cohort.PoolTargets = append(cohort.PoolTargets, target)
 			}
 		}
 		return out
@@ -924,7 +924,7 @@ func (rm *RouteManager) selectDestinationWithin(route *Route, req *RouteRequest,
 
 	for _, dest := range route.Destinations {
 		// Check conditions
-		if !rm.evaluateConditionsWithin(&dest, req, registry, allowed) {
+		if !rm.evaluateConditionsInNamespaceWithin(&dest, req, registry, routeNamespace(route), allowed) {
 			continue
 		}
 
@@ -946,11 +946,12 @@ func (rm *RouteManager) SelectActivationDestination(route *Route, req *RouteRequ
 func (rm *RouteManager) selectActivationDestinationWithin(route *Route, req *RouteRequest, registry *ModelRegistry, allowed map[string]endpointRef, enabled func(string) bool) *Destination {
 	eligible := make([]Destination, 0, len(route.Destinations))
 	totalWeight := int32(0)
+	namespace := routeNamespace(route)
 	for _, destination := range route.Destinations {
-		if (allowed != nil && !endpointRefsContainPool(allowed, destination.Pool)) ||
+		if (allowed != nil && !endpointRefsContainNamespacedPool(allowed, namespace, destination.Pool)) ||
 			!enabled(destination.Pool) ||
 			!staticDestinationEligible(&destination, req) ||
-			registry.poolConditionStatsWithin(destination.Pool, req.Model, allowed).HealthyEndpoints != 0 {
+			registry.poolConditionStatsInNamespaceWithin(namespace, destination.Pool, req.Model, allowed).HealthyEndpoints != 0 {
 			continue
 		}
 		eligible = append(eligible, destination)
@@ -959,9 +960,9 @@ func (rm *RouteManager) selectActivationDestinationWithin(route *Route, req *Rou
 	return selectWeightedDestination(route, req, eligible, totalWeight)
 }
 
-func endpointRefsContainPool(refs map[string]endpointRef, pool string) bool {
+func endpointRefsContainNamespacedPool(refs map[string]endpointRef, namespace, pool string) bool {
 	for _, ref := range refs {
-		if ref.endpoint != nil && ref.endpoint.pool == pool {
+		if endpointMatchesNamespace(ref.endpoint, namespace) && ref.endpoint.pool == pool {
 			return true
 		}
 	}
@@ -996,7 +997,11 @@ func (rm *RouteManager) evaluateConditions(dest *Destination, req *RouteRequest,
 }
 
 func (rm *RouteManager) evaluateConditionsWithin(dest *Destination, req *RouteRequest, registry *ModelRegistry, allowed map[string]endpointRef) bool {
-	stats := registry.poolConditionStatsWithin(dest.Pool, req.Model, allowed)
+	return rm.evaluateConditionsInNamespaceWithin(dest, req, registry, "", allowed)
+}
+
+func (rm *RouteManager) evaluateConditionsInNamespaceWithin(dest *Destination, req *RouteRequest, registry *ModelRegistry, namespace string, allowed map[string]endpointRef) bool {
+	stats := registry.poolConditionStatsInNamespaceWithin(namespace, dest.Pool, req.Model, allowed)
 	return rm.evaluateConditionStats(dest, req, stats)
 }
 

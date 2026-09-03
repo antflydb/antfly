@@ -138,6 +138,12 @@ func NewK8sWatcher(proxy *Proxy, cfg K8sWatcherConfig) (*K8sWatcher, error) {
 		externalAddrs: make(map[string][]string),
 		scalePools:    make(map[string]scaleToZeroPool),
 	}
+	// A namespaced watcher supplies the natural default-pool scope unless the
+	// proxy was configured explicitly. Cluster-wide watchers leave it empty and
+	// therefore fail closed instead of choosing among ambiguous same-named pools.
+	if proxy.defaultPoolNamespace == "" {
+		proxy.defaultPoolNamespace = cfg.Namespace
+	}
 	proxy.SetPoolActivator(w)
 	return w, nil
 }
@@ -532,7 +538,7 @@ func (w *K8sWatcher) processExternalPool(obj any) {
 
 		apiURL := serviceURL(apiService, u.GetNamespace(), apiPort)
 		healthURL := serviceURL(healthService, u.GetNamespace(), healthPort) + "/readyz"
-		w.proxy.RegisterEndpointWithHealth(apiURL, healthURL, u.GetName(), workloadType)
+		w.proxy.RegisterEndpointWithHealthInNamespace(apiURL, healthURL, u.GetNamespace(), u.GetName(), workloadType)
 		w.proxy.registry.registerBootstrapModels(apiURL, models)
 		addresses = append(addresses, apiURL)
 	}
@@ -612,7 +618,7 @@ func (w *K8sWatcher) processEndpointSlice(endpointSlice *discoveryv1.EndpointSli
 			address := fmt.Sprintf("http://%s:%d", addr, port)
 
 			if ready {
-				w.proxy.RegisterEndpoint(address, pool, workloadType)
+				w.proxy.RegisterEndpointInNamespace(address, endpointSlice.Namespace, pool, workloadType)
 			} else {
 				w.proxy.UnregisterEndpoint(address)
 			}
@@ -672,7 +678,7 @@ func (w *K8sWatcher) processPod(pod *corev1.Pod) {
 	address := fmt.Sprintf("http://%s:%d", pod.Status.PodIP, port)
 
 	if ready {
-		w.proxy.RegisterEndpoint(address, pool, workloadType)
+		w.proxy.RegisterEndpointInNamespace(address, pod.Namespace, pool, workloadType)
 	} else {
 		w.proxy.UnregisterEndpoint(address)
 	}

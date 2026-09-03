@@ -1355,6 +1355,66 @@ func TestAcquireRoutedRequestOwnsRecoveredCircuitProbe(t *testing.T) {
 	}
 }
 
+func TestAcquireDestinationEndpointReturnsOwnedCircuitProbe(t *testing.T) {
+	registry := NewModelRegistry(time.Minute)
+	registry.RegisterEndpoint("http://recovering.internal", "primary", WorkloadTypeGeneral)
+	registry.UpdateModels("http://recovering.internal", []string{"model-a"})
+	breaker := registry.circuitBreaker("http://recovering.internal")
+	breaker.threshold = 1
+	breaker.timeout = time.Millisecond
+	breaker.RecordFailure()
+	time.Sleep(2 * time.Millisecond)
+
+	router := NewRouter(registry)
+	lease, err := router.AcquireDestinationEndpoint(
+		&RouteRequest{Model: "model-a", Timestamp: time.Now()},
+		&Destination{Pool: "primary", Weight: 100},
+		WorkloadTypeGeneral,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Endpoint().Address() != "http://recovering.internal" || atomic.LoadInt32(&breaker.state) != 2 {
+		t.Fatalf("lease did not own half-open endpoint probe")
+	}
+	lease.Release()
+	if atomic.LoadInt32(&breaker.state) != 1 || atomic.LoadInt32(&breaker.halfOpenInFlight) != 0 {
+		t.Fatalf("released probe remained claimed: state=%d in_flight=%d", atomic.LoadInt32(&breaker.state), atomic.LoadInt32(&breaker.halfOpenInFlight))
+	}
+}
+
+func TestPublicRouterAPIsPreserveNamespaceIdentity(t *testing.T) {
+	registry := NewModelRegistry(time.Minute)
+	for namespace, address := range map[string]string{
+		"team-a": "http://team-a.internal",
+		"team-b": "http://team-b.internal",
+	} {
+		registry.RegisterEndpointInNamespace(address, namespace, "gpu", WorkloadTypeGeneral)
+		registry.UpdateModels(address, []string{"model-a"})
+	}
+	router := NewRouter(registry)
+	candidates := router.ResolveEndpointCandidatesInNamespace("model-a", "team-a", "gpu", nil)
+	if len(candidates) != 1 || candidates[0].Namespace() != "team-a" {
+		t.Fatalf("team-a candidates = %#v", candidates)
+	}
+	if stats := registry.PoolConditionStatsInNamespace("team-a", "gpu", "model-a"); stats.HealthyEndpoints != 1 {
+		t.Fatalf("team-a stats = %#v", stats)
+	}
+	lease, err := router.AcquireDestinationEndpointInNamespace(
+		&RouteRequest{Model: "model-a", Timestamp: time.Now()},
+		"team-a",
+		&Destination{Pool: "gpu", Weight: 100},
+		WorkloadTypeGeneral,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Endpoint().Namespace() != "team-a" || lease.Endpoint().Address() != "http://team-a.internal" {
+		t.Fatalf("team-a lease endpoint = %#v", lease.Endpoint())
+	}
+}
+
 func TestResolveRequestDoesNotClaimCircuitBreakerProbe(t *testing.T) {
 	t.Parallel()
 
@@ -2143,7 +2203,7 @@ func TestScopedCatalogActivatesColdRouteBeforeIssuingLease(t *testing.T) {
 				return 0, false, nil
 			}
 			if activations.Add(1) == 1 {
-				p.RegisterEndpoint("http://cold.internal", "gpu", WorkloadTypeGeneral)
+				p.RegisterEndpointInNamespace("http://cold.internal", "tenant-a", "gpu", WorkloadTypeGeneral)
 				advertiseModelOperation(p.registry, "http://cold.internal", "read", "owner/reader")
 			}
 			return time.Second, true, nil
@@ -2178,6 +2238,133 @@ func TestScopedCatalogActivatesColdRouteBeforeIssuingLease(t *testing.T) {
 	}
 	if activations.Load() < 2 {
 		t.Fatalf("activations = %d, want discovery wake and execution renewal", activations.Load())
+	}
+}
+
+func TestScopedCatalogFallsBackWhenSelectedColdPoolCannotActivate(t *testing.T) {
+	p := NewProxy(Config{DefaultPool: "cpu", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"readers":{"owner/reader":{"inputs":["image"]}}}`)),
+			Request:    req,
+		}, nil
+	})}
+	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().UpsertRoute(&Route{
+		Name:          "default/cold-reader-fallback",
+		Operations:    map[OperationType]bool{"read": true},
+		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/reader$`)},
+		Destinations:  []Destination{{Pool: "gpu", Weight: 100}},
+		Fallback:      &Fallback{Action: "redirect", RedirectPool: "cpu"},
+	})
+	var activated []string
+	p.SetPoolActivator(testPoolActivator{
+		activate: func(_ context.Context, namespace, pool string) (time.Duration, bool, error) {
+			activated = append(activated, namespace+"/"+pool)
+			if pool == "gpu" {
+				return 5 * time.Millisecond, true, nil
+			}
+			return 0, false, nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	p.handleModels(recorder, httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Freader&task=read", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("catalog status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	resolution, err := p.ResolveRequest(context.Background(), ResolveRequest{
+		Operation: "read",
+		Model:     "owner/reader",
+		Headers: map[string]string{
+			strings.ToLower(capabilityTokenHeader):    recorder.Header().Get(capabilityTokenHeader),
+			strings.ToLower(capabilityRevisionHeader): recorder.Header().Get(capabilityRevisionHeader),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Pool != "cpu" || resolution.Endpoint.Address() != "http://cpu.internal" {
+		t.Fatalf("fallback resolution = %#v, want healthy cpu endpoint", resolution)
+	}
+	if len(activated) == 0 || activated[0] != "default/gpu" {
+		t.Fatalf("activation path = %v, want selected gpu first", activated)
+	}
+}
+
+func TestScopedCatalogKeepsNamespacedPoolsDisjoint(t *testing.T) {
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"readers":{"owner/reader":{}}}`)),
+			Request:    req,
+		}, nil
+	})}
+	p.RegisterEndpointInNamespace("http://tenant-a.internal", "tenant-a", "gpu", WorkloadTypeGeneral)
+	p.RegisterEndpointInNamespace("http://tenant-b.internal", "tenant-b", "gpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().UpsertRoute(&Route{
+		Name:          "tenant-a/reader",
+		Operations:    map[OperationType]bool{"read": true},
+		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/reader$`)},
+		Destinations:  []Destination{{Pool: "gpu", Weight: 100}},
+	})
+
+	recorder := httptest.NewRecorder()
+	p.handleModels(recorder, httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Freader&task=read", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("catalog status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	lease := p.capabilityLeases[recorder.Header().Get(capabilityTokenHeader)]
+	if len(lease.endpoints) != 1 || lease.endpoints["http://tenant-a.internal"].incarnation == 0 {
+		t.Fatalf("leased endpoints = %#v, want tenant-a only", lease.endpoints)
+	}
+	resolution, err := p.ResolveRequest(context.Background(), ResolveRequest{
+		Operation: "read",
+		Model:     "owner/reader",
+		Headers: map[string]string{
+			strings.ToLower(capabilityTokenHeader):    recorder.Header().Get(capabilityTokenHeader),
+			strings.ToLower(capabilityRevisionHeader): recorder.Header().Get(capabilityRevisionHeader),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Endpoint.Address() != "http://tenant-a.internal" || resolution.Endpoint.Namespace() != "tenant-a" {
+		t.Fatalf("namespaced resolution = %#v, want tenant-a endpoint", resolution)
+	}
+}
+
+func TestScopedCatalogDoesNotActivateUnknownConditionalRoutes(t *testing.T) {
+	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"readers":{"owner/reader":{}}}`)), Request: req}, nil
+	})}
+	p.Router().RouteManager().UpsertRoute(&Route{
+		Name:           "tenant-a/private-reader",
+		Priority:       100,
+		Operations:     map[OperationType]bool{"read": true},
+		ModelPatterns:  []*RegexPattern{MustRegexPattern(`^owner/reader$`)},
+		HeaderMatchers: map[string]*StringMatcher{"x-tenant": {Exact: "tenant-a"}},
+		Destinations:   []Destination{{Pool: "private-gpu", Weight: 100}},
+	})
+	var activated []string
+	p.SetPoolActivator(testPoolActivator{activate: func(_ context.Context, namespace, pool string) (time.Duration, bool, error) {
+		activated = append(activated, namespace+"/"+pool)
+		return time.Second, true, nil
+	}})
+
+	recorder := httptest.NewRecorder()
+	p.handleModels(recorder, httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Freader&task=read", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("catalog status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !slices.Equal(activated, []string{"/cpu"}) {
+		t.Fatalf("activation path = %v, want only exact default route", activated)
 	}
 }
 

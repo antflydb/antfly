@@ -19,13 +19,13 @@ const generating_runtime = @import("generating/mod.zig");
 const managed_embedder = @import("inference/managed_embedder.zig");
 const common_secrets = @import("common/secrets.zig");
 const readers = @import("antfly_readers");
+const reader_config = @import("antfly_reader_config");
 const transcribing = @import("antfly_transcribing");
 const extracting = @import("antfly_extracting");
 const extraction_api = @import("antfly_extraction_openapi");
 const asset_producer = @import("storage/db/enrichment/asset_producer.zig");
 const inference_work = @import("inference/work.zig");
 const remote_capabilities = @import("inference/remote_capabilities.zig");
-const inference = @import("inference_server");
 
 const Allocator = std.mem.Allocator;
 const local_reader_batch_ceiling: usize = 64;
@@ -2203,7 +2203,7 @@ fn readerResultMatchesImageIdentity(result: readers.Result, image: readers.Encod
 /// from being silently repartitioned into differently attributed inner
 /// chunks. The server retains the same hard ceiling independently.
 fn localReaderBatchMaxImages() usize {
-    return inference.server.effectiveNativeReadBatchSize();
+    return reader_config.nativeBatchSize(platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_SIZE"));
 }
 
 fn readerBatchEnd(fingerprints: []const ?[]const u8, start: usize, max_images: usize) usize {

@@ -2027,6 +2027,7 @@ pub fn build(b: *std.Build) void {
     readers_mod.addImport("antfly_reader_config", reader_config_mod);
     readers_mod.addImport("antfly_scraping", scraping_mod);
     inference_server_mod.addImport("antfly_readers", readers_mod);
+    inference_server_mod.addImport("antfly_reader_config", reader_config_mod);
     inference_server_mod.addImport("antfly_transcribing", transcribing_mod);
     inference_server_mod.addImport("antfly_extracting", extracting_mod);
     const synthesizing_mod = b.createModule(.{
@@ -8010,6 +8011,8 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
     index_manager_test_mod.addImport("antfly-json", json_mod);
+    index_manager_test_mod.addImport("antfly_scraping", scraping_mod);
+    index_manager_test_mod.addImport("antfly_image", image_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     index_manager_test_mod.addImport("antfly_reader_config", reader_config_mod);
     index_manager_test_mod.addImport("structlog", structlog_mod);

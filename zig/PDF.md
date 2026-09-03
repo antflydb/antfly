@@ -1852,6 +1852,53 @@ The hardening above follows these long-term rules:
     execution. Its production-linked round-trip test now expects the decoder to
     reject an empty attachment set instead of treating an invalid batch as a
     valid codec-only value.
+50. **Implemented after scale-to-zero discovery review:** conservative catalog
+    membership and activation are separate concepts. Discovery may retain every
+    namespace-qualified pool that a partially specified request could reach,
+    but it activates only the exact matched route's weighted destination. A
+    redirect fallback is attempted after an unavailable or timed-out cold
+    destination, so one broken optional GPU pool cannot suppress a healthy CPU
+    executor. Unknown header/source branches remain passive and cannot wake
+    unrelated tenant workloads.
+51. **Implemented after namespace-isolation review:** an endpoint's routing
+    identity is `(namespace, pool, address, incarnation)`, not a bare pool name.
+    Kubernetes pod, EndpointSlice, and external-pool discovery preserve the
+    source namespace through catalog construction, route-condition statistics,
+    circuit admission, execution, and retry. Same-named pools in different
+    namespaces cannot enter each other's capability leases. The legacy empty
+    namespace is an explicit global standalone scope rather than an accidental
+    loss of Kubernetes identity. The default pool has an explicit namespace;
+    a namespaced watcher supplies it when omitted, while a cluster-wide watcher
+    fails closed unless the operator configures an unambiguous namespace.
+52. **Implemented after route-generation review:** potential cohort discovery
+    and exact activation matching bind to the same immutable route generation.
+    A mutation observed while constructing that plan causes no activation. A
+    mutation during an already-started activation may complete that harmless
+    wake-up, but bounded preparation publishes no stale capability lease and
+    retries against a fresh snapshot.
+53. **Implemented after circuit-ownership review:** every API that can claim a
+    half-open circuit probe returns an owned `EndpointLease`, never a bare
+    endpoint. Success, failure, or release completes the exact endpoint
+    incarnation and breaker reservation once, preventing an abandoned exported
+    selection from permanently occupying half-open admission.
+54. **Implemented after build-graph review:** focused Zig test roots declare the
+    complete import closure they compile. `index-manager-test` now imports the
+    JSON, scraping, and image modules used transitively by document extraction,
+    and the full target is part of verification rather than relying on a larger
+    build step to hide missing root imports.
+55. **Implemented after observability-isolation review:** endpoint health,
+    model-load, queue-depth, active-connection, request-count, and latency
+    metrics use the qualified `namespace/pool` label for Kubernetes endpoints.
+    Global standalone endpoints retain their existing bare-pool label. Bare-pool
+    compatibility views are inspection-only and are never fed back into
+    distributed selection or per-tenant accounting.
+56. **Implemented after CI build-closure review:** caller-side reader planning
+    no longer imports the heavyweight inference server merely to obtain its
+    microbatch cap. A language-neutral reader policy owns defaulting and
+    clamping; both the asset planner and Florence executor apply it to the same
+    process environment value. Distributed storage kernels therefore retain
+    their inference-free dependency boundary while advertising exactly the cap
+    enforced by a linked local inference runtime.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

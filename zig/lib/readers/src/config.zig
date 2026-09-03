@@ -16,6 +16,22 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
+pub const default_native_batch_size: usize = 8;
+pub const max_native_batch_size: usize = 64;
+
+/// Applies the process-wide native reader microbatch policy without importing
+/// an inference backend. Both the caller-side planner and concrete executor
+/// supply the same environment value to this authority.
+pub fn nativeBatchSize(configured: ?usize) usize {
+    return std.math.clamp(configured orelse default_native_batch_size, 1, max_native_batch_size);
+}
+
+test "native reader batch policy defaults and clamps" {
+    try std.testing.expectEqual(default_native_batch_size, nativeBatchSize(null));
+    try std.testing.expectEqual(@as(usize, 1), nativeBatchSize(0));
+    try std.testing.expectEqual(max_native_batch_size, nativeBatchSize(max_native_batch_size + 1));
+}
+
 /// Language-neutral reader configuration shared by admission and inference.
 /// This module deliberately has no HTTP, provider SDK, or inference runtime
 /// imports so storage-side validation cannot pull those graphs into codegen.

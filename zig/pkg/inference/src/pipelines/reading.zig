@@ -28,6 +28,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
+const reader_config = @import("antfly_reader_config");
 const session_factory = @import("../architectures/session_factory.zig");
 const florence_arch = @import("../architectures/florence.zig");
 const backends = @import("../backends/backends.zig");
@@ -1419,8 +1420,7 @@ fn compactDecoderInputIds(
 /// publication and execution must call this same authority so a node never
 /// advertises native batching that its configured executor will serialize.
 pub fn nativeFlorenceReadBatchSize() usize {
-    const parsed = platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_SIZE") orelse return 8;
-    return std.math.clamp(parsed, 1, 64);
+    return reader_config.nativeBatchSize(platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_SIZE"));
 }
 
 fn shouldFallbackFlorenceIncremental(err: anyerror) bool {

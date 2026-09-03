@@ -109,6 +109,7 @@ const (
 type Endpoint struct {
 	address      string
 	healthURL    string
+	namespace    string
 	pool         string
 	workloadType WorkloadType
 	models       map[string]*ModelInfo
@@ -149,6 +150,33 @@ func (e *Endpoint) Pool() string {
 	return e.pool
 }
 
+// Namespace returns the endpoint's immutable routing namespace. The empty
+// namespace denotes an explicitly global standalone endpoint.
+func (e *Endpoint) Namespace() string {
+	if e == nil {
+		return ""
+	}
+	return e.namespace
+}
+
+func endpointMatchesNamespace(endpoint *Endpoint, namespace string) bool {
+	return endpoint != nil && (endpoint.namespace == "" || endpoint.namespace == namespace)
+}
+
+func qualifiedPoolName(namespace, pool string) string {
+	if namespace == "" {
+		return pool
+	}
+	return namespace + "/" + pool
+}
+
+func (e *Endpoint) metricPool() string {
+	if e == nil {
+		return ""
+	}
+	return qualifiedPoolName(e.namespace, e.pool)
+}
+
 // WorkloadType returns the endpoint's immutable scheduling class.
 func (e *Endpoint) WorkloadType() WorkloadType {
 	if e == nil {
@@ -161,6 +189,7 @@ func (e *Endpoint) WorkloadType() WorkloadType {
 type EndpointSnapshot struct {
 	Address      string
 	HealthURL    string
+	Namespace    string
 	Pool         string
 	WorkloadType WorkloadType
 	Models       []ModelSnapshot
@@ -411,11 +440,24 @@ type PoolConditionStats struct {
 
 // RegisterEndpoint adds or updates an endpoint
 func (r *ModelRegistry) RegisterEndpoint(address, pool string, workloadType WorkloadType) {
-	r.RegisterEndpointWithHealth(address, "", pool, workloadType)
+	r.RegisterEndpointInNamespace(address, "", pool, workloadType)
 }
 
 // RegisterEndpointWithHealth adds or updates an endpoint with a distinct operational health URL.
 func (r *ModelRegistry) RegisterEndpointWithHealth(address, healthURL, pool string, workloadType WorkloadType) {
+	r.RegisterEndpointWithHealthInNamespace(address, healthURL, "", pool, workloadType)
+}
+
+// RegisterEndpointInNamespace adds or updates an endpoint with its immutable
+// Kubernetes namespace identity. Empty namespace explicitly registers a
+// globally scoped standalone endpoint.
+func (r *ModelRegistry) RegisterEndpointInNamespace(address, namespace, pool string, workloadType WorkloadType) {
+	r.RegisterEndpointWithHealthInNamespace(address, "", namespace, pool, workloadType)
+}
+
+// RegisterEndpointWithHealthInNamespace is the namespace-preserving registry
+// boundary used by distributed discovery.
+func (r *ModelRegistry) RegisterEndpointWithHealthInNamespace(address, healthURL, namespace, pool string, workloadType WorkloadType) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -424,6 +466,7 @@ func (r *ModelRegistry) RegisterEndpointWithHealth(address, healthURL, pool stri
 		ep = &Endpoint{
 			address:      address,
 			healthURL:    healthURL,
+			namespace:    namespace,
 			pool:         pool,
 			workloadType: workloadType,
 			models:       make(map[string]*ModelInfo),
@@ -436,18 +479,21 @@ func (r *ModelRegistry) RegisterEndpointWithHealth(address, healthURL, pool stri
 		r.circuitBreakers[address] = NewCircuitBreaker(5, 30*time.Second)
 	} else {
 		oldPool := ep.pool
-		if ep.healthURL != healthURL || ep.pool != pool || ep.workloadType != workloadType {
+		oldMetricPool := ep.metricPool()
+		if ep.healthURL != healthURL || ep.namespace != namespace || ep.pool != pool || ep.workloadType != workloadType {
 			r.removeEndpointFromPoolLocked(address, oldPool)
-			if oldPool != pool {
-				endpointHealth.WithLabelValues(oldPool, address).Set(0)
+			newMetricPool := qualifiedPoolName(namespace, pool)
+			if oldMetricPool != newMetricPool {
+				endpointHealth.WithLabelValues(oldMetricPool, address).Set(0)
 				for model := range ep.models {
-					modelLoaded.WithLabelValues(oldPool, address, model).Set(0)
-					modelLoaded.WithLabelValues(pool, address, model).Set(1)
+					modelLoaded.WithLabelValues(oldMetricPool, address, model).Set(0)
+					modelLoaded.WithLabelValues(newMetricPool, address, model).Set(1)
 				}
 			}
 			replacement := &Endpoint{
 				address:      address,
 				healthURL:    healthURL,
+				namespace:    namespace,
 				pool:         pool,
 				workloadType: workloadType,
 				models:       ep.models,
@@ -471,7 +517,7 @@ func (r *ModelRegistry) RegisterEndpointWithHealth(address, healthURL, pool stri
 			if replacement.healthy {
 				healthValue = 1
 			}
-			endpointHealth.WithLabelValues(pool, address).Set(healthValue)
+			endpointHealth.WithLabelValues(newMetricPool, address).Set(healthValue)
 		} else {
 			ep.lastSeen = time.Now()
 		}
@@ -663,7 +709,7 @@ func (r *ModelRegistry) updateModelsForEndpoint(
 		}
 
 		// Update metric
-		modelLoaded.WithLabelValues(ep.pool, address, model).Set(1)
+		modelLoaded.WithLabelValues(ep.metricPool(), address, model).Set(1)
 	}
 
 	// Remove old models
@@ -677,7 +723,7 @@ func (r *ModelRegistry) updateModelsForEndpoint(
 			}
 		}
 		r.models[model] = newEndpoints
-		modelLoaded.WithLabelValues(ep.pool, address, model).Set(0)
+		modelLoaded.WithLabelValues(ep.metricPool(), address, model).Set(0)
 	}
 
 	ep.lastSeen = time.Now()
@@ -786,19 +832,32 @@ func (r *ModelRegistry) getBootstrapEndpointsForPool(pool string) []*Endpoint {
 	return result
 }
 
-// GetEndpointsForPool returns all endpoints in a pool
+// GetEndpointsForPool returns globally scoped standalone endpoints in a pool.
+// Distributed callers must use GetEndpointsForNamespacedPool so a same-named
+// pool in another Kubernetes namespace cannot enter the result.
 func (r *ModelRegistry) GetEndpointsForPool(pool string) []*Endpoint {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.availableEndpointsForPoolLocked(pool)
+	return r.GetEndpointsForNamespacedPool("", pool)
 }
 
-func (r *ModelRegistry) availableEndpointsForPoolLocked(pool string) []*Endpoint {
+// GetEndpointsForNamespacedPool returns available endpoints whose complete
+// namespace/pool identity matches the requested pool, plus endpoints that were
+// explicitly registered with global standalone scope.
+func (r *ModelRegistry) GetEndpointsForNamespacedPool(namespace, pool string) []*Endpoint {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.availableEndpointsForNamespacedPoolLocked(namespace, pool)
+}
+
+func (r *ModelRegistry) getEndpointsForNamespacedPool(namespace, pool string) []*Endpoint {
+	return r.GetEndpointsForNamespacedPool(namespace, pool)
+}
+
+func (r *ModelRegistry) availableEndpointsForNamespacedPoolLocked(namespace, pool string) []*Endpoint {
 	endpoints := r.pools[pool]
 	result := make([]*Endpoint, 0, len(endpoints))
-	for _, ep := range endpoints {
-		if r.isEndpointAvailableLocked(ep) {
-			result = append(result, ep)
+	for _, endpoint := range endpoints {
+		if endpointMatchesNamespace(endpoint, namespace) && r.isEndpointAvailableLocked(endpoint) {
+			result = append(result, endpoint)
 		}
 	}
 	return result
@@ -817,7 +876,13 @@ func (r *ModelRegistry) GetAvailableEndpoints() []*Endpoint {
 }
 
 func (r *ModelRegistry) PoolConditionStats(pool, model string) PoolConditionStats {
-	return r.poolConditionStatsWithin(pool, model, nil)
+	return r.PoolConditionStatsInNamespace("", pool, model)
+}
+
+// PoolConditionStatsInNamespace returns dynamic route inputs for one complete
+// pool identity. Globally scoped standalone endpoints are included by design.
+func (r *ModelRegistry) PoolConditionStatsInNamespace(namespace, pool, model string) PoolConditionStats {
+	return r.poolConditionStatsInNamespaceWithin(namespace, pool, model, nil)
 }
 
 // poolConditionStatsWithin evaluates route conditions against an optional
@@ -825,12 +890,16 @@ func (r *ModelRegistry) PoolConditionStats(pool, model string) PoolConditionStat
 // selecting a healthy but undiscovered pool and rejecting after selection when
 // another leased destination is available.
 func (r *ModelRegistry) poolConditionStatsWithin(pool, model string, allowed map[string]endpointRef) PoolConditionStats {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.poolConditionStatsLocked(pool, model, allowed)
+	return r.poolConditionStatsInNamespaceWithin("", pool, model, allowed)
 }
 
-func (r *ModelRegistry) poolConditionStatsLocked(pool, model string, allowed map[string]endpointRef) PoolConditionStats {
+func (r *ModelRegistry) poolConditionStatsInNamespaceWithin(namespace, pool, model string, allowed map[string]endpointRef) PoolConditionStats {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.poolConditionStatsLocked(namespace, pool, model, allowed)
+}
+
+func (r *ModelRegistry) poolConditionStatsLocked(namespace, pool, model string, allowed map[string]endpointRef) PoolConditionStats {
 	stats := PoolConditionStats{}
 	endpoints := r.pools[pool]
 	if len(endpoints) == 0 {
@@ -841,6 +910,9 @@ func (r *ModelRegistry) poolConditionStatsLocked(pool, model string, allowed map
 	var totalQueueDepth int64
 	var latencySamples int
 	for _, ep := range endpoints {
+		if !endpointMatchesNamespace(ep, namespace) {
+			continue
+		}
 		if !r.isEndpointAvailableLocked(ep) {
 			continue
 		}
@@ -881,26 +953,30 @@ func (r *ModelRegistry) poolConditionStatsLocked(pool, model string, allowed map
 	return stats
 }
 
-// AcquireDestinationEndpoint evaluates a route destination and reserves one
-// matching endpoint under the same registry snapshot. The circuit-breaker
-// reservation happens after condition evaluation, so a half-open probe cannot
-// invalidate the condition snapshot that admitted it.
-func (r *Router) AcquireDestinationEndpoint(req *RouteRequest, destination *Destination, workloadType WorkloadType) (*Endpoint, error) {
-	reservation, err := r.acquireDestinationEndpointWithin(req, destination, workloadType, nil, req.Operation)
+// AcquireDestinationEndpoint evaluates a route destination and returns an
+// owned reservation. The caller must complete the lease exactly once.
+func (r *Router) AcquireDestinationEndpoint(req *RouteRequest, destination *Destination, workloadType WorkloadType) (*EndpointLease, error) {
+	return r.AcquireDestinationEndpointInNamespace(req, "", destination, workloadType)
+}
+
+// AcquireDestinationEndpointInNamespace selects and owns one endpoint from a
+// namespace-qualified route destination.
+func (r *Router) AcquireDestinationEndpointInNamespace(req *RouteRequest, namespace string, destination *Destination, workloadType WorkloadType) (*EndpointLease, error) {
+	reservation, err := r.acquireDestinationEndpointWithin(req, destination, workloadType, namespace, nil, req.Operation)
 	if err != nil {
 		return nil, err
 	}
-	return reservation.ref.endpoint, nil
+	return &EndpointLease{reservation: reservation}, nil
 }
 
 // acquireDestinationEndpointWithin linearizes dynamic route-condition
 // evaluation, operation filtering, capability-lease fencing, endpoint
 // selection, and circuit-breaker admission under one registry snapshot.
-func (r *Router) acquireDestinationEndpointWithin(req *RouteRequest, destination *Destination, workloadType WorkloadType, allowed map[string]endpointRef, operation OperationType) (endpointReservation, error) {
+func (r *Router) acquireDestinationEndpointWithin(req *RouteRequest, destination *Destination, workloadType WorkloadType, namespace string, allowed map[string]endpointRef, operation OperationType) (endpointReservation, error) {
 	r.registry.mu.RLock()
 	defer r.registry.mu.RUnlock()
 
-	stats := r.registry.poolConditionStatsLocked(destination.Pool, req.Model, allowed)
+	stats := r.registry.poolConditionStatsLocked(namespace, destination.Pool, req.Model, allowed)
 	if !r.routeManager.evaluateConditionStats(destination, req, stats) {
 		return endpointReservation{}, fmt.Errorf("route destination %s does not satisfy its conditions", destination.Pool)
 	}
@@ -910,7 +986,7 @@ func (r *Router) acquireDestinationEndpointWithin(req *RouteRequest, destination
 		for address, expected := range allowed {
 			endpoint := r.registry.endpoints[address]
 			if endpoint == nil || endpoint != expected.endpoint || endpoint.incarnation != expected.incarnation ||
-				r.registry.circuitBreakers[address] != expected.breaker || endpoint.pool != destination.Pool ||
+				r.registry.circuitBreakers[address] != expected.breaker || !endpointMatchesNamespace(endpoint, namespace) || endpoint.pool != destination.Pool ||
 				!r.registry.isEndpointAvailableLocked(endpoint) {
 				continue
 			}
@@ -919,6 +995,9 @@ func (r *Router) acquireDestinationEndpointWithin(req *RouteRequest, destination
 		sort.Slice(refs, func(i, j int) bool { return refs[i].endpoint.address < refs[j].endpoint.address })
 	} else {
 		for _, endpoint := range r.registry.getAvailableEndpointsForModelLocked(req.Model, destination.Pool, operation) {
+			if !endpointMatchesNamespace(endpoint, namespace) {
+				continue
+			}
 			breaker := r.registry.circuitBreakers[endpoint.address]
 			if breaker != nil {
 				refs = append(refs, endpointRef{endpoint: endpoint, incarnation: endpoint.incarnation, breaker: breaker})
@@ -1171,7 +1250,7 @@ func (r *ModelRegistry) markEndpointHealth(address string, expected *Endpoint, e
 		if healthy {
 			value = 1
 		}
-		endpointHealth.WithLabelValues(ep.pool, address).Set(value)
+		endpointHealth.WithLabelValues(ep.metricPool(), address).Set(value)
 	}
 }
 
@@ -1207,6 +1286,7 @@ func (r *ModelRegistry) EndpointSnapshots() []EndpointSnapshot {
 		snapshots = append(snapshots, EndpointSnapshot{
 			Address:      endpoint.address,
 			HealthURL:    endpoint.healthURL,
+			Namespace:    endpoint.namespace,
 			Pool:         endpoint.pool,
 			WorkloadType: endpoint.workloadType,
 			Models:       models,
@@ -1242,7 +1322,13 @@ func NewRouter(registry *ModelRegistry) *Router {
 // AcquireEndpoint selects and reserves an endpoint incarnation. Callers must
 // complete the returned lease exactly once.
 func (r *Router) AcquireEndpoint(ctx context.Context, model string, pool string, workloadType WorkloadType, excluded map[string]bool, operations ...OperationType) (*EndpointLease, error) {
-	reservation, err := r.routeRequestWithin(ctx, model, pool, workloadType, excluded, nil, operations...)
+	return r.AcquireEndpointInNamespace(ctx, model, "", pool, workloadType, excluded, operations...)
+}
+
+// AcquireEndpointInNamespace selects and owns one endpoint from a complete
+// namespace/pool identity.
+func (r *Router) AcquireEndpointInNamespace(ctx context.Context, model, namespace, pool string, workloadType WorkloadType, excluded map[string]bool, operations ...OperationType) (*EndpointLease, error) {
+	reservation, err := r.routeRequestInNamespaceWithin(ctx, model, namespace, pool, workloadType, excluded, nil, operations...)
 	if err != nil {
 		return nil, err
 	}
@@ -1252,8 +1338,12 @@ func (r *Router) AcquireEndpoint(ctx context.Context, model string, pool string,
 // routeRequestWithin selects only from the endpoint identities covered by a
 // capability lease. A nil allowed map preserves legacy, unfenced routing.
 func (r *Router) routeRequestWithin(ctx context.Context, model string, pool string, workloadType WorkloadType, excluded map[string]bool, allowed map[string]endpointRef, operations ...OperationType) (endpointReservation, error) {
+	return r.routeRequestInNamespaceWithin(ctx, model, "", pool, workloadType, excluded, allowed, operations...)
+}
+
+func (r *Router) routeRequestInNamespaceWithin(ctx context.Context, model, namespace, pool string, workloadType WorkloadType, excluded map[string]bool, allowed map[string]endpointRef, operations ...OperationType) (endpointReservation, error) {
 	_ = ctx
-	candidates := r.resolveEndpointCandidateRefsWithin(model, pool, excluded, allowed, operations...)
+	candidates := r.resolveEndpointCandidateRefsInNamespaceWithin(model, namespace, pool, excluded, allowed, operations...)
 	if len(candidates) == 0 {
 		return endpointReservation{}, fmt.Errorf("no healthy endpoints available for model %s", model)
 	}
@@ -1292,14 +1382,24 @@ func (r *Router) routeRequestWithin(ctx context.Context, model string, pool stri
 
 // ResolveEndpointCandidates returns currently eligible endpoint candidates without reserving them.
 func (r *Router) ResolveEndpointCandidates(model string, pool string, excluded map[string]bool, operations ...OperationType) []*Endpoint {
-	return r.resolveEndpointCandidatesWithin(model, pool, excluded, nil, operations...)
+	return r.ResolveEndpointCandidatesInNamespace(model, "", pool, excluded, operations...)
+}
+
+// ResolveEndpointCandidatesInNamespace returns the currently eligible
+// candidates from one complete namespace/pool identity without reserving them.
+func (r *Router) ResolveEndpointCandidatesInNamespace(model, namespace, pool string, excluded map[string]bool, operations ...OperationType) []*Endpoint {
+	return r.resolveEndpointCandidatesInNamespaceWithin(model, namespace, pool, excluded, nil, operations...)
 }
 
 // resolveEndpointCandidatesWithin intersects current operation eligibility
 // with the exact endpoint objects captured by a capability lease. Pointer
 // identity prevents an address-reused replacement from inheriting a lease.
 func (r *Router) resolveEndpointCandidatesWithin(model string, pool string, excluded map[string]bool, allowed map[string]endpointRef, operations ...OperationType) []*Endpoint {
-	refs := r.resolveEndpointCandidateRefsWithin(model, pool, excluded, allowed, operations...)
+	return r.resolveEndpointCandidatesInNamespaceWithin(model, "", pool, excluded, allowed, operations...)
+}
+
+func (r *Router) resolveEndpointCandidatesInNamespaceWithin(model, namespace, pool string, excluded map[string]bool, allowed map[string]endpointRef, operations ...OperationType) []*Endpoint {
+	refs := r.resolveEndpointCandidateRefsInNamespaceWithin(model, namespace, pool, excluded, allowed, operations...)
 	endpoints := make([]*Endpoint, len(refs))
 	for i := range refs {
 		endpoints[i] = refs[i].endpoint
@@ -1308,6 +1408,10 @@ func (r *Router) resolveEndpointCandidatesWithin(model string, pool string, excl
 }
 
 func (r *Router) resolveEndpointCandidateRefsWithin(model string, pool string, excluded map[string]bool, allowed map[string]endpointRef, operations ...OperationType) []endpointRef {
+	return r.resolveEndpointCandidateRefsInNamespaceWithin(model, "", pool, excluded, allowed, operations...)
+}
+
+func (r *Router) resolveEndpointCandidateRefsInNamespaceWithin(model, namespace, pool string, excluded map[string]bool, allowed map[string]endpointRef, operations ...OperationType) []endpointRef {
 	if allowed != nil {
 		// A capability lease is an immutable, authorization-scoped proof that
 		// these exact endpoint incarnations advertised the semantic task. Do not
@@ -1319,7 +1423,7 @@ func (r *Router) resolveEndpointCandidateRefsWithin(model string, pool string, e
 			endpoint := r.registry.endpoints[address]
 			if endpoint == nil || endpoint != expected.endpoint || endpoint.incarnation != expected.incarnation ||
 				r.registry.circuitBreakers[address] != expected.breaker ||
-				(pool != "" && endpoint.pool != pool) || !r.registry.isEndpointAvailableLocked(endpoint) {
+				!endpointMatchesNamespace(endpoint, namespace) || (pool != "" && endpoint.pool != pool) || !r.registry.isEndpointAvailableLocked(endpoint) {
 				continue
 			}
 			endpoints = append(endpoints, expected)
@@ -1357,11 +1461,22 @@ func (r *Router) resolveEndpointCandidateRefsWithin(model string, pool string, e
 	}
 
 	refs := r.registry.endpointRefs(endpoints)
+	refs = filterEndpointRefsByNamespace(refs, namespace)
 	filtered := filterExcludedEndpointRefs(refs, excluded)
 	if len(filtered) > 0 {
 		return filtered
 	}
 	return refs
+}
+
+func filterEndpointRefsByNamespace(endpoints []endpointRef, namespace string) []endpointRef {
+	filtered := make([]endpointRef, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		if endpointMatchesNamespace(endpoint.endpoint, namespace) {
+			filtered = append(filtered, endpoint)
+		}
+	}
+	return filtered
 }
 
 func (r *ModelRegistry) endpointRefs(endpoints []*Endpoint) []endpointRef {
@@ -1549,16 +1664,17 @@ type Proxy struct {
 	server       *http.Server
 	logger       *zap.Logger
 
-	defaultPool         string
-	listenAddr          string
-	maxRequestBodyBytes int64
-	bodyAdmission       *byteAdmission
-	catalogAdmission    *byteAdmission
-	refreshWake         chan struct{}
-	capabilityLeaseMu   sync.Mutex
-	capabilityLeases    map[string]proxyCapabilityLease
-	capabilityLeaseByID map[[sha256.Size]byte]string
-	verifiedSource      VerifiedSourceResolver
+	defaultPool          string
+	defaultPoolNamespace string
+	listenAddr           string
+	maxRequestBodyBytes  int64
+	bodyAdmission        *byteAdmission
+	catalogAdmission     *byteAdmission
+	refreshWake          chan struct{}
+	capabilityLeaseMu    sync.Mutex
+	capabilityLeases     map[string]proxyCapabilityLease
+	capabilityLeaseByID  map[[sha256.Size]byte]string
+	verifiedSource       VerifiedSourceResolver
 }
 
 // VerifiedSourceResolver authenticates source-scoped routing attributes for an
@@ -1601,6 +1717,7 @@ func (p *Proxy) SetPoolActivator(activator PoolActivator) {
 type Config struct {
 	ListenAddr              string
 	DefaultPool             string
+	DefaultPoolNamespace    string // Namespace of DefaultPool; empty selects globally scoped standalone endpoints
 	RefreshInterval         time.Duration
 	EnableRouteWatching     bool                   // Enable watching InferenceProxy CRs
 	RouteWatchNamespace     string                 // Namespace to watch for routes (empty for all)
@@ -1625,15 +1742,16 @@ func NewProxy(cfg Config) *Proxy {
 	}
 
 	p := &Proxy{
-		registry:            registry,
-		router:              router,
-		defaultPool:         cfg.DefaultPool,
-		listenAddr:          cfg.ListenAddr,
-		logger:              logger,
-		refreshWake:         make(chan struct{}, 1),
-		capabilityLeases:    make(map[string]proxyCapabilityLease),
-		capabilityLeaseByID: make(map[[sha256.Size]byte]string),
-		verifiedSource:      cfg.VerifiedSourceResolver,
+		registry:             registry,
+		router:               router,
+		defaultPool:          cfg.DefaultPool,
+		defaultPoolNamespace: cfg.DefaultPoolNamespace,
+		listenAddr:           cfg.ListenAddr,
+		logger:               logger,
+		refreshWake:          make(chan struct{}, 1),
+		capabilityLeases:     make(map[string]proxyCapabilityLease),
+		capabilityLeaseByID:  make(map[[sha256.Size]byte]string),
+		verifiedSource:       cfg.VerifiedSourceResolver,
 	}
 	p.maxRequestBodyBytes = cfg.MaxRequestBodyBytes
 	if p.maxRequestBodyBytes <= 0 {
@@ -1830,47 +1948,75 @@ type catalogEndpointCohort struct {
 // operation. A task family is not a routing identity: generate, generate.batch,
 // and chat.completions can legitimately have different policies and executors.
 func (p *Proxy) catalogEndpointCohortForRequest(routing RoutingContext, model string, operation OperationType) catalogEndpointCohort {
-	var pools []string
-	seenPools := make(map[string]bool)
-	cohort := p.router.RouteManager().PotentialCohortFor(routing.routeRequest(operation, model))
-	for _, candidate := range cohort.Pools {
-		if !seenPools[candidate] {
-			seenPools[candidate] = true
-			pools = append(pools, candidate)
-		}
-	}
+	req := routing.routeRequest(operation, model)
+	cohort := p.router.RouteManager().PotentialCohortFor(req)
+	matchedRoute, routeCurrent := p.router.RouteManager().matchInstalledAtGeneration(req, cohort.Generation)
+	targets := append([]RoutePoolTarget(nil), cohort.PoolTargets...)
 	// Without a definite route, this operation can fall through to its explicit
 	// pool and then the process default. A terminal reject contributes neither.
 	fallbackPool := firstNonEmpty(strings.TrimSpace(routing.ExplicitPool), p.defaultPool)
-	if !cohort.Terminal && fallbackPool != "" && !seenPools[fallbackPool] {
-		seenPools[fallbackPool] = true
-		pools = append(pools, fallbackPool)
-	}
-	activation := append([]RoutePoolTarget(nil), cohort.ActivationTargets...)
 	if !cohort.Terminal && fallbackPool != "" {
-		fallbackTarget := RoutePoolTarget{Pool: fallbackPool}
+		fallbackTarget := RoutePoolTarget{Namespace: p.defaultPoolNamespace, Pool: fallbackPool}
 		found := false
-		for _, target := range activation {
+		for _, target := range targets {
 			if target == fallbackTarget {
 				found = true
 				break
 			}
 		}
 		if !found {
-			activation = append(activation, fallbackTarget)
+			targets = append(targets, fallbackTarget)
 		}
 	}
 	seen := make(map[string]bool)
 	var endpoints []*Endpoint
-	for _, pool := range pools {
-		for _, endpoint := range p.registry.GetEndpointsForPool(pool) {
+	for _, target := range targets {
+		for _, endpoint := range p.registry.getEndpointsForNamespacedPool(target.Namespace, target.Pool) {
 			if endpoint != nil && !seen[endpoint.address] {
 				seen[endpoint.address] = true
 				endpoints = append(endpoints, endpoint)
 			}
 		}
 	}
-	return catalogEndpointCohort{endpoints: endpoints, activation: activation, routeGeneration: cohort.Generation}
+	return catalogEndpointCohort{
+		endpoints:       endpoints,
+		activation:      p.catalogActivationPath(req, matchedRoute, fallbackPool, routeCurrent),
+		routeGeneration: cohort.Generation,
+	}
+}
+
+// catalogActivationPath is the ordered route actually executable for this
+// request. Conservative cohort members remain passive discovery candidates;
+// missing headers or source identity must never wake every possibly matching
+// tenant pool. A redirect fallback is attempted only if the selected
+// destination cannot become available.
+func (p *Proxy) catalogActivationPath(req *RouteRequest, route *Route, fallbackPool string, routeCurrent bool) []RoutePoolTarget {
+	// A policy mutation between cohort construction and exact matching is
+	// retried by prepareCatalogEndpointCohort. Do not activate either snapshot.
+	if !routeCurrent {
+		return nil
+	}
+	if route == nil {
+		if fallbackPool == "" {
+			return nil
+		}
+		return []RoutePoolTarget{{Namespace: p.defaultPoolNamespace, Pool: fallbackPool}}
+	}
+	namespace := routeNamespace(route)
+	if destination, err := p.router.RouteManager().selectDestinationWithin(route, req, p.registry, nil); err == nil && destination != nil {
+		return []RoutePoolTarget{{Namespace: namespace, Pool: destination.Pool}}
+	}
+	path := make([]RoutePoolTarget, 0, 2)
+	if destination := p.selectActivationDestination(route, req); destination != nil {
+		path = append(path, RoutePoolTarget{Namespace: namespace, Pool: destination.Pool})
+	}
+	if route.Fallback != nil && route.Fallback.Action == "redirect" && route.Fallback.RedirectPool != "" {
+		fallback := RoutePoolTarget{Namespace: namespace, Pool: route.Fallback.RedirectPool}
+		if len(path) == 0 || path[len(path)-1] != fallback {
+			path = append(path, fallback)
+		}
+	}
+	return path
 }
 
 func (p *Proxy) catalogEndpointsForRequest(routing RoutingContext, model string, operation OperationType) []*Endpoint {
@@ -1879,73 +2025,53 @@ func (p *Proxy) catalogEndpointsForRequest(routing RoutingContext, model string,
 
 // activateCatalogCohort makes scale-to-zero part of capability discovery. A
 // scoped lease may only name endpoint incarnations that answered discovery, so
-// waking a previously absent pool during execution would be too late: the new
-// incarnation is deliberately outside that lease. Every managed reachable pool
-// is renewed, while only pools that were cold are awaited.
+// waking a previously absent pool during execution would be too late. Targets
+// are attempted in route/fallback order; an unavailable optional target is
+// omitted rather than making an already-viable fallback undiscoverable.
 func (p *Proxy) activateCatalogCohort(ctx context.Context, targets []RoutePoolTarget) error {
 	if p.activator == nil || len(targets) == 0 {
 		return nil
 	}
-	type pendingActivation struct {
-		target   RoutePoolTarget
-		deadline time.Time
-	}
-	pending := make([]pendingActivation, 0, len(targets))
 	for _, target := range targets {
 		if target.Pool == "" || !p.activator.IsEnabled(target.Namespace, target.Pool) {
 			continue
 		}
-		wasCold := len(p.registry.GetEndpointsForPool(target.Pool)) == 0
+		wasCold := len(p.registry.getEndpointsForNamespacedPool(target.Namespace, target.Pool)) == 0
 		started := time.Now()
 		wait, enabled, err := p.activatePool(ctx, target.Namespace, target.Pool)
 		if err != nil {
-			return fmt.Errorf("activate inference pool %s/%s: %w", target.Namespace, target.Pool, err)
-		}
-		if !enabled || !wasCold || len(p.registry.GetEndpointsForPool(target.Pool)) != 0 {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			p.logger.Warn("failed to activate inference capability target", zap.String("namespace", target.Namespace), zap.String("pool", target.Pool), zap.Error(err))
 			continue
 		}
-		if wait <= 0 {
-			return fmt.Errorf("inference pool %s/%s activation timed out", target.Namespace, target.Pool)
+		if !enabled {
+			continue
 		}
-		pending = append(pending, pendingActivation{target: target, deadline: started.Add(wait)})
-	}
-	if len(pending) == 0 {
-		return nil
-	}
-
-	for len(pending) > 0 {
-		now := time.Now()
-		remaining := pending[:0]
-		var nextDeadline time.Time
-		for _, activation := range pending {
-			if len(p.registry.GetEndpointsForPool(activation.target.Pool)) != 0 {
-				continue
-			}
-			if !now.Before(activation.deadline) {
-				return fmt.Errorf("inference pool %s/%s activation timed out", activation.target.Namespace, activation.target.Pool)
-			}
-			remaining = append(remaining, activation)
-			if nextDeadline.IsZero() || activation.deadline.Before(nextDeadline) {
-				nextDeadline = activation.deadline
-			}
-		}
-		pending = remaining
-		if len(pending) == 0 {
+		if !wasCold || len(p.registry.getEndpointsForNamespacedPool(target.Namespace, target.Pool)) != 0 {
 			return nil
 		}
-		pollAfter := min(250*time.Millisecond, time.Until(nextDeadline))
-		timer := time.NewTimer(pollAfter)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
+		deadline := started.Add(wait)
+		for wait > 0 && time.Now().Before(deadline) {
+			pollAfter := min(250*time.Millisecond, time.Until(deadline))
+			timer := time.NewTimer(pollAfter)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
 				}
+				return ctx.Err()
+			case <-timer.C:
 			}
-			return ctx.Err()
-		case <-timer.C:
+			if len(p.registry.getEndpointsForNamespacedPool(target.Namespace, target.Pool)) != 0 {
+				return nil
+			}
 		}
+		p.logger.Warn("inference capability target activation timed out", zap.String("namespace", target.Namespace), zap.String("pool", target.Pool))
 	}
 	return nil
 }
@@ -2044,7 +2170,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	} else if pool == "" {
 		endpoints = p.registry.GetAvailableEndpoints()
 	} else {
-		endpoints = p.registry.GetEndpointsForPool(pool)
+		endpoints = p.registry.getEndpointsForNamespacedPool(p.defaultPoolNamespace, pool)
 	}
 	type catalogTarget struct {
 		endpoint    *Endpoint
@@ -3294,7 +3420,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 	resolution := lease.Resolution
 
 	matchedRoute := resolution.Route
-	pool := resolution.Pool
+	metricPool := resolution.Endpoint.metricPool()
 
 	if err := lease.Admit(); err != nil {
 		lease.Release()
@@ -3321,7 +3447,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 			lease, err = lease.NextAttempt(r.Context())
 		}
 		if err != nil {
-			requestsTotal.WithLabelValues(pool, model, operation, "no_endpoint").Inc()
+			requestsTotal.WithLabelValues(metricPool, model, operation, "no_endpoint").Inc()
 			if writeResolutionError(w, err) {
 				return
 			}
@@ -3342,7 +3468,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 			if attempt+1 < attempts && shouldRetryRequestError(matchedRoute, reqErr) {
 				continue
 			}
-			p.recordProxyMetrics(endpoint.pool, model, operation, start, "error")
+			p.recordProxyMetrics(endpoint.metricPool(), model, operation, start, "error")
 			http.Error(w, fmt.Sprintf("proxy request failed: %v", reqErr), http.StatusBadGateway)
 			return
 		}
@@ -3366,10 +3492,10 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 
 		if resp.StatusCode >= 400 || streamErr != nil {
 			lease.RecordFailure()
-			p.recordProxyMetrics(endpoint.pool, model, operation, start, "error")
+			p.recordProxyMetrics(endpoint.metricPool(), model, operation, start, "error")
 		} else {
 			lease.RecordSuccess()
-			p.recordProxyMetrics(endpoint.pool, model, operation, start, "success")
+			p.recordProxyMetrics(endpoint.metricPool(), model, operation, start, "success")
 		}
 		return
 	}
@@ -3380,13 +3506,13 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 			status = "error"
 		}
 		if lastEndpoint != nil {
-			p.recordProxyMetrics(lastEndpoint.pool, model, operation, start, status)
+			p.recordProxyMetrics(lastEndpoint.metricPool(), model, operation, start, status)
 		}
 		_ = copyResponse(w, lastResp)
 		return
 	}
 
-	p.recordProxyMetrics(pool, model, operation, start, "error")
+	p.recordProxyMetrics(metricPool, model, operation, start, "error")
 	http.Error(w, fmt.Sprintf("proxy request failed: %v", lastErr), http.StatusBadGateway)
 }
 
@@ -3615,14 +3741,14 @@ func (p *Proxy) refreshAllEndpoints(ctx context.Context) {
 	}
 
 	p.registry.mu.RLock()
-	for pool, eps := range p.registry.pools {
-		var totalQueue int32
-		for _, ep := range eps {
-			totalQueue += atomic.LoadInt32(&ep.runtime.queueDepth)
-		}
-		queueDepth.WithLabelValues(pool).Set(float64(totalQueue))
+	queueByPool := make(map[string]int32)
+	for _, endpoint := range p.registry.endpoints {
+		queueByPool[endpoint.metricPool()] += atomic.LoadInt32(&endpoint.runtime.queueDepth)
 	}
 	p.registry.mu.RUnlock()
+	for pool, totalQueue := range queueByPool {
+		queueDepth.WithLabelValues(pool).Set(float64(totalQueue))
+	}
 }
 
 // Registry returns the model registry for external access
@@ -3644,6 +3770,20 @@ func (p *Proxy) RegisterEndpoint(address, pool string, workloadType WorkloadType
 // RegisterEndpointWithHealth adds an endpoint with a distinct operational health URL.
 func (p *Proxy) RegisterEndpointWithHealth(address, healthURL, pool string, workloadType WorkloadType) {
 	p.registry.RegisterEndpointWithHealth(address, healthURL, pool, workloadType)
+	p.requestEndpointRefresh()
+}
+
+// RegisterEndpointInNamespace registers a distributed endpoint and schedules
+// immediate capability refresh.
+func (p *Proxy) RegisterEndpointInNamespace(address, namespace, pool string, workloadType WorkloadType) {
+	p.registry.RegisterEndpointInNamespace(address, namespace, pool, workloadType)
+	p.requestEndpointRefresh()
+}
+
+// RegisterEndpointWithHealthInNamespace registers a distributed endpoint with
+// a distinct health URL and schedules immediate capability refresh.
+func (p *Proxy) RegisterEndpointWithHealthInNamespace(address, healthURL, namespace, pool string, workloadType WorkloadType) {
+	p.registry.RegisterEndpointWithHealthInNamespace(address, healthURL, namespace, pool, workloadType)
 	p.requestEndpointRefresh()
 }
 
