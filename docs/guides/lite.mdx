@@ -2,11 +2,6 @@
 title: Antfly Lite
 order: 4
 description: Use Antfly as an embedded local-first database with a single .aflite file
-prerequisites:
-  - "Antfly CLI built or installed"
-difficulty: intermediate
-estimatedTime: "20 min"
-tags: [lite, embedded, local-first, backup, migration]
 ---
 
 Antfly Lite is the embedded profile of Antfly. It stores documents, schemas,
@@ -462,3 +457,14 @@ antfly lite vacuum app.aflite
 
 For production applications, pair regular `.afb` backups with `check` in your
 maintenance workflow.
+
+## Let Your Agent Drive
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome — e.g. "Embed Antfly Lite in my application with a single-file database" — and use this page to judge the result.

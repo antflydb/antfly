@@ -447,3 +447,14 @@ starting replication  start_lsn=0/0
   ```sql
   ALTER TABLE users REPLICA IDENTITY FULL;
   ```
+
+## Let Your Agent Drive
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome — e.g. "Stream my Postgres orders table into Antfly with logical replication" — and use this page to judge the result.

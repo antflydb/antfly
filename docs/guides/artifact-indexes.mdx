@@ -163,3 +163,14 @@ when paired with `embedding_name`; the matching enrichment is authoritative.
 Internal graph manifest and edge materialization fields are engine-owned, not
 alternate public APIs. No graph status aliases were released, and the unreleased
 Go v0.2 SDK surface does not create an additional compatibility obligation.
+
+## Let Your Agent Drive
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome — e.g. "Create an artifact-backed index over my docs table's generated chunks" — and use this page to judge the result.

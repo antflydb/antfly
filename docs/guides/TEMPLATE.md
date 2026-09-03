@@ -12,7 +12,11 @@ Match the voice of `support-answer-agent.mdx`: confident, concrete, show-first.
 Target 120–180 lines. Structure:
 
 1. **Frontmatter** — `title` (imperative outcome: "Build a …", "Add … to …"),
-   `description` (one sentence, what the reader ends up with).
+   `description` (one sentence, what the reader ends up with), `order`, and
+   optionally `unlisted`. Nothing else — no `prerequisites`/`difficulty`/
+   `estimatedTime`/`tags`: labels about the doing rot once an agent does the
+   doing. A genuine state requirement (credentials, a configured Postgres)
+   goes in prose with a verification command, not in metadata.
 2. **`<Questions>`** — 3–5 questions a person would actually type, right after
    frontmatter.
 3. **The Pattern** — a few sentences of framing: what this solution is and the one
