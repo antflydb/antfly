@@ -27,6 +27,13 @@ const session_prefix = "\x00\x00__api_txn_sessions__:";
 const session_lease_prefix = "\x00\x00__api_txn_session_leases__:";
 const session_expiry_prefix = "\x00\x00__api_txn_session_expiry__:";
 const session_recovery_prefix = "\x00\x00__api_txn_session_recovery__:";
+// Keyed receipts use a versioned namespace that pre-feature binaries do not
+// scan. Older binaries therefore cannot discover, adopt, rewrite, or expire
+// them while a cluster is rolling through the feature boundary.
+const receipt_session_prefix = "\x00\x00__api_idempotent_receipts_v1__:";
+const receipt_lease_prefix = "\x00\x00__api_idempotent_receipt_leases_v1__:";
+const receipt_expiry_prefix = "\x00\x00__api_idempotent_receipt_expiry_v1__:";
+const receipt_recovery_prefix = "\x00\x00__api_idempotent_receipt_recovery_v1__:";
 var txn_id_nonce: std.atomic.Value(u64) = .init(0);
 var owner_incarnation_nonce: std.atomic.Value(u64) = .init(1);
 
@@ -286,8 +293,9 @@ pub const TerminalCommitStatus = enum {
     }
 };
 
-/// Additive receipt state kept outside TerminalCommitStatus so session files
-/// remain readable by rollback binaries that know the established commit enum.
+/// Non-commit receipt state remains distinct from committed visibility debt.
+/// The versioned receipt keyspace, rather than permissive JSON decoding, is the
+/// compatibility boundary that prevents rollback binaries mutating it.
 pub const IdempotentReceiptOutcome = enum {
     not_applied,
     aborted,
@@ -703,8 +711,8 @@ pub const Session = struct {
     /// Marks sessions whose identity is derived from an external idempotency
     /// key. Recovery must preserve their terminal non-application receipt.
     idempotent_receipt: bool = false,
-    /// Terminal rejection is deliberately an additive top-level field rather
-    /// than a new TerminalCommitStatus variant for downgrade compatibility.
+    /// Terminal rejection is deliberately distinct from commit visibility and
+    /// recovery status.
     idempotent_outcome: ?IdempotentReceiptOutcome = null,
     /// Persisted before releasing the retained coordinator's topology fence.
     terminal_commit: ?TerminalCommit = null,
@@ -786,7 +794,7 @@ pub const DurableSessionStore = struct {
 
     pub fn save(self: *DurableSessionStore, session: Session, max_record_bytes: ?usize) !void {
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
-        const key = try makeSessionKey(self.alloc, session.txn_id);
+        const key = try makeSessionKeyForKind(self.alloc, session.txn_id, sessionKind(session));
         defer self.alloc.free(key);
         const value = try encodeSessionRecord(self.alloc, session);
         defer self.alloc.free(value);
@@ -863,10 +871,18 @@ pub const DurableSessionStore = struct {
         max_record_bytes: ?usize,
         max_sessions: ?usize,
     ) !bool {
-        const session_key = try makeSessionKey(self.alloc, session.txn_id);
+        const kind = sessionKind(session);
+        const session_key = try makeSessionKeyForKind(self.alloc, session.txn_id, kind);
         defer self.alloc.free(session_key);
-        const lease_key = try makeSessionLeaseKey(self.alloc, session.txn_id);
+        const lease_key = try makeSessionLeaseKeyForKind(self.alloc, session.txn_id, kind);
         defer self.alloc.free(lease_key);
+        const alternate_kind: SessionKind = if (kind == .interactive) .idempotent_receipt else .interactive;
+        const alternate_key = try makeSessionKeyForKind(self.alloc, session.txn_id, alternate_kind);
+        defer self.alloc.free(alternate_key);
+        if (txn.get(alternate_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        } != null) return false;
 
         const current_raw = txn.get(session_key) catch |err| switch (err) {
             error.NotFound => null,
@@ -878,7 +894,9 @@ pub const DurableSessionStore = struct {
             defer current.deinit(self.alloc);
             if (current.owner_node_id != owner or
                 current.owner_incarnation != (expected_incarnation orelse return false)) return false;
-        } else if (current_raw != null) return false;
+        } else {
+            if (current_raw != null) return false;
+        }
 
         // Cluster-shared admission cannot use a process-local cached count.
         // Count and create under the backend write transaction so every API
@@ -913,21 +931,22 @@ pub const DurableSessionStore = struct {
             var previous = try decodeSessionRecord(self.alloc, session.txn_id, raw);
             defer previous.deinit(self.alloc);
             previous_needs_recovery = sessionNeedsRecovery(previous);
-            const old_expiry_key = try makeSessionExpiryKey(self.alloc, previous.last_touched_timestamp, session.txn_id);
+            if (sessionKind(previous) != kind) return error.InvalidTransactionSessionRecord;
+            const old_expiry_key = try makeSessionExpiryKeyForKind(self.alloc, previous.last_touched_timestamp, session.txn_id, kind);
             defer self.alloc.free(old_expiry_key);
             txn.delete(old_expiry_key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
             };
         }
-        const expiry_key = try makeSessionExpiryKey(self.alloc, session.last_touched_timestamp, session.txn_id);
+        const expiry_key = try makeSessionExpiryKeyForKind(self.alloc, session.last_touched_timestamp, session.txn_id, kind);
         defer self.alloc.free(expiry_key);
         try txn.put(session_key, session_value);
         try txn.put(expiry_key, &.{});
         if (sessionNeedsRecovery(session)) {
             try setSessionRecoveryIndexTxn(self, txn, session);
         } else if (previous_needs_recovery) {
-            try clearSessionRecoveryIndexTxn(self, txn, session.txn_id);
+            try clearSessionRecoveryIndexTxn(self, txn, session.txn_id, kind);
         }
         if (self.fail_lease_transition_after_session_write_for_test) return error.InjectedLeaseTransitionFailure;
         try txn.put(lease_key, lease_value);
@@ -939,17 +958,25 @@ pub const DurableSessionStore = struct {
         var cursor = try txn.openCursor();
         defer cursor.close();
         var count: usize = 0;
-        var entry = try cursor.seekAtOrAfter(session_prefix);
-        while (entry) |row| : (entry = try cursor.next()) {
-            if (!std.mem.startsWith(u8, row.key, session_prefix)) break;
-            count += 1;
-            if (count >= limit) break;
+        for ([_]SessionKind{ .interactive, .idempotent_receipt }) |kind| {
+            const prefix = sessionPrefix(kind);
+            var entry = try cursor.seekAtOrAfter(prefix);
+            while (entry) |row| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                count += 1;
+                if (count >= limit) return count;
+            }
         }
         return count;
     }
 
     pub fn load(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !?Session {
-        const key = try makeSessionKey(self.alloc, txn_id);
+        if (try self.loadForKind(txn_id, .idempotent_receipt)) |session| return session;
+        return try self.loadForKind(txn_id, .interactive);
+    }
+
+    fn loadForKind(self: *DurableSessionStore, txn_id: db_mod.types.TxnId, kind: SessionKind) !?Session {
+        const key = try makeSessionKeyForKind(self.alloc, txn_id, kind);
         defer self.alloc.free(key);
         const value = switch (self.backend) {
             .docstore => |store| store.get(self.alloc, key) catch |err| switch (err) {
@@ -967,24 +994,25 @@ pub const DurableSessionStore = struct {
             },
         };
         defer self.alloc.free(value);
-        return try decodeSessionRecord(self.alloc, txn_id, value);
+        var session = try decodeSessionRecord(self.alloc, txn_id, value);
+        errdefer session.deinit(self.alloc);
+        if (sessionKind(session) != kind) return error.InvalidTransactionSessionRecord;
+        return session;
     }
 
     pub fn delete(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !void {
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
-        const key = try makeSessionKey(self.alloc, txn_id);
-        defer self.alloc.free(key);
         switch (self.backend) {
             .docstore => |store| {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
-                try deleteSessionAndExpiryTxn(self, &txn, key, txn_id);
+                try deleteLocatedSessionAndExpiryTxn(self, &txn, txn_id);
                 try txn.commit();
             },
             .runtime => |store| {
                 var txn = try store.beginWrite();
                 errdefer txn.abort();
-                try deleteSessionAndExpiryTxn(self, &txn, key, txn_id);
+                try deleteLocatedSessionAndExpiryTxn(self, &txn, txn_id);
                 try txn.commit();
             },
         }
@@ -1085,18 +1113,14 @@ pub const DurableSessionStore = struct {
         owner_node_id: u64,
         owner_incarnation: u64,
     ) !bool {
-        const key = try makeSessionKey(self.alloc, txn_id);
-        defer self.alloc.free(key);
-        const raw = txn.get(key) catch |err| switch (err) {
-            error.NotFound => return false,
-            else => return err,
-        };
-        var current = try decodeSessionRecord(self.alloc, txn_id, raw);
-        defer current.deinit(self.alloc);
+        var located = (try loadLocatedSessionTxn(self, txn, txn_id)) orelse return false;
+        defer located.deinit(self.alloc);
+        const current = &located.session;
         if (current.owner_node_id != owner_node_id or
             current.owner_incarnation != owner_incarnation) return false;
 
-        const lease_key = try makeSessionLeaseKey(self.alloc, txn_id);
+        const kind = sessionKind(current.*);
+        const lease_key = try makeSessionLeaseKeyForKind(self.alloc, txn_id, kind);
         defer self.alloc.free(lease_key);
         const lease_raw = txn.get(lease_key) catch |err| switch (err) {
             error.NotFound => return false,
@@ -1108,7 +1132,7 @@ pub const DurableSessionStore = struct {
         defer self.alloc.free(owner_id);
         if (!std.mem.eql(u8, parsed.value.owner_id, owner_id)) return false;
 
-        try deleteSessionAndExpiryTxn(self, txn, key, txn_id);
+        try deleteSessionAndExpiryTxn(self, txn, located.key, txn_id, kind);
         try txn.delete(lease_key);
         return true;
     }
@@ -1123,14 +1147,9 @@ pub const DurableSessionStore = struct {
         cutoff_ns: u64,
         now_ms: u64,
     ) !bool {
-        const key = try makeSessionKey(self.alloc, txn_id);
-        defer self.alloc.free(key);
-        const raw = txn.get(key) catch |err| switch (err) {
-            error.NotFound => return false,
-            else => return err,
-        };
-        var current = try decodeSessionRecord(self.alloc, txn_id, raw);
-        defer current.deinit(self.alloc);
+        var located = (try loadLocatedSessionTxn(self, txn, txn_id)) orelse return false;
+        defer located.deinit(self.alloc);
+        const current = &located.session;
         if (current.owner_node_id != expected_owner_node_id or
             current.owner_incarnation != expected_owner_incarnation or
             current.last_touched_timestamp != expected_last_touched_timestamp or
@@ -1138,12 +1157,13 @@ pub const DurableSessionStore = struct {
         // Retention applies to completed receipts, never to an operation whose
         // durable decision or coordinator handoff is still being recovered.
         // Keep this check in the storage transaction as the final authority.
-        if (sessionRetentionPinned(current)) return false;
+        if (sessionRetentionPinned(current.*)) return false;
         if (current.terminal_commit) |terminal| {
             if (terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged) return false;
         }
 
-        const lease_key = try makeSessionLeaseKey(self.alloc, txn_id);
+        const kind = sessionKind(current.*);
+        const lease_key = try makeSessionLeaseKeyForKind(self.alloc, txn_id, kind);
         defer self.alloc.free(lease_key);
         const lease_raw = txn.get(lease_key) catch |err| switch (err) {
             error.NotFound => return false,
@@ -1156,12 +1176,20 @@ pub const DurableSessionStore = struct {
         if (!std.mem.eql(u8, parsed.value.owner_id, expected_owner_id) or
             parsed.value.expires_at_ms > now_ms) return false;
 
-        try deleteSessionAndExpiryTxn(self, txn, key, txn_id);
+        try deleteSessionAndExpiryTxn(self, txn, located.key, txn_id, kind);
         try txn.delete(lease_key);
         return true;
     }
 
     fn putSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, value: []const u8, session: Session) !void {
+        const kind = sessionKind(session);
+        const alternate_kind: SessionKind = if (kind == .interactive) .idempotent_receipt else .interactive;
+        const alternate_key = try makeSessionKeyForKind(self.alloc, session.txn_id, alternate_kind);
+        defer self.alloc.free(alternate_key);
+        if (txn.get(alternate_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        } != null) return error.SessionKindMismatch;
         var previous_needs_recovery = false;
         if (txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
@@ -1169,33 +1197,71 @@ pub const DurableSessionStore = struct {
         }) |raw| {
             var previous = try decodeSessionRecord(self.alloc, session.txn_id, raw);
             defer previous.deinit(self.alloc);
+            if (sessionKind(previous) != kind) return error.InvalidTransactionSessionRecord;
             previous_needs_recovery = sessionNeedsRecovery(previous);
-            const old_expiry_key = try makeSessionExpiryKey(self.alloc, previous.last_touched_timestamp, session.txn_id);
+            const old_expiry_key = try makeSessionExpiryKeyForKind(self.alloc, previous.last_touched_timestamp, session.txn_id, kind);
             defer self.alloc.free(old_expiry_key);
             txn.delete(old_expiry_key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
             };
         }
-        const expiry_key = try makeSessionExpiryKey(self.alloc, session.last_touched_timestamp, session.txn_id);
+        const expiry_key = try makeSessionExpiryKeyForKind(self.alloc, session.last_touched_timestamp, session.txn_id, kind);
         defer self.alloc.free(expiry_key);
         try txn.put(key, value);
         try txn.put(expiry_key, &.{});
         if (sessionNeedsRecovery(session)) {
             try setSessionRecoveryIndexTxn(self, txn, session);
         } else if (previous_needs_recovery) {
-            try clearSessionRecoveryIndexTxn(self, txn, session.txn_id);
+            try clearSessionRecoveryIndexTxn(self, txn, session.txn_id, kind);
         }
     }
 
-    fn deleteSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, txn_id: db_mod.types.TxnId) !void {
+    const LocatedSession = struct {
+        key: []u8,
+        session: Session,
+
+        fn deinit(self: *LocatedSession, alloc: std.mem.Allocator) void {
+            alloc.free(self.key);
+            self.session.deinit(alloc);
+            self.* = undefined;
+        }
+    };
+
+    fn loadLocatedSessionTxn(self: *DurableSessionStore, txn: anytype, txn_id: db_mod.types.TxnId) !?LocatedSession {
+        for ([_]SessionKind{ .idempotent_receipt, .interactive }) |kind| {
+            const key = try makeSessionKeyForKind(self.alloc, txn_id, kind);
+            errdefer self.alloc.free(key);
+            const raw = txn.get(key) catch |err| switch (err) {
+                error.NotFound => {
+                    self.alloc.free(key);
+                    continue;
+                },
+                else => return err,
+            };
+            var session = try decodeSessionRecord(self.alloc, txn_id, raw);
+            errdefer session.deinit(self.alloc);
+            if (sessionKind(session) != kind) return error.InvalidTransactionSessionRecord;
+            return .{ .key = key, .session = session };
+        }
+        return null;
+    }
+
+    fn deleteLocatedSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, txn_id: db_mod.types.TxnId) !void {
+        var located = (try loadLocatedSessionTxn(self, txn, txn_id)) orelse return;
+        defer located.deinit(self.alloc);
+        try deleteSessionAndExpiryTxn(self, txn, located.key, txn_id, sessionKind(located.session));
+    }
+
+    fn deleteSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, txn_id: db_mod.types.TxnId, kind: SessionKind) !void {
         if (txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         }) |raw| {
             var previous = try decodeSessionRecord(self.alloc, txn_id, raw);
             defer previous.deinit(self.alloc);
-            const expiry_key = try makeSessionExpiryKey(self.alloc, previous.last_touched_timestamp, txn_id);
+            if (sessionKind(previous) != kind) return error.InvalidTransactionSessionRecord;
+            const expiry_key = try makeSessionExpiryKeyForKind(self.alloc, previous.last_touched_timestamp, txn_id, kind);
             defer self.alloc.free(expiry_key);
             txn.delete(expiry_key) catch |err| switch (err) {
                 error.NotFound => {},
@@ -1206,7 +1272,7 @@ pub const DurableSessionStore = struct {
             error.NotFound => {},
             else => return err,
         };
-        const recovery_key = try makeSessionRecoveryKey(self.alloc, txn_id);
+        const recovery_key = try makeSessionRecoveryKeyForKind(self.alloc, txn_id, kind);
         defer self.alloc.free(recovery_key);
         txn.delete(recovery_key) catch |err| switch (err) {
             error.NotFound => {},
@@ -1215,7 +1281,7 @@ pub const DurableSessionStore = struct {
     }
 
     fn setSessionRecoveryIndexTxn(self: *DurableSessionStore, txn: anytype, session: Session) !void {
-        const key = try makeSessionRecoveryKey(self.alloc, session.txn_id);
+        const key = try makeSessionRecoveryKeyForKind(self.alloc, session.txn_id, sessionKind(session));
         defer self.alloc.free(key);
         if (sessionNeedsRecovery(session)) {
             try txn.put(key, &.{});
@@ -1227,8 +1293,8 @@ pub const DurableSessionStore = struct {
         }
     }
 
-    fn clearSessionRecoveryIndexTxn(self: *DurableSessionStore, txn: anytype, txn_id: db_mod.types.TxnId) !void {
-        const key = try makeSessionRecoveryKey(self.alloc, txn_id);
+    fn clearSessionRecoveryIndexTxn(self: *DurableSessionStore, txn: anytype, txn_id: db_mod.types.TxnId, kind: SessionKind) !void {
+        const key = try makeSessionRecoveryKeyForKind(self.alloc, txn_id, kind);
         defer self.alloc.free(key);
         txn.delete(key) catch |err| switch (err) {
             error.NotFound => {},
@@ -1247,29 +1313,32 @@ pub const DurableSessionStore = struct {
     pub fn scanRecoveryIds(
         self: *DurableSessionStore,
         alloc: std.mem.Allocator,
+        kind: SessionKind,
         after: ?db_mod.types.TxnId,
         limit: usize,
     ) !RecoveryIdPage {
         var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         errdefer ids.deinit(alloc);
         if (limit == 0) return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = null };
-        const start_key = if (after) |txn_id| try makeSessionRecoveryKey(alloc, txn_id) else null;
+        const prefix = sessionRecoveryPrefix(kind);
+        const start_key = if (after) |txn_id| try makeSessionRecoveryKeyForKind(alloc, txn_id, kind) else null;
         defer if (start_key) |key| alloc.free(key);
         const Scan = struct {
             allocator: std.mem.Allocator,
+            prefix: []const u8,
             limit: usize,
             ids: *std.ArrayListUnmanaged(db_mod.types.TxnId),
 
             fn visit(raw: *anyopaque, key: []const u8, _: []const u8) anyerror!bool {
                 const scan: *@This() = @ptrCast(@alignCast(raw));
-                if (key.len <= session_recovery_prefix.len) return true;
-                const txn_id = distributed_txn.parseTxnIdHex(key[session_recovery_prefix.len..]) catch return true;
+                if (key.len <= scan.prefix.len) return true;
+                const txn_id = distributed_txn.parseTxnIdHex(key[scan.prefix.len..]) catch return true;
                 try scan.ids.append(scan.allocator, txn_id);
                 return scan.ids.items.len < scan.limit;
             }
         };
-        var scan = Scan{ .allocator = alloc, .limit = limit, .ids = &ids };
-        try self.scanPrefixFromWithContext(session_recovery_prefix, start_key, &scan, Scan.visit);
+        var scan = Scan{ .allocator = alloc, .prefix = prefix, .limit = limit, .ids = &ids };
+        try self.scanPrefixFromWithContext(prefix, start_key, &scan, Scan.visit);
         const next_after = if (ids.items.len == limit) ids.items[ids.items.len - 1] else null;
         return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = next_after };
     }
@@ -1279,16 +1348,20 @@ pub const DurableSessionStore = struct {
     pub fn scanLegacyRecoveryIds(
         self: *DurableSessionStore,
         alloc: std.mem.Allocator,
+        kind: SessionKind,
         after: ?db_mod.types.TxnId,
         scan_limit: usize,
     ) !RecoveryIdPage {
         var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         errdefer ids.deinit(alloc);
         if (scan_limit == 0) return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = null };
-        const start_key = if (after) |txn_id| try makeSessionKey(alloc, txn_id) else null;
+        const prefix = sessionPrefix(kind);
+        const start_key = if (after) |txn_id| try makeSessionKeyForKind(alloc, txn_id, kind) else null;
         defer if (start_key) |key| alloc.free(key);
         const Scan = struct {
             allocator: std.mem.Allocator,
+            kind: SessionKind,
+            prefix: []const u8,
             scan_limit: usize,
             scanned: usize = 0,
             last_txn_id: ?db_mod.types.TxnId = null,
@@ -1296,28 +1369,29 @@ pub const DurableSessionStore = struct {
 
             fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
                 const scan: *@This() = @ptrCast(@alignCast(raw));
-                if (key.len <= session_prefix.len) return true;
-                const txn_id = distributed_txn.parseTxnIdHex(key[session_prefix.len..]) catch return true;
+                if (key.len <= scan.prefix.len) return true;
+                const txn_id = distributed_txn.parseTxnIdHex(key[scan.prefix.len..]) catch return true;
                 scan.scanned += 1;
                 scan.last_txn_id = txn_id;
                 var session = decodeSessionRecord(scan.allocator, txn_id, value) catch return scan.scanned < scan.scan_limit;
                 defer session.deinit(scan.allocator);
+                if (sessionKind(session) != scan.kind) return scan.scanned < scan.scan_limit;
                 if (sessionNeedsRecovery(session)) try scan.ids.append(scan.allocator, txn_id);
                 return scan.scanned < scan.scan_limit;
             }
         };
-        var scan = Scan{ .allocator = alloc, .scan_limit = scan_limit, .ids = &ids };
-        try self.scanPrefixFromWithContext(session_prefix, start_key, &scan, Scan.visit);
+        var scan = Scan{ .allocator = alloc, .kind = kind, .prefix = prefix, .scan_limit = scan_limit, .ids = &ids };
+        try self.scanPrefixFromWithContext(prefix, start_key, &scan, Scan.visit);
         const next_after = if (scan.scanned == scan_limit) scan.last_txn_id else null;
         return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = next_after };
     }
 
     /// Rechecks the current durable row under a write transaction before
     /// backfilling its index entry, avoiding stale audit results.
-    pub fn refreshRecoveryIndex(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !void {
-        const session_key = try makeSessionKey(self.alloc, txn_id);
+    pub fn refreshRecoveryIndex(self: *DurableSessionStore, txn_id: db_mod.types.TxnId, kind: SessionKind) !void {
+        const session_key = try makeSessionKeyForKind(self.alloc, txn_id, kind);
         defer self.alloc.free(session_key);
-        const recovery_key = try makeSessionRecoveryKey(self.alloc, txn_id);
+        const recovery_key = try makeSessionRecoveryKeyForKind(self.alloc, txn_id, kind);
         defer self.alloc.free(recovery_key);
         switch (self.backend) {
             .docstore => |store| {
@@ -1329,6 +1403,7 @@ pub const DurableSessionStore = struct {
                 }) |raw| {
                     var session = try decodeSessionRecord(self.alloc, txn_id, raw);
                     defer session.deinit(self.alloc);
+                    if (sessionKind(session) != kind) return error.InvalidTransactionSessionRecord;
                     try self.setSessionRecoveryIndexTxn(&txn, session);
                 } else {
                     txn.delete(recovery_key) catch |err| switch (err) {
@@ -1347,6 +1422,7 @@ pub const DurableSessionStore = struct {
                 }) |raw| {
                     var session = try decodeSessionRecord(self.alloc, txn_id, raw);
                     defer session.deinit(self.alloc);
+                    if (sessionKind(session) != kind) return error.InvalidTransactionSessionRecord;
                     try self.setSessionRecoveryIndexTxn(&txn, session);
                 } else {
                     txn.delete(recovery_key) catch |err| switch (err) {
@@ -1369,6 +1445,7 @@ pub const DurableSessionStore = struct {
     pub fn scanExpiredIds(
         self: *DurableSessionStore,
         alloc: std.mem.Allocator,
+        kind: SessionKind,
         cutoff_ns: u64,
         after: ?SessionExpiryCursor,
         limit: usize,
@@ -1376,25 +1453,27 @@ pub const DurableSessionStore = struct {
         var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         errdefer ids.deinit(alloc);
         if (limit == 0) return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = null };
-        const start_key = if (after) |cursor| try makeSessionExpiryKey(alloc, cursor.timestamp, cursor.txn_id) else null;
+        const prefix = sessionExpiryPrefix(kind);
+        const start_key = if (after) |cursor| try makeSessionExpiryKeyForKind(alloc, cursor.timestamp, cursor.txn_id, kind) else null;
         defer if (start_key) |key| alloc.free(key);
         const Scan = struct {
             allocator: std.mem.Allocator,
+            kind: SessionKind,
             cutoff: u64,
             limit: usize,
             ids: *std.ArrayListUnmanaged(db_mod.types.TxnId),
             last: ?SessionExpiryCursor = null,
             fn visit(raw: *anyopaque, key: []const u8, _: []const u8) anyerror!bool {
                 const scan: *@This() = @ptrCast(@alignCast(raw));
-                const parsed = parseSessionExpiryKey(key) orelse return true;
+                const parsed = parseSessionExpiryKey(key, scan.kind) orelse return true;
                 if (parsed.timestamp >= scan.cutoff or scan.ids.items.len >= scan.limit) return false;
                 try scan.ids.append(scan.allocator, parsed.txn_id);
                 scan.last = parsed;
                 return scan.ids.items.len < scan.limit;
             }
         };
-        var scan = Scan{ .allocator = alloc, .cutoff = cutoff_ns, .limit = limit, .ids = &ids };
-        try self.scanPrefixFromWithContext(session_expiry_prefix, start_key, &scan, Scan.visit);
+        var scan = Scan{ .allocator = alloc, .kind = kind, .cutoff = cutoff_ns, .limit = limit, .ids = &ids };
+        try self.scanPrefixFromWithContext(prefix, start_key, &scan, Scan.visit);
         const next_after = if (ids.items.len == limit) scan.last else null;
         return .{
             .ids = try ids.toOwnedSlice(alloc),
@@ -1456,15 +1535,19 @@ pub const DurableSessionStore = struct {
             .docstore => |store| blk: {
                 const Counter = struct {
                     count: usize = 0,
+                    prefix: []const u8 = "",
                     fn visit(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
                         const counter: *@This() = @ptrCast(@alignCast(ctx.?));
-                        if (!std.mem.startsWith(u8, key, session_prefix)) return .stop;
+                        if (!std.mem.startsWith(u8, key, counter.prefix)) return .stop;
                         counter.count += 1;
                         return .@"continue";
                     }
                 };
                 var counter = Counter{};
-                try store.scanWithContext(session_prefix, &.{}, .{}, &counter, Counter.visit);
+                for ([_]SessionKind{ .interactive, .idempotent_receipt }) |kind| {
+                    counter.prefix = sessionPrefix(kind);
+                    try store.scanWithContext(sessionPrefix(kind), &.{}, .{}, &counter, Counter.visit);
+                }
                 break :blk counter.count;
             },
             .runtime => |store| blk: {
@@ -1473,10 +1556,13 @@ pub const DurableSessionStore = struct {
                 var cursor = try txn.openCursor();
                 defer cursor.close();
                 var count: usize = 0;
-                var entry = try cursor.seekAtOrAfter(session_prefix);
-                while (entry) |row| : (entry = try cursor.next()) {
-                    if (!std.mem.startsWith(u8, row.key, session_prefix)) break;
-                    count += 1;
+                for ([_]SessionKind{ .interactive, .idempotent_receipt }) |kind| {
+                    const prefix = sessionPrefix(kind);
+                    var entry = try cursor.seekAtOrAfter(prefix);
+                    while (entry) |row| : (entry = try cursor.next()) {
+                        if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                        count += 1;
+                    }
                 }
                 break :blk count;
             },
@@ -1558,7 +1644,12 @@ pub const SessionLeaseStore = struct {
     }
 
     pub fn load(self: *const SessionLeaseStore, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?lease_mod.LeaseRecord {
-        const key = try makeSessionLeaseKey(self.alloc, txn_id);
+        if (try self.loadForKind(alloc, txn_id, .idempotent_receipt)) |record| return record;
+        return try self.loadForKind(alloc, txn_id, .interactive);
+    }
+
+    fn loadForKind(self: *const SessionLeaseStore, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, kind: SessionKind) !?lease_mod.LeaseRecord {
+        const key = try makeSessionLeaseKeyForKind(self.alloc, txn_id, kind);
         defer self.alloc.free(key);
         var lease = switch (self.backend) {
             .docstore => |store| try lease_mod.Lease.init(self.alloc, store, key),
@@ -1568,30 +1659,33 @@ pub const SessionLeaseStore = struct {
         return try lease.load(alloc);
     }
 
-    pub fn renew(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, owner_node_id: u64, owner_incarnation: u64, now_ms: u64, ttl_ms: u64) !bool {
-        const key = try makeSessionLeaseKey(self.alloc, txn_id);
+    pub fn renew(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, kind: SessionKind, owner_node_id: u64, owner_incarnation: u64, now_ms: u64, ttl_ms: u64) !bool {
+        const owner_id = try ownerLeaseId(self.alloc, owner_node_id, owner_incarnation);
+        defer self.alloc.free(owner_id);
+        const key = try makeSessionLeaseKeyForKind(self.alloc, txn_id, kind);
         defer self.alloc.free(key);
         var lease = switch (self.backend) {
             .docstore => |store| try lease_mod.Lease.init(self.alloc, store, key),
             .runtime => |store| try lease_mod.Lease.init(self.alloc, store, key),
         };
         defer lease.deinit();
-        const owner_id = try ownerLeaseId(self.alloc, owner_node_id, owner_incarnation);
-        defer self.alloc.free(owner_id);
         return try lease.renew(owner_id, now_ms, ttl_ms);
     }
 
     pub fn release(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, owner_node_id: u64, owner_incarnation: u64) !bool {
-        const key = try makeSessionLeaseKey(self.alloc, txn_id);
-        defer self.alloc.free(key);
-        var lease = switch (self.backend) {
-            .docstore => |store| try lease_mod.Lease.init(self.alloc, store, key),
-            .runtime => |store| try lease_mod.Lease.init(self.alloc, store, key),
-        };
-        defer lease.deinit();
         const owner_id = try ownerLeaseId(self.alloc, owner_node_id, owner_incarnation);
         defer self.alloc.free(owner_id);
-        return try lease.release(owner_id);
+        for ([_]SessionKind{ .idempotent_receipt, .interactive }) |kind| {
+            const key = try makeSessionLeaseKeyForKind(self.alloc, txn_id, kind);
+            defer self.alloc.free(key);
+            var lease = switch (self.backend) {
+                .docstore => |store| try lease_mod.Lease.init(self.alloc, store, key),
+                .runtime => |store| try lease_mod.Lease.init(self.alloc, store, key),
+            };
+            defer lease.deinit();
+            if (try lease.release(owner_id)) return true;
+        }
+        return false;
     }
 };
 
@@ -1611,9 +1705,11 @@ pub const SessionRegistry = struct {
     owner_incarnation: u64 = 0,
     known_durable_session_count: ?usize = null,
     reserved_session_count: usize = 0,
-    recovery_index_cursor: ?db_mod.types.TxnId = null,
-    recovery_audit_cursor: ?db_mod.types.TxnId = null,
-    expiry_cleanup_cursor: ?SessionExpiryCursor = null,
+    recovery_index_cursors: [2]?db_mod.types.TxnId = .{ null, null },
+    recovery_audit_cursors: [2]?db_mod.types.TxnId = .{ null, null },
+    recovery_namespace_cursor: SessionKind = .interactive,
+    expiry_cleanup_cursors: [2]?SessionExpiryCursor = .{ null, null },
+    expiry_namespace_cursor: SessionKind = .interactive,
     memory_recovery_scan_offset: usize = 0,
 
     pub fn init(durable: ?*DurableSessionStore) SessionRegistry {
@@ -2063,11 +2159,54 @@ pub const SessionRegistry = struct {
         );
     }
 
-    pub fn recordIdempotentOutcome(
+    pub const PreExecutionRejectionResult = enum {
+        recorded,
+        execution_started,
+        terminal,
+    };
+
+    /// Atomically terminalizes a keyed request only while it is still before
+    /// the durable execution boundary. A concurrent replay that observes a
+    /// started or terminal request must reconcile that state instead of
+    /// publishing a false non-application receipt.
+    pub fn recordIdempotentPreExecutionRejection(
         self: *SessionRegistry,
         alloc: std.mem.Allocator,
         txn_id: db_mod.types.TxnId,
-        outcome: IdempotentReceiptOutcome,
+    ) !?PreExecutionRejectionResult {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        errdefer candidate.deinit(alloc);
+        if (!candidate.idempotent_receipt) return error.SessionKindMismatch;
+        if (candidate.terminal_commit != null or candidate.idempotent_outcome != null) {
+            candidate.deinit(alloc);
+            return .terminal;
+        }
+        if (candidate.commit_execution_started) {
+            candidate.deinit(alloc);
+            return .execution_started;
+        }
+        candidate.idempotent_outcome = .not_applied;
+        touchSession(&candidate);
+        try self.persistOwnedLocked(candidate);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        return .recorded;
+    }
+
+    /// Persists the only non-commit terminal outcome permitted after execution
+    /// starts. The caller must already hold durable coordinator evidence that
+    /// the transaction chose abort.
+    pub fn recordIdempotentDurableAbort(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
     ) !?void {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
@@ -2075,13 +2214,15 @@ pub const SessionRegistry = struct {
 
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
+        if (!candidate.idempotent_receipt) return error.SessionKindMismatch;
+        if (!candidate.commit_execution_started) return error.TransactionExecutionNotStarted;
         if (candidate.terminal_commit != null) return error.TransactionOutcomeMismatch;
         if (candidate.idempotent_outcome) |existing| {
-            if (existing != outcome) return error.TransactionOutcomeMismatch;
+            if (existing != .aborted) return error.TransactionOutcomeMismatch;
             candidate.deinit(alloc);
             return {};
         }
-        candidate.idempotent_outcome = outcome;
+        candidate.idempotent_outcome = .aborted;
         touchSession(&candidate);
         try self.persistOwnedLocked(candidate);
 
@@ -2155,6 +2296,7 @@ pub const SessionRegistry = struct {
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest == null or candidate.staged == null) return error.InvalidTransactionSessionRecord;
+        if (candidate.idempotent_outcome != null) return error.TransactionOutcomeMismatch;
         if (candidate.commit_execution_started) {
             candidate.deinit(alloc);
             return {};
@@ -2237,35 +2379,49 @@ pub const SessionRegistry = struct {
 
         if (self.durable) |durable| {
             self.mutex.lock();
-            const index_after = self.recovery_index_cursor;
-            const audit_after = self.recovery_audit_cursor;
+            const index_after = self.recovery_index_cursors;
+            const audit_after = self.recovery_audit_cursors;
+            const first_kind = self.recovery_namespace_cursor;
             self.mutex.unlock();
 
-            const indexed = try durable.scanRecoveryIds(alloc, index_after, limit);
-            defer alloc.free(indexed.ids);
-            try pending.appendSlice(alloc, indexed.ids);
-
-            // Continuously audit a small bounded page. This backfills records
-            // written by a previous binary and self-heals a missing index key.
-            const audit_budget = @min(limit, 8);
-            const audited = try durable.scanLegacyRecoveryIds(alloc, audit_after, audit_budget);
-            defer alloc.free(audited.ids);
-            for (audited.ids) |txn_id| {
-                try durable.refreshRecoveryIndex(txn_id);
-                if (pending.items.len >= limit) continue;
-                var duplicate = false;
-                for (pending.items) |existing| {
-                    if (std.mem.eql(u8, &existing, &txn_id)) {
-                        duplicate = true;
-                        break;
-                    }
+            var next_index_after = index_after;
+            var next_audit_after = audit_after;
+            var kind = first_kind;
+            for (0..2) |_| {
+                const kind_index = sessionKindIndex(kind);
+                if (pending.items.len < limit) {
+                    const indexed = try durable.scanRecoveryIds(alloc, kind, index_after[kind_index], limit - pending.items.len);
+                    defer alloc.free(indexed.ids);
+                    try pending.appendSlice(alloc, indexed.ids);
+                    next_index_after[kind_index] = indexed.next_after;
                 }
-                if (!duplicate) try pending.append(alloc, txn_id);
+
+                // Continuously audit a small bounded page per namespace. This
+                // backfills records written before the compact index and
+                // self-heals a missing index key even while the index is full.
+                const audit_budget = @min(limit, 8);
+                const audited = try durable.scanLegacyRecoveryIds(alloc, kind, audit_after[kind_index], audit_budget);
+                defer alloc.free(audited.ids);
+                next_audit_after[kind_index] = audited.next_after;
+                for (audited.ids) |txn_id| {
+                    try durable.refreshRecoveryIndex(txn_id, kind);
+                    if (pending.items.len >= limit) continue;
+                    var duplicate = false;
+                    for (pending.items) |existing| {
+                        if (std.mem.eql(u8, &existing, &txn_id)) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) try pending.append(alloc, txn_id);
+                }
+                kind = nextSessionKind(kind);
             }
 
             self.mutex.lock();
-            self.recovery_index_cursor = indexed.next_after;
-            self.recovery_audit_cursor = audited.next_after;
+            self.recovery_index_cursors = next_index_after;
+            self.recovery_audit_cursors = next_audit_after;
+            self.recovery_namespace_cursor = nextSessionKind(first_kind);
             self.mutex.unlock();
         } else {
             self.mutex.lock();
@@ -2515,13 +2671,16 @@ pub const SessionRegistry = struct {
                 allocator: std.mem.Allocator,
                 statuses: *std.ArrayListUnmanaged(SessionStatus),
                 principal_filter: StatusPrincipalFilter,
+                kind: SessionKind = .interactive,
+                prefix: []const u8 = session_prefix,
 
                 fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
                     const scan: *@This() = @ptrCast(@alignCast(raw));
-                    if (key.len <= session_prefix.len) return true;
-                    const txn_id = distributed_txn.parseTxnIdHex(key[session_prefix.len..]) catch return true;
+                    if (key.len <= scan.prefix.len) return true;
+                    const txn_id = distributed_txn.parseTxnIdHex(key[scan.prefix.len..]) catch return true;
                     var session = decodeSessionRecord(scan.allocator, txn_id, value) catch return true;
                     defer session.deinit(scan.allocator);
+                    if (sessionKind(session) != scan.kind) return true;
                     switch (scan.principal_filter) {
                         .all => {},
                         .principal => |principal| if (!principalsEqual(session.principal, principal)) return true,
@@ -2541,7 +2700,11 @@ pub const SessionRegistry = struct {
                 .statuses = &statuses,
                 .principal_filter = principal_filter,
             };
-            try durable.scanPrefixWithContext(session_prefix, &scan, Scan.visit);
+            for ([_]SessionKind{ .interactive, .idempotent_receipt }) |kind| {
+                scan.kind = kind;
+                scan.prefix = sessionPrefix(kind);
+                try durable.scanPrefixWithContext(scan.prefix, &scan, Scan.visit);
+            }
             // Avoid nested backend reads by loading lease metadata only after
             // the scan transaction has closed.
             for (statuses.items) |*status| status.lease_expires_at = try self.loadLeaseExpiryLocked(alloc, status.txn_id);
@@ -2673,13 +2836,24 @@ pub const SessionRegistry = struct {
         defer expired_ids.deinit(alloc);
         if (self.durable) |durable| {
             self.mutex.lock();
-            const cleanup_after = self.expiry_cleanup_cursor;
+            const cleanup_after = self.expiry_cleanup_cursors;
+            const first_kind = self.expiry_namespace_cursor;
             self.mutex.unlock();
-            const indexed = try durable.scanExpiredIds(alloc, cutoff_ns, cleanup_after, scan_limit);
-            defer alloc.free(indexed.ids);
-            try expired_ids.appendSlice(alloc, indexed.ids);
+            var next_cleanup_after = cleanup_after;
+            var kind = first_kind;
+            for (0..2) |_| {
+                if (expired_ids.items.len < scan_limit) {
+                    const kind_index = sessionKindIndex(kind);
+                    const indexed = try durable.scanExpiredIds(alloc, kind, cutoff_ns, cleanup_after[kind_index], scan_limit - expired_ids.items.len);
+                    defer alloc.free(indexed.ids);
+                    try expired_ids.appendSlice(alloc, indexed.ids);
+                    next_cleanup_after[kind_index] = indexed.next_after;
+                }
+                kind = nextSessionKind(kind);
+            }
             self.mutex.lock();
-            self.expiry_cleanup_cursor = indexed.next_after;
+            self.expiry_cleanup_cursors = next_cleanup_after;
+            self.expiry_namespace_cursor = nextSessionKind(first_kind);
             self.mutex.unlock();
         } else {
             self.mutex.lock();
@@ -2982,8 +3156,12 @@ pub const SessionRegistry = struct {
     }
 
     pub fn renewOwnedLeases(self: *SessionRegistry, owner_node_id: u64, now_ns: u64) !usize {
-        var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
-        defer ids.deinit(self.durable.?.alloc);
+        const Renewal = struct {
+            txn_id: db_mod.types.TxnId,
+            kind: SessionKind,
+        };
+        var renewals = std.ArrayListUnmanaged(Renewal).empty;
+        defer renewals.deinit(self.durable.?.alloc);
         self.mutex.lock();
         if (self.lease_store == null or self.owner_lease_ttl_ns == null or self.durable == null) {
             self.mutex.unlock();
@@ -2993,7 +3171,10 @@ pub const SessionRegistry = struct {
         while (it.next()) |entry| {
             if (entry.value_ptr.owner_node_id != owner_node_id or
                 entry.value_ptr.owner_incarnation != self.owner_incarnation) continue;
-            ids.append(self.durable.?.alloc, entry.key_ptr.*) catch |err| {
+            renewals.append(self.durable.?.alloc, .{
+                .txn_id = entry.key_ptr.*,
+                .kind = sessionKind(entry.value_ptr.*),
+            }) catch |err| {
                 self.mutex.unlock();
                 return err;
             };
@@ -3001,19 +3182,20 @@ pub const SessionRegistry = struct {
         self.mutex.unlock();
 
         var renewed: usize = 0;
-        for (ids.items) |txn_id| {
-            const session_lock = self.sessionLock(txn_id);
+        for (renewals.items) |renewal| {
+            const session_lock = self.sessionLock(renewal.txn_id);
             session_lock.lock();
             defer session_lock.unlock();
             self.mutex.lock();
-            const incarnation = if (self.sessions.getPtr(txn_id)) |session| blk: {
+            const incarnation = if (self.sessions.getPtr(renewal.txn_id)) |session| blk: {
                 if (session.owner_node_id != owner_node_id or
-                    session.owner_incarnation != self.owner_incarnation) break :blk null;
+                    session.owner_incarnation != self.owner_incarnation or
+                    sessionKind(session.*) != renewal.kind) break :blk null;
                 break :blk session.owner_incarnation;
             } else null;
             self.mutex.unlock();
             if (incarnation == null) continue;
-            try self.renewLeaseLockedAt(txn_id, owner_node_id, incarnation.?, now_ns);
+            try self.renewLeaseLockedAt(renewal.txn_id, renewal.kind, owner_node_id, incarnation.?, now_ns);
             renewed += 1;
         }
         return renewed;
@@ -3031,16 +3213,21 @@ pub const SessionRegistry = struct {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
-        try self.renewLeaseLockedAt(txn_id, owner_node_id, self.owner_incarnation, now_ns);
+        const durable = self.durable orelse return;
+        var session = (try self.loadSessionCloneAssumeStripe(durable.alloc, txn_id)) orelse return error.SessionLeaseLost;
+        defer session.deinit(durable.alloc);
+        if (session.owner_node_id != owner_node_id or session.owner_incarnation != self.owner_incarnation)
+            return error.SessionLeaseLost;
+        try self.renewLeaseLockedAt(txn_id, sessionKind(session), owner_node_id, self.owner_incarnation, now_ns);
     }
 
-    fn renewLeaseLockedAt(self: *SessionRegistry, txn_id: db_mod.types.TxnId, owner_node_id: u64, owner_incarnation: u64, now_ns: u64) !void {
+    fn renewLeaseLockedAt(self: *SessionRegistry, txn_id: db_mod.types.TxnId, kind: SessionKind, owner_node_id: u64, owner_incarnation: u64, now_ns: u64) !void {
         const lease_store = self.lease_store orelse return;
         const ttl_ns = self.owner_lease_ttl_ns orelse return;
         const now_ms = now_ns / std.time.ns_per_ms;
         const ttl_ms = sessionLeaseStorageTtlMs(ttl_ns);
         if (owner_incarnation != self.owner_incarnation) return error.SessionLeaseLost;
-        if (!(try lease_store.renew(txn_id, owner_node_id, owner_incarnation, now_ms, ttl_ms))) return error.SessionLeaseLost;
+        if (!(try lease_store.renew(txn_id, kind, owner_node_id, owner_incarnation, now_ms, ttl_ms))) return error.SessionLeaseLost;
     }
 
     fn loadLeaseExpiryLocked(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !u64 {
@@ -4657,23 +4844,85 @@ fn sessionSavepointIds(alloc: std.mem.Allocator, session: *const Session) ![]u64
 }
 
 fn makeSessionKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) ![]u8 {
+    return try makeSessionKeyForKind(alloc, txn_id, .interactive);
+}
+
+fn makeSessionKeyForKind(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, kind: SessionKind) ![]u8 {
     const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
-    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ session_prefix, &txn_hex });
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ sessionPrefix(kind), &txn_hex });
 }
 
 fn makeSessionLeaseKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) ![]u8 {
+    return try makeSessionLeaseKeyForKind(alloc, txn_id, .interactive);
+}
+
+fn makeSessionLeaseKeyForKind(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, kind: SessionKind) ![]u8 {
     const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
-    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ session_lease_prefix, &txn_hex });
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ sessionLeasePrefix(kind), &txn_hex });
 }
 
 fn makeSessionExpiryKey(alloc: std.mem.Allocator, timestamp: u64, txn_id: db_mod.types.TxnId) ![]u8 {
+    return try makeSessionExpiryKeyForKind(alloc, timestamp, txn_id, .interactive);
+}
+
+fn makeSessionExpiryKeyForKind(alloc: std.mem.Allocator, timestamp: u64, txn_id: db_mod.types.TxnId, kind: SessionKind) ![]u8 {
     const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
-    return try std.fmt.allocPrint(alloc, "{s}{x:0>16}:{s}", .{ session_expiry_prefix, timestamp, &txn_hex });
+    return try std.fmt.allocPrint(alloc, "{s}{x:0>16}:{s}", .{ sessionExpiryPrefix(kind), timestamp, &txn_hex });
 }
 
 fn makeSessionRecoveryKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) ![]u8 {
+    return try makeSessionRecoveryKeyForKind(alloc, txn_id, .interactive);
+}
+
+fn makeSessionRecoveryKeyForKind(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, kind: SessionKind) ![]u8 {
     const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
-    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ session_recovery_prefix, &txn_hex });
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ sessionRecoveryPrefix(kind), &txn_hex });
+}
+
+fn sessionKind(session: Session) SessionKind {
+    return if (session.idempotent_receipt) .idempotent_receipt else .interactive;
+}
+
+fn sessionKindIndex(kind: SessionKind) usize {
+    return switch (kind) {
+        .interactive => 0,
+        .idempotent_receipt => 1,
+    };
+}
+
+fn nextSessionKind(kind: SessionKind) SessionKind {
+    return switch (kind) {
+        .interactive => .idempotent_receipt,
+        .idempotent_receipt => .interactive,
+    };
+}
+
+fn sessionPrefix(kind: SessionKind) []const u8 {
+    return switch (kind) {
+        .interactive => session_prefix,
+        .idempotent_receipt => receipt_session_prefix,
+    };
+}
+
+fn sessionLeasePrefix(kind: SessionKind) []const u8 {
+    return switch (kind) {
+        .interactive => session_lease_prefix,
+        .idempotent_receipt => receipt_lease_prefix,
+    };
+}
+
+fn sessionExpiryPrefix(kind: SessionKind) []const u8 {
+    return switch (kind) {
+        .interactive => session_expiry_prefix,
+        .idempotent_receipt => receipt_expiry_prefix,
+    };
+}
+
+fn sessionRecoveryPrefix(kind: SessionKind) []const u8 {
+    return switch (kind) {
+        .interactive => session_recovery_prefix,
+        .idempotent_receipt => receipt_recovery_prefix,
+    };
 }
 
 fn sessionNeedsRecovery(session: Session) bool {
@@ -4704,9 +4953,10 @@ fn sessionRetentionPinned(session: Session) bool {
     return session.commit_body_digest != null and session.commit_execution_started;
 }
 
-fn parseSessionExpiryKey(key: []const u8) ?SessionExpiryCursor {
-    if (!std.mem.startsWith(u8, key, session_expiry_prefix)) return null;
-    const suffix = key[session_expiry_prefix.len..];
+fn parseSessionExpiryKey(key: []const u8, kind: SessionKind) ?SessionExpiryCursor {
+    const prefix = sessionExpiryPrefix(kind);
+    if (!std.mem.startsWith(u8, key, prefix)) return null;
+    const suffix = key[prefix.len..];
     if (suffix.len < 18 or suffix[16] != ':') return null;
     return .{
         .timestamp = std.fmt.parseUnsigned(u64, suffix[0..16], 16) catch return null,
@@ -5621,6 +5871,21 @@ test "shared session mutations and cleanup reject an adopted owner incarnation" 
         error.SessionLeaseLost,
         owner.cloneIdempotentCommitRequest(alloc, txn_id, &request),
     );
+
+    // Interactive abort uses the same incarnation fence. A stale HTTP owner
+    // must surface lease loss instead of reporting success or deleting the
+    // adopter's record.
+    const interactive = try owner.begin(alloc, .{ .sync_level = .write }, 7);
+    var interactive_lease = (try leases.load(alloc, interactive.txn_id)).?;
+    defer lease_mod.deinitRecord(alloc, &interactive_lease);
+    try std.testing.expect(try adopter.adoptIfLeaseExpired(
+        alloc,
+        interactive.txn_id,
+        7,
+        interactive_lease.expires_at_ms * std.time.ns_per_ms + 1,
+    ));
+    try std.testing.expectError(error.SessionLeaseLost, owner.abortInteractive(alloc, interactive.txn_id));
+
     try std.testing.expectEqual(@as(usize, 0), try owner.cleanupExpired(alloc, std.math.maxInt(u64)));
     var persisted = (try durable.load(txn_id)).?;
     try std.testing.expectEqual(adopter.owner_incarnation, persisted.owner_incarnation);
@@ -6329,7 +6594,7 @@ test "idempotent batch identities are scoped and session bodies are sealed" {
     var recovery = (try registry.claimPendingRecovery(alloc, alice_docs, 7, nextTxnTimestamp())).?;
     defer recovery.deinit(alloc);
     try std.testing.expect(recovery.commit.idempotent_receipt);
-    _ = (try registry.recordIdempotentOutcome(alloc, alice_docs, .aborted)).?;
+    _ = (try registry.recordIdempotentDurableAbort(alloc, alice_docs)).?;
     const status = (try registry.getStatus(alloc, alice_docs)).?;
     try std.testing.expectEqualStrings("aborted", status.outcome.?);
 
@@ -6444,12 +6709,12 @@ test "retention never removes an idempotent receipt with live recovery" {
     var retained = (try durable.load(txn_id)).?;
     retained.deinit(alloc);
 
-    _ = (try registry.recordIdempotentOutcome(alloc, txn_id, .aborted)).?;
+    _ = (try registry.recordIdempotentDurableAbort(alloc, txn_id)).?;
     try std.testing.expectEqual(@as(usize, 1), try registry.cleanupExpired(alloc, std.math.maxInt(u64)));
     try std.testing.expect((try durable.load(txn_id)) == null);
 }
 
-test "retention scan rotates past pinned recovery receipts" {
+test "isolated retention namespaces cannot starve completed sessions" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6473,16 +6738,133 @@ test "retention scan rotates past pinned recovery receipts" {
     const completed = try registry.begin(alloc, .{ .sync_level = .write }, 7);
 
     try std.testing.expectEqual(
-        @as(usize, 0),
+        @as(usize, 1),
         try registry.cleanupExpiredAtLimit(alloc, std.math.maxInt(u64), std.math.maxInt(u64), 1),
     );
     try std.testing.expectEqual(
-        @as(usize, 1),
+        @as(usize, 0),
         try registry.cleanupExpiredAtLimit(alloc, std.math.maxInt(u64), std.math.maxInt(u64), 1),
     );
     try std.testing.expect((try durable.load(completed.txn_id)) == null);
     var pinned = (try durable.load(pinned_id)).?;
     pinned.deinit(alloc);
+}
+
+test "idempotent receipt transitions serialize rejection against execution start" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/idempotent-receipt-transition", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    var registry = SessionRegistry.init(&durable);
+    defer registry.deinit(alloc);
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}},"sync_level":"write"}
+    );
+    defer request.deinit(alloc);
+
+    const rejected_id = idempotentTransactionId("alice", "docs", "rejection-wins");
+    _ = try registry.beginIdempotentForPrincipal(alloc, rejected_id, .{ .sync_level = .write }, 7, "alice", &request);
+    try std.testing.expectError(error.TransactionExecutionNotStarted, registry.recordIdempotentDurableAbort(alloc, rejected_id));
+    try std.testing.expectEqual(
+        SessionRegistry.PreExecutionRejectionResult.recorded,
+        (try registry.recordIdempotentPreExecutionRejection(alloc, rejected_id)).?,
+    );
+    try std.testing.expectError(error.TransactionOutcomeMismatch, registry.markCommitExecutionStarted(alloc, rejected_id));
+    try std.testing.expectEqual(IdempotentReceiptOutcome.not_applied, (try registry.getIdempotentOutcome(alloc, rejected_id)).?);
+
+    const started_id = idempotentTransactionId("alice", "docs", "execution-wins");
+    _ = try registry.beginIdempotentForPrincipal(alloc, started_id, .{ .sync_level = .write }, 7, "alice", &request);
+    _ = (try registry.markCommitExecutionStarted(alloc, started_id)).?;
+    try std.testing.expectEqual(
+        SessionRegistry.PreExecutionRejectionResult.execution_started,
+        (try registry.recordIdempotentPreExecutionRejection(alloc, started_id)).?,
+    );
+    try std.testing.expect((try registry.getIdempotentOutcome(alloc, started_id)) == null);
+    _ = (try registry.recordIdempotentDurableAbort(alloc, started_id)).?;
+    try std.testing.expectEqual(IdempotentReceiptOutcome.aborted, (try registry.getIdempotentOutcome(alloc, started_id)).?);
+}
+
+test "versioned idempotent receipt storage is invisible to legacy session scans" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/idempotent-receipt-versioned-namespace", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    const lease_store = SessionLeaseStore.init(alloc, &store);
+    var registry = SessionRegistry.initWithOptions(&durable, lease_store, std.time.ns_per_s, null, 1, null);
+    registry.durable_scope = .cluster_shared;
+    defer registry.deinit(alloc);
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}},"sync_level":"write"}
+    );
+    defer request.deinit(alloc);
+    const txn_id = idempotentTransactionId("alice", "docs", "versioned-storage");
+    _ = try registry.beginIdempotentForPrincipal(alloc, txn_id, .{ .sync_level = .write }, 7, "alice", &request);
+    _ = (try registry.markCommitExecutionStarted(alloc, txn_id)).?;
+
+    const legacy_key = try makeSessionKey(alloc, txn_id);
+    defer alloc.free(legacy_key);
+    const legacy_value = store.get(alloc, legacy_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (legacy_value) |value| alloc.free(value);
+    try std.testing.expect(legacy_value == null);
+
+    const receipt_key = try makeSessionKeyForKind(alloc, txn_id, .idempotent_receipt);
+    defer alloc.free(receipt_key);
+    const receipt_value = try store.get(alloc, receipt_key);
+    defer alloc.free(receipt_value);
+    try std.testing.expect(receipt_value.len > 0);
+
+    const legacy_lease_key = try makeSessionLeaseKey(alloc, txn_id);
+    defer alloc.free(legacy_lease_key);
+    const legacy_lease_value = store.get(alloc, legacy_lease_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (legacy_lease_value) |value| alloc.free(value);
+    try std.testing.expect(legacy_lease_value == null);
+    const receipt_lease_key = try makeSessionLeaseKeyForKind(alloc, txn_id, .idempotent_receipt);
+    defer alloc.free(receipt_lease_key);
+    const receipt_lease_value = try store.get(alloc, receipt_lease_key);
+    defer alloc.free(receipt_lease_value);
+    try std.testing.expect(receipt_lease_value.len > 0);
+    try std.testing.expectEqual(@as(usize, 1), try registry.renewOwnedLeases(7, nextTxnTimestamp()));
+    const legacy_lease_after_renew = store.get(alloc, legacy_lease_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (legacy_lease_after_renew) |value| alloc.free(value);
+    try std.testing.expect(legacy_lease_after_renew == null);
+
+    const legacy_recovery = try durable.scanRecoveryIds(alloc, .interactive, null, 8);
+    defer alloc.free(legacy_recovery.ids);
+    try std.testing.expectEqual(@as(usize, 0), legacy_recovery.ids.len);
+    const receipt_recovery = try durable.scanRecoveryIds(alloc, .idempotent_receipt, null, 8);
+    defer alloc.free(receipt_recovery.ids);
+    try std.testing.expectEqual(@as(usize, 1), receipt_recovery.ids.len);
+    try std.testing.expectEqualSlices(u8, &txn_id, &receipt_recovery.ids[0]);
+    const legacy_expiry = try durable.scanExpiredIds(alloc, .interactive, std.math.maxInt(u64), null, 8);
+    defer alloc.free(legacy_expiry.ids);
+    try std.testing.expectEqual(@as(usize, 0), legacy_expiry.ids.len);
+    const receipt_expiry = try durable.scanExpiredIds(alloc, .idempotent_receipt, std.math.maxInt(u64), null, 8);
+    defer alloc.free(receipt_expiry.ids);
+    try std.testing.expectEqual(@as(usize, 1), receipt_expiry.ids.len);
+    try std.testing.expectEqualSlices(u8, &txn_id, &receipt_expiry.ids[0]);
+    try std.testing.expectEqual(@as(usize, 1), try durable.sessionCount());
+    try std.testing.expectError(error.SessionLimitExceeded, registry.begin(alloc, .{ .sync_level = .write }, 7));
 }
 
 test "session lease storage duration covers nanosecond to millisecond rounding" {

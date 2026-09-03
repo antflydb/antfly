@@ -3634,16 +3634,14 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         txn_id: db_mod.types.TxnId,
         idempotent_receipt: bool,
-        outcome: transactions_api.IdempotentReceiptOutcome,
     ) void {
         if (!idempotent_receipt) {
             _ = self.txn_sessions.removeInteractiveAfterDecision(self.alloc, txn_id);
             return;
         }
-        _ = (self.txn_sessions.recordIdempotentOutcome(
+        _ = (self.txn_sessions.recordIdempotentDurableAbort(
             self.alloc,
             txn_id,
-            outcome,
         ) catch |err| {
             std.log.warn("stable idempotent batch rejection persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
             return;
@@ -3825,7 +3823,8 @@ pub const ApiHttpServer = struct {
                     },
                     else => {
                         if (transactions_api.durableAbortOutcomeForExecutionError(err)) |abort_outcome| {
-                            self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt, abort_outcome);
+                            std.debug.assert(abort_outcome == .aborted);
+                            self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt);
                             return;
                         }
                         std.log.warn("stable transaction commit recovery deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
@@ -3836,7 +3835,7 @@ pub const ApiHttpServer = struct {
                     .conflict => {
                         // A replayed transaction ID can only conflict when
                         // the coordinator durably chose abort.
-                        self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt, .aborted);
+                        self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt);
                     },
                     .committed => |committed| {
                         const repair_required = commit.repair_required or committed.visibility_repair_required;

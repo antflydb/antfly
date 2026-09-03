@@ -3957,7 +3957,13 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        switch (try self.api_server.txn_sessions.abortInteractive(self.api_server.alloc, txn_id)) {
+        switch (self.api_server.txn_sessions.abortInteractive(self.api_server.alloc, txn_id) catch |err| switch (err) {
+            error.SessionLeaseLost => {
+                _ = ctx.status(409);
+                return ctx.text("session lease lost");
+            },
+            else => return err,
+        }) {
             .removed => {},
             .missing => {
                 _ = ctx.status(404);
@@ -4856,9 +4862,9 @@ pub const AntflyApiHandler = struct {
         );
     }
 
-    /// A separately versioned route is intentional: older binaries return 404
-    /// instead of silently accepting and ignoring the idempotency contract
-    /// during a rolling upgrade.
+    /// A separately versioned route and durable namespace are intentional:
+    /// older binaries neither accept keyed requests nor discover their receipts
+    /// through generic transaction maintenance during a rolling upgrade.
     pub fn idempotentBatchWrite(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -4998,17 +5004,18 @@ pub const AntflyApiHandler = struct {
         defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
         self.api_server.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
             error.InvalidBatchRequest, error.InvalidArgument, error.InvalidGraphEdges, error.UnsupportedTransformOperation => {
-                _ = try self.api_server.txn_sessions.recordIdempotentOutcome(alloc, txn_id, .not_applied);
-                return try idempotentBatchError(ctx, 409, "not_applied", "invalid_batch_request", "invalid batch request", false, &txn_hex);
+                return try self.respondIdempotentPreExecutionRejection(ctx, txn_id, &commit_req, "invalid_batch_request", "invalid batch request");
             },
             else => return err,
         };
         const source = self.api_server.table_writes orelse {
-            _ = try self.api_server.txn_sessions.recordIdempotentOutcome(alloc, txn_id, .not_applied);
-            return try idempotentBatchError(ctx, 409, "not_applied", "table_not_found", "table not found", false, &txn_hex);
+            return try self.respondIdempotentPreExecutionRejection(ctx, txn_id, &commit_req, "table_not_found", "table not found");
         };
-        _ = (try self.api_server.txn_sessions.markCommitExecutionStarted(alloc, txn_id)) orelse
-            return try idempotentBatchError(ctx, 409, "not_applied", "operation_not_found", "durable batch operation not found", false, &txn_hex);
+        _ = (self.api_server.txn_sessions.markCommitExecutionStarted(alloc, txn_id) catch |err| switch (err) {
+            error.TransactionOutcomeMismatch => return try self.respondCurrentIdempotentReceipt(ctx, txn_id, &commit_req),
+            error.SessionLeaseLost => return try idempotentBatchError(ctx, 409, "unknown", "idempotency_owner_changed", "the durable operation owner changed; retry the same request", true, &txn_hex),
+            else => return err,
+        }) orelse return try idempotentBatchError(ctx, 409, "not_applied", "operation_not_found", "durable batch operation not found", false, &txn_hex);
         const request = operationContext(ctx, authenticated_identity);
         const topology_retry_deadline_ns = request.deadline_ns orelse
             (platform_time.monotonicNs() +| 2 * std.time.ns_per_s);
@@ -5058,23 +5065,15 @@ pub const AntflyApiHandler = struct {
                     }) orelse return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_repair_required", commit_req.tables);
                     return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_repair_required", commit_req.tables);
                 },
-                error.InvalidBatchRequest,
-                error.InvalidArgument,
-                error.InvalidGraphEdges,
-                error.UnsupportedTransformOperation,
-                error.TableNotFound,
-                error.TxnNotFound,
-                error.InvalidTxnRecord,
-                error.DecisionConflict,
-                => {
+                else => {
                     if (transactions_api.durableAbortOutcomeForExecutionError(err)) |abort_outcome| {
-                        _ = try self.api_server.txn_sessions.recordIdempotentOutcome(alloc, txn_id, abort_outcome);
+                        std.debug.assert(abort_outcome == .aborted);
+                        _ = try self.api_server.txn_sessions.recordIdempotentDurableAbort(alloc, txn_id);
                         return try idempotentBatchError(ctx, 409, abort_outcome.text(), "transaction_aborted", "transaction was durably aborted", false, &txn_hex);
                     }
+                    std.log.warn("idempotent batch execution returned an unclassified non-terminal error txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                     return try idempotentBatchError(ctx, 409, "unknown", "transaction_outcome_unknown", "execution began without durable terminal evidence; retry with the same Idempotency-Key", true, &txn_hex);
                 },
-                error.AbortDecisionNotDurable, error.TransactionBeginFailed => return try idempotentBatchError(ctx, 409, "unknown", "transaction_outcome_unknown", "transaction recovery has not established a durable decision", true, &txn_hex),
-                else => return err,
             } orelse {
                 return try idempotentBatchError(ctx, 409, "unknown", "transaction_outcome_unknown", "execution began without a returned terminal decision; retry with the same Idempotency-Key", true, &txn_hex);
             };
@@ -5082,7 +5081,7 @@ pub const AntflyApiHandler = struct {
 
         switch (outcome) {
             .conflict => {
-                _ = try self.api_server.txn_sessions.recordIdempotentOutcome(alloc, txn_id, .aborted);
+                _ = try self.api_server.txn_sessions.recordIdempotentDurableAbort(alloc, txn_id);
                 return try idempotentBatchError(ctx, 409, "aborted", "transaction_conflict", "batch transaction conflicted and was durably aborted", false, &txn_hex);
             },
             .committed => |committed| {
@@ -5114,6 +5113,47 @@ pub const AntflyApiHandler = struct {
                 return try idempotentBatchSuccess(ctx, if (terminal_status == .committed and !committed.visibility_repair_required) 201 else 202, txn_id, status, commit_req.tables);
             },
         }
+    }
+
+    fn respondIdempotentPreExecutionRejection(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        txn_id: db_mod.types.TxnId,
+        request: *transactions_api.OwnedTransactionCommitRequest,
+        code: []const u8,
+        message: []const u8,
+    ) !httpx.Response {
+        const alloc = self.api_server.alloc;
+        const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
+        const transition = (self.api_server.txn_sessions.recordIdempotentPreExecutionRejection(alloc, txn_id) catch |err| switch (err) {
+            error.SessionLeaseLost => return try idempotentBatchError(ctx, 409, "unknown", "idempotency_owner_changed", "the durable operation owner changed; retry the same request", true, &txn_hex),
+            else => return err,
+        }) orelse return try idempotentBatchError(ctx, 409, "not_applied", "operation_not_found", "durable batch operation not found", false, &txn_hex);
+        switch (transition) {
+            .recorded => return try idempotentBatchError(ctx, 409, "not_applied", code, message, false, &txn_hex),
+            .execution_started => return try idempotentBatchError(ctx, 409, "unknown", "transaction_outcome_unknown", "execution already began; retry with the same Idempotency-Key or query the transaction", true, &txn_hex),
+            .terminal => {
+                return try self.respondCurrentIdempotentReceipt(ctx, txn_id, request);
+            },
+        }
+    }
+
+    fn respondCurrentIdempotentReceipt(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        txn_id: db_mod.types.TxnId,
+        request: *transactions_api.OwnedTransactionCommitRequest,
+    ) !httpx.Response {
+        const alloc = self.api_server.alloc;
+        const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
+        if (try self.api_server.txn_sessions.getIdempotentOutcome(alloc, txn_id)) |outcome|
+            return try respondIdempotentBatchRejection(ctx, txn_id, outcome);
+        if (try self.api_server.txn_sessions.getTerminalCommit(alloc, txn_id)) |terminal_value| {
+            var terminal = terminal_value;
+            defer terminal.deinit(alloc);
+            return try self.respondIdempotentBatchTerminal(ctx, txn_id, request, &terminal);
+        }
+        return try idempotentBatchError(ctx, 409, "unknown", "transaction_outcome_unknown", "receipt changed during reconciliation; retry with the same Idempotency-Key", true, &txn_hex);
     }
 
     fn respondIdempotentBatchTerminal(
@@ -7585,7 +7625,9 @@ test "httpx post-start ambiguity preserves receipt and rejects interactive mutat
         ) anyerror!?distributed_txn.CommitOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.commit_calls += 1;
-            return error.InvalidBatchRequest;
+            // This error was previously omitted from a hand-maintained catch
+            // list and escaped as an untyped 500 after execution had started.
+            return error.DocIdentityNamespaceMismatch;
         }
     };
 
