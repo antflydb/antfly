@@ -4043,6 +4043,34 @@ A clean post-fix 50K public-API qualification confirmed the combined result:
 - 2.54 GB cache-inclusive live peak RSS and 339 MB restarted peak RSS, with
   post-phase attributable demand of 848 MB and 103 MB respectively.
 
+The corresponding clean 1M qualification also recovered and exceeded the
+earlier r126 result from this PR:
+
+- 617.3662 s readiness: 548.9080 s insert plus 68.4582 s optimize, versus
+  r126's 706.2518 s total and 636.1355 s insert;
+- 0.9925 recall versus 0.9932 for r126, a 0.07 percentage-point difference;
+- 78.13 / 633.96 / 794.07 / 828.00 QPS at concurrency 1/10/20/30, improving
+  r126 by 31.2% / 5.6% / 16.9% / 22.9%;
+- 12.90 / 24.72 / 55.77 / 94.32 ms p95 at concurrency 1/10/20/30, improving
+  the first three curves while concurrency-30 was 1.5% above r126's 92.88 ms;
+- 8.86 ms mean and 9.52 ms p95 server time in the detailed public profile,
+  versus 9.49 ms and 10.16 ms for r126;
+- 239,734 approximate and 146.5 authoritative exact vectors per query, with
+  all 2,048 explored leaves served by the native scan plane, zero leaf-scan
+  fallbacks, and zero approximate projection reads;
+- one 1,848,328 KiB full posting segment, an empty WAL, no redundant successor
+  generation, and 8,177,052 KiB total durable data;
+- 7.05 GB cache-inclusive live peak RSS and 2.39 GB restarted peak RSS, with
+  post-phase attributable demand of 913 MB and 453 MB respectively.
+
+Both r126 and the post-fix run reached their live RSS maxima roughly 40 seconds
+before readiness, during final native publication rather than query serving.
+The post-fix cache-inclusive maximum was 0.94 GB higher than r126, but its
+post-phase attributable demand was 0.39 GB lower and its fresh-process restart
+RSS was 34 MB lower. This classifies the remaining difference as transient
+publication/file-cache residency, not retained serving heap. It remains a real
+peak-RSS optimization target and must not be hidden by reporting demand alone.
+
 ## Next checks
 
 1. Narrow broad persisted L0 source ranges with adaptive, workload-independent
