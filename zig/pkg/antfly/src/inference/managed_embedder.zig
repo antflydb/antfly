@@ -1203,7 +1203,7 @@ pub const ManagedEmbedder = struct {
         dims: u32,
     ) !db_embedder.DensePartInvocationMemory {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
-        const entry = self.findEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        const entry = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         const vector_values = std.math.mul(usize, shape.item_count, @as(usize, dims)) catch
             return error.InferenceEncodedBytesExceeded;
         const vector_bytes = std.math.mul(usize, vector_values, @sizeOf(f32)) catch
@@ -5556,7 +5556,10 @@ pub fn testArtifactBackedEmbeddingRequestsWithoutIndexEmbedder() !void {
     var colliding = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator,
         \\{
         \\  "shared_name":{"type":"embeddings","field":"body","dimension":384,"embedder":{"provider":"antfly","model":"direct-model"}},
-        \\  "enrichments":[{"name":"shared_name","kind":"embedding","field":"body","expected_dims":384,"producer_json":"{\"provider\":\"antfly\",\"model\":\"artifact-model\"}"}],
+        \\  "enrichments":[
+        \\    {"name":"shared_name","kind":"embedding","field":"body","expected_dims":384,"producer_json":"{\"provider\":\"antfly\",\"model\":\"artifact-model\",\"multimodal\":true}"},
+        \\    {"name":"reference_artifact","kind":"embedding","field":"body","expected_dims":384,"producer_json":"{\"provider\":\"antfly\",\"model\":\"artifact-model\",\"multimodal\":true}"}
+        \\  ],
         \\  "artifact_consumer":{"type":"embeddings","dimension":384,"sources":[{"artifact":"shared_name"}]}
         \\}
     , .{ .antfly_provider = local.provider() });
@@ -5564,6 +5567,10 @@ pub fn testArtifactBackedEmbeddingRequestsWithoutIndexEmbedder() !void {
     try std.testing.expectEqual(@as(usize, 2), colliding.entries.len);
     try std.testing.expectEqualStrings("direct-model", colliding.findQueryEntry("shared_name").?.model);
     try std.testing.expectEqualStrings("artifact-model", colliding.findArtifactEntry("shared_name").?.model);
+    try std.testing.expectEqual(@as(?usize, 1), denseMediaPartLimit(&colliding, "shared_name"));
+    const colliding_plan = try densePartInvocationMemory(&colliding, "shared_name", .{ .item_count = 1 }, 384);
+    const reference_plan = try densePartInvocationMemory(&colliding, "reference_artifact", .{ .item_count = 1 }, 384);
+    try std.testing.expectEqual(reference_plan, colliding_plan);
 
     // Public query aliases outrank every legacy artifact name globally, not
     // merely within whichever registry entry is encountered first.

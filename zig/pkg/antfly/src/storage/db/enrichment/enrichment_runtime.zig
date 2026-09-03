@@ -7982,7 +7982,7 @@ test "PDF native grant partitions concurrent inspection and render ownership" {
     );
 }
 
-test "PDF operation reservation owns OCR allocation headroom" {
+test "PDF operation reservation owns native scratch and output headroom" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
@@ -7998,6 +7998,14 @@ test "PDF operation reservation owns OCR allocation headroom" {
     try std.testing.expectEqual(@as(usize, 30), operation.output_bytes);
     try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.document_extraction_working_set).used_bytes);
     try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserve(.document_extraction_working_set, 1));
+
+    var native = ReservedWorkingSetAllocator.init(std.testing.allocator, operation.render_bytes);
+    const native_alloc = native.allocator();
+    const scratch = try native_alloc.alloc(u8, 20);
+    defer native_alloc.free(scratch);
+    // Native memory consumes the already-owned primary grant; only retained
+    // outputs use a ResourceManager-accounted allocator after the split.
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.document_extraction_working_set).used_bytes);
 
     var retained = resource_manager_mod.BudgetedAllocator.init(
         &manager,
@@ -10957,6 +10965,13 @@ fn processPdfPageImageEmbedding(
     {
         return error.UnsupportedEmbeddingProvider;
     }
+    const policy = try enrichment_types.parseExecutionPolicyJson(runtime.alloc, request.execution_json);
+    const capability_items = @max(@as(usize, 1), capabilities.batch.max_items);
+    const default_items = @max(@as(usize, 1), capabilities.batch.preferred_items);
+    const batch_items = @min(policy.batch_items orelse default_items, capability_items);
+    const capability_bytes = capabilities.batch.max_encoded_media_bytes orelse generated_ocr_default_render_inflight_bytes;
+    const batch_bytes = @min(policy.batch_bytes orelse capability_bytes, capability_bytes);
+    if (batch_bytes == 0) return error.InvalidInferenceCapabilities;
 
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
@@ -10971,7 +10986,9 @@ fn processPdfPageImageEmbedding(
     };
     defer runtime.alloc.free(source_url);
 
-    var download_budgeted: ?resource_manager_mod.BudgetedAllocator = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
+    var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
+    defer resource_tracker.deinit();
+    var download_budgeted: ?resource_manager_mod.BudgetedAllocator = if (resource_tracker.manager) |manager|
         resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
     else
         null;
@@ -10994,9 +11011,25 @@ fn processPdfPageImageEmbedding(
     applyDocumentExtractionRuntimePolicy(&render_config);
     if (!document_extraction_mod.resolvesToPdf(render_config, source_url, downloaded.content_type, downloaded.data))
         return error.UnsupportedDocumentType;
+    // The renderer deliberately gives each worker a thread-local allocator,
+    // so its numeric scratch cap is not itself global admission. Own the full
+    // native render grant at the operation boundary before any page worker can
+    // start, and transfer a separate output grant to the allocator retaining
+    // PNG/provider buffers. Concurrent PDF embedding operations now compose
+    // under the same process-wide document working-set limit as OCR.
+    const pdf_operation_budget = try resource_tracker.reservePdfOperation(
+        0,
+        render_config.pdf_render_max_inflight_bytes,
+        batch_bytes,
+    );
+    if (download_budgeted) |*budgeted| try resource_tracker.transferPdfOutputCredit(budgeted);
+    render_config.pdf_render_max_inflight_bytes = pdf_operation_budget.render_bytes;
     const coordinator = try RuntimePdfOcrCoordinator.create(
         runtime.alloc,
-        download_alloc,
+        // Native parser/renderer memory is already globally precharged by
+        // pdf_operation_budget. Back it directly so it is locally bounded but
+        // not charged a second time through the output BudgetedAllocator.
+        runtime.alloc,
         runtime.config.sync_wait_timeout_ms,
         render_config,
         downloaded.data,
@@ -11009,18 +11042,11 @@ fn processPdfPageImageEmbedding(
         return;
     }
 
-    const policy = try enrichment_types.parseExecutionPolicyJson(runtime.alloc, request.execution_json);
     const max_document_pages = effectivePdfMaxDocumentPages(
         policy.max_document_pages,
         generatedPdfMaxDocumentPages(),
     );
     if (page_count > max_document_pages) return error.PdfDocumentPageLimitExceeded;
-    const capability_items = @max(@as(usize, 1), capabilities.batch.max_items);
-    const default_items = @max(@as(usize, 1), capabilities.batch.preferred_items);
-    const batch_items = @min(policy.batch_items orelse default_items, capability_items);
-    const capability_bytes = capabilities.batch.max_encoded_media_bytes orelse generated_ocr_default_render_inflight_bytes;
-    const batch_bytes = @min(policy.batch_bytes orelse capability_bytes, capability_bytes);
-    if (batch_bytes == 0) return error.InvalidInferenceCapabilities;
     try heartbeatEnrichmentLease(runtime);
     const fence_epoch = if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0;
     const source_hash = std.hash.Wyhash.hash(0x7064665f73746167, downloaded.data);

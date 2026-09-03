@@ -9,43 +9,88 @@
 package proxy
 
 import (
+	"container/list"
 	"context"
+	"errors"
 	"sync"
 )
 
-// byteAdmission is a cancellation-aware weighted semaphore for memory that
-// must remain resident across an inference request. A generation channel is
-// used instead of sync.Cond so waiters can also observe context cancellation.
+var errByteAdmissionRequestTooLarge = errors.New("byte admission request exceeds capacity")
+
+type byteAdmissionWaiter struct {
+	bytes   int64
+	ready   chan struct{}
+	granted bool
+	element *list.Element
+}
+
+// byteAdmission is a cancellation-aware, FIFO weighted semaphore for memory
+// that must remain resident across an inference request. Strict queue order is
+// intentional: allowing a newer small request to bypass an older large one can
+// starve PDF and multimodal bodies indefinitely under sustained small traffic.
 type byteAdmission struct {
 	mu      sync.Mutex
 	limit   int64
 	used    int64
-	changed chan struct{}
+	waiters list.List
 }
 
 func newByteAdmission(limit int64) *byteAdmission {
-	return &byteAdmission{limit: limit, changed: make(chan struct{})}
+	return &byteAdmission{limit: limit}
 }
 
 func (a *byteAdmission) Acquire(ctx context.Context, bytes int64) error {
 	if bytes <= 0 {
 		return nil
 	}
-	for {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if bytes > a.limit {
+		return errByteAdmissionRequestTooLarge
+	}
+
+	waiter := &byteAdmissionWaiter{bytes: bytes, ready: make(chan struct{})}
+	a.mu.Lock()
+	waiter.element = a.waiters.PushBack(waiter)
+	a.grantWaitersLocked()
+	a.mu.Unlock()
+
+	select {
+	case <-waiter.ready:
+		return nil
+	case <-ctx.Done():
 		a.mu.Lock()
-		if bytes <= a.limit-a.used {
-			a.used += bytes
+		if waiter.granted {
+			// Admission won the race with cancellation. The caller owns the
+			// bytes and must observe success so its deferred Release remains
+			// paired with the grant.
 			a.mu.Unlock()
 			return nil
 		}
-		changed := a.changed
+		a.waiters.Remove(waiter.element)
+		waiter.element = nil
+		a.grantWaitersLocked()
 		a.mu.Unlock()
+		return ctx.Err()
+	}
+}
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-changed:
+func (a *byteAdmission) grantWaitersLocked() {
+	for {
+		front := a.waiters.Front()
+		if front == nil {
+			return
 		}
+		waiter := front.Value.(*byteAdmissionWaiter)
+		if waiter.bytes > a.limit-a.used {
+			return
+		}
+		a.waiters.Remove(front)
+		waiter.element = nil
+		waiter.granted = true
+		a.used += waiter.bytes
+		close(waiter.ready)
 	}
 }
 
@@ -59,8 +104,7 @@ func (a *byteAdmission) Release(bytes int64) {
 		panic("inference body admission released more bytes than reserved")
 	}
 	a.used -= bytes
-	close(a.changed)
-	a.changed = make(chan struct{})
+	a.grantWaitersLocked()
 	a.mu.Unlock()
 }
 

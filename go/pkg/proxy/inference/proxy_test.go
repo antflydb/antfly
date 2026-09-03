@@ -20,6 +20,14 @@ import (
 	"go.uber.org/zap"
 )
 
+func advertiseModelOperation(registry *ModelRegistry, address string, operation OperationType, models ...string) {
+	operations := make(map[string]map[OperationType]bool, len(models))
+	for _, model := range models {
+		operations[model] = map[OperationType]bool{operation: true}
+	}
+	registry.UpdateModelOperations(address, operations)
+}
+
 func TestProxyStartStopsOnContextCancel(t *testing.T) {
 	t.Parallel()
 
@@ -139,6 +147,7 @@ func TestProxyRequestRetriesRetryableStatus(t *testing.T) {
 		}),
 	}
 	p.RegisterEndpoint("http://inference.internal", "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://inference.internal", "embed", "bge-small-en-v1.5")
 	p.Router().RouteManager().AddRoute(&Route{
 		Name:       "default/retry",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
@@ -195,6 +204,8 @@ func TestProxyRequestRetryFailsOverToDifferentEndpoint(t *testing.T) {
 	}
 	p.RegisterEndpoint("http://primary-a.internal", "primary", WorkloadTypeGeneral)
 	p.RegisterEndpoint("http://primary-b.internal", "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://primary-a.internal", "embed", "bge-small-en-v1.5")
+	advertiseModelOperation(p.registry, "http://primary-b.internal", "embed", "bge-small-en-v1.5")
 	atomic.StoreInt32(&p.registry.endpoints["http://primary-b.internal"].Connections, 1)
 	p.Router().RouteManager().AddRoute(&Route{
 		Name:       "default/retry-failover",
@@ -245,6 +256,7 @@ func TestProxyRequestRecordsFailureOnStreamCopyError(t *testing.T) {
 		}),
 	}
 	p.RegisterEndpoint("http://primary.internal", "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://primary.internal", "embed", "bge-small-en-v1.5")
 	p.Router().RouteManager().AddRoute(&Route{
 		Name:       "default/stream-error",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
@@ -289,6 +301,7 @@ func TestResolveRequestUsesVerifiedHostedSource(t *testing.T) {
 
 	p.RegisterEndpoint("http://default.internal", "default", WorkloadTypeGeneral)
 	p.RegisterEndpoint("http://source.internal", "source-pool", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://source.internal", "embed", "bge-small-en-v1.5")
 	p.Router().RouteManager().AddRoute(&Route{
 		Name:                "default/source-context",
 		Operations:          map[OperationType]bool{OperationType("embed"): true},
@@ -330,7 +343,8 @@ func TestResolveRequestStaysInSelectedPoolWhenModelIsLoadedElsewhere(t *testing.
 
 	p.RegisterEndpoint("http://default.internal", "default", WorkloadTypeGeneral)
 	p.RegisterEndpoint("http://source.internal", "source-pool", WorkloadTypeGeneral)
-	p.registry.UpdateModels("http://default.internal", []string{"bge-small-en-v1.5"})
+	advertiseModelOperation(p.registry, "http://default.internal", "embed", "bge-small-en-v1.5")
+	advertiseModelOperation(p.registry, "http://source.internal", "embed", "bge-small-en-v1.5")
 
 	p.Router().RouteManager().AddRoute(&Route{
 		Name:                "default/source-context",
@@ -379,6 +393,7 @@ func TestProxyRequestDoesNotMatchHostedSourceRouteFromHeadersAlone(t *testing.T)
 
 	p.RegisterEndpoint("http://default.internal", "default", WorkloadTypeGeneral)
 	p.RegisterEndpoint("http://source.internal", "source-pool", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://default.internal", "embed", "bge-small-en-v1.5")
 	p.Router().RouteManager().AddRoute(&Route{
 		Name:                "default/source-context",
 		Operations:          map[OperationType]bool{OperationType("embed"): true},
@@ -445,6 +460,7 @@ func TestProxyQueueFallbackWaitsForEligibleDestination(t *testing.T) {
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		p.RegisterEndpoint("http://queued.internal", "queued", WorkloadTypeGeneral)
+		advertiseModelOperation(p.registry, "http://queued.internal", "embed", "bge-small-en-v1.5")
 	}()
 
 	req := httptest.NewRequest(http.MethodPost, "/ai/v1/embed", bytes.NewBufferString(`{"model":"bge-small-en-v1.5"}`))
@@ -568,7 +584,7 @@ func TestForwardRequestSendsUpstreamAuthorization(t *testing.T) {
 		}),
 	}
 	p.RegisterEndpoint("http://inference.internal", "default", WorkloadTypeGeneral)
-	p.registry.UpdateModels("http://inference.internal", []string{"model-a"})
+	advertiseModelOperation(p.registry, "http://inference.internal", "embed", "model-a")
 
 	req := httptest.NewRequest(http.MethodPost, "/ai/v1/embed", bytes.NewBufferString(`{"model":"model-a"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -597,8 +613,8 @@ func TestResolveRequestDoesNotAdvanceBurstRoundRobinState(t *testing.T) {
 	})
 	p.RegisterEndpoint("http://burst-a.internal", "burst", WorkloadTypeBurst)
 	p.RegisterEndpoint("http://burst-b.internal", "burst", WorkloadTypeBurst)
-	p.registry.UpdateModels("http://burst-a.internal", []string{"model-a"})
-	p.registry.UpdateModels("http://burst-b.internal", []string{"model-a"})
+	advertiseModelOperation(p.registry, "http://burst-a.internal", "embed", "model-a")
+	advertiseModelOperation(p.registry, "http://burst-b.internal", "embed", "model-a")
 
 	firstLease, err := p.AcquireRequestResolution(context.Background(), ResolveRequest{
 		Operation: OperationType("embed"),
@@ -828,7 +844,7 @@ func TestResolveRequestDoesNotClaimCircuitBreakerProbe(t *testing.T) {
 		Logger:          zap.NewNop(),
 	})
 	p.RegisterEndpoint("http://recovering.internal", "primary", WorkloadTypeGeneral)
-	p.registry.UpdateModels("http://recovering.internal", []string{"model-a"})
+	advertiseModelOperation(p.registry, "http://recovering.internal", "embed", "model-a")
 
 	cb := p.registry.GetCircuitBreaker("http://recovering.internal")
 	cb.threshold = 1
@@ -879,6 +895,7 @@ func TestResolveRequestDoesNotConsumeRouteRateLimit(t *testing.T) {
 		Logger:          zap.NewNop(),
 	})
 	p.RegisterEndpoint("http://primary.internal", "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://primary.internal", "embed", "model-a")
 
 	route := &Route{
 		Name:         "default/rate-limit",
@@ -935,6 +952,7 @@ func TestAcquireRequestResolutionUsesResolvedModelForPerModelRateLimit(t *testin
 		Logger:          zap.NewNop(),
 	})
 	p.RegisterEndpoint("http://primary.internal", "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://primary.internal", "embed", "model-a", "model-b")
 
 	route := &Route{
 		Name:         "default/per-model-rate-limit",
@@ -994,8 +1012,8 @@ func TestAcquireRequestResolutionBeginForwardingUpdatesLeastLoadedSelection(t *t
 	})
 	p.RegisterEndpoint("http://primary-a.internal", "primary", WorkloadTypeGeneral)
 	p.RegisterEndpoint("http://primary-b.internal", "primary", WorkloadTypeGeneral)
-	p.registry.UpdateModels("http://primary-a.internal", []string{"model-a"})
-	p.registry.UpdateModels("http://primary-b.internal", []string{"model-a"})
+	advertiseModelOperation(p.registry, "http://primary-a.internal", "embed", "model-a")
+	advertiseModelOperation(p.registry, "http://primary-b.internal", "embed", "model-a")
 
 	firstLease, err := p.AcquireRequestResolution(context.Background(), ResolveRequest{
 		Operation: OperationType("embed"),
@@ -1038,6 +1056,8 @@ func TestResolutionLeaseNextAttemptSharesAdmissionDecision(t *testing.T) {
 	})
 	p.RegisterEndpoint("http://primary-a.internal", "primary", WorkloadTypeGeneral)
 	p.RegisterEndpoint("http://primary-b.internal", "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://primary-a.internal", "embed", "model-a")
+	advertiseModelOperation(p.registry, "http://primary-b.internal", "embed", "model-a")
 
 	route := &Route{
 		Name:          "default/retry-admission",
@@ -1095,6 +1115,8 @@ func TestResolutionLeaseNextAttemptRequiresCompletedCurrentAttempt(t *testing.T)
 	})
 	p.RegisterEndpoint("http://primary-a.internal", "primary", WorkloadTypeGeneral)
 	p.RegisterEndpoint("http://primary-b.internal", "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://primary-a.internal", "embed", "model-a")
+	advertiseModelOperation(p.registry, "http://primary-b.internal", "embed", "model-a")
 	p.Router().RouteManager().AddRoute(&Route{
 		Name:       "default/retry-ordering",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
@@ -1143,6 +1165,8 @@ func TestResolutionLeaseNextAttemptExcludesFailedEndpoint(t *testing.T) {
 	})
 	p.RegisterEndpoint("http://primary-a.internal", "primary", WorkloadTypeGeneral)
 	p.RegisterEndpoint("http://primary-b.internal", "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://primary-a.internal", "embed", "model-a")
+	advertiseModelOperation(p.registry, "http://primary-b.internal", "embed", "model-a")
 	atomic.StoreInt32(&p.registry.endpoints["http://primary-b.internal"].Connections, 1)
 	p.Router().RouteManager().AddRoute(&Route{
 		Name:       "default/retry-endpoints",
@@ -1198,7 +1222,7 @@ func TestProxyRequestKeepsConnectionCountUntilResponseBodyCloses(t *testing.T) {
 		}),
 	}
 	p.RegisterEndpoint("http://primary.internal", "primary", WorkloadTypeGeneral)
-	p.registry.UpdateModels("http://primary.internal", []string{"model-a"})
+	advertiseModelOperation(p.registry, "http://primary.internal", "embed", "model-a")
 
 	req := httptest.NewRequest(http.MethodPost, "/ai/v1/embed", bytes.NewBufferString(`{"model":"model-a"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -1367,17 +1391,31 @@ func TestResolveRejectsSuccessfullyDiscoveredTaskUnknownModel(t *testing.T) {
 	}
 }
 
-func TestResolveUsesBootstrapFallbackBeforeCatalogDiscovery(t *testing.T) {
+func TestResolveFailsClosedBeforeCatalogDiscovery(t *testing.T) {
 	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.RegisterEndpoint("http://bootstrap.internal", "primary", WorkloadTypeGeneral)
 	p.registry.UpdateModels("http://bootstrap.internal", []string{"shared"})
 
-	resolution, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: "read", Model: "shared"})
-	if err != nil {
+	if _, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: "read", Model: "shared"}); err == nil {
+		t.Fatal("operation-scoped request must wait for endpoint capability discovery")
+	}
+}
+
+func TestResolveDoesNotRebindCachedCapabilityToUndiscoveredReplacement(t *testing.T) {
+	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://reader-a.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://reader-a.internal", map[string]map[OperationType]bool{
+		"shared": {"read": true},
+	})
+	if _, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: "read", Model: "shared"}); err != nil {
 		t.Fatal(err)
 	}
-	if resolution.Endpoint.Address != "http://bootstrap.internal" {
-		t.Fatalf("read routed to %s", resolution.Endpoint.Address)
+
+	p.UnregisterEndpoint("http://reader-a.internal")
+	p.RegisterEndpoint("http://replacement.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModels("http://replacement.internal", []string{"shared"})
+	if _, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: "read", Model: "shared"}); err == nil {
+		t.Fatal("cached capability was rebound to an undiscovered replacement")
 	}
 }
 
@@ -1411,7 +1449,9 @@ func TestProxyRoutesReadAndHomogeneousGenerateBatch(t *testing.T) {
 		}, nil
 	})}
 	p.RegisterEndpoint("http://inference.internal", "primary", WorkloadTypeGeneral)
-	p.registry.UpdateModels("http://inference.internal", []string{"gemma4"})
+	p.registry.UpdateModelOperations("http://inference.internal", map[string]map[OperationType]bool{
+		"gemma4": {"read": true, "generate.batch": true},
+	})
 
 	read := httptest.NewRequest(http.MethodPost, "/ai/v1/read", strings.NewReader(`{"model":"gemma4"}`))
 	readRecorder := httptest.NewRecorder()

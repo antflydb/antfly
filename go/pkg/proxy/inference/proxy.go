@@ -109,7 +109,8 @@ type Endpoint struct {
 	Models       map[string]*ModelInfo
 	// CatalogKnown distinguishes a successfully discovered empty/partial catalog
 	// from bootstrap registration, where the proxy has not learned capabilities
-	// yet. Only the latter may use the compatibility pool fallback.
+	// yet. Bootstrap endpoints participate only in task-unscoped legacy lookup;
+	// executable routes require a discovered per-model operation.
 	CatalogKnown bool
 	QueueDepth   int32
 	LastSeen     time.Time
@@ -927,9 +928,12 @@ func (r *Router) ResolveEndpointCandidates(model string, pool string, excluded m
 	var endpoints []*Endpoint
 	endpoints = r.registry.getAvailableEndpointsForModelOperation(model, pool, operation)
 
-	if len(endpoints) == 0 && pool != "" {
-		// Preserve bootstrap compatibility before the first successful catalog
-		// refresh, but never route a known-incompatible discovered endpoint.
+	if len(endpoints) == 0 && pool != "" && operation == "" {
+		// Bootstrap inventory is usable only by legacy, task-unscoped callers.
+		// Every executable inference route carries an operation and must fail
+		// closed until the selected endpoint has advertised that exact
+		// model/task pair. This keeps a cached capability decision from being
+		// rebound to a newly joined, undiscovered node after topology churn.
 		endpoints = r.registry.getBootstrapEndpointsForPool(pool)
 	}
 

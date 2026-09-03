@@ -483,8 +483,8 @@ document. They are architectural requirements, not Florence-specific cleanup:
     advertised the same name only as a generator could be selected for reading,
     and partial catalog fan-out could overstate the capabilities of another
     still-routable node. Registry snapshots now retain per-model operations,
-    every initial and retry selection applies that filter, successful discovery
-    disables the unknown bootstrap fallback, and cluster discovery fails closed
+    every initial and retry selection applies that filter, executable routes
+    never use unknown bootstrap inventory, and cluster discovery fails closed
     if any eligible catalog is unavailable.
 33. **Generic generator media bypassed generation-batch byte and decoded-pixel
     admission.** Preflight now includes raw `media` parts in the aggregate
@@ -505,7 +505,9 @@ document. They are architectural requirements, not Florence-specific cleanup:
     limit (256 MiB by default) before forwarding. A process-wide weighted body
     admission budget (512 MiB by default) is acquired before reading and held
     through retries, so concurrent requests cannot multiply that per-request
-    ceiling into unbounded proxy memory. Waiting observes request cancellation.
+    ceiling into unbounded proxy memory. Admission is FIFO by request arrival,
+    preventing a steady stream of small requests from starving an older large
+    PDF body; cancellation removes a waiter and immediately advances the queue.
     Inference nodes still apply their stricter decoded-media and model admission
     independently.
 36. **Cluster catalog fan-out multiplied memory by node count.** Discovery now
@@ -516,9 +518,9 @@ document. They are architectural requirements, not Florence-specific cleanup:
 37. **Successfully discovered task-unknown models still routed as every
     operation.** Model inventory now has explicit bootstrap, task-unknown, and
     known-operation states. Only known operation advertisements participate in
-    normal routing. Bootstrap compatibility is used only while a catalog has
-    never completed; a legacy generic entry cannot receive read or generation
-    traffic merely because its model name matches.
+    normal routing. Bootstrap compatibility is restricted to task-unscoped
+    legacy inventory; a legacy generic entry cannot receive any executable
+    model-family traffic merely because its model name matches.
 38. **The proxy catalog described a different pool from request execution.**
     Capability discovery now carries model and task scope and honors the same
     explicit/default pool as execution. The proxy fans out only to healthy
@@ -1130,6 +1132,34 @@ document. They are architectural requirements, not Florence-specific cleanup:
     pre-load rejection. The same invariant therefore holds behind HTTP, the
     linked runtime, and a distributed proxy: adapters may narrow work, but only
     the executor grants final admission.
+115. **Page-image embedding gave renderer workers a local byte ceiling without
+    owning that memory globally.** Worker allocators remain task-local for
+    thread safety, but the document operation now pre-reserves the entire
+    native render grant from the process resource manager before coordinator
+    parsing or worker creation. A distinct output grant is transferred to the
+    allocator that retains PNG and provider buffers. OCR and visual embedding
+    therefore share one ownership rule: local allocators enforce the granted
+    partition; they never create global capacity.
+116. **Proxy byte admission was bounded but not fair.** Broadcast wakeups let
+    newer small requests repeatedly consume capacity ahead of an older large
+    PDF. The weighted semaphore now queues in strict FIFO order, grants only
+    from the head, removes canceled waiters under the same lock, and rejects an
+    impossible request larger than total capacity instead of waiting forever.
+117. **Bootstrap routing could rebind a cached capability to an undiscovered
+    replacement node.** A client could discover model/task limits from node A,
+    then reach a newly registered node B after A disappeared even though B had
+    not published that operation. Every executable route now requires a current
+    per-endpoint model/task advertisement. Bootstrap names remain available only
+    for task-unscoped legacy inventory, so topology churn produces temporary
+    unavailability rather than capability-unsafe execution. This applies to
+    read, generate, embed, rerank, chunk, extract, rewrite, classify, and
+    transcribe equally.
+118. **Artifact execution could inherit a colliding query index after rebasing.**
+    Public query aliases and durable embedding artifacts are distinct
+    namespaces. Dense execution, media-part limits, capability discovery, and
+    invocation-memory planning now all resolve the artifact producer; a public
+    index with the same name cannot change the model or transport contract used
+    by enrichment.
 
 ### Post-review implementation contract
 
@@ -1143,6 +1173,11 @@ The hardening above follows these long-term rules:
   waits are deadline-bounded and cancelable; runtime shutdown drains owners.
   Valid catalog failures may use stale or conservative capabilities, but an
   expired or canceled caller never does.
+- Distributed execution re-resolves endpoint eligibility from a current
+  per-endpoint model/task catalog on every initial attempt and retry. A cached
+  planner snapshot may make a request temporarily too ambitious after topology
+  change, but the proxy never sends it to an endpoint whose operation is still
+  bootstrap-unknown; the concrete node remains the final limit validator.
 - Every executor owns final admission. Remote read and generation calls and
   multimodal embedding calls are split at both model item and encoded-byte
   ceilings. Image-bearing readers, generators, embedders, and extractors also
@@ -1151,7 +1186,9 @@ The hardening above follows these long-term rules:
 - Renderer admission and model admission are distinct dimensions. In-flight
   render pixels bound one concurrent worker wave; cumulative preflighted pixels
   bound every retained page image passed to one model invocation. Neither limit
-  may stand in for the other.
+  may stand in for the other. A numeric renderer limit is valid only while the
+  document operation owns the corresponding process-wide reservation. Worker
+  allocators stay private and thread-safe inside that owned grant.
 - Render planners preserve a singleton quality invariant. The retained-output
   allowance for an item in a batch is never smaller than its admitted singleton
   allowance. If that invariant does not fit, the planner reduces the window;
@@ -1420,6 +1457,18 @@ The hardening above follows these long-term rules:
 37. **Implemented after remote-codec review:** version 4 remote image MIME
     extensions must be measurable by the local shared inference codec registry
     before the capability snapshot can become routable.
+38. **Implemented after renderer-ownership review:** durable PDF page-image
+    embedding acquires an operation-scoped native scratch reservation and
+    allocator-owned output credit before constructing its render coordinator.
+39. **Implemented after proxy-admission review:** retained-body admission is a
+    cancellation-aware FIFO weighted semaphore with impossible-weight
+    rejection and regression coverage for large-request starvation.
+40. **Implemented after distributed TOCTOU review:** operation-scoped routing
+    is eligible only from a current endpoint catalog; bootstrap pool fallback is
+    task-unscoped and cannot execute any model-family request.
+41. **Implemented during the semantic rebase:** every dense artifact hook uses
+    artifact-first lookup, including invocation-memory planning; query lookup
+    precedence remains confined to query execution.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -1767,12 +1816,14 @@ Parallel rendering uses two levels of admission in the current runtime:
   thread group.
 
 The resource-manager admission is one owned split reservation. With the
-defaults, the operation must own the 64 MiB OCR transient-output credit and may
-own the requested inspection-plus-render native capacity. A partial native
-grant is divided proportionally into non-overlapping inspection and render
-ceilings; both must remain nonzero when both phases are requested. Another
-operation cannot consume the already-owned output side. An unusable native
-partition or unavailable required output credit fails before parsing starts.
+defaults, an OCR operation must own the 64 MiB transient-output credit and may
+own the requested inspection-plus-render native capacity. Page-image embedding
+uses the same mechanism with a render-only native side and a model-batch output
+side. A partial OCR native grant is divided proportionally into non-overlapping
+inspection and render ceilings; both must remain nonzero when both phases are
+requested. Another operation cannot consume either operation's already-owned
+scratch or output side. An unusable native partition or unavailable required
+output credit fails before coordinator parsing or worker creation.
 
 A separate process-wide CPU permit pool remains an optional follow-up if
 operational measurements show that the bounded enrichment lanes are too coarse.
