@@ -447,16 +447,3 @@ starting replication  start_lsn=0/0
   ```sql
   ALTER TABLE users REPLICA IDENTITY FULL;
   ```
-
-## Comparison with PostgreSQL Sync
-
-Antfly offers two approaches for syncing data from PostgreSQL:
-
-| | PostgreSQL Replication (this guide) | [PostgreSQL Sync](/docs/examples/postgres-sync) |
-|---|---|---|
-| **Mechanism** | WAL logical replication | LISTEN/NOTIFY + polling |
-| **Setup** | Declarative (table config) | External Go daemon |
-| **Latency** | Sub-second (WAL streaming) | ~1 second (batched notifications) |
-| **Requires** | `wal_level=logical` | Triggers on source tables |
-| **Crash recovery** | LSN checkpoints (no data loss) | Periodic full sync catches gaps |
-| **Best for** | Production pipelines | Quick prototyping, JSONB columns |
