@@ -19,7 +19,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -131,7 +130,12 @@ func (w *RouteWatcher) onRouteAdd(obj any) {
 		return
 	}
 
-	if !w.routeManager.UpsertRoute(route) {
+	changed, err := w.routeManager.UpsertRoute(route)
+	if err != nil {
+		w.logger.Error("failed to install InferenceProxy", zap.Error(err))
+		return
+	}
+	if !changed {
 		w.logger.Debug("route policy already installed", zap.String("name", route.Name))
 		return
 	}
@@ -153,7 +157,12 @@ func (w *RouteWatcher) onRouteUpdate(oldObj, newObj any) {
 		return
 	}
 
-	if !w.routeManager.UpsertRoute(route) { // UpsertRoute handles updates by name.
+	changed, err := w.routeManager.UpsertRoute(route)
+	if err != nil {
+		w.logger.Error("failed to update InferenceProxy", zap.Error(err))
+		return
+	}
+	if !changed { // UpsertRoute handles updates by name.
 		w.logger.Debug("route update did not change policy", zap.String("name", route.Name))
 		return
 	}
@@ -194,7 +203,7 @@ func (w *RouteWatcher) convertRoute(obj any) (*Route, error) {
 		Name:                fullName,
 		Priority:            getInt32(spec, "priority", 100),
 		Operations:          make(map[OperationType]bool),
-		ModelPatterns:       make([]*regexp.Regexp, 0),
+		ModelPatterns:       make([]*RegexPattern, 0),
 		HeaderMatchers:      make(map[string]*StringMatcher),
 		SourceTables:        make(map[string]bool),
 		SourceOrganizations: make(map[string]bool),
@@ -220,8 +229,7 @@ func (w *RouteWatcher) convertRoute(obj any) (*Route, error) {
 				if modelStr, ok := model.(string); ok {
 					pattern, err := CompileModelPattern(modelStr)
 					if err != nil {
-						w.logger.Warn("failed to compile model pattern", zap.String("pattern", modelStr), zap.Error(err))
-						continue
+						return nil, fmt.Errorf("compile model pattern %q: %w", modelStr, err)
 					}
 					route.ModelPatterns = append(route.ModelPatterns, pattern)
 				}
@@ -240,9 +248,11 @@ func (w *RouteWatcher) convertRoute(obj any) (*Route, error) {
 						matcher.Prefix = prefix
 					}
 					if regexStr, ok := matchMap["regex"].(string); ok {
-						if regex, err := regexp.Compile(regexStr); err == nil {
-							matcher.Regex = regex
+						regex, err := CompileRegexPattern(regexStr, RegexLeftmostFirst)
+						if err != nil {
+							return nil, fmt.Errorf("compile header pattern %q for %q: %w", regexStr, headerName, err)
 						}
+						matcher.Regex = regex
 					}
 					route.HeaderMatchers[headerName] = matcher
 				}

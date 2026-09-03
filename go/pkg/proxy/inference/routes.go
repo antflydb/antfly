@@ -16,6 +16,7 @@
 package proxy
 
 import (
+	"fmt"
 	"hash/fnv"
 	"regexp"
 	"sort"
@@ -29,9 +30,10 @@ type Route struct {
 	Name     string
 	Priority int32
 
-	// Compiled matchers
+	// Declarative matchers. The manager compiles private programs when it owns
+	// an installed route snapshot.
 	Operations          map[OperationType]bool
-	ModelPatterns       []*regexp.Regexp
+	ModelPatterns       []*RegexPattern
 	HeaderMatchers      map[string]*StringMatcher
 	SourceTables        map[string]bool
 	SourceOrganizations map[string]bool
@@ -59,11 +61,73 @@ type Route struct {
 // OperationType for matching
 type OperationType string
 
+// RegexSyntax is part of route policy identity. Go's regexp.String omits
+// whether a program was compiled as POSIX or switched to leftmost-longest, so
+// retaining only *regexp.Regexp cannot support authoritative change detection.
+type RegexSyntax string
+
+const (
+	RegexLeftmostFirst   RegexSyntax = "leftmost-first"
+	RegexLeftmostLongest RegexSyntax = "leftmost-longest"
+	RegexPOSIX           RegexSyntax = "posix"
+)
+
+// RegexPattern is the declarative route representation. compiled is owned by
+// the installed immutable snapshot and never exposed as mutable policy state.
+type RegexPattern struct {
+	Expression string
+	Syntax     RegexSyntax
+	compiled   *regexp.Regexp
+}
+
+func CompileRegexPattern(expression string, syntax RegexSyntax) (*RegexPattern, error) {
+	pattern := &RegexPattern{Expression: expression, Syntax: syntax}
+	compiled, err := pattern.compile()
+	if err != nil {
+		return nil, err
+	}
+	pattern.compiled = compiled
+	return pattern, nil
+}
+
+func MustRegexPattern(expression string) *RegexPattern {
+	pattern, err := CompileRegexPattern(expression, RegexLeftmostFirst)
+	if err != nil {
+		panic(err)
+	}
+	return pattern
+}
+
+func (p *RegexPattern) compile() (*regexp.Regexp, error) {
+	if p == nil {
+		return nil, nil
+	}
+	switch p.Syntax {
+	case "", RegexLeftmostFirst:
+		return regexp.Compile(p.Expression)
+	case RegexLeftmostLongest:
+		compiled, err := regexp.Compile(p.Expression)
+		if err != nil {
+			return nil, err
+		}
+		compiled.Longest()
+		return compiled, nil
+	case RegexPOSIX:
+		return regexp.CompilePOSIX(p.Expression)
+	default:
+		return nil, fmt.Errorf("unsupported regex syntax %q", p.Syntax)
+	}
+}
+
+func (p *RegexPattern) Matches(value string) bool {
+	return p != nil && p.compiled != nil && p.compiled.MatchString(value)
+}
+
 // StringMatcher for header matching
 type StringMatcher struct {
 	Exact  string
 	Prefix string
-	Regex  *regexp.Regexp
+	Regex  *RegexPattern
 }
 
 func (m *StringMatcher) Matches(value string) bool {
@@ -73,7 +137,7 @@ func (m *StringMatcher) Matches(value string) bool {
 	if m.Prefix != "" && strings.HasPrefix(value, m.Prefix) {
 		return true
 	}
-	if m.Regex != nil && m.Regex.MatchString(value) {
+	if m.Regex != nil && m.Regex.Matches(value) {
 		return true
 	}
 	return false
@@ -255,11 +319,14 @@ func NewRouteManager() *RouteManager {
 // resyncs and equivalent updates preserve both the routing generation and live
 // rate-limiter state, while later caller mutations cannot alter installed
 // routing policy behind the generation fence.
-func (rm *RouteManager) UpsertRoute(route *Route) bool {
+func (rm *RouteManager) UpsertRoute(route *Route) (bool, error) {
 	if route == nil {
-		return false
+		return false, nil
 	}
-	candidate := cloneRoute(route, true)
+	candidate, err := prepareRoute(route, true)
+	if err != nil {
+		return false, err
+	}
 
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -269,7 +336,7 @@ func (rm *RouteManager) UpsertRoute(route *Route) bool {
 	for _, r := range rm.routes {
 		if r.Name == candidate.Name {
 			if routePolicyEqual(r, candidate) {
-				return false
+				return false, nil
 			}
 			// The token bucket is mutable runtime state, not declarative policy.
 			// Preserve it across unrelated policy changes when its configuration
@@ -293,7 +360,38 @@ func (rm *RouteManager) UpsertRoute(route *Route) bool {
 
 	rm.routes = newRoutes
 	rm.generation++
-	return true
+	return true, nil
+}
+
+func prepareRoute(route *Route, ownRateLimiter bool) (*Route, error) {
+	cloned := cloneRoute(route, ownRateLimiter)
+	for _, pattern := range cloned.ModelPatterns {
+		if pattern == nil {
+			continue
+		}
+		if pattern.Syntax == "" {
+			pattern.Syntax = RegexLeftmostFirst
+		}
+		compiled, err := pattern.compile()
+		if err != nil {
+			return nil, fmt.Errorf("invalid model pattern %q: %w", pattern.Expression, err)
+		}
+		pattern.compiled = compiled
+	}
+	for name, matcher := range cloned.HeaderMatchers {
+		if matcher == nil || matcher.Regex == nil {
+			continue
+		}
+		if matcher.Regex.Syntax == "" {
+			matcher.Regex.Syntax = RegexLeftmostFirst
+		}
+		compiled, err := matcher.Regex.compile()
+		if err != nil {
+			return nil, fmt.Errorf("invalid header pattern %q for %q: %w", matcher.Regex.Expression, name, err)
+		}
+		matcher.Regex.compiled = compiled
+	}
+	return cloned, nil
 }
 
 func cloneRoute(route *Route, ownRateLimiter bool) *Route {
@@ -345,16 +443,15 @@ func cloneBoolMap[K comparable](source map[K]bool) map[K]bool {
 	return cloned
 }
 
-func cloneRegexps(source []*regexp.Regexp) []*regexp.Regexp {
+func cloneRegexps(source []*RegexPattern) []*RegexPattern {
 	if source == nil {
 		return nil
 	}
-	cloned := make([]*regexp.Regexp, len(source))
+	cloned := make([]*RegexPattern, len(source))
 	for i, pattern := range source {
 		if pattern != nil {
-			// Copy preserves POSIX/Longest compilation semantics while isolating
-			// the one mutating Regexp operation, Longest, from installed policy.
-			cloned[i] = pattern.Copy()
+			patternCopy := *pattern
+			cloned[i] = &patternCopy
 		}
 	}
 	return cloned
@@ -372,7 +469,8 @@ func cloneStringMatchers(source map[string]*StringMatcher) map[string]*StringMat
 		}
 		matcherCopy := *matcher
 		if matcher.Regex != nil {
-			matcherCopy.Regex = matcher.Regex.Copy()
+			regexCopy := *matcher.Regex
+			matcherCopy.Regex = &regexCopy
 		}
 		cloned[name] = &matcherCopy
 	}
@@ -455,7 +553,7 @@ func boolMapEqual[K comparable](left, right map[K]bool) bool {
 	return true
 }
 
-func regexpSliceEqual(left, right []*regexp.Regexp) bool {
+func regexpSliceEqual(left, right []*RegexPattern) bool {
 	if len(left) != len(right) {
 		return false
 	}
@@ -466,7 +564,7 @@ func regexpSliceEqual(left, right []*regexp.Regexp) bool {
 			}
 			continue
 		}
-		if left[i].String() != right[i].String() {
+		if left[i].Expression != right[i].Expression || left[i].Syntax != right[i].Syntax {
 			return false
 		}
 	}
@@ -496,7 +594,7 @@ func stringMatcherEqual(left, right *StringMatcher) bool {
 	if left.Regex == nil || right.Regex == nil {
 		return left.Regex == right.Regex
 	}
-	return left.Regex.String() == right.Regex.String()
+	return left.Regex.Expression == right.Regex.Expression && left.Regex.Syntax == right.Regex.Syntax
 }
 
 func timeWindowEqual(left, right *TimeWindow) bool {
@@ -574,12 +672,18 @@ func (rm *RouteManager) Generation() uint64 {
 
 // Match finds the first matching route for a request
 func (rm *RouteManager) Match(req *RouteRequest) *Route {
+	return cloneRoute(rm.matchInstalled(req), false)
+}
+
+// matchInstalled returns a manager-owned immutable snapshot for the internal
+// proxy hot path. It must never escape through an exported result.
+func (rm *RouteManager) matchInstalled(req *RouteRequest) *Route {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 
 	for _, route := range rm.routes {
 		if rm.matchRoute(route, req) {
-			return cloneRoute(route, false)
+			return route
 		}
 	}
 	return nil
@@ -589,6 +693,11 @@ func (rm *RouteManager) Match(req *RouteRequest) *Route {
 // used for capability discovery. A false result means the caller must refresh
 // its capability lease before executing.
 func (rm *RouteManager) MatchAtGeneration(req *RouteRequest, generation uint64) (*Route, bool) {
+	route, current := rm.matchInstalledAtGeneration(req, generation)
+	return cloneRoute(route, false), current
+}
+
+func (rm *RouteManager) matchInstalledAtGeneration(req *RouteRequest, generation uint64) (*Route, bool) {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 	if rm.generation != generation {
@@ -596,7 +705,7 @@ func (rm *RouteManager) MatchAtGeneration(req *RouteRequest, generation uint64) 
 	}
 	for _, route := range rm.routes {
 		if rm.matchRoute(route, req) {
-			return cloneRoute(route, false), true
+			return route, true
 		}
 	}
 	return nil, true
@@ -645,7 +754,7 @@ func (rm *RouteManager) PotentialCohortFor(req *RouteRequest) RouteCohort {
 		if len(route.ModelPatterns) > 0 {
 			matched := false
 			for _, pattern := range route.ModelPatterns {
-				if pattern.MatchString(req.Model) {
+				if pattern.Matches(req.Model) {
 					matched = true
 					break
 				}
@@ -720,7 +829,7 @@ func (rm *RouteManager) matchRoute(route *Route, req *RouteRequest) bool {
 	if len(route.ModelPatterns) > 0 {
 		matched := false
 		for _, pattern := range route.ModelPatterns {
-			if pattern.MatchString(req.Model) {
+			if pattern.Matches(req.Model) {
 				matched = true
 				break
 			}
@@ -776,12 +885,12 @@ func (rm *RouteManager) matchRoute(route *Route, req *RouteRequest) bool {
 // SelectDestination chooses a destination from a matched route
 // based on weights and conditions
 func (rm *RouteManager) SelectDestination(route *Route, req *RouteRequest, registry *ModelRegistry) (*Destination, error) {
-	return rm.SelectDestinationWithin(route, req, registry, nil)
+	return rm.selectDestinationWithin(route, req, registry, nil)
 }
 
-// SelectDestinationWithin applies route weights and conditions only to pools
+// selectDestinationWithin applies route weights and conditions only to pools
 // containing a currently healthy endpoint from the immutable capability lease.
-func (rm *RouteManager) SelectDestinationWithin(route *Route, req *RouteRequest, registry *ModelRegistry, allowed map[string]*Endpoint) (*Destination, error) {
+func (rm *RouteManager) selectDestinationWithin(route *Route, req *RouteRequest, registry *ModelRegistry, allowed map[string]endpointRef) (*Destination, error) {
 	// Collect eligible destinations
 	eligible := make([]Destination, 0)
 	totalWeight := int32(0)
@@ -827,8 +936,8 @@ func (rm *RouteManager) evaluateConditions(dest *Destination, req *RouteRequest,
 	return rm.evaluateConditionsWithin(dest, req, registry, nil)
 }
 
-func (rm *RouteManager) evaluateConditionsWithin(dest *Destination, req *RouteRequest, registry *ModelRegistry, allowed map[string]*Endpoint) bool {
-	stats := registry.PoolConditionStatsWithin(dest.Pool, req.Model, allowed)
+func (rm *RouteManager) evaluateConditionsWithin(dest *Destination, req *RouteRequest, registry *ModelRegistry, allowed map[string]endpointRef) bool {
+	stats := registry.poolConditionStatsWithin(dest.Pool, req.Model, allowed)
 	if stats.HealthyEndpoints == 0 {
 		return false // Pool has no healthy endpoints
 	}
@@ -872,14 +981,14 @@ func (rm *RouteManager) evaluateConditionsWithin(dest *Destination, req *RouteRe
 }
 
 // CompileModelPattern compiles a model pattern with wildcards to a regex
-func CompileModelPattern(pattern string) (*regexp.Regexp, error) {
+func CompileModelPattern(pattern string) (*RegexPattern, error) {
 	// Escape regex special chars except *
 	escaped := regexp.QuoteMeta(pattern)
 	// Convert * to .*
 	regexPattern := strings.ReplaceAll(escaped, `\*`, `.*`)
 	// Anchor the pattern
 	regexPattern = "^" + regexPattern + "$"
-	return regexp.Compile(regexPattern)
+	return CompileRegexPattern(regexPattern, RegexLeftmostFirst)
 }
 
 // ParseThresholdCondition parses conditions like ">50", ">=100", "<10"

@@ -51,6 +51,11 @@ test "inference module compiles" {
     _ = list_models;
     _ = query_embedding_cache;
     _ = work;
+    _ = remote_capabilities;
+}
+
+test "remote capability invalidation fences active discovery" {
+    try remote_capabilities.testCapabilityInvalidationFencesActiveFlight();
 }
 
 test "bedrock provider request helpers" {

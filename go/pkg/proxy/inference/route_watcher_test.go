@@ -34,3 +34,21 @@ func TestRouteWatcherIgnoresInformerResyncUpdate(t *testing.T) {
 		t.Fatalf("generation = %d after informer resync, want %d", got, generation)
 	}
 }
+
+func TestRouteWatcherRejectsInvalidHeaderRegex(t *testing.T) {
+	t.Parallel()
+	watcher := &RouteWatcher{routeManager: NewRouteManager(), logger: zap.NewNop()}
+	object := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"namespace": "default", "name": "reader"},
+		"spec": map[string]any{
+			"match": map[string]any{
+				"headers": map[string]any{
+					"x-tenant": map[string]any{"regex": "["},
+				},
+			},
+		},
+	}}
+	if _, err := watcher.convertRoute(object); err == nil {
+		t.Fatal("invalid header regex was accepted")
+	}
+}

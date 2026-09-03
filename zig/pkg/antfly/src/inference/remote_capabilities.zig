@@ -119,6 +119,10 @@ const CapabilityFlight = struct {
     routing_token: ?RoutingToken = null,
     descriptor_revision: ?CapabilityRevision = null,
     err: ?anyerror = null,
+    // An execution-side stale response is an authoritative revocation. A
+    // discovery response that was already in flight at that boundary cannot
+    // publish its older lease afterward.
+    invalidated: bool = false,
     ready: std.Io.Event = .unset,
     refs_changed: std.Io.Event = .unset,
 };
@@ -248,7 +252,8 @@ pub const Cache = struct {
             }
             if (self.flights.get(key)) |flight| {
                 if (flight.done and (if (flight.err) |err|
-                    err == error.CapabilityDiscoveryOwnerAbandoned
+                    err == error.CapabilityDiscoveryOwnerAbandoned or
+                        err == error.CapabilityDiscoveryInvalidated
                 else
                     false))
                 {
@@ -278,7 +283,8 @@ pub const Cache = struct {
                 self.releaseFlightLocked(flight);
                 self.mutex.unlock(self.io);
                 if (flight_err) |err| {
-                    if (err == error.CapabilityDiscoveryOwnerAbandoned) continue;
+                    if (err == error.CapabilityDiscoveryOwnerAbandoned or
+                        err == error.CapabilityDiscoveryInvalidated) continue;
                     return err;
                 }
                 return .{
@@ -320,6 +326,10 @@ pub const Cache = struct {
                     break :blk null;
                 };
                 self.mutex.lockUncancelable(self.io);
+                if (self.retireInvalidatedFlightLocked(flight)) {
+                    self.mutex.unlock(self.io);
+                    continue;
+                }
                 if (owner_context_error != null) {
                     flight.err = error.CapabilityDiscoveryOwnerAbandoned;
                     flight.done = true;
@@ -360,6 +370,10 @@ pub const Cache = struct {
                     break :blk null;
                 };
                 self.mutex.lockUncancelable(self.io);
+                if (owner_context_error == null and self.retireInvalidatedFlightLocked(flight)) {
+                    self.mutex.unlock(self.io);
+                    continue;
+                }
                 // Authoritative rejection, routing-stale responses, and invalid
                 // contracts revoke the cached plan. Only explicitly transient
                 // discovery failures are eligible for stale-if-error behavior.
@@ -491,6 +505,9 @@ pub const Cache = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.removeEntryLocked(key);
+        if (self.flights.get(key)) |flight| {
+            if (!flight.done) flight.invalidated = true;
+        }
     }
 
     fn removeEntryLocked(self: *Cache, key: []const u8) void {
@@ -511,6 +528,20 @@ pub const Cache = struct {
             const removed = self.entries.fetchRemove(key) orelse return;
             self.alloc.free(@constCast(removed.key));
         }
+    }
+
+    // Returns true after retiring an invalidated owner without publishing its
+    // discovery result. The caller holds mutex and must unlock before retrying.
+    fn retireInvalidatedFlightLocked(self: *Cache, flight: *CapabilityFlight) bool {
+        if (!flight.invalidated) return false;
+        flight.value = null;
+        flight.routing_token = null;
+        flight.descriptor_revision = null;
+        flight.err = error.CapabilityDiscoveryInvalidated;
+        flight.done = true;
+        flight.ready.set(self.io);
+        self.releaseFlightLocked(flight);
+        return true;
     }
 
     fn releaseFlightLocked(self: *Cache, flight: *CapabilityFlight) void {
@@ -1409,4 +1440,44 @@ test "capability stale revocation prevents transient rediscovery fallback" {
         error.RemoteCapabilityDiscoveryTransient,
     );
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, completion.err.?);
+}
+
+pub fn testCapabilityInvalidationFencesActiveFlight() !void {
+    const alloc = std.testing.allocator;
+    var cache = Cache.init(alloc, std.Options.debug_io);
+    defer cache.deinit();
+    const headers: []const [2][]const u8 = &.{};
+    const key = try capabilityCacheKeyAlloc(alloc, "http://proxy", "model", .read, headers);
+    const flight = try alloc.create(CapabilityFlight);
+    // Keep a synthetic waiter reference so the test can inspect the exact
+    // post-completion state before releasing the flight.
+    flight.* = .{ .key = key, .refs = 2 };
+    try cache.flights.put(alloc, flight.key, flight);
+
+    try cache.invalidate("http://proxy", "model", .read, headers);
+    try std.testing.expect(flight.invalidated);
+
+    // Exercise the same publication gate used by a successful discovery owner.
+    cache.mutex.lockUncancelable(cache.io);
+    const retired = cache.retireInvalidatedFlightLocked(flight);
+    const done = flight.done;
+    const flight_err = flight.err;
+    const value = flight.value;
+    const entry_absent = cache.entries.get(flight.key) == null;
+    cache.mutex.unlock(cache.io);
+    defer {
+        // Release the synthetic waiter and destroy the retired flight.
+        cache.mutex.lockUncancelable(cache.io);
+        cache.releaseFlightLocked(flight);
+        cache.mutex.unlock(cache.io);
+    }
+    try std.testing.expect(retired);
+    try std.testing.expect(done);
+    try std.testing.expectEqual(error.CapabilityDiscoveryInvalidated, flight_err.?);
+    try std.testing.expect(value == null);
+    try std.testing.expect(entry_absent);
+}
+
+test "capability invalidation fences an active discovery flight" {
+    try testCapabilityInvalidationFencesActiveFlight();
 }

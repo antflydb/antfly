@@ -3693,6 +3693,7 @@ pub fn build(b: *std.Build) void {
         "query embedding cache owns results and coalesces misses",
         "query embedding cache keys isolate security domains",
         "managed embedder deadlines bound provider pacing and transport",
+        "remote capability invalidation fences active discovery",
         "managed embedder dimension probe validation modes",
         "managed embedding request overlays borrow capability cache synchronization",
         "managed embedder rejects malformed provider vectors",

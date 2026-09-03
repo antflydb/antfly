@@ -107,25 +107,130 @@ const (
 
 // Endpoint represents a single inference instance
 type Endpoint struct {
-	Address      string
-	HealthURL    string
-	Pool         string
-	WorkloadType WorkloadType
-	Models       map[string]*ModelInfo
-	// CatalogKnown distinguishes a successfully discovered empty/partial catalog
+	address      string
+	healthURL    string
+	pool         string
+	workloadType WorkloadType
+	models       map[string]*ModelInfo
+	// catalogKnown distinguishes a successfully discovered empty/partial catalog
 	// from bootstrap registration, where the proxy has not learned capabilities
 	// yet. Bootstrap endpoints participate only in task-unscoped legacy lookup;
 	// executable routes require a discovered per-model operation.
-	CatalogKnown bool
-	QueueDepth   int32
-	LastSeen     time.Time
-	Healthy      bool
-	Connections  int32 // Active connections
+	catalogKnown bool
+	runtime      *endpointRuntime
+	lastSeen     time.Time
+	healthy      bool
 	// incarnation is assigned by the registry and changes whenever an address is
 	// replaced or its routing topology changes. It is the authority captured by
 	// distributed capability discovery and execution leases.
 	incarnation uint64
 }
+
+type endpointRuntime struct {
+	queueDepth  int32
+	connections int32
+}
+
+// Address returns the immutable network identity of this endpoint. All other
+// registry state is exposed through value snapshots so callers cannot mutate
+// routing state behind the registry's incarnation fence.
+func (e *Endpoint) Address() string {
+	if e == nil {
+		return ""
+	}
+	return e.address
+}
+
+// Pool returns the endpoint's immutable routing pool.
+func (e *Endpoint) Pool() string {
+	if e == nil {
+		return ""
+	}
+	return e.pool
+}
+
+// WorkloadType returns the endpoint's immutable scheduling class.
+func (e *Endpoint) WorkloadType() WorkloadType {
+	if e == nil {
+		return ""
+	}
+	return e.workloadType
+}
+
+// EndpointSnapshot is a detached, read-only view of registry state.
+type EndpointSnapshot struct {
+	Address      string
+	HealthURL    string
+	Pool         string
+	WorkloadType WorkloadType
+	Models       []ModelSnapshot
+	CatalogKnown bool
+	QueueDepth   int32
+	LastSeen     time.Time
+	Healthy      bool
+	Connections  int32
+	Incarnation  uint64
+}
+
+// ModelSnapshot is the detached model catalog carried by EndpointSnapshot.
+// Operations are sorted so snapshots are deterministic and safe to compare.
+type ModelSnapshot struct {
+	Name           string
+	LoadedAt       time.Time
+	RequestsTotal  int64
+	AvgLatencyMs   float64
+	OperationState ModelOperationState
+	Operations     []OperationType
+}
+
+// endpointRef is an immutable registry identity captured while the registry is
+// read-locked. Endpoint pointers and addresses are deliberately insufficient:
+// topology changes replace Endpoint objects and addresses may be reused.
+type endpointRef struct {
+	endpoint    *Endpoint
+	incarnation uint64
+	breaker     *CircuitBreaker
+}
+
+// endpointReservation is the linearized result of selecting and admitting one
+// endpoint incarnation. The exact breaker must travel with the reservation so
+// completion can never be charged to a replacement registered at the same
+// address.
+type endpointReservation struct {
+	ref endpointRef
+}
+
+// EndpointLease is the public reservation API. It exposes the immutable
+// endpoint identity while retaining the exact circuit breaker that admitted
+// this incarnation.
+type EndpointLease struct {
+	reservation endpointReservation
+	once        sync.Once
+}
+
+// Endpoint returns the immutable endpoint identity reserved by this lease.
+func (l *EndpointLease) Endpoint() *Endpoint {
+	if l == nil {
+		return nil
+	}
+	return l.reservation.ref.endpoint
+}
+
+func (l *EndpointLease) finish(fn func(*CircuitBreaker)) {
+	if l == nil || l.reservation.ref.breaker == nil {
+		return
+	}
+	l.once.Do(func() { fn(l.reservation.ref.breaker) })
+}
+
+// RecordSuccess completes the lease and records successful execution.
+func (l *EndpointLease) RecordSuccess() { l.finish(func(cb *CircuitBreaker) { cb.RecordSuccess() }) }
+
+// RecordFailure completes the lease and records failed execution.
+func (l *EndpointLease) RecordFailure() { l.finish(func(cb *CircuitBreaker) { cb.RecordFailure() }) }
+
+// Release abandons the lease without recording an execution result.
+func (l *EndpointLease) Release() { l.finish(func(cb *CircuitBreaker) { cb.ReleaseReservation() }) }
 
 // ModelInfo contains information about a loaded model
 type ModelInfo struct {
@@ -317,28 +422,58 @@ func (r *ModelRegistry) RegisterEndpointWithHealth(address, healthURL, pool stri
 	ep, exists := r.endpoints[address]
 	if !exists {
 		ep = &Endpoint{
-			Address:      address,
-			HealthURL:    healthURL,
-			Pool:         pool,
-			WorkloadType: workloadType,
-			Models:       make(map[string]*ModelInfo),
-			Healthy:      true,
-			LastSeen:     time.Now(),
+			address:      address,
+			healthURL:    healthURL,
+			pool:         pool,
+			workloadType: workloadType,
+			models:       make(map[string]*ModelInfo),
+			runtime:      &endpointRuntime{},
+			healthy:      true,
+			lastSeen:     time.Now(),
 			incarnation:  r.nextEndpointIncarnationLocked(),
 		}
 		r.endpoints[address] = ep
 		r.circuitBreakers[address] = NewCircuitBreaker(5, 30*time.Second)
 	} else {
-		oldPool := ep.Pool
-		if ep.HealthURL != healthURL || ep.Pool != pool || ep.WorkloadType != workloadType {
-			ep.incarnation = r.nextEndpointIncarnationLocked()
-		}
-		ep.HealthURL = healthURL
-		ep.Pool = pool
-		ep.WorkloadType = workloadType
-		ep.LastSeen = time.Now()
-		if oldPool != pool {
+		oldPool := ep.pool
+		if ep.healthURL != healthURL || ep.pool != pool || ep.workloadType != workloadType {
 			r.removeEndpointFromPoolLocked(address, oldPool)
+			if oldPool != pool {
+				endpointHealth.WithLabelValues(oldPool, address).Set(0)
+				for model := range ep.models {
+					modelLoaded.WithLabelValues(oldPool, address, model).Set(0)
+					modelLoaded.WithLabelValues(pool, address, model).Set(1)
+				}
+			}
+			replacement := &Endpoint{
+				address:      address,
+				healthURL:    healthURL,
+				pool:         pool,
+				workloadType: workloadType,
+				models:       ep.models,
+				catalogKnown: ep.catalogKnown,
+				runtime:      ep.runtime,
+				lastSeen:     time.Now(),
+				healthy:      ep.healthy,
+				incarnation:  r.nextEndpointIncarnationLocked(),
+			}
+			for model := range ep.models {
+				for i, indexed := range r.models[model] {
+					if indexed == ep {
+						r.models[model][i] = replacement
+					}
+				}
+			}
+			ep = replacement
+			r.endpoints[address] = replacement
+			r.circuitBreakers[address] = NewCircuitBreaker(5, 30*time.Second)
+			healthValue := float64(0)
+			if replacement.healthy {
+				healthValue = 1
+			}
+			endpointHealth.WithLabelValues(pool, address).Set(healthValue)
+		} else {
+			ep.lastSeen = time.Now()
 		}
 	}
 
@@ -348,7 +483,7 @@ func (r *ModelRegistry) RegisterEndpointWithHealth(address, healthURL, pool stri
 	}
 	found := false
 	for _, indexed := range r.pools[pool] {
-		if indexed.Address == address {
+		if indexed.address == address {
 			found = true
 			break
 		}
@@ -369,7 +504,7 @@ func (r *ModelRegistry) nextEndpointIncarnationLocked() uint64 {
 func (r *ModelRegistry) removeEndpointFromPoolLocked(address, pool string) {
 	newPoolEndpoints := make([]*Endpoint, 0, len(r.pools[pool]))
 	for _, e := range r.pools[pool] {
-		if e.Address != address {
+		if e.address != address {
 			newPoolEndpoints = append(newPoolEndpoints, e)
 		}
 	}
@@ -387,7 +522,7 @@ func (r *ModelRegistry) endpointHealthURL(address string) string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if ep, exists := r.endpoints[address]; exists {
-		return ep.HealthURL
+		return ep.healthURL
 	}
 	return ""
 }
@@ -403,13 +538,13 @@ func (r *ModelRegistry) UnregisterEndpoint(address string) {
 	}
 
 	// Remove from pool index
-	r.removeEndpointFromPoolLocked(address, ep.Pool)
+	r.removeEndpointFromPoolLocked(address, ep.pool)
 
 	// Remove from model index
-	for model := range ep.Models {
+	for model := range ep.models {
 		newModelEndpoints := make([]*Endpoint, 0)
 		for _, e := range r.models[model] {
-			if e.Address != address {
+			if e.address != address {
 				newModelEndpoints = append(newModelEndpoints, e)
 			}
 		}
@@ -432,14 +567,26 @@ func (r *ModelRegistry) UpdateModelOperations(address string, operations map[str
 	r.updateModelOperationsForEndpoint(address, nil, 0, operations)
 }
 
-func (r *ModelRegistry) endpointAtIncarnation(address string, incarnation uint64) *Endpoint {
+func (r *ModelRegistry) endpointRefAtIncarnation(address string, incarnation uint64) (endpointRef, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	endpoint := r.endpoints[address]
 	if endpoint == nil || endpoint.incarnation != incarnation {
+		return endpointRef{}, false
+	}
+	breaker := r.circuitBreakers[address]
+	if breaker == nil {
+		return endpointRef{}, false
+	}
+	return endpointRef{endpoint: endpoint, incarnation: incarnation, breaker: breaker}, true
+}
+
+func (r *ModelRegistry) endpointAtIncarnation(address string, incarnation uint64) *Endpoint {
+	ref, ok := r.endpointRefAtIncarnation(address, incarnation)
+	if !ok {
 		return nil
 	}
-	return endpoint
+	return ref.endpoint
 }
 
 func (r *ModelRegistry) endpointIncarnationSnapshotLocked() map[string]uint64 {
@@ -481,21 +628,21 @@ func (r *ModelRegistry) updateModelsForEndpoint(
 
 	// Track old models for cleanup
 	oldModels := make(map[string]bool)
-	for m := range ep.Models {
+	for m := range ep.models {
 		oldModels[m] = true
 	}
 
 	// Update models
 	for _, model := range models {
-		if _, exists := ep.Models[model]; !exists {
-			ep.Models[model] = newModelInfo(model)
+		if _, exists := ep.models[model]; !exists {
+			ep.models[model] = newModelInfo(model)
 		}
 		if operations != nil {
-			ep.Models[model].Operations = cloneOperations(operations[model])
-			if len(ep.Models[model].Operations) == 0 {
-				ep.Models[model].OperationState = ModelOperationsTaskUnknown
+			ep.models[model].Operations = cloneOperations(operations[model])
+			if len(ep.models[model].Operations) == 0 {
+				ep.models[model].OperationState = ModelOperationsTaskUnknown
 			} else {
-				ep.Models[model].OperationState = ModelOperationsKnown
+				ep.models[model].OperationState = ModelOperationsKnown
 			}
 		}
 		delete(oldModels, model)
@@ -506,7 +653,7 @@ func (r *ModelRegistry) updateModelsForEndpoint(
 		}
 		found := false
 		for _, e := range r.models[model] {
-			if e.Address == address {
+			if e.address == address {
 				found = true
 				break
 			}
@@ -516,26 +663,26 @@ func (r *ModelRegistry) updateModelsForEndpoint(
 		}
 
 		// Update metric
-		modelLoaded.WithLabelValues(ep.Pool, address, model).Set(1)
+		modelLoaded.WithLabelValues(ep.pool, address, model).Set(1)
 	}
 
 	// Remove old models
 	for model := range oldModels {
-		delete(ep.Models, model)
+		delete(ep.models, model)
 		// Remove from model index
 		newEndpoints := make([]*Endpoint, 0)
 		for _, e := range r.models[model] {
-			if e.Address != address {
+			if e.address != address {
 				newEndpoints = append(newEndpoints, e)
 			}
 		}
 		r.models[model] = newEndpoints
-		modelLoaded.WithLabelValues(ep.Pool, address, model).Set(0)
+		modelLoaded.WithLabelValues(ep.pool, address, model).Set(0)
 	}
 
-	ep.LastSeen = time.Now()
+	ep.lastSeen = time.Now()
 	if catalogKnown {
-		ep.CatalogKnown = true
+		ep.catalogKnown = true
 	}
 }
 
@@ -562,10 +709,10 @@ func (r *ModelRegistry) RecordModelLatency(address, model string, duration time.
 		return
 	}
 
-	info, exists := ep.Models[model]
+	info, exists := ep.models[model]
 	if !exists {
 		info = newModelInfo(model)
-		ep.Models[model] = info
+		ep.models[model] = info
 	}
 	if info.Latency == nil {
 		info.Latency = NewRollingLatency(defaultLatencyWindowSize)
@@ -604,11 +751,11 @@ func (r *ModelRegistry) getAvailableEndpointsForModelLocked(model, pool string, 
 	endpoints := r.models[model]
 	result := make([]*Endpoint, 0, len(endpoints))
 	for _, ep := range endpoints {
-		if pool != "" && ep.Pool != pool {
+		if pool != "" && ep.pool != pool {
 			continue
 		}
 		if r.isEndpointAvailableLocked(ep) {
-			if operation != "" && !modelSupportsOperation(ep.Models[model], operation) {
+			if operation != "" && !modelSupportsOperation(ep.models[model], operation) {
 				continue
 			}
 			result = append(result, ep)
@@ -632,7 +779,7 @@ func (r *ModelRegistry) getBootstrapEndpointsForPool(pool string) []*Endpoint {
 	defer r.mu.RUnlock()
 	result := make([]*Endpoint, 0, len(r.pools[pool]))
 	for _, ep := range r.pools[pool] {
-		if !ep.CatalogKnown && r.isEndpointAvailableLocked(ep) {
+		if !ep.catalogKnown && r.isEndpointAvailableLocked(ep) {
 			result = append(result, ep)
 		}
 	}
@@ -667,14 +814,14 @@ func (r *ModelRegistry) GetAvailableEndpoints() []*Endpoint {
 }
 
 func (r *ModelRegistry) PoolConditionStats(pool, model string) PoolConditionStats {
-	return r.PoolConditionStatsWithin(pool, model, nil)
+	return r.poolConditionStatsWithin(pool, model, nil)
 }
 
-// PoolConditionStatsWithin evaluates route conditions against an optional
+// poolConditionStatsWithin evaluates route conditions against an optional
 // immutable capability-lease endpoint set. This prevents a weighted route from
 // selecting a healthy but undiscovered pool and rejecting after selection when
 // another leased destination is available.
-func (r *ModelRegistry) PoolConditionStatsWithin(pool, model string, allowed map[string]*Endpoint) PoolConditionStats {
+func (r *ModelRegistry) poolConditionStatsWithin(pool, model string, allowed map[string]endpointRef) PoolConditionStats {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -692,14 +839,15 @@ func (r *ModelRegistry) PoolConditionStatsWithin(pool, model string, allowed map
 			continue
 		}
 		if allowed != nil {
-			expected, ok := allowed[ep.Address]
-			if !ok || expected != ep {
+			expected, ok := allowed[ep.address]
+			if !ok || expected.endpoint != ep || expected.incarnation != ep.incarnation ||
+				expected.breaker != r.circuitBreakers[ep.address] {
 				continue
 			}
 		}
 
 		stats.HealthyEndpoints++
-		totalQueueDepth += int64(atomic.LoadInt32(&ep.QueueDepth))
+		totalQueueDepth += int64(atomic.LoadInt32(&ep.runtime.queueDepth))
 
 		if allowed != nil {
 			// Inclusion in a model/task/operation lease is the caller-authorized proof that
@@ -707,7 +855,7 @@ func (r *ModelRegistry) PoolConditionStatsWithin(pool, model string, allowed map
 			// credential cannot see the same tenant-scoped catalog entry.
 			stats.ModelLoaded = true
 		}
-		info, exists := ep.Models[model]
+		info, exists := ep.models[model]
 		if !exists {
 			continue
 		}
@@ -735,22 +883,26 @@ func newModelInfo(name string) *ModelInfo {
 	}
 }
 
-func (r *ModelRegistry) TryAcquireEndpoint(address string) bool {
+func (r *ModelRegistry) tryAcquireEndpoint(expected endpointRef) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	cb := r.circuitBreakers[address]
-	if cb == nil {
+	if expected.endpoint == nil || expected.incarnation == 0 || expected.breaker == nil {
 		return false
 	}
-	return cb.TryAcquire()
+	current := r.endpoints[expected.endpoint.address]
+	if current != expected.endpoint || current.incarnation != expected.incarnation ||
+		r.circuitBreakers[current.address] != expected.breaker || !r.isEndpointAvailableLocked(current) {
+		return false
+	}
+	return expected.breaker.TryAcquire()
 }
 
 func (r *ModelRegistry) isEndpointAvailableLocked(ep *Endpoint) bool {
-	if ep == nil || !ep.Healthy {
+	if ep == nil || !ep.healthy {
 		return false
 	}
-	cb := r.circuitBreakers[ep.Address]
+	cb := r.circuitBreakers[ep.address]
 	if cb == nil {
 		return false
 	}
@@ -764,7 +916,7 @@ func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) err
 	var healthURL string
 	var expectedIncarnation uint64
 	if expected != nil {
-		healthURL = expected.HealthURL
+		healthURL = expected.healthURL
 		expectedIncarnation = expected.incarnation
 	}
 	r.mu.RUnlock()
@@ -936,30 +1088,60 @@ func (r *ModelRegistry) markEndpointHealth(address string, expected *Endpoint, e
 		if expected != nil && (ep != expected || ep.incarnation != expectedIncarnation) {
 			return
 		}
-		ep.Healthy = healthy
+		ep.healthy = healthy
 		value := float64(0)
 		if healthy {
 			value = 1
 		}
-		endpointHealth.WithLabelValues(ep.Pool, address).Set(value)
+		endpointHealth.WithLabelValues(ep.pool, address).Set(value)
 	}
 }
 
-// GetCircuitBreaker returns the circuit breaker for an endpoint
-func (r *ModelRegistry) GetCircuitBreaker(address string) *CircuitBreaker {
+func (r *ModelRegistry) circuitBreaker(address string) *CircuitBreaker {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.circuitBreakers[address]
 }
 
-// GetLock returns the registry's read-write lock for external access
-func (r *ModelRegistry) GetLock() *sync.RWMutex {
-	return &r.mu
-}
-
-// GetEndpoints returns all registered endpoints (caller must hold lock)
-func (r *ModelRegistry) GetEndpoints() map[string]*Endpoint {
-	return r.endpoints
+// EndpointSnapshots returns detached endpoint values in stable address order.
+func (r *ModelRegistry) EndpointSnapshots() []EndpointSnapshot {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	snapshots := make([]EndpointSnapshot, 0, len(r.endpoints))
+	for _, endpoint := range r.endpoints {
+		models := make([]ModelSnapshot, 0, len(endpoint.models))
+		for _, model := range endpoint.models {
+			operations := make([]OperationType, 0, len(model.Operations))
+			for operation := range model.Operations {
+				operations = append(operations, operation)
+			}
+			sort.Slice(operations, func(i, j int) bool { return operations[i] < operations[j] })
+			models = append(models, ModelSnapshot{
+				Name:           model.Name,
+				LoadedAt:       model.LoadedAt,
+				RequestsTotal:  model.RequestsTotal,
+				AvgLatencyMs:   model.AvgLatencyMs,
+				OperationState: model.OperationState,
+				Operations:     operations,
+			})
+		}
+		sort.Slice(models, func(i, j int) bool { return models[i].Name < models[j].Name })
+		snapshots = append(snapshots, EndpointSnapshot{
+			Address:      endpoint.address,
+			HealthURL:    endpoint.healthURL,
+			Pool:         endpoint.pool,
+			WorkloadType: endpoint.workloadType,
+			Models:       models,
+			CatalogKnown: endpoint.catalogKnown,
+			QueueDepth:   atomic.LoadInt32(&endpoint.runtime.queueDepth),
+			LastSeen:     endpoint.lastSeen,
+			Healthy:      endpoint.healthy,
+			Connections:  atomic.LoadInt32(&endpoint.runtime.connections),
+			Incarnation:  endpoint.incarnation,
+		})
+	}
+	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].Address < snapshots[j].Address })
+	return snapshots
 }
 
 // Router handles request routing logic
@@ -979,70 +1161,94 @@ func NewRouter(registry *ModelRegistry) *Router {
 	}
 }
 
-// RouteRequest selects the best endpoint for a request
-func (r *Router) RouteRequest(ctx context.Context, model string, pool string, workloadType WorkloadType, excluded map[string]bool, operations ...OperationType) (*Endpoint, error) {
-	return r.RouteRequestWithin(ctx, model, pool, workloadType, excluded, nil, operations...)
+// AcquireEndpoint selects and reserves an endpoint incarnation. Callers must
+// complete the returned lease exactly once.
+func (r *Router) AcquireEndpoint(ctx context.Context, model string, pool string, workloadType WorkloadType, excluded map[string]bool, operations ...OperationType) (*EndpointLease, error) {
+	reservation, err := r.routeRequestWithin(ctx, model, pool, workloadType, excluded, nil, operations...)
+	if err != nil {
+		return nil, err
+	}
+	return &EndpointLease{reservation: reservation}, nil
 }
 
-// RouteRequestWithin selects only from the endpoint identities covered by a
+// routeRequestWithin selects only from the endpoint identities covered by a
 // capability lease. A nil allowed map preserves legacy, unfenced routing.
-func (r *Router) RouteRequestWithin(ctx context.Context, model string, pool string, workloadType WorkloadType, excluded map[string]bool, allowed map[string]*Endpoint, operations ...OperationType) (*Endpoint, error) {
-	endpoints := r.ResolveEndpointCandidatesWithin(model, pool, excluded, allowed, operations...)
-	if len(endpoints) == 0 {
-		return nil, fmt.Errorf("no healthy endpoints available for model %s", model)
+func (r *Router) routeRequestWithin(ctx context.Context, model string, pool string, workloadType WorkloadType, excluded map[string]bool, allowed map[string]endpointRef, operations ...OperationType) (endpointReservation, error) {
+	_ = ctx
+	candidates := r.resolveEndpointCandidateRefsWithin(model, pool, excluded, allowed, operations...)
+	if len(candidates) == 0 {
+		return endpointReservation{}, fmt.Errorf("no healthy endpoints available for model %s", model)
 	}
 
-	candidates := make([]*Endpoint, len(endpoints))
-	copy(candidates, endpoints)
-
 	for len(candidates) > 0 {
-		endpoint, err := r.selectEndpoint(model, workloadType, candidates, true)
-		if err != nil {
-			return nil, err
+		endpoints := make([]*Endpoint, len(candidates))
+		for i := range candidates {
+			endpoints[i] = candidates[i].endpoint
 		}
-		if r.registry.TryAcquireEndpoint(endpoint.Address) {
-			return endpoint, nil
+		endpoint, err := r.selectEndpoint(model, workloadType, endpoints, true)
+		if err != nil {
+			return endpointReservation{}, err
+		}
+		var selected endpointRef
+		for _, candidate := range candidates {
+			if candidate.endpoint == endpoint {
+				selected = candidate
+				break
+			}
+		}
+		if r.registry.tryAcquireEndpoint(selected) {
+			return endpointReservation{ref: selected}, nil
 		}
 
-		filtered := make([]*Endpoint, 0, len(candidates)-1)
-		for _, ep := range candidates {
-			if ep.Address != endpoint.Address {
-				filtered = append(filtered, ep)
+		filtered := make([]endpointRef, 0, len(candidates)-1)
+		for _, candidate := range candidates {
+			if candidate.endpoint != endpoint {
+				filtered = append(filtered, candidate)
 			}
 		}
 		candidates = filtered
 	}
 
-	return nil, fmt.Errorf("no healthy endpoints available for model %s", model)
+	return endpointReservation{}, fmt.Errorf("no healthy endpoints available for model %s", model)
 }
 
 // ResolveEndpointCandidates returns currently eligible endpoint candidates without reserving them.
 func (r *Router) ResolveEndpointCandidates(model string, pool string, excluded map[string]bool, operations ...OperationType) []*Endpoint {
-	return r.ResolveEndpointCandidatesWithin(model, pool, excluded, nil, operations...)
+	return r.resolveEndpointCandidatesWithin(model, pool, excluded, nil, operations...)
 }
 
-// ResolveEndpointCandidatesWithin intersects current operation eligibility
+// resolveEndpointCandidatesWithin intersects current operation eligibility
 // with the exact endpoint objects captured by a capability lease. Pointer
 // identity prevents an address-reused replacement from inheriting a lease.
-func (r *Router) ResolveEndpointCandidatesWithin(model string, pool string, excluded map[string]bool, allowed map[string]*Endpoint, operations ...OperationType) []*Endpoint {
+func (r *Router) resolveEndpointCandidatesWithin(model string, pool string, excluded map[string]bool, allowed map[string]endpointRef, operations ...OperationType) []*Endpoint {
+	refs := r.resolveEndpointCandidateRefsWithin(model, pool, excluded, allowed, operations...)
+	endpoints := make([]*Endpoint, len(refs))
+	for i := range refs {
+		endpoints[i] = refs[i].endpoint
+	}
+	return endpoints
+}
+
+func (r *Router) resolveEndpointCandidateRefsWithin(model string, pool string, excluded map[string]bool, allowed map[string]endpointRef, operations ...OperationType) []endpointRef {
 	if allowed != nil {
 		// A capability lease is an immutable, authorization-scoped proof that
 		// these exact endpoint incarnations advertised the semantic task. Do not
 		// re-filter it through the registry's service-credential catalog: that
 		// global inventory can legitimately differ from the caller's catalog.
 		r.registry.mu.RLock()
-		endpoints := make([]*Endpoint, 0, len(allowed))
+		endpoints := make([]endpointRef, 0, len(allowed))
 		for address, expected := range allowed {
 			endpoint := r.registry.endpoints[address]
-			if endpoint == nil || endpoint != expected || (pool != "" && endpoint.Pool != pool) ||
-				!r.registry.isEndpointAvailableLocked(endpoint) {
+			if endpoint == nil || endpoint != expected.endpoint || endpoint.incarnation != expected.incarnation ||
+				r.registry.circuitBreakers[address] != expected.breaker ||
+				(pool != "" && endpoint.pool != pool) || !r.registry.isEndpointAvailableLocked(endpoint) {
 				continue
 			}
-			endpoints = append(endpoints, endpoint)
+			endpoints = append(endpoints, expected)
 		}
 		r.registry.mu.RUnlock()
-		sort.Slice(endpoints, func(i, j int) bool { return endpoints[i].Address < endpoints[j].Address })
-		return filterExcludedEndpoints(endpoints, excluded)
+		sort.Slice(endpoints, func(i, j int) bool { return endpoints[i].endpoint.address < endpoints[j].endpoint.address })
+		return filterExcludedEndpointRefs(endpoints, excluded)
 	}
 
 	var endpoints []*Endpoint
@@ -1072,11 +1278,43 @@ func (r *Router) ResolveEndpointCandidatesWithin(model string, pool string, excl
 		}
 	}
 
-	filtered := filterExcludedEndpoints(endpoints, excluded)
+	refs := r.registry.endpointRefs(endpoints)
+	filtered := filterExcludedEndpointRefs(refs, excluded)
 	if len(filtered) > 0 {
 		return filtered
 	}
-	return endpoints
+	return refs
+}
+
+func (r *ModelRegistry) endpointRefs(endpoints []*Endpoint) []endpointRef {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	refs := make([]endpointRef, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		if endpoint == nil || r.endpoints[endpoint.address] != endpoint {
+			continue
+		}
+		breaker := r.circuitBreakers[endpoint.address]
+		if breaker == nil {
+			continue
+		}
+		refs = append(refs, endpointRef{endpoint: endpoint, incarnation: endpoint.incarnation, breaker: breaker})
+	}
+	return refs
+}
+
+func filterExcludedEndpointRefs(endpoints []endpointRef, excluded map[string]bool) []endpointRef {
+	if len(endpoints) == 0 || len(excluded) == 0 {
+		return endpoints
+	}
+	filtered := make([]endpointRef, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		if endpoint.endpoint == nil || excluded[endpoint.endpoint.address] {
+			continue
+		}
+		filtered = append(filtered, endpoint)
+	}
+	return filtered
 }
 
 // RouteManager returns the route manager for advanced routing
@@ -1104,7 +1342,7 @@ func filterExcludedEndpoints(endpoints []*Endpoint, excluded map[string]bool) []
 
 	filtered := make([]*Endpoint, 0, len(endpoints))
 	for _, endpoint := range endpoints {
-		if endpoint == nil || excluded[endpoint.Address] {
+		if endpoint == nil || excluded[endpoint.address] {
 			continue
 		}
 		filtered = append(filtered, endpoint)
@@ -1139,7 +1377,7 @@ func (r *Router) leastLoaded(endpoints []*Endpoint) (*Endpoint, error) {
 	sorted := make([]*Endpoint, len(endpoints))
 	copy(sorted, endpoints)
 	sort.Slice(sorted, func(i, j int) bool {
-		return atomic.LoadInt32(&sorted[i].Connections) < atomic.LoadInt32(&sorted[j].Connections)
+		return atomic.LoadInt32(&sorted[i].runtime.connections) < atomic.LoadInt32(&sorted[j].runtime.connections)
 	})
 
 	return sorted[0], nil
@@ -1155,7 +1393,7 @@ func (r *Router) roundRobinWithQueueAwareness(endpoints []*Endpoint, maxQueue in
 	// Filter out endpoints with full queues
 	available := make([]*Endpoint, 0)
 	for _, ep := range endpoints {
-		if atomic.LoadInt32(&ep.QueueDepth) < maxQueue {
+		if atomic.LoadInt32(&ep.runtime.queueDepth) < maxQueue {
 			available = append(available, ep)
 		}
 	}
@@ -1208,7 +1446,7 @@ func (r *ConsistentHashRing) GetN(key string, endpoints []*Endpoint, n int) []*E
 
 	for i, ep := range endpoints {
 		// Combine key hash with endpoint hash
-		epHash := r.hash(ep.Address)
+		epHash := r.hash(ep.address)
 		scores[i] = scored{ep: ep, score: keyHash ^ epHash}
 	}
 
@@ -1532,8 +1770,8 @@ func (p *Proxy) catalogEndpointCohortForRequest(routing RoutingContext, model st
 	var endpoints []*Endpoint
 	for _, pool := range pools {
 		for _, endpoint := range p.registry.GetEndpointsForPool(pool) {
-			if endpoint != nil && !seen[endpoint.Address] {
-				seen[endpoint.Address] = true
+			if endpoint != nil && !seen[endpoint.address] {
+				seen[endpoint.address] = true
 				endpoints = append(endpoints, endpoint)
 			}
 		}
@@ -1618,11 +1856,11 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	targets := make([]catalogTarget, 0, len(endpoints))
 	p.registry.mu.RLock()
 	for _, endpoint := range endpoints {
-		current := p.registry.endpoints[endpoint.Address]
+		current := p.registry.endpoints[endpoint.address]
 		if current == endpoint {
 			targets = append(targets, catalogTarget{
 				endpoint:    endpoint,
-				address:     endpoint.Address,
+				address:     endpoint.address,
 				incarnation: endpoint.incarnation,
 			})
 		}
@@ -1956,13 +2194,13 @@ func (p *Proxy) validateCapabilityLease(token, revision, model string, operation
 	return err
 }
 
-func (p *Proxy) capabilityLeaseEndpoints(token, revision, model string, operation OperationType, authorizationDigest [sha256.Size]byte) (map[string]*Endpoint, error) {
+func (p *Proxy) capabilityLeaseEndpoints(token, revision, model string, operation OperationType, authorizationDigest [sha256.Size]byte) (map[string]endpointRef, error) {
 	lease, err := p.validatedCapabilityLease(token, revision, model, operation, authorizationDigest)
 	return lease.endpoints, err
 }
 
 type validatedCapabilityLease struct {
-	endpoints       map[string]*Endpoint
+	endpoints       map[string]endpointRef
 	routeGeneration uint64
 	scoped          bool
 }
@@ -1991,13 +2229,13 @@ func (p *Proxy) validatedCapabilityLease(token, revision, model string, operatio
 		p.deleteCapabilityLeaseIfIdentityMatches(token, lease.identity)
 		return validatedCapabilityLease{}, staleCapabilityResolutionError("inference capability lease is stale")
 	}
-	allowed := make(map[string]*Endpoint, len(lease.endpoints))
+	allowed := make(map[string]endpointRef, len(lease.endpoints))
 	for address, expected := range lease.endpoints {
 		if !expected.operations[operation] {
 			continue
 		}
-		endpoint := p.registry.endpointAtIncarnation(address, expected.incarnation)
-		if endpoint == nil {
+		endpoint, ok := p.registry.endpointRefAtIncarnation(address, expected.incarnation)
+		if !ok {
 			p.deleteCapabilityLeaseIfIdentityMatches(token, lease.identity)
 			return validatedCapabilityLease{}, staleCapabilityResolutionError("inference capability lease is stale")
 		}
@@ -2907,7 +3145,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 			if attempt+1 < attempts && shouldRetryRequestError(matchedRoute, reqErr) {
 				continue
 			}
-			p.recordProxyMetrics(endpoint.Pool, model, operation, start, "error")
+			p.recordProxyMetrics(endpoint.pool, model, operation, start, "error")
 			http.Error(w, fmt.Sprintf("proxy request failed: %v", reqErr), http.StatusBadGateway)
 			return
 		}
@@ -2917,7 +3155,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		resp.Body = wrapForwardingBody(resp.Body, forwardingLease)
 		if attempt+1 < attempts && shouldRetryStatus(matchedRoute, resp.StatusCode) {
 			drainErr := copyResponse(io.Discard, resp)
-			p.registry.RecordModelLatency(endpoint.Address, model, time.Since(attemptStarted))
+			p.registry.RecordModelLatency(endpoint.address, model, time.Since(attemptStarted))
 			lease.RecordFailure()
 			if drainErr != nil {
 				lastErr = drainErr
@@ -2927,14 +3165,14 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		}
 
 		streamErr := copyResponse(w, resp)
-		p.registry.RecordModelLatency(endpoint.Address, model, time.Since(attemptStarted))
+		p.registry.RecordModelLatency(endpoint.address, model, time.Since(attemptStarted))
 
 		if resp.StatusCode >= 400 || streamErr != nil {
 			lease.RecordFailure()
-			p.recordProxyMetrics(endpoint.Pool, model, operation, start, "error")
+			p.recordProxyMetrics(endpoint.pool, model, operation, start, "error")
 		} else {
 			lease.RecordSuccess()
-			p.recordProxyMetrics(endpoint.Pool, model, operation, start, "success")
+			p.recordProxyMetrics(endpoint.pool, model, operation, start, "success")
 		}
 		return
 	}
@@ -2945,7 +3183,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 			status = "error"
 		}
 		if lastEndpoint != nil {
-			p.recordProxyMetrics(lastEndpoint.Pool, model, operation, start, status)
+			p.recordProxyMetrics(lastEndpoint.pool, model, operation, start, status)
 		}
 		_ = copyResponse(w, lastResp)
 		return
@@ -3183,7 +3421,7 @@ func (p *Proxy) refreshAllEndpoints(ctx context.Context) {
 	for pool, eps := range p.registry.pools {
 		var totalQueue int32
 		for _, ep := range eps {
-			totalQueue += atomic.LoadInt32(&ep.QueueDepth)
+			totalQueue += atomic.LoadInt32(&ep.runtime.queueDepth)
 		}
 		queueDepth.WithLabelValues(pool).Set(float64(totalQueue))
 	}
@@ -3225,7 +3463,7 @@ func (p *Proxy) forwardRequest(r *http.Request, body []byte, endpoint *Endpoint,
 		defer cancel()
 	}
 
-	targetURL, err := url.Parse(endpoint.Address)
+	targetURL, err := url.Parse(endpoint.address)
 	if err != nil {
 		return nil, err
 	}
@@ -3336,7 +3574,7 @@ func shouldRetryRequestError(route *Route, err error) bool {
 	return route.RetryOnRequestErrs || errors.Is(err, context.DeadlineExceeded)
 }
 
-func (p *Proxy) waitForQueuedDestination(ctx context.Context, route *Route, req *RouteRequest, allowed map[string]*Endpoint) (string, error) {
+func (p *Proxy) waitForQueuedDestination(ctx context.Context, route *Route, req *RouteRequest, allowed map[string]endpointRef) (string, error) {
 	maxQueueTime := route.Fallback.MaxQueueTime
 	if maxQueueTime <= 0 {
 		maxQueueTime = 30 * time.Second
@@ -3356,7 +3594,7 @@ func (p *Proxy) waitForQueuedDestination(ctx context.Context, route *Route, req 
 			return "", fmt.Errorf("queue timeout exceeded")
 		case <-ticker.C:
 			req.Timestamp = time.Now()
-			dest, err := p.router.RouteManager().SelectDestinationWithin(route, req, p.registry, allowed)
+			dest, err := p.router.RouteManager().selectDestinationWithin(route, req, p.registry, allowed)
 			if err != nil {
 				return "", err
 			}

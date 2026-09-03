@@ -92,6 +92,7 @@ type ResolutionLease struct {
 	capabilityRevision            string
 	capabilityAuthorizationDigest [sha256.Size]byte
 	workloadType                  WorkloadType
+	reservation                   endpointReservation
 	once                          sync.Once
 	completed                     uint32
 	admission                     *leaseAdmission
@@ -158,18 +159,44 @@ func writeResolutionError(w http.ResponseWriter, err error) bool {
 // ResolveRequest resolves a request to an endpoint without forwarding it.
 func (p *Proxy) ResolveRequest(ctx context.Context, req ResolveRequest) (*Resolution, error) {
 	routing := routingContextForResolveRequest(req)
-	return p.resolve(ctx, routing.routeRequest(req.Operation, req.Model), routing, false)
+	resolution, _, err := p.resolve(ctx, routing.routeRequest(req.Operation, req.Model), routing, false)
+	if err != nil {
+		return nil, err
+	}
+	return publicResolutionSnapshot(resolution), nil
 }
 
 // AcquireRequestResolution resolves and reserves an endpoint for forwarding.
 // Callers must Admit the request before forwarding, then finish the returned
 // lease with RecordSuccess, RecordFailure, or Release.
 func (p *Proxy) AcquireRequestResolution(ctx context.Context, req ResolveRequest) (*ResolutionLease, error) {
-	return p.acquireRequestResolution(ctx, req.Operation, req.Model, routingContextForResolveRequest(req))
+	lease, err := p.acquireRequestResolution(ctx, req.Operation, req.Model, routingContextForResolveRequest(req))
+	if err != nil {
+		return nil, err
+	}
+	lease.Resolution = publicResolutionSnapshot(lease.Resolution)
+	return lease, nil
+}
+
+func publicResolutionSnapshot(resolution *Resolution) *Resolution {
+	if resolution == nil {
+		return nil
+	}
+	snapshot := *resolution
+	snapshot.Route = cloneRoute(resolution.Route, false)
+	if resolution.Destination != nil {
+		destination := *resolution.Destination
+		destination.QueueDepthCondition = cloneThreshold(resolution.Destination.QueueDepthCondition)
+		destination.ReplicaCondition = cloneThreshold(resolution.Destination.ReplicaCondition)
+		destination.LatencyCondition = cloneThreshold(resolution.Destination.LatencyCondition)
+		destination.TimeCondition = cloneTimeWindow(resolution.Destination.TimeCondition)
+		snapshot.Destination = &destination
+	}
+	return &snapshot
 }
 
 func (p *Proxy) acquireRequestResolution(ctx context.Context, operation OperationType, model string, routing RoutingContext) (*ResolutionLease, error) {
-	resolution, err := p.resolve(ctx, routing.routeRequest(operation, model), routing, true)
+	resolution, reservation, err := p.resolve(ctx, routing.routeRequest(operation, model), routing, true)
 	if err != nil {
 		return nil, err
 	}
@@ -182,6 +209,7 @@ func (p *Proxy) acquireRequestResolution(ctx context.Context, operation Operatio
 		capabilityRevision:            headerValue(routing.Headers, capabilityRevisionHeader),
 		capabilityAuthorizationDigest: sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(routing.Headers))),
 		workloadType:                  resolveWorkloadType(operation, routing.Headers),
+		reservation:                   reservation,
 		admission:                     &leaseAdmission{},
 		attempts:                      newLeaseAttempts(),
 	}, nil
@@ -232,7 +260,7 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 	if err != nil {
 		return nil, err
 	}
-	endpoint, err := l.proxy.router.RouteRequestWithin(ctx, l.model, l.Resolution.Pool, l.workloadType, excluded, allowed, l.operation)
+	reservation, err := l.proxy.router.routeRequestWithin(ctx, l.model, l.Resolution.Pool, l.workloadType, excluded, allowed, l.operation)
 	if err != nil {
 		return nil, err
 	}
@@ -241,7 +269,7 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 		Resolution: &Resolution{
 			Route:       l.Resolution.Route,
 			Destination: l.Resolution.Destination,
-			Endpoint:    endpoint,
+			Endpoint:    reservation.ref.endpoint,
 			Pool:        l.Resolution.Pool,
 		},
 		proxy:                         l.proxy,
@@ -251,6 +279,7 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 		capabilityRevision:            l.capabilityRevision,
 		capabilityAuthorizationDigest: l.capabilityAuthorizationDigest,
 		workloadType:                  l.workloadType,
+		reservation:                   reservation,
 		admission:                     l.admission,
 		attempts:                      l.attempts,
 	}, nil
@@ -282,8 +311,8 @@ func (l *ResolutionLease) BeginForwarding() *ForwardingLease {
 	}
 
 	endpoint := l.Resolution.Endpoint
-	atomic.AddInt32(&endpoint.Connections, 1)
-	activeConnections.WithLabelValues(endpoint.Pool, endpoint.Address).Inc()
+	atomic.AddInt32(&endpoint.runtime.connections, 1)
+	activeConnections.WithLabelValues(endpoint.pool, endpoint.address).Inc()
 
 	return &ForwardingLease{endpoint: endpoint}
 }
@@ -294,8 +323,8 @@ func (f *ForwardingLease) Finish() {
 		return
 	}
 	f.once.Do(func() {
-		atomic.AddInt32(&f.endpoint.Connections, -1)
-		activeConnections.WithLabelValues(f.endpoint.Pool, f.endpoint.Address).Dec()
+		atomic.AddInt32(&f.endpoint.runtime.connections, -1)
+		activeConnections.WithLabelValues(f.endpoint.pool, f.endpoint.address).Dec()
 	})
 }
 
@@ -304,8 +333,8 @@ func (l *ResolutionLease) finish(release func(*CircuitBreaker)) {
 		return
 	}
 	l.once.Do(func() {
-		if cb := l.proxy.registry.GetCircuitBreaker(l.Resolution.Endpoint.Address); cb != nil {
-			release(cb)
+		if l.reservation.ref.breaker != nil {
+			release(l.reservation.ref.breaker)
 		}
 		atomic.StoreUint32(&l.completed, 1)
 	})
@@ -326,7 +355,7 @@ func (a *leaseAttempts) excludeAndSnapshot(endpoint *Endpoint) map[string]bool {
 	defer a.mu.Unlock()
 
 	if endpoint != nil {
-		a.excluded[endpoint.Address] = true
+		a.excluded[endpoint.address] = true
 	}
 
 	snapshot := make(map[string]bool, len(a.excluded))
@@ -366,7 +395,7 @@ func (p *Proxy) startBackgroundWorkers(ctx context.Context) {
 	}()
 }
 
-func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing RoutingContext, reserve bool) (*Resolution, error) {
+func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing RoutingContext, reserve bool) (*Resolution, endpointReservation, error) {
 	var pool string
 	var matchedRoute *Route
 	var selectedDest *Destination
@@ -378,23 +407,23 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 		sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(routing.Headers))),
 	)
 	if err != nil {
-		return nil, err
+		return nil, endpointReservation{}, err
 	}
 	allowed := capabilityLease.endpoints
 
 	if capabilityLease.scoped {
 		var current bool
-		matchedRoute, current = p.router.RouteManager().MatchAtGeneration(routeReq, capabilityLease.routeGeneration)
+		matchedRoute, current = p.router.RouteManager().matchInstalledAtGeneration(routeReq, capabilityLease.routeGeneration)
 		if !current {
-			return nil, staleCapabilityResolutionError("inference capability lease is stale")
+			return nil, endpointReservation{}, staleCapabilityResolutionError("inference capability lease is stale")
 		}
 	} else {
-		matchedRoute = p.router.RouteManager().Match(routeReq)
+		matchedRoute = p.router.RouteManager().matchInstalled(routeReq)
 	}
 	if matchedRoute != nil {
-		dest, err := p.router.RouteManager().SelectDestinationWithin(matchedRoute, routeReq, p.registry, allowed)
+		dest, err := p.router.RouteManager().selectDestinationWithin(matchedRoute, routeReq, p.registry, allowed)
 		if err != nil {
-			return nil, &ResolutionError{
+			return nil, endpointReservation{}, &ResolutionError{
 				StatusCode: http.StatusServiceUnavailable,
 				Message:    err.Error(),
 			}
@@ -405,11 +434,11 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 		} else if matchedRoute.Fallback != nil {
 			fallbackPool, fallbackErr := p.resolveRouteFallback(ctx, matchedRoute, routeReq, allowed)
 			if fallbackErr != nil {
-				return nil, fallbackErr
+				return nil, endpointReservation{}, fallbackErr
 			}
 			pool = fallbackPool
 		} else {
-			return nil, noEligibleDestinationsError()
+			return nil, endpointReservation{}, noEligibleDestinationsError()
 		}
 	}
 
@@ -420,9 +449,9 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 		pool = p.defaultPool
 	}
 	workloadType := resolveWorkloadType(routeReq.Operation, routing.Headers)
-	endpoint, err := p.resolveEndpoint(ctx, routeReq.Model, pool, workloadType, routeReq.Operation, reserve, allowed)
+	endpoint, reservation, err := p.resolveEndpoint(ctx, routeReq.Model, pool, workloadType, routeReq.Operation, reserve, allowed)
 	if err != nil {
-		return nil, &ResolutionError{
+		return nil, endpointReservation{}, &ResolutionError{
 			StatusCode: http.StatusServiceUnavailable,
 			Message:    err.Error(),
 		}
@@ -433,25 +462,27 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 		Destination: selectedDest,
 		Endpoint:    endpoint,
 		Pool:        pool,
-	}, nil
+	}, reservation, nil
 }
 
-func (p *Proxy) resolveEndpoint(ctx context.Context, model, pool string, workloadType WorkloadType, operation OperationType, reserve bool, allowed map[string]*Endpoint) (*Endpoint, error) {
+func (p *Proxy) resolveEndpoint(ctx context.Context, model, pool string, workloadType WorkloadType, operation OperationType, reserve bool, allowed map[string]endpointRef) (*Endpoint, endpointReservation, error) {
 	if reserve {
-		return p.router.RouteRequestWithin(ctx, model, pool, workloadType, nil, allowed, operation)
+		reservation, err := p.router.routeRequestWithin(ctx, model, pool, workloadType, nil, allowed, operation)
+		return reservation.ref.endpoint, reservation, err
 	}
 
-	candidates := p.router.ResolveEndpointCandidatesWithin(model, pool, nil, allowed, operation)
+	candidates := p.router.resolveEndpointCandidatesWithin(model, pool, nil, allowed, operation)
 	if len(candidates) == 0 {
-		return nil, &ResolutionError{
+		return nil, endpointReservation{}, &ResolutionError{
 			StatusCode: http.StatusServiceUnavailable,
 			Message:    "no healthy endpoints available for model " + model,
 		}
 	}
-	return p.router.selectEndpoint(model, workloadType, candidates, false)
+	endpoint, err := p.router.selectEndpoint(model, workloadType, candidates, false)
+	return endpoint, endpointReservation{}, err
 }
 
-func (p *Proxy) resolveRouteFallback(ctx context.Context, route *Route, routeReq *RouteRequest, allowed map[string]*Endpoint) (string, *ResolutionError) {
+func (p *Proxy) resolveRouteFallback(ctx context.Context, route *Route, routeReq *RouteRequest, allowed map[string]endpointRef) (string, *ResolutionError) {
 	switch route.Fallback.Action {
 	case "reject":
 		statusCode := route.Fallback.StatusCode

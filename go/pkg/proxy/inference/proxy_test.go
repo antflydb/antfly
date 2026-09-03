@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -147,15 +146,15 @@ func TestRefreshCompletionCannotMutateChangedEndpointTopology(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- p.registry.RefreshEndpoint(context.Background(), address) }()
 	<-started
-	// This updates the same Endpoint allocation. The captured incarnation, not
-	// pointer identity, must prevent the old catalog response from publishing.
+	// Topology is copy-on-write. The old catalog response must not publish into
+	// the replacement endpoint identity.
 	p.registry.RegisterEndpointWithHealth(address, "", "new-pool", WorkloadTypeReadHeavy)
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
 	if endpoints := p.registry.GetEndpointsForModel("old-model"); len(endpoints) != 0 {
-		t.Fatalf("stale refresh published across an in-place topology change: %#v", endpoints)
+		t.Fatalf("stale refresh published across a topology change: %#v", endpoints)
 	}
 }
 
@@ -291,7 +290,7 @@ func TestProxyRequestRetryFailsOverToDifferentEndpoint(t *testing.T) {
 	p.RegisterEndpoint("http://primary-b.internal", "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://primary-a.internal", "embed", "bge-small-en-v1.5")
 	advertiseModelOperation(p.registry, "http://primary-b.internal", "embed", "bge-small-en-v1.5")
-	atomic.StoreInt32(&p.registry.endpoints["http://primary-b.internal"].Connections, 1)
+	atomic.StoreInt32(&p.registry.endpoints["http://primary-b.internal"].runtime.connections, 1)
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:       "default/retry-failover",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
@@ -426,7 +425,7 @@ func TestProxyRequestRecordsFailureOnStreamCopyError(t *testing.T) {
 
 	p.handleEmbed(recorder, req)
 
-	cb := p.registry.GetCircuitBreaker("http://primary.internal")
+	cb := p.registry.circuitBreaker("http://primary.internal")
 	if cb == nil {
 		t.Fatal("expected circuit breaker for endpoint")
 	}
@@ -482,7 +481,7 @@ func TestResolveRequestUsesVerifiedHostedSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveRequest: %v", err)
 	}
-	if got := resolved.Endpoint.Address; got != "http://source.internal" {
+	if got := resolved.Endpoint.address; got != "http://source.internal" {
 		t.Fatalf("expected hosted source route to resolve source-pool, got %q", got)
 	}
 }
@@ -522,7 +521,7 @@ func TestResolveRequestStaysInSelectedPoolWhenModelIsLoadedElsewhere(t *testing.
 	if err != nil {
 		t.Fatalf("ResolveRequest: %v", err)
 	}
-	if got := resolved.Endpoint.Address; got != "http://source.internal" {
+	if got := resolved.Endpoint.address; got != "http://source.internal" {
 		t.Fatalf("expected route-selected pool to remain authoritative, got %q", got)
 	}
 }
@@ -654,17 +653,19 @@ func TestBurstRoutingDistributesAcrossEligibleEndpoints(t *testing.T) {
 	var seenA bool
 	var seenB bool
 	for i := 0; i < 6; i++ {
-		endpoint, err := router.RouteRequest(context.Background(), "model-a", "burst", WorkloadTypeBurst, nil)
+		lease, err := router.AcquireEndpoint(context.Background(), "model-a", "burst", WorkloadTypeBurst, nil)
 		if err != nil {
-			t.Fatalf("RouteRequest returned error: %v", err)
+			t.Fatalf("AcquireEndpoint returned error: %v", err)
 		}
-		switch endpoint.Address {
+		endpoint := lease.Endpoint()
+		lease.Release()
+		switch endpoint.address {
 		case "http://burst-a.internal":
 			seenA = true
 		case "http://burst-b.internal":
 			seenB = true
 		default:
-			t.Fatalf("unexpected endpoint %q", endpoint.Address)
+			t.Fatalf("unexpected endpoint %q", endpoint.address)
 		}
 	}
 
@@ -706,12 +707,14 @@ func TestRefreshEndpointSendsUpstreamAuthorization(t *testing.T) {
 		t.Fatalf("RefreshEndpoint returned error: %v", err)
 	}
 
-	endpoint, err := p.router.RouteRequest(context.Background(), "model-a", "bridge", WorkloadTypeGeneral, nil)
+	lease, err := p.router.AcquireEndpoint(context.Background(), "model-a", "bridge", WorkloadTypeGeneral, nil)
 	if err != nil {
-		t.Fatalf("RouteRequest returned error: %v", err)
+		t.Fatalf("AcquireEndpoint returned error: %v", err)
 	}
-	if endpoint.Address != server.URL {
-		t.Fatalf("expected endpoint %q, got %q", server.URL, endpoint.Address)
+	defer lease.Release()
+	endpoint := lease.Endpoint()
+	if endpoint.address != server.URL {
+		t.Fatalf("expected endpoint %q, got %q", server.URL, endpoint.address)
 	}
 }
 
@@ -800,11 +803,11 @@ func TestResolveRequestDoesNotAdvanceBurstRoundRobinState(t *testing.T) {
 			t.Fatalf("ResolveRequest %d: %v", i+1, err)
 		}
 		if i == 0 {
-			previewEndpoint = resolved.Endpoint.Address
+			previewEndpoint = resolved.Endpoint.address
 			continue
 		}
-		if resolved.Endpoint.Address != previewEndpoint {
-			t.Fatalf("expected burst preview to remain stable at %q, got %q", previewEndpoint, resolved.Endpoint.Address)
+		if resolved.Endpoint.address != previewEndpoint {
+			t.Fatalf("expected burst preview to remain stable at %q, got %q", previewEndpoint, resolved.Endpoint.address)
 		}
 	}
 
@@ -820,8 +823,8 @@ func TestResolveRequestDoesNotAdvanceBurstRoundRobinState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("next AcquireRequestResolution: %v", err)
 	}
-	if nextLease.Resolution.Endpoint.Address != previewEndpoint {
-		t.Fatalf("expected ResolveRequest previews not to advance burst selector, got %q want %q", nextLease.Resolution.Endpoint.Address, previewEndpoint)
+	if nextLease.Resolution.Endpoint.address != previewEndpoint {
+		t.Fatalf("expected ResolveRequest previews not to advance burst selector, got %q want %q", nextLease.Resolution.Endpoint.address, previewEndpoint)
 	}
 }
 
@@ -925,7 +928,7 @@ func TestSelectDestinationSkipsOpenCircuitPools(t *testing.T) {
 	registry.UpdateModels("http://open.internal", []string{"model-a"})
 	registry.UpdateModels("http://healthy.internal", []string{"model-a"})
 
-	openCB := registry.GetCircuitBreaker("http://open.internal")
+	openCB := registry.circuitBreaker("http://open.internal")
 	for i := 0; i < 5; i++ {
 		openCB.RecordFailure()
 	}
@@ -963,14 +966,14 @@ func TestSelectDestinationSkipsOpenCircuitPools(t *testing.T) {
 	}
 }
 
-func TestRouteRequestClaimsRecoveredCircuitOnce(t *testing.T) {
+func TestAcquireEndpointClaimsRecoveredCircuitOnce(t *testing.T) {
 	t.Parallel()
 
 	registry := NewModelRegistry(time.Minute)
 	registry.RegisterEndpoint("http://recovering.internal", "primary", WorkloadTypeGeneral)
 	registry.UpdateModels("http://recovering.internal", []string{"model-a"})
 
-	cb := registry.GetCircuitBreaker("http://recovering.internal")
+	cb := registry.circuitBreaker("http://recovering.internal")
 	cb.threshold = 1
 	cb.timeout = 10 * time.Millisecond
 	cb.RecordFailure()
@@ -978,12 +981,14 @@ func TestRouteRequestClaimsRecoveredCircuitOnce(t *testing.T) {
 
 	router := NewRouter(registry)
 
-	endpoint, err := router.RouteRequest(context.Background(), "model-a", "primary", WorkloadTypeGeneral, nil)
+	lease, err := router.AcquireEndpoint(context.Background(), "model-a", "primary", WorkloadTypeGeneral, nil)
 	if err != nil {
-		t.Fatalf("RouteRequest returned error: %v", err)
+		t.Fatalf("AcquireEndpoint returned error: %v", err)
 	}
-	if endpoint.Address != "http://recovering.internal" {
-		t.Fatalf("expected recovering endpoint, got %q", endpoint.Address)
+	defer lease.Release()
+	endpoint := lease.Endpoint()
+	if endpoint.address != "http://recovering.internal" {
+		t.Fatalf("expected recovering endpoint, got %q", endpoint.address)
 	}
 	if got := atomic.LoadInt32(&cb.state); got != 2 {
 		t.Fatalf("expected recovered request to claim half-open probe, got state=%d", got)
@@ -1001,7 +1006,7 @@ func TestResolveRequestDoesNotClaimCircuitBreakerProbe(t *testing.T) {
 	p.RegisterEndpoint("http://recovering.internal", "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://recovering.internal", "embed", "model-a")
 
-	cb := p.registry.GetCircuitBreaker("http://recovering.internal")
+	cb := p.registry.circuitBreaker("http://recovering.internal")
 	cb.threshold = 1
 	cb.timeout = 10 * time.Millisecond
 	cb.RecordFailure()
@@ -1016,8 +1021,8 @@ func TestResolveRequestDoesNotClaimCircuitBreakerProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveRequest: %v", err)
 	}
-	if resolved.Endpoint.Address != "http://recovering.internal" {
-		t.Fatalf("expected resolving endpoint, got %q", resolved.Endpoint.Address)
+	if resolved.Endpoint.address != "http://recovering.internal" {
+		t.Fatalf("expected resolving endpoint, got %q", resolved.Endpoint.address)
 	}
 	if got := atomic.LoadInt32(&cb.state); got != 1 {
 		t.Fatalf("expected pure ResolveRequest to leave breaker open, got state=%d", got)
@@ -1193,8 +1198,8 @@ func TestAcquireRequestResolutionBeginForwardingUpdatesLeastLoadedSelection(t *t
 		t.Fatalf("second AcquireRequestResolution: %v", err)
 	}
 
-	if firstLease.Resolution.Endpoint.Address == secondLease.Resolution.Endpoint.Address {
-		t.Fatalf("expected in-flight load to shift least-loaded selection, both leases resolved %q", firstLease.Resolution.Endpoint.Address)
+	if firstLease.Resolution.Endpoint.address == secondLease.Resolution.Endpoint.address {
+		t.Fatalf("expected in-flight load to shift least-loaded selection, both leases resolved %q", firstLease.Resolution.Endpoint.address)
 	}
 
 	firstLease.Release()
@@ -1322,7 +1327,7 @@ func TestResolutionLeaseNextAttemptExcludesFailedEndpoint(t *testing.T) {
 	p.RegisterEndpoint("http://primary-b.internal", "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, "http://primary-a.internal", "embed", "model-a")
 	advertiseModelOperation(p.registry, "http://primary-b.internal", "embed", "model-a")
-	atomic.StoreInt32(&p.registry.endpoints["http://primary-b.internal"].Connections, 1)
+	atomic.StoreInt32(&p.registry.endpoints["http://primary-b.internal"].runtime.connections, 1)
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:       "default/retry-endpoints",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
@@ -1341,7 +1346,7 @@ func TestResolutionLeaseNextAttemptExcludesFailedEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first AcquireRequestResolution: %v", err)
 	}
-	firstEndpoint := firstLease.Resolution.Endpoint.Address
+	firstEndpoint := firstLease.Resolution.Endpoint.address
 
 	firstLease.RecordFailure()
 
@@ -1349,7 +1354,7 @@ func TestResolutionLeaseNextAttemptExcludesFailedEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NextAttempt: %v", err)
 	}
-	if retryLease.Resolution.Endpoint.Address == firstEndpoint {
+	if retryLease.Resolution.Endpoint.address == firstEndpoint {
 		t.Fatalf("expected retry attempt to exclude failed endpoint %q", firstEndpoint)
 	}
 	retryLease.Release()
@@ -1396,7 +1401,7 @@ func TestProxyRequestKeepsConnectionCountUntilResponseBodyCloses(t *testing.T) {
 		endpoint = p.registry.endpoints["http://primary.internal"]
 		var connections int32
 		if endpoint != nil {
-			connections = atomic.LoadInt32(&endpoint.Connections)
+			connections = atomic.LoadInt32(&endpoint.runtime.connections)
 		}
 		p.registry.mu.RUnlock()
 		if connections == 1 {
@@ -1408,7 +1413,7 @@ func TestProxyRequestKeepsConnectionCountUntilResponseBodyCloses(t *testing.T) {
 	if endpoint == nil {
 		t.Fatal("expected endpoint to be registered")
 	}
-	if got := atomic.LoadInt32(&endpoint.Connections); got != 1 {
+	if got := atomic.LoadInt32(&endpoint.runtime.connections); got != 1 {
 		t.Fatalf("expected connection count to remain active while response body is open, got %d", got)
 	}
 
@@ -1431,7 +1436,7 @@ func TestProxyRequestKeepsConnectionCountUntilResponseBodyCloses(t *testing.T) {
 		t.Fatal("proxy request did not complete after backend body closed")
 	}
 
-	if got := atomic.LoadInt32(&endpoint.Connections); got != 0 {
+	if got := atomic.LoadInt32(&endpoint.runtime.connections); got != 0 {
 		t.Fatalf("expected connection count to drop after response body close, got %d", got)
 	}
 }
@@ -1446,7 +1451,7 @@ func TestReadyRequiresRoutableEndpoint(t *testing.T) {
 	})
 	p.RegisterEndpoint("http://primary.internal", "primary", WorkloadTypeGeneral)
 
-	cb := p.registry.GetCircuitBreaker("http://primary.internal")
+	cb := p.registry.circuitBreaker("http://primary.internal")
 	if cb == nil {
 		t.Fatal("expected circuit breaker for endpoint")
 	}
@@ -1525,15 +1530,15 @@ func TestResolveFiltersDiscoveredModelByOperation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if readResolution.Endpoint.Address != "http://reader.internal" {
-		t.Fatalf("read routed to %s", readResolution.Endpoint.Address)
+	if readResolution.Endpoint.address != "http://reader.internal" {
+		t.Fatalf("read routed to %s", readResolution.Endpoint.address)
 	}
 	generateResolution, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: "generate", Model: "shared"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if generateResolution.Endpoint.Address != "http://generator.internal" {
-		t.Fatalf("generation routed to %s", generateResolution.Endpoint.Address)
+	if generateResolution.Endpoint.address != "http://generator.internal" {
+		t.Fatalf("generation routed to %s", generateResolution.Endpoint.address)
 	}
 }
 
@@ -1877,7 +1882,7 @@ func TestScopedCatalogUsesRouteCapabilityCohort(t *testing.T) {
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "default/gemma-reader",
 		Operations:    map[OperationType]bool{"read": true},
-		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reader$`)},
+		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/reader$`)},
 		Destinations:  []Destination{{Pool: "gpu", Weight: 1}},
 	})
 	request := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Freader&task=read", nil)
@@ -1886,7 +1891,7 @@ func TestScopedCatalogUsesRouteCapabilityCohort(t *testing.T) {
 		t.Fatal(err)
 	}
 	endpoints := p.catalogEndpointsForRequest(routing, "owner/reader", "read")
-	if len(endpoints) != 1 || endpoints[0].Address != "http://gpu.internal" {
+	if len(endpoints) != 1 || endpoints[0].address != "http://gpu.internal" {
 		t.Fatalf("route capability cohort = %#v, want gpu endpoint only", endpoints)
 	}
 
@@ -1896,7 +1901,7 @@ func TestScopedCatalogUsesRouteCapabilityCohort(t *testing.T) {
 		t.Fatal(err)
 	}
 	endpoints = p.catalogEndpointsForRequest(routing, "owner/other", "read")
-	if len(endpoints) != 1 || endpoints[0].Address != "http://cpu.internal" {
+	if len(endpoints) != 1 || endpoints[0].address != "http://cpu.internal" {
 		t.Fatalf("default capability cohort = %#v, want cpu endpoint only", endpoints)
 	}
 }
@@ -1910,14 +1915,14 @@ func TestScopedCatalogIncludesUnknownConditionalRouteContext(t *testing.T) {
 		Name:                "tenant-reader",
 		Priority:            100,
 		Operations:          map[OperationType]bool{"read": true},
-		ModelPatterns:       []*regexp.Regexp{regexp.MustCompile(`^owner/reader$`)},
+		ModelPatterns:       []*RegexPattern{MustRegexPattern(`^owner/reader$`)},
 		SourceOrganizations: map[string]bool{"tenant-a": true},
 		Destinations:        []Destination{{Pool: "tenant-gpu", Weight: 1}},
 	})
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "general-reader",
 		Operations:    map[OperationType]bool{"read": true},
-		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reader$`)},
+		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/reader$`)},
 		Destinations:  []Destination{{Pool: "cpu", Weight: 1}},
 	})
 
@@ -1929,7 +1934,7 @@ func TestScopedCatalogIncludesUnknownConditionalRouteContext(t *testing.T) {
 	endpoints := p.catalogEndpointsForRequest(routing, "owner/reader", "read")
 	addresses := make(map[string]bool, len(endpoints))
 	for _, endpoint := range endpoints {
-		addresses[endpoint.Address] = true
+		addresses[endpoint.address] = true
 	}
 	if !addresses["http://tenant-gpu.internal"] || !addresses["http://cpu.internal"] || len(addresses) != 2 {
 		t.Fatalf("unknown-context capability cohort = %#v, want tenant and general endpoints", addresses)
@@ -1943,7 +1948,7 @@ func TestScopedCatalogIncludesUnknownConditionalRouteContext(t *testing.T) {
 	endpoints = p.catalogEndpointsForRequest(routing, "owner/reader", "read")
 	addresses = make(map[string]bool, len(endpoints))
 	for _, endpoint := range endpoints {
-		addresses[endpoint.Address] = true
+		addresses[endpoint.address] = true
 	}
 	if !addresses["http://tenant-gpu.internal"] || !addresses["http://cpu.internal"] || len(addresses) != 2 {
 		t.Fatalf("unverified source header narrowed capability cohort = %#v", addresses)
@@ -1957,7 +1962,7 @@ func TestScopedCatalogIncludesUnknownConditionalRouteContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	endpoints = p.catalogEndpointsForRequest(routing, "owner/reader", "read")
-	if len(endpoints) != 1 || endpoints[0].Address != "http://tenant-gpu.internal" {
+	if len(endpoints) != 1 || endpoints[0].address != "http://tenant-gpu.internal" {
 		t.Fatalf("verified exact-context capability cohort = %#v, want tenant endpoint only", endpoints)
 	}
 	advertiseModelOperation(p.registry, "http://cpu.internal", "read", "owner/reader")
@@ -1971,7 +1976,7 @@ func TestScopedCatalogIncludesUnknownConditionalRouteContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolution.Pool != "tenant-gpu" || resolution.Endpoint.Address != "http://tenant-gpu.internal" {
+	if resolution.Pool != "tenant-gpu" || resolution.Endpoint.address != "http://tenant-gpu.internal" {
 		t.Fatalf("verified execution resolution = %#v, want tenant endpoint", resolution)
 	}
 }
@@ -1986,7 +1991,7 @@ func TestRoutesPrecedeExplicitPoolForDiscoveryAndExecution(t *testing.T) {
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "force-gpu",
 		Operations:    map[OperationType]bool{"read": true},
-		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reader$`)},
+		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/reader$`)},
 		Destinations:  []Destination{{Pool: "gpu", Weight: 1}},
 	})
 
@@ -1995,7 +2000,7 @@ func TestRoutesPrecedeExplicitPoolForDiscoveryAndExecution(t *testing.T) {
 		ExplicitPool: "cpu",
 	}
 	endpoints := p.catalogEndpointsForRequest(routing, "owner/reader", "read")
-	if len(endpoints) != 1 || endpoints[0].Address != "http://gpu.internal" {
+	if len(endpoints) != 1 || endpoints[0].address != "http://gpu.internal" {
 		t.Fatalf("routed capability cohort = %#v, want gpu endpoint only", endpoints)
 	}
 	token, err := issueReaderCapabilityLease(
@@ -2019,7 +2024,7 @@ func TestRoutesPrecedeExplicitPoolForDiscoveryAndExecution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolution.Pool != "gpu" || resolution.Endpoint.Address != "http://gpu.internal" || resolution.Route == nil {
+	if resolution.Pool != "gpu" || resolution.Endpoint.address != "http://gpu.internal" || resolution.Route == nil {
 		t.Fatalf("routed resolution = %#v, want route-selected gpu resolution", resolution)
 	}
 }
@@ -2031,7 +2036,7 @@ func TestTerminalRejectRouteDoesNotExposeDefaultPool(t *testing.T) {
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "reject-reader",
 		Operations:    map[OperationType]bool{"read": true},
-		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reader$`)},
+		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/reader$`)},
 		Fallback:      &Fallback{Action: "reject", StatusCode: http.StatusForbidden},
 	})
 	routing := RoutingContext{}
@@ -2052,17 +2057,17 @@ func TestCatalogCohortIsBoundToConcreteOperation(t *testing.T) {
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "batch-generator",
 		Operations:    map[OperationType]bool{"generate.batch": true},
-		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/generator$`)},
+		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/generator$`)},
 		Destinations:  []Destination{{Pool: "gpu", Weight: 1}},
 	})
 
 	routing := RoutingContext{}
 	batch := p.catalogEndpointsForRequest(routing, "owner/generator", "generate.batch")
-	if len(batch) != 1 || batch[0].Address != "http://gpu.internal" {
+	if len(batch) != 1 || batch[0].address != "http://gpu.internal" {
 		t.Fatalf("batch cohort = %#v, want gpu only", batch)
 	}
 	single := p.catalogEndpointsForRequest(routing, "owner/generator", "generate")
-	if len(single) != 1 || single[0].Address != "http://cpu.internal" {
+	if len(single) != 1 || single[0].address != "http://cpu.internal" {
 		t.Fatalf("single cohort = %#v, want default cpu only", single)
 	}
 }
@@ -2074,7 +2079,7 @@ func TestTerminalAliasRejectDoesNotFallThroughViaSemanticTask(t *testing.T) {
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "reject-batch-generator",
 		Operations:    map[OperationType]bool{"generate.batch": true},
-		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/generator$`)},
+		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/generator$`)},
 		Fallback:      &Fallback{Action: "reject", StatusCode: http.StatusForbidden},
 	})
 	if endpoints := p.catalogEndpointsForRequest(RoutingContext{}, "owner/generator", "generate.batch"); len(endpoints) != 0 {
@@ -2093,7 +2098,7 @@ func TestCapabilityLeaseRejectsRoutePolicyGenerationChange(t *testing.T) {
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "generator",
 		Operations:    map[OperationType]bool{"generate": true},
-		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/generator$`)},
+		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/generator$`)},
 		Destinations:  []Destination{{Pool: "gpu-a", Weight: 1}},
 	})
 	cohort := p.catalogEndpointCohortForRequest(RoutingContext{}, "owner/generator", "generate")
@@ -2113,7 +2118,7 @@ func TestCapabilityLeaseRejectsRoutePolicyGenerationChange(t *testing.T) {
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "generator",
 		Operations:    map[OperationType]bool{"generate": true},
-		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/generator$`)},
+		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/generator$`)},
 		Destinations:  []Destination{{Pool: "gpu-b", Weight: 1}},
 	})
 	request := httptest.NewRequest(http.MethodPost, "/ai/v1/generate", strings.NewReader(`{"model":"owner/generator"}`))
@@ -2136,7 +2141,7 @@ func TestMultimodalRerankHandlerPreservesConcreteOperation(t *testing.T) {
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "multimodal-rerank",
 		Operations:    map[OperationType]bool{"rerank_multimodal": true},
-		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reranker$`)},
+		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/reranker$`)},
 		Destinations:  []Destination{{Pool: "gpu", Weight: 1}},
 	})
 	var forwardedHost string
@@ -2186,8 +2191,8 @@ func TestCapabilityLeaseConstrainsRoutingAfterEndpointAddition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("endpoint addition invalidated a safely constrainable lease: %v", err)
 	}
-	candidates := p.router.ResolveEndpointCandidatesWithin("owner/reader", "primary", nil, allowed, "read")
-	if len(candidates) != 1 || candidates[0].Address != "http://reader-a.internal" {
+	candidates := p.router.resolveEndpointCandidatesWithin("owner/reader", "primary", nil, allowed, "read")
+	if len(candidates) != 1 || candidates[0].address != "http://reader-a.internal" {
 		t.Fatalf("lease-constrained candidates = %#v, want only reader-a", candidates)
 	}
 }
@@ -2206,7 +2211,7 @@ func TestCapabilityLeaseFiltersWeightedRouteDestinationsBeforeSelection(t *testi
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "default/generator",
 		Operations:    map[OperationType]bool{"generate": true},
-		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^gemma4$`)},
+		ModelPatterns: []*RegexPattern{MustRegexPattern(`^gemma4$`)},
 		Destinations: []Destination{
 			{Pool: "unleased", Weight: 100},
 			{Pool: "leased", Weight: 1},
@@ -2229,8 +2234,8 @@ func TestCapabilityLeaseFiltersWeightedRouteDestinationsBeforeSelection(t *testi
 		t.Fatal(err)
 	}
 	defer lease.Release()
-	if lease.Resolution.Pool != "leased" || lease.Resolution.Endpoint.Address != "http://catalog-ready.internal" {
-		t.Fatalf("resolution = pool %q endpoint %q, want leased catalog responder", lease.Resolution.Pool, lease.Resolution.Endpoint.Address)
+	if lease.Resolution.Pool != "leased" || lease.Resolution.Endpoint.address != "http://catalog-ready.internal" {
+		t.Fatalf("resolution = pool %q endpoint %q, want leased catalog responder", lease.Resolution.Pool, lease.Resolution.Endpoint.address)
 	}
 }
 
@@ -2296,7 +2301,7 @@ func TestCapabilityLeaseIssuanceReclaimsReplacedEndpointIncarnations(t *testing.
 	}
 }
 
-func TestCapabilityLeaseRejectsInPlaceEndpointTopologyChange(t *testing.T) {
+func TestCapabilityLeaseRejectsEndpointTopologyChange(t *testing.T) {
 	t.Parallel()
 
 	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
@@ -2309,8 +2314,8 @@ func TestCapabilityLeaseRejectsInPlaceEndpointTopologyChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The address and Endpoint allocation remain stable, but routing semantics
-	// changed. The explicit incarnation must still fence the old capability plan.
+	// The address remains stable, but routing semantics and endpoint identity
+	// changed. The explicit incarnation must fence the old capability plan.
 	p.registry.RegisterEndpointWithHealth(address, address+"/ready", "secondary", WorkloadTypeReadHeavy)
 	err = p.validateCapabilityLease(token, "revision-a", "owner/reader", "read", "")
 	var resolutionErr *ResolutionError
@@ -2322,6 +2327,84 @@ func TestCapabilityLeaseRejectsInPlaceEndpointTopologyChange(t *testing.T) {
 	p.capabilityLeaseMu.Unlock()
 	if retained {
 		t.Fatal("topology-stale lease was retained after validation")
+	}
+}
+
+func TestEndpointReservationRejectsChangedIncarnation(t *testing.T) {
+	t.Parallel()
+	registry := NewModelRegistry(time.Minute)
+	const address = "http://reader.internal"
+	registry.RegisterEndpointWithHealth(address, address+"/ready", "primary", WorkloadTypeGeneral)
+	registry.mu.RLock()
+	endpoint := registry.endpoints[address]
+	old := endpointRef{
+		endpoint:    endpoint,
+		incarnation: endpoint.incarnation,
+		breaker:     registry.circuitBreakers[address],
+	}
+	registry.mu.RUnlock()
+
+	registry.RegisterEndpointWithHealth(address, address+"/ready-v2", "primary", WorkloadTypeGeneral)
+	if registry.tryAcquireEndpoint(old) {
+		t.Fatal("reservation crossed an endpoint incarnation change")
+	}
+	current := registry.GetEndpointsForPool("primary")
+	if len(current) != 1 || current[0] == endpoint {
+		t.Fatalf("same-pool topology replacement was not reindexed: %#v", current)
+	}
+}
+
+func TestResolutionCompletionUsesReservedCircuitBreaker(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	const address = "http://reader.internal"
+	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+	p.registry.mu.RLock()
+	endpoint := p.registry.endpoints[address]
+	reserved := endpointRef{
+		endpoint:    endpoint,
+		incarnation: endpoint.incarnation,
+		breaker:     p.registry.circuitBreakers[address],
+	}
+	p.registry.mu.RUnlock()
+
+	p.registry.UnregisterEndpoint(address)
+	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+	replacement := p.registry.circuitBreaker(address)
+	lease := &ResolutionLease{
+		Resolution:  &Resolution{Endpoint: endpoint},
+		proxy:       p,
+		reservation: endpointReservation{ref: reserved},
+	}
+	lease.RecordFailure()
+	if got := atomic.LoadInt32(&reserved.breaker.failures); got != 1 {
+		t.Fatalf("reserved breaker failures = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&replacement.failures); got != 0 {
+		t.Fatalf("replacement breaker failures = %d, want 0", got)
+	}
+}
+
+func TestEndpointSnapshotsAreDetachedAndStable(t *testing.T) {
+	t.Parallel()
+	registry := NewModelRegistry(time.Minute)
+	registry.RegisterEndpoint("http://b.internal", "primary", WorkloadTypeGeneral)
+	registry.RegisterEndpoint("http://a.internal", "primary", WorkloadTypeReadHeavy)
+	registry.UpdateModelOperations("http://a.internal", map[string]map[OperationType]bool{
+		"z-model": {"generate": true},
+		"a-model": {"read": true},
+	})
+	snapshots := registry.EndpointSnapshots()
+	if len(snapshots) != 2 || snapshots[0].Address != "http://a.internal" ||
+		len(snapshots[0].Models) != 2 || snapshots[0].Models[0].Name != "a-model" ||
+		len(snapshots[0].Models[0].Operations) != 1 || snapshots[0].Models[0].Operations[0] != "read" {
+		t.Fatalf("unexpected endpoint snapshots: %#v", snapshots)
+	}
+	snapshots[0].Models[0].Name = "mutated"
+	snapshots[0].Models[0].Operations[0] = "mutated"
+	again := registry.EndpointSnapshots()
+	if again[0].Models[0].Name != "a-model" || again[0].Models[0].Operations[0] != "read" {
+		t.Fatalf("caller mutation changed registry snapshot: %#v", again)
 	}
 }
 
@@ -2418,8 +2501,8 @@ func TestGeneratorCapabilityLeaseConstrainsEachRouteVariant(t *testing.T) {
 		if err != nil {
 			t.Fatalf("validate %q: %v", test.operation, err)
 		}
-		candidates := p.router.ResolveEndpointCandidatesWithin("gemma4", "primary", nil, allowed, test.operation)
-		if len(candidates) != 1 || candidates[0].Address != test.address {
+		candidates := p.router.resolveEndpointCandidatesWithin("gemma4", "primary", nil, allowed, test.operation)
+		if len(candidates) != 1 || candidates[0].address != test.address {
 			t.Fatalf("%q candidates = %#v, want only %s", test.operation, candidates, test.address)
 		}
 	}
@@ -2490,7 +2573,7 @@ func TestScopedCatalogLeaseFollowsNonDefaultRouteAndCallerCatalog(t *testing.T) 
 	p.Router().RouteManager().UpsertRoute(&Route{
 		Name:          "default/tenant-generator",
 		Operations:    map[OperationType]bool{"generate": true},
-		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^tenant/gemma4$`)},
+		ModelPatterns: []*RegexPattern{MustRegexPattern(`^tenant/gemma4$`)},
 		Destinations:  []Destination{{Pool: "gpu", Weight: 100}},
 	})
 
@@ -2677,8 +2760,8 @@ func TestRouteManagerEquivalentUpdatePreservesGenerationAndState(t *testing.T) {
 			Name:                "default/full-policy",
 			Priority:            7,
 			Operations:          map[OperationType]bool{"generate.batch": true},
-			ModelPatterns:       []*regexp.Regexp{regexp.MustCompile(`^gemma`)},
-			HeaderMatchers:      map[string]*StringMatcher{"x-tenant": {Prefix: "tenant-", Regex: regexp.MustCompile(`tenant-[0-9]+`)}},
+			ModelPatterns:       []*RegexPattern{MustRegexPattern(`^gemma`)},
+			HeaderMatchers:      map[string]*StringMatcher{"x-tenant": {Prefix: "tenant-", Regex: MustRegexPattern(`tenant-[0-9]+`)}},
 			SourceTables:        map[string]bool{"documents": true},
 			SourceOrganizations: map[string]bool{"org": true},
 			SourceProjects:      map[string]bool{"project": true},
@@ -2697,7 +2780,7 @@ func TestRouteManagerEquivalentUpdatePreservesGenerationAndState(t *testing.T) {
 
 	rm := NewRouteManager()
 	first := newRoute()
-	if !rm.UpsertRoute(first) {
+	if changed, err := rm.UpsertRoute(first); err != nil || !changed {
 		t.Fatal("initial route was not added")
 	}
 	routeRequest := &RouteRequest{
@@ -2718,7 +2801,7 @@ func TestRouteManagerEquivalentUpdatePreservesGenerationAndState(t *testing.T) {
 		t.Fatal("route manager retained caller-owned rate-limiter runtime")
 	}
 	generation := rm.Generation()
-	if rm.UpsertRoute(newRoute()) {
+	if changed, err := rm.UpsertRoute(newRoute()); err != nil || changed {
 		t.Fatal("equivalent declarative update was treated as a policy change")
 	}
 	if got := rm.Generation(); got != generation {
@@ -2730,7 +2813,7 @@ func TestRouteManagerEquivalentUpdatePreservesGenerationAndState(t *testing.T) {
 	}
 	changed := newRoute()
 	changed.Priority++
-	if !rm.UpsertRoute(changed) {
+	if didChange, err := rm.UpsertRoute(changed); err != nil || !didChange {
 		t.Fatal("real route policy change was ignored")
 	}
 	if got := rm.Generation(); got != generation+1 {
@@ -2749,7 +2832,7 @@ func TestRouteManagerOwnsImmutablePolicySnapshots(t *testing.T) {
 	source := &Route{
 		Name:               "default/reader",
 		Operations:         map[OperationType]bool{"read": true},
-		ModelPatterns:      []*regexp.Regexp{regexp.MustCompile(`^reader$`)},
+		ModelPatterns:      []*RegexPattern{MustRegexPattern(`^reader$`)},
 		HeaderMatchers:     map[string]*StringMatcher{"x-tenant": {Exact: "tenant-a"}},
 		SourceTables:       map[string]bool{"documents": true},
 		Destinations:       []Destination{{Pool: "gpu", Weight: 1, QueueDepthCondition: &ThresholdCondition{Operator: "<", Value: 10}}},
@@ -2758,13 +2841,14 @@ func TestRouteManagerOwnsImmutablePolicySnapshots(t *testing.T) {
 		RateLimiter:        NewRateLimiter(10, 10, false),
 		RetryOnRequestErrs: true,
 	}
-	if !rm.UpsertRoute(source) {
+	if changed, err := rm.UpsertRoute(source); err != nil || !changed {
 		t.Fatal("initial route was not installed")
 	}
 	generation := rm.Generation()
 
 	// Mutating the object supplied by the caller must not alter installed policy.
 	source.Operations["read"] = false
+	source.ModelPatterns[0].Expression = "^other$"
 	source.HeaderMatchers["x-tenant"].Exact = "tenant-b"
 	source.SourceTables["documents"] = false
 	source.Destinations[0].Pool = "mutated"
@@ -2786,6 +2870,7 @@ func TestRouteManagerOwnsImmutablePolicySnapshots(t *testing.T) {
 
 	// Mutating a returned snapshot must likewise not alter future matches.
 	matched.Operations["read"] = false
+	matched.ModelPatterns[0].Expression = "^other$"
 	matched.Destinations[0].Pool = "returned-mutation"
 	matched.Fallback.RedirectPool = "returned-mutation"
 	again := rm.Match(req)
@@ -2794,6 +2879,55 @@ func TestRouteManagerOwnsImmutablePolicySnapshots(t *testing.T) {
 	}
 	if rm.Generation() != generation {
 		t.Fatalf("snapshot-only mutations changed generation: got %d want %d", rm.Generation(), generation)
+	}
+}
+
+func TestRouteManagerOwnsDeclarativeRegexSemantics(t *testing.T) {
+	t.Parallel()
+	rm := NewRouteManager()
+	base, err := CompileRegexPattern("a|aa", RegexLeftmostFirst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := rm.UpsertRoute(&Route{Name: "regex", ModelPatterns: []*RegexPattern{base}})
+	if err != nil || !changed {
+		t.Fatalf("initial regex route changed=%v err=%v", changed, err)
+	}
+	generation := rm.Generation()
+	longest, err := CompileRegexPattern("a|aa", RegexLeftmostLongest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err = rm.UpsertRoute(&Route{Name: "regex", ModelPatterns: []*RegexPattern{longest}})
+	if err != nil || !changed {
+		t.Fatalf("regex syntax update changed=%v err=%v", changed, err)
+	}
+	if rm.Generation() != generation+1 {
+		t.Fatalf("generation = %d, want %d", rm.Generation(), generation+1)
+	}
+	if _, err := rm.UpsertRoute(&Route{
+		Name:          "invalid",
+		ModelPatterns: []*RegexPattern{{Expression: "["}},
+	}); err == nil {
+		t.Fatal("invalid declarative regex was installed")
+	}
+}
+
+func TestRouteManagerInstalledMatchDoesNotAllocate(t *testing.T) {
+	rm := NewRouteManager()
+	if changed, err := rm.UpsertRoute(&Route{
+		Name:       "readers",
+		Operations: map[OperationType]bool{"read": true},
+	}); err != nil || !changed {
+		t.Fatalf("install route changed=%v err=%v", changed, err)
+	}
+	req := &RouteRequest{Operation: "read", Timestamp: time.Now()}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if rm.matchInstalled(req) == nil {
+			panic("route disappeared")
+		}
+	}); allocations != 0 {
+		t.Fatalf("installed route match allocations = %v, want 0", allocations)
 	}
 }
 
@@ -2825,12 +2959,12 @@ func capabilityEndpointSet(registry *ModelRegistry, endpoints []*Endpoint) map[s
 	result := make(map[string]leasedEndpoint, len(endpoints))
 	for _, endpoint := range endpoints {
 		operations := make(map[OperationType]bool)
-		for _, info := range endpoint.Models {
+		for _, info := range endpoint.models {
 			for operation := range info.Operations {
 				operations[operation] = true
 			}
 		}
-		result[endpoint.Address] = leasedEndpoint{
+		result[endpoint.address] = leasedEndpoint{
 			incarnation: endpoint.incarnation,
 			operations:  operations,
 		}
@@ -3205,7 +3339,7 @@ func TestProxyModelCatalogLeasesOnlySuccessfulCandidates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(allowed) != 1 || allowed["http://healthy.internal"] == nil {
+	if endpoint, ok := allowed["http://healthy.internal"]; len(allowed) != 1 || !ok || endpoint.endpoint == nil {
 		t.Fatalf("leased endpoints = %#v, want only healthy catalog responder", allowed)
 	}
 }

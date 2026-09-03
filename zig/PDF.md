@@ -1315,7 +1315,7 @@ document. They are architectural requirements, not Florence-specific cleanup:
     the intersection of a new route and an old endpoint set.
 138. **Informer resyncs looked like route-policy changes.** The watcher now
     drops same-resource-version resync notifications before conversion, and the
-    route manager independently compares the complete compiled policy before
+    route manager independently compares the complete declarative policy before
     replacing it. `UpsertRoute` owns a deep immutable copy of every declarative
     map, matcher, time window, destination condition, fallback, and retry rule;
     neither the submitted object nor a returned match can mutate installed
@@ -1357,16 +1357,51 @@ document. They are architectural requirements, not Florence-specific cleanup:
     capacity check, and validation deletes a stale lease as soon as it observes
     replacement.
 144. **The routing API obscured replacement semantics.** The route manager now
-    exposes the deliberate breaking API `UpsertRoute(*Route) bool`; the result
-    is true only for an installed semantic change. Watchers and direct callers
-    use that contract explicitly, so no compatibility shim can accidentally
-    discard change detection or imply append-only behavior.
+    exposes the deliberate breaking API `UpsertRoute(*Route) (bool, error)`;
+    the boolean is true only for an installed semantic change and invalid
+    declarative matchers return an error. Watchers and direct callers use that
+    contract explicitly, so no compatibility shim can accidentally discard
+    change detection, matcher validation, or imply append-only behavior.
 145. **PDF stale-page cleanup retained a superseded vector-delete shape.**
     Embedding artifacts now remain the sole owner of their projection cleanup:
     stale PDF-page scans return bounded artifact keys only, and replay applies
     those deletes atomically. The old parallel `vector_keys` list is neither
     constructed nor freed, matching the artifact-backed chunk path and avoiding
     duplicate or prematurely visible projection deletion.
+146. **Endpoint incarnation was discarded before reservation.** Capability
+    validation now produces immutable endpoint references containing the exact
+    endpoint allocation, incarnation, and circuit breaker. Candidate filtering
+    rechecks all three under the registry lock, and selection atomically
+    reserves that reference. Resolution completion retains the same breaker
+    instead of looking one up by address, so an old request can neither execute
+    against nor charge failure state to an address-reused replacement.
+147. **Mutable registry exports bypassed endpoint authority.** Endpoint routing
+    state is now private and topology changes replace an immutable endpoint
+    identity while retaining only its shared atomic load counters. Raw registry
+    lock, backing-map, and circuit-breaker accessors are removed; operators
+    receive detached, stably ordered `EndpointSnapshot` values with copied,
+    deterministic per-model operation catalogs. The public routing primitive
+    is an owned `EndpointLease` with explicit success, failure, and release completion.
+    Every routing mutation therefore remains inside the registry incarnation
+    boundary.
+148. **Capability invalidation raced successful single-flight completion.** An
+    execution-side capability-stale response now marks the matching active
+    discovery flight invalidated while removing the cache entry. A response
+    already in flight at that boundary is retired and rediscovered; it cannot
+    republish its older descriptor, routing token, or revision for either the
+    owner or joined waiters.
+149. **Compiled regex objects were not a declarative policy identity.** Route
+    patterns now carry an expression and explicit leftmost-first,
+    leftmost-longest, or POSIX syntax mode. `UpsertRoute` validates and compiles
+    private programs for its immutable snapshot, while equality and generation
+    changes compare the declarative fields. This removes dependence on
+    `regexp.String()`, which does not encode compilation mode.
+150. **Safe route ownership allocated on every proxy request.** The route
+    manager now has a private installed-snapshot match path used by proxy
+    discovery and execution. Exported match and resolution APIs still return
+    detached copies, but ordinary HTTP forwarding reuses the immutable
+    copy-on-write policy and compiled programs without configuration-sized
+    allocations per request.
 
 ### Post-review implementation contract
 
