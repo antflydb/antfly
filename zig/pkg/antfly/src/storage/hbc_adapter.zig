@@ -7488,12 +7488,18 @@ pub const HBCIndex = struct {
     /// the generation, so the compactor cannot become the first query's work.
     pub fn requestExperimentalPostingFullCheckpointForReadiness(self: *HBCIndex) !bool {
         if (!self.experimental_posting_sidecar_managed or
-            !self.experimental_posting_wal_authoritative.load(.acquire) or
             self.write_session_depth != 0 or
             self.experimental_posting_capture_enabled)
         {
             return false;
         }
+        // Stable-tip flattening is a physical query-layout operation, not an
+        // authority transition. A released-v1 index may retain its HBC LSM as
+        // mutation authority while serving from the same native immutable
+        // mirror. Refusing to flatten that mirror leaves every leaf touched by
+        // a delta on the sparse resolver/projection path. The caller separately
+        // controls `make_authoritative`, so allowing the mirror to compact
+        // cannot retire its compatibility LSM or change rollback ownership.
         if (self.experimental_posting_write_store == null) {
             self.experimental_posting_write_store = try self.openExperimentalPostingStore();
         }
@@ -19784,18 +19790,15 @@ test "background posting checkpoint preserves concurrent same-sequence WAL tail"
     try std.testing.expectEqual(@as(usize, 5), compacted_results.items.items.len);
 
     // A readiness owner can explicitly choose a full generation and join its
-    // background build before exposing the stable tip. The resulting store
+    // background build before exposing the stable tip. This reopened index is
+    // deliberately still a v1 mirror: flattening its query layout must not be
+    // confused with publishing native mutation authority. The resulting store
     // remains flat even when the ordinary policy would have selected a delta.
     try reopened.beginExperimentalPostingMutationCapture();
     try reopened.insertWithMetadata(6, &[_]f32{ 0.4, 0.6 }, "doc:6");
     try reopened.persistExperimentalPostingSidecarAtAppliedSequence(4, .{});
-    if (reopened.experimental_posting_write_store == null) {
-        reopened.experimental_posting_write_store = try reopened.openExperimentalPostingStore();
-    }
-    try std.testing.expect(try reopened.startExperimentalPostingCheckpointBuild(
-        &reopened.experimental_posting_write_store.?,
-        .full,
-    ));
+    try std.testing.expect(!reopened.experimentalPostingWalAuthoritative());
+    try std.testing.expect(try reopened.requestExperimentalPostingFullCheckpointForReadiness());
     // Commit a real packed-node/quantized mutation after the full builder has
     // retained its source boundary. Publication must replay this patch tail
     // over the newly compacted base, not flatten it accidentally or encode a
@@ -19806,6 +19809,7 @@ test "background posting checkpoint preserves concurrent same-sequence WAL tail"
     // The mutation's ordinary maintenance may publish a builder that already
     // completed; otherwise join it explicitly here.
     _ = try reopened.finishExperimentalPostingCheckpointForReadiness();
+    try std.testing.expect(!reopened.experimentalPostingWalAuthoritative());
     try std.testing.expectEqual(
         @as(usize, 0),
         reopened.experimental_posting_write_store.?.deltaSegmentCount(),

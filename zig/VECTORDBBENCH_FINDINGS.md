@@ -3968,6 +3968,42 @@ the revalidated pointer protects the post-publication window. Invalid pointers
 fail closed. A deterministic hook test publishes and clears the marker exactly
 between inventory and deletion and verifies that the live generation survives.
 
+## Stable-tip mirror flatten regression and recovery
+
+An exact A/B within this PR isolated a query-layout regression. Commit
+`2c9d731a9c` (the r126 experiment) finished with one flat posting generation,
+whereas the later PR retained a base plus three delta generations. The search
+work was otherwise comparable at 1M: about 240K approximate scores and 145
+authoritative completions per query. The retained deltas shadowed almost every
+leaf, reducing native leaf-scan hits from 2,048 to about 35 and forcing about
+469 sparse projection reads per query. Concurrency-20 throughput fell from
+679.28 QPS to 125.28 QPS and p95 rose from 66.62 ms to 218.54 ms.
+
+The cause was an invalid coupling between physical layout and mutation
+authority. Stable-tip readiness requested a full posting checkpoint only when
+the native WAL was authoritative. A released-v1 index is deliberately still
+LSM-authoritative, but its native query mirror is equally safe to flatten:
+`make_authoritative` remains a separate, capability-fenced transition.
+
+Allowing stable-tip flattening for managed v1 mirrors recovered the fast path
+without weakening rollback or upgrade behavior. A fresh public-API 50K run at
+batch 100 and four load workers produced:
+
+- 23.5014 s readiness: 21.471 s insert plus 2.0304 s optimize;
+- 0.9862 recall;
+- 178.51 / 1070.49 / 1224.40 / 1146.74 QPS at concurrency 1/10/20/30;
+- 7.09 / 15.26 / 33.87 / 62.92 ms p95 at concurrency 1/10/20/30;
+- 207.926 native leaf-scan hits and zero leaf-scan fallbacks per query;
+- zero approximate projection reads and 137.338 exact residual reads per query;
+- one 172 MiB full posting segment and an empty WAL after restart;
+- 2.80 GB cache-inclusive live peak RSS and 533 MB restarted peak RSS.
+
+This is better than the pre-fix PR's 26.6046 s readiness and restores its
+regressed query curve (405.15 / 423.87 / 379.32 QPS at concurrency 10/20/30)
+to r126-class performance. The deterministic checkpoint test now proves that a
+non-authoritative v1 mirror can flatten while retaining a concurrently appended
+WAL tail and remaining non-authoritative throughout publication.
+
 ## Next checks
 
 1. Narrow broad persisted L0 source ranges with adaptive, workload-independent
