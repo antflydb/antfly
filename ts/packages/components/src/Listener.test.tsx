@@ -4,7 +4,7 @@ import type React from "react";
 import { describe, expect, it, vi } from "vitest";
 import Antfly from "./Antfly";
 import Autosuggest from "./Autosuggest";
-import Listener from "./Listener";
+import Listener, { facetFilterMatches } from "./Listener";
 import QueryBox from "./QueryBox";
 import Results from "./Results";
 
@@ -18,6 +18,11 @@ const TestWrapper = ({ children }: { children: React.ReactNode }) => {
 };
 
 describe("Listener", () => {
+  it("applies a facet filter value modifier as a case-insensitive pattern", () => {
+    expect(facetFilterMatches("Anderson", "And", (value) => `^${value}.*`)).toBe(true);
+    expect(facetFilterMatches("Sandy", "And", (value) => `^${value}.*`)).toBe(false);
+    expect(facetFilterMatches("Anything", "[", (value) => value)).toBe(false);
+  });
   describe("Widget configuration readiness checks", () => {
     it("should fire queries when widget has both needsConfiguration and configuration", async () => {
       // Regression test for bug where:
@@ -670,6 +675,30 @@ describe("Listener", () => {
       // Check that onChange was called with Map containing values
       const lastCall = onChange.mock.calls[onChange.mock.calls.length - 1];
       expect(lastCall[0]).toBeInstanceOf(Map);
+    });
+
+    it("should not call onChange again for an unrelated provider rerender", async () => {
+      const onChange = vi.fn();
+      const tree = (
+        <Antfly url="http://localhost:8082/db/v1" table="test">
+          <Listener onChange={onChange}>
+            <QueryBox id="search" mode="live" />
+            <Results
+              id="results-cfg"
+              searchBoxId="search"
+              fields={["title"]}
+              items={() => <div />}
+            />
+          </Listener>
+        </Antfly>
+      );
+      const rendered = render(tree);
+      await waitFor(() => expect(onChange).toHaveBeenCalled());
+      const callCount = onChange.mock.calls.length;
+
+      rendered.rerender(tree);
+
+      expect(onChange).toHaveBeenCalledTimes(callCount);
     });
   });
 

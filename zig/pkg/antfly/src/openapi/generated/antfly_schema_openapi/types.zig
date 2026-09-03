@@ -397,7 +397,7 @@ pub const TableSchema = struct {
     document_schemas: ?std.json.ArrayHashMap(DocumentSchema) = null,
     /// The field containing the timestamp for TTL expiration (optional). Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
     ttl_field: ?[]const u8 = null,
-    /// The duration after which documents should expire, based on the ttl_field timestamp (optional). Uses Go duration format (e.g., '24h', '7d', '168h').
+    /// The duration after which documents should expire, based on the ttl_field timestamp (optional). Uses integer duration components with `ns`, `us`, `ms`, `s`, `m`, `h`, or `d` units (for example, `90m`, `1h30m`, or `7d`).
     ttl_duration: ?[]const u8 = null,
     /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
     dynamic_templates: ?[]const DynamicTemplate = null,

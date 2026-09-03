@@ -574,7 +574,7 @@ fn executeInternal(
     if (raw_queries_value != .array) return error.InvalidRetrievalAgentRequest;
     const raw_queries = raw_queries_value.array.items;
 
-    const format: ResponseFormat = if (request.stream orelse false) .sse else .json;
+    const format: ResponseFormat = if (request.stream orelse true) .sse else .json;
     var live = LiveEmitter{ .sink = event_sink, .alloc = alloc };
     const tool_policy = try parseToolPolicy(request);
     const max_internal_iterations = try effectiveMaxInternalIterations(request, tool_policy);
@@ -2182,7 +2182,7 @@ fn parseGenerationConfig(
         return null;
     }
 
-    const generation = generationStepFromPublic(public_generation);
+    const generation = public_generation;
     const chain = try buildGenerationChain(alloc, request, generation);
     return .{
         .chain = chain,
@@ -2399,8 +2399,7 @@ fn parseFollowupConfig(request: RetrievalAgentRequest, has_generation: bool) !?P
     const followup = steps.followup orelse return null;
     if (followup.enabled != null and followup.enabled.? == false) return null;
     if (!has_generation) return error.UnsupportedRetrievalAgentRequest;
-    if (followup.generator != null or followup.chain != null) return error.UnsupportedRetrievalAgentRequest;
-    const count = @as(usize, @intCast(@max(@as(i64, 1), followup.count orelse 3)));
+    const count = @as(usize, @intCast(@min(@as(i64, 4), @max(@as(i64, 1), followup.count orelse 3))));
     return .{ .count = count };
 }
 
@@ -2487,47 +2486,34 @@ fn buildGenerationChain(
     return try links.toOwnedSlice(alloc);
 }
 
-fn generationStepFromPublic(generation: generating_api_openapi.GenerationStepConfig) generating_api_openapi.GenerationStepConfig {
-    return .{
-        .enabled = generation.enabled,
-        .generator = if (generation.generator) |cfg| publicGeneratorConfigToGenerated(cfg) else null,
-        // Chain fallback is not implemented yet, but non-null still needs to trip validation.
-        .chain = if (generation.chain != null) &[_]generating_openapi.ChainLink{} else null,
-        .system_prompt = generation.system_prompt,
-        .generation_context = generation.generation_context,
+fn generatorConfigFromGenerated(cfg: generating_api_openapi.GeneratorConfig) !generating.GeneratorConfig {
+    const provider: generating.Provider = switch (cfg.provider) {
+        .gemini => .gemini,
+        .vertex => .vertex,
+        .openai => .openai,
+        .ollama => .ollama,
+        .antfly => .antfly,
     };
-}
-
-fn publicGeneratorConfigToGenerated(cfg: generating_openapi.GeneratorConfig) generating_openapi.GeneratorConfig {
+    const model = cfg.model orelse return error.InvalidRetrievalAgentRequest;
+    const url = switch (provider) {
+        .antfly => cfg.api_url orelse "",
+        .gemini, .vertex => cfg.url orelse "",
+        .openai, .ollama => cfg.url orelse return error.InvalidRetrievalAgentRequest,
+        else => return error.UnsupportedRetrievalAgentRequest,
+    };
     return .{
-        .provider = switch (cfg.provider) {
-            .gemini => .gemini,
-            .vertex => .vertex,
-            .ollama => .ollama,
-            .openai => .openai,
-            .openrouter => .openrouter,
-            .bedrock => .bedrock,
-            .anthropic => .anthropic,
-            .cohere => .cohere,
-            .antfly => .antfly,
-            .mock => .mock,
-        },
-        .model = cfg.model,
-        .temperature = cfg.temperature,
-        .max_tokens = cfg.max_tokens,
-        .top_p = cfg.top_p,
-        .top_k = cfg.top_k,
+        .provider = provider,
+        .model = model,
+        .url = url,
         .api_key = cfg.api_key,
-        .url = cfg.url,
-        .api_url = cfg.api_url,
         .project_id = cfg.project_id,
         .location = cfg.location,
         .credentials_path = cfg.credentials_path,
-        .region = cfg.region,
+        .max_tokens = cfg.max_tokens orelse generating.default_max_tokens,
     };
 }
 
-fn generatorConfigFromGenerated(cfg: generating_openapi.GeneratorConfig) !generating.GeneratorConfig {
+fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generating.GeneratorConfig {
     const provider: generating.Provider = switch (cfg.provider) {
         .gemini => .gemini,
         .vertex => .vertex,
@@ -2553,10 +2539,6 @@ fn generatorConfigFromGenerated(cfg: generating_openapi.GeneratorConfig) !genera
         .credentials_path = cfg.credentials_path,
         .max_tokens = cfg.max_tokens orelse generating.default_max_tokens,
     };
-}
-
-fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generating.GeneratorConfig {
-    return try generatorConfigFromGenerated(publicGeneratorConfigToGenerated(cfg));
 }
 
 fn buildGenerationMessages(

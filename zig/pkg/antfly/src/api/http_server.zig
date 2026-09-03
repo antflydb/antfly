@@ -163,10 +163,30 @@ const ParsedGlobalQueryTable = struct {
 fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlobalQueryTable {
     var parsed = parsePublicGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
     errdefer parsed.deinit();
+    const table_name = parsed.value.table orelse return error.InvalidQueryRequest;
+    if (table_name.len == 0) return error.InvalidQueryRequest;
     return .{
         .parsed = parsed,
-        .table_name = parsed.value.table orelse "",
+        .table_name = table_name,
     };
+}
+
+test "global query requires a non-empty table name" {
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseGlobalQueryTable(std.testing.allocator, "{}"),
+    );
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseGlobalQueryTable(std.testing.allocator, "{\"table\":\"\"}"),
+    );
+}
+
+test "OCC version zero matches only an absent document" {
+    try std.testing.expect(ApiHttpServer.readSetVersionMatches(0, null));
+    try std.testing.expect(!ApiHttpServer.readSetVersionMatches(1, null));
+    try std.testing.expect(!ApiHttpServer.readSetVersionMatches(0, 7));
+    try std.testing.expect(ApiHttpServer.readSetVersionMatches(7, 7));
 }
 
 fn parsePublicGlobalQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.StatefulQueryRequest) {
@@ -6711,6 +6731,10 @@ pub const ApiHttpServer = struct {
         for (tables) |table| try self.validateTableWritesAgainstSchema(table.table_name, table.writes);
     }
 
+    fn readSetVersionMatches(expected_version: u64, actual_version: ?u64) bool {
+        return (actual_version orelse 0) == expected_version;
+    }
+
     pub fn validateCommitReadSet(
         self: *ApiHttpServer,
         req: transactions_api.OwnedTransactionCommitRequest,
@@ -6718,10 +6742,11 @@ pub const ApiHttpServer = struct {
         const source = self.table_reads orelse return null;
         for (req.read_set) |item| {
             var lookup = (try source.lookup(self.alloc, item.table_name, item.key, .{}, .read_index)) orelse {
+                if (readSetVersionMatches(item.expected_version, null)) continue;
                 return transactions_api.versionConflict(item.table_name, item.key, item.expected_version, 0);
             };
             defer lookup.deinit(self.alloc);
-            if (lookup.version != item.expected_version) {
+            if (!readSetVersionMatches(item.expected_version, lookup.version)) {
                 return transactions_api.versionConflict(item.table_name, item.key, item.expected_version, lookup.version);
             }
         }
@@ -14495,6 +14520,7 @@ pub const ApiHttpServer = struct {
                 false,
             ),
             error.QueryEmbeddingInputTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "query embedding input too large"),
+            error.EmbeddingIndexNotFound => try contextual_operations.textAlloc(self.alloc, 422, "embedding index not found"),
             error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(self.alloc, 429, "query embedding overloaded"),
             error.EmbedRateLimited => try contextualRetryableTextResponse(self.alloc, 429, "query embedding rate limited"),
             error.EmbedTransientFailure => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .query_embedding_temporarily_unavailable),

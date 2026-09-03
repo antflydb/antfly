@@ -4219,7 +4219,7 @@ components:
           type: array
           items:
             type: string
-          description: Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order.
+          description: Ordered field list for multi-field terms aggregations. Each bucket key is a JSON string containing the serialized value array in the same order; clients should parse bucket.key as JSON.
         size:
           type: integer
           x-go-type-skip-optional-pointer: false
@@ -4295,7 +4295,7 @@ components:
       properties:
         key:
           type: string
-          description: Bucket key (term, range name, date, etc.)
+          description: Bucket key (term, range name, date, etc.). For a multi-field terms aggregation this is a JSON string containing the serialized value array; use JSON.parse(bucket.key) to recover the array.
         key_as_string:
           type: string
           x-go-type-skip-optional-pointer: false
@@ -4949,7 +4949,7 @@ components:
 
             Notes:
             - Non-existent keys are silently ignored
-            - Deletions are processed before inserts in the same batch
+            - Deletions take precedence over inserts for the same key in one batch
             - Keys are permanently removed from storage and indexes
           items:
             type: string
@@ -7188,7 +7188,7 @@ components:
       properties:
         table:
           type: string
-          description: Name of the table to query. Optional for global queries.
+          description: Name of the table to query. Required for global-query requests.
           example: "wikipedia"
         query:
           x-go-type: json.RawMessage
@@ -8610,13 +8610,9 @@ components:
       type: string
       enum:
         - success
-        - partial
-        - error
       description: |
-        Status of a linear merge page operation:
-        - "success": All records in batch processed successfully
-        - "partial": Processing stopped at shard boundary, client should retry with next_cursor
-        - "error": Fatal error occurred, no records processed successfully
+        Status of a completed linear merge page. Successful responses are atomic
+        and use "success"; failures are returned as non-2xx HTTP responses.
     LinearMergeRequest:
       type: object
       required:
@@ -8635,7 +8631,7 @@ components:
         1. Send sorted records from your external source
         2. Server upserts records that exist in your batch
         3. Server deletes Antfly records in the key range that are absent from your batch
-        4. If stopped at shard boundary, use next_cursor for next request
+        4. Use next_cursor as last_merged_id for the next request
 
         **WARNING:** Not safe for concurrent operations with overlapping key ranges.
       properties:
@@ -8712,7 +8708,9 @@ components:
         - upserted
         - deleted
         - skipped
+        - failed
         - next_cursor
+        - took
       properties:
         status:
           $ref: "#/components/schemas/LinearMergePageStatus"
@@ -8869,9 +8867,11 @@ components:
           example: "users"
         key_template:
           type: string
-          default: "id"
+          default: "_id"
           description: |
             Template for constructing the Antfly document key from PG columns.
+            When omitted, Antfly first uses `_id`, then falls back to `id` if
+            the row has no `_id` column.
             A plain string (e.g., "id") uses that column's value directly.
             Use `{{column}}` syntax for composite keys: `{{tenant_id}}:{{user_id}}`.
           example: "id"
@@ -8916,6 +8916,10 @@ components:
             WHERE clause on the PostgreSQL publication. This filters rows at the
             source before they are sent over the replication stream, reducing
             network and processing overhead.
+
+            Requires PostgreSQL 15 or newer and is applied only when Antfly
+            creates the publication. Changing this value does not alter an
+            existing publication; update or recreate that publication directly.
 
             Only a subset of filter types are supported (term, match, range,
             conjuncts, disjuncts, must_not). The filter is translated to SQL

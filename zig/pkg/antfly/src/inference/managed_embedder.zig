@@ -1677,7 +1677,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         return try out.toOwnedSlice(alloc);
     }
 
-    const metric = if (cfg.distance_metric) |distance_metric| @tagName(distance_metric) else "cosine";
+    const metric = if (cfg.distance_metric) |distance_metric| @tagName(distance_metric) else "l2_squared";
 
     const embedder_value = root.get("embedder");
     const embedder_json = if (embedder_value) |embedder| blk: {
@@ -4872,7 +4872,7 @@ test "managed embedder preserves coverage policy in storage config" {
 
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        \\{"field":"body","dims":384,"embedding_name":"thumbnail","coverage_policy":"partial"}
+        \\{"field":"body","dims":384,"metric":"l2_squared","embedding_name":"thumbnail","coverage_policy":"partial"}
     ,
         config_json,
     );

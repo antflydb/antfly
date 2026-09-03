@@ -44,6 +44,7 @@ const common_config = @import("../../common/config.zig");
 
 pub const BootstrapConfig = struct {
     pub const S3Options = object_store_support.S3Options;
+    pub const GcsOptions = object_store_support.GcsOptions;
 
     artifacts_uri: []const u8,
     manifests_uri: []const u8,
@@ -51,6 +52,7 @@ pub const BootstrapConfig = struct {
     progress_uri: []const u8,
     catalog_uri: []const u8,
     s3_options: [5]?S3Options = .{ null, null, null, null, null },
+    gcs_options: [5]?GcsOptions = .{ null, null, null, null, null },
     query_cache_dir: ?[]const u8 = null,
     query_cache_max_bytes: u64 = 4 * 1024 * 1024 * 1024,
     query_cache_payload_max_bytes: u64 = 64 * 1024 * 1024,
@@ -236,6 +238,53 @@ const S3ClientPool = struct {
     }
 };
 
+const GcsClientPool = struct {
+    const Entry = struct {
+        options: object_store_support.GcsOptions,
+        impl: *objectstore.Gcs.JsonApiClient,
+        client: objectstore.Client,
+    };
+
+    alloc: Allocator,
+    io: std.Io,
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+
+    fn init(alloc: Allocator, io: std.Io) GcsClientPool {
+        return .{ .alloc = alloc, .io = io };
+    }
+
+    fn deinit(self: *GcsClientPool) void {
+        for (self.entries.items) |*entry| {
+            entry.client.deinit();
+            self.alloc.destroy(entry.impl);
+        }
+        self.entries.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn getOrCreate(self: *GcsClientPool, maybe_options: ?object_store_support.GcsOptions) !objectstore.Client {
+        const options = maybe_options orelse object_store_support.GcsOptions{};
+        for (self.entries.items) |entry| {
+            if (gcsOptionsEql(entry.options, options)) return entry.client;
+        }
+        var cfg = try object_store_support.gcsConfigAlloc(self.alloc, options);
+        cfg.io = self.io;
+        var cfg_owned = true;
+        errdefer if (cfg_owned) cfg.deinit(self.alloc);
+        const impl = try self.alloc.create(objectstore.Gcs.JsonApiClient);
+        errdefer self.alloc.destroy(impl);
+        impl.* = try objectstore.Gcs.JsonApiClient.init(self.alloc, cfg);
+        cfg_owned = false;
+        errdefer {
+            var client = impl.client();
+            client.deinit();
+        }
+        const client = impl.client();
+        try self.entries.append(self.alloc, .{ .options = options, .impl = impl, .client = client });
+        return client;
+    }
+};
+
 test "serverless S3 client pool has a finite retained-worker ceiling" {
     var pool = try S3ClientPool.init(std.testing.allocator);
     defer pool.deinit();
@@ -254,6 +303,17 @@ fn s3OptionsEql(a: object_store_support.S3Options, b: object_store_support.S3Opt
         optionalStringEql(a.session_token, b.session_token) and
         credentialSourceEql(a.credential_source, b.credential_source) and
         a.use_ssl == b.use_ssl and a.addressing_style == b.addressing_style;
+}
+
+fn gcsOptionsEql(a: object_store_support.GcsOptions, b: object_store_support.GcsOptions) bool {
+    return optionalStringEql(a.endpoint, b.endpoint) and
+        optionalStringEql(a.upload_endpoint, b.upload_endpoint) and
+        optionalStringEql(a.project_id, b.project_id) and
+        a.credential_source == b.credential_source and
+        optionalStringEql(a.bearer_token, b.bearer_token) and
+        optionalStringEql(a.service_account_json, b.service_account_json) and
+        optionalStringEql(a.credentials_path, b.credentials_path) and
+        optionalStringEql(a.scope, b.scope);
 }
 
 fn credentialSourceEql(a: bedrock.CredentialSource, b: bedrock.CredentialSource) bool {
@@ -290,11 +350,26 @@ fn shouldCreateBucket(options: ?object_store_support.S3Options) bool {
     return if (options) |value| value.create_bucket else false;
 }
 
+fn shouldCreateGcsBucket(options: ?object_store_support.GcsOptions) bool {
+    return if (options) |value| value.create_bucket else false;
+}
+
 const OwnedS3Target = struct {
     bucket: []u8,
     prefix: []u8,
 
     fn deinit(self: *OwnedS3Target, alloc: Allocator) void {
+        alloc.free(self.bucket);
+        alloc.free(self.prefix);
+        self.* = undefined;
+    }
+};
+
+const OwnedGcsTarget = struct {
+    bucket: []u8,
+    prefix: []u8,
+
+    fn deinit(self: *OwnedGcsTarget, alloc: Allocator) void {
         alloc.free(self.bucket);
         alloc.free(self.prefix);
         self.* = undefined;
@@ -319,9 +394,28 @@ fn s3TargetAlloc(alloc: Allocator, uri: []const u8) !?OwnedS3Target {
     };
 }
 
+fn gcsTargetAlloc(alloc: Allocator, uri: []const u8) !?OwnedGcsTarget {
+    var parsed = try remote_uri.parseAlloc(alloc, uri);
+    return switch (parsed) {
+        .file => |value| blk: {
+            alloc.free(value);
+            break :blk null;
+        },
+        .s3 => |*value| blk: {
+            value.deinit(alloc);
+            break :blk null;
+        },
+        .gcs => |*value| .{
+            .bucket = value.bucket,
+            .prefix = value.prefix,
+        },
+    };
+}
+
 pub const OwnedStack = struct {
     alloc: Allocator,
     s3_client_pool: S3ClientPool,
+    gcs_client_pool: GcsClientPool,
     artifacts_impl: artifacts_object_store.ObjectStore,
     artifacts: artifacts_mod.ArtifactStore,
     manifests_impl: manifest_object_store.ObjectStore,
@@ -352,15 +446,23 @@ pub const OwnedStack = struct {
         self.alloc = alloc;
         self.s3_client_pool = try S3ClientPool.init(alloc);
         errdefer self.s3_client_pool.deinit();
+        self.gcs_client_pool = GcsClientPool.init(alloc, self.s3_client_pool.io_impl.io());
+        errdefer self.gcs_client_pool.deinit();
         self.query_cache = null;
         self.managed_query_embedder = null;
         self.dense_query_index_name = null;
         self.owned_foreign_registry = null;
         var artifacts_target = try s3TargetAlloc(alloc, cfg.artifacts_uri);
         defer if (artifacts_target) |*target| target.deinit(alloc);
+        var artifacts_gcs_target = try gcsTargetAlloc(alloc, cfg.artifacts_uri);
+        defer if (artifacts_gcs_target) |*target| target.deinit(alloc);
         self.artifacts_impl = if (artifacts_target) |target| blk: {
             const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[0]);
             try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[0]));
+            break :blk try artifacts_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
+        } else if (artifacts_gcs_target) |target| blk: {
+            const client = try self.gcs_client_pool.getOrCreate(cfg.gcs_options[0]);
+            try ensureConfiguredBucket(client, target.bucket, shouldCreateGcsBucket(cfg.gcs_options[0]));
             break :blk try artifacts_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
         } else try artifacts_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.artifacts_uri, cfg.s3_options[0]);
         self.artifacts = self.artifacts_impl.artifactStore();
@@ -368,9 +470,15 @@ pub const OwnedStack = struct {
 
         var manifests_target = try s3TargetAlloc(alloc, cfg.manifests_uri);
         defer if (manifests_target) |*target| target.deinit(alloc);
+        var manifests_gcs_target = try gcsTargetAlloc(alloc, cfg.manifests_uri);
+        defer if (manifests_gcs_target) |*target| target.deinit(alloc);
         self.manifests_impl = if (manifests_target) |target| blk: {
             const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[1]);
             try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[1]));
+            break :blk try manifest_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
+        } else if (manifests_gcs_target) |target| blk: {
+            const client = try self.gcs_client_pool.getOrCreate(cfg.gcs_options[1]);
+            try ensureConfiguredBucket(client, target.bucket, shouldCreateGcsBucket(cfg.gcs_options[1]));
             break :blk try manifest_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
         } else try manifest_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.manifests_uri, cfg.s3_options[1]);
         self.manifests = self.manifests_impl.manifestStore();
@@ -378,9 +486,15 @@ pub const OwnedStack = struct {
 
         var wal_target = try s3TargetAlloc(alloc, cfg.wal_uri);
         defer if (wal_target) |*target| target.deinit(alloc);
+        var wal_gcs_target = try gcsTargetAlloc(alloc, cfg.wal_uri);
+        defer if (wal_gcs_target) |*target| target.deinit(alloc);
         self.wal_impl = if (wal_target) |target| blk: {
             const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[2]);
             try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[2]));
+            break :blk try wal_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
+        } else if (wal_gcs_target) |target| blk: {
+            const client = try self.gcs_client_pool.getOrCreate(cfg.gcs_options[2]);
+            try ensureConfiguredBucket(client, target.bucket, shouldCreateGcsBucket(cfg.gcs_options[2]));
             break :blk try wal_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
         } else try wal_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.wal_uri, cfg.s3_options[2]);
         self.wal = self.wal_impl.walStore();
@@ -388,9 +502,15 @@ pub const OwnedStack = struct {
 
         var progress_target = try s3TargetAlloc(alloc, cfg.progress_uri);
         defer if (progress_target) |*target| target.deinit(alloc);
+        var progress_gcs_target = try gcsTargetAlloc(alloc, cfg.progress_uri);
+        defer if (progress_gcs_target) |*target| target.deinit(alloc);
         self.progress_impl = if (progress_target) |target| blk: {
             const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[3]);
             try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[3]));
+            break :blk try progress_object_store.ObjectProgressStore.initWithClient(alloc, client, target.bucket, target.prefix);
+        } else if (progress_gcs_target) |target| blk: {
+            const client = try self.gcs_client_pool.getOrCreate(cfg.gcs_options[3]);
+            try ensureConfiguredBucket(client, target.bucket, shouldCreateGcsBucket(cfg.gcs_options[3]));
             break :blk try progress_object_store.ObjectProgressStore.initWithClient(alloc, client, target.bucket, target.prefix);
         } else try progress_object_store.ObjectProgressStore.initRemoteUriWithS3Options(alloc, cfg.progress_uri, cfg.s3_options[3]);
         self.progress = self.progress_impl.progressStore();
@@ -398,9 +518,15 @@ pub const OwnedStack = struct {
 
         var catalog_target = try s3TargetAlloc(alloc, cfg.catalog_uri);
         defer if (catalog_target) |*target| target.deinit(alloc);
+        var catalog_gcs_target = try gcsTargetAlloc(alloc, cfg.catalog_uri);
+        defer if (catalog_gcs_target) |*target| target.deinit(alloc);
         self.catalog_impl = if (catalog_target) |target| blk: {
             const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[4]);
             try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[4]));
+            break :blk try catalog_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
+        } else if (catalog_gcs_target) |target| blk: {
+            const client = try self.gcs_client_pool.getOrCreate(cfg.gcs_options[4]);
+            try ensureConfiguredBucket(client, target.bucket, shouldCreateGcsBucket(cfg.gcs_options[4]));
             break :blk try catalog_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
         } else try catalog_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.catalog_uri, cfg.s3_options[4]);
         self.catalog_store = self.catalog_impl.catalogStore();
@@ -514,6 +640,7 @@ pub const OwnedStack = struct {
         self.wal.deinit();
         self.manifests.deinit();
         self.artifacts.deinit();
+        self.gcs_client_pool.deinit();
         self.s3_client_pool.deinit();
         self.* = undefined;
     }
@@ -527,8 +654,6 @@ pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
         if (cfg.query_cache_payload_max_bytes == 0) return error.InvalidQueryCachePayloadBudget;
         if (cfg.query_cache_payload_max_bytes > cfg.query_cache_max_bytes) return error.QueryCachePayloadExceedsBudget;
     }
-
-    var requires_gcs = false;
 
     for ([_][]const u8{
         cfg.artifacts_uri,
@@ -546,17 +671,15 @@ pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
 
         switch (parsed) {
             .file => {},
-            .gcs => requires_gcs = true,
+            .gcs => {
+                var gcs_cfg = try object_store_support.gcsConfigAlloc(alloc, cfg.gcs_options[lane_index]);
+                gcs_cfg.deinit(alloc);
+            },
             .s3 => {
                 var s3_cfg = try object_store_support.s3ConfigAlloc(alloc, cfg.s3_options[lane_index]);
                 s3_cfg.deinit(alloc);
             },
         }
-    }
-
-    if (requires_gcs) {
-        var gcs_cfg = try objectstore.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
-        gcs_cfg.deinit(alloc);
     }
 }
 

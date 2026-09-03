@@ -2764,7 +2764,15 @@ pub fn parseQueryRequestWithDeadline(
     );
     try ensureQueryDeadline(execution_deadline_ns);
 
-    const vector_queries = try buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, req.limit);
+    const vector_queries = buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, req.limit) catch |err| blk: {
+        const failover_enabled = if (request.merge_config) |merge_config|
+            merge_config.strategy == .failover
+        else
+            false;
+        const has_full_text = req.full_text != null or req.full_text_queries.len > 0;
+        if (!failover_enabled or !has_full_text or !isEmbeddingGenerationFailure(err)) return err;
+        break :blk NamedVectorQueries{};
+    };
     errdefer vector_queries.deinit(alloc);
     try ensureQueryDeadline(execution_deadline_ns);
     req.dense_queries = vector_queries.dense;
@@ -7268,6 +7276,7 @@ fn buildProfileValue(
             .strategy = if (req.merge_config) |merge_config| switch (merge_config.strategy) {
                 .rrf => .rrf,
                 .rsf => .rsf,
+                .failover => .failover,
             } else .rrf,
             .full_text_hits = result.total_hits,
             .semantic_hits = if (req.dense_queries.len > 0 or req.sparse_queries.len > 0) result.total_hits else 0,
@@ -7388,7 +7397,7 @@ fn parseMergeConfig(alloc: std.mem.Allocator, generated: indexes_openapi.MergeCo
         config.strategy = switch (strategy) {
             .rrf => .rrf,
             .rsf => .rsf,
-            .failover => return error.UnsupportedQueryRequest,
+            .failover => .failover,
         };
     }
     if (generated.rank_constant) |rank_constant| config.rank_constant = rank_constant;
@@ -7412,6 +7421,29 @@ fn parseMergeConfig(alloc: std.mem.Allocator, generated: indexes_openapi.MergeCo
         config.weights = named;
     }
     return config;
+}
+
+fn isEmbeddingGenerationFailure(err: anyerror) bool {
+    return switch (err) {
+        error.QueryEmbeddingOverloaded,
+        error.EmbedRateLimited,
+        error.EmbedTransientFailure,
+        error.EmbedUpstreamFailure,
+        error.Timeout,
+        error.EmbedRequestFailed,
+        error.EmptyEmbeddingResponse,
+        error.InvalidEmbeddingResponse,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.ConnectionTimedOut,
+        error.Canceled,
+        => true,
+        else => false,
+    };
 }
 
 fn parsePruner(generated: indexes_openapi.Pruner) !fusion_mod.Pruner {
@@ -9375,13 +9407,6 @@ fn parseGeneratedBleveQueryBoost(query: query_openapi.Query) !f32 {
 }
 
 fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.Query) anyerror!db_mod.types.TextQuery {
-    const query_string_has_default_operator = comptime blk: {
-        const QueryStringType = @TypeOf((@as(query_openapi.Query, undefined)).query_string_query);
-        break :blk switch (@typeInfo(QueryStringType)) {
-            .pointer => |pointer| @hasField(pointer.child, "default_operator"),
-            else => @hasField(QueryStringType, "default_operator"),
-        };
-    };
     const query_boost = try parseGeneratedBleveQueryBoost(query);
 
     return switch (query) {
@@ -9391,10 +9416,6 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             alloc,
             query_string.query,
             query_boost,
-            if (query_string_has_default_operator)
-                try normalizeQueryStringDefaultOperator(query_string.default_operator)
-            else
-                null,
         ),
         .term_query => |term| .{ .term = .{
             .field = try alloc.dupe(u8, term.field orelse return error.UnsupportedQueryRequest),
@@ -9830,34 +9851,10 @@ fn parseQueryStringTextQuery(
     alloc: std.mem.Allocator,
     input: []const u8,
     boost: f32,
-    default_operator: ?[]const u8,
 ) !db_mod.types.TextQuery {
-    const parsed_default_operator = if (default_operator) |value|
-        if (std.ascii.eqlIgnoreCase(value, "or"))
-            public_query_string_mod.ParseOptions{ .default_operator = .or_ }
-        else if (std.ascii.eqlIgnoreCase(value, "and"))
-            public_query_string_mod.ParseOptions{ .default_operator = .and_ }
-        else
-            return error.UnsupportedQueryRequest
-    else
-        public_query_string_mod.ParseOptions{};
-
-    var owned = try public_query_string_mod.parseFilterAllocWithOptions(alloc, input, parsed_default_operator);
+    var owned = try public_query_string_mod.parseFilterAllocWithOptions(alloc, input, .{});
     defer owned.deinit(alloc);
     return try public_query_string_mod.filterToStatefulTextQueryAlloc(alloc, owned.filter, boost);
-}
-
-fn normalizeQueryStringDefaultOperator(value: anytype) !?[]const u8 {
-    const T = @TypeOf(value);
-    return switch (@typeInfo(T)) {
-        .optional => if (value) |inner| try normalizeQueryStringDefaultOperator(inner) else null,
-        .pointer => |pointer| switch (pointer.size) {
-            .slice => value,
-            else => error.UnsupportedQueryRequest,
-        },
-        .@"enum" => @tagName(value),
-        else => error.UnsupportedQueryRequest,
-    };
 }
 
 const ParsedFuzziness = struct {
@@ -9947,10 +9944,16 @@ fn buildSemanticVectorQueries(
         }
         if (request.semantic_search) |semantic_search| {
             const resolver = semantic_resolver orelse return error.UnsupportedQueryRequest;
+            const query = try resolver.resolveDenseQuery(alloc, table_name, index_name, semantic_search, request.embedding_template, limit);
+            errdefer alloc.free(query.vector);
+            const name = try alloc.dupe(u8, index_name);
+            errdefer alloc.free(name);
+            const owned_index_name = try alloc.dupe(u8, index_name);
+            errdefer alloc.free(owned_index_name);
             try dense_queries.append(alloc, .{
-                .name = try alloc.dupe(u8, index_name),
-                .index_name = try alloc.dupe(u8, index_name),
-                .query = try resolver.resolveDenseQuery(alloc, table_name, index_name, semantic_search, request.embedding_template, limit),
+                .name = name,
+                .index_name = owned_index_name,
+                .query = query,
             });
             continue;
         }
@@ -14632,6 +14635,43 @@ test "api query contract includes stored source when fields are omitted" {
     try std.testing.expect(parsed.req.include_stored);
     try std.testing.expect(!parsed.req.defer_stored_projection);
     try std.testing.expectEqual(@as(usize, 0), parsed.req.fields.len);
+}
+
+test "api query failover continues with full text after embedding outage" {
+    const FailingResolver = struct {
+        fn resolve(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            _: u32,
+        ) anyerror!db_mod.types.DenseKnnQuery {
+            return error.EmbedTransientFailure;
+        }
+    };
+    var state: u8 = 0;
+    const resolver = SemanticResolver{
+        .ptr = &state,
+        .vtable = &.{ .resolve_dense_query = FailingResolver.resolve },
+    };
+    const body =
+        \\{"full_text_search":{"match":"needle","field":"content"},"semantic_search":"needle","indexes":["semantic"],"merge_config":{"strategy":"failover"}}
+    ;
+
+    var parsed = try parseQueryRequest(std.testing.allocator, resolver, "docs", body);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expect(parsed.req.full_text != null);
+    try std.testing.expectEqual(@as(usize, 0), parsed.req.dense_queries.len);
+    try std.testing.expectEqual(fusion_mod.FusionStrategy.failover, parsed.req.merge_config.?.strategy);
+
+    try std.testing.expectError(
+        error.EmbedTransientFailure,
+        parseQueryRequest(std.testing.allocator, resolver, "docs",
+            \\{"full_text_search":{"match":"needle","field":"content"},"semantic_search":"needle","indexes":["semantic"],"merge_config":{"strategy":"rrf"}}
+        ),
+    );
 }
 
 test "api query contract accepts multi_match bool_prefix full text" {

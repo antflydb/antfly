@@ -147,9 +147,11 @@ fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlob
     try query_contract.validatePublicQuerySortTupleContract(alloc, body);
     var parsed = metadata_openapi.server.parseGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
     errdefer parsed.deinit();
+    const table_name = parsed.value.table orelse return error.InvalidQueryRequest;
+    if (table_name.len == 0) return error.InvalidQueryRequest;
     return .{
         .parsed = parsed,
-        .table_name = parsed.value.table orelse "",
+        .table_name = table_name,
     };
 }
 
@@ -157,6 +159,34 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
     const value = content_type orelse return false;
     const media_type = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, value, ';')) |idx| value[0..idx] else value, " \t");
     return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
+}
+
+fn gunzipRequestBodyAlloc(alloc: std.mem.Allocator, encoded: []const u8, max_size: usize) ![]u8 {
+    var encoded_reader: std.Io.Reader = .fixed(encoded);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompressor = std.compress.flate.Decompress.init(&encoded_reader, .gzip, &window);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var buf: [16 * 1024]u8 = undefined;
+    while (true) {
+        const count = decompressor.reader.readSliceShort(&buf) catch |err| {
+            if (err == error.EndOfStream) break;
+            return error.InvalidCompressedBody;
+        };
+        if (count == 0) break;
+        if (count > max_size -| out.items.len) return error.RequestBodyTooLarge;
+        try out.appendSlice(alloc, buf[0..count]);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+test "gzip request bodies are decoded with an expanded-size limit" {
+    const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0 };
+    const decoded = try gunzipRequestBodyAlloc(std.testing.allocator, &encoded, 2);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("{}", decoded);
+    try std.testing.expectError(error.RequestBodyTooLarge, gunzipRequestBodyAlloc(std.testing.allocator, &encoded, 1));
+    try std.testing.expectError(error.InvalidCompressedBody, gunzipRequestBodyAlloc(std.testing.allocator, "not gzip", 1024));
 }
 
 fn requiresInternalServicePrincipal(path: []const u8) bool {
@@ -300,6 +330,7 @@ pub const AntflyApiHandler = struct {
 
     fn installMiddleware(self: *AntflyApiHandler, server: *httpx.Server) !void {
         try server.use(httpx.Middleware.bind("antfly-request-stats", self, recordRequest));
+        try server.use(httpx.Middleware.bind("antfly-request-content-encoding", self, decodeRequestContent));
         try server.use(httpx.Middleware.bind("antfly-ha-mutation-policy", self, enforceHaMutationPolicy));
         try server.use(httpx.Middleware.bind("antfly-internal-service-auth", self, enforceInternalServiceAuth));
     }
@@ -311,6 +342,29 @@ pub const AntflyApiHandler = struct {
         establishInternalBackupDeadline(ctx);
         establishCatalogRouteFenceDeadline(ctx);
         return next.call(ctx) catch |err| mapIngressError(ctx, err);
+    }
+
+    fn decodeRequestContent(_: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
+        const raw_encoding = ctx.header("content-encoding") orelse return next.call(ctx);
+        const encoding = std.mem.trim(u8, raw_encoding, " \t");
+        if (std.ascii.eqlIgnoreCase(encoding, "identity")) return next.call(ctx);
+        if (!std.ascii.eqlIgnoreCase(encoding, "gzip") and !std.ascii.eqlIgnoreCase(encoding, "x-gzip")) {
+            return textResponse(ctx, 415, "unsupported content encoding");
+        }
+
+        const encoded = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid gzip request body");
+        const decoded = gunzipRequestBodyAlloc(ctx.allocator, encoded, http_server_mod.public_api_max_request_body_bytes) catch |err| switch (err) {
+            error.RequestBodyTooLarge => return textResponse(ctx, 413, "request body too large"),
+            else => return textResponse(ctx, 400, "invalid gzip request body"),
+        };
+        if (ctx.request.body_owned) {
+            if (ctx.request.body) |owned| ctx.request.allocator.free(owned);
+        }
+        ctx.request.body = decoded;
+        ctx.request.body_owned = true;
+        _ = ctx.request.headers.remove("content-encoding");
+        try ctx.request.headers.setContentLength(decoded.len);
+        return next.call(ctx);
     }
 
     fn establishCatalogRouteFenceDeadline(ctx: *httpx.Context) void {
@@ -8933,6 +8987,17 @@ test "httpx global query table name comes from request body" {
     defer parsed_table.deinit();
 
     try std.testing.expectEqualStrings("files", parsed_table.table_name);
+}
+
+test "httpx global query requires a non-empty table name" {
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseGlobalQueryTable(std.testing.allocator, "{}"),
+    );
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseGlobalQueryTable(std.testing.allocator, "{\"table\":\"\"}"),
+    );
 }
 
 test "stored destination admission requires write permission on every eventual sink" {

@@ -3490,6 +3490,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "preload model spec parser categorizes registry variants and backends",
             "inference runtime preload parser preserves registry variants and explicit backends",
+            "inference list accepts models directory before or after flags",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -7559,6 +7560,7 @@ pub fn build(b: *std.Build) void {
             "standalone linked inference ABI validates the supported function-table prefix",
             "linked inference ABI rejects mismatched context and function-table prefixes",
             "standalone local inference lifetime distinguishes deadline from upstream cancellation",
+            "standalone resolves the default secret store before full config parsing",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",

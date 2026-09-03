@@ -8,14 +8,14 @@ describe("createIndexArguments", () => {
         name: "semantic",
         type: "embeddings",
         dimension: 384,
-        embedder: { provider: "mock", model: "test" },
+        embedder: { provider: "antfly", model: "test" },
       })
     ).toEqual({
       indexName: "semantic",
       request: {
         type: "embeddings",
         dimension: 384,
-        embedder: { provider: "mock", model: "test" },
+        embedder: { provider: "antfly", model: "test" },
       },
     });
   });

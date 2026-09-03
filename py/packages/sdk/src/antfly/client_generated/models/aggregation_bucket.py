@@ -19,7 +19,8 @@ T = TypeVar("T", bound="AggregationBucket")
 class AggregationBucket:
     """
     Attributes:
-        key (str): Bucket key (term, range name, date, etc.)
+        key (str): Bucket key (term, range name, date, etc.). For a multi-field terms aggregation this is a JSON string
+            containing the serialized value array; use JSON.parse(bucket.key) to recover the array.
         doc_count (int): Number of documents in this bucket
         key_as_string (str | Unset): Formatted key for display (e.g., formatted dates)
         from_ (float | Unset): Lower bound for range buckets

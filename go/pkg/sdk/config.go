@@ -39,20 +39,10 @@ func NewEmbedderConfig(config any) (*EmbedderConfig, error) {
 		if err := modelConfig.FromOpenAIEmbedderConfig(v); err != nil {
 			return nil, fmt.Errorf("from openai embedder config: %w", err)
 		}
-	case GoogleEmbedderConfig:
-		provider = EmbedderProviderGemini
-		if err := modelConfig.FromGoogleEmbedderConfig(v); err != nil {
-			return nil, fmt.Errorf("from google embedder config: %w", err)
-		}
 	case BedrockEmbedderConfig:
 		provider = EmbedderProviderBedrock
 		if err := modelConfig.FromBedrockEmbedderConfig(v); err != nil {
 			return nil, fmt.Errorf("from bedrock embedder config: %w", err)
-		}
-	case VertexEmbedderConfig:
-		provider = EmbedderProviderVertex
-		if err := modelConfig.FromVertexEmbedderConfig(v); err != nil {
-			return nil, fmt.Errorf("from vertex embedder config: %w", err)
 		}
 	case AntflyEmbedderConfig:
 		provider = EmbedderProviderAntfly
@@ -118,15 +108,20 @@ func NewRerankerConfig(config any) (*RerankerConfig, error) {
 	var provider RerankerProvider
 	rerankerConfig := &RerankerConfig{}
 	switch v := config.(type) {
-	case OllamaRerankerConfig:
-		provider = RerankerProviderOllama
-		if err := rerankerConfig.FromOllamaRerankerConfig(v); err != nil {
-			return nil, fmt.Errorf("from ollama reranker config: %w", err)
-		}
 	case AntflyRerankerConfig:
 		provider = RerankerProviderAntfly
 		if err := rerankerConfig.FromAntflyRerankerConfig(v); err != nil {
 			return nil, fmt.Errorf("from antfly reranker config: %w", err)
+		}
+	case CohereRerankerConfig:
+		provider = RerankerProviderCohere
+		if err := rerankerConfig.FromCohereRerankerConfig(v); err != nil {
+			return nil, fmt.Errorf("from cohere reranker config: %w", err)
+		}
+	case VertexRerankerConfig:
+		provider = RerankerProviderVertex
+		if err := rerankerConfig.FromVertexRerankerConfig(v); err != nil {
+			return nil, fmt.Errorf("from vertex reranker config: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("unknown reranker config type: %T", v)

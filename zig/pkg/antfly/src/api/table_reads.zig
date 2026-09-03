@@ -18311,6 +18311,7 @@ fn appendMergeConfigField(
     try appendJsonFieldString(alloc, out, &merge_first, "strategy", switch (merge_config.strategy) {
         .rrf => "rrf",
         .rsf => "rsf",
+        .failover => "failover",
     });
     if (merge_config.rank_constant != 60.0) {
         try appendJsonFieldF64(alloc, out, &merge_first, "rank_constant", merge_config.rank_constant);

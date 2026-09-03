@@ -329,20 +329,16 @@ export type ExternalIoConnection = components["schemas"]["ExternalIoConnection"]
 export type CdcConnection = components["schemas"]["CdcConnection"];
 
 // Model and reranker types
-export type EmbedderConfig = components["schemas"]["EmbedderConfig"];
+export type EmbedderConfig = components["schemas"]["ManagedEmbedderConfig"];
+export type ManagedEmbedderConfig = components["schemas"]["ManagedEmbedderConfig"];
 export type RerankerConfig = components["schemas"]["RerankerConfig"];
 export type GeneratorConfig = components["schemas"]["GeneratorConfig"];
-export type EmbedderProvider = components["schemas"]["EmbedderProvider"];
-export const embedderProviders: components["schemas"]["EmbedderProvider"][] = [
+export type EmbedderProvider = components["schemas"]["ManagedEmbedderProvider"];
+export const embedderProviders: components["schemas"]["ManagedEmbedderProvider"][] = [
   "antfly",
   "ollama",
-  "gemini",
-  "vertex",
   "openai",
-  "openrouter",
   "bedrock",
-  "cohere",
-  "mock",
 ];
 export type GeneratorProvider = components["schemas"]["GeneratorProvider"];
 export const generatorProviders: components["schemas"]["GeneratorProvider"][] = [
@@ -350,10 +346,7 @@ export const generatorProviders: components["schemas"]["GeneratorProvider"][] = 
   "ollama",
   "gemini",
   "openai",
-  "anthropic",
   "vertex",
-  "cohere",
-  "openrouter",
 ];
 
 // AI response types
@@ -448,6 +441,7 @@ export type RetrievalAgentRequest = components["schemas"]["RetrievalAgentRequest
 export type RetrievalAgentResult = components["schemas"]["RetrievalAgentResult"];
 export type RetrievalAgentSteps = components["schemas"]["RetrievalAgentSteps"];
 export type SSEStepStarted = components["schemas"]["SSEStepStarted"];
+export type SSEToolMode = components["schemas"]["SSEToolMode"];
 
 // Retrieval Agent streaming callbacks for structured SSE events
 export interface RetrievalAgentStreamCallbacks {
@@ -458,8 +452,7 @@ export interface RetrievalAgentStreamCallbacks {
   onConfidence?: (data: GenerationConfidence) => void;
   onFollowup?: (question: string) => void;
   onEvalResult?: (data: EvalResult) => void;
-  onFilterApplied?: (filter: FilterSpec) => void;
-  onSearchExecuted?: (data: { query: string }) => void;
+  onToolMode?: (data: SSEToolMode) => void;
   onStepStarted?: (step: SSEStepStarted) => void;
   onStepProgress?: (data: Record<string, unknown>) => void;
   onStepCompleted?: (step: AgentStep) => void;

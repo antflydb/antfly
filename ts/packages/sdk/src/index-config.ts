@@ -1,11 +1,11 @@
 import type {
   ArtifactIndexSource,
   CreateIndexRequest,
-  EmbedderConfig,
   EmbeddingsIndexConfig,
   EnrichmentConfig,
   GraphIndexSource,
   IndexConfig,
+  ManagedEmbedderConfig,
 } from "./types.js";
 
 const MAX_ARTIFACT_SOURCES = 64;
@@ -365,7 +365,7 @@ export interface ArtifactEmbeddingSourceConfig {
 
 interface ArtifactEmbeddingIndexOptionsBase {
   sources: ArtifactEmbeddingSourceConfig[];
-  embedder: EmbedderConfig;
+  embedder: ManagedEmbedderConfig;
 }
 
 export type ArtifactEmbeddingIndexOptions = ArtifactEmbeddingIndexOptionsBase &

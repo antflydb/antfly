@@ -1819,13 +1819,18 @@ pub fn runFromIterator(
     if (cli.secret_store_paths.items.len > 0) {
         secret_store = try initLayeredSecretStore(alloc, cli.secret_store_paths.items);
         secret_store_initialized = true;
+    } else {
+        const default_secret_store_path = try resolveDefaultSecretStorePathBeforeConfig(alloc, cli);
+        defer alloc.free(default_secret_store_path);
+        secret_store = try antfly.common.secrets.FileStore.init(alloc, default_secret_store_path);
+        secret_store_initialized = true;
     }
 
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |config_path|
         try antfly.common.config.loadFromPathWithSecretsForDeployment(
             alloc,
             config_path,
-            if (secret_store_initialized) &secret_store else null,
+            &secret_store,
             .standalone,
         )
     else
@@ -1849,7 +1854,7 @@ pub fn runFromIterator(
         remote_content_runtime = try antfly.common.remote_content_runtime.Runtime.init(
             alloc,
             config_path,
-            if (secret_store_initialized) &secret_store else null,
+            &secret_store,
             .standalone,
         );
         remote_content_runtime_initialized = true;
@@ -2098,11 +2103,6 @@ pub fn runFromIterator(
         if (loaded_config) |*cfg| cfg else null,
     );
     defer active_audio_runtime.deinit();
-
-    if (!secret_store_initialized) {
-        secret_store = try antfly.common.secrets.FileStore.init(alloc, resolved.secret_store_path);
-        secret_store_initialized = true;
-    }
 
     const internal_service_secret = try secret_store.getOwned(alloc, internal_service_secret_key);
     defer if (internal_service_secret) |value| alloc.free(value);
@@ -4030,6 +4030,57 @@ fn resolveLocalBaseDir(
 ) ![]u8 {
     if (cli.data_dir) |path| return try normalizeResolvedPathAlloc(alloc, path);
     return try antfly.common.config.resolveLocalBaseDir(alloc, cfg);
+}
+
+fn configLocalBaseDirHintFromRaw(alloc: std.mem.Allocator, raw: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    const storage_value = root.get("storage") orelse return null;
+    const storage = switch (storage_value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    const local_value = storage.get("local") orelse return null;
+    const local = switch (local_value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    const base_value = local.get("base_dir") orelse return null;
+    const base_dir = switch (base_value) {
+        .string => |value| value,
+        else => return error.InvalidConfig,
+    };
+    if (antfly.common.secrets.parseSecretReference(base_dir) != null)
+        return error.InvalidConfig;
+    return try alloc.dupe(u8, base_dir);
+}
+
+fn configLocalBaseDirHintFromPath(alloc: std.mem.Allocator, path: []const u8) !?[]u8 {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(16 * 1024 * 1024));
+    defer alloc.free(raw);
+    return try configLocalBaseDirHintFromRaw(alloc, raw);
+}
+
+fn resolveDefaultSecretStorePathBeforeConfig(alloc: std.mem.Allocator, cli: CliConfig) ![]u8 {
+    const raw_base = if (cli.data_dir) |path|
+        try alloc.dupe(u8, path)
+    else if (cli.config_path) |config_path|
+        (try configLocalBaseDirHintFromPath(alloc, config_path)) orelse
+            try antfly.common.config.defaultLocalBaseDir(alloc)
+    else
+        try antfly.common.config.defaultLocalBaseDir(alloc);
+    defer alloc.free(raw_base);
+    const base = try normalizeResolvedPathAlloc(alloc, raw_base);
+    defer alloc.free(base);
+    const joined = try std.fs.path.join(alloc, &.{ base, "secrets.json" });
+    defer alloc.free(joined);
+    return try normalizeResolvedPathAlloc(alloc, joined);
 }
 
 fn resolvePaths(
@@ -7791,6 +7842,23 @@ test "standalone runtime resolves paths from common storage base dir" {
     const expected_secret_store = try normalizeResolvedPathAlloc(alloc, "/tmp/antflydb/secrets.json");
     defer alloc.free(expected_secret_store);
     try std.testing.expectEqualStrings(expected_secret_store, resolved.secret_store_path);
+}
+
+test "standalone resolves the default secret store before full config parsing" {
+    const alloc = std.testing.allocator;
+    const base_dir = (try configLocalBaseDirHintFromRaw(alloc,
+        \\{"storage":{"local":{"base_dir":"/var/lib/antfly"}},"generators":{"default":{"api_key":"${secret:generator.key}"}}}
+    )).?;
+    defer alloc.free(base_dir);
+    try std.testing.expectEqualStrings("/var/lib/antfly", base_dir);
+
+    try std.testing.expect((try configLocalBaseDirHintFromRaw(alloc, "{}")) == null);
+    try std.testing.expectError(
+        error.InvalidConfig,
+        configLocalBaseDirHintFromRaw(alloc,
+            \\{"storage":{"local":{"base_dir":"${secret:data.dir}"}}}
+        ),
+    );
 }
 
 test "standalone runtime resolves explicit extension package store path" {

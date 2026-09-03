@@ -122,6 +122,7 @@ pub fn runFromIterator(
         .progress_uri = try resolveRequired(init.environ_map, cli.progress_uri, configured_uris.progress, "ANTFLY_SERVERLESS_PROGRESS_URI"),
         .catalog_uri = try resolveRequired(init.environ_map, cli.catalog_uri, configured_uris.catalog, "ANTFLY_SERVERLESS_CATALOG_URI"),
         .s3_options = configured_uris.s3_options,
+        .gcs_options = configured_uris.gcs_options,
         .query_cache_dir = cli.query_cache_dir orelse init.environ_map.get("ANTFLY_SERVERLESS_QUERY_CACHE_DIR"),
         .query_cache_max_bytes = cli.query_cache_max_bytes orelse try parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES", serverless_default_query_cache_max_bytes),
         .query_cache_payload_max_bytes = cli.query_cache_payload_max_bytes orelse try parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES", serverless_default_query_cache_payload_max_bytes),
@@ -400,6 +401,7 @@ const ConfiguredStorageUris = struct {
     progress: ?[]u8 = null,
     catalog: ?[]u8 = null,
     s3_options: [5]?serverless.BootstrapConfig.S3Options = .{ null, null, null, null, null },
+    gcs_options: [5]?serverless.BootstrapConfig.GcsOptions = .{ null, null, null, null, null },
     resolved_credentials: [5]?antfly.common.config.Config.ResolvedExternalIoCredentials = .{ null, null, null, null, null },
 
     fn init(
@@ -426,17 +428,21 @@ const ConfiguredStorageUris = struct {
         for (lanes, names, 0..) |lane, name, index| {
             const lane_connection = lane.connection orelse connection;
             const lane_bucket = lane.bucket orelse bucket;
+            const external = try storageExternalIo(config, lane_connection);
+            const scheme: []const u8 = switch (external.protocol) {
+                .s3 => "s3",
+                .gcs => "gs",
+                else => return error.InvalidServerlessStorageConfig,
+            };
             uris[index].* = if (lane.prefix) |lane_prefix|
-                try objectUriAlloc(alloc, lane_bucket, lane_prefix)
+                try objectUriAlloc(alloc, scheme, lane_bucket, lane_prefix)
             else
-                try objectLaneUriAlloc(alloc, lane_bucket, prefix, name);
-            out.s3_options[index] = try storageS3Options(
-                alloc,
-                config,
-                lane_connection,
-                secret_store,
-                &out.resolved_credentials[index],
-            );
+                try objectLaneUriAlloc(alloc, scheme, lane_bucket, prefix, name);
+            switch (external.protocol) {
+                .s3 => out.s3_options[index] = try storageS3Options(alloc, external, secret_store, &out.resolved_credentials[index]),
+                .gcs => out.gcs_options[index] = try storageGcsOptions(alloc, external, secret_store, &out.resolved_credentials[index]),
+                else => unreachable,
+            }
         }
         return out;
     }
@@ -454,16 +460,21 @@ const ConfiguredStorageUris = struct {
     }
 };
 
-fn storageS3Options(
-    alloc: std.mem.Allocator,
+fn storageExternalIo(
     config: *const antfly.common.config.Config,
     connection_id: []const u8,
+) !antfly.common.config.Config.ExternalIoConnectionConfig {
+    const connection = config.connections.get(connection_id) orelse return error.InvalidServerlessStorageConfig;
+    if (connection.kind != .external_io) return error.InvalidServerlessStorageConfig;
+    return connection.external_io orelse return error.InvalidServerlessStorageConfig;
+}
+
+fn storageS3Options(
+    alloc: std.mem.Allocator,
+    configured_external: antfly.common.config.Config.ExternalIoConnectionConfig,
     secret_store: ?*antfly.common.secrets.FileStore,
     resolved_credentials: *?antfly.common.config.Config.ResolvedExternalIoCredentials,
 ) !serverless.BootstrapConfig.S3Options {
-    const connection = config.connections.get(connection_id) orelse return error.InvalidServerlessStorageConfig;
-    if (connection.kind != .external_io) return error.InvalidServerlessStorageConfig;
-    const configured_external = connection.external_io orelse return error.InvalidServerlessStorageConfig;
     if (configured_external.protocol != .s3) return error.InvalidServerlessStorageConfig;
     resolved_credentials.* = try antfly.common.config.Config.resolveExternalIoCredentials(alloc, configured_external, secret_store);
     const external = resolved_credentials.*.?.apply(configured_external);
@@ -498,20 +509,46 @@ fn storageS3Options(
     return options;
 }
 
-fn objectUriAlloc(alloc: std.mem.Allocator, bucket: []const u8, raw_prefix: []const u8) ![]u8 {
-    const prefix = std.mem.trim(u8, raw_prefix, "/");
-    return if (prefix.len == 0)
-        try std.fmt.allocPrint(alloc, "s3://{s}", .{bucket})
-    else
-        try std.fmt.allocPrint(alloc, "s3://{s}/{s}", .{ bucket, prefix });
+fn storageGcsOptions(
+    alloc: std.mem.Allocator,
+    configured_external: antfly.common.config.Config.ExternalIoConnectionConfig,
+    secret_store: ?*antfly.common.secrets.FileStore,
+    resolved_credentials: *?antfly.common.config.Config.ResolvedExternalIoCredentials,
+) !serverless.BootstrapConfig.GcsOptions {
+    if (configured_external.protocol != .gcs) return error.InvalidServerlessStorageConfig;
+    resolved_credentials.* = try antfly.common.config.Config.resolveExternalIoCredentials(alloc, configured_external, secret_store);
+    const external = resolved_credentials.*.?.apply(configured_external);
+    return .{
+        .endpoint = external.endpoint,
+        .upload_endpoint = external.upload_endpoint,
+        .project_id = external.project_id,
+        .credential_source = switch (external.gcs_credentials.source) {
+            .default => .default,
+            .bearer_token => .bearer_token,
+            .service_account => .service_account,
+        },
+        .bearer_token = external.gcs_credentials.bearer_token,
+        .service_account_json = external.gcs_credentials.service_account_json,
+        .credentials_path = external.gcs_credentials.credentials_path,
+        .scope = external.gcs_credentials.scope,
+        .create_bucket = external.bucket_provisioning == .create_if_missing,
+    };
 }
 
-fn objectLaneUriAlloc(alloc: std.mem.Allocator, bucket: []const u8, raw_prefix: []const u8, lane: []const u8) ![]u8 {
+fn objectUriAlloc(alloc: std.mem.Allocator, scheme: []const u8, bucket: []const u8, raw_prefix: []const u8) ![]u8 {
     const prefix = std.mem.trim(u8, raw_prefix, "/");
     return if (prefix.len == 0)
-        try std.fmt.allocPrint(alloc, "s3://{s}/{s}", .{ bucket, lane })
+        try std.fmt.allocPrint(alloc, "{s}://{s}", .{ scheme, bucket })
     else
-        try std.fmt.allocPrint(alloc, "s3://{s}/{s}/{s}", .{ bucket, prefix, lane });
+        try std.fmt.allocPrint(alloc, "{s}://{s}/{s}", .{ scheme, bucket, prefix });
+}
+
+fn objectLaneUriAlloc(alloc: std.mem.Allocator, scheme: []const u8, bucket: []const u8, raw_prefix: []const u8, lane: []const u8) ![]u8 {
+    const prefix = std.mem.trim(u8, raw_prefix, "/");
+    return if (prefix.len == 0)
+        try std.fmt.allocPrint(alloc, "{s}://{s}/{s}", .{ scheme, bucket, lane })
+    else
+        try std.fmt.allocPrint(alloc, "{s}://{s}/{s}/{s}", .{ scheme, bucket, prefix, lane });
 }
 
 fn parseEnvIntOrDefault(
@@ -888,4 +925,27 @@ test "serverless main derives multi-bucket lanes and per-connection credentials"
     try std.testing.expectEqualStrings("data-key", configured.s3_options[0].?.access_key_id.?);
     try std.testing.expectEqualStrings("wal-key", configured.s3_options[2].?.access_key_id.?);
     try std.testing.expect(!configured.s3_options[2].?.use_ssl);
+}
+
+test "serverless main derives GCS lanes and configured credentials" {
+    const alloc = std.testing.allocator;
+    var cfg = try antfly.common.config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "deployment_mode": "serverless",
+        \\  "connections": {
+        \\    "gcs-data": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "gcs", "project_id": "antfly-prod", "endpoint": "https://storage.example/v1", "upload_endpoint": "https://storage.example/upload/v1", "buckets": ["data-bucket"], "credentials": { "source": "bearer_token", "bearer_token": "gcs-token" } } }
+        \\  },
+        \\  "storage": { "engine": "object", "object": { "connection": "gcs-data", "bucket": "data-bucket", "prefix": "/prod/" } }
+        \\}
+    );
+    defer cfg.deinit();
+    var configured = try ConfiguredStorageUris.init(alloc, &cfg, null);
+    defer configured.deinit(alloc);
+
+    try std.testing.expectEqualStrings("gs://data-bucket/prod/artifacts", configured.artifacts.?);
+    try std.testing.expect(configured.s3_options[0] == null);
+    try std.testing.expectEqual(.bearer_token, configured.gcs_options[0].?.credential_source);
+    try std.testing.expectEqualStrings("gcs-token", configured.gcs_options[0].?.bearer_token.?);
+    try std.testing.expectEqualStrings("antfly-prod", configured.gcs_options[0].?.project_id.?);
+    try std.testing.expectEqualStrings("https://storage.example/v1", configured.gcs_options[0].?.endpoint.?);
 }

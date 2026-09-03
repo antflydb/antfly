@@ -30,18 +30,13 @@ import { Combobox } from "./Combobox";
 const staticModelSuggestions: Record<EmbedderProvider, string[]> = {
   antfly: ["all-MiniLM-L6-v2"],
   ollama: ["all-minilm", "nomic-embed-text", "embeddinggemma"],
-  gemini: ["embeddinggemma", "gemini-embedding-001"],
-  vertex: ["text-embedding-004", "text-multilingual-embedding-002"],
   openai: ["text-embedding-3-small", "text-embedding-3-large"],
-  openrouter: ["openai/text-embedding-3-small", "openai/text-embedding-3-large"],
   bedrock: [
     "amazon.titan-embed-text-v2:0",
     "amazon.titan-embed-image-v1",
     "cohere.embed-multilingual-v3",
     "cohere.embed-english-v3",
   ],
-  cohere: ["embed-english-v3.0", "embed-multilingual-v3.0", "embed-english-light-v3.0"],
-  mock: [],
 };
 
 interface IndexFormProps {

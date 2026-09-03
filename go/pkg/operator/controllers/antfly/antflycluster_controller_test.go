@@ -14902,10 +14902,9 @@ func TestReconcileStandaloneStatefulSetMountsSecretStore(t *testing.T) {
 	container := sts.Spec.Template.Spec.Containers[0]
 	g.Expect(container.Args).To(HaveLen(1))
 	g.Expect(container.Args[0]).To(ContainSubstring("--secret-store-path '/run/antfly/secrets/secrets.json'"))
-	g.Expect(container.Env).To(ContainElement(corev1.EnvVar{
-		Name:  antflySecretStoreEnvVar,
-		Value: "/run/antfly/secrets/secrets.json",
-	}))
+	for _, env := range container.Env {
+		g.Expect(env.Name).NotTo(Equal("ANTFLY_SECRET_STORE_PATH"))
+	}
 	g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
 		Name:      antflySecretStoreVolumeName,
 		MountPath: "/run/antfly/secrets",
@@ -16135,11 +16134,8 @@ func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
 		container := sts.Spec.Template.Spec.Containers[0]
 		g.Expect(container.Args).To(HaveLen(1))
 		g.Expect(container.Args[0]).To(ContainSubstring("--secret-store-path '/run/antfly/secrets/secrets.json'"))
-		g.Expect(container.Env).To(ContainElement(corev1.EnvVar{
-			Name:  antflySecretStoreEnvVar,
-			Value: "/run/antfly/secrets/secrets.json",
-		}))
 		for _, env := range container.Env {
+			g.Expect(env.Name).NotTo(Equal("ANTFLY_SECRET_STORE_PATH"))
 			g.Expect(env.Name).NotTo(Equal("ANTFLY_EXTENSION_PACKAGE_STORE"))
 		}
 		g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{

@@ -26,8 +26,8 @@ from .client_generated.models import (
     CreateGraphIndexRequestType,
     DerivedCoveragePolicy,
     DistanceMetric,
-    EmbedderConfig,
-    EmbedderProvider,
+    ManagedEmbedderConfig as EmbedderConfig,
+    ManagedEmbedderProvider as EmbedderProvider,
 )
 from .client_generated.models.embedding_type_1 import EmbeddingType1 as SparseEmbedding
 from .client_generated.models.embedding_type_3 import EmbeddingType3 as PackedSparseEmbedding

@@ -17,7 +17,7 @@ class RerankerConfig:
     """A unified configuration for a reranking provider.
 
     Example:
-        {'provider': 'ollama', 'model': 'dengcao/Qwen3-Reranker-0.6B:F16', 'field': 'content'}
+        {'provider': 'cohere', 'model': 'rerank-v4.0-pro', 'field': 'content'}
 
     Attributes:
         provider (RerankerProvider): The reranking provider to use.

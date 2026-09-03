@@ -765,16 +765,6 @@ export class AntflyClient {
                         callbacks.onReasoning(JSON.parse(data));
                       }
                       break;
-                    case "filter_applied":
-                      if (callbacks.onFilterApplied) {
-                        callbacks.onFilterApplied(JSON.parse(data));
-                      }
-                      break;
-                    case "search_executed":
-                      if (callbacks.onSearchExecuted) {
-                        callbacks.onSearchExecuted(JSON.parse(data));
-                      }
-                      break;
                     case "hit":
                       if (callbacks.onHit) {
                         callbacks.onHit(JSON.parse(data));
@@ -800,9 +790,9 @@ export class AntflyClient {
                         callbacks.onStepCompleted(JSON.parse(data));
                       }
                       break;
-                    case "confidence":
-                      if (callbacks.onConfidence) {
-                        callbacks.onConfidence(JSON.parse(data));
+                    case "tool_mode":
+                      if (callbacks.onToolMode) {
+                        callbacks.onToolMode(JSON.parse(data));
                       }
                       break;
                     case "followup":
@@ -815,11 +805,23 @@ export class AntflyClient {
                         callbacks.onEvalResult(JSON.parse(data));
                       }
                       break;
-                    case "done":
+                    case "done": {
+                      const result = JSON.parse(data);
+                      if (
+                        callbacks.onConfidence &&
+                        typeof result.generation_confidence === "number" &&
+                        typeof result.context_relevance === "number"
+                      ) {
+                        callbacks.onConfidence({
+                          generation_confidence: result.generation_confidence,
+                          context_relevance: result.context_relevance,
+                        });
+                      }
                       if (callbacks.onDone) {
-                        callbacks.onDone(JSON.parse(data));
+                        callbacks.onDone(result);
                       }
                       return;
+                    }
                     case "error": {
                       const parsed = JSON.parse(data);
                       const message =

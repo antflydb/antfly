@@ -4579,7 +4579,7 @@ export interface components {
             field?: string;
             /** @description Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types. */
             mode?: components["schemas"]["CardinalityMode"];
-            /** @description Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order. */
+            /** @description Ordered field list for multi-field terms aggregations. Each bucket key is a JSON string containing the serialized value array in the same order; clients should parse bucket.key as JSON. */
             fields?: string[];
             /**
              * @description Maximum number of buckets to return (for bucketing aggregations)
@@ -4625,7 +4625,7 @@ export interface components {
             };
         };
         AggregationBucket: {
-            /** @description Bucket key (term, range name, date, etc.) */
+            /** @description Bucket key (term, range name, date, etc.). For a multi-field terms aggregation this is a JSON string containing the serialized value array; use JSON.parse(bucket.key) to recover the array. */
             key: string;
             /** @description Formatted key for display (e.g., formatted dates) */
             key_as_string?: string;
@@ -5143,7 +5143,7 @@ export interface components {
              *
              *     Notes:
              *     - Non-existent keys are silently ignored
-             *     - Deletions are processed before inserts in the same batch
+             *     - Deletions take precedence over inserts for the same key in one batch
              *     - Keys are permanently removed from storage and indexes
              * @example [
              *       "user:789",
@@ -6633,7 +6633,7 @@ export interface components {
         } & (unknown & unknown & unknown);
         QueryRequest: {
             /**
-             * @description Name of the table to query. Optional for global queries.
+             * @description Name of the table to query. Required for global-query requests.
              * @example wikipedia
              */
             table?: string;
@@ -7844,13 +7844,11 @@ export interface components {
             graph_results?: components["schemas"]["StatefulGraphQueryResults"];
         };
         /**
-         * @description Status of a linear merge page operation:
-         *     - "success": All records in batch processed successfully
-         *     - "partial": Processing stopped at shard boundary, client should retry with next_cursor
-         *     - "error": Fatal error occurred, no records processed successfully
+         * @description Status of a completed linear merge page. Successful responses are atomic
+         *     and use "success"; failures are returned as non-2xx HTTP responses.
          * @enum {string}
          */
-        LinearMergePageStatus: "success" | "partial" | "error";
+        LinearMergePageStatus: "success";
         /**
          * @description Linear merge operation for syncing sorted records from external sources.
          *     Use this to keep Antfly in sync with an external database or data source.
@@ -7865,7 +7863,7 @@ export interface components {
          *     1. Send sorted records from your external source
          *     2. Server upserts records that exist in your batch
          *     3. Server deletes Antfly records in the key range that are absent from your batch
-         *     4. If stopped at shard boundary, use next_cursor for next request
+         *     4. Use next_cursor as last_merged_id for the next request
          *
          *     **WARNING:** Not safe for concurrent operations with overlapping key ranges.
          */
@@ -7944,7 +7942,7 @@ export interface components {
             deleted: number;
             /** @description IDs that were deleted (or would be deleted if dry_run=true). Only included if dry_run=true. */
             deleted_ids?: string[];
-            failed?: components["schemas"]["FailedOperation"][];
+            failed: components["schemas"]["FailedOperation"][];
             /** @description ID of last record in this batch (use for next request) */
             next_cursor: string;
             key_range?: components["schemas"]["KeyRange"];
@@ -7953,7 +7951,7 @@ export interface components {
             /** @description Additional information (e.g., "stopped at shard boundary", "dry run - no changes made") */
             message?: string;
             /** Format: int64 */
-            took?: number;
+            took: number;
         };
         /** @description A typed, weighted connection between documents */
         Edge: {
@@ -8189,9 +8187,11 @@ export interface components {
             postgres_table: string;
             /**
              * @description Template for constructing the Antfly document key from PG columns.
+             *     When omitted, Antfly first uses `_id`, then falls back to `id` if
+             *     the row has no `_id` column.
              *     A plain string (e.g., "id") uses that column's value directly.
              *     Use `{{column}}` syntax for composite keys: `{{tenant_id}}:{{user_id}}`.
-             * @default id
+             * @default _id
              * @example id
              */
             key_template?: string;
@@ -8251,6 +8251,10 @@ export interface components {
              *     WHERE clause on the PostgreSQL publication. This filters rows at the
              *     source before they are sent over the replication stream, reducing
              *     network and processing overhead.
+             *
+             *     Requires PostgreSQL 15 or newer and is applied only when Antfly
+             *     creates the publication. Changing this value does not alter an
+             *     existing publication; update or recreate that publication directly.
              *
              *     Only a subset of filter types are supported (term, match, range,
              *     conjuncts, disjuncts, must_not). The filter is translated to SQL
@@ -8651,88 +8655,11 @@ export interface components {
             artifact: string;
         };
         /**
-         * @description Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
+         * @description Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
          * @default l2_squared
          * @enum {string}
          */
         DistanceMetric: "l2_squared" | "inner_product" | "cosine";
-        /**
-         * @description Configuration for the Google AI (Gemini) embedding provider.
-         *
-         *     API key via `api_key` field or `GEMINI_API_KEY` environment variable.
-         *
-         *     **Example Models:** gemini-embedding-001 (default, 3072 dims)
-         *
-         *     **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
-         * @example {
-         *       "provider": "gemini",
-         *       "model": "gemini-embedding-001",
-         *       "dimension": 3072,
-         *       "api_key": "your-api-key"
-         *     }
-         */
-        GoogleEmbedderConfig: {
-            /** @description The Google Cloud project ID (optional for Gemini API, required for Vertex AI). */
-            project_id?: string;
-            /** @description The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API. */
-            location?: string;
-            /**
-             * @description The name of the embedding model to use.
-             * @default gemini-embedding-001
-             * @example gemini-embedding-001
-             */
-            model: string;
-            /**
-             * @description The dimension of the embedding vector (768, 1536, or 3072 recommended).
-             * @default 3072
-             */
-            dimension?: number;
-            /** @description The Google API key. Can also be set via GEMINI_API_KEY environment variable. */
-            api_key?: string;
-            /**
-             * Format: uri
-             * @description The URL of the Google API endpoint (optional, uses default if not specified).
-             */
-            url?: string;
-        };
-        /**
-         * @description Configuration for Google Cloud Vertex AI embedding models (enterprise-grade).
-         *
-         *     Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
-         *
-         *     **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video)
-         *
-         *     **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
-         * @example {
-         *       "provider": "vertex",
-         *       "model": "gemini-embedding-001",
-         *       "project_id": "my-gcp-project",
-         *       "location": "us-central1",
-         *       "dimension": 3072
-         *     }
-         */
-        VertexEmbedderConfig: {
-            /**
-             * @description The name of the Vertex AI embedding model to use.
-             * @default gemini-embedding-001
-             * @example gemini-embedding-001
-             */
-            model: string;
-            /** @description Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable. */
-            project_id?: string;
-            /**
-             * @description Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
-             * @default us-central1
-             */
-            location?: string;
-            /** @description Path to service account JSON key file. Alternative to ADC for non-GCP environments. */
-            credentials_path?: string;
-            /**
-             * @description The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding).
-             * @default 3072
-             */
-            dimension?: number;
-        };
         /**
          * @description Configuration for the Ollama embedding provider.
          *
@@ -8796,34 +8723,6 @@ export interface components {
             dimensions?: number;
         };
         /**
-         * @description Configuration for the OpenRouter embedding provider.
-         *
-         *     OpenRouter provides a unified API for multiple embedding models from different providers.
-         *     API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
-         *
-         *     **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
-         *     google/gemini-embedding-001, qwen/qwen3-embedding-8b
-         *
-         *     **Docs:** https://openrouter.ai/docs/api/reference/embeddings
-         * @example {
-         *       "provider": "openrouter",
-         *       "model": "openai/text-embedding-3-small",
-         *       "api_key": "sk-or-..."
-         *     }
-         */
-        OpenRouterEmbedderConfig: {
-            /**
-             * @description The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
-             * @default openai/text-embedding-3-small
-             * @example openai/text-embedding-3-small
-             */
-            model: string;
-            /** @description The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable. */
-            api_key?: string;
-            /** @description Output dimension for the embedding (if supported by the model). */
-            dimensions?: number;
-        };
-        /**
          * @description Configuration for the AWS Bedrock embedding provider.
          *
          *     Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles.
@@ -8878,42 +8777,6 @@ export interface components {
             batch_size?: number;
         };
         /**
-         * @description Configuration for the Cohere embedding provider.
-         *
-         *     API key via `api_key` field or `COHERE_API_KEY` environment variable.
-         *
-         *     **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0
-         *
-         *     **Docs:** https://docs.cohere.com/reference/embed
-         * @example {
-         *       "provider": "cohere",
-         *       "model": "embed-english-v3.0",
-         *       "input_type": "search_document"
-         *     }
-         */
-        CohereEmbedderConfig: {
-            /**
-             * @description The name of the Cohere embedding model to use.
-             * @default embed-english-v3.0
-             * @example embed-english-v3.0
-             */
-            model: string;
-            /** @description The Cohere API key. Can also be set via COHERE_API_KEY environment variable. */
-            api_key?: string;
-            /**
-             * @description Specifies the type of input for optimized embeddings.
-             * @default search_document
-             * @enum {string}
-             */
-            input_type?: "search_document" | "search_query" | "classification" | "clustering";
-            /**
-             * @description How to handle inputs longer than the max token length.
-             * @default END
-             * @enum {string}
-             */
-            truncate?: "NONE" | "START" | "END";
-        };
-        /**
          * @description Configuration for the Antfly inference embedding provider.
          *
          *     Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
@@ -8948,213 +8811,237 @@ export interface components {
             api_url?: string;
         };
         /**
-         * @description The embedding provider to use.
+         * @description Embedding providers executable by managed index creation.
          * @enum {string}
          */
-        EmbedderProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "mock" | "antfly";
+        ManagedEmbedderProvider: "ollama" | "openai" | "bedrock" | "antfly";
+        /** @description Embedding provider configuration accepted by managed index creation. */
+        ManagedEmbedderConfig: (components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
+            provider: components["schemas"]["ManagedEmbedderProvider"];
+        };
+        /** @description Options specific to text chunking. */
+        TextChunkOptions: {
+            /** @description Target number of tokens per chunk. */
+            target_tokens?: number;
+            /** @description Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers. */
+            overlap_tokens?: number;
+            /** @description Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers. */
+            separator?: string;
+        };
+        /** @description Options specific to audio chunking. */
+        AudioChunkOptions: {
+            /** @description Window duration in milliseconds for fixed-window audio chunking (default: 30000). */
+            window_duration_ms?: number;
+            /** @description Overlap duration in milliseconds between audio chunks (default: 0). */
+            overlap_duration_ms?: number;
+        };
+        /** @description Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults. */
+        ChunkOptions: {
+            /** @description Maximum number of chunks to generate per document. */
+            max_chunks?: number;
+            /**
+             * Format: float
+             * @description Confidence threshold for model-based chunking (0.0-1.0).
+             */
+            threshold?: number;
+            text?: components["schemas"]["TextChunkOptions"];
+            audio?: components["schemas"]["AudioChunkOptions"];
+        };
         /**
-         * @description A unified configuration for an embedding provider.
+         * @description Configuration for the Antfly inference chunking provider.
          *
-         *     Embedders can be configured with templates to customize how documents are
-         *     converted to text before embedding. Templates use Handlebars syntax and
-         *     support various built-in helpers.
+         *     Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching.
+         *     The model name maps to ONNX model directory names (similar to how Ollama works).
          *
-         *     **Template System:**
-         *     - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
-         *     - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
-         *     - **Context**: Templates receive the full document as context
+         *     **Chunking Models:**
+         *     - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
+         *     - Any other name will attempt to load from models/chunkers/{name}/ directory
          *
-         *     **Built-in Helpers:**
-         *
-         *     1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
-         *        ```handlebars
-         *        {{scrubHtml html_content}}
-         *        ```
-         *        - Removes `<script>` and `<style>` tags
-         *        - Adds newlines after block elements (p, div, h1-h6, li, etc.)
-         *        - Returns plain text with preserved readability
-         *
-         *     2. **eq** - Equality comparison for conditionals
-         *        ```handlebars
-         *        {{#if (eq status "active")}}Active user{{/if}}
-         *        {{#if (eq @key "special")}}Special field{{/if}}
-         *        ```
-         *
-         *     3. **media** - GenKit dotprompt media directive for multimodal content
-         *        ```handlebars
-         *        {{media url=imageDataURI}}
-         *        {{media url=this.image_url}}
-         *        {{media url="https://example.com/image.jpg"}}
-         *        {{media url="s3://endpoint/bucket/image.png"}}
-         *        {{media url="file:///path/to/image.jpg"}}
-         *        ```
-         *
-         *        **Supported URL Schemes:**
-         *        - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
-         *        - `http://` / `https://` - Web URLs with automatic content type detection
-         *        - `file://` - Local filesystem paths
-         *        - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
-         *
-         *        **Automatic Content Processing:**
-         *        - **Images**: Downloaded, resized (if needed), converted to data URIs
-         *        - **PDFs**: Text extracted or first page rendered as image
-         *        - **HTML**: Readable text extracted using Mozilla Readability
-         *
-         *        **Security Controls:**
-         *        Downloads are protected by content security settings (see Configuration Reference):
-         *        - Allowed host whitelist
-         *        - Private IP blocking (prevents SSRF attacks)
-         *        - Download size limits (default: 100MB)
-         *        - HTTP downloads time out after 30 seconds by default; zero disables the deadline
-         *        - Image dimension limits (default: 2048px, auto-resized)
-         *
-         *        See: https://antfly.io/docs/configuration#security--cors
-         *
-         *     4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-         *        ```handlebars
-         *        {{encodeToon this.fields}}
-         *        {{encodeToon this.fields lengthMarker=false indent=4}}
-         *        {{encodeToon this.fields delimiter="\t"}}
-         *        ```
-         *
-         *        **What is TOON?**
-         *        TOON is a compact, human-readable format designed for passing structured data to LLMs.
-         *        It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-         *        comprehension accuracy.
-         *
-         *        **Key Features:**
-         *        - Compact syntax using `:` for key-value pairs
-         *        - Array length markers: `tags[#3]: ai,search,ml`
-         *        - Tabular format for uniform data structures
-         *        - Optimized for LLM parsing and understanding
-         *        - Maintains human readability
-         *
-         *        **Benefits:**
-         *        - **Lower API costs** - Reduced token usage means lower LLM API costs
-         *        - **Faster responses** - Less tokens to process
-         *        - **More context** - Fit more documents within token limits
-         *
-         *        **Options:**
-         *        - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-         *        - `indent` (int): Indentation spacing for nested objects (default: 2)
-         *        - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-         *
-         *        **Example output:**
-         *        ```
-         *        title: Introduction to Vector Search
-         *        author: Jane Doe
-         *        tags[#3]: ai,search,ml
-         *        metadata:
-         *          edition: 2
-         *          pages: 450
-         *        ```
-         *
-         *        **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-         *
-         *        **References:**
-         *        - TOON Specification: https://github.com/toon-format/toon
-         *        - Go Implementation: https://github.com/alpkeskin/gotoon
-         *
-         *     **Template Examples:**
-         *
-         *     Document with metadata:
-         *     ```handlebars
-         *     Title: {{metadata.title}}
-         *     Date: {{metadata.date}}
-         *     Tags: {{#each metadata.tags}}{{this}}, {{/each}}
-         *
-         *     {{content}}
-         *     ```
-         *
-         *     HTML content extraction:
-         *     ```handlebars
-         *     Product: {{name}}
-         *     Description: {{scrubHtml description_html}}
-         *     Price: ${{price}}
-         *     ```
-         *
-         *     Multimodal with image:
-         *     ```handlebars
-         *     Product: {{title}}
-         *     {{media url=image}}
-         *     Description: {{description}}
-         *     ```
-         *
-         *     Conditional formatting:
-         *     ```handlebars
-         *     {{title}}
-         *     {{#if author}}By: {{author}}{{/if}}
-         *     {{#if (eq category "premium")}}⭐ Premium Content{{/if}}
-         *     {{body}}
-         *     ```
-         *
-         *     **Environment Variables:**
-         *     - `GEMINI_API_KEY` - API key for Google AI
-         *     - `OPENAI_API_KEY` - API key for OpenAI
-         *     - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs
-         *     - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434)
-         *
-         *     **Importing Pre-computed Embeddings:**
-         *
-         *     You can import existing embeddings (from OpenAI, Cohere, or any provider), but only
-         *     for indexes configured with `external: true`. External indexes accept vectors written
-         *     directly through the document `_embeddings` field and do not generate prompts from
-         *     `field` or `template`.
-         *
-         *     **Steps:**
-         *     1. Create an embeddings index with `external: true`
-         *     2. For dense indexes, set the index `dimension`
-         *     3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
-         *
-         *     **Example:**
-         *     ```json
-         *     {
-         *       "title": "My Document",
-         *       "content": "Document text...",
-         *       "_embeddings": {
-         *         "my_vector_index": [0.1, 0.2, 0.3, ...]
+         *     **Caching:**
+         *     - L1: Memory cache with 2-minute TTL
+         *     - L2: Persistent Pebble database
+         *     - Singleflight deduplication for concurrent identical requests
+         * @example {
+         *       "provider": "antfly",
+         *       "api_url": "http://localhost:8080",
+         *       "model": "fixed",
+         *       "max_chunks": 50,
+         *       "text": {
+         *         "target_tokens": 500,
+         *         "overlap_tokens": 50,
+         *         "separator": "\n\n"
          *       }
          *     }
-         *     ```
-         *
-         *     **Delete Behavior:**
-         *     - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector
-         *     - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged
-         *
-         *     **Use Cases:**
-         *     - Migrating from another vector database with existing embeddings
-         *     - Using embeddings generated by external systems
-         *     - Importing pre-computed OpenAI, Cohere, or other provider embeddings
-         *     - Batch processing embeddings offline before ingestion
+         */
+        AntflyChunkerConfig: components["schemas"]["ChunkOptions"] & {
+            /**
+             * Format: uri
+             * @description The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
+             * @example http://localhost:8080
+             */
+            api_url?: string;
+            /**
+             * @description The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
+             * @default fixed
+             * @example fixed
+             */
+            model?: string;
+        };
+        /**
+         * @description The chunking provider to use.
+         * @enum {string}
+         */
+        ChunkerProvider: "mock" | "antfly";
+        /**
+         * @description A unified configuration for a chunking provider.
          * @example {
-         *       "provider": "openai",
-         *       "model": "text-embedding-3-small"
+         *       "provider": "antfly",
+         *       "model": "fixed",
+         *       "text": {
+         *         "target_tokens": 500,
+         *         "overlap_tokens": 50
+         *       }
          *     }
          */
-        EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
-            provider: components["schemas"]["EmbedderProvider"];
+        ChunkerConfig: components["schemas"]["AntflyChunkerConfig"] & {
+            provider: components["schemas"]["ChunkerProvider"];
             /**
-             * @description Declare that this model supports non-text content (images, audio, video, PDFs),
-             *     even if the model isn't in Antfly's built-in model registry yet.
-             *
-             *     When `true`, Antfly treats the model as multimodal and will send binary content
-             *     (images, audio, etc.) to the provider instead of extracting text. The provider's
-             *     API is still responsible for accepting the content — this flag just tells Antfly
-             *     not to strip it.
-             *
-             *     Not needed for models already in the registry (e.g., `multimodalembedding`,
-             *     `gemini-embedding-2-preview`, `clip-*`, `clipclap`).
-             *
-             *     **Example:**
-             *     ```json
-             *     {
-             *       "provider": "vertex",
-             *       "model": "some-future-multimodal-model",
-             *       "multimodal": true
-             *     }
-             *     ```
+             * @description Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
+             * @default false
              */
-            multimodal?: boolean;
+            store_chunks?: boolean;
+            /**
+             * @description Configuration for full-text indexing of chunks in Bleve.
+             *     When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
+             *     When absent, chunks use :c: suffix and are only used for vector embeddings.
+             */
+            full_text_index?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Format: uri
+             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL.
+             * @example http://localhost:8080
+             */
+            api_url?: string;
+            /**
+             * @description The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
+             * @default fixed
+             * @example fixed
+             */
+            model?: string;
+            max_chunks?: number;
+            /** Format: float */
+            threshold?: number;
+            text?: components["schemas"]["TextChunkOptions"];
+            audio?: components["schemas"]["AudioChunkOptions"];
+        };
+        /** @description Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted. */
+        IndexExecutionConfig: {
+            /** @description Chunk producer batching for shorthand-created chunk enrichments. */
+            chunking?: components["schemas"]["ExecutionPolicy"];
+            /** @description Embedding producer batching for shorthand-created embedding enrichments. */
+            embedding?: components["schemas"]["ExecutionPolicy"];
+        };
+        /** @description Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense HBC vector index. For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected. */
+        EmbeddingsIndexConfig: {
+            publication_policy?: components["schemas"]["IndexPublicationPolicy"];
+            /** @description Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field. */
+            coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
+            /**
+             * @description When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
+             * @default false
+             */
+            external?: boolean;
+            /**
+             * @description When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
+             * @default false
+             */
+            sparse?: boolean;
+            /** @description Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
+            dimension?: number;
+            /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
+            field?: string;
+            /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            sources?: components["schemas"]["ArtifactIndexSource"][];
+            /** @description Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            embedding_name?: string;
+            /**
+             * @deprecated
+             * @description Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name is required and this value must exactly match the source_artifact_name on the authoritative embedding enrichment. New clients should declare the relationship only on that enrichment.
+             */
+            source_artifact_name?: string;
+            /**
+             * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
+             * @example Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old.
+             */
+            template?: string;
+            distance_metric?: components["schemas"]["DistanceMetric"];
+            /** @description Whether to use in-memory only storage (dense only) */
+            mem_only?: boolean;
+            /** @description Configuration for the embeddings plugin (managed indexes only; not allowed when external=true) */
+            embedder?: components["schemas"]["ManagedEmbedderConfig"];
+            /** @description Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing. */
+            chunker?: components["schemas"]["ChunkerConfig"];
+            /**
+             * @description Default number of results to return from search (sparse only)
+             * @default 10
+             */
+            top_k?: number;
+            /**
+             * Format: float
+             * @description Minimum weight threshold for sparse vector entries (sparse only)
+             * @default 0
+             */
+            min_weight?: number;
+            /**
+             * @description Number of documents per posting list chunk (sparse only)
+             * @default 1024
+             */
+            chunk_size?: number;
+            /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
+            execution?: components["schemas"]["IndexExecutionConfig"];
+        };
+        /** @description Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit. */
+        GraphEdgeType: string;
+        /** @description A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item. */
+        GraphTemplateValue: string | number;
+        /** @description Maps each artifact item to graph node identifiers. */
+        GraphArtifactNodeMappingConfig: {
+            /**
+             * @default document
+             * @enum {string}
+             */
+            model?: "document" | "external";
+            target?: components["schemas"]["GraphTemplateValue"];
+        };
+        /** @description Maps each artifact item to an edge type, weight, and public metadata. */
+        GraphArtifactEdgeMappingConfig: {
+            type?: components["schemas"]["GraphTemplateValue"];
+            weight?: components["schemas"]["GraphTemplateValue"];
+            /** @description JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses. */
+            metadata?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Document fields made available to graph mapping templates through `_doc.value`. */
+        GraphArtifactContextConfig: {
+            doc_fields?: string[];
+        };
+        /** @description Artifact stream materialized into graph edges. Each source artifact is limited to 16 MiB and 1,000,000 relation items so live apply, repair, split, and restore share one bounded admission contract. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are rejected by serverless deployments. */
+        GraphArtifactSourceConfig: {
+            artifact: string;
+            /** @description Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`. */
+            path?: string;
+            /**
+             * @default extraction_relation
+             * @enum {string}
+             */
+            format?: "extraction_relation" | "extraction_graph";
+            mention_edge_type?: components["schemas"]["GraphEdgeType"];
+            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
+            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
+            context?: components["schemas"]["GraphArtifactContextConfig"];
         };
         /** @description Configuration for the Google generative AI provider (Gemini). */
         GoogleGeneratorConfig: {
@@ -9458,232 +9345,6 @@ export interface components {
         GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["AnthropicGeneratorConfig"] | components["schemas"]["CohereGeneratorConfig"]) & {
             provider: components["schemas"]["GeneratorProvider"];
         };
-        /** @description Options specific to text chunking. */
-        TextChunkOptions: {
-            /** @description Target number of tokens per chunk. */
-            target_tokens?: number;
-            /** @description Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers. */
-            overlap_tokens?: number;
-            /** @description Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers. */
-            separator?: string;
-        };
-        /** @description Options specific to audio chunking. */
-        AudioChunkOptions: {
-            /** @description Window duration in milliseconds for fixed-window audio chunking (default: 30000). */
-            window_duration_ms?: number;
-            /** @description Overlap duration in milliseconds between audio chunks (default: 0). */
-            overlap_duration_ms?: number;
-        };
-        /** @description Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults. */
-        ChunkOptions: {
-            /** @description Maximum number of chunks to generate per document. */
-            max_chunks?: number;
-            /**
-             * Format: float
-             * @description Confidence threshold for model-based chunking (0.0-1.0).
-             */
-            threshold?: number;
-            text?: components["schemas"]["TextChunkOptions"];
-            audio?: components["schemas"]["AudioChunkOptions"];
-        };
-        /**
-         * @description Configuration for the Antfly inference chunking provider.
-         *
-         *     Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching.
-         *     The model name maps to ONNX model directory names (similar to how Ollama works).
-         *
-         *     **Chunking Models:**
-         *     - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
-         *     - Any other name will attempt to load from models/chunkers/{name}/ directory
-         *
-         *     **Caching:**
-         *     - L1: Memory cache with 2-minute TTL
-         *     - L2: Persistent Pebble database
-         *     - Singleflight deduplication for concurrent identical requests
-         * @example {
-         *       "provider": "antfly",
-         *       "api_url": "http://localhost:8080",
-         *       "model": "fixed",
-         *       "max_chunks": 50,
-         *       "text": {
-         *         "target_tokens": 500,
-         *         "overlap_tokens": 50,
-         *         "separator": "\n\n"
-         *       }
-         *     }
-         */
-        AntflyChunkerConfig: components["schemas"]["ChunkOptions"] & {
-            /**
-             * Format: uri
-             * @description The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
-             * @example http://localhost:8080
-             */
-            api_url?: string;
-            /**
-             * @description The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
-             * @default fixed
-             * @example fixed
-             */
-            model?: string;
-        };
-        /**
-         * @description The chunking provider to use.
-         * @enum {string}
-         */
-        ChunkerProvider: "mock" | "antfly";
-        /**
-         * @description A unified configuration for a chunking provider.
-         * @example {
-         *       "provider": "antfly",
-         *       "model": "fixed",
-         *       "text": {
-         *         "target_tokens": 500,
-         *         "overlap_tokens": 50
-         *       }
-         *     }
-         */
-        ChunkerConfig: components["schemas"]["AntflyChunkerConfig"] & {
-            provider: components["schemas"]["ChunkerProvider"];
-            /**
-             * @description Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
-             * @default false
-             */
-            store_chunks?: boolean;
-            /**
-             * @description Configuration for full-text indexing of chunks in Bleve.
-             *     When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
-             *     When absent, chunks use :c: suffix and are only used for vector embeddings.
-             */
-            full_text_index?: {
-                [key: string]: unknown;
-            };
-            /**
-             * Format: uri
-             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL.
-             * @example http://localhost:8080
-             */
-            api_url?: string;
-            /**
-             * @description The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
-             * @default fixed
-             * @example fixed
-             */
-            model?: string;
-            max_chunks?: number;
-            /** Format: float */
-            threshold?: number;
-            text?: components["schemas"]["TextChunkOptions"];
-            audio?: components["schemas"]["AudioChunkOptions"];
-        };
-        /** @description Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted. */
-        IndexExecutionConfig: {
-            /** @description Chunk producer batching for shorthand-created chunk enrichments. */
-            chunking?: components["schemas"]["ExecutionPolicy"];
-            /** @description Embedding producer batching for shorthand-created embedding enrichments. */
-            embedding?: components["schemas"]["ExecutionPolicy"];
-        };
-        /** @description Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected. */
-        EmbeddingsIndexConfig: {
-            publication_policy?: components["schemas"]["IndexPublicationPolicy"];
-            /** @description Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field. */
-            coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
-            /**
-             * @description When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
-             * @default false
-             */
-            external?: boolean;
-            /**
-             * @description When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
-             * @default false
-             */
-            sparse?: boolean;
-            /** @description Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
-            dimension?: number;
-            /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
-            field?: string;
-            /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
-            sources?: components["schemas"]["ArtifactIndexSource"][];
-            /** @description Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
-            embedding_name?: string;
-            /**
-             * @deprecated
-             * @description Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name is required and this value must exactly match the source_artifact_name on the authoritative embedding enrichment. New clients should declare the relationship only on that enrichment.
-             */
-            source_artifact_name?: string;
-            /**
-             * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
-             * @example Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old.
-             */
-            template?: string;
-            distance_metric?: components["schemas"]["DistanceMetric"];
-            /** @description Whether to use in-memory only storage (dense only) */
-            mem_only?: boolean;
-            /** @description Configuration for the embeddings plugin (managed indexes only; not allowed when external=true) */
-            embedder?: components["schemas"]["EmbedderConfig"];
-            /** @description Configuration for the summarizer plugin (dense managed indexes only) */
-            summarizer?: components["schemas"]["GeneratorConfig"];
-            /** @description Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only) */
-            chunker?: components["schemas"]["ChunkerConfig"];
-            /**
-             * @description Default number of results to return from search (sparse only)
-             * @default 10
-             */
-            top_k?: number;
-            /**
-             * Format: float
-             * @description Minimum weight threshold for sparse vector entries (sparse only)
-             * @default 0
-             */
-            min_weight?: number;
-            /**
-             * @description Number of documents per posting list chunk (sparse only)
-             * @default 1024
-             */
-            chunk_size?: number;
-            /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
-            execution?: components["schemas"]["IndexExecutionConfig"];
-        };
-        /** @description Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit. */
-        GraphEdgeType: string;
-        /** @description A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item. */
-        GraphTemplateValue: string | number;
-        /** @description Maps each artifact item to graph node identifiers. */
-        GraphArtifactNodeMappingConfig: {
-            /**
-             * @default document
-             * @enum {string}
-             */
-            model?: "document" | "external";
-            target?: components["schemas"]["GraphTemplateValue"];
-        };
-        /** @description Maps each artifact item to an edge type, weight, and public metadata. */
-        GraphArtifactEdgeMappingConfig: {
-            type?: components["schemas"]["GraphTemplateValue"];
-            weight?: components["schemas"]["GraphTemplateValue"];
-            /** @description JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses. */
-            metadata?: {
-                [key: string]: unknown;
-            };
-        };
-        /** @description Document fields made available to graph mapping templates through `_doc.value`. */
-        GraphArtifactContextConfig: {
-            doc_fields?: string[];
-        };
-        /** @description Artifact stream materialized into graph edges. Each source artifact is limited to 16 MiB and 1,000,000 relation items so live apply, repair, split, and restore share one bounded admission contract. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are rejected by serverless deployments. */
-        GraphArtifactSourceConfig: {
-            artifact: string;
-            /** @description Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`. */
-            path?: string;
-            /**
-             * @default extraction_relation
-             * @enum {string}
-             */
-            format?: "extraction_relation" | "extraction_graph";
-            mention_edge_type?: components["schemas"]["GraphEdgeType"];
-            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
-            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
-            context?: components["schemas"]["GraphArtifactContextConfig"];
-        };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
             name: components["schemas"]["GraphEdgeType"];
@@ -9701,25 +9362,6 @@ export interface components {
              * @enum {string}
              */
             topology?: "tree" | "graph";
-            /**
-             * Format: double
-             * @description Maximum allowed edge weight
-             * @default 1
-             */
-            max_weight?: number;
-            /**
-             * Format: double
-             * @description Minimum allowed edge weight
-             * @default 0
-             */
-            min_weight?: number;
-            /**
-             * @description Whether to allow edges from a node to itself
-             * @default true
-             */
-            allow_self_loops?: boolean;
-            /** @description Required metadata fields for this edge type */
-            required_metadata?: string[];
         };
         /** @description Document input used by an artifact producer. Field sources read one document field; template sources render a Handlebars template. */
         GraphArtifactProducerSourceConfig: {
@@ -10095,7 +9737,8 @@ export interface components {
             ttl_field?: string;
             /**
              * @description The duration after which documents should expire, based on the ttl_field timestamp (optional).
-             *     Uses Go duration format (e.g., '24h', '7d', '168h').
+             *     Uses integer duration components with `ns`, `us`, `ms`, `s`, `m`, `h`,
+             *     or `d` units (for example, `90m`, `1h30m`, or `7d`).
              */
             ttl_duration?: string;
             /**
@@ -10209,7 +9852,6 @@ export interface components {
             distance_metric?: components["schemas"]["DistanceMetric"];
             mem_only?: boolean;
             embedder?: components["schemas"]["CreatedProviderConfig"];
-            summarizer?: components["schemas"]["CreatedProviderConfig"];
             chunker?: components["schemas"]["ChunkerConfig"];
             /** @default 10 */
             top_k?: number;
@@ -11696,8 +11338,8 @@ export interface components {
             generation_context?: string;
         };
         /**
-         * @description Configuration for generating follow-up questions. Uses a separate generator
-         *     call which can use a cheaper/faster model.
+         * @description Configuration for deterministic follow-up suggestions derived from the
+         *     original query and the standard Antfly follow-up templates.
          */
         FollowupStepConfig: {
             /**
@@ -11705,20 +11347,11 @@ export interface components {
              * @default false
              */
             enabled?: boolean;
-            /** @description Generator for follow-up questions. If not specified, uses the answer step's generator. */
-            generator?: components["schemas"]["GeneratorConfig"];
-            /** @description Chain of generators to try in order. Mutually exclusive with 'generator'. */
-            chain?: components["schemas"]["ChainLink"][];
             /**
              * @description Number of follow-up questions to generate
              * @default 3
              */
             count?: number;
-            /**
-             * @description Custom guidance for follow-up question focus and style
-             * @example Focus on implementation details and edge cases
-             */
-            context?: string;
         };
         /**
          * @description Configuration for confidence assessment. Evaluates answer quality and
@@ -12221,7 +11854,7 @@ export interface components {
          * @description The reranking provider to use.
          * @enum {string}
          */
-        RerankerProvider: "antfly" | "ollama" | "cohere" | "vertex";
+        RerankerProvider: "antfly" | "cohere" | "vertex";
         /**
          * @description Configuration for the Antfly inference reranking provider.
          * @example {
@@ -12236,16 +11869,6 @@ export interface components {
             /**
              * Format: uri
              * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-             */
-            url?: string;
-        };
-        /** @description Configuration for the Ollama reranking provider. */
-        OllamaRerankerConfig: {
-            /** @description The name of the Ollama model to use for reranking. */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the Ollama API endpoint.
              */
             url?: string;
         };
@@ -12313,8 +11936,8 @@ export interface components {
         /**
          * @description A unified configuration for a reranking provider.
          * @example {
-         *       "provider": "ollama",
-         *       "model": "dengcao/Qwen3-Reranker-0.6B:F16",
+         *       "provider": "cohere",
+         *       "model": "rerank-v4.0-pro",
          *       "field": "content"
          *     }
          */
@@ -12324,7 +11947,7 @@ export interface components {
             field?: string;
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
-        } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
+        } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
         /** @description User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes. */
         GraphIdentifier: string;
         GraphDocumentFuzzyFilter: {

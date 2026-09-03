@@ -15,6 +15,7 @@
 const std = @import("std");
 const object_storage = @import("../storage/object_storage.zig");
 const bedrock = @import("../inference/bedrock.zig");
+const google_auth = @import("antfly_google").auth;
 const remote_uri = @import("remote_uri.zig");
 
 const Allocator = std.mem.Allocator;
@@ -31,6 +32,20 @@ pub const S3Options = struct {
     create_bucket: bool = false,
 };
 
+pub const GcsCredentialSource = enum { default, bearer_token, service_account };
+
+pub const GcsOptions = struct {
+    endpoint: ?[]const u8 = null,
+    upload_endpoint: ?[]const u8 = null,
+    project_id: ?[]const u8 = null,
+    credential_source: GcsCredentialSource = .default,
+    bearer_token: ?[]const u8 = null,
+    service_account_json: ?[]const u8 = null,
+    credentials_path: ?[]const u8 = null,
+    scope: ?[]const u8 = null,
+    create_bucket: bool = false,
+};
+
 pub fn s3ConfigAlloc(alloc: Allocator, options: ?S3Options) !object_storage.S3.Config {
     const opts = options orelse S3Options{};
     return try object_storage.S3.fromEnvAlloc(
@@ -43,6 +58,68 @@ pub fn s3ConfigAlloc(alloc: Allocator, options: ?S3Options) !object_storage.S3.C
         opts.region,
         opts.addressing_style,
     );
+}
+
+pub fn gcsConfigAlloc(alloc: Allocator, maybe_options: ?GcsOptions) !object_storage.Gcs.JsonApiConfig {
+    const options = maybe_options orelse GcsOptions{};
+    var cfg = switch (options.credential_source) {
+        .default => try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc),
+        .bearer_token => try object_storage.Gcs.jsonApiClientConfigWithBearerTokenAlloc(
+            alloc,
+            options.bearer_token orelse return error.MissingGcsBearerToken,
+            options.project_id,
+        ),
+        .service_account => blk: {
+            var service_account = if (options.service_account_json) |raw|
+                try google_auth.parseServiceAccountJsonAlloc(alloc, raw)
+            else if (options.credentials_path) |path|
+                try google_auth.serviceAccountFromFileAlloc(alloc, path)
+            else
+                return error.MissingServiceAccount;
+            var service_account_owned = true;
+            errdefer if (service_account_owned) service_account.deinit(alloc);
+            const discovered_project = service_account.project_id;
+            var auth_cfg = try google_auth.configFromServiceAccountAlloc(
+                alloc,
+                service_account,
+                options.scope orelse google_auth.default_scope,
+            );
+            service_account_owned = false;
+            var auth_cfg_owned = true;
+            errdefer if (auth_cfg_owned) auth_cfg.deinit(alloc);
+            const source = try alloc.create(google_auth.CachedTokenSource);
+            errdefer alloc.destroy(source);
+            source.* = try google_auth.CachedTokenSource.init(alloc, auth_cfg);
+            auth_cfg_owned = false;
+            var source_owned = true;
+            errdefer if (source_owned) {
+                source.deinit();
+                alloc.destroy(source);
+            };
+            var result = try object_storage.Gcs.jsonApiClientConfigAlloc(alloc);
+            errdefer result.deinit(alloc);
+            result.auth = .{ .google_token_source = source };
+            source_owned = false;
+            if (options.project_id orelse discovered_project) |project_id| {
+                result.project_id = try alloc.dupe(u8, project_id);
+            }
+            break :blk result;
+        },
+    };
+    errdefer cfg.deinit(alloc);
+    if (options.endpoint) |endpoint| {
+        alloc.free(cfg.endpoint);
+        cfg.endpoint = try alloc.dupe(u8, endpoint);
+    }
+    if (options.upload_endpoint) |upload_endpoint| {
+        alloc.free(cfg.upload_endpoint);
+        cfg.upload_endpoint = try alloc.dupe(u8, upload_endpoint);
+    }
+    if (options.project_id) |project_id| {
+        if (cfg.project_id) |owned| alloc.free(owned);
+        cfg.project_id = try alloc.dupe(u8, project_id);
+    }
+    return cfg;
 }
 
 pub const OpenedObjectStore = struct {

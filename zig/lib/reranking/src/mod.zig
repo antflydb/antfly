@@ -63,7 +63,7 @@ pub const Config = struct {
         if (self.field.len == 0 and self.template.len == 0) return error.InvalidRerankerConfig;
         switch (self.provider) {
             .antfly => {},
-            .ollama, .cohere, .vertex => {
+            .cohere, .vertex => {
                 if (self.model.len == 0) return error.InvalidRerankerConfig;
             },
         }
@@ -78,7 +78,6 @@ pub const Config = struct {
     pub fn defaultedUrl(self: Config) []const u8 {
         if (self.url.len > 0) return self.url;
         return switch (self.provider) {
-            .ollama => "http://127.0.0.1:11434",
             .antfly => "http://127.0.0.1:8082",
             else => "",
         };

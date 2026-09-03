@@ -31,7 +31,7 @@ class LinearMergeRequest:
     1. Send sorted records from your external source
     2. Server upserts records that exist in your batch
     3. Server deletes Antfly records in the key range that are absent from your batch
-    4. If stopped at shard boundary, use next_cursor for next request
+    4. Use next_cursor as last_merged_id for the next request
 
     **WARNING:** Not safe for concurrent operations with overlapping key ranges.
 

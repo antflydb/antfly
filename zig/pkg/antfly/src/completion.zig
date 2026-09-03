@@ -34,11 +34,11 @@ const artifact_subcommands = [_][]const u8{ "list", "get", "put", "delete", "rep
 const agents_subcommands = [_][]const u8{ "retrieval", "query-builder" };
 const auth_subcommands = [_][]const u8{ "me", "users", "permissions", "roles", "row-filters", "subjects", "api-keys" };
 const inference_subcommands = [_][]const u8{
-    "run",          "embed",            "classify", "generate",
-    "chat",         "compile-artifact", "export",   "quantize",
-    "run-artifact", "transcribe",       "read",     "extract",
-    "compare",      "finetune",         "smoke",    "list",
-    "pull",         "convert",
+    "run",          "embed",            "classify",  "generate",
+    "chat",         "compile-artifact", "export",    "quantize",
+    "run-artifact", "transcribe",       "read",      "extract",
+    "compare",      "finetune",         "smoke",     "list",
+    "pull",         "convert",          "cuda-info",
 };
 const lite_subcommands = [_][]const u8{
     "init",           "status",  "info",   "batch",      "lookup",

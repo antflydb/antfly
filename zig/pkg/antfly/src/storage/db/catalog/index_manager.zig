@@ -21972,6 +21972,13 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
 
     for (edge_types.array.items, 0..) |item, i| {
         if (item != .object) return error.InvalidIndexConfig;
+        var fields = item.object.iterator();
+        while (fields.next()) |field| {
+            const key = field.key_ptr.*;
+            if (!std.mem.eql(u8, key, "name") and
+                !std.mem.eql(u8, key, "field") and
+                !std.mem.eql(u8, key, "topology")) return error.InvalidIndexConfig;
+        }
         const name = item.object.get("name") orelse return error.InvalidIndexConfig;
         if (name != .string) return error.InvalidIndexConfig;
 
@@ -22477,6 +22484,16 @@ test "graph config rejects artifact source combined with document field edge typ
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"artifact":"relations_v1"},"edge_types":[{"name":"mentions","field":"edges"}]}
+    ));
+}
+
+test "graph edge type config rejects unsupported constraints" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"edge_types":[{"name":"mentions","max_weight":1.0}]}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"edge_types":[{"name":"mentions","allow_self_loops":false}]}
     ));
 }
 

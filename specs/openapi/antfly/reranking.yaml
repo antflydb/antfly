@@ -9,24 +9,9 @@ components:
       type: string
       enum:
         - antfly
-        - ollama
         - cohere
         - vertex
       description: "The reranking provider to use."
-
-    OllamaRerankerConfig:
-      type: object
-      description: "Configuration for the Ollama reranking provider."
-      properties:
-        model:
-          type: string
-          description: "The name of the Ollama model to use for reranking."
-        url:
-          type: string
-          format: uri
-          description: "The URL of the Ollama API endpoint."
-      required:
-        - model
 
     AntflyRerankerConfig:
       type: object
@@ -133,10 +118,9 @@ components:
             - provider
         - oneOf:
             - $ref: "#/components/schemas/AntflyRerankerConfig"
-            - $ref: "#/components/schemas/OllamaRerankerConfig"
             - $ref: "#/components/schemas/CohereRerankerConfig"
             - $ref: "#/components/schemas/VertexRerankerConfig"
       example:
-        provider: "ollama"
-        model: "dengcao/Qwen3-Reranker-0.6B:F16"
+        provider: "cohere"
+        model: "rerank-v4.0-pro"
         field: "content"

@@ -24,9 +24,6 @@ marker applies to the whole directory tree, not to an individual node mode.
     catalog.txt
     snapshots/
 
-  inference/
-    models/
-    artifacts/
 ```
 
 ## Design
@@ -54,13 +51,11 @@ directories as standalone metadata, data, and inference nodes.
 Table database snapshots are a lower-level DB artifact and remain adjacent to
 the database path as `<db_path>.snapshots/<snapshot-id>/...`.
 
-`inference/` owns local inference assets:
-
-- `ANTFLY_INFERENCE_MODELS_DIR` still overrides model storage.
-- When a runtime has an Antfly data-dir, the default model directory is
-  `<data-dir>/inference/models`.
-- Standalone inference commands without a data-dir keep the legacy
-  `~/.antfly/inference/models` fallback.
+Inference assets are deliberately independent of the database data root.
+AI model discovery defaults to `~/.antfly/inference/models`, and Traditional
+ML predictor discovery defaults to `~/.antfly/inference/ml`.
+`ANTFLY_INFERENCE_MODELS_DIR`/`--models-dir` and
+`ANTFLY_INFERENCE_ML_DIR`/`--ml-dir` override those locations.
 
 `secrets.json` is rooted at `<data-dir>/secrets.json` because secrets are
 runtime-wide process configuration, not metadata replica state or data replica

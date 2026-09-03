@@ -60,7 +60,7 @@ class StatefulQueryRequest:
     the stateful public transport boundary for the v0.2 transition window.
 
         Attributes:
-            table (str | Unset): Name of the table to query. Optional for global queries. Example: wikipedia.
+            table (str | Unset): Name of the table to query. Required for global-query requests. Example: wikipedia.
             query (QueryRequestQuery | Unset): Canonical public query AST. Prefer this field for new clients.
 
                 Boolean clauses are normalized before planning:
@@ -296,7 +296,7 @@ class StatefulQueryRequest:
                 join metadata, reranker stats, and merge details.
                 Has minor performance overhead — not recommended for production traffic.
             reranker (RerankerConfig | Unset): A unified configuration for a reranking provider. Example: {'provider':
-                'ollama', 'model': 'dengcao/Qwen3-Reranker-0.6B:F16', 'field': 'content'}.
+                'cohere', 'model': 'rerank-v4.0-pro', 'field': 'content'}.
             analyses (Analyses | Unset):
             graph_queries (GraphQueries | Unset): Named canonical graph operations. When graph_queries is present it must
                 contain at least one operation. A request may contain at most 64 operations, of which at most eight may be MATCH

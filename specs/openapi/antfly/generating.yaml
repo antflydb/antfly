@@ -6,10 +6,53 @@ info:
 components:
   schemas:
     GeneratorProvider:
-      $ref: "../shared/generating.yaml#/components/schemas/GeneratorProvider"
+      type: string
+      enum: [gemini, vertex, ollama, openai, antfly]
+      description: "Generator providers executable by retrieval and query-builder agents."
 
     GeneratorConfig:
-      $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
+      type: object
+      description: "Generator configuration accepted by retrieval and query-builder agents."
+      required: [provider]
+      properties:
+        provider:
+          $ref: "#/components/schemas/GeneratorProvider"
+        model:
+          type: string
+          description: "The model name or identifier."
+        temperature:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+        top_p:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+        api_key:
+          type: string
+          writeOnly: true
+        url:
+          type: string
+          format: uri
+        api_url:
+          type: string
+          format: uri
+        project_id:
+          type: string
+        location:
+          type: string
+        credentials_path:
+          type: string
+          writeOnly: true
+        timeout:
+          type: integer
+          minimum: 1
 
     GenerateResult:
       type: object
@@ -226,31 +269,19 @@ components:
     FollowupStepConfig:
       type: object
       description: |
-        Configuration for generating follow-up questions. Uses a separate generator
-        call which can use a cheaper/faster model.
+        Configuration for deterministic follow-up suggestions derived from the
+        original query and the standard Antfly follow-up templates.
       properties:
         enabled:
           type: boolean
           default: false
           description: "Enable follow-up question generation"
-        generator:
-          $ref: "#/components/schemas/GeneratorConfig"
-          description: "Generator for follow-up questions. If not specified, uses the answer step's generator."
-        chain:
-          type: array
-          items:
-            $ref: "#/components/schemas/ChainLink"
-          description: "Chain of generators to try in order. Mutually exclusive with 'generator'."
         count:
           type: integer
           default: 3
           minimum: 1
-          maximum: 10
+          maximum: 4
           description: "Number of follow-up questions to generate"
-        context:
-          type: string
-          description: "Custom guidance for follow-up question focus and style"
-          example: "Focus on implementation details and edge cases"
 
     ConfidenceStepConfig:
       type: object

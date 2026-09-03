@@ -31,7 +31,8 @@ class TableSchema:
             Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
         ttl_duration (str | Unset): The duration after which documents should expire, based on the ttl_field timestamp
             (optional).
-            Uses Go duration format (e.g., '24h', '7d', '168h').
+            Uses integer duration components with `ns`, `us`, `ms`, `s`, `m`, `h`,
+            or `d` units (for example, `90m`, `1h30m`, or `7d`).
         dynamic_templates (list[DynamicTemplate] | Unset): Rules for mapping dynamically detected fields. When a
             document contains fields
             that don't have explicit mappings and dynamic mapping is enabled, templates are

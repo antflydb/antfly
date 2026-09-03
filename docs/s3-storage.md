@@ -1,4 +1,4 @@
-# S3 object storage
+# Object storage (S3 and GCS)
 
 Antfly's Zig serverless runtime uses object storage as the durable engine for
 artifacts, manifests, WAL, progress, and catalog state. Object storage is an
@@ -82,15 +82,40 @@ protected secret-store file:
 ```json
 {
   "external_io": {
-    "protocol": "s3",
-    "endpoint": "minio.internal:9000",
-    "use_ssl": true,
-    "access_key_id": "${secret:storage.access_key_id}",
-    "secret_access_key": "${secret:storage.secret_access_key}",
-    "buckets": ["antfly-data"]
+      "protocol": "s3",
+      "endpoint": "minio.internal:9000",
+      "use_ssl": true,
+      "credentials": {
+        "source": "static",
+        "access_key_id": "${secret:storage.access_key_id}",
+        "secret_access_key": "${secret:storage.secret_access_key}"
+      },
+      "buckets": ["antfly-data"]
   }
 }
 ```
+
+For Google Cloud Storage, select `gcs` and use Application Default
+Credentials, an explicit bearer token, or a service-account document:
+
+```json
+{
+  "external_io": {
+    "protocol": "gcs",
+    "project_id": "antfly-production",
+    "buckets": ["antfly-data"],
+    "credentials": {
+      "source": "service_account",
+      "credentials_path": "/run/secrets/gcs-service-account.json"
+    }
+  }
+}
+```
+
+With `"source": "default"` (or no `credentials` object), the serverless
+runtime reads the standard GCS/Google credential environment variables. Named
+GCS connections also support per-lane buckets, prefixes, credentials, custom
+JSON API endpoints, and `bucket_provisioning`, just like S3 connections.
 
 Primary-storage credentials grant database write authority. Keep them separate
 from `remote_content.s3`, which grants read access to customer-provided objects

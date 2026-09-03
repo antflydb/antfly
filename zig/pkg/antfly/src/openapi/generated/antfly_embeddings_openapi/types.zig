@@ -410,6 +410,147 @@ pub const GoogleEmbedderConfig = struct {
     }
 };
 
+/// Embedding provider configuration accepted by managed index creation.
+pub const ManagedEmbedderConfig = struct {
+    /// The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large').
+    model: ?[]const u8 = null,
+    /// The URL of the Ollama API endpoint. Can also be set via OLLAMA_HOST environment variable.
+    url: ?[]const u8 = null,
+    /// The OpenAI API key. Can also be set via OPENAI_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072.
+    dimensions: ?i64 = null,
+    /// Bedrock provider request schema. `auto` recognizes direct foundation-model IDs, foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly for application inference profiles, provisioned throughput, custom models, and other aliases whose invocation target does not identify the underlying model.
+    request_format: ?[]const u8 = null,
+    /// The AWS region for the Bedrock service (e.g., 'us-east-1').
+    region: ?[]const u8 = null,
+    /// Output dimension for Bedrock embedding models that support configurable dimensions.
+    dimension: ?i64 = null,
+    /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
+    input_type: ?[]const u8 = null,
+    /// Cohere Bedrock truncate behavior.
+    truncate: ?[]const u8 = null,
+    /// Whether to strip new lines from the input text before embedding.
+    strip_new_lines: ?bool = null,
+    /// The batch size for embedding requests to optimize throughput.
+    batch_size: ?i64 = null,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    provider: ManagedEmbedderProvider,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "url", "url", true },
+        .{ "api_key", "api_key", true },
+        .{ "dimensions", "dimensions", true },
+        .{ "request_format", "request_format", true },
+        .{ "region", "region", true },
+        .{ "dimension", "dimension", true },
+        .{ "input_type", "input_type", true },
+        .{ "truncate", "truncate", true },
+        .{ "strip_new_lines", "strip_new_lines", true },
+        .{ "batch_size", "batch_size", true },
+        .{ "api_url", "api_url", true },
+        .{ "provider", "provider", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        if (self.request_format) |value| {
+            try jw.objectField("request_format");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.dimension) |value| {
+            try jw.objectField("dimension");
+            try jw.write(value);
+        }
+        if (self.input_type) |value| {
+            try jw.objectField("input_type");
+            try jw.write(value);
+        }
+        if (self.truncate) |value| {
+            try jw.objectField("truncate");
+            try jw.write(value);
+        }
+        if (self.strip_new_lines) |value| {
+            try jw.objectField("strip_new_lines");
+            try jw.write(value);
+        }
+        if (self.batch_size) |value| {
+            try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.endObject();
+    }
+};
+
+/// Embedding providers executable by managed index creation.
+pub const ManagedEmbedderProvider = enum {
+    ollama,
+    openai,
+    bedrock,
+    antfly,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .ollama => "ollama",
+            .openai => "openai",
+            .bedrock => "bedrock",
+            .antfly => "antfly",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "ollama", .ollama },
+            .{ "openai", .openai },
+            .{ "bedrock", .bedrock },
+            .{ "antfly", .antfly },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Configuration for the Ollama embedding provider. Local embeddings for privacy and offline use. URL via `url` field or `OLLAMA_HOST` env var. **Example Models:** nomic-embed-text (768 dims), mxbai-embed-large (1024 dims), all-minilm (384 dims) **Docs:** https://ollama.com/search?c=embedding
 pub const OllamaEmbedderConfig = struct {
     /// The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large').

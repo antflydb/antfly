@@ -320,7 +320,7 @@ pub const AgentStepStatus = enum {
 };
 
 pub const AggregationBucket = struct {
-    /// Bucket key (term, range name, date, etc.)
+    /// Bucket key (term, range name, date, etc.). For a multi-field terms aggregation this is a JSON string containing the serialized value array; use JSON.parse(bucket.key) to recover the array.
     key: []const u8,
     /// Formatted key for display (e.g., formatted dates)
     key_as_string: ?[]const u8 = null,
@@ -489,7 +489,7 @@ pub const AggregationRequest = struct {
     field: ?[]const u8 = null,
     /// Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types.
     mode: ?std.json.Value = null,
-    /// Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order.
+    /// Ordered field list for multi-field terms aggregations. Each bucket key is a JSON string containing the serialized value array in the same order; clients should parse bucket.key as JSON.
     fields: ?[]const []const u8 = null,
     /// Maximum number of buckets to return (for bucketing aggregations)
     size: ?i64 = null,
@@ -1591,7 +1591,7 @@ pub const BackupRequest = struct {
 pub const BatchRequest = struct {
     /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans
     inserts: ?std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)) = null,
-    /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
+    /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions take precedence over inserts for the same key in one batch - Keys are permanently removed from storage and indexes
     deletes: ?[]const []const u8 = null,
     /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add or remove array values ($addToSet, $pull) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
@@ -5504,17 +5504,13 @@ pub const KeyRange = struct {
     }
 };
 
-/// Status of a linear merge page operation: - "success": All records in batch processed successfully - "partial": Processing stopped at shard boundary, client should retry with next_cursor - "error": Fatal error occurred, no records processed successfully
+/// Status of a completed linear merge page. Successful responses are atomic and use "success"; failures are returned as non-2xx HTTP responses.
 pub const LinearMergePageStatus = enum {
     success,
-    partial,
-    @"error",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .success => "success",
-            .partial => "partial",
-            .@"error" => "error",
         };
         try jw.write(s);
     }
@@ -5526,14 +5522,12 @@ pub const LinearMergePageStatus = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "success", .success },
-            .{ "partial", .partial },
-            .{ "error", .@"error" },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
-/// Linear merge operation for syncing sorted records from external sources. Use this to keep Antfly in sync with an external database or data source. Requests may be sent as plain JSON or gzip-compressed JSON (`Content-Encoding: gzip`). Request bodies are limited to 64 MiB after decompression. Requests that exceed this limit return HTTP 413. **How it works:** 1. Send sorted records from your external source 2. Server upserts records that exist in your batch 3. Server deletes Antfly records in the key range that are absent from your batch 4. If stopped at shard boundary, use next_cursor for next request **WARNING:** Not safe for concurrent operations with overlapping key ranges.
+/// Linear merge operation for syncing sorted records from external sources. Use this to keep Antfly in sync with an external database or data source. Requests may be sent as plain JSON or gzip-compressed JSON (`Content-Encoding: gzip`). Request bodies are limited to 64 MiB after decompression. Requests that exceed this limit return HTTP 413. **How it works:** 1. Send sorted records from your external source 2. Server upserts records that exist in your batch 3. Server deletes Antfly records in the key range that are absent from your batch 4. Use next_cursor as last_merged_id for the next request **WARNING:** Not safe for concurrent operations with overlapping key ranges.
 pub const LinearMergeRequest = struct {
     /// Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}} Requirements: - The server processes keys in lexicographic order - Use consistent key naming (e.g., all start with same prefix) This format avoids duplicate IDs and matches Antfly's batch write interface.
     records: std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)),
@@ -5589,7 +5583,7 @@ pub const LinearMergeResult = struct {
     deleted: i64,
     /// IDs that were deleted (or would be deleted if dry_run=true). Only included if dry_run=true.
     deleted_ids: ?[]const []const u8 = null,
-    failed: ?[]const FailedOperation = null,
+    failed: []const FailedOperation,
     /// ID of last record in this batch (use for next request)
     next_cursor: []const u8,
     key_range: ?KeyRange = null,
@@ -5597,7 +5591,7 @@ pub const LinearMergeResult = struct {
     keys_scanned: ?i64 = null,
     /// Additional information (e.g., "stopped at shard boundary", "dry run - no changes made")
     message: ?[]const u8 = null,
-    took: ?i64 = null,
+    took: i64,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -5606,12 +5600,12 @@ pub const LinearMergeResult = struct {
         .{ "skipped", "skipped", false },
         .{ "deleted", "deleted", false },
         .{ "deleted_ids", "deleted_ids", true },
-        .{ "failed", "failed", true },
+        .{ "failed", "failed", false },
         .{ "next_cursor", "next_cursor", false },
         .{ "key_range", "key_range", true },
         .{ "keys_scanned", "keys_scanned", true },
         .{ "message", "message", true },
-        .{ "took", "took", true },
+        .{ "took", "took", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -5636,10 +5630,8 @@ pub const LinearMergeResult = struct {
             try jw.objectField("deleted_ids");
             try jw.write(value);
         }
-        if (self.failed) |value| {
-            try jw.objectField("failed");
-            try jw.write(value);
-        }
+        try jw.objectField("failed");
+        try jw.write(self.failed);
         try jw.objectField("next_cursor");
         try jw.write(self.next_cursor);
         if (self.key_range) |value| {
@@ -5654,10 +5646,8 @@ pub const LinearMergeResult = struct {
             try jw.objectField("message");
             try jw.write(value);
         }
-        if (self.took) |value| {
-            try jw.objectField("took");
-            try jw.write(value);
-        }
+        try jw.objectField("took");
+        try jw.write(self.took);
         try jw.endObject();
     }
 };
@@ -7193,7 +7183,7 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
-    /// Name of the table to query. Optional for global queries.
+    /// Name of the table to query. Required for global-query requests.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -8063,7 +8053,7 @@ pub const ReplicationSource = struct {
     dsn: []const u8,
     /// Name of the table in the PostgreSQL database to replicate from.
     postgres_table: []const u8,
-    /// Template for constructing the Antfly document key from PG columns. A plain string (e.g., "id") uses that column's value directly. Use `{{column}}` syntax for composite keys: `{{tenant_id}}:{{user_id}}`.
+    /// Template for constructing the Antfly document key from PG columns. When omitted, Antfly first uses `_id`, then falls back to `id` if the row has no `_id` column. A plain string (e.g., "id") uses that column's value directly. Use `{{column}}` syntax for composite keys: `{{tenant_id}}:{{user_id}}`.
     key_template: ?[]const u8 = null,
     /// PostgreSQL replication slot name. If omitted, auto-derived from the Antfly table and PG table names. Specify this when using pre-created slots (e.g., on Supabase or Neon).
     slot_name: ?[]const u8 = null,
@@ -8073,7 +8063,7 @@ pub const ReplicationSource = struct {
     on_update: ?[]const ReplicationTransformOp = null,
     /// Transform operations applied on DELETE events. If omitted, auto-derives `$unset` ops from `on_update`'s `$set` paths (safe for multi-source). Use `$delete_document` op to delete the entire Antfly document.
     on_delete: ?[]const ReplicationTransformOp = null,
-    /// Bleve-style filter query that gets translated to SQL and applied as a WHERE clause on the PostgreSQL publication. This filters rows at the source before they are sent over the replication stream, reducing network and processing overhead. Only a subset of filter types are supported (term, match, range, conjuncts, disjuncts, must_not). The filter is translated to SQL with inlined literal values. Example: `{"term": "active", "field": "status"}` becomes `WHERE ("status" = 'active')` on the publication.
+    /// Bleve-style filter query that gets translated to SQL and applied as a WHERE clause on the PostgreSQL publication. This filters rows at the source before they are sent over the replication stream, reducing network and processing overhead. Requires PostgreSQL 15 or newer and is applied only when Antfly creates the publication. Changing this value does not alter an existing publication; update or recreate that publication directly. Only a subset of filter types are supported (term, match, range, conjuncts, disjuncts, must_not). The filter is translated to SQL with inlined literal values. Example: `{"term": "active", "field": "status"}` becomes `WHERE ("status" = 'active')` on the publication.
     publication_filter: ?RawQuery = null,
     /// Conditional routes for fan-out replication. Each route evaluates its `where` filter against every CDC row and, on match, writes to the specified `target_table`. Multiple routes can match the same row. When routes are present, the top-level `on_update`/`on_delete` are ignored — each route defines its own transforms.
     routes: ?[]const ReplicationRoute = null,
@@ -9087,7 +9077,7 @@ pub const RetrievalAgentUsage = struct {
 
 /// A canonical query in the retrieval pipeline with an optional tree search configuration. Each query specifies its own table. Deprecated stateful graph_searches compatibility is intentionally unavailable here. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
 pub const RetrievalQueryRequest = struct {
-    /// Name of the table to query. Optional for global queries.
+    /// Name of the table to query. Required for global-query requests.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -10107,7 +10097,7 @@ pub const SortProfile = struct {
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
-    /// Name of the table to query. Optional for global queries.
+    /// Name of the table to query. Required for global-query requests.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,

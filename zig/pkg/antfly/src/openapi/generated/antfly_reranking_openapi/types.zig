@@ -83,39 +83,6 @@ pub const CohereRerankerConfig = struct {
     }
 };
 
-/// Configuration for the Ollama reranking provider.
-pub const OllamaRerankerConfig = struct {
-    /// The name of the Ollama model to use for reranking.
-    model: []const u8,
-    /// The URL of the Ollama API endpoint.
-    url: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "url", "url", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        if (self.url) |value| {
-            try jw.objectField("url");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 /// A unified configuration for a reranking provider.
 pub const RerankerConfig = struct {
     provider: RerankerProvider,
@@ -207,14 +174,12 @@ pub const RerankerConfig = struct {
 /// The reranking provider to use.
 pub const RerankerProvider = enum {
     antfly,
-    ollama,
     cohere,
     vertex,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .antfly => "antfly",
-            .ollama => "ollama",
             .cohere => "cohere",
             .vertex => "vertex",
         };
@@ -228,7 +193,6 @@ pub const RerankerProvider = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "antfly", .antfly },
-            .{ "ollama", .ollama },
             .{ "cohere", .cohere },
             .{ "vertex", .vertex },
         });

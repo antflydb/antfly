@@ -184,7 +184,7 @@ pub const ClassificationStepConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", false },
+        .{ "generator", "generator", true },
         .{ "chain", "chain", true },
         .{ "with_reasoning", "with_reasoning", true },
         .{ "force_strategy", "force_strategy", true },
@@ -209,9 +209,6 @@ pub const ClassificationStepConfig = struct {
         if (self.generator) |value| {
             try jw.objectField("generator");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("generator");
-            try jw.write(@as(?u8, null));
         }
         if (self.chain) |value| {
             try jw.objectField("chain");
@@ -327,7 +324,7 @@ pub const ConfidenceStepConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", false },
+        .{ "generator", "generator", true },
         .{ "chain", "chain", true },
         .{ "context", "context", true },
     };
@@ -349,9 +346,6 @@ pub const ConfidenceStepConfig = struct {
         if (self.generator) |value| {
             try jw.objectField("generator");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("generator");
-            try jw.write(@as(?u8, null));
         }
         if (self.chain) |value| {
             try jw.objectField("chain");
@@ -375,26 +369,17 @@ pub const FilterSpec = struct {
     value: std.json.Value,
 };
 
-/// Configuration for generating follow-up questions. Uses a separate generator call which can use a cheaper/faster model.
+/// Configuration for deterministic follow-up suggestions derived from the original query and the standard Antfly follow-up templates.
 pub const FollowupStepConfig = struct {
     /// Enable follow-up question generation
     enabled: ?bool = null,
-    /// Generator for follow-up questions. If not specified, uses the answer step's generator.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
     /// Number of follow-up questions to generate
     count: ?i64 = null,
-    /// Custom guidance for follow-up question focus and style
-    context: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", false },
-        .{ "chain", "chain", true },
         .{ "count", "count", true },
-        .{ "context", "context", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -411,23 +396,8 @@ pub const FollowupStepConfig = struct {
             try jw.objectField("enabled");
             try jw.write(value);
         }
-        if (self.generator) |value| {
-            try jw.objectField("generator");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("generator");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.chain) |value| {
-            try jw.objectField("chain");
-            try jw.write(value);
-        }
         if (self.count) |value| {
             try jw.objectField("count");
-            try jw.write(value);
-        }
-        if (self.context) |value| {
-            try jw.objectField("context");
             try jw.write(value);
         }
         try jw.endObject();
@@ -511,7 +481,7 @@ pub const GenerationStepConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", false },
+        .{ "generator", "generator", true },
         .{ "chain", "chain", true },
         .{ "system_prompt", "system_prompt", true },
         .{ "generation_context", "generation_context", true },
@@ -534,9 +504,6 @@ pub const GenerationStepConfig = struct {
         if (self.generator) |value| {
             try jw.objectField("generator");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("generator");
-            try jw.write(@as(?u8, null));
         }
         if (self.chain) |value| {
             try jw.objectField("chain");
@@ -554,9 +521,138 @@ pub const GenerationStepConfig = struct {
     }
 };
 
-pub const GeneratorConfig = antfly_generating_openapi.GeneratorConfig;
+/// Generator configuration accepted by retrieval and query-builder agents.
+pub const GeneratorConfig = struct {
+    provider: GeneratorProvider,
+    /// The model name or identifier.
+    model: ?[]const u8 = null,
+    temperature: ?f32 = null,
+    max_tokens: ?i64 = null,
+    top_p: ?f32 = null,
+    top_k: ?i64 = null,
+    api_key: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    api_url: ?[]const u8 = null,
+    project_id: ?[]const u8 = null,
+    location: ?[]const u8 = null,
+    credentials_path: ?[]const u8 = null,
+    timeout: ?i64 = null,
 
-pub const GeneratorProvider = antfly_generating_openapi.GeneratorProvider;
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "model", "model", true },
+        .{ "temperature", "temperature", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "top_p", "top_p", true },
+        .{ "top_k", "top_k", true },
+        .{ "api_key", "api_key", true },
+        .{ "url", "url", true },
+        .{ "api_url", "api_url", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "timeout", "timeout", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.timeout) |value| {
+            try jw.objectField("timeout");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Generator providers executable by retrieval and query-builder agents.
+pub const GeneratorProvider = enum {
+    gemini,
+    vertex,
+    ollama,
+    openai,
+    antfly,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .gemini => "gemini",
+            .vertex => "vertex",
+            .ollama => "ollama",
+            .openai => "openai",
+            .antfly => "antfly",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "gemini", .gemini },
+            .{ "vertex", .vertex },
+            .{ "ollama", .ollama },
+            .{ "openai", .openai },
+            .{ "antfly", .antfly },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
 
 /// Strategy for query transformation and retrieval: - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries. - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part questions. - step_back: Generate broader background query first, then specific query. Best for questions needing context. - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual questions.
 pub const QueryStrategy = enum {

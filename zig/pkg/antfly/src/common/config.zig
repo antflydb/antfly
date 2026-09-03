@@ -1638,7 +1638,7 @@ fn validateStorageConnection(
     const connection = connections.get(connection_id) orelse return error.InvalidConfig;
     if (connection.kind != .external_io) return error.InvalidConfig;
     const external = connection.external_io orelse return error.InvalidConfig;
-    if (external.protocol != .s3) return error.InvalidConfig;
+    if (external.protocol != .s3 and external.protocol != .gcs) return error.InvalidConfig;
     var authorized = false;
     for (connection.capabilities) |capability| {
         if (std.mem.eql(u8, capability, "storage.primary")) {

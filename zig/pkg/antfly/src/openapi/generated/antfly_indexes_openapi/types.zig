@@ -644,7 +644,7 @@ pub const CreateEmbeddingsIndexRequest = struct {
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
-    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
@@ -662,10 +662,8 @@ pub const CreateEmbeddingsIndexRequest = struct {
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?antfly_embeddings_openapi.EmbedderConfig = null,
-    /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
-    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    embedder: ?antfly_embeddings_openapi.ManagedEmbedderConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
     chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
     /// Default number of results to return from search (sparse only)
     top_k: ?i64 = null,
@@ -695,7 +693,6 @@ pub const CreateEmbeddingsIndexRequest = struct {
         .{ "distance_metric", "distance_metric", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", false },
-        .{ "summarizer", "summarizer", false },
         .{ "chunker", "chunker", false },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
@@ -779,13 +776,6 @@ pub const CreateEmbeddingsIndexRequest = struct {
             try jw.write(value);
         } else if (jw.options.emit_null_optional_fields) {
             try jw.objectField("embedder");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("summarizer");
             try jw.write(@as(?u8, null));
         }
         if (self.chunker) |value| {
@@ -1206,7 +1196,6 @@ pub const CreatedEmbeddingsIndex = struct {
     distance_metric: ?DistanceMetric = null,
     mem_only: ?bool = null,
     embedder: ?CreatedProviderConfig = null,
-    summarizer: ?CreatedProviderConfig = null,
     chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
     top_k: ?i64 = null,
     min_weight: ?f32 = null,
@@ -1233,7 +1222,6 @@ pub const CreatedEmbeddingsIndex = struct {
         .{ "distance_metric", "distance_metric", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", true },
-        .{ "summarizer", "summarizer", true },
         .{ "chunker", "chunker", false },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
@@ -1318,10 +1306,6 @@ pub const CreatedEmbeddingsIndex = struct {
             try jw.objectField("embedder");
             try jw.write(value);
         }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
-            try jw.write(value);
-        }
         if (self.chunker) |value| {
             try jw.objectField("chunker");
             try jw.write(value);
@@ -1369,7 +1353,6 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     distance_metric: ?DistanceMetric = null,
     mem_only: ?bool = null,
     embedder: ?CreatedProviderConfig = null,
-    summarizer: ?CreatedProviderConfig = null,
     chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
     top_k: ?i64 = null,
     min_weight: ?f32 = null,
@@ -1391,7 +1374,6 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         .{ "distance_metric", "distance_metric", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", true },
-        .{ "summarizer", "summarizer", true },
         .{ "chunker", "chunker", false },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
@@ -1459,10 +1441,6 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         }
         if (self.embedder) |value| {
             try jw.objectField("embedder");
-            try jw.write(value);
-        }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
             try jw.write(value);
         }
         if (self.chunker) |value| {
@@ -2453,7 +2431,7 @@ pub const DerivedCoverageStatusPolicy = enum {
     }
 };
 
-/// Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
+/// Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
 pub const DistanceMetric = enum {
     l2_squared,
     inner_product,
@@ -2579,24 +2557,12 @@ pub const EdgeTypeConfig = struct {
     field: ?[]const u8 = null,
     /// Topology constraint for this edge type: - tree: Single parent per node, no cycles - graph: No constraints (default)
     topology: ?[]const u8 = null,
-    /// Maximum allowed edge weight
-    max_weight: ?f64 = null,
-    /// Minimum allowed edge weight
-    min_weight: ?f64 = null,
-    /// Whether to allow edges from a node to itself
-    allow_self_loops: ?bool = null,
-    /// Required metadata fields for this edge type
-    required_metadata: ?[]const []const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
         .{ "field", "field", true },
         .{ "topology", "topology", true },
-        .{ "max_weight", "max_weight", true },
-        .{ "min_weight", "min_weight", true },
-        .{ "allow_self_loops", "allow_self_loops", true },
-        .{ "required_metadata", "required_metadata", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -2619,34 +2585,18 @@ pub const EdgeTypeConfig = struct {
             try jw.objectField("topology");
             try jw.write(value);
         }
-        if (self.max_weight) |value| {
-            try jw.objectField("max_weight");
-            try jw.write(value);
-        }
-        if (self.min_weight) |value| {
-            try jw.objectField("min_weight");
-            try jw.write(value);
-        }
-        if (self.allow_self_loops) |value| {
-            try jw.objectField("allow_self_loops");
-            try jw.write(value);
-        }
-        if (self.required_metadata) |value| {
-            try jw.objectField("required_metadata");
-            try jw.write(value);
-        }
         try jw.endObject();
     }
 };
 
-/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
+/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense HBC vector index. For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
 pub const EmbeddingsIndexConfig = struct {
     publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
-    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
@@ -2664,10 +2614,8 @@ pub const EmbeddingsIndexConfig = struct {
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?antfly_embeddings_openapi.EmbedderConfig = null,
-    /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
-    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    embedder: ?antfly_embeddings_openapi.ManagedEmbedderConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
     chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
     /// Default number of results to return from search (sparse only)
     top_k: ?i64 = null,
@@ -2693,7 +2641,6 @@ pub const EmbeddingsIndexConfig = struct {
         .{ "distance_metric", "distance_metric", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", false },
-        .{ "summarizer", "summarizer", false },
         .{ "chunker", "chunker", false },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
@@ -2764,13 +2711,6 @@ pub const EmbeddingsIndexConfig = struct {
             try jw.write(value);
         } else if (jw.options.emit_null_optional_fields) {
             try jw.objectField("embedder");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("summarizer");
             try jw.write(@as(?u8, null));
         }
         if (self.chunker) |value| {
@@ -6754,7 +6694,7 @@ pub const IndexConfig = struct {
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
-    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
@@ -6766,10 +6706,8 @@ pub const IndexConfig = struct {
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?antfly_embeddings_openapi.EmbedderConfig = null,
-    /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
-    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    embedder: ?antfly_embeddings_openapi.ManagedEmbedderConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
     chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
     /// Default number of results to return from search (sparse only)
     top_k: ?i64 = null,
@@ -6779,6 +6717,8 @@ pub const IndexConfig = struct {
     chunk_size: ?i64 = null,
     /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
     execution: ?IndexExecutionConfig = null,
+    /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
+    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
@@ -6813,12 +6753,12 @@ pub const IndexConfig = struct {
         .{ "template", "template", true },
         .{ "distance_metric", "distance_metric", true },
         .{ "embedder", "embedder", false },
-        .{ "summarizer", "summarizer", false },
         .{ "chunker", "chunker", false },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
         .{ "chunk_size", "chunk_size", true },
         .{ "execution", "execution", true },
+        .{ "summarizer", "summarizer", false },
         .{ "edge_types", "edge_types", true },
         .{ "max_edges_per_document", "max_edges_per_document", true },
         .{ "source", "source", true },
@@ -6910,10 +6850,6 @@ pub const IndexConfig = struct {
             try jw.objectField("embedder");
             try jw.write(value);
         }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
-            try jw.write(value);
-        }
         if (self.chunker) |value| {
             try jw.objectField("chunker");
             try jw.write(value);
@@ -6932,6 +6868,10 @@ pub const IndexConfig = struct {
         }
         if (self.execution) |value| {
             try jw.objectField("execution");
+            try jw.write(value);
+        }
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
             try jw.write(value);
         }
         if (self.edge_types) |value| {

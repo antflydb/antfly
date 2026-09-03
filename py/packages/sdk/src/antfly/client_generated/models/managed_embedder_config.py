@@ -6,55 +6,46 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
+from ..models.managed_embedder_provider import ManagedEmbedderProvider
 
-T = TypeVar("T", bound="OllamaRerankerConfig")
+T = TypeVar("T", bound="ManagedEmbedderConfig")
 
 
 @_attrs_define
-class OllamaRerankerConfig:
-    """Configuration for the Ollama reranking provider.
+class ManagedEmbedderConfig:
+    """Embedding provider configuration accepted by managed index creation.
 
     Attributes:
-        model (str): The name of the Ollama model to use for reranking.
-        url (str | Unset): The URL of the Ollama API endpoint.
+        provider (ManagedEmbedderProvider): Embedding providers executable by managed index creation.
     """
 
-    model: str
-    url: str | Unset = UNSET
+    provider: ManagedEmbedderProvider
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        model = self.model
-
-        url = self.url
+        provider = self.provider.value
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "model": model,
+                "provider": provider,
             }
         )
-        if url is not UNSET:
-            field_dict["url"] = url
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        model = d.pop("model")
+        provider = ManagedEmbedderProvider(d.pop("provider"))
 
-        url = d.pop("url", UNSET)
-
-        ollama_reranker_config = cls(
-            model=model,
-            url=url,
+        managed_embedder_config = cls(
+            provider=provider,
         )
 
-        ollama_reranker_config.additional_properties = d
-        return ollama_reranker_config
+        managed_embedder_config.additional_properties = d
+        return managed_embedder_config
 
     @property
     def additional_keys(self) -> list[str]:

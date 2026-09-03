@@ -438,7 +438,6 @@ components:
         distance_metric: { $ref: "#/components/schemas/DistanceMetric" }
         mem_only: { type: boolean }
         embedder: { $ref: "#/components/schemas/CreatedProviderConfig" }
-        summarizer: { $ref: "#/components/schemas/CreatedProviderConfig" }
         chunker: { $ref: "chunking.yaml#/components/schemas/ChunkerConfig" }
         top_k: { type: integer, minimum: 1, default: 10 }
         min_weight: { type: number, format: float, default: 0.0 }
@@ -1012,7 +1011,7 @@ components:
       description: >-
         Unified configuration for embeddings indexes.
         When sparse is true, creates a sparse vector index (SPLADE inverted index).
-        When sparse is false (default), creates a dense vector index (HNSW).
+        When sparse is false (default), creates a dense HBC vector index.
         For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
       x-antfly-mutually-exclusive:
         - [sources, external]
@@ -1046,7 +1045,7 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           default: false
-          description: "When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index."
+          description: "When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index."
         dimension:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -1097,12 +1096,9 @@ components:
           description: "Whether to use in-memory only storage (dense only)"
         embedder:
           description: "Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)"
-          $ref: "embeddings.yaml#/components/schemas/EmbedderConfig"
-        summarizer:
-          description: "Configuration for the summarizer plugin (dense managed indexes only)"
-          $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
+          $ref: "embeddings.yaml#/components/schemas/ManagedEmbedderConfig"
         chunker:
-          description: "Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)"
+          description: "Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing."
           $ref: "chunking.yaml#/components/schemas/ChunkerConfig"
         top_k:
           x-go-type-skip-optional-pointer: true
@@ -2042,7 +2038,7 @@ components:
         Distance metric for the vector index (dense only).
         Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI).
         Use "inner_product" for models trained with dot product similarity.
-        Use "l2_squared" (default) for models trained with Euclidean distance.
+        Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
     AntflyType:
       type: string
       enum:
@@ -2140,28 +2136,6 @@ components:
             Topology constraint for this edge type:
             - tree: Single parent per node, no cycles
             - graph: No constraints (default)
-        max_weight:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: double
-          default: 1.0
-          description: "Maximum allowed edge weight"
-        min_weight:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: double
-          default: 0.0
-          description: "Minimum allowed edge weight"
-        allow_self_loops:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
-          default: true
-          description: "Whether to allow edges from a node to itself"
-        required_metadata:
-          type: array
-          description: "Required metadata fields for this edge type"
-          items:
-            type: string
       required:
         - name
     GraphIndexStats:

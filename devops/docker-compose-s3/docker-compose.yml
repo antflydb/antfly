@@ -33,7 +33,17 @@ services:
     build:
       context: ../..
       dockerfile: zig/Dockerfile
-    command: ["serverless", "combined", "--config", "/etc/antfly/config.json"]
+    command:
+      [
+        "serverless",
+        "combined",
+        "--config",
+        "/etc/antfly/config.json",
+        "--bind-host",
+        "0.0.0.0",
+        "--health-port",
+        "4200",
+      ]
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin

@@ -173,6 +173,64 @@ pub const Provider = struct {
         };
     }
 
+    pub fn rerank(
+        self: *Provider,
+        alloc: Allocator,
+        model: []const u8,
+        query: []const u8,
+        documents: []const []const u8,
+    ) ![]f32 {
+        const Record = struct {
+            id: []const u8,
+            content: []const u8,
+        };
+        const records = try alloc.alloc(Record, documents.len);
+        defer alloc.free(records);
+        var initialized: usize = 0;
+        defer for (records[0..initialized]) |record| alloc.free(record.id);
+        for (documents, 0..) |document, index| {
+            records[index] = .{
+                .id = try std.fmt.allocPrint(alloc, "{d}", .{index}),
+                .content = document,
+            };
+            initialized += 1;
+        }
+
+        const request_body = try std.json.Stringify.valueAlloc(alloc, .{
+            .model = model,
+            .query = query,
+            .records = records,
+            .ignoreRecordDetailsInResponse = true,
+        }, .{});
+        defer alloc.free(request_body);
+        const url = try std.fmt.allocPrint(
+            alloc,
+            "{s}/projects/{s}/locations/global/rankingConfigs/default_ranking_config:rank",
+            .{ self.base_url, self.project_id },
+        );
+        defer alloc.free(url);
+
+        var headers = std.ArrayList([2][]const u8).empty;
+        defer headers.deinit(alloc);
+        var minted_auth: ?[]u8 = null;
+        defer if (minted_auth) |value| alloc.free(value);
+        try self.appendAuthHeaders(alloc, &headers, &minted_auth);
+        try headers.append(alloc, .{ "X-Goog-User-Project", self.project_id });
+
+        var response = try self.http.post(url, .{ .json = request_body, .headers = headers.items });
+        defer response.deinit();
+        if (!response.ok()) return error.RerankRequestFailed;
+        const Response = struct {
+            records: []const struct {
+                id: []const u8,
+                score: f32,
+            } = &.{},
+        };
+        var parsed = try std.json.parseFromSlice(Response, alloc, response.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        return try scoresByStringIndexAlloc(alloc, documents.len, parsed.value.records);
+    }
+
     pub fn setMaxTokens(self: *Provider, max_tokens: i64) void {
         self.max_tokens = max_tokens;
     }
@@ -248,6 +306,34 @@ pub const Provider = struct {
         .generate = &generateImpl,
     };
 };
+
+fn scoresByStringIndexAlloc(alloc: Allocator, count: usize, records: anytype) ![]f32 {
+    const scores = try alloc.alloc(f32, count);
+    errdefer alloc.free(scores);
+    @memset(scores, 0);
+    const seen = try alloc.alloc(bool, count);
+    defer alloc.free(seen);
+    @memset(seen, false);
+    for (records) |record| {
+        const index = std.fmt.parseUnsigned(usize, record.id, 10) catch return error.InvalidRerankerResponse;
+        if (index >= count or seen[index]) return error.InvalidRerankerResponse;
+        scores[index] = record.score;
+        seen[index] = true;
+    }
+    for (seen) |present| if (!present) return error.InvalidRerankerResponse;
+    return scores;
+}
+
+test "reranking runtime maps Vertex record IDs back to input order" {
+    const records = [_]struct { id: []const u8, score: f32 }{
+        .{ .id = "1", .score = 0.85 },
+        .{ .id = "0", .score = 0.2 },
+    };
+    const scores = try scoresByStringIndexAlloc(std.testing.allocator, 2, &records);
+    defer std.testing.allocator.free(scores);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), scores[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.85), scores[1], 0.0001);
+}
 
 fn parseGenerateResponseAlloc(alloc: Allocator, body: []const u8) !inference.GenerateResult {
     const Response = struct {

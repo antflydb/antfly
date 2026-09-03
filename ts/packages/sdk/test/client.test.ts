@@ -1265,6 +1265,40 @@ describe("AntflyClient", () => {
 
         mockFetch.mockRestore();
       });
+
+      it("should expose tool mode and confidence from the authoritative done payload", async () => {
+        const events = [
+          {
+            event: "tool_mode",
+            data: JSON.stringify({ mode: "native", tools_count: 3 }),
+          },
+          {
+            event: "done",
+            data: JSON.stringify({ generation_confidence: 0.8, context_relevance: 0.9 }),
+          },
+        ];
+        const mockFetch = vi
+          .spyOn(globalThis, "fetch")
+          .mockResolvedValueOnce(createSSEResponse(events));
+        const toolModes: Array<{ mode: string; tools_count?: number }> = [];
+        const confidence: Array<{
+          generation_confidence: number;
+          context_relevance: number;
+        }> = [];
+
+        await client.retrievalAgent(
+          { table: "test", query: "test query" },
+          {
+            onToolMode: (data) => toolModes.push(data),
+            onConfidence: (data) => confidence.push(data),
+          }
+        );
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        expect(toolModes).toEqual([{ mode: "native", tools_count: 3 }]);
+        expect(confidence).toEqual([{ generation_confidence: 0.8, context_relevance: 0.9 }]);
+        mockFetch.mockRestore();
+      });
     });
 
     describe("Retrieval Agent SSE parsing (multi-paragraph)", () => {

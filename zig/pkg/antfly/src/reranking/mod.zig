@@ -18,6 +18,7 @@ const lib = @import("antfly_reranking");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const antfly_provider = @import("../inference/local.zig");
+const vertex_provider = @import("../inference/vertex.zig");
 const common_secrets = @import("../common/secrets.zig");
 
 pub const Config = lib.Config;
@@ -58,7 +59,11 @@ pub fn rerankDocumentsWithOptions(
     documents: []const []const u8,
 ) ![]f32 {
     try cfg.validate();
-    const api_key = if (try common_secrets.SecretValue.initConfig(alloc, cfg.api_key)) |secret_value| blk: {
+    const configured_secret = switch (cfg.provider) {
+        .cohere => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, "COHERE_API_KEY"),
+        else => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
+    };
+    const api_key = if (configured_secret) |secret_value| blk: {
         var owned_secret = secret_value;
         defer owned_secret.deinit(alloc);
         break :blk try owned_secret.resolveOwned(alloc, options.secret_store);
@@ -80,8 +85,113 @@ pub fn rerankDocumentsWithOptions(
             defer result.deinit();
             return try alloc.dupe(f32, result.scores);
         },
-        else => return error.UnsupportedRerankerProvider,
+        .cohere => {
+            const token = api_key orelse return error.InvalidRerankerConfig;
+            return try rerankCohere(alloc, http, cfg, token, query, documents);
+        },
+        .vertex => {
+            var provider = try vertex_provider.Provider.init(alloc, http, .{
+                .base_url = if (cfg.url.len > 0) cfg.url else "https://discoveryengine.googleapis.com/v1",
+                .project_id = if (cfg.project_id.len > 0) cfg.project_id else null,
+                .credentials_path = if (cfg.credentials_path.len > 0) cfg.credentials_path else null,
+                .bearer_token = api_key,
+            });
+            defer provider.deinit();
+            return try provider.rerank(alloc, cfg.model, query, documents);
+        },
     }
+}
+
+fn rerankCohere(
+    alloc: std.mem.Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    api_key: []const u8,
+    query: []const u8,
+    documents: []const []const u8,
+) ![]f32 {
+    const body = try std.json.Stringify.valueAlloc(alloc, .{
+        .model = cfg.model,
+        .query = query,
+        .documents = documents,
+    }, .{});
+    defer alloc.free(body);
+    const url = try std.fmt.allocPrint(
+        alloc,
+        "{s}/v2/rerank",
+        .{if (cfg.url.len > 0) cfg.url else "https://api.cohere.com"},
+    );
+    defer alloc.free(url);
+    const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{api_key});
+    defer alloc.free(authorization);
+    const headers = [_][2][]const u8{.{ "Authorization", authorization }};
+    var response = try http.post(url, .{ .json = body, .headers = &headers });
+    defer response.deinit();
+    if (!response.ok()) return error.RerankRequestFailed;
+    const Response = struct {
+        results: []const struct {
+            index: usize,
+            relevance_score: f32,
+        } = &.{},
+    };
+    var parsed = try std.json.parseFromSlice(Response, alloc, response.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return try scoresByIndexAlloc(alloc, documents.len, parsed.value.results);
+}
+
+fn scoresByIndexAlloc(alloc: std.mem.Allocator, count: usize, results: anytype) ![]f32 {
+    const scores = try alloc.alloc(f32, count);
+    errdefer alloc.free(scores);
+    @memset(scores, 0);
+    const seen = try alloc.alloc(bool, count);
+    defer alloc.free(seen);
+    @memset(seen, false);
+    for (results) |result| {
+        if (result.index >= count or seen[result.index]) return error.InvalidRerankerResponse;
+        scores[result.index] = result.relevance_score;
+        seen[result.index] = true;
+    }
+    for (seen) |present| if (!present) return error.InvalidRerankerResponse;
+    return scores;
+}
+
+test "reranking runtime maps Cohere scores back to input order" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = try httpx.TestServer.start(alloc, io, &.{.{
+        .method = .POST,
+        .path = "/v2/rerank",
+        .respond = .{ .body = "{\"results\":[{\"index\":1,\"relevance_score\":0.9},{\"index\":0,\"relevance_score\":0.25}]}" },
+    }});
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var scores: ?[]f32 = null;
+    defer if (scores) |value| alloc.free(value);
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(a: std.mem.Allocator, test_client: *httpx.Client, base_url: []const u8, out: *?[]f32, err_out: *?anyerror) std.Io.Cancelable!void {
+            out.* = rerankDocuments(a, test_client, .{
+                .provider = .cohere,
+                .model = "rerank-v4.0-pro",
+                .url = base_url,
+                .api_key = "test-token",
+                .field = "body",
+            }, "query", &.{ "first", "second" }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ alloc, &client, server.baseUrl(), &scores, &run_err }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), scores.?[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), scores.?[1], 0.0001);
 }
 
 test "reranking runtime delegates to antfly provider" {

@@ -42,7 +42,8 @@ Each replication source gets a dedicated worker that:
 
 ## Prerequisites
 
-- PostgreSQL **15+** (for pgoutput protocol v2)
+- PostgreSQL **14+** (for pgoutput protocol v2). PostgreSQL 15+ is required
+  only when creating a publication with `publication_filter`.
 - `wal_level = logical` on the source database
 - A database user with the `REPLICATION` attribute (or equivalent managed-service role)
 
@@ -111,13 +112,17 @@ curl -s http://localhost:8080/db/v1/table/users/key/user-1 -u admin:admin | jq .
 | `type` | Yes | — | Must be `"postgres"` |
 | `dsn` | Yes | — | PostgreSQL connection string. Supports `${secret:key}` references. |
 | `postgres_table` | Yes | — | Source table name in PostgreSQL |
-| `key_template` | No | `"id"` | How to derive the Antfly document key. Plain column name or `{{col}}` template. |
+| `key_template` | No | `"_id"`, then `"id"` fallback | How to derive the Antfly document key. Plain column name or `{{col}}` template. |
 | `slot_name` | No | auto-derived | Replication slot name. Set this when using pre-created slots. |
 | `publication_name` | No | auto-derived | Publication name. Set this when using pre-created publications. |
+| `publication_filter` | No | — | PostgreSQL 15+ row filter, applied only when Antfly creates the publication. Changing it does not alter an existing publication. |
 | `on_update` | No | passthrough | Transform ops for INSERT/UPDATE events |
 | `on_delete` | No | auto-derived | Transform ops for DELETE events |
 
 ### Key Templates
+
+When omitted, Antfly uses the `_id` column if present and falls back to `id`.
+Set the field explicitly when the source uses another primary key.
 
 ```json
 "key_template": "id"

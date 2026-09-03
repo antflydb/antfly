@@ -295,6 +295,14 @@ test "standalone data directory does not change the default models directory" {
 
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expect(!std.mem.startsWith(u8, first, "/tmp/antfly-data-"));
+
+    const first_ml = try antfly.inference_runtime.defaultMlDirForDataDirAlloc(std.testing.allocator, "/tmp/antfly-data-a");
+    defer std.testing.allocator.free(first_ml);
+    const second_ml = try antfly.inference_runtime.defaultMlDirForDataDirAlloc(std.testing.allocator, "/tmp/antfly-data-b");
+    defer std.testing.allocator.free(second_ml);
+
+    try std.testing.expectEqualStrings(first_ml, second_ml);
+    try std.testing.expect(!std.mem.startsWith(u8, first_ml, "/tmp/antfly-data-"));
 }
 
 /// Creates the standalone inference implementation inside its focused codegen

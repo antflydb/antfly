@@ -313,7 +313,7 @@ pub const AgentStepStatus = enum {
 };
 
 pub const AggregationBucket = struct {
-    /// Bucket key (term, range name, date, etc.)
+    /// Bucket key (term, range name, date, etc.). For a multi-field terms aggregation this is a JSON string containing the serialized value array; use JSON.parse(bucket.key) to recover the array.
     key: []const u8,
     /// Formatted key for display (e.g., formatted dates)
     key_as_string: ?[]const u8 = null,
@@ -482,7 +482,7 @@ pub const AggregationRequest = struct {
     field: ?[]const u8 = null,
     /// Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types.
     mode: ?std.json.Value = null,
-    /// Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order.
+    /// Ordered field list for multi-field terms aggregations. Each bucket key is a JSON string containing the serialized value array in the same order; clients should parse bucket.key as JSON.
     fields: ?[]const []const u8 = null,
     /// Maximum number of buckets to return (for bucketing aggregations)
     size: ?i64 = null,
@@ -2474,7 +2474,7 @@ pub const BackupRequest = struct {
 pub const BatchRequest = struct {
     /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans
     inserts: ?std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)) = null,
-    /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
+    /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions take precedence over inserts for the same key in one batch - Keys are permanently removed from storage and indexes
     deletes: ?[]const []const u8 = null,
     /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add or remove array values ($addToSet, $pull) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
@@ -4443,53 +4443,6 @@ pub const ClusterTopology = struct {
     }
 };
 
-/// Configuration for the Cohere embedding provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/embed
-pub const CohereEmbedderConfig = struct {
-    /// The name of the Cohere embedding model to use.
-    model: []const u8,
-    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// Specifies the type of input for optimized embeddings.
-    input_type: ?[]const u8 = null,
-    /// How to handle inputs longer than the max token length.
-    truncate: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "api_key", "api_key", true },
-        .{ "input_type", "input_type", true },
-        .{ "truncate", "truncate", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.input_type) |value| {
-            try jw.objectField("input_type");
-            try jw.write(value);
-        }
-        if (self.truncate) |value| {
-            try jw.objectField("truncate");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 /// Configuration for the Cohere generative AI provider.
 pub const CohereGeneratorConfig = struct {
     /// The name of the Cohere model to use.
@@ -5167,7 +5120,7 @@ pub const CreateEmbeddingsIndexRequest = struct {
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
-    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
@@ -5185,10 +5138,8 @@ pub const CreateEmbeddingsIndexRequest = struct {
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?EmbedderConfig = null,
-    /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?GeneratorConfig = null,
-    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    embedder: ?ManagedEmbedderConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
     chunker: ?ChunkerConfig = null,
     /// Default number of results to return from search (sparse only)
     top_k: ?i64 = null,
@@ -5218,7 +5169,6 @@ pub const CreateEmbeddingsIndexRequest = struct {
         .{ "distance_metric", "distance_metric", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", true },
-        .{ "summarizer", "summarizer", true },
         .{ "chunker", "chunker", true },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
@@ -5299,10 +5249,6 @@ pub const CreateEmbeddingsIndexRequest = struct {
         }
         if (self.embedder) |value| {
             try jw.objectField("embedder");
-            try jw.write(value);
-        }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
             try jw.write(value);
         }
         if (self.chunker) |value| {
@@ -5831,7 +5777,6 @@ pub const CreatedEmbeddingsIndex = struct {
     distance_metric: ?DistanceMetric = null,
     mem_only: ?bool = null,
     embedder: ?CreatedProviderConfig = null,
-    summarizer: ?CreatedProviderConfig = null,
     chunker: ?ChunkerConfig = null,
     top_k: ?i64 = null,
     min_weight: ?f32 = null,
@@ -5858,7 +5803,6 @@ pub const CreatedEmbeddingsIndex = struct {
         .{ "distance_metric", "distance_metric", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", true },
-        .{ "summarizer", "summarizer", true },
         .{ "chunker", "chunker", true },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
@@ -5943,10 +5887,6 @@ pub const CreatedEmbeddingsIndex = struct {
             try jw.objectField("embedder");
             try jw.write(value);
         }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
-            try jw.write(value);
-        }
         if (self.chunker) |value| {
             try jw.objectField("chunker");
             try jw.write(value);
@@ -5991,7 +5931,6 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     distance_metric: ?DistanceMetric = null,
     mem_only: ?bool = null,
     embedder: ?CreatedProviderConfig = null,
-    summarizer: ?CreatedProviderConfig = null,
     chunker: ?ChunkerConfig = null,
     top_k: ?i64 = null,
     min_weight: ?f32 = null,
@@ -6013,7 +5952,6 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         .{ "distance_metric", "distance_metric", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", true },
-        .{ "summarizer", "summarizer", true },
         .{ "chunker", "chunker", true },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
@@ -6081,10 +6019,6 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         }
         if (self.embedder) |value| {
             try jw.objectField("embedder");
-            try jw.write(value);
-        }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
             try jw.write(value);
         }
         if (self.chunker) |value| {
@@ -7341,7 +7275,7 @@ pub const DisjunctionQuery = struct {
     }
 };
 
-/// Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
+/// Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
 pub const DistanceMetric = enum {
     l2_squared,
     inner_product,
@@ -8516,24 +8450,12 @@ pub const EdgeTypeConfig = struct {
     field: ?[]const u8 = null,
     /// Topology constraint for this edge type: - tree: Single parent per node, no cycles - graph: No constraints (default)
     topology: ?[]const u8 = null,
-    /// Maximum allowed edge weight
-    max_weight: ?f64 = null,
-    /// Minimum allowed edge weight
-    min_weight: ?f64 = null,
-    /// Whether to allow edges from a node to itself
-    allow_self_loops: ?bool = null,
-    /// Required metadata fields for this edge type
-    required_metadata: ?[]const []const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
         .{ "field", "field", true },
         .{ "topology", "topology", true },
-        .{ "max_weight", "max_weight", true },
-        .{ "min_weight", "min_weight", true },
-        .{ "allow_self_loops", "allow_self_loops", true },
-        .{ "required_metadata", "required_metadata", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -8554,22 +8476,6 @@ pub const EdgeTypeConfig = struct {
         }
         if (self.topology) |value| {
             try jw.objectField("topology");
-            try jw.write(value);
-        }
-        if (self.max_weight) |value| {
-            try jw.objectField("max_weight");
-            try jw.write(value);
-        }
-        if (self.min_weight) |value| {
-            try jw.objectField("min_weight");
-            try jw.write(value);
-        }
-        if (self.allow_self_loops) |value| {
-            try jw.objectField("allow_self_loops");
-            try jw.write(value);
-        }
-        if (self.required_metadata) |value| {
-            try jw.objectField("required_metadata");
             try jw.write(value);
         }
         try jw.endObject();
@@ -8609,200 +8515,16 @@ pub const EdgesResponse = struct {
     }
 };
 
-/// A unified configuration for an embedding provider. Embedders can be configured with templates to customize how documents are converted to text before embedding. Templates use Handlebars syntax and support various built-in helpers. **Template System:** - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/) - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes) - **Context**: Templates receive the full document as context **Built-in Helpers:** 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML ```handlebars {{scrubHtml html_content}} ``` - Removes `<script>` and `<style>` tags - Adds newlines after block elements (p, div, h1-h6, li, etc.) - Returns plain text with preserved readability 2. **eq** - Equality comparison for conditionals ```handlebars {{#if (eq status "active")}}Active user{{/if}} {{#if (eq @key "special")}}Special field{{/if}} ``` 3. **media** - GenKit dotprompt media directive for multimodal content ```handlebars {{media url=imageDataURI}} {{media url=this.image_url}} {{media url="https://example.com/image.jpg"}} {{media url="s3://endpoint/bucket/image.png"}} {{media url="file:///path/to/image.jpg"}} ``` **Supported URL Schemes:** - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`) - `http://` / `https://` - Web URLs with automatic content type detection - `file://` - Local filesystem paths - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`) **Automatic Content Processing:** - **Images**: Downloaded, resized (if needed), converted to data URIs - **PDFs**: Text extracted or first page rendered as image - **HTML**: Readable text extracted using Mozilla Readability **Security Controls:** Downloads are protected by content security settings (see Configuration Reference): - Allowed host whitelist - Private IP blocking (prevents SSRF attacks) - Download size limits (default: 100MB) - HTTP downloads time out after 30 seconds by default; zero disables the deadline - Image dimension limits (default: 2048px, auto-resized) See: https://antfly.io/docs/configuration#security--cors 4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation) ```handlebars {{encodeToon this.fields}} {{encodeToon this.fields lengthMarker=false indent=4}} {{encodeToon this.fields delimiter="\t"}} ``` **What is TOON?** TOON is a compact, human-readable format designed for passing structured data to LLMs. It provides **30-60% token reduction** compared to JSON while maintaining high LLM comprehension accuracy. **Key Features:** - Compact syntax using `:` for key-value pairs - Array length markers: `tags[#3]: ai,search,ml` - Tabular format for uniform data structures - Optimized for LLM parsing and understanding - Maintains human readability **Benefits:** - **Lower API costs** - Reduced token usage means lower LLM API costs - **Faster responses** - Less tokens to process - **More context** - Fit more documents within token limits **Options:** - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true) - `indent` (int): Indentation spacing for nested objects (default: 2) - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs) **Example output:** ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml metadata: edition: 2 pages: 450 ``` **Default in RAG:** TOON is the default format for document rendering in RAG queries. **References:** - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon **Template Examples:** Document with metadata: ```handlebars Title: {{metadata.title}} Date: {{metadata.date}} Tags: {{#each metadata.tags}}{{this}}, {{/each}} {{content}} ``` HTML content extraction: ```handlebars Product: {{name}} Description: {{scrubHtml description_html}} Price: ${{price}} ``` Multimodal with image: ```handlebars Product: {{title}} {{media url=image}} Description: {{description}} ``` Conditional formatting: ```handlebars {{title}} {{#if author}}By: {{author}}{{/if}} {{#if (eq category "premium")}}⭐ Premium Content{{/if}} {{body}} ``` **Environment Variables:** - `GEMINI_API_KEY` - API key for Google AI - `OPENAI_API_KEY` - API key for OpenAI - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434) **Importing Pre-computed Embeddings:** You can import existing embeddings (from OpenAI, Cohere, or any provider), but only for indexes configured with `external: true`. External indexes accept vectors written directly through the document `_embeddings` field and do not generate prompts from `field` or `template`. **Steps:** 1. Create an embeddings index with `external: true` 2. For dense indexes, set the index `dimension` 3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }` **Example:** ```json { "title": "My Document", "content": "Document text...", "_embeddings": { "my_vector_index": [0.1, 0.2, 0.3, ...] } } ``` **Delete Behavior:** - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged **Use Cases:** - Migrating from another vector database with existing embeddings - Using embeddings generated by external systems - Importing pre-computed OpenAI, Cohere, or other provider embeddings - Batch processing embeddings offline before ingestion
-pub const EmbedderConfig = struct {
-    /// The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
-    project_id: ?[]const u8 = null,
-    /// The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API.
-    location: ?[]const u8 = null,
-    /// The name of the embedding model to use.
-    model: ?[]const u8 = null,
-    /// The dimension of the embedding vector (768, 1536, or 3072 recommended).
-    dimension: ?i64 = null,
-    /// The Google API key. Can also be set via GEMINI_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// The URL of the Google API endpoint (optional, uses default if not specified).
-    url: ?[]const u8 = null,
-    /// Path to service account JSON key file. Alternative to ADC for non-GCP environments.
-    credentials_path: ?[]const u8 = null,
-    /// Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072.
-    dimensions: ?i64 = null,
-    /// Bedrock provider request schema. `auto` recognizes direct foundation-model IDs, foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly for application inference profiles, provisioned throughput, custom models, and other aliases whose invocation target does not identify the underlying model.
-    request_format: ?[]const u8 = null,
-    /// The AWS region for the Bedrock service (e.g., 'us-east-1').
-    region: ?[]const u8 = null,
-    /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
-    input_type: ?[]const u8 = null,
-    /// Cohere Bedrock truncate behavior.
-    truncate: ?[]const u8 = null,
-    /// Whether to strip new lines from the input text before embedding.
-    strip_new_lines: ?bool = null,
-    /// The batch size for embedding requests to optimize throughput.
-    batch_size: ?i64 = null,
-    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-    provider: EmbedderProvider,
-    /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and will send binary content (images, audio, etc.) to the provider instead of extracting text. The provider's API is still responsible for accepting the content — this flag just tells Antfly not to strip it. Not needed for models already in the registry (e.g., `multimodalembedding`, `gemini-embedding-2-preview`, `clip-*`, `clipclap`). **Example:** ```json { "provider": "vertex", "model": "some-future-multimodal-model", "multimodal": true } ```
-    multimodal: ?bool = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "project_id", "project_id", true },
-        .{ "location", "location", true },
-        .{ "model", "model", true },
-        .{ "dimension", "dimension", true },
-        .{ "api_key", "api_key", true },
-        .{ "url", "url", true },
-        .{ "credentials_path", "credentials_path", true },
-        .{ "dimensions", "dimensions", true },
-        .{ "request_format", "request_format", true },
-        .{ "region", "region", true },
-        .{ "input_type", "input_type", true },
-        .{ "truncate", "truncate", true },
-        .{ "strip_new_lines", "strip_new_lines", true },
-        .{ "batch_size", "batch_size", true },
-        .{ "api_url", "api_url", true },
-        .{ "provider", "provider", false },
-        .{ "multimodal", "multimodal", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.project_id) |value| {
-            try jw.objectField("project_id");
-            try jw.write(value);
-        }
-        if (self.location) |value| {
-            try jw.objectField("location");
-            try jw.write(value);
-        }
-        if (self.model) |value| {
-            try jw.objectField("model");
-            try jw.write(value);
-        }
-        if (self.dimension) |value| {
-            try jw.objectField("dimension");
-            try jw.write(value);
-        }
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.url) |value| {
-            try jw.objectField("url");
-            try jw.write(value);
-        }
-        if (self.credentials_path) |value| {
-            try jw.objectField("credentials_path");
-            try jw.write(value);
-        }
-        if (self.dimensions) |value| {
-            try jw.objectField("dimensions");
-            try jw.write(value);
-        }
-        if (self.request_format) |value| {
-            try jw.objectField("request_format");
-            try jw.write(value);
-        }
-        if (self.region) |value| {
-            try jw.objectField("region");
-            try jw.write(value);
-        }
-        if (self.input_type) |value| {
-            try jw.objectField("input_type");
-            try jw.write(value);
-        }
-        if (self.truncate) |value| {
-            try jw.objectField("truncate");
-            try jw.write(value);
-        }
-        if (self.strip_new_lines) |value| {
-            try jw.objectField("strip_new_lines");
-            try jw.write(value);
-        }
-        if (self.batch_size) |value| {
-            try jw.objectField("batch_size");
-            try jw.write(value);
-        }
-        if (self.api_url) |value| {
-            try jw.objectField("api_url");
-            try jw.write(value);
-        }
-        try jw.objectField("provider");
-        try jw.write(self.provider);
-        if (self.multimodal) |value| {
-            try jw.objectField("multimodal");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// The embedding provider to use.
-pub const EmbedderProvider = enum {
-    gemini,
-    vertex,
-    ollama,
-    openai,
-    openrouter,
-    bedrock,
-    cohere,
-    mock,
-    antfly,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .gemini => "gemini",
-            .vertex => "vertex",
-            .ollama => "ollama",
-            .openai => "openai",
-            .openrouter => "openrouter",
-            .bedrock => "bedrock",
-            .cohere => "cohere",
-            .mock => "mock",
-            .antfly => "antfly",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "gemini", .gemini },
-            .{ "vertex", .vertex },
-            .{ "ollama", .ollama },
-            .{ "openai", .openai },
-            .{ "openrouter", .openrouter },
-            .{ "bedrock", .bedrock },
-            .{ "cohere", .cohere },
-            .{ "mock", .mock },
-            .{ "antfly", .antfly },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
 pub const Embedding = std.json.Value;
 
-/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
+/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense HBC vector index. For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
 pub const EmbeddingsIndexConfig = struct {
     publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
-    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
@@ -8820,10 +8542,8 @@ pub const EmbeddingsIndexConfig = struct {
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?EmbedderConfig = null,
-    /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?GeneratorConfig = null,
-    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    embedder: ?ManagedEmbedderConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
     chunker: ?ChunkerConfig = null,
     /// Default number of results to return from search (sparse only)
     top_k: ?i64 = null,
@@ -8849,7 +8569,6 @@ pub const EmbeddingsIndexConfig = struct {
         .{ "distance_metric", "distance_metric", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", true },
-        .{ "summarizer", "summarizer", true },
         .{ "chunker", "chunker", true },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
@@ -8917,10 +8636,6 @@ pub const EmbeddingsIndexConfig = struct {
         }
         if (self.embedder) |value| {
             try jw.objectField("embedder");
-            try jw.write(value);
-        }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
             try jw.write(value);
         }
         if (self.chunker) |value| {
@@ -11635,26 +11350,17 @@ pub const FilterSpec = struct {
     value: std.json.Value,
 };
 
-/// Configuration for generating follow-up questions. Uses a separate generator call which can use a cheaper/faster model.
+/// Configuration for deterministic follow-up suggestions derived from the original query and the standard Antfly follow-up templates.
 pub const FollowupStepConfig = struct {
     /// Enable follow-up question generation
     enabled: ?bool = null,
-    /// Generator for follow-up questions. If not specified, uses the answer step's generator.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
     /// Number of follow-up questions to generate
     count: ?i64 = null,
-    /// Custom guidance for follow-up question focus and style
-    context: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", true },
-        .{ "chain", "chain", true },
         .{ "count", "count", true },
-        .{ "context", "context", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -11671,20 +11377,8 @@ pub const FollowupStepConfig = struct {
             try jw.objectField("enabled");
             try jw.write(value);
         }
-        if (self.generator) |value| {
-            try jw.objectField("generator");
-            try jw.write(value);
-        }
-        if (self.chain) |value| {
-            try jw.objectField("chain");
-            try jw.write(value);
-        }
         if (self.count) |value| {
             try jw.objectField("count");
-            try jw.write(value);
-        }
-        if (self.context) |value| {
-            try jw.objectField("context");
             try jw.write(value);
         }
         try jw.endObject();
@@ -12706,67 +12400,6 @@ pub const GeoShapeQuery = struct {
                 try jw.objectField("boost");
                 try jw.write(value);
             },
-        }
-        try jw.endObject();
-    }
-};
-
-/// Configuration for the Google AI (Gemini) embedding provider. API key via `api_key` field or `GEMINI_API_KEY` environment variable. **Example Models:** gemini-embedding-001 (default, 3072 dims) **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
-pub const GoogleEmbedderConfig = struct {
-    /// The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
-    project_id: ?[]const u8 = null,
-    /// The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API.
-    location: ?[]const u8 = null,
-    /// The name of the embedding model to use.
-    model: []const u8,
-    /// The dimension of the embedding vector (768, 1536, or 3072 recommended).
-    dimension: ?i64 = null,
-    /// The Google API key. Can also be set via GEMINI_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// The URL of the Google API endpoint (optional, uses default if not specified).
-    url: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "project_id", "project_id", true },
-        .{ "location", "location", true },
-        .{ "model", "model", false },
-        .{ "dimension", "dimension", true },
-        .{ "api_key", "api_key", true },
-        .{ "url", "url", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.project_id) |value| {
-            try jw.objectField("project_id");
-            try jw.write(value);
-        }
-        if (self.location) |value| {
-            try jw.objectField("location");
-            try jw.write(value);
-        }
-        try jw.objectField("model");
-        try jw.write(self.model);
-        if (self.dimension) |value| {
-            try jw.objectField("dimension");
-            try jw.write(value);
-        }
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.url) |value| {
-            try jw.objectField("url");
-            try jw.write(value);
         }
         try jw.endObject();
     }
@@ -16437,7 +16070,7 @@ pub const IndexConfig = struct {
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
-    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
@@ -16449,10 +16082,8 @@ pub const IndexConfig = struct {
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?EmbedderConfig = null,
-    /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?GeneratorConfig = null,
-    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    embedder: ?ManagedEmbedderConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
     chunker: ?ChunkerConfig = null,
     /// Default number of results to return from search (sparse only)
     top_k: ?i64 = null,
@@ -16462,6 +16093,8 @@ pub const IndexConfig = struct {
     chunk_size: ?i64 = null,
     /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
     execution: ?IndexExecutionConfig = null,
+    /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
+    summarizer: ?GeneratorConfig = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
@@ -16496,12 +16129,12 @@ pub const IndexConfig = struct {
         .{ "template", "template", true },
         .{ "distance_metric", "distance_metric", true },
         .{ "embedder", "embedder", true },
-        .{ "summarizer", "summarizer", true },
         .{ "chunker", "chunker", true },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
         .{ "chunk_size", "chunk_size", true },
         .{ "execution", "execution", true },
+        .{ "summarizer", "summarizer", true },
         .{ "edge_types", "edge_types", true },
         .{ "max_edges_per_document", "max_edges_per_document", true },
         .{ "source", "source", true },
@@ -16593,10 +16226,6 @@ pub const IndexConfig = struct {
             try jw.objectField("embedder");
             try jw.write(value);
         }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
-            try jw.write(value);
-        }
         if (self.chunker) |value| {
             try jw.objectField("chunker");
             try jw.write(value);
@@ -16615,6 +16244,10 @@ pub const IndexConfig = struct {
         }
         if (self.execution) |value| {
             try jw.objectField("execution");
+            try jw.write(value);
+        }
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
             try jw.write(value);
         }
         if (self.edge_types) |value| {
@@ -21353,17 +20986,13 @@ pub const LegacyGraphSearchResult = struct {
     }
 };
 
-/// Status of a linear merge page operation: - "success": All records in batch processed successfully - "partial": Processing stopped at shard boundary, client should retry with next_cursor - "error": Fatal error occurred, no records processed successfully
+/// Status of a completed linear merge page. Successful responses are atomic and use "success"; failures are returned as non-2xx HTTP responses.
 pub const LinearMergePageStatus = enum {
     success,
-    partial,
-    @"error",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .success => "success",
-            .partial => "partial",
-            .@"error" => "error",
         };
         try jw.write(s);
     }
@@ -21375,14 +21004,12 @@ pub const LinearMergePageStatus = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "success", .success },
-            .{ "partial", .partial },
-            .{ "error", .@"error" },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
-/// Linear merge operation for syncing sorted records from external sources. Use this to keep Antfly in sync with an external database or data source. Requests may be sent as plain JSON or gzip-compressed JSON (`Content-Encoding: gzip`). Request bodies are limited to 64 MiB after decompression. Requests that exceed this limit return HTTP 413. **How it works:** 1. Send sorted records from your external source 2. Server upserts records that exist in your batch 3. Server deletes Antfly records in the key range that are absent from your batch 4. If stopped at shard boundary, use next_cursor for next request **WARNING:** Not safe for concurrent operations with overlapping key ranges.
+/// Linear merge operation for syncing sorted records from external sources. Use this to keep Antfly in sync with an external database or data source. Requests may be sent as plain JSON or gzip-compressed JSON (`Content-Encoding: gzip`). Request bodies are limited to 64 MiB after decompression. Requests that exceed this limit return HTTP 413. **How it works:** 1. Send sorted records from your external source 2. Server upserts records that exist in your batch 3. Server deletes Antfly records in the key range that are absent from your batch 4. Use next_cursor as last_merged_id for the next request **WARNING:** Not safe for concurrent operations with overlapping key ranges.
 pub const LinearMergeRequest = struct {
     /// Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}} Requirements: - The server processes keys in lexicographic order - Use consistent key naming (e.g., all start with same prefix) This format avoids duplicate IDs and matches Antfly's batch write interface.
     records: std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)),
@@ -21438,7 +21065,7 @@ pub const LinearMergeResult = struct {
     deleted: i64,
     /// IDs that were deleted (or would be deleted if dry_run=true). Only included if dry_run=true.
     deleted_ids: ?[]const []const u8 = null,
-    failed: ?[]const FailedOperation = null,
+    failed: []const FailedOperation,
     /// ID of last record in this batch (use for next request)
     next_cursor: []const u8,
     key_range: ?KeyRange = null,
@@ -21446,7 +21073,7 @@ pub const LinearMergeResult = struct {
     keys_scanned: ?i64 = null,
     /// Additional information (e.g., "stopped at shard boundary", "dry run - no changes made")
     message: ?[]const u8 = null,
-    took: ?i64 = null,
+    took: i64,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -21455,12 +21082,12 @@ pub const LinearMergeResult = struct {
         .{ "skipped", "skipped", false },
         .{ "deleted", "deleted", false },
         .{ "deleted_ids", "deleted_ids", true },
-        .{ "failed", "failed", true },
+        .{ "failed", "failed", false },
         .{ "next_cursor", "next_cursor", false },
         .{ "key_range", "key_range", true },
         .{ "keys_scanned", "keys_scanned", true },
         .{ "message", "message", true },
-        .{ "took", "took", true },
+        .{ "took", "took", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -21485,10 +21112,8 @@ pub const LinearMergeResult = struct {
             try jw.objectField("deleted_ids");
             try jw.write(value);
         }
-        if (self.failed) |value| {
-            try jw.objectField("failed");
-            try jw.write(value);
-        }
+        try jw.objectField("failed");
+        try jw.write(self.failed);
         try jw.objectField("next_cursor");
         try jw.write(self.next_cursor);
         if (self.key_range) |value| {
@@ -21503,10 +21128,8 @@ pub const LinearMergeResult = struct {
             try jw.objectField("message");
             try jw.write(value);
         }
-        if (self.took) |value| {
-            try jw.objectField("took");
-            try jw.write(value);
-        }
+        try jw.objectField("took");
+        try jw.write(self.took);
         try jw.endObject();
     }
 };
@@ -22241,6 +21864,147 @@ pub const LsmStorageStatus = struct {
     }
 };
 
+/// Embedding provider configuration accepted by managed index creation.
+pub const ManagedEmbedderConfig = struct {
+    /// The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large').
+    model: ?[]const u8 = null,
+    /// The URL of the Ollama API endpoint. Can also be set via OLLAMA_HOST environment variable.
+    url: ?[]const u8 = null,
+    /// The OpenAI API key. Can also be set via OPENAI_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072.
+    dimensions: ?i64 = null,
+    /// Bedrock provider request schema. `auto` recognizes direct foundation-model IDs, foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly for application inference profiles, provisioned throughput, custom models, and other aliases whose invocation target does not identify the underlying model.
+    request_format: ?[]const u8 = null,
+    /// The AWS region for the Bedrock service (e.g., 'us-east-1').
+    region: ?[]const u8 = null,
+    /// Output dimension for Bedrock embedding models that support configurable dimensions.
+    dimension: ?i64 = null,
+    /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
+    input_type: ?[]const u8 = null,
+    /// Cohere Bedrock truncate behavior.
+    truncate: ?[]const u8 = null,
+    /// Whether to strip new lines from the input text before embedding.
+    strip_new_lines: ?bool = null,
+    /// The batch size for embedding requests to optimize throughput.
+    batch_size: ?i64 = null,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    provider: ManagedEmbedderProvider,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "url", "url", true },
+        .{ "api_key", "api_key", true },
+        .{ "dimensions", "dimensions", true },
+        .{ "request_format", "request_format", true },
+        .{ "region", "region", true },
+        .{ "dimension", "dimension", true },
+        .{ "input_type", "input_type", true },
+        .{ "truncate", "truncate", true },
+        .{ "strip_new_lines", "strip_new_lines", true },
+        .{ "batch_size", "batch_size", true },
+        .{ "api_url", "api_url", true },
+        .{ "provider", "provider", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        if (self.request_format) |value| {
+            try jw.objectField("request_format");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.dimension) |value| {
+            try jw.objectField("dimension");
+            try jw.write(value);
+        }
+        if (self.input_type) |value| {
+            try jw.objectField("input_type");
+            try jw.write(value);
+        }
+        if (self.truncate) |value| {
+            try jw.objectField("truncate");
+            try jw.write(value);
+        }
+        if (self.strip_new_lines) |value| {
+            try jw.objectField("strip_new_lines");
+            try jw.write(value);
+        }
+        if (self.batch_size) |value| {
+            try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.endObject();
+    }
+};
+
+/// Embedding providers executable by managed index creation.
+pub const ManagedEmbedderProvider = enum {
+    ollama,
+    openai,
+    bedrock,
+    antfly,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .ollama => "ollama",
+            .openai => "openai",
+            .bedrock => "bedrock",
+            .antfly => "antfly",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "ollama", .ollama },
+            .{ "openai", .openai },
+            .{ "bedrock", .bedrock },
+            .{ "antfly", .antfly },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const MatchAllQuery = struct {
     match_all: std.json.ArrayHashMap(std.json.Value),
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
@@ -22923,39 +22687,6 @@ pub const OllamaGeneratorConfig = struct {
     }
 };
 
-/// Configuration for the Ollama reranking provider.
-pub const OllamaRerankerConfig = struct {
-    /// The name of the Ollama model to use for reranking.
-    model: []const u8,
-    /// The URL of the Ollama API endpoint.
-    url: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "url", "url", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        if (self.url) |value| {
-            try jw.objectField("url");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 /// Configuration for the OpenAI embedding provider. API key via `api_key` field or `OPENAI_API_KEY` environment variable. Supports OpenAI-compatible APIs via `url` field. **Example Models:** text-embedding-3-small (default, 1536 dims), text-embedding-3-large (3072 dims) **Docs:** https://platform.openai.com/docs/guides/embeddings
 pub const OpenAIEmbedderConfig = struct {
     /// The name of the OpenAI model to use.
@@ -23072,46 +22803,6 @@ pub const OpenAIGeneratorConfig = struct {
         }
         if (self.presence_penalty) |value| {
             try jw.objectField("presence_penalty");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
-pub const OpenRouterEmbedderConfig = struct {
-    /// The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
-    model: []const u8,
-    /// The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// Output dimension for the embedding (if supported by the model).
-    dimensions: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "api_key", "api_key", true },
-        .{ "dimensions", "dimensions", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.dimensions) |value| {
-            try jw.objectField("dimensions");
             try jw.write(value);
         }
         try jw.endObject();
@@ -24973,7 +24664,7 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
-    /// Name of the table to query. Optional for global queries.
+    /// Name of the table to query. Required for global-query requests.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -25926,7 +25617,7 @@ pub const ReplicationSource = struct {
     dsn: []const u8,
     /// Name of the table in the PostgreSQL database to replicate from.
     postgres_table: []const u8,
-    /// Template for constructing the Antfly document key from PG columns. A plain string (e.g., "id") uses that column's value directly. Use `{{column}}` syntax for composite keys: `{{tenant_id}}:{{user_id}}`.
+    /// Template for constructing the Antfly document key from PG columns. When omitted, Antfly first uses `_id`, then falls back to `id` if the row has no `_id` column. A plain string (e.g., "id") uses that column's value directly. Use `{{column}}` syntax for composite keys: `{{tenant_id}}:{{user_id}}`.
     key_template: ?[]const u8 = null,
     /// PostgreSQL replication slot name. If omitted, auto-derived from the Antfly table and PG table names. Specify this when using pre-created slots (e.g., on Supabase or Neon).
     slot_name: ?[]const u8 = null,
@@ -25936,7 +25627,7 @@ pub const ReplicationSource = struct {
     on_update: ?[]const ReplicationTransformOp = null,
     /// Transform operations applied on DELETE events. If omitted, auto-derives `$unset` ops from `on_update`'s `$set` paths (safe for multi-source). Use `$delete_document` op to delete the entire Antfly document.
     on_delete: ?[]const ReplicationTransformOp = null,
-    /// Bleve-style filter query that gets translated to SQL and applied as a WHERE clause on the PostgreSQL publication. This filters rows at the source before they are sent over the replication stream, reducing network and processing overhead. Only a subset of filter types are supported (term, match, range, conjuncts, disjuncts, must_not). The filter is translated to SQL with inlined literal values. Example: `{"term": "active", "field": "status"}` becomes `WHERE ("status" = 'active')` on the publication.
+    /// Bleve-style filter query that gets translated to SQL and applied as a WHERE clause on the PostgreSQL publication. This filters rows at the source before they are sent over the replication stream, reducing network and processing overhead. Requires PostgreSQL 15 or newer and is applied only when Antfly creates the publication. Changing this value does not alter an existing publication; update or recreate that publication directly. Only a subset of filter types are supported (term, match, range, conjuncts, disjuncts, must_not). The filter is translated to SQL with inlined literal values. Example: `{"term": "active", "field": "status"}` becomes `WHERE ("status" = 'active')` on the publication.
     publication_filter: ?RawQuery = null,
     /// Conditional routes for fan-out replication. Each route evaluates its `where` filter against every CDC row and, on match, writes to the specified `target_table`. Multiple routes can match the same row. When routes are present, the top-level `on_update`/`on_delete` are ignored — each route defines its own transforms.
     routes: ?[]const ReplicationRoute = null,
@@ -26371,14 +26062,12 @@ pub const RerankerProfile = struct {
 /// The reranking provider to use.
 pub const RerankerProvider = enum {
     antfly,
-    ollama,
     cohere,
     vertex,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .antfly => "antfly",
-            .ollama => "ollama",
             .cohere => "cohere",
             .vertex => "vertex",
         };
@@ -26392,7 +26081,6 @@ pub const RerankerProvider = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "antfly", .antfly },
-            .{ "ollama", .ollama },
             .{ "cohere", .cohere },
             .{ "vertex", .vertex },
         });
@@ -27043,7 +26731,7 @@ pub const RetrievalAgentUsage = struct {
 
 /// A canonical query in the retrieval pipeline with an optional tree search configuration. Each query specifies its own table. Deprecated stateful graph_searches compatibility is intentionally unavailable here. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
 pub const RetrievalQueryRequest = struct {
-    /// Name of the table to query. Optional for global queries.
+    /// Name of the table to query. Required for global-query requests.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -28496,7 +28184,7 @@ pub const StatefulGraphResult = union(enum) {
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
-    /// Name of the table to query. Optional for global queries.
+    /// Name of the table to query. Required for global-query requests.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -29774,7 +29462,7 @@ pub const TableSchema = struct {
     document_schemas: ?std.json.ArrayHashMap(DocumentSchema) = null,
     /// The field containing the timestamp for TTL expiration (optional). Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
     ttl_field: ?[]const u8 = null,
-    /// The duration after which documents should expire, based on the ttl_field timestamp (optional). Uses Go duration format (e.g., '24h', '7d', '168h').
+    /// The duration after which documents should expire, based on the ttl_field timestamp (optional). Uses integer duration components with `ns`, `us`, `ms`, `s`, `m`, `h`, or `d` units (for example, `90m`, `1h30m`, or `7d`).
     ttl_duration: ?[]const u8 = null,
     /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
     dynamic_templates: ?[]const DynamicTemplate = null,
@@ -31643,60 +31331,6 @@ pub const VADOptions = struct {
         }
         if (self.max_segment_duration_ms) |value| {
             try jw.objectField("max_segment_duration_ms");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// Configuration for Google Cloud Vertex AI embedding models (enterprise-grade). Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`. **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video) **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
-pub const VertexEmbedderConfig = struct {
-    /// The name of the Vertex AI embedding model to use.
-    model: []const u8,
-    /// Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
-    location: ?[]const u8 = null,
-    /// Path to service account JSON key file. Alternative to ADC for non-GCP environments.
-    credentials_path: ?[]const u8 = null,
-    /// The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding).
-    dimension: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "project_id", "project_id", true },
-        .{ "location", "location", true },
-        .{ "credentials_path", "credentials_path", true },
-        .{ "dimension", "dimension", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        if (self.project_id) |value| {
-            try jw.objectField("project_id");
-            try jw.write(value);
-        }
-        if (self.location) |value| {
-            try jw.objectField("location");
-            try jw.write(value);
-        }
-        if (self.credentials_path) |value| {
-            try jw.objectField("credentials_path");
-            try jw.write(value);
-        }
-        if (self.dimension) |value| {
-            try jw.objectField("dimension");
             try jw.write(value);
         }
         try jw.endObject();

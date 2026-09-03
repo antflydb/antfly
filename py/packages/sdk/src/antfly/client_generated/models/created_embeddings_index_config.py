@@ -45,12 +45,10 @@ class CreatedEmbeddingsIndexConfig:
             template (str | Unset):
             distance_metric (DistanceMetric | Unset): Distance metric for the vector index (dense only). Use "cosine" for
                 models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
-                product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
+                product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
             mem_only (bool | Unset):
             embedder (CreatedProviderConfig | Unset): Credential-free provider configuration returned after index creation.
                 Only non-secret provider settings are represented.
-            summarizer (CreatedProviderConfig | Unset): Credential-free provider configuration returned after index
-                creation. Only non-secret provider settings are represented.
             chunker (ChunkerConfig | Unset): A unified configuration for a chunking provider. Example: {'provider':
                 'antfly', 'model': 'fixed', 'text': {'target_tokens': 500, 'overlap_tokens': 50}}.
             top_k (int | Unset):  Default: 10.
@@ -73,7 +71,6 @@ class CreatedEmbeddingsIndexConfig:
     distance_metric: DistanceMetric | Unset = UNSET
     mem_only: bool | Unset = UNSET
     embedder: CreatedProviderConfig | Unset = UNSET
-    summarizer: CreatedProviderConfig | Unset = UNSET
     chunker: ChunkerConfig | Unset = UNSET
     top_k: int | Unset = 10
     min_weight: float | Unset = 0.0
@@ -121,10 +118,6 @@ class CreatedEmbeddingsIndexConfig:
         if not isinstance(self.embedder, Unset):
             embedder = self.embedder.to_dict()
 
-        summarizer: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.summarizer, Unset):
-            summarizer = self.summarizer.to_dict()
-
         chunker: dict[str, Any] | Unset = UNSET
         if not isinstance(self.chunker, Unset):
             chunker = self.chunker.to_dict()
@@ -168,8 +161,6 @@ class CreatedEmbeddingsIndexConfig:
             field_dict["mem_only"] = mem_only
         if embedder is not UNSET:
             field_dict["embedder"] = embedder
-        if summarizer is not UNSET:
-            field_dict["summarizer"] = summarizer
         if chunker is not UNSET:
             field_dict["chunker"] = chunker
         if top_k is not UNSET:
@@ -244,13 +235,6 @@ class CreatedEmbeddingsIndexConfig:
         else:
             embedder = CreatedProviderConfig.from_dict(_embedder)
 
-        _summarizer = d.pop("summarizer", UNSET)
-        summarizer: CreatedProviderConfig | Unset
-        if isinstance(_summarizer, Unset):
-            summarizer = UNSET
-        else:
-            summarizer = CreatedProviderConfig.from_dict(_summarizer)
-
         _chunker = d.pop("chunker", UNSET)
         chunker: ChunkerConfig | Unset
         if isinstance(_chunker, Unset):
@@ -285,7 +269,6 @@ class CreatedEmbeddingsIndexConfig:
             distance_metric=distance_metric,
             mem_only=mem_only,
             embedder=embedder,
-            summarizer=summarizer,
             chunker=chunker,
             top_k=top_k,
             min_weight=min_weight,

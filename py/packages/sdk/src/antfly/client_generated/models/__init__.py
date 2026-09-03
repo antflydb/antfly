@@ -104,9 +104,6 @@ from .cluster_status import ClusterStatus
 from .cluster_status_deployment_mode import ClusterStatusDeploymentMode
 from .cluster_topology import ClusterTopology
 from .cluster_topology_deployment_mode import ClusterTopologyDeploymentMode
-from .cohere_embedder_config import CohereEmbedderConfig
-from .cohere_embedder_config_input_type import CohereEmbedderConfigInputType
-from .cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
 from .cohere_generator_config import CohereGeneratorConfig
 from .cohere_reranker_config import CohereRerankerConfig
 from .confidence_step_config import ConfidenceStepConfig
@@ -202,8 +199,6 @@ from .edge_metadata import EdgeMetadata
 from .edge_type_config import EdgeTypeConfig
 from .edge_type_config_topology import EdgeTypeConfigTopology
 from .edges_response import EdgesResponse
-from .embedder_config import EmbedderConfig
-from .embedder_provider import EmbedderProvider
 from .embedding_type_1 import EmbeddingType1
 from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
@@ -307,7 +302,6 @@ from .geo_shape_query import GeoShapeQuery
 from .get_current_user_response_200 import GetCurrentUserResponse200
 from .get_current_user_response_200_metadata_type_0 import GetCurrentUserResponse200MetadataType0
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
-from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
 from .graph_aggregate_value import GraphAggregateValue
 from .graph_aggregates_result import GraphAggregatesResult
@@ -682,6 +676,8 @@ from .list_users_response_200_item import ListUsersResponse200Item
 from .lookup_key_consistency import LookupKeyConsistency
 from .lookup_key_response_200 import LookupKeyResponse200
 from .lsm_storage_status import LsmStorageStatus
+from .managed_embedder_config import ManagedEmbedderConfig
+from .managed_embedder_provider import ManagedEmbedderProvider
 from .match_all_query import MatchAllQuery
 from .match_all_query_match_all import MatchAllQueryMatchAll
 from .match_none_query import MatchNoneQuery
@@ -716,10 +712,8 @@ from .node_filter import NodeFilter
 from .numeric_range_query import NumericRangeQuery
 from .ollama_embedder_config import OllamaEmbedderConfig
 from .ollama_generator_config import OllamaGeneratorConfig
-from .ollama_reranker_config import OllamaRerankerConfig
 from .open_ai_embedder_config import OpenAIEmbedderConfig
 from .open_ai_generator_config import OpenAIGeneratorConfig
-from .open_router_embedder_config import OpenRouterEmbedderConfig
 from .open_router_generator_config import OpenRouterGeneratorConfig
 from .package_artifact import PackageArtifact
 from .package_artifact_kind import PackageArtifactKind
@@ -965,7 +959,6 @@ from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
 from .vad_options import VADOptions
-from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_generator_config import VertexGeneratorConfig
 from .vertex_reranker_config import VertexRerankerConfig
 from .vertex_search_config import VertexSearchConfig
@@ -1081,9 +1074,6 @@ __all__ = (
     "ClusterStatusDeploymentMode",
     "ClusterTopology",
     "ClusterTopologyDeploymentMode",
-    "CohereEmbedderConfig",
-    "CohereEmbedderConfigInputType",
-    "CohereEmbedderConfigTruncate",
     "CohereGeneratorConfig",
     "CohereRerankerConfig",
     "ConfidenceStepConfig",
@@ -1177,8 +1167,6 @@ __all__ = (
     "EdgesResponse",
     "EdgeTypeConfig",
     "EdgeTypeConfigTopology",
-    "EmbedderConfig",
-    "EmbedderProvider",
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
     "EmbeddingsIndexStatsAsyncIndexing",
@@ -1282,7 +1270,6 @@ __all__ = (
     "GetCurrentUserResponse200",
     "GetCurrentUserResponse200MetadataType0",
     "GetDocumentArtifactManifestDetail",
-    "GoogleEmbedderConfig",
     "GoogleGeneratorConfig",
     "GraphAggregatesResult",
     "GraphAggregatesResultAggregates",
@@ -1655,6 +1642,8 @@ __all__ = (
     "LookupKeyConsistency",
     "LookupKeyResponse200",
     "LsmStorageStatus",
+    "ManagedEmbedderConfig",
+    "ManagedEmbedderProvider",
     "MatchAllQuery",
     "MatchAllQueryMatchAll",
     "MatchNoneQuery",
@@ -1687,10 +1676,8 @@ __all__ = (
     "NumericRangeQuery",
     "OllamaEmbedderConfig",
     "OllamaGeneratorConfig",
-    "OllamaRerankerConfig",
     "OpenAIEmbedderConfig",
     "OpenAIGeneratorConfig",
-    "OpenRouterEmbedderConfig",
     "OpenRouterGeneratorConfig",
     "PackageArtifact",
     "PackageArtifactKind",
@@ -1936,7 +1923,6 @@ __all__ = (
     "User",
     "UserMetadataType0",
     "VADOptions",
-    "VertexEmbedderConfig",
     "VertexGeneratorConfig",
     "VertexRerankerConfig",
     "VertexSearchConfig",

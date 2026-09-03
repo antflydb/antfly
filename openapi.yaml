@@ -11122,8 +11122,9 @@ components:
           type: array
           items:
             type: string
-          description: Ordered field list for multi-field terms aggregations. Bucket keys are returned
-            as JSON arrays in the same order.
+          description: Ordered field list for multi-field terms aggregations. Each bucket key is a JSON
+            string containing the serialized value array in the same order; clients should parse bucket.key
+            as JSON.
         size:
           type: integer
           x-go-type-skip-optional-pointer: false
@@ -11200,7 +11201,9 @@ components:
       properties:
         key:
           type: string
-          description: Bucket key (term, range name, date, etc.)
+          description: Bucket key (term, range name, date, etc.). For a multi-field terms aggregation
+            this is a JSON string containing the serialized value array; use JSON.parse(bucket.key) to
+            recover the array.
         key_as_string:
           type: string
           x-go-type-skip-optional-pointer: false
@@ -11910,7 +11913,7 @@ components:
 
             - Non-existent keys are silently ignored
 
-            - Deletions are processed before inserts in the same batch
+            - Deletions take precedence over inserts for the same key in one batch
 
             - Keys are permanently removed from storage and indexes
           items:
@@ -14513,7 +14516,7 @@ components:
       properties:
         table:
           type: string
-          description: Name of the table to query. Optional for global queries.
+          description: Name of the table to query. Required for global-query requests.
           example: wikipedia
         query:
           x-go-type: json.RawMessage
@@ -16350,16 +16353,10 @@ components:
       type: string
       enum:
         - success
-        - partial
-        - error
       description: >
-        Status of a linear merge page operation:
+        Status of a completed linear merge page. Successful responses are atomic
 
-        - "success": All records in batch processed successfully
-
-        - "partial": Processing stopped at shard boundary, client should retry with next_cursor
-
-        - "error": Fatal error occurred, no records processed successfully
+        and use "success"; failures are returned as non-2xx HTTP responses.
     LinearMergeRequest:
       type: object
       required:
@@ -16388,7 +16385,7 @@ components:
 
         3. Server deletes Antfly records in the key range that are absent from your batch
 
-        4. If stopped at shard boundary, use next_cursor for next request
+        4. Use next_cursor as last_merged_id for the next request
 
 
         **WARNING:** Not safe for concurrent operations with overlapping key ranges.
@@ -16481,7 +16478,9 @@ components:
         - upserted
         - deleted
         - skipped
+        - failed
         - next_cursor
+        - took
       properties:
         status:
           $ref: '#/components/schemas/LinearMergePageStatus'
@@ -16903,9 +16902,13 @@ components:
           example: users
         key_template:
           type: string
-          default: id
+          default: _id
           description: >
             Template for constructing the Antfly document key from PG columns.
+
+            When omitted, Antfly first uses `_id`, then falls back to `id` if
+
+            the row has no `_id` column.
 
             A plain string (e.g., "id") uses that column's value directly.
 
@@ -16971,6 +16974,13 @@ components:
             source before they are sent over the replication stream, reducing
 
             network and processing overhead.
+
+
+            Requires PostgreSQL 15 or newer and is applied only when Antfly
+
+            creates the publication. Changing this value does not alter an
+
+            existing publication; update or recreate that publication directly.
 
 
             Only a subset of filter types are supported (term, match, range,
@@ -17591,96 +17601,7 @@ components:
       default: l2_squared
       description: Distance metric for the vector index (dense only). Use "cosine" for models trained
         with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product
-        similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
-    GoogleEmbedderConfig:
-      type: object
-      description: >-
-        Configuration for the Google AI (Gemini) embedding provider.
-
-
-        API key via `api_key` field or `GEMINI_API_KEY` environment variable.
-
-
-        **Example Models:** gemini-embedding-001 (default, 3072 dims)
-
-
-        **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
-      properties:
-        project_id:
-          type: string
-          description: The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
-        location:
-          type: string
-          description: The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional
-            for Gemini API.
-        model:
-          type: string
-          description: The name of the embedding model to use.
-          default: gemini-embedding-001
-          example: gemini-embedding-001
-        dimension:
-          type: integer
-          description: The dimension of the embedding vector (768, 1536, or 3072 recommended).
-          default: 3072
-        api_key:
-          type: string
-          writeOnly: true
-          description: The Google API key. Can also be set via GEMINI_API_KEY environment variable.
-        url:
-          type: string
-          format: uri
-          description: The URL of the Google API endpoint (optional, uses default if not specified).
-      required:
-        - model
-      example:
-        provider: gemini
-        model: gemini-embedding-001
-        dimension: 3072
-        api_key: your-api-key
-    VertexEmbedderConfig:
-      type: object
-      description: >
-        Configuration for Google Cloud Vertex AI embedding models (enterprise-grade).
-
-
-        Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
-
-
-        **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video)
-
-
-        **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
-      properties:
-        model:
-          type: string
-          description: The name of the Vertex AI embedding model to use.
-          default: gemini-embedding-001
-          example: gemini-embedding-001
-        project_id:
-          type: string
-          description: Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable.
-        location:
-          type: string
-          description: Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can
-            also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
-          default: us-central1
-        credentials_path:
-          type: string
-          writeOnly: true
-          description: Path to service account JSON key file. Alternative to ADC for non-GCP environments.
-        dimension:
-          type: integer
-          description: The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001;
-            128-1408 for multimodalembedding).
-          default: 3072
-      required:
-        - model
-      example:
-        provider: vertex
-        model: gemini-embedding-001
-        project_id: my-gcp-project
-        location: us-central1
-        dimension: 3072
+        similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
     OllamaEmbedderConfig:
       type: object
       description: >-
@@ -17756,42 +17677,6 @@ components:
         provider: openai
         model: text-embedding-3-small
         api_key: sk-...
-    OpenRouterEmbedderConfig:
-      type: object
-      description: >-
-        Configuration for the OpenRouter embedding provider.
-
-
-        OpenRouter provides a unified API for multiple embedding models from different providers.
-
-        API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
-
-
-        **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
-
-        google/gemini-embedding-001, qwen/qwen3-embedding-8b
-
-
-        **Docs:** https://openrouter.ai/docs/api/reference/embeddings
-      properties:
-        model:
-          type: string
-          description: The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
-          default: openai/text-embedding-3-small
-          example: openai/text-embedding-3-small
-        api_key:
-          type: string
-          writeOnly: true
-          description: The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
-        dimensions:
-          type: integer
-          description: Output dimension for the embedding (if supported by the model).
-      required:
-        - model
-      example:
-        provider: openrouter
-        model: openai/text-embedding-3-small
-        api_key: sk-or-...
     BedrockEmbedderConfig:
       type: object
       description: >-
@@ -17861,52 +17746,6 @@ components:
         model: cohere.embed-v4
         request_format: cohere_v4
         region: us-east-1
-    CohereEmbedderConfig:
-      type: object
-      description: >-
-        Configuration for the Cohere embedding provider.
-
-
-        API key via `api_key` field or `COHERE_API_KEY` environment variable.
-
-
-        **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0
-
-
-        **Docs:** https://docs.cohere.com/reference/embed
-      properties:
-        model:
-          type: string
-          description: The name of the Cohere embedding model to use.
-          default: embed-english-v3.0
-          example: embed-english-v3.0
-        api_key:
-          type: string
-          writeOnly: true
-          description: The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
-        input_type:
-          type: string
-          description: Specifies the type of input for optimized embeddings.
-          enum:
-            - search_document
-            - search_query
-            - classification
-            - clustering
-          default: search_document
-        truncate:
-          type: string
-          description: How to handle inputs longer than the max token length.
-          enum:
-            - NONE
-            - START
-            - END
-          default: END
-      required:
-        - model
-      example:
-        provider: cohere
-        model: embed-english-v3.0
-        input_type: search_document
     AntflyEmbedderConfig:
       type: object
       description: >-
@@ -17950,306 +17789,406 @@ components:
         provider: antfly
         model: bge-base-en-v1.5
         api_url: http://localhost:8082
-    EmbedderProvider:
+    ManagedEmbedderProvider:
       type: string
       enum:
-        - gemini
-        - vertex
         - ollama
         - openai
-        - openrouter
         - bedrock
-        - cohere
-        - mock
         - antfly
-      description: The embedding provider to use.
-    EmbedderConfig:
-      description: >-
-        A unified configuration for an embedding provider.
-
-
-        Embedders can be configured with templates to customize how documents are
-
-        converted to text before embedding. Templates use Handlebars syntax and
-
-        support various built-in helpers.
-
-
-        **Template System:**
-
-        - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
-
-        - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
-
-        - **Context**: Templates receive the full document as context
-
-
-        **Built-in Helpers:**
-
-
-        1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
-           ```handlebars
-           {{scrubHtml html_content}}
-           ```
-           - Removes `<script>` and `<style>` tags
-           - Adds newlines after block elements (p, div, h1-h6, li, etc.)
-           - Returns plain text with preserved readability
-
-        2. **eq** - Equality comparison for conditionals
-           ```handlebars
-           {{#if (eq status "active")}}Active user{{/if}}
-           {{#if (eq @key "special")}}Special field{{/if}}
-           ```
-
-        3. **media** - GenKit dotprompt media directive for multimodal content
-           ```handlebars
-           {{media url=imageDataURI}}
-           {{media url=this.image_url}}
-           {{media url="https://example.com/image.jpg"}}
-           {{media url="s3://endpoint/bucket/image.png"}}
-           {{media url="file:///path/to/image.jpg"}}
-           ```
-
-           **Supported URL Schemes:**
-           - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
-           - `http://` / `https://` - Web URLs with automatic content type detection
-           - `file://` - Local filesystem paths
-           - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
-
-           **Automatic Content Processing:**
-           - **Images**: Downloaded, resized (if needed), converted to data URIs
-           - **PDFs**: Text extracted or first page rendered as image
-           - **HTML**: Readable text extracted using Mozilla Readability
-
-           **Security Controls:**
-           Downloads are protected by content security settings (see Configuration Reference):
-           - Allowed host whitelist
-           - Private IP blocking (prevents SSRF attacks)
-           - Download size limits (default: 100MB)
-           - HTTP downloads time out after 30 seconds by default; zero disables the deadline
-           - Image dimension limits (default: 2048px, auto-resized)
-
-           See: https://antfly.io/docs/configuration#security--cors
-
-        4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-           ```handlebars
-           {{encodeToon this.fields}}
-           {{encodeToon this.fields lengthMarker=false indent=4}}
-           {{encodeToon this.fields delimiter="\t"}}
-           ```
-
-           **What is TOON?**
-           TOON is a compact, human-readable format designed for passing structured data to LLMs.
-           It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-           comprehension accuracy.
-
-           **Key Features:**
-           - Compact syntax using `:` for key-value pairs
-           - Array length markers: `tags[#3]: ai,search,ml`
-           - Tabular format for uniform data structures
-           - Optimized for LLM parsing and understanding
-           - Maintains human readability
-
-           **Benefits:**
-           - **Lower API costs** - Reduced token usage means lower LLM API costs
-           - **Faster responses** - Less tokens to process
-           - **More context** - Fit more documents within token limits
-
-           **Options:**
-           - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-           - `indent` (int): Indentation spacing for nested objects (default: 2)
-           - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-
-           **Example output:**
-           ```
-           title: Introduction to Vector Search
-           author: Jane Doe
-           tags[#3]: ai,search,ml
-           metadata:
-             edition: 2
-             pages: 450
-           ```
-
-           **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-
-           **References:**
-           - TOON Specification: https://github.com/toon-format/toon
-           - Go Implementation: https://github.com/alpkeskin/gotoon
-
-        **Template Examples:**
-
-
-        Document with metadata:
-
-        ```handlebars
-
-        Title: {{metadata.title}}
-
-        Date: {{metadata.date}}
-
-        Tags: {{#each metadata.tags}}{{this}}, {{/each}}
-
-
-        {{content}}
-
-        ```
-
-
-        HTML content extraction:
-
-        ```handlebars
-
-        Product: {{name}}
-
-        Description: {{scrubHtml description_html}}
-
-        Price: ${{price}}
-
-        ```
-
-
-        Multimodal with image:
-
-        ```handlebars
-
-        Product: {{title}}
-
-        {{media url=image}}
-
-        Description: {{description}}
-
-        ```
-
-
-        Conditional formatting:
-
-        ```handlebars
-
-        {{title}}
-
-        {{#if author}}By: {{author}}{{/if}}
-
-        {{#if (eq category "premium")}}⭐ Premium Content{{/if}}
-
-        {{body}}
-
-        ```
-
-
-        **Environment Variables:**
-
-        - `GEMINI_API_KEY` - API key for Google AI
-
-        - `OPENAI_API_KEY` - API key for OpenAI
-
-        - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs
-
-        - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434)
-
-
-        **Importing Pre-computed Embeddings:**
-
-
-        You can import existing embeddings (from OpenAI, Cohere, or any provider), but only
-
-        for indexes configured with `external: true`. External indexes accept vectors written
-
-        directly through the document `_embeddings` field and do not generate prompts from
-
-        `field` or `template`.
-
-
-        **Steps:**
-
-        1. Create an embeddings index with `external: true`
-
-        2. For dense indexes, set the index `dimension`
-
-        3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
-
-
-        **Example:**
-
-        ```json
-
-        {
-          "title": "My Document",
-          "content": "Document text...",
-          "_embeddings": {
-            "my_vector_index": [0.1, 0.2, 0.3, ...]
-          }
-        }
-
-        ```
-
-
-        **Delete Behavior:**
-
-        - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector
-
-        - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged
-
-
-        **Use Cases:**
-
-        - Migrating from another vector database with existing embeddings
-
-        - Using embeddings generated by external systems
-
-        - Importing pre-computed OpenAI, Cohere, or other provider embeddings
-
-        - Batch processing embeddings offline before ingestion
+      description: Embedding providers executable by managed index creation.
+    ManagedEmbedderConfig:
+      description: Embedding provider configuration accepted by managed index creation.
       allOf:
         - oneOf:
-            - $ref: '#/components/schemas/GoogleEmbedderConfig'
-            - $ref: '#/components/schemas/VertexEmbedderConfig'
             - $ref: '#/components/schemas/OllamaEmbedderConfig'
             - $ref: '#/components/schemas/OpenAIEmbedderConfig'
-            - $ref: '#/components/schemas/OpenRouterEmbedderConfig'
             - $ref: '#/components/schemas/BedrockEmbedderConfig'
-            - $ref: '#/components/schemas/CohereEmbedderConfig'
             - $ref: '#/components/schemas/AntflyEmbedderConfig'
-        - properties:
+        - type: object
+          required:
+            - provider
+          properties:
             provider:
-              $ref: '#/components/schemas/EmbedderProvider'
-            multimodal:
+              $ref: '#/components/schemas/ManagedEmbedderProvider'
+    TextChunkOptions:
+      type: object
+      description: Options specific to text chunking.
+      properties:
+        target_tokens:
+          type: integer
+          description: Target number of tokens per chunk.
+        overlap_tokens:
+          type: integer
+          description: Number of tokens to overlap between consecutive chunks. Helps maintain context
+            across chunk boundaries. Only used by fixed-size chunkers.
+        separator:
+          type: string
+          description: Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size
+            chunkers.
+    AudioChunkOptions:
+      type: object
+      description: Options specific to audio chunking.
+      properties:
+        window_duration_ms:
+          type: integer
+          description: 'Window duration in milliseconds for fixed-window audio chunking (default: 30000).'
+        overlap_duration_ms:
+          type: integer
+          description: 'Overlap duration in milliseconds between audio chunks (default: 0).'
+    ChunkOptions:
+      type: object
+      description: Per-request configuration for chunking. All fields are optional - zero/omitted values
+        use chunker defaults.
+      properties:
+        max_chunks:
+          type: integer
+          description: Maximum number of chunks to generate per document.
+        threshold:
+          type: number
+          format: float
+          description: Confidence threshold for model-based chunking (0.0-1.0).
+        text:
+          $ref: '#/components/schemas/TextChunkOptions'
+        audio:
+          $ref: '#/components/schemas/AudioChunkOptions'
+    AntflyChunkerConfig:
+      description: >
+        Configuration for the Antfly inference chunking provider.
+
+
+        Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching.
+
+        The model name maps to ONNX model directory names (similar to how Ollama works).
+
+
+        **Chunking Models:**
+
+        - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
+
+        - Any other name will attempt to load from models/chunkers/{name}/ directory
+
+
+        **Caching:**
+
+        - L1: Memory cache with 2-minute TTL
+
+        - L2: Persistent Pebble database
+
+        - Singleflight deduplication for concurrent identical requests
+      allOf:
+        - $ref: '#/components/schemas/ChunkOptions'
+        - type: object
+          properties:
+            api_url:
+              type: string
+              format: uri
+              description: The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can
+                also be set via ANTFLY_INFERENCE_URL environment variable.
+              example: http://localhost:8080
+            model:
+              type: string
+              description: The chunking model to use. Defaults to 'fixed' for simple token-based chunking;
+                other values select a model from models/chunkers/{name}/. Successful create responses
+                include the effective model.
+              default: fixed
+              example: fixed
+      example:
+        provider: antfly
+        api_url: http://localhost:8080
+        model: fixed
+        max_chunks: 50
+        text:
+          target_tokens: 500
+          overlap_tokens: 50
+          separator: >2+
+
+
+    ChunkerProvider:
+      type: string
+      enum:
+        - mock
+        - antfly
+      description: The chunking provider to use.
+    ChunkerConfig:
+      description: A unified configuration for a chunking provider.
+      allOf:
+        - $ref: '#/components/schemas/AntflyChunkerConfig'
+        - type: object
+          properties:
+            provider:
+              $ref: '#/components/schemas/ChunkerProvider'
+            store_chunks:
+              x-go-type-skip-optional-pointer: true
               type: boolean
-              description: >-
-                Declare that this model supports non-text content (images, audio, video, PDFs),
+              description: Controls whether chunk data is persisted to storage. When false (default),
+                chunks are generated in memory and only embeddings are stored. When true, both chunks
+                and embeddings are stored.
+              default: false
+            full_text_index:
+              x-go-type-skip-optional-pointer: true
+              type: object
+              description: >
+                Configuration for full-text indexing of chunks in Bleve.
 
-                even if the model isn't in Antfly's built-in model registry yet.
+                When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's
+                _chunks field.
 
-
-                When `true`, Antfly treats the model as multimodal and will send binary content
-
-                (images, audio, etc.) to the provider instead of extracting text. The provider's
-
-                API is still responsible for accepting the content — this flag just tells Antfly
-
-                not to strip it.
-
-
-                Not needed for models already in the registry (e.g., `multimodalembedding`,
-
-                `gemini-embedding-2-preview`, `clip-*`, `clipclap`).
-
-
-                **Example:**
-
-                ```json
-
-                {
-                  "provider": "vertex",
-                  "model": "some-future-multimodal-model",
-                  "multimodal": true
-                }
-
-                ```
+                When absent, chunks use :c: suffix and are only used for vector embeddings.
+              additionalProperties: true
+            api_url:
+              type: string
+              format: uri
+              description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL.
+              example: http://localhost:8080
+            model:
+              type: string
+              description: The chunking model to use. Defaults to 'fixed' for simple token-based chunking;
+                other values select a model from models/chunkers/{name}/. Successful create responses
+                include the effective model.
+              default: fixed
+              example: fixed
+            max_chunks:
+              type: integer
+              minimum: 1
+            threshold:
+              type: number
+              format: float
+              minimum: 0
+              maximum: 1
+            text:
+              $ref: '#/components/schemas/TextChunkOptions'
+            audio:
+              $ref: '#/components/schemas/AudioChunkOptions'
           required:
             - provider
       example:
-        provider: openai
-        model: text-embedding-3-small
+        provider: antfly
+        model: fixed
+        text:
+          target_tokens: 500
+          overlap_tokens: 50
+    IndexExecutionConfig:
+      type: object
+      additionalProperties: false
+      description: Namespaced execution policy for managed index shorthand. Only namespaces with runtime
+        effects are accepted.
+      properties:
+        chunking:
+          $ref: '#/components/schemas/ExecutionPolicy'
+          description: Chunk producer batching for shorthand-created chunk enrichments.
+        embedding:
+          $ref: '#/components/schemas/ExecutionPolicy'
+          description: Embedding producer batching for shorthand-created embedding enrichments.
+    EmbeddingsIndexConfig:
+      type: object
+      description: Unified configuration for embeddings indexes. When sparse is true, creates a sparse
+        vector index (SPLADE inverted index). When sparse is false (default), creates a dense HBC vector
+        index. For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
+      x-antfly-mutually-exclusive:
+        - - sources
+          - external
+        - - sources
+          - field
+        - - sources
+          - template
+        - - sources
+          - chunker
+        - - sources
+          - embedding_name
+        - - sources
+          - source_artifact_name
+      x-antfly-dependent-required:
+        source_artifact_name:
+          - embedding_name
+      properties:
+        publication_policy:
+          $ref: '#/components/schemas/IndexPublicationPolicy'
+        coverage_policy:
+          $ref: '#/components/schemas/DerivedCoveragePolicy'
+          description: 'Source-unit completeness policy for managed embeddings. `strict` requires one
+            produced outcome per source document; `partial` permits intentional skips; `best_effort` also
+            treats terminal failures as complete while reporting the index unhealthy. External indexes
+            use `external: true` and must not set this field.'
+        external:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+          description: When true, embeddings are supplied externally via _embeddings and the index does
+            not derive prompts from a field or template.
+        sparse:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+          description: When true, creates a sparse (SPLADE) inverted index. When false (default), creates
+            a dense HBC vector index.
+        dimension:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          description: Vector dimension for dense indexes. Required for external dense indexes. Can be
+            omitted for managed dense indexes when an embedder is configured (auto-detected via probe).
+            Ignored for sparse indexes.
+        field:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Field to extract embeddings from (managed indexes only; not allowed when external=true)
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/ArtifactIndexSource'
+          x-go-type-skip-optional-pointer: true
+          description: Embedding artifact streams indexed together. Each artifact record is an independent
+            vector member identified by (artifact name, source key). All sources must use the same dense
+            vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name,
+            or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected
+            by serverless deployments.
+        embedding_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          minLength: 1
+          description: Released v0.2 single-source alternative request form. Mutually exclusive with sources.
+            Required when source_artifact_name is set. Responses also expose canonical sources while preserving
+            these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless
+            deployments.
+        source_artifact_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          minLength: 1
+          deprecated: true
+          x-deprecated-reason: Set source_artifact_name only on the matching embedding enrichment.
+          description: Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name
+            is required and this value must exactly match the source_artifact_name on the authoritative
+            embedding enrichment. New clients should declare the relationship only on that enrichment.
+        template:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Handlebars template for generating prompts (managed indexes only; not allowed when
+            external=true). See https://handlebarsjs.com/guide/ for more information.
+          example: Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years
+            old.
+        distance_metric:
+          $ref: '#/components/schemas/DistanceMetric'
+        mem_only:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Whether to use in-memory only storage (dense only)
+        embedder:
+          description: Configuration for the embeddings plugin (managed indexes only; not allowed when
+            external=true)
+          $ref: '#/components/schemas/ManagedEmbedderConfig'
+        chunker:
+          description: Configuration for the chunking plugin. When specified, documents are automatically
+            chunked at write time before dense or sparse managed indexing.
+          $ref: '#/components/schemas/ChunkerConfig'
+        top_k:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          default: 10
+          description: Default number of results to return from search (sparse only)
+        min_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: float
+          default: 0.0
+          description: Minimum weight threshold for sparse vector entries (sparse only)
+        chunk_size:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 64
+          default: 1024
+          description: Number of documents per posting list chunk (sparse only)
+        execution:
+          $ref: '#/components/schemas/IndexExecutionConfig'
+          description: Non-semantic execution policy for shorthand-created chunking or embedding producers.
+    GraphEdgeType:
+      type: string
+      minLength: 1
+      maxLength: 65536
+      x-antfly-max-utf8-bytes: 65536
+      description: Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength`
+        is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte
+        limit.
+    GraphTemplateValue:
+      description: A literal string or finite numeric value, or a Handlebars template evaluated for each
+        materialized graph item.
+      anyOf:
+        - type: string
+        - type: number
+          format: double
+    GraphArtifactNodeMappingConfig:
+      type: object
+      additionalProperties: false
+      description: Maps each artifact item to graph node identifiers.
+      properties:
+        model:
+          type: string
+          enum:
+            - document
+            - external
+          default: document
+        target:
+          $ref: '#/components/schemas/GraphTemplateValue'
+    GraphArtifactEdgeMappingConfig:
+      type: object
+      additionalProperties: false
+      description: Maps each artifact item to an edge type, weight, and public metadata.
+      properties:
+        type:
+          $ref: '#/components/schemas/GraphTemplateValue'
+        weight:
+          $ref: '#/components/schemas/GraphTemplateValue'
+        metadata:
+          type: object
+          additionalProperties: true
+          description: JSON metadata template copied onto each materialized edge. Sensitive keys are omitted
+            from create responses.
+    GraphArtifactContextConfig:
+      type: object
+      additionalProperties: false
+      description: Document fields made available to graph mapping templates through `_doc.value`.
+      properties:
+        doc_fields:
+          type: array
+          items:
+            type: string
+            minLength: 1
+    GraphArtifactSourceConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - artifact
+      description: Artifact stream materialized into graph edges. Each source artifact is limited to 16
+        MiB and 1,000,000 relation items so live apply, repair, split, and restore share one bounded admission
+        contract. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are
+        rejected by serverless deployments.
+      properties:
+        artifact:
+          type: string
+          minLength: 1
+        path:
+          type: string
+          pattern: ^(\$|\$\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*(\[\*\])?)?$
+          description: Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII
+            field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`.
+        format:
+          type: string
+          enum:
+            - extraction_relation
+            - extraction_graph
+          default: extraction_relation
+        mention_edge_type:
+          $ref: '#/components/schemas/GraphEdgeType'
+        nodes:
+          $ref: '#/components/schemas/GraphArtifactNodeMappingConfig'
+        edge:
+          $ref: '#/components/schemas/GraphArtifactEdgeMappingConfig'
+        context:
+          $ref: '#/components/schemas/GraphArtifactContextConfig'
     GoogleGeneratorConfig:
       type: object
       description: >
@@ -18657,388 +18596,6 @@ components:
         model: gpt-4.1
         temperature: 0.7
         max_tokens: 2048
-    TextChunkOptions:
-      type: object
-      description: Options specific to text chunking.
-      properties:
-        target_tokens:
-          type: integer
-          description: Target number of tokens per chunk.
-        overlap_tokens:
-          type: integer
-          description: Number of tokens to overlap between consecutive chunks. Helps maintain context
-            across chunk boundaries. Only used by fixed-size chunkers.
-        separator:
-          type: string
-          description: Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size
-            chunkers.
-    AudioChunkOptions:
-      type: object
-      description: Options specific to audio chunking.
-      properties:
-        window_duration_ms:
-          type: integer
-          description: 'Window duration in milliseconds for fixed-window audio chunking (default: 30000).'
-        overlap_duration_ms:
-          type: integer
-          description: 'Overlap duration in milliseconds between audio chunks (default: 0).'
-    ChunkOptions:
-      type: object
-      description: Per-request configuration for chunking. All fields are optional - zero/omitted values
-        use chunker defaults.
-      properties:
-        max_chunks:
-          type: integer
-          description: Maximum number of chunks to generate per document.
-        threshold:
-          type: number
-          format: float
-          description: Confidence threshold for model-based chunking (0.0-1.0).
-        text:
-          $ref: '#/components/schemas/TextChunkOptions'
-        audio:
-          $ref: '#/components/schemas/AudioChunkOptions'
-    AntflyChunkerConfig:
-      description: >
-        Configuration for the Antfly inference chunking provider.
-
-
-        Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching.
-
-        The model name maps to ONNX model directory names (similar to how Ollama works).
-
-
-        **Chunking Models:**
-
-        - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
-
-        - Any other name will attempt to load from models/chunkers/{name}/ directory
-
-
-        **Caching:**
-
-        - L1: Memory cache with 2-minute TTL
-
-        - L2: Persistent Pebble database
-
-        - Singleflight deduplication for concurrent identical requests
-      allOf:
-        - $ref: '#/components/schemas/ChunkOptions'
-        - type: object
-          properties:
-            api_url:
-              type: string
-              format: uri
-              description: The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can
-                also be set via ANTFLY_INFERENCE_URL environment variable.
-              example: http://localhost:8080
-            model:
-              type: string
-              description: The chunking model to use. Defaults to 'fixed' for simple token-based chunking;
-                other values select a model from models/chunkers/{name}/. Successful create responses
-                include the effective model.
-              default: fixed
-              example: fixed
-      example:
-        provider: antfly
-        api_url: http://localhost:8080
-        model: fixed
-        max_chunks: 50
-        text:
-          target_tokens: 500
-          overlap_tokens: 50
-          separator: >2+
-
-
-    ChunkerProvider:
-      type: string
-      enum:
-        - mock
-        - antfly
-      description: The chunking provider to use.
-    ChunkerConfig:
-      description: A unified configuration for a chunking provider.
-      allOf:
-        - $ref: '#/components/schemas/AntflyChunkerConfig'
-        - type: object
-          properties:
-            provider:
-              $ref: '#/components/schemas/ChunkerProvider'
-            store_chunks:
-              x-go-type-skip-optional-pointer: true
-              type: boolean
-              description: Controls whether chunk data is persisted to storage. When false (default),
-                chunks are generated in memory and only embeddings are stored. When true, both chunks
-                and embeddings are stored.
-              default: false
-            full_text_index:
-              x-go-type-skip-optional-pointer: true
-              type: object
-              description: >
-                Configuration for full-text indexing of chunks in Bleve.
-
-                When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's
-                _chunks field.
-
-                When absent, chunks use :c: suffix and are only used for vector embeddings.
-              additionalProperties: true
-            api_url:
-              type: string
-              format: uri
-              description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL.
-              example: http://localhost:8080
-            model:
-              type: string
-              description: The chunking model to use. Defaults to 'fixed' for simple token-based chunking;
-                other values select a model from models/chunkers/{name}/. Successful create responses
-                include the effective model.
-              default: fixed
-              example: fixed
-            max_chunks:
-              type: integer
-              minimum: 1
-            threshold:
-              type: number
-              format: float
-              minimum: 0
-              maximum: 1
-            text:
-              $ref: '#/components/schemas/TextChunkOptions'
-            audio:
-              $ref: '#/components/schemas/AudioChunkOptions'
-          required:
-            - provider
-      example:
-        provider: antfly
-        model: fixed
-        text:
-          target_tokens: 500
-          overlap_tokens: 50
-    IndexExecutionConfig:
-      type: object
-      additionalProperties: false
-      description: Namespaced execution policy for managed index shorthand. Only namespaces with runtime
-        effects are accepted.
-      properties:
-        chunking:
-          $ref: '#/components/schemas/ExecutionPolicy'
-          description: Chunk producer batching for shorthand-created chunk enrichments.
-        embedding:
-          $ref: '#/components/schemas/ExecutionPolicy'
-          description: Embedding producer batching for shorthand-created embedding enrichments.
-    EmbeddingsIndexConfig:
-      type: object
-      description: Unified configuration for embeddings indexes. When sparse is true, creates a sparse
-        vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index
-        (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be
-        auto-detected.
-      x-antfly-mutually-exclusive:
-        - - sources
-          - external
-        - - sources
-          - field
-        - - sources
-          - template
-        - - sources
-          - chunker
-        - - sources
-          - embedding_name
-        - - sources
-          - source_artifact_name
-      x-antfly-dependent-required:
-        source_artifact_name:
-          - embedding_name
-      properties:
-        publication_policy:
-          $ref: '#/components/schemas/IndexPublicationPolicy'
-        coverage_policy:
-          $ref: '#/components/schemas/DerivedCoveragePolicy'
-          description: 'Source-unit completeness policy for managed embeddings. `strict` requires one
-            produced outcome per source document; `partial` permits intentional skips; `best_effort` also
-            treats terminal failures as complete while reporting the index unhealthy. External indexes
-            use `external: true` and must not set this field.'
-        external:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
-          default: false
-          description: When true, embeddings are supplied externally via _embeddings and the index does
-            not derive prompts from a field or template.
-        sparse:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
-          default: false
-          description: When true, creates a sparse (SPLADE) inverted index. When false (default), creates
-            a dense (HNSW) vector index.
-        dimension:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          minimum: 1
-          description: Vector dimension for dense indexes. Required for external dense indexes. Can be
-            omitted for managed dense indexes when an embedder is configured (auto-detected via probe).
-            Ignored for sparse indexes.
-        field:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          description: Field to extract embeddings from (managed indexes only; not allowed when external=true)
-        sources:
-          type: array
-          minItems: 1
-          maxItems: 64
-          uniqueItems: true
-          items:
-            $ref: '#/components/schemas/ArtifactIndexSource'
-          x-go-type-skip-optional-pointer: true
-          description: Embedding artifact streams indexed together. Each artifact record is an independent
-            vector member identified by (artifact name, source key). All sources must use the same dense
-            vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name,
-            or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected
-            by serverless deployments.
-        embedding_name:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          minLength: 1
-          description: Released v0.2 single-source alternative request form. Mutually exclusive with sources.
-            Required when source_artifact_name is set. Responses also expose canonical sources while preserving
-            these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless
-            deployments.
-        source_artifact_name:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          minLength: 1
-          deprecated: true
-          x-deprecated-reason: Set source_artifact_name only on the matching embedding enrichment.
-          description: Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name
-            is required and this value must exactly match the source_artifact_name on the authoritative
-            embedding enrichment. New clients should declare the relationship only on that enrichment.
-        template:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          description: Handlebars template for generating prompts (managed indexes only; not allowed when
-            external=true). See https://handlebarsjs.com/guide/ for more information.
-          example: Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years
-            old.
-        distance_metric:
-          $ref: '#/components/schemas/DistanceMetric'
-        mem_only:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
-          description: Whether to use in-memory only storage (dense only)
-        embedder:
-          description: Configuration for the embeddings plugin (managed indexes only; not allowed when
-            external=true)
-          $ref: '#/components/schemas/EmbedderConfig'
-        summarizer:
-          description: Configuration for the summarizer plugin (dense managed indexes only)
-          $ref: '#/components/schemas/GeneratorConfig'
-        chunker:
-          description: Configuration for the chunking plugin. When specified, documents are automatically
-            chunked at write time before indexing. (dense managed indexes only)
-          $ref: '#/components/schemas/ChunkerConfig'
-        top_k:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          minimum: 1
-          default: 10
-          description: Default number of results to return from search (sparse only)
-        min_weight:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: float
-          default: 0.0
-          description: Minimum weight threshold for sparse vector entries (sparse only)
-        chunk_size:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          minimum: 64
-          default: 1024
-          description: Number of documents per posting list chunk (sparse only)
-        execution:
-          $ref: '#/components/schemas/IndexExecutionConfig'
-          description: Non-semantic execution policy for shorthand-created chunking or embedding producers.
-    GraphEdgeType:
-      type: string
-      minLength: 1
-      maxLength: 65536
-      x-antfly-max-utf8-bytes: 65536
-      description: Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength`
-        is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte
-        limit.
-    GraphTemplateValue:
-      description: A literal string or finite numeric value, or a Handlebars template evaluated for each
-        materialized graph item.
-      anyOf:
-        - type: string
-        - type: number
-          format: double
-    GraphArtifactNodeMappingConfig:
-      type: object
-      additionalProperties: false
-      description: Maps each artifact item to graph node identifiers.
-      properties:
-        model:
-          type: string
-          enum:
-            - document
-            - external
-          default: document
-        target:
-          $ref: '#/components/schemas/GraphTemplateValue'
-    GraphArtifactEdgeMappingConfig:
-      type: object
-      additionalProperties: false
-      description: Maps each artifact item to an edge type, weight, and public metadata.
-      properties:
-        type:
-          $ref: '#/components/schemas/GraphTemplateValue'
-        weight:
-          $ref: '#/components/schemas/GraphTemplateValue'
-        metadata:
-          type: object
-          additionalProperties: true
-          description: JSON metadata template copied onto each materialized edge. Sensitive keys are omitted
-            from create responses.
-    GraphArtifactContextConfig:
-      type: object
-      additionalProperties: false
-      description: Document fields made available to graph mapping templates through `_doc.value`.
-      properties:
-        doc_fields:
-          type: array
-          items:
-            type: string
-            minLength: 1
-    GraphArtifactSourceConfig:
-      type: object
-      additionalProperties: false
-      required:
-        - artifact
-      description: Artifact stream materialized into graph edges. Each source artifact is limited to 16
-        MiB and 1,000,000 relation items so live apply, repair, split, and restore share one bounded admission
-        contract. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are
-        rejected by serverless deployments.
-      properties:
-        artifact:
-          type: string
-          minLength: 1
-        path:
-          type: string
-          pattern: ^(\$|\$\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*(\[\*\])?)?$
-          description: Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII
-            field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`.
-        format:
-          type: string
-          enum:
-            - extraction_relation
-            - extraction_graph
-          default: extraction_relation
-        mention_edge_type:
-          $ref: '#/components/schemas/GraphEdgeType'
-        nodes:
-          $ref: '#/components/schemas/GraphArtifactNodeMappingConfig'
-        edge:
-          $ref: '#/components/schemas/GraphArtifactEdgeMappingConfig'
-        context:
-          $ref: '#/components/schemas/GraphArtifactContextConfig'
     EdgeTypeConfig:
       type: object
       description: Configuration for a specific edge type
@@ -19067,28 +18624,6 @@ components:
             - tree: Single parent per node, no cycles
 
             - graph: No constraints (default)
-        max_weight:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: double
-          default: 1.0
-          description: Maximum allowed edge weight
-        min_weight:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: double
-          default: 0.0
-          description: Minimum allowed edge weight
-        allow_self_loops:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
-          default: true
-          description: Whether to allow edges from a node to itself
-        required_metadata:
-          type: array
-          description: Required metadata fields for this edge type
-          items:
-            type: string
       required:
         - name
     GraphArtifactProducerSourceConfig:
@@ -19721,7 +19256,9 @@ components:
           description: >
             The duration after which documents should expire, based on the ttl_field timestamp (optional).
 
-            Uses Go duration format (e.g., '24h', '7d', '168h').
+            Uses integer duration components with `ns`, `us`, `ms`, `s`, `m`, `h`,
+
+            or `d` units (for example, `90m`, `1h30m`, or `7d`).
         dynamic_templates:
           type: array
           items:
@@ -19937,8 +19474,6 @@ components:
         mem_only:
           type: boolean
         embedder:
-          $ref: '#/components/schemas/CreatedProviderConfig'
-        summarizer:
           $ref: '#/components/schemas/CreatedProviderConfig'
         chunker:
           $ref: '#/components/schemas/ChunkerConfig'
@@ -22255,32 +21790,20 @@ components:
     FollowupStepConfig:
       type: object
       description: >
-        Configuration for generating follow-up questions. Uses a separate generator
+        Configuration for deterministic follow-up suggestions derived from the
 
-        call which can use a cheaper/faster model.
+        original query and the standard Antfly follow-up templates.
       properties:
         enabled:
           type: boolean
           default: false
           description: Enable follow-up question generation
-        generator:
-          $ref: '#/components/schemas/GeneratorConfig'
-          description: Generator for follow-up questions. If not specified, uses the answer step's generator.
-        chain:
-          type: array
-          items:
-            $ref: '#/components/schemas/ChainLink'
-          description: Chain of generators to try in order. Mutually exclusive with 'generator'.
         count:
           type: integer
           default: 3
           minimum: 1
-          maximum: 10
+          maximum: 4
           description: Number of follow-up questions to generate
-        context:
-          type: string
-          description: Custom guidance for follow-up question focus and style
-          example: Focus on implementation details and edge cases
     ConfidenceStepConfig:
       type: object
       description: >
@@ -23271,7 +22794,6 @@ components:
       type: string
       enum:
         - antfly
-        - ollama
         - cohere
         - vertex
       description: The reranking provider to use.
@@ -23293,19 +22815,6 @@ components:
         provider: antfly
         model: mixedbread-ai/mxbai-rerank-base-v1
         url: http://localhost:8080
-    OllamaRerankerConfig:
-      type: object
-      description: Configuration for the Ollama reranking provider.
-      properties:
-        model:
-          type: string
-          description: The name of the Ollama model to use for reranking.
-        url:
-          type: string
-          format: uri
-          description: The URL of the Ollama API endpoint.
-      required:
-        - model
     CohereRerankerConfig:
       type: object
       description: >-
@@ -23406,12 +22915,11 @@ components:
             - provider
         - oneOf:
             - $ref: '#/components/schemas/AntflyRerankerConfig'
-            - $ref: '#/components/schemas/OllamaRerankerConfig'
             - $ref: '#/components/schemas/CohereRerankerConfig'
             - $ref: '#/components/schemas/VertexRerankerConfig'
       example:
-        provider: ollama
-        model: dengcao/Qwen3-Reranker-0.6B:F16
+        provider: cohere
+        model: rerank-v4.0-pro
         field: content
     GraphIdentifier:
       type: string
