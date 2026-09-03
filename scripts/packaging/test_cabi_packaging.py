@@ -431,6 +431,34 @@ class CAbiPackagingTests(unittest.TestCase):
         ).read_text()
         self.assertIn("NPM_VERSION: 11.19.1", sdk_npm_workflow)
         self.assertIn('npm install -g "npm@$NPM_VERSION"', sdk_npm_workflow)
+        ts_ci_workflow = (
+            REPO_ROOT / ".github" / "workflows" / "ts-ci.yml"
+        ).read_text()
+        for workflow, expected_jobs in (
+            (ts_ci_workflow, 2),
+            (sdk_npm_workflow, 1),
+        ):
+            lines = workflow.splitlines()
+            node_steps = [
+                index
+                for index, line in enumerate(lines)
+                if "uses: actions/setup-node@" in line
+            ]
+            pnpm_steps = [
+                index
+                for index, line in enumerate(lines)
+                if "uses: pnpm/action-setup@" in line
+            ]
+            self.assertEqual(len(node_steps), expected_jobs)
+            self.assertEqual(len(pnpm_steps), expected_jobs)
+            self.assertTrue(
+                all(
+                    node_step < pnpm_step
+                    for node_step, pnpm_step in zip(node_steps, pnpm_steps)
+                ),
+                "Node must be installed before pnpm so self-hosted runners "
+                "avoid the native bootstrap",
+            )
         platform_publish = [
             release_workflow.index(f'@antfly/cli-{name} "$VERSION"')
             for name in ("darwin-arm64", "linux-arm64", "linux-x64")
