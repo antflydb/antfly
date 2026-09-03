@@ -1222,6 +1222,7 @@ type Proxy struct {
 	refreshWake         chan struct{}
 	capabilityLeaseMu   sync.Mutex
 	capabilityLeases    map[string]proxyCapabilityLease
+	capabilityLeaseByID map[[sha256.Size]byte]string
 }
 
 const defaultMaxProxyRequestBodyBytes int64 = 256 << 20
@@ -1239,6 +1240,7 @@ type leasedEndpoint struct {
 }
 
 type proxyCapabilityLease struct {
+	identity            [sha256.Size]byte
 	model               string
 	task                string
 	descriptorRevision  string
@@ -1274,13 +1276,14 @@ func NewProxy(cfg Config) *Proxy {
 	}
 
 	p := &Proxy{
-		registry:         registry,
-		router:           router,
-		defaultPool:      cfg.DefaultPool,
-		listenAddr:       cfg.ListenAddr,
-		logger:           logger,
-		refreshWake:      make(chan struct{}, 1),
-		capabilityLeases: make(map[string]proxyCapabilityLease),
+		registry:            registry,
+		router:              router,
+		defaultPool:         cfg.DefaultPool,
+		listenAddr:          cfg.ListenAddr,
+		logger:              logger,
+		refreshWake:         make(chan struct{}, 1),
+		capabilityLeases:    make(map[string]proxyCapabilityLease),
+		capabilityLeaseByID: make(map[[sha256.Size]byte]string),
 	}
 	p.maxRequestBodyBytes = cfg.MaxRequestBodyBytes
 	if p.maxRequestBodyBytes <= 0 {
@@ -1431,6 +1434,63 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "chat.completions")
 }
 
+func requestHeaderMap(header http.Header) map[string]string {
+	result := make(map[string]string, len(header))
+	for name, values := range header {
+		if len(values) != 0 {
+			result[name] = values[0]
+		}
+	}
+	return result
+}
+
+// catalogEndpointsForRequest returns one route capability cohort: every pool
+// the matching request may select, rather than every inference node in the
+// cluster. If source-scoped fields are not present on the discovery request,
+// PotentialPoolsFor conservatively includes routes whose operation/model match
+// while still excluding unrelated model families and pools.
+func (p *Proxy) catalogEndpointsForRequest(r *http.Request, model string, operation OperationType, explicitPool string) []*Endpoint {
+	if explicitPool != "" {
+		return p.registry.GetEndpointsForPool(explicitPool)
+	}
+	headers := requestHeaderMap(r.Header)
+	routeRequest := &RouteRequest{
+		Operation:          operation,
+		Model:              model,
+		Headers:            headers,
+		SourceTable:        headerValue(headers, "X-Antfly-Source-Table", "X-Antfly-Table"),
+		SourceOrganization: headerValue(headers, "X-Antfly-Source-Organization"),
+		SourceProject:      headerValue(headers, "X-Antfly-Source-Project"),
+		SourceAPIKey:       headerValue(headers, "X-Antfly-Source-API-Key"),
+		Timestamp:          time.Now(),
+	}
+	var pools []string
+	seenPools := make(map[string]bool)
+	for _, semanticOperation := range semanticOperationsForTask(semanticTaskForOperation(operation), operation) {
+		routeRequest.Operation = semanticOperation
+		for _, candidate := range p.router.RouteManager().PotentialPoolsFor(routeRequest) {
+			if !seenPools[candidate] {
+				seenPools[candidate] = true
+				pools = append(pools, candidate)
+			}
+		}
+	}
+	if len(pools) == 0 && p.defaultPool != "" {
+		pools = append(pools, p.defaultPool)
+	}
+	seen := make(map[string]bool)
+	var endpoints []*Endpoint
+	for _, pool := range pools {
+		for _, endpoint := range p.registry.GetEndpointsForPool(pool) {
+			if endpoint != nil && !seen[endpoint.Address] {
+				seen[endpoint.Address] = true
+				endpoints = append(endpoints, endpoint)
+			}
+		}
+	}
+	return endpoints
+}
+
 const maxModelCatalogBytes = 8 << 20
 const maxMergedModelCatalogBytes = 32 << 20
 const maxConcurrentModelCatalogRequests = 8
@@ -1438,7 +1498,7 @@ const maxModelCatalogWorkingBytes = 3 * maxModelCatalogBytes
 
 // handleModels publishes a conservative catalog for one routing scope. Antfly
 // clients provide model+task query parameters, allowing the proxy to aggregate
-// exactly the operation-eligible endpoints in the selected/default pool.
+// exactly the operation-eligible endpoints in the matching route cohort.
 // Unscoped compatibility requests remain pool-scoped rather than leaking a
 // cluster-wide union that the subsequent request router cannot honor.
 func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -1455,19 +1515,18 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pool := strings.TrimSpace(r.Header.Get("X-Antfly-Inference-Pool"))
-	if pool == "" {
+	if pool == "" && model == "" {
 		pool = p.defaultPool
 	}
 	authorization := p.upstreamAuthorizationForRequest(r)
 	var endpoints []*Endpoint
 	if model != "" {
-		// Scoped discovery starts from every currently healthy endpoint. The
-		// caller-authorized catalogs below establish task eligibility and the
-		// resulting lease constrains execution after the route manager selects a
-		// concrete pool. Prefiltering here by the service catalog or default pool
-		// would make tenant-visible models and non-default route destinations
-		// undiscoverable.
-		endpoints = p.registry.GetAvailableEndpoints()
+		// Discover only the pools the matching route can actually select. Mixing
+		// unrelated pools forces a conservative descriptor to inherit the weakest
+		// cluster-wide limits even though execution can never reach those nodes.
+		// Caller-scoped upstream catalogs still provide the authorization proof;
+		// this is only a route-cohort prefilter.
+		endpoints = p.catalogEndpointsForRequest(r, model, taskScope.Operation, pool)
 	} else if pool == "" {
 		endpoints = p.registry.GetAvailableEndpoints()
 	} else {
@@ -1663,11 +1722,8 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) issueCapabilityLease(model, task, descriptorRevision, authorization string, endpoints map[string]leasedEndpoint) (string, error) {
-	var random [32]byte
-	if _, err := rand.Read(random[:]); err != nil {
-		return "", err
-	}
-	token := hex.EncodeToString(random[:])
+	authorizationDigest := sha256.Sum256([]byte(authorization))
+	identity := capabilityLeaseIdentity(model, task, descriptorRevision, authorizationDigest, endpoints)
 	allowed := make(map[string]leasedEndpoint, len(endpoints))
 	for address, endpoint := range endpoints {
 		allowed[address] = leasedEndpoint{
@@ -1678,10 +1734,24 @@ func (p *Proxy) issueCapabilityLease(model, task, descriptorRevision, authorizat
 	now := time.Now()
 	p.capabilityLeaseMu.Lock()
 	defer p.capabilityLeaseMu.Unlock()
-	for key, lease := range p.capabilityLeases {
+	for token, lease := range p.capabilityLeases {
 		if !now.Before(lease.expiresAt) {
-			delete(p.capabilityLeases, key)
+			delete(p.capabilityLeases, token)
+			if p.capabilityLeaseByID[lease.identity] == token {
+				delete(p.capabilityLeaseByID, lease.identity)
+			}
 		}
+	}
+	if token, ok := p.capabilityLeaseByID[identity]; ok {
+		if lease, live := p.capabilityLeases[token]; live {
+			// Refresh the same immutable capability snapshot in place. Clients poll
+			// much more frequently than the execution lease TTL; minting a token per
+			// poll turns bounded safety state into an availability leak.
+			lease.expiresAt = now.Add(capabilityLeaseTTL)
+			p.capabilityLeases[token] = lease
+			return token, nil
+		}
+		delete(p.capabilityLeaseByID, identity)
 	}
 	if len(p.capabilityLeases) >= maxCapabilityLeases {
 		// Never invalidate an unexpired lease to admit a newer caller. Returning
@@ -1689,12 +1759,56 @@ func (p *Proxy) issueCapabilityLease(model, task, descriptorRevision, authorizat
 		// that has already been admitted.
 		return "", errCapabilityLeaseCapacity
 	}
+	var random [32]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(random[:])
 	p.capabilityLeases[token] = proxyCapabilityLease{
-		model: model, task: task, descriptorRevision: descriptorRevision,
-		authorizationDigest: sha256.Sum256([]byte(authorization)),
+		identity: identity,
+		model:    model, task: task, descriptorRevision: descriptorRevision,
+		authorizationDigest: authorizationDigest,
 		endpoints:           allowed, expiresAt: now.Add(capabilityLeaseTTL),
 	}
+	p.capabilityLeaseByID[identity] = token
 	return token, nil
+}
+
+func capabilityLeaseIdentity(model, task, revision string, authorizationDigest [sha256.Size]byte, endpoints map[string]leasedEndpoint) [sha256.Size]byte {
+	h := sha256.New()
+	writeField := func(value string) {
+		_, _ = fmt.Fprintf(h, "%d:", len(value))
+		_, _ = h.Write([]byte(value))
+	}
+	writeField(model)
+	writeField(task)
+	writeField(revision)
+	_, _ = h.Write(authorizationDigest[:])
+	addresses := make([]string, 0, len(endpoints))
+	for address := range endpoints {
+		addresses = append(addresses, address)
+	}
+	sort.Strings(addresses)
+	for _, address := range addresses {
+		endpoint := endpoints[address]
+		writeField(address)
+		// Pointer identity is the registry's endpoint-incarnation authority. An
+		// address-reused replacement must produce a different immutable lease.
+		writeField(fmt.Sprintf("%p", endpoint.endpoint))
+		operations := make([]string, 0, len(endpoint.operations))
+		for operation, enabled := range endpoint.operations {
+			if enabled {
+				operations = append(operations, string(operation))
+			}
+		}
+		sort.Strings(operations)
+		for _, operation := range operations {
+			writeField(operation)
+		}
+	}
+	var identity [sha256.Size]byte
+	copy(identity[:], h.Sum(nil))
+	return identity
 }
 
 func (p *Proxy) validateCapabilityLease(token, revision, model string, operation OperationType, authorization string) error {
@@ -1714,6 +1828,9 @@ func (p *Proxy) capabilityLeaseEndpoints(token, revision, model string, operatio
 	lease, ok := p.capabilityLeases[token]
 	if ok && !now.Before(lease.expiresAt) {
 		delete(p.capabilityLeases, token)
+		if p.capabilityLeaseByID[lease.identity] == token {
+			delete(p.capabilityLeaseByID, lease.identity)
+		}
 		ok = false
 	}
 	p.capabilityLeaseMu.Unlock()

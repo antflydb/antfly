@@ -91,6 +91,7 @@ pub const EncodedRequest = struct {
 /// mode selection. Keeping this here prevents embedded and standalone readers
 /// from accepting different requests.
 pub fn validateEncodedRequest(request: EncodedRequest) !void {
+    if (request.images.len == 0) return error.ReadBatchTooLarge;
     for (request.images) |image| {
         if (image.bytes.len == 0) return error.InvalidImageInput;
         const mime_type = std.mem.trim(u8, image.mime_type, &std.ascii.whitespace);
@@ -104,6 +105,7 @@ pub fn validateEncodedRequest(request: EncodedRequest) !void {
 
 test "encoded reader validation is execution-mode independent" {
     const bytes = [_]u8{1};
+    try std.testing.expectError(error.ReadBatchTooLarge, validateEncodedRequest(.{ .images = &.{} }));
     try validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "image/png" }} });
     try validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "IMAGE/PNG" }} });
     try validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "image/png; charset=binary" }} });

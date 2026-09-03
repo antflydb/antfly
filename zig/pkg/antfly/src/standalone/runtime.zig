@@ -5358,7 +5358,7 @@ fn inferenceProviderReadEncodedImages(
     model: []const u8,
     request: antfly.readers.EncodedRequest,
 ) anyerror![]antfly.readers.Result {
-    if (request.images.len == 0) return try alloc.alloc(antfly.readers.Result, 0);
+    if (request.images.len == 0) return error.ReadBatchTooLarge;
     var encoded = try encodedImageProviderPayloadsAlloc(alloc, request.images);
     defer encoded.deinit(alloc);
     return try invokeInferenceProviderWithBinary(
@@ -5379,10 +5379,7 @@ fn inferenceProviderReadEncodedImagesReported(
     model: []const u8,
     request: antfly.readers.EncodedRequest,
 ) anyerror!antfly.readers.BatchResult {
-    if (request.images.len == 0) return .{
-        .items = try alloc.alloc(antfly.readers.Result, 0),
-        .execution = .{},
-    };
+    if (request.images.len == 0) return error.ReadBatchTooLarge;
     var encoded = try encodedImageProviderPayloadsAlloc(alloc, request.images);
     defer encoded.deinit(alloc);
     return try invokeInferenceProviderWithBinary(
@@ -6273,9 +6270,14 @@ test "standalone encoded reader ABI round trips borrowed payloads" {
     try std.testing.expectEqual(@as(usize, 0), empty_decoded.images.len);
 
     const unused_handle: *anyopaque = @ptrFromInt(1);
-    const empty_results = try inferenceProviderReadEncodedImages(unused_handle, alloc, "florence2", empty_request);
-    defer alloc.free(empty_results);
-    try std.testing.expectEqual(@as(usize, 0), empty_results.len);
+    try std.testing.expectError(
+        error.ReadBatchTooLarge,
+        inferenceProviderReadEncodedImages(unused_handle, alloc, "florence2", empty_request),
+    );
+    try std.testing.expectError(
+        error.ReadBatchTooLarge,
+        inferenceProviderReadEncodedImagesReported(unused_handle, alloc, "florence2", empty_request),
+    );
 }
 
 test "standalone runtime local generator preflights mixed resident media exactly" {

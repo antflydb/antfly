@@ -12,9 +12,9 @@ const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const remote_capabilities = @import("../inference/remote_capabilities.zig");
 
 pub const Provider = struct {
-    ptr: *anyopaque,
-    boundary_dispatch: runtime_callback_abi.CallbackDispatch,
-    chunk_input_callback: *const anyopaque,
+    ptr: ?*anyopaque = null,
+    boundary_dispatch: ?runtime_callback_abi.CallbackDispatch = null,
+    chunk_input_callback: ?*const anyopaque = null,
     remote_capability_cache: ?*remote_capabilities.Cache = null,
     io: ?std.Io = null,
 };

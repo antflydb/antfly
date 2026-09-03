@@ -251,6 +251,10 @@ const writer_locked_retry_sleep_ns: u64 = 100_000;
 const generated_replay_default_window_items: usize = 2048;
 const generated_embed_default_batch_items: usize = 8;
 const generated_embed_default_batch_bytes: usize = 256 * 1024;
+// Text embedding batches are commonly kilobytes; rendered PDF pages are not.
+// Keeping a distinct total-media default lets a preferred eight-page image
+// batch retain the same per-page quality it would receive as a singleton.
+const generated_pdf_embed_default_batch_bytes: usize = 64 * 1024 * 1024;
 const generated_ocr_default_batch_items: usize = 8;
 const generated_ocr_default_batch_max_items: usize = 8;
 const generated_ocr_default_batch_bytes: usize = 64 * 1024 * 1024;
@@ -523,6 +527,19 @@ fn requestEmbedBatchItems(alloc: Allocator, request: enrichment_types.GeneratedE
 
 fn requestEmbedBatchBytes(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) usize {
     return enrichment_types.executionBatchBytesOrDefault(alloc, request.execution_json, generatedEmbedBatchBytes());
+}
+
+fn pdfImageEmbeddingBatchBytes(requested: ?usize, model_limit: usize) usize {
+    return @min(requested orelse generated_pdf_embed_default_batch_bytes, model_limit);
+}
+
+test "PDF image embedding has a media-sized batch byte default" {
+    try std.testing.expectEqual(
+        @as(usize, generated_pdf_embed_default_batch_bytes),
+        pdfImageEmbeddingBatchBytes(null, generated_pdf_embed_default_batch_bytes * 2),
+    );
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), pdfImageEmbeddingBatchBytes(4 * 1024 * 1024, 32 * 1024 * 1024));
+    try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), pdfImageEmbeddingBatchBytes(null, 16 * 1024 * 1024));
 }
 
 const GeneratedTextBatchPolicy = struct {
@@ -11043,7 +11060,7 @@ fn processPdfPageImageEmbedding(
     // reservation impossible under the default 256 MiB extraction budget.
     const capability_bytes = capabilities.batch.max_encoded_media_bytes;
     const batch_bytes = if (capability_bytes) |model_limit|
-        @min(policy.batch_bytes orelse model_limit, model_limit)
+        pdfImageEmbeddingBatchBytes(policy.batch_bytes, model_limit)
     else
         policy.batch_bytes orelse return error.InferenceCapabilitiesUnavailable;
     if (batch_bytes == 0) return error.InvalidInferenceCapabilities;

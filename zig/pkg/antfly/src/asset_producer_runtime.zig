@@ -197,6 +197,7 @@ pub const Runtime = struct {
     alloc: Allocator,
     http: *httpx.Client,
     capability_cache: remote_capabilities.Cache,
+    remote_capability_cache: ?*remote_capabilities.Cache = null,
     owned_http: ?*httpx.Client = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
@@ -210,6 +211,7 @@ pub const Runtime = struct {
         max_provider_response_bytes: usize = default_asset_provider_response_bytes,
         provider_response_envelope_bytes: usize = default_provider_response_envelope_bytes,
         result_limits: ResultLimits = .{},
+        remote_capability_cache: ?*remote_capabilities.Cache = null,
     };
 
     pub fn init(alloc: Allocator, http: *httpx.Client) Runtime {
@@ -221,6 +223,7 @@ pub const Runtime = struct {
             .alloc = alloc,
             .http = http,
             .capability_cache = remote_capabilities.Cache.init(alloc, http.io),
+            .remote_capability_cache = options.remote_capability_cache,
             .antfly_provider = options.antfly_provider,
             .secret_store = options.secret_store,
             .max_provider_response_bytes = options.max_provider_response_bytes,
@@ -259,6 +262,10 @@ pub const Runtime = struct {
             self.owned_http = null;
         }
         self.* = undefined;
+    }
+
+    fn capabilityCache(self: *Runtime) *remote_capabilities.Cache {
+        return self.remote_capability_cache orelse &self.capability_cache;
     }
 
     pub fn producer(self: *Runtime) asset_producer.Producer {
@@ -580,7 +587,7 @@ pub const Runtime = struct {
                         header_storage[0] = .{ "Authorization", auth_value.? };
                         break :auth &header_storage;
                     } else &.{};
-                    break :blk self.capability_cache.getOrDiscover(
+                    break :blk self.capabilityCache().getOrDiscover(
                         self.http,
                         parsed.generator.url,
                         parsed.generator.model,
@@ -719,7 +726,7 @@ pub const Runtime = struct {
                 header_storage[0] = .{ "Authorization", auth_value.? };
                 break :blk &header_storage;
             } else &.{};
-            return self.capability_cache.getOrDiscover(
+            return self.capabilityCache().getOrDiscover(
                 self.http,
                 endpoint,
                 cfg.model orelse "",
@@ -802,7 +809,7 @@ pub const Runtime = struct {
             header_storage[0] = .{ "Authorization", auth_value.? };
             break :blk &header_storage;
         } else &.{};
-        return self.capability_cache.getOrDiscover(
+        return self.capabilityCache().getOrDiscover(
             self.http,
             endpoint,
             cfg.model,
@@ -824,7 +831,7 @@ pub const Runtime = struct {
             header_storage[0] = .{ "Authorization", auth_value.? };
             break :blk &header_storage;
         } else &.{};
-        const lease = try self.capability_cache.getOrDiscoverLease(
+        const lease = try self.capabilityCache().getOrDiscoverLease(
             self.http,
             cfg.resolvedUrl().?,
             cfg.model,
@@ -844,7 +851,7 @@ pub const Runtime = struct {
             header_storage[0] = .{ "Authorization", auth_value.? };
             break :blk &header_storage;
         } else &.{};
-        try self.capability_cache.invalidate(cfg.resolvedUrl().?, cfg.model, .extract, headers);
+        try self.capabilityCache().invalidate(cfg.resolvedUrl().?, cfg.model, .extract, headers);
     }
 
     fn produceOne(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
@@ -1158,7 +1165,7 @@ pub const Runtime = struct {
             break :auth header_storage[0..1];
         } else &.{};
         var header_count = auth_headers.len;
-        const capability_lease = try self.capability_cache.getOrDiscoverLease(
+        const capability_lease = try self.capabilityCache().getOrDiscoverLease(
             self.http,
             cfg.url,
             cfg.model,
@@ -1210,7 +1217,7 @@ pub const Runtime = struct {
                 if (resp.status.code == 409 and stale_value != null and
                     std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale_value.?, " \t"), "true"))
                 {
-                    try self.capability_cache.invalidate(cfg.url, cfg.model, .generate, auth_headers);
+                    try self.capabilityCache().invalidate(cfg.url, cfg.model, .generate, auth_headers);
                     return error.InferenceCapabilitiesStale;
                 }
                 return mapAntflyGenerateBatchStatus(resp.status.code);
@@ -1272,7 +1279,7 @@ pub const Runtime = struct {
             header_storage[0] = .{ "Authorization", auth_value.? };
             break :blk &header_storage;
         } else &.{};
-        const lease = try self.capability_cache.getOrDiscoverLease(
+        const lease = try self.capabilityCache().getOrDiscoverLease(
             self.http,
             cfg.url,
             cfg.model,
@@ -1304,7 +1311,7 @@ pub const Runtime = struct {
             header_storage[0] = .{ "Authorization", auth_value.? };
             break :blk &header_storage;
         } else &.{};
-        try self.capability_cache.invalidate(cfg.url, cfg.model, .generate, headers);
+        try self.capabilityCache().invalidate(cfg.url, cfg.model, .generate, headers);
     }
 
     fn tryTranscribeBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
@@ -1679,7 +1686,7 @@ pub const Runtime = struct {
         } else &.{};
         const discovered_capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and cfg.provider == .antfly) blk: {
             const endpoint = cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
-            const lease = try self.capability_cache.getOrDiscoverLease(
+            const lease = try self.capabilityCache().getOrDiscoverLease(
                 self.http,
                 endpoint,
                 cfg.model orelse "",
@@ -1730,7 +1737,7 @@ pub const Runtime = struct {
         return provider.readReported(alloc, request) catch |err| {
             if (err == error.InferenceCapabilitiesStale and cfg.provider == .antfly) {
                 const endpoint = cfg.resolvedUrl() orelse return err;
-                try self.capability_cache.invalidate(endpoint, cfg.model orelse "", .read, capability_auth_headers);
+                try self.capabilityCache().invalidate(endpoint, cfg.model orelse "", .read, capability_auth_headers);
             }
             return err;
         };
@@ -1910,7 +1917,7 @@ pub const Runtime = struct {
         } else &.{};
         if (cfg_parsed.value.provider == .antfly) {
             const endpoint = cfg_parsed.value.resolvedUrl() orelse return error.InvalidTranscribingConfig;
-            const lease = try self.capability_cache.getOrDiscoverLease(
+            const lease = try self.capabilityCache().getOrDiscoverLease(
                 self.http,
                 endpoint,
                 cfg_parsed.value.model orelse "",
@@ -1939,7 +1946,7 @@ pub const Runtime = struct {
         var result = provider.transcribe(alloc, .{ .url = request.source_text }) catch |err| {
             if (err == error.InferenceCapabilitiesStale and cfg_parsed.value.provider == .antfly) {
                 const endpoint = cfg_parsed.value.resolvedUrl() orelse return err;
-                try self.capability_cache.invalidate(
+                try self.capabilityCache().invalidate(
                     endpoint,
                     cfg_parsed.value.model orelse "",
                     .transcribe,

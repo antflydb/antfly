@@ -785,7 +785,7 @@ pub const InferenceCapabilities = struct {
     pub fn validateInvocation(self: InferenceCapabilities, task: Task, shape: InvocationShape) !void {
         try self.validate();
         if (self.task != task) return error.InferenceTaskMismatch;
-        if (shape.item_count > 0 and !self.batch.acceptsItems(shape.item_count))
+        if (!self.batch.acceptsItems(shape.item_count))
             return error.InferenceBatchTooLarge;
         if (@as(u8, @bitCast(shape.modalities)) != 0 and !self.supports(shape.modalities))
             return error.UnsupportedInferenceModality;
@@ -1156,10 +1156,7 @@ test "inference capabilities enforce invocation resource limits" {
         error.InferenceSchemaBytesExceeded,
         capabilities.validateInvocation(.embed, .{ .item_count = 1, .modalities = .{ .image = true }, .schema_bytes = 33 }),
     );
-    try std.testing.expectError(
-        error.InferenceSchemaBytesExceeded,
-        capabilities.validateInvocation(.embed, .{ .item_count = 0, .schema_bytes = 33 }),
-    );
+    try std.testing.expectError(error.InferenceBatchTooLarge, capabilities.validateInvocation(.embed, .{ .item_count = 0 }));
     try std.testing.expectError(error.UnsupportedInferenceMimeType, capabilities.validateMimeType("image/webp"));
 }
 

@@ -5126,10 +5126,7 @@ pub const Node = struct {
         model_name: []const u8,
         request: readers_api.EncodedRequest,
     ) !readers_api.BatchResult {
-        if (request.images.len == 0) return .{
-            .items = try allocator.alloc(readers_api.Result, 0),
-            .execution = .{},
-        };
+        if (request.images.len == 0) return error.ReadBatchTooLarge;
         if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
         try readers_api.validateEncodedRequest(request);
         const max_tokens = try validateReadMaxTokens(request.max_tokens);

@@ -97,9 +97,11 @@ pub fn chunkInputWithProvider(
     input: RemoteInput,
     antfly_provider: ?chunk_provider.Provider,
 ) ![]RemoteChunk {
-    if (cfg.api_url.len == 0) if (antfly_provider) |provider| {
-        const chunk_input: ChunkInputFn = @ptrCast(@alignCast(provider.chunk_input_callback));
-        const chunks = try ChunkProviderBoundary.call("chunk_input", provider.boundary_dispatch, chunk_input, .{ provider.ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg });
+    if (cfg.api_url.len == 0) if (antfly_provider) |provider| if (provider.chunk_input_callback) |callback| {
+        const ptr = provider.ptr orelse return error.InvalidChunkProvider;
+        const dispatch = provider.boundary_dispatch orelse return error.InvalidChunkProvider;
+        const chunk_input: ChunkInputFn = @ptrCast(@alignCast(callback));
+        const chunks = try ChunkProviderBoundary.call("chunk_input", dispatch, chunk_input, .{ ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg });
         defer inference_chunker.types.freeChunks(alloc, chunks);
         return try cloneRemoteChunks(alloc, chunks);
     };

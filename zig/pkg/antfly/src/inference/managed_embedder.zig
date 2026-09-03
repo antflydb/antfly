@@ -245,6 +245,9 @@ const AntflyProviderBoundary = runtime_callback_abi.Boundary(AntflyProvider);
 
 pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
+    /// Runtime-owned cache shared by distributed task adapters. Managed
+    /// embedders borrow it; standalone callers retain an owned fallback.
+    remote_capability_cache: ?*remote_capabilities.Cache = null,
     io: ?std.Io = null,
     /// The supplied I/O executor can run the provider request and its timeout
     /// watchdog concurrently. Keep this explicit: merely having an Io value
@@ -506,7 +509,24 @@ pub const ManagedEmbeddingEntry = struct {
     burst: u32 = default_pacing_burst,
     pacer: ?*RequestPacer = null,
     antfly_provider: ?AntflyProvider = null,
+    shared_remote_capability_cache: ?*remote_capabilities.Cache = null,
     remote_capability_cache: ?remote_capabilities.Cache = null,
+
+    fn capabilityCache(self: *const ManagedEmbeddingEntry) ?*remote_capabilities.Cache {
+        if (self.shared_remote_capability_cache) |cache| return cache;
+        if (self.remote_capability_cache != null)
+            return &@constCast(self).remote_capability_cache.?;
+        return null;
+    }
+
+    fn requestOverlay(self: *const ManagedEmbeddingEntry) ManagedEmbeddingEntry {
+        var overlay = self.*;
+        // A request overlay may replace cancellation and credential caches,
+        // but it must borrow the configured entry's synchronization owner.
+        overlay.shared_remote_capability_cache = self.capabilityCache();
+        overlay.remote_capability_cache = null;
+        return overlay;
+    }
 
     fn deinit(self: *ManagedEmbeddingEntry, alloc: std.mem.Allocator) void {
         std.debug.assert(self.alloc.ptr == alloc.ptr);
@@ -528,6 +548,26 @@ pub const ManagedEmbeddingEntry = struct {
         self.* = undefined;
     }
 };
+
+test "managed embedding request overlays borrow capability cache synchronization" {
+    var entry = ManagedEmbeddingEntry{
+        .alloc = std.testing.allocator,
+        .index_name = @constCast("index"),
+        .provider = .antfly,
+        .model = @constCast("model"),
+        .base_url = @constCast("http://inference.invalid"),
+        .dimensions = 8,
+        .remote_capability_cache = remote_capabilities.Cache.init(
+            std.testing.allocator,
+            std.Io.Threaded.global_single_threaded.io(),
+        ),
+    };
+    defer entry.remote_capability_cache.?.deinit();
+
+    const overlay = entry.requestOverlay();
+    try std.testing.expect(overlay.remote_capability_cache == null);
+    try std.testing.expect(overlay.shared_remote_capability_cache.? == &entry.remote_capability_cache.?);
+}
 
 const RequestPacerScopeEntry = struct {
     key: []u8,
@@ -981,7 +1021,7 @@ pub const ManagedEmbedder = struct {
         cancellation: CancellationToken,
     ) ![]f32 {
         const configured_entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
-        var request_entry = configured_entry.*;
+        var request_entry = configured_entry.requestOverlay();
         request_entry.bedrock_credentials = .{};
         defer request_entry.bedrock_credentials.deinit(alloc);
         request_entry.auth_header_cache = .{};
@@ -1051,7 +1091,7 @@ pub const ManagedEmbedder = struct {
         cancellation: CancellationToken,
     ) ![]f32 {
         const configured_entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
-        var request_entry = configured_entry.*;
+        var request_entry = configured_entry.requestOverlay();
         request_entry.bedrock_credentials = .{};
         defer request_entry.bedrock_credentials.deinit(alloc);
         request_entry.auth_header_cache = .{};
@@ -1295,7 +1335,7 @@ pub const ManagedEmbedder = struct {
                 header_storage[0] = .{ "Authorization", auth_header.? };
                 break :blk &header_storage;
             } else &.{};
-            const cache = &@constCast(entry).remote_capability_cache.?;
+            const cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
             const discovered: ?remote_capabilities.CapabilityLease = cache.getOrDiscoverLeaseWithContext(
                 &http,
                 entry.base_url,
@@ -3555,7 +3595,11 @@ fn buildManagedEmbeddingEntry(
         .requests_per_minute = requests_per_minute,
         .burst = burst,
         .antfly_provider = antfly_provider,
-        .remote_capability_cache = if (provider == .antfly and antfly_provider == null)
+        .shared_remote_capability_cache = if (provider == .antfly and antfly_provider == null)
+            options.remote_capability_cache
+        else
+            null,
+        .remote_capability_cache = if (provider == .antfly and antfly_provider == null and options.remote_capability_cache == null)
             remote_capabilities.Cache.init(alloc, options.io orelse std.Io.Threaded.global_single_threaded.io())
         else
             null,
@@ -4472,7 +4516,7 @@ fn embedPartItemsWithEntry(
             capability_headers = &capability_header_storage;
         }
     }
-    const capability_cache = &@constCast(entry).remote_capability_cache.?;
+    const capability_cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
     const capability_lease = try capability_cache.getOrDiscoverLeaseWithContext(
         &http,
         entry.base_url,

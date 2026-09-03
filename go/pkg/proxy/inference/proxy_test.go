@@ -1746,6 +1746,67 @@ func TestScopedCatalogForwardsCallerAuthorization(t *testing.T) {
 	}
 }
 
+func TestScopedCatalogUsesRouteCapabilityCohort(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.registry.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:          "default/gemma-reader",
+		Operations:    map[OperationType]bool{"read": true},
+		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reader$`)},
+		Destinations:  []Destination{{Pool: "gpu", Weight: 1}},
+	})
+	request := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Freader&task=read", nil)
+	endpoints := p.catalogEndpointsForRequest(request, "owner/reader", "read", "")
+	if len(endpoints) != 1 || endpoints[0].Address != "http://gpu.internal" {
+		t.Fatalf("route capability cohort = %#v, want gpu endpoint only", endpoints)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Fother&task=read", nil)
+	endpoints = p.catalogEndpointsForRequest(request, "owner/other", "read", "")
+	if len(endpoints) != 1 || endpoints[0].Address != "http://cpu.internal" {
+		t.Fatalf("default capability cohort = %#v, want cpu endpoint only", endpoints)
+	}
+}
+
+func TestScopedCatalogIncludesUnknownConditionalRouteContext(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.registry.RegisterEndpoint("http://tenant-gpu.internal", "tenant-gpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:                "tenant-reader",
+		Priority:            100,
+		Operations:          map[OperationType]bool{"read": true},
+		ModelPatterns:       []*regexp.Regexp{regexp.MustCompile(`^owner/reader$`)},
+		SourceOrganizations: map[string]bool{"tenant-a": true},
+		Destinations:        []Destination{{Pool: "tenant-gpu", Weight: 1}},
+	})
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:          "general-reader",
+		Operations:    map[OperationType]bool{"read": true},
+		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reader$`)},
+		Destinations:  []Destination{{Pool: "cpu", Weight: 1}},
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Freader&task=read", nil)
+	endpoints := p.catalogEndpointsForRequest(request, "owner/reader", "read", "")
+	addresses := make(map[string]bool, len(endpoints))
+	for _, endpoint := range endpoints {
+		addresses[endpoint.Address] = true
+	}
+	if !addresses["http://tenant-gpu.internal"] || !addresses["http://cpu.internal"] || len(addresses) != 2 {
+		t.Fatalf("unknown-context capability cohort = %#v, want tenant and general endpoints", addresses)
+	}
+
+	request.Header.Set("X-Antfly-Source-Organization", "tenant-a")
+	endpoints = p.catalogEndpointsForRequest(request, "owner/reader", "read", "")
+	if len(endpoints) != 1 || endpoints[0].Address != "http://tenant-gpu.internal" {
+		t.Fatalf("exact-context capability cohort = %#v, want tenant endpoint only", endpoints)
+	}
+}
+
 func TestCapabilityLeaseConstrainsRoutingAfterEndpointAddition(t *testing.T) {
 	t.Parallel()
 
@@ -2050,7 +2111,7 @@ func TestCapabilityLeaseCapacityNeverEvictsLiveLease(t *testing.T) {
 	endpoints := capabilityEndpointSet(p.registry, p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read"))
 	var firstToken string
 	for i := 0; i < maxCapabilityLeases; i++ {
-		token, err := p.issueCapabilityLease("owner/reader", "read", "revision-a", "", endpoints)
+		token, err := p.issueCapabilityLease("owner/reader", "read", fmt.Sprintf("revision-%d", i), "", endpoints)
 		if err != nil {
 			t.Fatalf("lease %d: %v", i, err)
 		}
@@ -2058,11 +2119,36 @@ func TestCapabilityLeaseCapacityNeverEvictsLiveLease(t *testing.T) {
 			firstToken = token
 		}
 	}
-	if _, err := p.issueCapabilityLease("owner/reader", "read", "revision-a", "", endpoints); !errors.Is(err, errCapabilityLeaseCapacity) {
+	if _, err := p.issueCapabilityLease("owner/reader", "read", "overflow-revision", "", endpoints); !errors.Is(err, errCapabilityLeaseCapacity) {
 		t.Fatalf("overflow error = %v, want capacity error", err)
 	}
-	if err := p.validateCapabilityLease(firstToken, "revision-a", "owner/reader", "read", ""); err != nil {
+	if err := p.validateCapabilityLease(firstToken, "revision-0", "owner/reader", "read", ""); err != nil {
 		t.Fatalf("capacity pressure invalidated oldest live lease: %v", err)
+	}
+}
+
+func TestCapabilityLeaseRefreshReusesImmutableSnapshot(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	const address = "http://reader.internal"
+	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, address, "read", "owner/reader")
+	endpoints := capabilityEndpointSet(p.registry, p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read"))
+	first, err := p.issueCapabilityLease("owner/reader", "read", "revision-a", "Bearer caller", endpoints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxCapabilityLeases*2; i++ {
+		refreshed, refreshErr := p.issueCapabilityLease("owner/reader", "read", "revision-a", "Bearer caller", endpoints)
+		if refreshErr != nil {
+			t.Fatalf("refresh %d: %v", i, refreshErr)
+		}
+		if refreshed != first {
+			t.Fatalf("refresh %d minted token %q, want stable %q", i, refreshed, first)
+		}
+	}
+	if len(p.capabilityLeases) != 1 || len(p.capabilityLeaseByID) != 1 {
+		t.Fatalf("lease refresh retained %d tokens and %d identities", len(p.capabilityLeases), len(p.capabilityLeaseByID))
 	}
 }
 

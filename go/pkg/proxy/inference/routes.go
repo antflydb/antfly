@@ -301,6 +301,91 @@ func (rm *RouteManager) Match(req *RouteRequest) *Route {
 	return nil
 }
 
+// PotentialPoolsFor returns the route cohort that can handle an operation and
+// model. Missing source/header context is treated as unknown rather than as a
+// negative match. Routes stay priority ordered: all possibly matching routes
+// are included until a definite match makes every lower-priority route
+// unreachable. Time windows remain possible for the lifetime of a capability
+// lease because discovery and execution may straddle a window boundary.
+func (rm *RouteManager) PotentialPoolsFor(req *RouteRequest) []string {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	seen := make(map[string]bool)
+	appendRoutePools := func(out []string, route *Route) []string {
+		for _, destination := range route.Destinations {
+			if destination.Pool != "" && !seen[destination.Pool] {
+				seen[destination.Pool] = true
+				out = append(out, destination.Pool)
+			}
+		}
+		if route.Fallback != nil && route.Fallback.Action == "redirect" && route.Fallback.RedirectPool != "" && !seen[route.Fallback.RedirectPool] {
+			seen[route.Fallback.RedirectPool] = true
+			out = append(out, route.Fallback.RedirectPool)
+		}
+		return out
+	}
+	var pools []string
+	for _, route := range rm.routes {
+		if len(route.Operations) > 0 && !route.Operations[req.Operation] {
+			continue
+		}
+		if len(route.ModelPatterns) > 0 {
+			matched := false
+			for _, pattern := range route.ModelPatterns {
+				if pattern.MatchString(req.Model) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		possible := false
+		impossible := false
+		for headerName, matcher := range route.HeaderMatchers {
+			value, present := req.Headers[headerName]
+			if !present {
+				possible = true
+				continue
+			}
+			if !matcher.Matches(value) {
+				impossible = true
+				break
+			}
+		}
+		if impossible {
+			continue
+		}
+		matchSource := func(value string, accepted map[string]bool) bool {
+			if len(accepted) == 0 {
+				return true
+			}
+			if value == "" {
+				possible = true
+				return true
+			}
+			return accepted[value]
+		}
+		if !matchSource(req.SourceTable, route.SourceTables) ||
+			!matchSource(req.SourceOrganization, route.SourceOrganizations) ||
+			!matchSource(req.SourceProject, route.SourceProjects) ||
+			!matchSource(req.SourceAPIKey, route.SourceAPIKeys) {
+			continue
+		}
+		if route.TimeWindow != nil {
+			// Even a currently exact time match can change while the issued lease
+			// remains live, so retain both this route and the next definite route.
+			possible = true
+		}
+		pools = appendRoutePools(pools, route)
+		if !possible {
+			return pools
+		}
+	}
+	return pools
+}
+
 func (rm *RouteManager) matchRoute(route *Route, req *RouteRequest) bool {
 	// Match operations (if specified)
 	if len(route.Operations) > 0 {
