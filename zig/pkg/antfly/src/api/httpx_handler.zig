@@ -805,36 +805,8 @@ pub const AntflyApiHandler = struct {
         transition_error: ?anyerror = null,
         commit_error: ?anyerror = null,
         session_missing: bool = false,
+        lease_ownership_uncertain: bool = false,
         outcome: ?distributed_txn.CommitOutcome = null,
-    };
-
-    const IdempotentExecutionLeaseHeartbeat = struct {
-        registry: *transactions_api.SessionRegistry,
-        io: std.Io,
-        txn_id: db_mod.types.TxnId,
-        owner_node_id: u64,
-        interval_ns: u64,
-        stop_event: std.Io.Event = .unset,
-
-        fn run(self: *@This()) void {
-            while (!self.stop_event.isSet()) {
-                self.stop_event.waitTimeout(self.io, .{
-                    .duration = .{ .raw = std.Io.Duration.fromNanoseconds(self.interval_ns), .clock = .awake },
-                }) catch |err| switch (err) {
-                    error.Timeout => {},
-                    error.Canceled => return,
-                };
-                if (self.stop_event.isSet()) return;
-                self.registry.renewOwnedLease(
-                    self.txn_id,
-                    self.owner_node_id,
-                    platform_time.realtimeNs(),
-                ) catch |err| {
-                    std.log.warn("idempotent execution lease heartbeat stopped txn_id={x} err={s}", .{ self.txn_id, @errorName(err) });
-                    return;
-                };
-            }
-        }
     };
 
     /// The durable execution marker and the potentially blocking retained 2PC
@@ -852,12 +824,18 @@ pub const AntflyApiHandler = struct {
         cancellation: db_mod.types.CancellationToken,
         owner_node_id: u64,
         lease_renew_interval_ns: ?u64,
+        lease_ttl_ns: ?u64,
         lease_io: ?std.Io = null,
         done: std.atomic.Value(bool) = .init(false),
         result: IdempotentCommitAttempt = .{},
 
         fn run(self: *@This()) void {
             defer self.done.store(true, .release);
+            // The durable marker renews the lease using a timestamp captured
+            // during its storage transaction. Use a conservative timestamp
+            // from before that write: a slow store must shorten, never extend,
+            // the heartbeat's view of the last confirmed ownership window.
+            const execution_lease_started_ns = platform_time.realtimeNs();
             const marked = self.registry.markCommitExecutionStarted(self.alloc, self.txn_id) catch |err| {
                 self.result.transition_error = err;
                 return;
@@ -866,20 +844,36 @@ pub const AntflyApiHandler = struct {
                 self.result.session_missing = true;
                 return;
             }
-            if (self.lease_renew_interval_ns) |interval_ns| if (self.lease_io) |io| {
-                var heartbeat: IdempotentExecutionLeaseHeartbeat = .{
-                    .registry = self.registry,
-                    .io = io,
-                    .txn_id = self.txn_id,
-                    .owner_node_id = self.owner_node_id,
-                    .interval_ns = interval_ns,
-                };
-                var heartbeat_future = std.Io.async(io, IdempotentExecutionLeaseHeartbeat.run, .{&heartbeat});
-                defer {
-                    heartbeat.stop_event.set(io);
-                    heartbeat_future.await(io);
+            if (self.lease_renew_interval_ns) |interval_ns| if (self.lease_ttl_ns) |ttl_ns| if (self.lease_io) |io| {
+                var heartbeat_confirmed_at_ns = execution_lease_started_ns;
+                const heartbeat_start_ns = platform_time.realtimeNs();
+                const conservative_expiry_ns = transactions_api.sessionLeaseExpirationNs(ttl_ns, heartbeat_confirmed_at_ns);
+                if (heartbeat_start_ns +| interval_ns >= conservative_expiry_ns) {
+                    // If publishing the execution marker consumed most of the
+                    // lease, establish a fresh fenced window before invoking
+                    // externally visible transaction work. Failure after the
+                    // durable marker is ambiguous and belongs to recovery.
+                    self.registry.renewOwnedLease(self.txn_id, self.owner_node_id, heartbeat_start_ns) catch {
+                        self.result.lease_ownership_uncertain = true;
+                        return;
+                    };
+                    heartbeat_confirmed_at_ns = heartbeat_start_ns;
                 }
-                return self.commit();
+                var heartbeat = transactions_api.OwnedSessionLeaseHeartbeat.init(
+                    self.registry,
+                    io,
+                    self.txn_id,
+                    self.owner_node_id,
+                    interval_ns,
+                    ttl_ns,
+                    heartbeat_confirmed_at_ns,
+                );
+                var heartbeat_future = std.Io.async(io, transactions_api.OwnedSessionLeaseHeartbeat.run, .{&heartbeat});
+                self.commit();
+                heartbeat.stop();
+                heartbeat_future.await(io);
+                self.result.lease_ownership_uncertain = heartbeat.isLost();
+                return;
             };
             self.commit();
         }
@@ -983,6 +977,7 @@ pub const AntflyApiHandler = struct {
                 const configured = self.api_server.cfg.session_owner_lease_renew_interval_ns orelse @max(@as(u64, 1), ttl_ns / 3);
                 break :blk @max(@as(u64, 1), @min(configured, @max(@as(u64, 1), ttl_ns / 2)));
             } else null,
+            .lease_ttl_ns = self.api_server.cfg.session_owner_lease_ttl_ns,
         };
         const runtime = self.api_server.cfg.backend_runtime orelse {
             job.lease_io = ctx.io;
@@ -5218,6 +5213,8 @@ pub const AntflyApiHandler = struct {
             };
             if (execution.session_missing)
                 return try idempotentBatchError(ctx, 409, "not_applied", "operation_not_found", "durable batch operation not found", false, &txn_hex);
+            if (execution.lease_ownership_uncertain)
+                return try idempotentBatchError(ctx, 409, "unknown", "idempotency_owner_changed", "durable operation ownership could not be confirmed; retry the same request", true, &txn_hex);
             if (execution.commit_error) |err| switch (err) {
                 error.TopologyChanged, error.UnknownGroup => {
                     // These errors establish that no commit decision was
@@ -7851,7 +7848,7 @@ test "httpx post-start ambiguity preserves receipt and rejects interactive mutat
             self.commit_calls += 1;
             // This error was previously omitted from a hand-maintained catch
             // list and escaped as an untyped 500 after execution had started.
-            sleepNs(40 * std.time.ns_per_ms);
+            sleepNs(250 * std.time.ns_per_ms);
             return error.DocIdentityNamespaceMismatch;
         }
     };
@@ -7868,8 +7865,8 @@ test "httpx post-start ambiguity preserves receipt and rejects interactive mutat
     var api_server = try ApiHttpServer.initWithConfig(alloc, .{
         .deployment_mode = .standalone,
         .session_store_path = session_path,
-        .session_owner_lease_ttl_ns = 10 * std.time.ns_per_ms,
-        .session_owner_lease_renew_interval_ns = 2 * std.time.ns_per_ms,
+        .session_owner_lease_ttl_ns = 100 * std.time.ns_per_ms,
+        .session_owner_lease_renew_interval_ns = 10 * std.time.ns_per_ms,
     }, status.iface(), null, writes.source());
     defer api_server.deinit();
     var e2e_server: HttpxE2eServer = undefined;
@@ -7893,6 +7890,9 @@ test "httpx post-start ambiguity preserves receipt and rejects interactive mutat
     };
     const body = "{\"inserts\":{\"counter\":{\"value\":1}},\"sync_level\":\"write\"}";
 
+    // The active-operation heartbeat must survive a transient lease-store
+    // failure and renew again before this deliberately long commit returns.
+    api_server.txn_sessions.lease_renewal_failures_for_test = 1;
     var first = try requestWithRetry(&client, client_io.io(), .POST, batch_url, body, &headers, 20);
     defer first.deinit();
     try std.testing.expectEqual(@as(u16, 409), first.status.code);

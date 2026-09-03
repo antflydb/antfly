@@ -1113,6 +1113,12 @@ pub const ApiHttpServerConfig = struct {
 };
 
 const default_session_owner_lease_ttl_ns: u64 = 30 * std.time.ns_per_s;
+const session_lease_renewal_scan_batch = 256;
+
+fn safeSessionLeaseRenewInterval(ttl_ns: u64, configured_ns: ?u64) u64 {
+    const safety_interval_ns = @max(@as(u64, 1), ttl_ns / 3);
+    return @max(@as(u64, 1), @min(configured_ns orelse safety_interval_ns, safety_interval_ns));
+}
 
 /// A durable receipt without a fenced owner lease cannot be recovered safely
 /// after a process restart: the persisted process incarnation changes, while
@@ -1123,8 +1129,10 @@ fn withDurableSessionLeaseDefaults(input: ApiHttpServerConfig) ApiHttpServerConf
     if (cfg.session_store != null or cfg.session_store_path != null) {
         if (cfg.session_owner_lease_ttl_ns == null)
             cfg.session_owner_lease_ttl_ns = default_session_owner_lease_ttl_ns;
-        if (cfg.session_owner_lease_renew_interval_ns == null)
-            cfg.session_owner_lease_renew_interval_ns = @max(@as(u64, 1), cfg.session_owner_lease_ttl_ns.? / 3);
+        cfg.session_owner_lease_renew_interval_ns = safeSessionLeaseRenewInterval(
+            cfg.session_owner_lease_ttl_ns.?,
+            cfg.session_owner_lease_renew_interval_ns,
+        );
     }
     return cfg;
 }
@@ -2680,6 +2688,11 @@ pub const ApiHttpServer = struct {
     restore_leadership_term: std.atomic.Value(u64) = .init(0),
     session_maintenance_owner_id: u64 = 0,
     session_maintenance_in_flight: std.atomic.Value(bool) = .init(false),
+    session_lease_renewal_owner_id: u64 = 0,
+    session_lease_renewal_in_flight: std.atomic.Value(bool) = .init(false),
+    session_maintenance_pause_for_test: std.atomic.Value(bool) = .init(false),
+    session_maintenance_entered_for_test: std.atomic.Value(bool) = .init(false),
+    session_maintenance_release_for_test: std.atomic.Value(bool) = .init(false),
     backup_maintenance_owner_id: u64 = 0,
     index_installation_owner_id: u64 = 0,
     index_installation_closing: std.atomic.Value(bool) = .init(false),
@@ -2718,6 +2731,7 @@ pub const ApiHttpServer = struct {
         repair: u64 = 0,
         restore: u64 = 0,
         session_maintenance: u64 = 0,
+        session_lease_renewal: u64 = 0,
         backup_maintenance: u64 = 0,
         index_installation: u64 = 0,
         incoming_graph_routes: u64 = 0,
@@ -2730,12 +2744,14 @@ pub const ApiHttpServer = struct {
             if (ids.repair != 0) active.durable_jobs.closeOwner(ids.repair);
             if (ids.restore != 0) active.durable_jobs.closeOwner(ids.restore);
             if (ids.session_maintenance != 0) active.durable_jobs.closeOwner(ids.session_maintenance);
+            if (ids.session_lease_renewal != 0) active.durable_jobs.closeOwner(ids.session_lease_renewal);
             if (ids.backup_maintenance != 0) active.durable_jobs.closeOwner(ids.backup_maintenance);
             if (ids.index_installation != 0) active.durable_jobs.closeOwner(ids.index_installation);
         }
         ids.repair = try active.allocOwnerId();
         ids.restore = try active.allocOwnerId();
         ids.session_maintenance = try active.allocOwnerId();
+        ids.session_lease_renewal = try active.allocOwnerId();
         ids.backup_maintenance = try active.allocOwnerId();
         ids.index_installation = try active.allocOwnerId();
         ids.incoming_graph_routes = try active.allocOwnerId();
@@ -2891,6 +2907,7 @@ pub const ApiHttpServer = struct {
             .repair_job_owner_id = owner_ids.repair,
             .restore_job_owner_id = .init(owner_ids.restore),
             .session_maintenance_owner_id = owner_ids.session_maintenance,
+            .session_lease_renewal_owner_id = owner_ids.session_lease_renewal,
             .backup_maintenance_owner_id = owner_ids.backup_maintenance,
             .index_installation_owner_id = owner_ids.index_installation,
             .connections_cache = connections_api.Cache.init(owner_alloc),
@@ -3152,6 +3169,7 @@ pub const ApiHttpServer = struct {
                 if (owner_ids.repair != 0) runtime.durable_jobs.closeOwner(owner_ids.repair);
                 if (owner_ids.restore != 0) runtime.durable_jobs.closeOwner(owner_ids.restore);
                 if (owner_ids.session_maintenance != 0) runtime.durable_jobs.closeOwner(owner_ids.session_maintenance);
+                if (owner_ids.session_lease_renewal != 0) runtime.durable_jobs.closeOwner(owner_ids.session_lease_renewal);
                 if (owner_ids.backup_maintenance != 0) runtime.durable_jobs.closeOwner(owner_ids.backup_maintenance);
                 if (owner_ids.index_installation != 0) runtime.durable_jobs.closeOwner(owner_ids.index_installation);
             }
@@ -3266,6 +3284,7 @@ pub const ApiHttpServer = struct {
             const restore_owner_id = self.restore_job_owner_id.load(.acquire);
             if (restore_owner_id != 0) runtime.durable_jobs.closeOwner(restore_owner_id);
             if (self.session_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_maintenance_owner_id);
+            if (self.session_lease_renewal_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_lease_renewal_owner_id);
             if (self.backup_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.backup_maintenance_owner_id);
             if (self.index_installation_owner_id != 0) runtime.durable_jobs.closeOwner(self.index_installation_owner_id);
         }
@@ -3614,6 +3633,15 @@ pub const ApiHttpServer = struct {
         // primary-local. Their mutating routes are rejected in continuous HA,
         // and their cleanup/resume loop must remain frozen for the same reason.
         if (!self.mutationBackgroundExecutionPermitted()) return;
+        // Renew before any potentially blocking recovery and keep the normal
+        // scheduler's renewal job independent from this maintenance worker.
+        // The inline call is a fallback for manual runtimes and direct users.
+        try self.maybeRenewOwnedSessionLeases();
+        if (comptime builtin.is_test) if (self.session_maintenance_pause_for_test.load(.acquire)) {
+            self.session_maintenance_entered_for_test.store(true, .release);
+            while (!self.session_maintenance_release_for_test.load(.acquire))
+                sleepNs(std.time.ns_per_ms);
+        };
         // Queue insertion is durable in server memory even when the bounded
         // executor temporarily rejects the worker submission. The periodic
         // supervisor is the independent wake source that makes such an
@@ -3626,7 +3654,6 @@ pub const ApiHttpServer = struct {
             std.log.warn("failed to advance stable transaction recovery err={s}", .{@errorName(err)});
         };
         try self.maybeCleanupExpiredSessions();
-        try self.maybeRenewOwnedSessionLeases();
         // Durable named-index cancellation is correctness work, not a client
         // polling obligation. Advance at most one queued pass per supervisor
         // tick; the repair-job FIFO and BackendRuntime maintenance queue keep
@@ -3668,55 +3695,9 @@ pub const ApiHttpServer = struct {
         }) orelse return;
     }
 
-    const SessionRecoveryLeaseHeartbeat = struct {
-        server: *ApiHttpServer,
-        io: std.Io,
-        txn_id: db_mod.types.TxnId,
-        owner_node_id: u64,
-        interval_ns: u64,
-        stop_event: std.Io.Event = .unset,
-        lost: std.atomic.Value(bool) = .init(false),
-        expires_at_ns: std.atomic.Value(u64),
-
-        fn renew(self: *@This()) !void {
-            const now_ns = platform_time.realtimeNs();
-            try self.server.txn_sessions.renewOwnedLease(self.txn_id, self.owner_node_id, now_ns);
-            self.expires_at_ns.store(self.server.sessionRecoveryLeaseExpirationNs(now_ns).?, .release);
-        }
-
-        fn run(self: *@This()) void {
-            while (!self.stop_event.isSet()) {
-                self.stop_event.waitTimeout(self.io, .{
-                    .duration = .{
-                        .raw = std.Io.Duration.fromNanoseconds(self.interval_ns),
-                        .clock = .awake,
-                    },
-                }) catch |err| switch (err) {
-                    error.Timeout => {},
-                    error.Canceled => {
-                        if (self.stop_event.isSet()) return;
-                        self.lost.store(true, .release);
-                        return;
-                    },
-                };
-                if (self.stop_event.isSet()) return;
-                self.renew() catch |err| {
-                    if (err == error.SessionLeaseLost or
-                        platform_time.realtimeNs() >= self.expires_at_ns.load(.acquire))
-                    {
-                        self.lost.store(true, .release);
-                        return;
-                    }
-                    std.log.warn("stable transaction recovery lease renewal deferred txn_id={x} err={s}", .{ self.txn_id, @errorName(err) });
-                };
-            }
-        }
-    };
-
     fn sessionRecoveryLeaseRenewInterval(self: *const ApiHttpServer) ?u64 {
         const ttl_ns = self.sessionRecoveryLeaseDurationNs() orelse return null;
-        const configured = self.cfg.session_owner_lease_renew_interval_ns orelse @max(@as(u64, 1), ttl_ns / 3);
-        return @max(@as(u64, 1), @min(configured, @max(@as(u64, 1), ttl_ns / 2)));
+        return safeSessionLeaseRenewInterval(ttl_ns, self.cfg.session_owner_lease_renew_interval_ns);
     }
 
     fn sessionRecoveryLeaseDurationNs(self: *const ApiHttpServer) ?u64 {
@@ -3730,11 +3711,7 @@ pub const ApiHttpServer = struct {
 
     fn sessionRecoveryLeaseExpirationNs(self: *const ApiHttpServer, now_ns: u64) ?u64 {
         const configured_ns = self.cfg.session_owner_lease_ttl_ns orelse return null;
-        const storage_duration_ns = transactions_api.sessionLeaseStorageTtlMs(configured_ns) *| std.time.ns_per_ms;
-        // Durable lease timestamps have millisecond resolution. Mirror the
-        // stored floor and its rounding guard exactly instead of tracking an
-        // optimistic local expiry.
-        return (now_ns / std.time.ns_per_ms) *| std.time.ns_per_ms +| storage_duration_ns;
+        return transactions_api.sessionLeaseExpirationNs(configured_ns, now_ns);
     }
 
     fn retryPendingTransactionRecovery(self: *ApiHttpServer, limit: usize) !void {
@@ -3759,20 +3736,21 @@ pub const ApiHttpServer = struct {
             }) orelse continue;
             defer recovery.deinit(self.alloc);
             if (self.sessionRecoveryLeaseRenewInterval()) |interval_ns| if (recovery_io) |io| {
-                var heartbeat: SessionRecoveryLeaseHeartbeat = .{
-                    .server = self,
-                    .io = io,
-                    .txn_id = txn_id,
-                    .owner_node_id = local_node_id,
-                    .interval_ns = interval_ns,
-                    .expires_at_ns = .init(self.sessionRecoveryLeaseExpirationNs(claim_now_ns).?),
-                };
-                var heartbeat_future = std.Io.async(io, SessionRecoveryLeaseHeartbeat.run, .{&heartbeat});
-                defer {
-                    heartbeat.stop_event.set(io);
-                    heartbeat_future.await(io);
-                }
+                var heartbeat = transactions_api.OwnedSessionLeaseHeartbeat.init(
+                    &self.txn_sessions,
+                    io,
+                    txn_id,
+                    local_node_id,
+                    interval_ns,
+                    self.cfg.session_owner_lease_ttl_ns.?,
+                    claim_now_ns,
+                );
+                var heartbeat_future = std.Io.async(io, transactions_api.OwnedSessionLeaseHeartbeat.run, .{&heartbeat});
                 self.advanceClaimedTransactionRecovery(source, txn_id, &recovery);
+                heartbeat.stop();
+                heartbeat_future.await(io);
+                if (heartbeat.isLost())
+                    std.log.warn("stable transaction recovery lost its owner lease txn_id={x}", .{txn_id});
                 continue;
             };
             self.advanceClaimedTransactionRecovery(source, txn_id, &recovery);
@@ -3922,7 +3900,70 @@ pub const ApiHttpServer = struct {
         }
     };
 
+    const SessionLeaseRenewalWork = struct {
+        server: *ApiHttpServer,
+
+        fn run(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.server.renewOwnedSessionLeasesNow() catch |err| {
+                // Permit the runtime loop to retry immediately instead of
+                // suppressing renewal for a full interval after a failed pass.
+                self.server.last_session_lease_renew_ns.store(0, .release);
+                return err;
+            };
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.server.session_lease_renewal_in_flight.store(false, .release);
+            self.server.alloc.destroy(self);
+        }
+    };
+
+    fn scheduleSessionLeaseRenewal(self: *ApiHttpServer) !void {
+        if (self.cfg.session_owner_lease_ttl_ns == null or
+            self.cfg.session_owner_lease_renew_interval_ns == null) return;
+        if (self.session_lease_renewal_in_flight.load(.acquire)) return;
+        if (!self.claimSessionLeaseRenewalDue()) return;
+        const runtime = self.cfg.backend_runtime orelse {
+            self.renewOwnedSessionLeasesNow() catch |err| {
+                self.last_session_lease_renew_ns.store(0, .release);
+                return err;
+            };
+            return;
+        };
+        if (runtime.threaded_jobs == null or self.session_lease_renewal_owner_id == 0) {
+            self.renewOwnedSessionLeasesNow() catch |err| {
+                self.last_session_lease_renew_ns.store(0, .release);
+                return err;
+            };
+            return;
+        }
+        if (self.session_lease_renewal_in_flight.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        const work = self.alloc.create(SessionLeaseRenewalWork) catch |err| {
+            self.session_lease_renewal_in_flight.store(false, .release);
+            self.last_session_lease_renew_ns.store(0, .release);
+            return err;
+        };
+        work.* = .{ .server = self };
+        runtime.durable_jobs.submit(.{
+            .owner_id = self.session_lease_renewal_owner_id,
+            .class = .commit_durable,
+            .ptr = work,
+            .run = SessionLeaseRenewalWork.run,
+            .deinit = SessionLeaseRenewalWork.deinit,
+        }) catch |err| {
+            self.alloc.destroy(work);
+            self.session_lease_renewal_in_flight.store(false, .release);
+            self.last_session_lease_renew_ns.store(0, .release);
+            return err;
+        };
+    }
+
     pub fn scheduleSessionMaintenance(self: *ApiHttpServer) !void {
+        // Ownership fencing has its own in-flight job and owner. A slow 2PC
+        // recovery pass must never delay the next lease-renewal deadline.
+        try self.scheduleSessionLeaseRenewal();
         // The data runtime can complete many rounds per second. Rate-limit
         // submission before allocating work so an idle server does not churn
         // cleanup jobs. The worker's per-task clocks retain the configured
@@ -9982,21 +10023,43 @@ pub const ApiHttpServer = struct {
     }
 
     fn maybeRenewOwnedSessionLeases(self: *ApiHttpServer) !void {
-        const ttl_ns = self.cfg.session_owner_lease_ttl_ns orelse return;
-        _ = ttl_ns;
-        const interval_ns = self.cfg.session_owner_lease_renew_interval_ns orelse return;
-        const owner_node_id = self.localSessionNodeId();
+        if (!self.claimSessionLeaseRenewalDue()) return;
+        self.renewOwnedSessionLeasesNow() catch |err| {
+            self.last_session_lease_renew_ns.store(0, .release);
+            return err;
+        };
+    }
+
+    fn claimSessionLeaseRenewalDue(self: *ApiHttpServer) bool {
+        const interval_ns = self.cfg.session_owner_lease_renew_interval_ns orelse return false;
         const schedule_now_ns = platform_time.monotonicNs();
         const previous_ns = self.last_session_lease_renew_ns.load(.acquire);
-        if (previous_ns != 0 and schedule_now_ns -| previous_ns < interval_ns) return;
-        self.last_session_lease_renew_ns.store(schedule_now_ns, .release);
+        if (previous_ns != 0 and schedule_now_ns -| previous_ns < interval_ns) return false;
+        return self.last_session_lease_renew_ns.cmpxchgStrong(
+            previous_ns,
+            schedule_now_ns,
+            .acq_rel,
+            .acquire,
+        ) == null;
+    }
+
+    fn renewOwnedSessionLeasesNow(self: *ApiHttpServer) !void {
+        if (self.cfg.session_owner_lease_ttl_ns == null) return;
+        const owner_node_id = self.localSessionNodeId();
         // Lease expirations are durable and compared across processes, so they
         // must use the Unix realtime epoch. Monotonic time is only valid for
         // deciding when this process should run another renewal pass.
-        _ = self.txn_sessions.renewOwnedLeases(owner_node_id, platform_time.realtimeNs()) catch |err| switch (err) {
+        const batch = self.txn_sessions.renewOwnedLeaseBatch(
+            owner_node_id,
+            platform_time.realtimeNs(),
+            session_lease_renewal_scan_batch,
+        ) catch |err| switch (err) {
             error.SessionLeaseLost => return,
             else => return err,
         };
+        // Continue a large active set on the next runtime tick instead of
+        // monopolizing one worker or allocating an unbounded snapshot.
+        if (batch.has_more) self.last_session_lease_renew_ns.store(0, .release);
     }
 
     pub const SessionForwardRequest = struct {
@@ -26511,12 +26574,18 @@ test "stable transaction recovery heartbeat interval stays inside the lease" {
     const durable_defaults = withDurableSessionLeaseDefaults(.{ .session_store_path = "/tmp/unused-session-store" });
     try std.testing.expectEqual(@as(?u64, default_session_owner_lease_ttl_ns), durable_defaults.session_owner_lease_ttl_ns);
     try std.testing.expectEqual(@as(?u64, default_session_owner_lease_ttl_ns / 3), durable_defaults.session_owner_lease_renew_interval_ns);
+    const clamped = withDurableSessionLeaseDefaults(.{
+        .session_store_path = "/tmp/unused-session-store",
+        .session_owner_lease_ttl_ns = 10 * std.time.ns_per_ms,
+        .session_owner_lease_renew_interval_ns = std.time.ns_per_s,
+    });
+    try std.testing.expectEqual(@as(?u64, (10 * std.time.ns_per_ms) / 3), clamped.session_owner_lease_renew_interval_ns);
     var server = ApiHttpServer.init(std.testing.allocator, .{
         .session_owner_lease_ttl_ns = 10 * std.time.ns_per_ms,
         .session_owner_lease_renew_interval_ns = std.time.ns_per_s,
     }, source.iface(), null, null);
     defer server.deinit();
-    try std.testing.expectEqual(@as(?u64, 5 * std.time.ns_per_ms), server.sessionRecoveryLeaseRenewInterval());
+    try std.testing.expectEqual(@as(?u64, (10 * std.time.ns_per_ms) / 3), server.sessionRecoveryLeaseRenewInterval());
     const edge_now = std.time.ns_per_ms - 1;
     try std.testing.expect(
         server.sessionRecoveryLeaseExpirationNs(edge_now).? - edge_now >= 10 * std.time.ns_per_ms,
@@ -33312,6 +33381,71 @@ test "api http server can renew owned session leases via explicit maintenance ho
     defer adopter.deinit();
 
     try std.testing.expect(!(try adopter.tryAdoptSession(txn_id)));
+}
+
+test "session lease renewal remains independent while recovery is blocked" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const alloc = std.testing.allocator;
+    const session_path = "/tmp/antfly-api-independent-session-lease-renewal";
+    var cleanup_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer cleanup_io.deinit();
+    std.Io.Dir.cwd().deleteTree(cleanup_io.io(), session_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(cleanup_io.io(), session_path) catch {};
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var source = FakeSource{};
+    var server = try ApiHttpServer.initWithConfig(alloc, .{
+        .deployment_mode = .standalone,
+        .backend_runtime = runtime.ptr(),
+        .session_store_path = session_path,
+        .session_owner_lease_ttl_ns = 100 * std.time.ns_per_ms,
+        .session_owner_lease_renew_interval_ns = 5 * std.time.ns_per_ms,
+    }, source.iface(), null, null);
+    defer {
+        server.session_maintenance_release_for_test.store(true, .release);
+        server.deinit();
+    }
+
+    const idle = try server.txn_sessions.begin(alloc, .{}, 0);
+    const initial_expiry = (try server.txn_sessions.getStatus(alloc, idle.txn_id)).?.lease_expires_at;
+    server.session_maintenance_pause_for_test.store(true, .release);
+    server.last_session_lease_renew_ns.store(0, .release);
+    try server.scheduleSessionMaintenance();
+    const wait_deadline = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+    while (!server.session_maintenance_entered_for_test.load(.acquire) and platform_time.monotonicNs() < wait_deadline)
+        sleepNs(std.time.ns_per_ms);
+    try std.testing.expect(server.session_maintenance_entered_for_test.load(.acquire));
+
+    var first_expiry = initial_expiry;
+    while (first_expiry <= initial_expiry and platform_time.monotonicNs() < wait_deadline) {
+        sleepNs(std.time.ns_per_ms);
+        first_expiry = (try server.txn_sessions.getStatus(alloc, idle.txn_id)).?.lease_expires_at;
+    }
+    try std.testing.expect(first_expiry > initial_expiry);
+
+    sleepNs(8 * std.time.ns_per_ms);
+    try server.scheduleSessionMaintenance();
+    var second_expiry = first_expiry;
+    while (second_expiry <= first_expiry and platform_time.monotonicNs() < wait_deadline) {
+        sleepNs(std.time.ns_per_ms);
+        second_expiry = (try server.txn_sessions.getStatus(alloc, idle.txn_id)).?.lease_expires_at;
+    }
+    try std.testing.expect(second_expiry > first_expiry);
+    try std.testing.expect(server.session_maintenance_in_flight.load(.acquire));
+    server.session_maintenance_release_for_test.store(true, .release);
+    while (server.session_maintenance_in_flight.load(.acquire) and platform_time.monotonicNs() < wait_deadline)
+        sleepNs(std.time.ns_per_ms);
+    try std.testing.expect(!server.session_maintenance_in_flight.load(.acquire));
 }
 
 test "api http server keeps session maintenance off internal request paths" {

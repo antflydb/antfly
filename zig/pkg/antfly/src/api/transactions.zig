@@ -1713,6 +1713,7 @@ pub const SessionRegistry = struct {
     mutex: AtomicMutex = .{},
     session_locks: [session_lock_count]AtomicMutex = [_]AtomicMutex{.{}} ** session_lock_count,
     sessions: std.AutoHashMapUnmanaged(db_mod.types.TxnId, Session) = .empty,
+    lease_renewal_candidates: std.AutoHashMapUnmanaged(db_mod.types.TxnId, SessionKind) = .empty,
     durable: ?*DurableSessionStore = null,
     lease_store: ?SessionLeaseStore = null,
     owner_lease_ttl_ns: ?u64 = null,
@@ -1729,6 +1730,11 @@ pub const SessionRegistry = struct {
     expiry_cleanup_cursors: [2]?SessionExpiryCursor = .{ null, null },
     expiry_namespace_cursor: SessionKind = .interactive,
     memory_recovery_scan_offset: usize = 0,
+    lease_renewal_scan_offset: usize = 0,
+    /// Test-only fault injection for deadline-aware heartbeat coverage. The
+    /// transaction stripe serializes access, just like the lease mutation it
+    /// precedes.
+    lease_renewal_failures_for_test: usize = 0,
 
     pub fn init(durable: ?*DurableSessionStore) SessionRegistry {
         return initWithOptions(durable, null, null, null, null, null);
@@ -1761,6 +1767,7 @@ pub const SessionRegistry = struct {
         var it = self.sessions.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(alloc);
         self.sessions.deinit(alloc);
+        self.lease_renewal_candidates.deinit(alloc);
         self.* = .{};
     }
 
@@ -1820,6 +1827,10 @@ pub const SessionRegistry = struct {
             self.mutex.unlock();
             return err;
         };
+        if (self.shouldTrackLeaseRenewal(session)) self.lease_renewal_candidates.ensureUnusedCapacity(alloc, 1) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
         self.reserved_session_count += 1;
         self.mutex.unlock();
         var reservation_active = true;
@@ -1837,6 +1848,8 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.sessions.putAssumeCapacity(txn_id, session);
+        if (self.shouldTrackLeaseRenewal(session))
+            self.lease_renewal_candidates.putAssumeCapacity(txn_id, sessionKind(session));
         session_owned = false;
         self.reserved_session_count -= 1;
         reservation_active = false;
@@ -1904,6 +1917,10 @@ pub const SessionRegistry = struct {
             self.mutex.unlock();
             return err;
         };
+        if (self.shouldTrackLeaseRenewal(session)) self.lease_renewal_candidates.ensureUnusedCapacity(alloc, 1) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
         self.reserved_session_count += 1;
         self.mutex.unlock();
         var reservation_active = true;
@@ -1938,6 +1955,8 @@ pub const SessionRegistry = struct {
 
         self.mutex.lock();
         self.sessions.putAssumeCapacity(txn_id, session);
+        if (self.shouldTrackLeaseRenewal(session))
+            self.lease_renewal_candidates.putAssumeCapacity(txn_id, sessionKind(session));
         self.reserved_session_count -= 1;
         if (self.known_durable_session_count) |count| self.known_durable_session_count = count + 1;
         self.mutex.unlock();
@@ -2016,7 +2035,7 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
-        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        try self.publishCandidateLocked(alloc, publish_target, &candidate);
         return publish_target.info();
     }
 
@@ -2062,7 +2081,7 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
-        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        try self.publishCandidateLocked(alloc, publish_target, &candidate);
         return publish_target.info();
     }
 
@@ -2122,7 +2141,7 @@ pub const SessionRegistry = struct {
                 self.mutex.unlock();
                 return error.SessionRemovedDuringMutation;
             };
-            self.publishCandidateLocked(alloc, publish_target, &candidate);
+            try self.publishCandidateLocked(alloc, publish_target, &candidate);
             self.mutex.unlock();
             candidate_owned = false;
             return error.UnsealedIdempotencyReceipt;
@@ -2138,7 +2157,7 @@ pub const SessionRegistry = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
-            self.publishCandidateLocked(alloc, publish_target, &candidate);
+            try self.publishCandidateLocked(alloc, publish_target, &candidate);
             return out;
         }
         var out: OwnedTransactionCommitRequest = if (candidate.staged) |staged|
@@ -2161,7 +2180,7 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
-        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        try self.publishCandidateLocked(alloc, publish_target, &candidate);
         return out;
     }
 
@@ -2226,7 +2245,7 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
-        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        try self.publishCandidateLocked(alloc, publish_target, &candidate);
         return .recorded;
     }
 
@@ -2261,7 +2280,7 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
-        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        try self.publishCandidateLocked(alloc, publish_target, &candidate);
         return {};
     }
 
@@ -2313,7 +2332,7 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
-        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        try self.publishCandidateLocked(alloc, publish_target, &candidate);
         return {};
     }
 
@@ -2339,7 +2358,7 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
-        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        try self.publishCandidateLocked(alloc, publish_target, &candidate);
         return {};
     }
 
@@ -2367,7 +2386,7 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
-        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        try self.publishCandidateLocked(alloc, publish_target, &candidate);
         return {};
     }
 
@@ -2648,7 +2667,7 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
-        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        try self.publishCandidateLocked(alloc, publish_target, &candidate);
         return .{ .txn_id = txn_id, .savepoint_id = savepoint_id };
     }
 
@@ -2671,7 +2690,7 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
-        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        try self.publishCandidateLocked(alloc, publish_target, &candidate);
         return .{ .txn_id = txn_id, .savepoint_id = savepoint_id };
     }
 
@@ -2945,6 +2964,7 @@ pub const SessionRegistry = struct {
             if (self.sessions.fetchRemove(txn_id)) |removed| {
                 var session = removed.value;
                 session.deinit(alloc);
+                _ = self.lease_renewal_candidates.remove(txn_id);
                 removed_count += 1;
             }
             self.mutex.unlock();
@@ -3002,6 +3022,7 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const removed = self.sessions.fetchRemove(txn_id) orelse return;
+        _ = self.lease_renewal_candidates.remove(txn_id);
         var session = removed.value;
         session.deinit(alloc);
     }
@@ -3023,11 +3044,27 @@ pub const SessionRegistry = struct {
         }
     }
 
-    fn publishCandidateLocked(self: *SessionRegistry, alloc: std.mem.Allocator, current: *Session, candidate: *Session) void {
-        _ = self;
+    fn publishCandidateLocked(self: *SessionRegistry, alloc: std.mem.Allocator, current: *Session, candidate: *Session) !void {
+        try self.syncLeaseRenewalCandidateLocked(alloc, candidate.*);
         var previous = current.*;
         current.* = candidate.*;
         previous.deinit(alloc);
+    }
+
+    fn shouldTrackLeaseRenewal(self: *const SessionRegistry, session: Session) bool {
+        return self.durable != null and
+            self.lease_store != null and
+            self.owner_lease_ttl_ns != null and
+            session.owner_incarnation == self.owner_incarnation and
+            sessionNeedsLeaseRenewal(session);
+    }
+
+    fn syncLeaseRenewalCandidateLocked(self: *SessionRegistry, alloc: std.mem.Allocator, session: Session) !void {
+        if (self.shouldTrackLeaseRenewal(session)) {
+            try self.lease_renewal_candidates.put(alloc, session.txn_id, sessionKind(session));
+        } else {
+            _ = self.lease_renewal_candidates.remove(session.txn_id);
+        }
     }
 
     /// Publishes an authoritative durable ownership transition into this
@@ -3040,11 +3077,19 @@ pub const SessionRegistry = struct {
     ) !void {
         self.mutex.lock();
         if (self.sessions.getPtr(txn_id)) |current| {
-            self.publishCandidateLocked(alloc, current, candidate);
+            self.publishCandidateLocked(alloc, current, candidate) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
             self.mutex.unlock();
             return;
         }
+        self.syncLeaseRenewalCandidateLocked(alloc, candidate.*) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
         self.sessions.put(alloc, txn_id, candidate.*) catch |err| {
+            _ = self.lease_renewal_candidates.remove(txn_id);
             self.mutex.unlock();
             return err;
         };
@@ -3178,9 +3223,17 @@ pub const SessionRegistry = struct {
             // ownership before the caller attempts a fenced mutation.
             self.mutex.lock();
             if (self.sessions.getPtr(txn_id)) |current| {
-                self.publishCandidateLocked(alloc, current, &cached);
+                self.publishCandidateLocked(alloc, current, &cached) catch |err| {
+                    self.mutex.unlock();
+                    return err;
+                };
             } else {
+                self.syncLeaseRenewalCandidateLocked(alloc, cached) catch |err| {
+                    self.mutex.unlock();
+                    return err;
+                };
                 self.sessions.put(alloc, txn_id, cached) catch |err| {
+                    _ = self.lease_renewal_candidates.remove(txn_id);
                     self.mutex.unlock();
                     return err;
                 };
@@ -3210,38 +3263,63 @@ pub const SessionRegistry = struct {
             loaded_owned = false;
             return try session.clone(alloc);
         }
-        try self.sessions.put(alloc, txn_id, loaded);
+        try self.syncLeaseRenewalCandidateLocked(alloc, loaded);
+        self.sessions.put(alloc, txn_id, loaded) catch |err| {
+            _ = self.lease_renewal_candidates.remove(txn_id);
+            return err;
+        };
         loaded_owned = false;
         return try self.sessions.getPtr(txn_id).?.clone(alloc);
     }
 
-    pub fn renewOwnedLeases(self: *SessionRegistry, owner_node_id: u64, now_ns: u64) !usize {
+    pub const LeaseRenewalBatch = struct {
+        renewed: usize,
+        has_more: bool,
+    };
+
+    pub fn renewOwnedLeaseBatch(
+        self: *SessionRegistry,
+        owner_node_id: u64,
+        now_ns: u64,
+        scan_limit: usize,
+    ) !LeaseRenewalBatch {
         const Renewal = struct {
             txn_id: db_mod.types.TxnId,
             kind: SessionKind,
         };
+        const durable = self.durable orelse return .{ .renewed = 0, .has_more = false };
         var renewals = std.ArrayListUnmanaged(Renewal).empty;
-        defer renewals.deinit(self.durable.?.alloc);
+        defer renewals.deinit(durable.alloc);
         self.mutex.lock();
-        if (self.lease_store == null or self.owner_lease_ttl_ns == null or self.durable == null) {
+        if (self.lease_store == null or self.owner_lease_ttl_ns == null) {
             self.mutex.unlock();
-            return 0;
+            return .{ .renewed = 0, .has_more = false };
         }
-        var it = self.sessions.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.owner_node_id != owner_node_id or
-                entry.value_ptr.owner_incarnation != self.owner_incarnation) continue;
-            renewals.append(self.durable.?.alloc, .{
+        var it = self.lease_renewal_candidates.iterator();
+        var scan_offset = self.lease_renewal_scan_offset;
+        var skipped: usize = 0;
+        while (skipped < scan_offset and it.next() != null) skipped += 1;
+        if (skipped < scan_offset) {
+            scan_offset = 0;
+            it = self.lease_renewal_candidates.iterator();
+        }
+        var scanned: usize = 0;
+        while (scanned < @max(scan_limit, 1)) : (scanned += 1) {
+            const entry = it.next() orelse break;
+            renewals.append(durable.alloc, .{
                 .txn_id = entry.key_ptr.*,
-                .kind = sessionKind(entry.value_ptr.*),
+                .kind = entry.value_ptr.*,
             }) catch |err| {
                 self.mutex.unlock();
                 return err;
             };
         }
+        const has_more = scanned == @max(scan_limit, 1) and it.next() != null;
+        self.lease_renewal_scan_offset = if (has_more) scan_offset +| scanned else 0;
         self.mutex.unlock();
 
         var renewed: usize = 0;
+        var deferred_error: ?anyerror = null;
         for (renewals.items) |renewal| {
             const session_lock = self.sessionLock(renewal.txn_id);
             session_lock.lock();
@@ -3255,10 +3333,28 @@ pub const SessionRegistry = struct {
             } else null;
             self.mutex.unlock();
             if (incarnation == null) continue;
-            try self.renewLeaseLockedAt(renewal.txn_id, renewal.kind, owner_node_id, incarnation.?, now_ns);
+            self.renewLeaseLockedAt(renewal.txn_id, renewal.kind, owner_node_id, incarnation.?, now_ns) catch |err| {
+                // A stale cached owner is local work to forget, not a reason to
+                // suppress renewal for the rest of the batch. Other storage
+                // failures are reported after every independent lease had its
+                // chance to advance.
+                if (err != error.SessionLeaseLost and deferred_error == null)
+                    deferred_error = err;
+                continue;
+            };
             renewed += 1;
         }
-        return renewed;
+        if (deferred_error) |err| return err;
+        return .{ .renewed = renewed, .has_more = has_more };
+    }
+
+    pub fn renewOwnedLeases(self: *SessionRegistry, owner_node_id: u64, now_ns: u64) !usize {
+        var renewed: usize = 0;
+        while (true) {
+            const batch = try self.renewOwnedLeaseBatch(owner_node_id, now_ns, 256);
+            renewed +|= batch.renewed;
+            if (!batch.has_more) return renewed;
+        }
     }
 
     /// Renews one claimed session using the exact process incarnation. Long
@@ -3278,6 +3374,10 @@ pub const SessionRegistry = struct {
         defer session.deinit(durable.alloc);
         if (session.owner_node_id != owner_node_id or session.owner_incarnation != self.owner_incarnation)
             return error.SessionLeaseLost;
+        if (self.lease_renewal_failures_for_test > 0) {
+            self.lease_renewal_failures_for_test -= 1;
+            return error.InjectedSessionLeaseRenewalFailure;
+        }
         try self.renewLeaseLockedAt(txn_id, sessionKind(session), owner_node_id, self.owner_incarnation, now_ns);
     }
 
@@ -3299,6 +3399,83 @@ pub const SessionRegistry = struct {
         return leaseExpiryNs(record.expires_at_ms);
     }
 };
+
+/// Keeps one active session fenced while external work is in flight. A
+/// transient storage failure is retried while the last confirmed lease is
+/// still valid; only an explicit ownership mismatch or exhaustion of that
+/// deadline publishes `lost`.
+pub const OwnedSessionLeaseHeartbeat = struct {
+    registry: *SessionRegistry,
+    io: std.Io,
+    txn_id: db_mod.types.TxnId,
+    owner_node_id: u64,
+    interval_ns: u64,
+    lease_ttl_ns: u64,
+    stop_event: std.Io.Event = .unset,
+    lost: std.atomic.Value(bool) = .init(false),
+    expires_at_ns: std.atomic.Value(u64),
+
+    pub fn init(
+        registry: *SessionRegistry,
+        io: std.Io,
+        txn_id: db_mod.types.TxnId,
+        owner_node_id: u64,
+        interval_ns: u64,
+        lease_ttl_ns: u64,
+        confirmed_at_ns: u64,
+    ) OwnedSessionLeaseHeartbeat {
+        return .{
+            .registry = registry,
+            .io = io,
+            .txn_id = txn_id,
+            .owner_node_id = owner_node_id,
+            .interval_ns = interval_ns,
+            .lease_ttl_ns = lease_ttl_ns,
+            .expires_at_ns = .init(sessionLeaseExpirationNs(lease_ttl_ns, confirmed_at_ns)),
+        };
+    }
+
+    pub fn run(self: *@This()) void {
+        while (!self.stop_event.isSet()) {
+            self.stop_event.waitTimeout(self.io, .{
+                .duration = .{ .raw = std.Io.Duration.fromNanoseconds(self.interval_ns), .clock = .awake },
+            }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => {
+                    if (self.stop_event.isSet()) return;
+                    self.lost.store(true, .release);
+                    return;
+                },
+            };
+            if (self.stop_event.isSet()) return;
+            const now_ns = platform_time.realtimeNs();
+            self.registry.renewOwnedLease(self.txn_id, self.owner_node_id, now_ns) catch |err| {
+                if (err == error.SessionLeaseLost or
+                    now_ns >= self.expires_at_ns.load(.acquire))
+                {
+                    self.lost.store(true, .release);
+                    return;
+                }
+                std.log.warn("session lease heartbeat renewal deferred txn_id={x} err={s}", .{ self.txn_id, @errorName(err) });
+                continue;
+            };
+            self.expires_at_ns.store(sessionLeaseExpirationNs(self.lease_ttl_ns, now_ns), .release);
+        }
+    }
+
+    pub fn stop(self: *@This()) void {
+        self.stop_event.set(self.io);
+    }
+
+    pub fn isLost(self: *const @This()) bool {
+        return self.lost.load(.acquire);
+    }
+};
+
+pub fn sessionLeaseExpirationNs(ttl_ns: u64, now_ns: u64) u64 {
+    const duration_ns = sessionLeaseStorageTtlMs(ttl_ns) *| std.time.ns_per_ms;
+    return (now_ns / std.time.ns_per_ms) *| std.time.ns_per_ms +| duration_ns;
+}
 
 pub fn sessionOwnerNodeId(txn_id: db_mod.types.TxnId) u64 {
     return std.mem.readInt(u64, txn_id[0..8], .big);
@@ -5010,6 +5187,12 @@ fn sessionNeedsRecovery(session: Session) bool {
             (terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged);
     }
     return session.commit_body_digest != null and session.commit_execution_started;
+}
+
+fn sessionNeedsLeaseRenewal(session: Session) bool {
+    if (session.idempotent_outcome != null) return false;
+    if (session.terminal_commit != null) return sessionNeedsRecovery(session);
+    return true;
 }
 
 /// A retention deadline must not delete work while its outcome or required
@@ -6981,6 +7164,71 @@ test "versioned idempotent receipt storage is invisible to legacy session scans"
     try std.testing.expectEqualSlices(u8, &txn_id, &receipt_expiry.ids[0]);
     try std.testing.expectEqual(@as(usize, 1), try durable.sessionCount());
     try std.testing.expectError(error.SessionLimitExceeded, registry.begin(alloc, .{ .sync_level = .write }, 7));
+}
+
+test "lease renewal retries transient failure and excludes terminal receipts" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-session-lease-supervisor";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    const lease_store = SessionLeaseStore.init(alloc, &store);
+    const ttl_ns = 40 * std.time.ns_per_ms;
+    var registry = SessionRegistry.initWithLeaseTtl(&durable, lease_store, ttl_ns);
+    defer registry.deinit(alloc);
+
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}},"sync_level":"write"}
+    );
+    defer request.deinit(alloc);
+    const txn_id = idempotentTransactionId(null, "docs", "heartbeat-retry");
+    _ = try registry.beginIdempotentForPrincipal(alloc, txn_id, .{ .sync_level = .write }, 0, null, &request);
+    _ = (try registry.markCommitExecutionStarted(alloc, txn_id)).?;
+    const before = (try registry.getStatus(alloc, txn_id)).?.lease_expires_at;
+
+    registry.lease_renewal_failures_for_test = 1;
+    const now_ns = platform_time.realtimeNs();
+    var heartbeat = OwnedSessionLeaseHeartbeat.init(
+        &registry,
+        io_impl.io(),
+        txn_id,
+        0,
+        5 * std.time.ns_per_ms,
+        ttl_ns,
+        now_ns,
+    );
+    var future = std.Io.async(io_impl.io(), OwnedSessionLeaseHeartbeat.run, .{&heartbeat});
+    io_impl.io().sleep(std.Io.Duration.fromMilliseconds(18), .awake) catch {};
+    heartbeat.stop();
+    future.await(io_impl.io());
+    try std.testing.expect(!heartbeat.isLost());
+    try std.testing.expect((try registry.getStatus(alloc, txn_id)).?.lease_expires_at > before);
+    try std.testing.expectEqual(@as(usize, 1), try registry.renewOwnedLeases(0, platform_time.realtimeNs()));
+
+    _ = (try registry.recordIdempotentDurableAbort(alloc, txn_id, "transaction_conflict", "conflict")).?;
+    try std.testing.expectEqual(@as(usize, 0), try registry.renewOwnedLeases(0, platform_time.realtimeNs()));
+    try std.testing.expectEqual(@as(usize, 0), registry.lease_renewal_candidates.count());
+
+    _ = try registry.begin(alloc, .{}, 0);
+    _ = try registry.begin(alloc, .{}, 0);
+    try std.testing.expectEqual(@as(usize, 2), registry.lease_renewal_candidates.count());
+    var total_renewed: usize = 0;
+    var rounds: usize = 0;
+    while (true) {
+        const batch = try registry.renewOwnedLeaseBatch(0, platform_time.realtimeNs(), 1);
+        try std.testing.expect(batch.renewed <= 1);
+        total_renewed += batch.renewed;
+        rounds += 1;
+        if (!batch.has_more) break;
+        try std.testing.expect(rounds <= 3);
+    }
+    try std.testing.expectEqual(@as(usize, 2), total_renewed);
 }
 
 test "session lease storage duration covers nanosecond to millisecond rounding" {
