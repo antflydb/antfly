@@ -2,11 +2,6 @@
 title: Antfly Inference
 order: 3
 description: Use Antfly Inference for local ML inference — embeddings, chunking, and reranking
-prerequisites:
-  - Antfly installed and running
-difficulty: beginner
-estimatedTime: "10 min"
-tags: [inference, embeddings, reranking, models]
 ---
 
 <Questions>
@@ -168,3 +163,14 @@ lifecycle problem from retrying inference.
 ## API Reference
 
 See the [Inference API documentation](/inference/api) for details on the HTTP endpoints.
+
+## Let Your Agent Drive
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome — e.g. "Set up local embeddings and reranking with Antfly Inference and wire them into my table's index" — and use this page to judge the result.

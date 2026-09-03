@@ -293,3 +293,14 @@ You can always start with the defaults (hybrid search with RRF, no reranking, no
 - [REST API Reference](/docs/api) -- Full query API documentation
 - [Inference Guide](/docs/guides/inference) -- Configure custom embedding and reranking models
 - [Configuration Reference](/docs/configuration) -- Server and index configuration options
+
+## Let Your Agent Drive
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome — e.g. "Add hybrid search with RRF and a reranker to my products table" — and use this page to judge the result.

@@ -2,12 +2,6 @@
 title: Multimodal Embeddings
 order: 2
 description: Learn how to work with images and multimedia content in AntflyDB
-prerequisites:
-  - Antfly installed and running
-  - Ollama with LLaVA (for vision) or Vertex AI / Gemini credentials
-difficulty: intermediate
-estimatedTime: "20 min"
-tags: [multimodal, images, pdf, embeddings]
 ---
 
 <Questions>
@@ -17,6 +11,8 @@ tags: [multimodal, images, pdf, embeddings]
 - How do vision models work with Antfly?
 - Can I index PDFs with Antfly?
 </Questions>
+
+You'll need a vision-capable model: Ollama with LLaVA locally, or Vertex AI / Gemini credentials.
 
 ## Overview
 
@@ -545,3 +541,14 @@ curl -X POST http://localhost:8080/v1/query \
 | Ollama + Vision | Any + LLaVA | Via summarizer | Via summarizer |
 
 For providers that don't natively support multimodal embeddings, use the `--summarizer` option to convert images to text descriptions before embedding.
+
+## Let Your Agent Drive
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome — e.g. "Build image search over my photos with a CLIP embeddings index" — and use this page to judge the result.
