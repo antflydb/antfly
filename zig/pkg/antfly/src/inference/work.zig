@@ -35,6 +35,48 @@ pub const Task = enum {
     transcribe,
 };
 
+/// Concrete inference transport operation. Capabilities are planned for a
+/// semantic task, but distributed routing and leases bind to the exact endpoint
+/// operation so compatibility aliases cannot silently select different pools.
+pub const Operation = enum {
+    read,
+    generate,
+    generate_batch,
+    chat_completions,
+    embed,
+    embeddings,
+    rerank,
+    rerank_multimodal,
+    chunk,
+    extract,
+    rewrite,
+    classify,
+    transcribe,
+
+    pub fn task(self: Operation) Task {
+        return switch (self) {
+            .read => .read,
+            .generate, .generate_batch, .chat_completions => .generate,
+            .embed, .embeddings => .embed,
+            .rerank, .rerank_multimodal => .rerank,
+            .chunk => .chunk,
+            .extract => .extract,
+            .rewrite => .rewrite,
+            .classify => .classify,
+            .transcribe => .transcribe,
+        };
+    }
+
+    pub fn wireName(self: Operation) []const u8 {
+        return switch (self) {
+            .generate_batch => "generate.batch",
+            .chat_completions => "chat.completions",
+            .rerank_multimodal => "rerank_multimodal",
+            else => @tagName(self),
+        };
+    }
+};
+
 pub const InputGranularity = enum {
     document,
     page,

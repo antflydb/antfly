@@ -1677,6 +1677,22 @@ func TestCatalogTaskScopesCoverEveryRoutableModelFamily(t *testing.T) {
 	}
 }
 
+func TestCatalogTaskScopeValidatesConcreteOperationFamily(t *testing.T) {
+	scope, err := catalogTaskScopeForOperation("generate", "generate.batch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope.Operation != "generate.batch" || scope.Category != "generators" {
+		t.Fatalf("scope = %#v, want concrete generation batch operation", scope)
+	}
+	if _, err := catalogTaskScopeForOperation("generate", "embed"); err == nil {
+		t.Fatal("cross-family operation was accepted")
+	}
+	if _, err := catalogTaskScopeForOperation("", "read"); err == nil {
+		t.Fatal("operation without task was accepted")
+	}
+}
+
 func TestProxyRequestModelReadsAndCanonicalizesChunkConfig(t *testing.T) {
 	for _, test := range []struct {
 		body string
@@ -1879,9 +1895,9 @@ func TestRoutesPrecedeExplicitPoolForDiscoveryAndExecution(t *testing.T) {
 	if len(endpoints) != 1 || endpoints[0].Address != "http://gpu.internal" {
 		t.Fatalf("routed capability cohort = %#v, want gpu endpoint only", endpoints)
 	}
-	token, err := p.issueCapabilityLease(
+	token, err := issueReaderCapabilityLease(
+		p,
 		"owner/reader",
-		"read",
 		"revision-a",
 		"",
 		capabilityEndpointSet(p.registry, endpoints),
@@ -1922,6 +1938,88 @@ func TestTerminalRejectRouteDoesNotExposeDefaultPool(t *testing.T) {
 	}
 	if endpoints := p.catalogEndpointsForRequest(routing, "owner/reader", "read"); len(endpoints) != 0 {
 		t.Fatalf("reject catalog = %#v, want no default-pool endpoints", endpoints)
+	}
+}
+
+func TestCatalogCohortIsBoundToConcreteOperation(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.registry.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:          "batch-generator",
+		Operations:    map[OperationType]bool{"generate.batch": true},
+		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/generator$`)},
+		Destinations:  []Destination{{Pool: "gpu", Weight: 1}},
+	})
+
+	routing := RoutingContext{}
+	batch := p.catalogEndpointsForRequest(routing, "owner/generator", "generate.batch")
+	if len(batch) != 1 || batch[0].Address != "http://gpu.internal" {
+		t.Fatalf("batch cohort = %#v, want gpu only", batch)
+	}
+	single := p.catalogEndpointsForRequest(routing, "owner/generator", "generate")
+	if len(single) != 1 || single[0].Address != "http://cpu.internal" {
+		t.Fatalf("single cohort = %#v, want default cpu only", single)
+	}
+}
+
+func TestTerminalAliasRejectDoesNotFallThroughViaSemanticTask(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:          "reject-batch-generator",
+		Operations:    map[OperationType]bool{"generate.batch": true},
+		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/generator$`)},
+		Fallback:      &Fallback{Action: "reject", StatusCode: http.StatusForbidden},
+	})
+	if endpoints := p.catalogEndpointsForRequest(RoutingContext{}, "owner/generator", "generate.batch"); len(endpoints) != 0 {
+		t.Fatalf("batch reject catalog = %#v, want no alias/default endpoints", endpoints)
+	}
+}
+
+func TestCapabilityLeaseRejectsRoutePolicyGenerationChange(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p.registry.RegisterEndpoint("http://gpu-a.internal", "gpu-a", WorkloadTypeGeneral)
+	p.registry.RegisterEndpoint("http://gpu-b.internal", "gpu-b", WorkloadTypeGeneral)
+	for _, address := range []string{"http://gpu-a.internal", "http://gpu-b.internal"} {
+		advertiseModelOperation(p.registry, address, "generate", "owner/generator")
+	}
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:          "generator",
+		Operations:    map[OperationType]bool{"generate": true},
+		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/generator$`)},
+		Destinations:  []Destination{{Pool: "gpu-a", Weight: 1}},
+	})
+	cohort := p.catalogEndpointCohortForRequest(RoutingContext{}, "owner/generator", "generate")
+	token, err := p.issueCapabilityLease(
+		"owner/generator",
+		"generate",
+		"generate",
+		cohort.routeGeneration,
+		"revision-a",
+		"",
+		capabilityEndpointSet(p.registry, cohort.endpoints),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:          "generator",
+		Operations:    map[OperationType]bool{"generate": true},
+		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/generator$`)},
+		Destinations:  []Destination{{Pool: "gpu-b", Weight: 1}},
+	})
+	request := httptest.NewRequest(http.MethodPost, "/ai/v1/generate", strings.NewReader(`{"model":"owner/generator"}`))
+	request.Header.Set(capabilityTokenHeader, token)
+	request.Header.Set(capabilityRevisionHeader, "revision-a")
+	recorder := httptest.NewRecorder()
+	p.handleGenerate(recorder, request)
+	if recorder.Code != http.StatusConflict || recorder.Header().Get(capabilityStaleHeader) != "true" {
+		t.Fatalf("route-change response = %d headers=%v body=%q, want capability-stale conflict", recorder.Code, recorder.Header(), recorder.Body.String())
 	}
 }
 
@@ -1968,7 +2066,7 @@ func TestCapabilityLeaseConstrainsRoutingAfterEndpointAddition(t *testing.T) {
 	advertiseModelOperation(p.registry, "http://reader-a.internal", "read", "owner/reader")
 	endpoints := p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read")
 	discovered := capabilityEndpointSet(p.registry, endpoints)
-	token, err := p.issueCapabilityLease("owner/reader", "read", "revision-a", "", discovered)
+	token, err := issueReaderCapabilityLease(p, "owner/reader", "revision-a", "", discovered)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2012,7 +2110,7 @@ func TestCapabilityLeaseFiltersWeightedRouteDestinationsBeforeSelection(t *testi
 		},
 	})
 	covered := p.router.ResolveEndpointCandidates("gemma4", "leased", nil, "generate")
-	token, err := p.issueCapabilityLease("gemma4", "generate", "revision-a", "", capabilityEndpointSet(p.registry, covered))
+	token, err := p.issueCapabilityLease("gemma4", "generate", "generate", p.router.RouteManager().Generation(), "revision-a", "", capabilityEndpointSet(p.registry, covered))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2041,7 +2139,7 @@ func TestCapabilityLeaseRejectsReregisteredEndpointAtSameAddress(t *testing.T) {
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
 	endpoints := p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read")
-	token, err := p.issueCapabilityLease("owner/reader", "read", "revision-a", "", capabilityEndpointSet(p.registry, endpoints))
+	token, err := issueReaderCapabilityLease(p, "owner/reader", "revision-a", "", capabilityEndpointSet(p.registry, endpoints))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2064,7 +2162,7 @@ func TestCapabilityLeaseRejectsChangedAuthorization(t *testing.T) {
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
 	endpoints := p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read")
-	token, err := p.issueCapabilityLease("owner/reader", "read", "revision-a", "Bearer first", capabilityEndpointSet(p.registry, endpoints))
+	token, err := issueReaderCapabilityLease(p, "owner/reader", "revision-a", "Bearer first", capabilityEndpointSet(p.registry, endpoints))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2086,13 +2184,39 @@ func TestGeneratorCapabilityLeaseAllowsExplicitRouteVariants(t *testing.T) {
 	})
 	for _, operation := range []OperationType{"generate", "generate.batch", "chat.completions"} {
 		endpoints := p.router.ResolveEndpointCandidates("gemma4", "primary", nil, operation)
-		token, err := p.issueCapabilityLease("gemma4", "generate", "revision-a", "", capabilityEndpointSet(p.registry, endpoints))
+		token, err := p.issueCapabilityLease("gemma4", "generate", operation, p.router.RouteManager().Generation(), "revision-a", "", capabilityEndpointSet(p.registry, endpoints))
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := p.validateCapabilityLease(token, "revision-a", "gemma4", operation, ""); err != nil {
 			t.Fatalf("semantic generator lease rejected %q: %v", operation, err)
 		}
+	}
+}
+
+func TestCapabilityLeaseRejectsSemanticAliasReuse(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "primary", Logger: zap.NewNop()})
+	const address = "http://generator.internal"
+	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations(address, map[string]map[OperationType]bool{
+		"gemma4": {"generate": true, "generate.batch": true},
+	})
+	endpoints := p.router.ResolveEndpointCandidates("gemma4", "primary", nil, "generate")
+	token, err := p.issueCapabilityLease(
+		"gemma4",
+		"generate",
+		"generate",
+		p.router.RouteManager().Generation(),
+		"revision-a",
+		"",
+		capabilityEndpointSet(p.registry, endpoints),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.validateCapabilityLease(token, "revision-a", "gemma4", "generate.batch", ""); err == nil {
+		t.Fatal("single-generation lease was reused for the batch alias")
 	}
 }
 
@@ -2107,17 +2231,6 @@ func TestGeneratorCapabilityLeaseConstrainsEachRouteVariant(t *testing.T) {
 	p.registry.UpdateModelOperations("http://batch.internal", map[string]map[OperationType]bool{
 		"gemma4": {"generate.batch": true},
 	})
-	endpoints := p.router.ResolveEndpointCandidates(
-		"gemma4",
-		"primary",
-		nil,
-		semanticOperationsForTask("generate", "generate.batch")...,
-	)
-	token, err := p.issueCapabilityLease("gemma4", "generate", "revision-a", "", capabilityEndpointSet(p.registry, endpoints))
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	for _, test := range []struct {
 		operation OperationType
 		address   string
@@ -2125,6 +2238,11 @@ func TestGeneratorCapabilityLeaseConstrainsEachRouteVariant(t *testing.T) {
 		{operation: "generate", address: "http://single.internal"},
 		{operation: "generate.batch", address: "http://batch.internal"},
 	} {
+		endpoints := p.router.ResolveEndpointCandidates("gemma4", "primary", nil, test.operation)
+		token, err := p.issueCapabilityLease("gemma4", "generate", test.operation, p.router.RouteManager().Generation(), "revision-a", "", capabilityEndpointSet(p.registry, endpoints))
+		if err != nil {
+			t.Fatal(err)
+		}
 		allowed, err := p.capabilityLeaseEndpoints(token, "revision-a", "gemma4", test.operation, sha256.Sum256(nil))
 		if err != nil {
 			t.Fatalf("validate %q: %v", test.operation, err)
@@ -2157,7 +2275,7 @@ func TestScopedGeneratorCatalogLeaseExecutesSingleRoute(t *testing.T) {
 		"gemma4": {"generate": true, "generate.batch": true, "chat.completions": true},
 	})
 
-	catalogRequest := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=gemma4&task=generate", nil)
+	catalogRequest := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=gemma4&task=generate&operation=generate", nil)
 	catalogRecorder := httptest.NewRecorder()
 	p.handleModels(catalogRecorder, catalogRequest)
 	if catalogRecorder.Code != http.StatusOK {
@@ -2205,7 +2323,7 @@ func TestScopedCatalogLeaseFollowsNonDefaultRouteAndCallerCatalog(t *testing.T) 
 		Destinations:  []Destination{{Pool: "gpu", Weight: 100}},
 	})
 
-	catalogRequest := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=tenant%2Fgemma4&task=generate", nil)
+	catalogRequest := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=tenant%2Fgemma4&task=generate&operation=generate", nil)
 	catalogRequest.Header.Set("Authorization", "Bearer tenant")
 	catalogRecorder := httptest.NewRecorder()
 	p.handleModels(catalogRecorder, catalogRequest)
@@ -2234,7 +2352,7 @@ func TestCapabilityLeaseRejectsChangedDescriptorRevision(t *testing.T) {
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
 	endpoints := p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read")
-	token, err := p.issueCapabilityLease("owner/reader", "read", "revision-a", "", capabilityEndpointSet(p.registry, endpoints))
+	token, err := issueReaderCapabilityLease(p, "owner/reader", "revision-a", "", capabilityEndpointSet(p.registry, endpoints))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2264,7 +2382,7 @@ func TestCapabilityLeaseCapacityNeverEvictsLiveLease(t *testing.T) {
 	endpoints := capabilityEndpointSet(p.registry, p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read"))
 	var firstToken string
 	for i := 0; i < maxCapabilityLeases; i++ {
-		token, err := p.issueCapabilityLease("owner/reader", "read", fmt.Sprintf("revision-%d", i), "", endpoints)
+		token, err := issueReaderCapabilityLease(p, "owner/reader", fmt.Sprintf("revision-%d", i), "", endpoints)
 		if err != nil {
 			t.Fatalf("lease %d: %v", i, err)
 		}
@@ -2272,7 +2390,7 @@ func TestCapabilityLeaseCapacityNeverEvictsLiveLease(t *testing.T) {
 			firstToken = token
 		}
 	}
-	if _, err := p.issueCapabilityLease("owner/reader", "read", "overflow-revision", "", endpoints); !errors.Is(err, errCapabilityLeaseCapacity) {
+	if _, err := issueReaderCapabilityLease(p, "owner/reader", "overflow-revision", "", endpoints); !errors.Is(err, errCapabilityLeaseCapacity) {
 		t.Fatalf("overflow error = %v, want capacity error", err)
 	}
 	if err := p.validateCapabilityLease(firstToken, "revision-0", "owner/reader", "read", ""); err != nil {
@@ -2287,12 +2405,12 @@ func TestCapabilityLeaseRefreshReusesImmutableSnapshot(t *testing.T) {
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
 	endpoints := capabilityEndpointSet(p.registry, p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read"))
-	first, err := p.issueCapabilityLease("owner/reader", "read", "revision-a", "Bearer caller", endpoints)
+	first, err := issueReaderCapabilityLease(p, "owner/reader", "revision-a", "Bearer caller", endpoints)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < maxCapabilityLeases*2; i++ {
-		refreshed, refreshErr := p.issueCapabilityLease("owner/reader", "read", "revision-a", "Bearer caller", endpoints)
+		refreshed, refreshErr := issueReaderCapabilityLease(p, "owner/reader", "revision-a", "Bearer caller", endpoints)
 		if refreshErr != nil {
 			t.Fatalf("refresh %d: %v", i, refreshErr)
 		}
@@ -2312,7 +2430,7 @@ func TestCapabilityLeaseKeepsImmutableSnapshotAcrossCatalogRefresh(t *testing.T)
 	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
 	advertiseModelOperation(p.registry, address, "read", "owner/reader")
 	endpoints := p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read")
-	token, err := p.issueCapabilityLease("owner/reader", "read", "revision-a", "", capabilityEndpointSet(p.registry, endpoints))
+	token, err := issueReaderCapabilityLease(p, "owner/reader", "revision-a", "", capabilityEndpointSet(p.registry, endpoints))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2340,6 +2458,18 @@ func capabilityEndpointSet(registry *ModelRegistry, endpoints []*Endpoint) map[s
 		result[endpoint.Address] = leasedEndpoint{endpoint: endpoint, operations: operations}
 	}
 	return result
+}
+
+func issueReaderCapabilityLease(p *Proxy, model, revision, authorization string, endpoints map[string]leasedEndpoint) (string, error) {
+	return p.issueCapabilityLease(
+		model,
+		"read",
+		"read",
+		p.router.RouteManager().Generation(),
+		revision,
+		authorization,
+		endpoints,
+	)
 }
 
 func TestProxyBodyAdmissionAccountsForDecodeAndExactRetention(t *testing.T) {
@@ -2651,7 +2781,7 @@ func TestProxyModelCatalogLeasesOnlySuccessfulCandidates(t *testing.T) {
 	}
 	token := recorder.Header().Get(capabilityTokenHeader)
 	revision := recorder.Header().Get(capabilityRevisionHeader)
-	allowed, err := p.capabilityLeaseEndpoints(token, revision, "gemma4", "generate", sha256.Sum256(nil))
+	allowed, err := p.capabilityLeaseEndpoints(token, revision, "gemma4", "generate.batch", sha256.Sum256(nil))
 	if err != nil {
 		t.Fatal(err)
 	}

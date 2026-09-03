@@ -32,6 +32,7 @@ import (
 	"net/url"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -686,7 +687,7 @@ func (r *ModelRegistry) PoolConditionStatsWithin(pool, model string, allowed map
 		totalQueueDepth += int64(atomic.LoadInt32(&ep.QueueDepth))
 
 		if allowed != nil {
-			// Inclusion in a model/task lease is the caller-authorized proof that
+			// Inclusion in a model/task/operation lease is the caller-authorized proof that
 			// this endpoint loaded the model, even when the background service
 			// credential cannot see the same tenant-scoped catalog entry.
 			stats.ModelLoaded = true
@@ -1249,6 +1250,8 @@ type proxyCapabilityLease struct {
 	identity            [sha256.Size]byte
 	model               string
 	task                string
+	operation           OperationType
+	routeGeneration     uint64
 	descriptorRevision  string
 	authorizationDigest [sha256.Size]byte
 	endpoints           map[string]leasedEndpoint
@@ -1483,30 +1486,30 @@ func (p *Proxy) routingContextForRequest(r *http.Request, timestamp time.Time) (
 	}, nil
 }
 
-// catalogEndpointsForRequest returns one route capability cohort: every pool
-// the matching request may select, rather than every inference node in the
-// cluster. If source-scoped fields are not present on the discovery request,
-// PotentialCohortFor conservatively includes routes whose operation/model
-// match while still excluding unrelated model families and pools.
-func (p *Proxy) catalogEndpointsForRequest(routing RoutingContext, model string, operation OperationType) []*Endpoint {
+type catalogEndpointCohort struct {
+	endpoints       []*Endpoint
+	routeGeneration uint64
+}
+
+// catalogEndpointCohortForRequest returns the pools reachable by one concrete
+// operation. A task family is not a routing identity: generate, generate.batch,
+// and chat.completions can legitimately have different policies and executors.
+func (p *Proxy) catalogEndpointCohortForRequest(routing RoutingContext, model string, operation OperationType) catalogEndpointCohort {
 	var pools []string
 	seenPools := make(map[string]bool)
-	for _, semanticOperation := range semanticOperationsForTask(semanticTaskForOperation(operation), operation) {
-		cohort := p.router.RouteManager().PotentialCohortFor(routing.routeRequest(semanticOperation, model))
-		for _, candidate := range cohort.Pools {
-			if !seenPools[candidate] {
-				seenPools[candidate] = true
-				pools = append(pools, candidate)
-			}
+	cohort := p.router.RouteManager().PotentialCohortFor(routing.routeRequest(operation, model))
+	for _, candidate := range cohort.Pools {
+		if !seenPools[candidate] {
+			seenPools[candidate] = true
+			pools = append(pools, candidate)
 		}
-		// Without a definite route, this concrete operation can fall through to
-		// its explicit pool and then the process default. A definite terminal
-		// reject intentionally contributes neither fallback.
-		fallbackPool := firstNonEmpty(strings.TrimSpace(routing.ExplicitPool), p.defaultPool)
-		if !cohort.Terminal && fallbackPool != "" && !seenPools[fallbackPool] {
-			seenPools[fallbackPool] = true
-			pools = append(pools, fallbackPool)
-		}
+	}
+	// Without a definite route, this operation can fall through to its explicit
+	// pool and then the process default. A terminal reject contributes neither.
+	fallbackPool := firstNonEmpty(strings.TrimSpace(routing.ExplicitPool), p.defaultPool)
+	if !cohort.Terminal && fallbackPool != "" && !seenPools[fallbackPool] {
+		seenPools[fallbackPool] = true
+		pools = append(pools, fallbackPool)
 	}
 	seen := make(map[string]bool)
 	var endpoints []*Endpoint
@@ -1518,7 +1521,11 @@ func (p *Proxy) catalogEndpointsForRequest(routing RoutingContext, model string,
 			}
 		}
 	}
-	return endpoints
+	return catalogEndpointCohort{endpoints: endpoints, routeGeneration: cohort.Generation}
+}
+
+func (p *Proxy) catalogEndpointsForRequest(routing RoutingContext, model string, operation OperationType) []*Endpoint {
+	return p.catalogEndpointCohortForRequest(routing, model, operation).endpoints
 }
 
 const maxModelCatalogBytes = 8 << 20
@@ -1539,7 +1546,8 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	model := strings.TrimSpace(r.URL.Query().Get("model"))
 	task := strings.TrimSpace(r.URL.Query().Get("task"))
-	taskScope, taskErr := catalogTaskScopeFor(task)
+	operation := strings.TrimSpace(r.URL.Query().Get("operation"))
+	taskScope, taskErr := catalogTaskScopeForOperation(task, operation)
 	if taskErr != nil || (model == "") != (taskScope.Operation == "") {
 		http.Error(w, "model and a valid task must be provided together", http.StatusBadRequest)
 		return
@@ -1555,6 +1563,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	authorization := p.upstreamAuthorizationForRequest(r)
 	var endpoints []*Endpoint
+	var routeGeneration uint64
 	if model != "" {
 		// Discover only the pools the matching route can actually select. Mixing
 		// unrelated pools forces a conservative descriptor to inherit the weakest
@@ -1562,7 +1571,9 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		// Caller-scoped upstream catalogs still provide the authorization proof;
 		// this is only a route-cohort prefilter.
 		routing.ExplicitPool = pool
-		endpoints = p.catalogEndpointsForRequest(routing, model, taskScope.Operation)
+		cohort := p.catalogEndpointCohortForRequest(routing, model, taskScope.Operation)
+		endpoints = cohort.endpoints
+		routeGeneration = cohort.routeGeneration
 	} else if pool == "" {
 		endpoints = p.registry.GetAvailableEndpoints()
 	} else {
@@ -1666,22 +1677,10 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		successes++
-		inventoryOperations := p.registry.endpointModelOperations(result.endpoint.Address, result.endpoint, model)
-		operations := make(map[OperationType]bool)
-		semanticOperations := semanticOperationsForTask(task, taskScope.Operation)
-		for _, operation := range semanticOperations {
-			if inventoryOperations[operation] {
-				operations[operation] = true
-			}
-		}
-		if len(operations) == 0 {
-			// The caller-scoped catalog proved the semantic task even when the
-			// service-credential inventory is absent or advertises the same model
-			// name under a different family.
-			for _, operation := range semanticOperations {
-				operations[operation] = true
-			}
-		}
+		// The caller-scoped catalog proves this model/task on the endpoint. The
+		// lease deliberately authorizes only the concrete operation requested by
+		// the planner, never every compatibility alias in the family.
+		operations := map[OperationType]bool{taskScope.Operation: true}
 		leaseEndpoints[result.endpoint.Address] = leasedEndpoint{endpoint: result.endpoint, operations: operations}
 		if !mergedTooLarge {
 			if model != "" {
@@ -1734,6 +1733,8 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		token, err := p.issueCapabilityLease(
 			model,
 			task,
+			taskScope.Operation,
+			routeGeneration,
 			descriptorRevision,
 			authorization,
 			leaseEndpoints,
@@ -1757,9 +1758,9 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (p *Proxy) issueCapabilityLease(model, task, descriptorRevision, authorization string, endpoints map[string]leasedEndpoint) (string, error) {
+func (p *Proxy) issueCapabilityLease(model, task string, operation OperationType, routeGeneration uint64, descriptorRevision, authorization string, endpoints map[string]leasedEndpoint) (string, error) {
 	authorizationDigest := sha256.Sum256([]byte(authorization))
-	identity := capabilityLeaseIdentity(model, task, descriptorRevision, authorizationDigest, endpoints)
+	identity := capabilityLeaseIdentity(model, task, operation, routeGeneration, descriptorRevision, authorizationDigest, endpoints)
 	allowed := make(map[string]leasedEndpoint, len(endpoints))
 	for address, endpoint := range endpoints {
 		allowed[address] = leasedEndpoint{
@@ -1801,8 +1802,12 @@ func (p *Proxy) issueCapabilityLease(model, task, descriptorRevision, authorizat
 	}
 	token := hex.EncodeToString(random[:])
 	p.capabilityLeases[token] = proxyCapabilityLease{
-		identity: identity,
-		model:    model, task: task, descriptorRevision: descriptorRevision,
+		identity:            identity,
+		model:               model,
+		task:                task,
+		operation:           operation,
+		routeGeneration:     routeGeneration,
+		descriptorRevision:  descriptorRevision,
 		authorizationDigest: authorizationDigest,
 		endpoints:           allowed, expiresAt: now.Add(capabilityLeaseTTL),
 	}
@@ -1810,7 +1815,7 @@ func (p *Proxy) issueCapabilityLease(model, task, descriptorRevision, authorizat
 	return token, nil
 }
 
-func capabilityLeaseIdentity(model, task, revision string, authorizationDigest [sha256.Size]byte, endpoints map[string]leasedEndpoint) [sha256.Size]byte {
+func capabilityLeaseIdentity(model, task string, operation OperationType, routeGeneration uint64, revision string, authorizationDigest [sha256.Size]byte, endpoints map[string]leasedEndpoint) [sha256.Size]byte {
 	h := sha256.New()
 	writeField := func(value string) {
 		_, _ = fmt.Fprintf(h, "%d:", len(value))
@@ -1818,6 +1823,8 @@ func capabilityLeaseIdentity(model, task, revision string, authorizationDigest [
 	}
 	writeField(model)
 	writeField(task)
+	writeField(string(operation))
+	writeField(strconv.FormatUint(routeGeneration, 10))
 	writeField(revision)
 	_, _ = h.Write(authorizationDigest[:])
 	addresses := make([]string, 0, len(endpoints))
@@ -1853,11 +1860,22 @@ func (p *Proxy) validateCapabilityLease(token, revision, model string, operation
 }
 
 func (p *Proxy) capabilityLeaseEndpoints(token, revision, model string, operation OperationType, authorizationDigest [sha256.Size]byte) (map[string]*Endpoint, error) {
+	lease, err := p.validatedCapabilityLease(token, revision, model, operation, authorizationDigest)
+	return lease.endpoints, err
+}
+
+type validatedCapabilityLease struct {
+	endpoints       map[string]*Endpoint
+	routeGeneration uint64
+	scoped          bool
+}
+
+func (p *Proxy) validatedCapabilityLease(token, revision, model string, operation OperationType, authorizationDigest [sha256.Size]byte) (validatedCapabilityLease, error) {
 	if token == "" {
 		if revision != "" {
-			return nil, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is incomplete"}
+			return validatedCapabilityLease{}, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is incomplete"}
 		}
-		return nil, nil
+		return validatedCapabilityLease{}, nil
 	}
 	now := time.Now()
 	p.capabilityLeaseMu.Lock()
@@ -1870,10 +1888,13 @@ func (p *Proxy) capabilityLeaseEndpoints(token, revision, model string, operatio
 		ok = false
 	}
 	p.capabilityLeaseMu.Unlock()
-	if !ok || lease.model != model || lease.task != semanticTaskForOperation(operation) ||
+	if !ok || lease.model != model || lease.task != semanticTaskForOperation(operation) || lease.operation != operation ||
 		lease.descriptorRevision == "" || lease.descriptorRevision != revision ||
 		lease.authorizationDigest != authorizationDigest {
-		return nil, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
+		return validatedCapabilityLease{}, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
+	}
+	if lease.routeGeneration != p.router.RouteManager().Generation() {
+		return validatedCapabilityLease{}, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
 	}
 	allowed := make(map[string]*Endpoint, len(lease.endpoints))
 	for address, expected := range lease.endpoints {
@@ -1881,11 +1902,15 @@ func (p *Proxy) capabilityLeaseEndpoints(token, revision, model string, operatio
 			continue
 		}
 		if !p.registry.endpointIncarnationMatches(address, expected.endpoint) {
-			return nil, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
+			return validatedCapabilityLease{}, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
 		}
 		allowed[address] = expected.endpoint
 	}
-	return allowed, nil
+	return validatedCapabilityLease{
+		endpoints:       allowed,
+		routeGeneration: lease.routeGeneration,
+		scoped:          true,
+	}, nil
 }
 
 func semanticTaskForOperation(operation OperationType) string {
@@ -1940,6 +1965,29 @@ func catalogTaskScopeFor(raw string) (catalogTaskScope, error) {
 	if !ok {
 		return catalogTaskScope{}, fmt.Errorf("unsupported inference task %q", raw)
 	}
+	return scope, nil
+}
+
+func catalogTaskScopeForOperation(rawTask, rawOperation string) (catalogTaskScope, error) {
+	scope, err := catalogTaskScopeFor(rawTask)
+	if err != nil || scope.Operation == "" || strings.TrimSpace(rawOperation) == "" {
+		if strings.TrimSpace(rawOperation) != "" && scope.Operation == "" && err == nil {
+			return catalogTaskScope{}, errors.New("operation requires an inference task")
+		}
+		return scope, err
+	}
+	requested := OperationType(strings.TrimSpace(rawOperation))
+	valid := false
+	for _, candidate := range semanticOperationsForTask(rawTask, scope.Operation) {
+		if candidate == requested {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return catalogTaskScope{}, fmt.Errorf("operation %q does not belong to inference task %q", rawOperation, rawTask)
+	}
+	scope.Operation = requested
 	return scope, nil
 }
 

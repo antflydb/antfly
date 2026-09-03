@@ -238,8 +238,9 @@ type RouteRequest struct {
 
 // RouteManager manages all routes and performs matching
 type RouteManager struct {
-	routes []*Route // Sorted by priority (descending)
-	mu     sync.RWMutex
+	routes     []*Route // Sorted by priority (descending)
+	generation uint64
+	mu         sync.RWMutex
 }
 
 // NewRouteManager creates a new RouteManager
@@ -272,6 +273,7 @@ func (rm *RouteManager) AddRoute(route *Route) {
 	})
 
 	rm.routes = newRoutes
+	rm.generation++
 }
 
 // RemoveRoute removes a route by name
@@ -285,7 +287,19 @@ func (rm *RouteManager) RemoveRoute(name string) {
 			newRoutes = append(newRoutes, r)
 		}
 	}
-	rm.routes = newRoutes
+	if len(newRoutes) != len(rm.routes) {
+		rm.routes = newRoutes
+		rm.generation++
+	}
+}
+
+// Generation identifies the immutable routing policy snapshot currently
+// installed in this manager. Capability leases bind to this value so a policy
+// update cannot silently reinterpret an already planned invocation.
+func (rm *RouteManager) Generation() uint64 {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.generation
 }
 
 // Match finds the first matching route for a request
@@ -301,15 +315,33 @@ func (rm *RouteManager) Match(req *RouteRequest) *Route {
 	return nil
 }
 
+// MatchAtGeneration linearizes a routing decision against the policy snapshot
+// used for capability discovery. A false result means the caller must refresh
+// its capability lease before executing.
+func (rm *RouteManager) MatchAtGeneration(req *RouteRequest, generation uint64) (*Route, bool) {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	if rm.generation != generation {
+		return nil, false
+	}
+	for _, route := range rm.routes {
+		if rm.matchRoute(route, req) {
+			return route, true
+		}
+	}
+	return nil, true
+}
+
 // RouteCohort describes the pools that a future execution may reach. Matched
 // distinguishes a route cohort from the absence of any applicable route, and
 // Terminal records that a definite route makes the default pool and every
 // lower-priority route unreachable. A terminal route may intentionally expose
 // no pools (for example, a reject fallback).
 type RouteCohort struct {
-	Pools    []string
-	Matched  bool
-	Terminal bool
+	Pools      []string
+	Matched    bool
+	Terminal   bool
+	Generation uint64
 }
 
 // PotentialCohortFor returns the route cohort that can handle an operation and
@@ -335,7 +367,7 @@ func (rm *RouteManager) PotentialCohortFor(req *RouteRequest) RouteCohort {
 		}
 		return out
 	}
-	cohort := RouteCohort{}
+	cohort := RouteCohort{Generation: rm.generation}
 	for _, route := range rm.routes {
 		if len(route.Operations) > 0 && !route.Operations[req.Operation] {
 			continue

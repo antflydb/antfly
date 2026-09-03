@@ -591,7 +591,7 @@ pub const Runtime = struct {
                         self.http,
                         parsed.generator.url,
                         parsed.generator.model,
-                        .generate,
+                        .generate_batch,
                         headers,
                     ) catch |err| switch (err) {
                         error.OutOfMemory => return err,
@@ -1169,7 +1169,7 @@ pub const Runtime = struct {
             self.http,
             cfg.url,
             cfg.model,
-            .generate,
+            .generate_batch,
             auth_headers,
         );
         capabilities = capability_lease.capabilities orelse return error.InvalidInferenceCapabilities;
@@ -1217,7 +1217,7 @@ pub const Runtime = struct {
                 if (resp.status.code == 409 and stale_value != null and
                     std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale_value.?, " \t"), "true"))
                 {
-                    try self.capabilityCache().invalidate(cfg.url, cfg.model, .generate, auth_headers);
+                    try self.capabilityCache().invalidate(cfg.url, cfg.model, .generate_batch, auth_headers);
                     return error.InferenceCapabilitiesStale;
                 }
                 return mapAntflyGenerateBatchStatus(resp.status.code);

@@ -342,7 +342,7 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 	var pool string
 	var matchedRoute *Route
 	var selectedDest *Destination
-	allowed, err := p.capabilityLeaseEndpoints(
+	capabilityLease, err := p.validatedCapabilityLease(
 		headerValue(routing.Headers, capabilityTokenHeader),
 		headerValue(routing.Headers, capabilityRevisionHeader),
 		routeReq.Model,
@@ -352,8 +352,17 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 	if err != nil {
 		return nil, err
 	}
+	allowed := capabilityLease.endpoints
 
-	matchedRoute = p.router.RouteManager().Match(routeReq)
+	if capabilityLease.scoped {
+		var current bool
+		matchedRoute, current = p.router.RouteManager().MatchAtGeneration(routeReq, capabilityLease.routeGeneration)
+		if !current {
+			return nil, &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
+		}
+	} else {
+		matchedRoute = p.router.RouteManager().Match(routeReq)
+	}
 	if matchedRoute != nil {
 		dest, err := p.router.RouteManager().SelectDestinationWithin(matchedRoute, routeReq, p.registry, allowed)
 		if err != nil {

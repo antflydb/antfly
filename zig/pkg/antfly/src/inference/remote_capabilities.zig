@@ -176,10 +176,10 @@ pub const Cache = struct {
         http: *httpx.Client,
         inference_url: []const u8,
         model: []const u8,
-        task: work.Task,
+        operation: work.Operation,
         headers: []const [2][]const u8,
     ) !?work.InferenceCapabilities {
-        return (try self.getOrDiscoverLease(http, inference_url, model, task, headers)).capabilities;
+        return (try self.getOrDiscoverLease(http, inference_url, model, operation, headers)).capabilities;
     }
 
     pub fn getOrDiscoverLease(
@@ -187,10 +187,10 @@ pub const Cache = struct {
         http: *httpx.Client,
         inference_url: []const u8,
         model: []const u8,
-        task: work.Task,
+        operation: work.Operation,
         headers: []const [2][]const u8,
     ) !CapabilityLease {
-        return try self.getOrDiscoverLeaseWithContext(http, inference_url, model, task, headers, .{
+        return try self.getOrDiscoverLeaseWithContext(http, inference_url, model, operation, headers, .{
             .deadline_ns = monotonicNowNs(self.io) +| capability_discovery_timeout_ns,
         });
     }
@@ -200,7 +200,7 @@ pub const Cache = struct {
         http: *httpx.Client,
         inference_url: []const u8,
         model: []const u8,
-        task: work.Task,
+        operation: work.Operation,
         headers: []const [2][]const u8,
         wait_context: WaitContext,
     ) !?work.InferenceCapabilities {
@@ -208,7 +208,7 @@ pub const Cache = struct {
             http,
             inference_url,
             model,
-            task,
+            operation,
             headers,
             wait_context,
         )).capabilities;
@@ -219,11 +219,11 @@ pub const Cache = struct {
         http: *httpx.Client,
         inference_url: []const u8,
         model: []const u8,
-        task: work.Task,
+        operation: work.Operation,
         headers: []const [2][]const u8,
         wait_context: WaitContext,
     ) !CapabilityLease {
-        const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, task, headers);
+        const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, operation, headers);
         defer self.alloc.free(key);
         while (true) {
             try wait_context.check(monotonicNowNs(self.io));
@@ -303,7 +303,7 @@ pub const Cache = struct {
             };
             self.mutex.unlock(self.io);
 
-            const discovered = discoverWithContext(self.alloc, self.io, http, inference_url, model, task, headers, wait_context);
+            const discovered = discoverWithContext(self.alloc, self.io, http, inference_url, model, operation, headers, wait_context);
             if (discovered) |value| {
                 const owner_context_error: ?anyerror = blk: {
                     wait_context.check(monotonicNowNs(self.io)) catch |err| break :blk err;
@@ -408,10 +408,10 @@ pub const Cache = struct {
         self: *Cache,
         inference_url: []const u8,
         model: []const u8,
-        task: work.Task,
+        operation: work.Operation,
         headers: []const [2][]const u8,
     ) !?RoutingToken {
-        const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, task, headers);
+        const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, operation, headers);
         defer self.alloc.free(key);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -427,10 +427,10 @@ pub const Cache = struct {
         self: *Cache,
         inference_url: []const u8,
         model: []const u8,
-        task: work.Task,
+        operation: work.Operation,
         headers: []const [2][]const u8,
     ) !void {
-        const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, task, headers);
+        const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, operation, headers);
         defer self.alloc.free(key);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -488,7 +488,7 @@ fn capabilityCacheKeyAlloc(
     alloc: std.mem.Allocator,
     inference_url: []const u8,
     model: []const u8,
-    task: work.Task,
+    operation: work.Operation,
     headers: []const [2][]const u8,
 ) ![]u8 {
     var auth_hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -504,7 +504,7 @@ fn capabilityCacheKeyAlloc(
     return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}\x1f{s}", .{
         inference_url,
         model,
-        @tagName(task),
+        operation.wireName(),
         &auth_hex,
     });
 }
@@ -583,13 +583,18 @@ fn scopedModelsUrlAlloc(
     alloc: std.mem.Allocator,
     inference_url: []const u8,
     model: []const u8,
-    task: work.Task,
+    operation: work.Operation,
 ) ![]u8 {
     const base = try modelsUrlAlloc(alloc, inference_url);
     defer alloc.free(base);
     const encoded_model = try percentEncodeQueryValueAlloc(alloc, model);
     defer alloc.free(encoded_model);
-    return try std.fmt.allocPrint(alloc, "{s}?model={s}&task={s}", .{ base, encoded_model, @tagName(task) });
+    return try std.fmt.allocPrint(alloc, "{s}?model={s}&task={s}&operation={s}", .{
+        base,
+        encoded_model,
+        @tagName(operation.task()),
+        operation.wireName(),
+    });
 }
 
 fn taskCatalogName(task: work.Task) []const u8 {
@@ -903,10 +908,10 @@ pub fn discover(
     http: *httpx.Client,
     inference_url: []const u8,
     model: []const u8,
-    task: work.Task,
+    operation: work.Operation,
     headers: []const [2][]const u8,
 ) !?work.InferenceCapabilities {
-    const url = try scopedModelsUrlAlloc(alloc, inference_url, model, task);
+    const url = try scopedModelsUrlAlloc(alloc, inference_url, model, operation);
     defer alloc.free(url);
     var response = try http.get(url, .{
         .headers = headers,
@@ -914,7 +919,7 @@ pub fn discover(
     });
     defer response.deinit();
     if (!response.ok()) return error.RemoteCapabilityDiscoveryFailed;
-    return try parseModelCapabilities(alloc, response.body orelse return error.RemoteCapabilityDiscoveryFailed, model, task);
+    return try parseModelCapabilities(alloc, response.body orelse return error.RemoteCapabilityDiscoveryFailed, model, operation.task());
 }
 
 fn discoverWithContext(
@@ -923,7 +928,7 @@ fn discoverWithContext(
     http: *httpx.Client,
     inference_url: []const u8,
     model: []const u8,
-    task: work.Task,
+    operation: work.Operation,
     headers: []const [2][]const u8,
     context: WaitContext,
 ) !DiscoveredCapability {
@@ -939,7 +944,7 @@ fn discoverWithContext(
         @as(u64, 30_000),
         (remaining_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms,
     ));
-    const url = try scopedModelsUrlAlloc(alloc, inference_url, model, task);
+    const url = try scopedModelsUrlAlloc(alloc, inference_url, model, operation);
     defer alloc.free(url);
     var response = try http.get(url, .{
         .headers = headers,
@@ -963,7 +968,7 @@ fn discoverWithContext(
     if ((routing_token == null) != (descriptor_revision == null))
         return error.IncompleteCapabilityLease;
     return .{
-        .value = try parseModelCapabilities(alloc, response.body orelse return error.RemoteCapabilityDiscoveryFailed, model, task),
+        .value = try parseModelCapabilities(alloc, response.body orelse return error.RemoteCapabilityDiscoveryFailed, model, operation.task()),
         .routing_token = routing_token,
         .descriptor_revision = descriptor_revision,
     };
@@ -1094,12 +1099,21 @@ test "remote Antfly model catalog URL normalizes service and operation URLs" {
         try std.testing.expectEqualStrings("http://localhost:8082/ai/v1/models", catalog_url);
     }
 
-    const scoped = try scopedModelsUrlAlloc(std.testing.allocator, "http://localhost:8082/ai/v1/generate/batch", "owner/gemma 4", .generate);
+    const scoped = try scopedModelsUrlAlloc(std.testing.allocator, "http://localhost:8082/ai/v1/generate/batch", "owner/gemma 4", .generate_batch);
     defer std.testing.allocator.free(scoped);
     try std.testing.expectEqualStrings(
-        "http://localhost:8082/ai/v1/models?model=owner%2Fgemma%204&task=generate",
+        "http://localhost:8082/ai/v1/models?model=owner%2Fgemma%204&task=generate&operation=generate.batch",
         scoped,
     );
+}
+
+test "remote Antfly capability cache keys concrete operations independently" {
+    const headers: []const [2][]const u8 = &.{};
+    const single = try capabilityCacheKeyAlloc(std.testing.allocator, "http://proxy", "model", .generate, headers);
+    defer std.testing.allocator.free(single);
+    const batch = try capabilityCacheKeyAlloc(std.testing.allocator, "http://proxy", "model", .generate_batch, headers);
+    defer std.testing.allocator.free(batch);
+    try std.testing.expect(!std.mem.eql(u8, single, batch));
 }
 
 test "remote Antfly capability parser maps legacy zero and explicit null to unknown" {
