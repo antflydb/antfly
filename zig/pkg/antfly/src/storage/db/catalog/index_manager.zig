@@ -2054,7 +2054,12 @@ pub const IndexManager = struct {
         /// generation. It scopes authority to this entry instead of exposing
         /// the manager-wide repair grant to unrelated live v1 indexes.
         native_candidate_build_authorized: bool = false,
-        index: hbc_mod.HBCIndex,
+        // HBC registers resource-manager observers and reclaim callbacks whose
+        // identities contain addresses inside the runtime. Dense catalog
+        // entries move during array growth and generation cutover, so owning
+        // the runtime by value would invalidate those identities. Keep the
+        // runtime at one stable heap address for its entire lifetime.
+        index: *hbc_mod.HBCIndex,
         vector_loader_context: ?*DenseVectorLoadContext = null,
         ordinal_vector_ids: std.AutoHashMapUnmanaged(doc_identity.DocOrdinal, u64) = .empty,
         vector_ordinals: std.AutoHashMapUnmanaged(u64, doc_identity.DocOrdinal) = .empty,
@@ -4568,6 +4573,7 @@ pub const IndexManager = struct {
         } else {
             entry.index.close();
         }
+        self.alloc.destroy(entry.index);
         self.destroyIndexApplyMutex(entry.apply_mutex);
         if (entry.vector_loader_context) |ctx| ctx.deinit(self.alloc);
         entry.ordinal_vector_ids.deinit(self.alloc);
@@ -4594,7 +4600,7 @@ pub const IndexManager = struct {
         defer dense_cfg.deinit(self.alloc);
         const cache_limits = self.resource_manager.?.hbcCacheLimits(dense_cfg.dims, self.hbc_cache != null);
 
-        var index = try hbc_mod.HBCIndex.openWithLsmOptions(self.alloc, zpath, .{
+        entry.index.* = try hbc_mod.HBCIndex.openWithLsmOptions(self.alloc, zpath, .{
             .storage_backend = self.dense_storage_backend,
             .dims = dense_cfg.dims,
             .metric = dense_cfg.metric,
@@ -4627,13 +4633,13 @@ pub const IndexManager = struct {
             .cache = self.lsm_cache,
             .root_generation = self.lsm_root_generation,
         });
-        errdefer index.close();
+        errdefer entry.index.close();
 
-        index.setRetainedVectorCacheEnabled(self.retainedVectorCacheEnabled());
-        index.setIo(self.io);
-        if (self.hbc_cache) |cache| index.attachSharedCache(cache);
+        entry.index.setRetainedVectorCacheEnabled(self.retainedVectorCacheEnabled());
+        entry.index.setIo(self.io);
+        if (self.hbc_cache) |cache| entry.index.attachSharedCache(cache);
         if (self.resource_manager) |manager| {
-            index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
+            entry.index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
         }
 
         const vector_loader_context = try self.alloc.create(DenseVectorLoadContext);
@@ -4646,23 +4652,23 @@ pub const IndexManager = struct {
             self.alloc.free(vector_loader_context.index_name);
             self.alloc.destroy(vector_loader_context);
         }
-        index.setExternalVectorLoader(vector_loader_context, loadDenseVectorForHbc);
-        index.setExternalVectorScratchLoader(vector_loader_context, loadDenseVectorForHbcIntoScratch);
-        index.setExternalVectorBatchScratchLoader(vector_loader_context, loadDenseVectorsForHbcBatch);
-        index.setExternalVectorBatchTransformedMatrixLoader(vector_loader_context, loadDenseVectorsForHbcBatchIntoTransformedMatrix);
-        index.setExternalVectorBatchDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatch);
-        index.setExternalVectorBatchBoundedDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatchBounded);
-        index.setExternalVectorBatchLocatedDistanceLoader(vector_loader_context, scoreDenseVectorsFromNativeLocations);
-        index.setExternalVectorBoundedDistanceAvailable(vector_loader_context, denseVectorBoundedProjectionAvailable);
-        index.setExternalVectorProjectionBuildLoader(vector_loader_context, loadDenseVectorProjectionsForPostingBuild);
-        self.attachVectorBlockResidencyPolicy(&index);
+        entry.index.setExternalVectorLoader(vector_loader_context, loadDenseVectorForHbc);
+        entry.index.setExternalVectorScratchLoader(vector_loader_context, loadDenseVectorForHbcIntoScratch);
+        entry.index.setExternalVectorBatchScratchLoader(vector_loader_context, loadDenseVectorsForHbcBatch);
+        entry.index.setExternalVectorBatchTransformedMatrixLoader(vector_loader_context, loadDenseVectorsForHbcBatchIntoTransformedMatrix);
+        entry.index.setExternalVectorBatchDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatch);
+        entry.index.setExternalVectorBatchBoundedDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatchBounded);
+        entry.index.setExternalVectorBatchLocatedDistanceLoader(vector_loader_context, scoreDenseVectorsFromNativeLocations);
+        entry.index.setExternalVectorBoundedDistanceAvailable(vector_loader_context, denseVectorBoundedProjectionAvailable);
+        entry.index.setExternalVectorProjectionBuildLoader(vector_loader_context, loadDenseVectorProjectionsForPostingBuild);
+        self.attachVectorBlockResidencyPolicy(entry.index);
 
         // Repair/rebuild reopens must restore the same physical-format
         // capabilities as ordinary startup. In particular, a v2 root may
         // atomically rebuild its native authority without being mistaken for
         // an unauthorized v1 migration, and future mutations must remain on
         // the WAL-backed store after that authority is republished.
-        index.setExperimentalPostingAuthorityTransitionPermitted(
+        entry.index.setExperimentalPostingAuthorityTransitionPermitted(
             self.denseNativeAuthorityTransitionPermitted(
                 entry.native_physical_v2,
                 entry.native_candidate_build_authorized,
@@ -4673,10 +4679,9 @@ pub const IndexManager = struct {
         // route mutations through its native WAL even when new v2 admission is
         // disabled for the deployment.
         if (entry.native_physical_v2) {
-            try index.enableNativePostingMutationStore();
+            try entry.index.enableNativePostingMutationStore();
         }
 
-        entry.index = index;
         entry.vector_loader_context = vector_loader_context;
         entry.capture_incarnation = self.allocateDenseCaptureIncarnation();
     }
@@ -16373,7 +16378,16 @@ pub const IndexManager = struct {
                 const zpath = try self.alloc.dupeZ(u8, path);
                 defer self.alloc.free(zpath);
 
-                var index = try hbc_mod.HBCIndex.openWithLsmOptions(self.alloc, zpath, .{
+                const index = try self.alloc.create(hbc_mod.HBCIndex);
+                var index_owned = true;
+                var index_open = false;
+                errdefer {
+                    if (index_owned) {
+                        if (index_open) index.close();
+                        self.alloc.destroy(index);
+                    }
+                }
+                index.* = try hbc_mod.HBCIndex.openWithLsmOptions(self.alloc, zpath, .{
                     .storage_backend = self.dense_storage_backend,
                     .dims = dense_cfg.dims,
                     .metric = dense_cfg.metric,
@@ -16406,6 +16420,7 @@ pub const IndexManager = struct {
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
                 });
+                index_open = true;
                 index.setIo(self.io);
                 index.setRetainedVectorCacheEnabled(self.retainedVectorCacheEnabled());
                 if (self.hbc_cache) |cache| index.attachSharedCache(cache);
@@ -16421,7 +16436,6 @@ pub const IndexManager = struct {
                     ),
                 );
                 var index_moved = false;
-                errdefer if (!index_moved) index.close();
                 const vector_loader_context = try self.alloc.create(DenseVectorLoadContext);
                 var vector_loader_context_initialized = false;
                 errdefer if (!index_moved) {
@@ -16445,7 +16459,7 @@ pub const IndexManager = struct {
                 index.setExternalVectorBatchLocatedDistanceLoader(vector_loader_context, scoreDenseVectorsFromNativeLocations);
                 index.setExternalVectorBoundedDistanceAvailable(vector_loader_context, denseVectorBoundedProjectionAvailable);
                 index.setExternalVectorProjectionBuildLoader(vector_loader_context, loadDenseVectorProjectionsForPostingBuild);
-                self.attachVectorBlockResidencyPolicy(&index);
+                self.attachVectorBlockResidencyPolicy(index);
                 if (index.experimentalPostingWalAuthoritative() or
                     (densePostingSidecarEnabled() and
                         (native_physical_v2 or configured_native_posting_store_supported)))
@@ -16561,6 +16575,8 @@ pub const IndexManager = struct {
                 };
                 apply_mutex_owned = false;
                 index_moved = true;
+                index_owned = false;
+                index_open = false;
                 errdefer self.freeDenseIndexEntry(&entry);
 
                 if (allow_backfill and entry.index.metadata.active_count == 0) {
@@ -22061,7 +22077,7 @@ pub const IndexManager = struct {
         errdefer alloc.free(vector);
         if (load_session) |session| {
             try session.cacheVector(vector_id, vector);
-            session.cacheDecodedVector(&entry.index, vector_id, vector);
+            session.cacheDecodedVector(entry.index, vector_id, vector);
         }
         return vector;
     }
@@ -22088,7 +22104,7 @@ pub const IndexManager = struct {
             };
             if (load_session) |session| {
                 try session.cacheVector(vector_id, vector);
-                session.cacheDecodedVector(&entry.index, vector_id, vector);
+                session.cacheDecodedVector(entry.index, vector_id, vector);
             }
             return vector;
         }
@@ -22096,7 +22112,7 @@ pub const IndexManager = struct {
             const vector = try manager.loadDenseVectorArtifactForHbcIntoScratch(store, metadata, embedding_name, load_session, scratch);
             if (load_session) |session| {
                 try session.cacheVector(vector_id, vector);
-                session.cacheDecodedVector(&entry.index, vector_id, vector);
+                session.cacheDecodedVector(entry.index, vector_id, vector);
             }
             return vector;
         }
@@ -22104,7 +22120,7 @@ pub const IndexManager = struct {
             const vector = try manager.loadDenseVectorArtifactForHbcIntoScratch(store, metadata, entry.config.name, load_session, scratch);
             if (load_session) |session| {
                 try session.cacheVector(vector_id, vector);
-                session.cacheDecodedVector(&entry.index, vector_id, vector);
+                session.cacheDecodedVector(entry.index, vector_id, vector);
             }
             return vector;
         }
@@ -22252,7 +22268,7 @@ pub const IndexManager = struct {
             vector_views[slot] = vector;
             if (load_session) |session| {
                 try session.cacheVector(vector_ids[slot], vector);
-                session.cacheDecodedVector(&entry.index, vector_ids[slot], vector);
+                session.cacheDecodedVector(entry.index, vector_ids[slot], vector);
             }
         }
     }
@@ -22442,7 +22458,7 @@ pub const IndexManager = struct {
             _ = transform(index, vector, matrix[matrix_start..matrix_end]);
             if (load_session) |session| {
                 try session.cacheVector(vector_ids[slot], vector);
-                session.cacheDecodedVector(&entry.index, vector_ids[slot], vector);
+                session.cacheDecodedVector(entry.index, vector_ids[slot], vector);
             }
         }
     }
@@ -23277,7 +23293,7 @@ pub const IndexManager = struct {
             if (vector.len != dims) return error.InvalidVectorDimensions;
             if (load_session) |session| try session.cacheVector(vector_ids[slot], vector);
             if (load_session) |session| {
-                session.cacheDecodedVector(&entry.index, vector_ids[slot], vector);
+                session.cacheDecodedVector(entry.index, vector_ids[slot], vector);
             } else {
                 cache_positions[cache_count] = slot;
                 cache_vectors[cache_count] = vector;
@@ -23401,7 +23417,7 @@ pub const IndexManager = struct {
             if (vector.len != dims) continue;
             if (load_session) |session| try session.cacheVector(vector_ids[slot], vector);
             if (load_session) |session| {
-                session.cacheDecodedVector(&entry.index, vector_ids[slot], vector);
+                session.cacheDecodedVector(entry.index, vector_ids[slot], vector);
             } else {
                 cache_positions[cache_count] = slot;
                 cache_vectors[cache_count] = vector;
@@ -30723,7 +30739,7 @@ test "production exact dense scorer cancels during bounded vector work" {
         .external = false,
         .chunk_name = null,
         .embedding_name = null,
-        .index = index,
+        .index = &index,
     };
     index_owned = false;
     defer entry.index.close();

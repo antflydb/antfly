@@ -19194,7 +19194,7 @@ pub const DB = struct {
                     try native_generation.invalidateProjection(projection.name, .unreadable);
                     continue;
                 };
-                if (@hasDecl(@TypeOf(dense.index), "validateStoredStructure")) {
+                if (@hasDecl(@TypeOf(dense.index.*), "validateStoredStructure")) {
                     dense.index.validateStoredStructure(alloc) catch |err| switch (err) {
                         error.NotFound, error.FileNotFound, error.Corrupted => {
                             try native_generation.invalidateProjection(projection.name, .unreadable);
@@ -23048,8 +23048,17 @@ pub const DB = struct {
     fn runMaintenanceUntilWithOptions(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets, options: ReplayDrainOptions) !void {
         var stable_target = sequence;
         while (true) {
-            try self.runDerivedUntilWithOptions(stable_target, options);
+            // Enrichment is a producer for the managed derived indexes: it can
+            // append embedding/chunk artifacts at the same source revision as
+            // the document being drained. Waiting for a derived consumer
+            // first creates a cycle when that consumer correctly refuses to
+            // checkpoint an incomplete generation outcome. More importantly,
+            // bypassing that wait can publish the source revision before its
+            // later artifacts exist and make those artifacts unreplayable.
+            // Drain the producer boundary first, then every consumer observes
+            // the complete revision and can advance from durable evidence.
             try self.runEnrichmentUntilForDrain(stable_target, options);
+            try self.runDerivedUntilWithOptions(stable_target, options);
 
             const next_target = self.core.nextDerivedSequence();
             if (next_target <= stable_target) {
@@ -23078,8 +23087,8 @@ pub const DB = struct {
         };
         var stable_target = sequence;
         while (true) {
-            try self.runDerivedUntilWithVisibilityWait(stable_target, wait);
             try self.runEnrichmentUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
+            try self.runDerivedUntilWithVisibilityWait(stable_target, wait);
 
             const next_target = self.core.nextDerivedSequence();
             if (next_target <= stable_target) {
@@ -23095,8 +23104,8 @@ pub const DB = struct {
         if (index_names.len == 0) return;
         var stable_target = sequence;
         while (true) {
-            try self.runDerivedUntilTargets(stable_target, index_names);
             try self.runEnrichmentUntil(stable_target);
+            try self.runDerivedUntilTargets(stable_target, index_names);
 
             const next_target = self.core.nextDerivedSequence();
             if (next_target <= stable_target) {
@@ -24515,7 +24524,7 @@ pub const DB = struct {
                 if (checkpoint_config_mismatch) break :blk "dense_projection_config_mismatch";
                 if (projection_checkpoint.status == .repair_required) break :blk "dense_projection_checkpoint_repair_required";
                 if (entry.index.stats().active_count == 0) break :blk null;
-                if (@hasDecl(@TypeOf(entry.index), "validateStoredStructure")) {
+                if (@hasDecl(@TypeOf(entry.index.*), "validateStoredStructure")) {
                     entry.index.validateStoredStructure(alloc) catch |err| {
                         if (recoverable_dense_integrity_errors.check(err)) {
                             entry.index.quarantineExperimentalPostingGeneration();
@@ -69183,7 +69192,7 @@ test "db document extraction chunks units through source artifact enrichment" {
     const query_vec = try deterministic_dense.interface().embedDense(alloc, "document_chunk_dense_v1", "alpha beta gamma", 3);
     defer alloc.free(query_vec);
     const dense_index = db.core.index_manager.denseIndex("document_vectors") orelse return error.IndexNotFound;
-    var direct = try waitForDenseIndexResultsWithAttempts(&dense_index.index, query_vec, 3, 1, slow_test_wait_attempts);
+    var direct = try waitForDenseIndexResultsWithAttempts(dense_index.index, query_vec, 3, 1, slow_test_wait_attempts);
     defer direct.deinit();
     const dense_internal_id = if (direct.takeMetadata(0)) |metadata|
         metadata
@@ -74959,7 +74968,7 @@ test "db dense index can reference existing chunk embedding enrichment" {
     const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
     defer alloc.free(query_vec);
     const dv_ref = db.core.index_manager.denseIndex("dv_ref") orelse return error.IndexNotFound;
-    var direct = try waitForDenseIndexResultsWithAttempts(&dv_ref.index, query_vec, 3, 2, slow_test_wait_attempts);
+    var direct = try waitForDenseIndexResultsWithAttempts(dv_ref.index, query_vec, 3, 2, slow_test_wait_attempts);
     defer direct.deinit();
 
     const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
@@ -76165,9 +76174,10 @@ test "db restart after provider failure resumes enrichment from retained async r
     var first_applied_sequence: u64 = 0;
     var failed_target_sequence: u64 = 0;
     {
-        // Permit one document to establish a durable enrichment watermark, then
-        // keep returning a retryable provider error for the next document while
-        // the independent managed-index executor reaches the replay tail.
+        // Permit one document to establish a durable enrichment watermark,
+        // then keep returning a retryable provider error for the next
+        // document. The managed-index consumer must remain behind that source
+        // revision until enrichment has published its terminal outcome.
         var gated = GateDenseEmbedder{};
         var db = try DB.open(alloc, std.mem.span(path), .{
             .enrichment = .{
@@ -76203,17 +76213,21 @@ test "db restart after provider failure resumes enrichment from retained async r
         }
         try std.testing.expect(gated.snapshot().blocked_requests > 0);
 
-        // Stop at the observed provider failure boundary, then let the
-        // independent executor finish and attempt async truncation. This
-        // deterministically models the process exiting during the outage
-        // without spending the test budget on provider retry backoff.
+        // Stop at the observed provider failure boundary and attempt the same
+        // asynchronous truncation that a derived consumer completion would
+        // request. The consumer is intentionally not allowed to reach the
+        // failed source revision: doing so could make a later same-revision
+        // artifact unreplayable. Enrichment's durable watermark must retain
+        // the source record across restart without spending the test budget on
+        // provider retry backoff.
         db.enrichment_runtime.?.stop();
-        try db.executor.waitForAll(failed_target_sequence);
+        try truncateReplaySequenceAsync(db.async_context, failed_target_sequence);
 
         const failed_stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, failed_stats);
         try std.testing.expectEqual(first_applied_sequence, failed_stats.enrichment.applied_sequence);
         try std.testing.expectEqual(failed_target_sequence, failed_stats.enrichment.target_sequence);
+        try std.testing.expect((db.executor.appliedSequence("dv_v1") orelse 0) < failed_target_sequence);
 
         const retained = try replay_stream_mod.iterateFrom(alloc, db.core.store, first_applied_sequence + 1);
         defer {
