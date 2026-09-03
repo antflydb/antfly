@@ -301,13 +301,24 @@ func (rm *RouteManager) Match(req *RouteRequest) *Route {
 	return nil
 }
 
-// PotentialPoolsFor returns the route cohort that can handle an operation and
+// RouteCohort describes the pools that a future execution may reach. Matched
+// distinguishes a route cohort from the absence of any applicable route, and
+// Terminal records that a definite route makes the default pool and every
+// lower-priority route unreachable. A terminal route may intentionally expose
+// no pools (for example, a reject fallback).
+type RouteCohort struct {
+	Pools    []string
+	Matched  bool
+	Terminal bool
+}
+
+// PotentialCohortFor returns the route cohort that can handle an operation and
 // model. Missing source/header context is treated as unknown rather than as a
 // negative match. Routes stay priority ordered: all possibly matching routes
 // are included until a definite match makes every lower-priority route
 // unreachable. Time windows remain possible for the lifetime of a capability
 // lease because discovery and execution may straddle a window boundary.
-func (rm *RouteManager) PotentialPoolsFor(req *RouteRequest) []string {
+func (rm *RouteManager) PotentialCohortFor(req *RouteRequest) RouteCohort {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 	seen := make(map[string]bool)
@@ -324,7 +335,7 @@ func (rm *RouteManager) PotentialPoolsFor(req *RouteRequest) []string {
 		}
 		return out
 	}
-	var pools []string
+	cohort := RouteCohort{}
 	for _, route := range rm.routes {
 		if len(route.Operations) > 0 && !route.Operations[req.Operation] {
 			continue
@@ -344,7 +355,7 @@ func (rm *RouteManager) PotentialPoolsFor(req *RouteRequest) []string {
 		possible := false
 		impossible := false
 		for headerName, matcher := range route.HeaderMatchers {
-			value, present := req.Headers[headerName]
+			value, present := lookupHeader(req.Headers, headerName)
 			if !present {
 				possible = true
 				continue
@@ -378,12 +389,21 @@ func (rm *RouteManager) PotentialPoolsFor(req *RouteRequest) []string {
 			// remains live, so retain both this route and the next definite route.
 			possible = true
 		}
-		pools = appendRoutePools(pools, route)
+		cohort.Matched = true
+		cohort.Pools = appendRoutePools(cohort.Pools, route)
 		if !possible {
-			return pools
+			cohort.Terminal = true
+			return cohort
 		}
 	}
-	return pools
+	return cohort
+}
+
+// PotentialPoolsFor is retained for source compatibility.
+// Deprecated: use PotentialCohortFor so a terminal route cannot be confused
+// with the absence of a matching route.
+func (rm *RouteManager) PotentialPoolsFor(req *RouteRequest) []string {
+	return rm.PotentialCohortFor(req).Pools
 }
 
 func (rm *RouteManager) matchRoute(route *Route, req *RouteRequest) bool {
@@ -410,7 +430,7 @@ func (rm *RouteManager) matchRoute(route *Route, req *RouteRequest) bool {
 
 	// Match headers (if specified)
 	for headerName, matcher := range route.HeaderMatchers {
-		value, exists := req.Headers[headerName]
+		value, exists := lookupHeader(req.Headers, headerName)
 		if !exists || !matcher.Matches(value) {
 			return false
 		}

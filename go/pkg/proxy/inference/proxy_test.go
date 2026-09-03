@@ -1387,7 +1387,8 @@ func TestExtractModelOperationsPreservesTaskIdentity(t *testing.T) {
 	operations, err := extractModelOperations(strings.NewReader(`{
 		"data": [{"id": "legacy"}],
 		"generators": {"shared": {}},
-		"readers": {"shared": {}, "reader-only": {}}
+		"readers": {"shared": {}, "reader-only": {}},
+		"rerankers": {"multimodal": {}}
 	}`))
 	if err != nil {
 		t.Fatal(err)
@@ -1400,6 +1401,9 @@ func TestExtractModelOperationsPreservesTaskIdentity(t *testing.T) {
 	}
 	if len(operations["legacy"]) != 0 {
 		t.Fatalf("legacy generic catalog must remain task-unknown, got %#v", operations["legacy"])
+	}
+	if !operations["multimodal"]["rerank"] || !operations["multimodal"]["rerank_multimodal"] {
+		t.Fatalf("reranker aliases = %#v, want text and multimodal operations", operations["multimodal"])
 	}
 }
 
@@ -1758,13 +1762,21 @@ func TestScopedCatalogUsesRouteCapabilityCohort(t *testing.T) {
 		Destinations:  []Destination{{Pool: "gpu", Weight: 1}},
 	})
 	request := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Freader&task=read", nil)
-	endpoints := p.catalogEndpointsForRequest(request, "owner/reader", "read", "")
+	routing, err := p.routingContextForRequest(request, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoints := p.catalogEndpointsForRequest(routing, "owner/reader", "read")
 	if len(endpoints) != 1 || endpoints[0].Address != "http://gpu.internal" {
 		t.Fatalf("route capability cohort = %#v, want gpu endpoint only", endpoints)
 	}
 
 	request = httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Fother&task=read", nil)
-	endpoints = p.catalogEndpointsForRequest(request, "owner/other", "read", "")
+	routing, err = p.routingContextForRequest(request, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoints = p.catalogEndpointsForRequest(routing, "owner/other", "read")
 	if len(endpoints) != 1 || endpoints[0].Address != "http://cpu.internal" {
 		t.Fatalf("default capability cohort = %#v, want cpu endpoint only", endpoints)
 	}
@@ -1791,7 +1803,11 @@ func TestScopedCatalogIncludesUnknownConditionalRouteContext(t *testing.T) {
 	})
 
 	request := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Freader&task=read", nil)
-	endpoints := p.catalogEndpointsForRequest(request, "owner/reader", "read", "")
+	routing, err := p.routingContextForRequest(request, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoints := p.catalogEndpointsForRequest(routing, "owner/reader", "read")
 	addresses := make(map[string]bool, len(endpoints))
 	for _, endpoint := range endpoints {
 		addresses[endpoint.Address] = true
@@ -1801,9 +1817,146 @@ func TestScopedCatalogIncludesUnknownConditionalRouteContext(t *testing.T) {
 	}
 
 	request.Header.Set("X-Antfly-Source-Organization", "tenant-a")
-	endpoints = p.catalogEndpointsForRequest(request, "owner/reader", "read", "")
+	routing, err = p.routingContextForRequest(request, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoints = p.catalogEndpointsForRequest(routing, "owner/reader", "read")
+	addresses = make(map[string]bool, len(endpoints))
+	for _, endpoint := range endpoints {
+		addresses[endpoint.Address] = true
+	}
+	if !addresses["http://tenant-gpu.internal"] || !addresses["http://cpu.internal"] || len(addresses) != 2 {
+		t.Fatalf("unverified source header narrowed capability cohort = %#v", addresses)
+	}
+
+	p.verifiedSource = func(r *http.Request) (VerifiedSource, error) {
+		return VerifiedSource{OrganizationID: r.Header.Get("X-Antfly-Source-Organization")}, nil
+	}
+	routing, err = p.routingContextForRequest(request, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoints = p.catalogEndpointsForRequest(routing, "owner/reader", "read")
 	if len(endpoints) != 1 || endpoints[0].Address != "http://tenant-gpu.internal" {
-		t.Fatalf("exact-context capability cohort = %#v, want tenant endpoint only", endpoints)
+		t.Fatalf("verified exact-context capability cohort = %#v, want tenant endpoint only", endpoints)
+	}
+	advertiseModelOperation(p.registry, "http://cpu.internal", "read", "owner/reader")
+	advertiseModelOperation(p.registry, "http://tenant-gpu.internal", "read", "owner/reader")
+	resolution, err := p.ResolveRequest(context.Background(), ResolveRequest{
+		Operation: "read",
+		Model:     "owner/reader",
+		Headers:   routing.Headers,
+		Source:    routing.Source,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Pool != "tenant-gpu" || resolution.Endpoint.Address != "http://tenant-gpu.internal" {
+		t.Fatalf("verified execution resolution = %#v, want tenant endpoint", resolution)
+	}
+}
+
+func TestRoutesPrecedeExplicitPoolForDiscoveryAndExecution(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.registry.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://cpu.internal", "read", "owner/reader")
+	advertiseModelOperation(p.registry, "http://gpu.internal", "read", "owner/reader")
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:          "force-gpu",
+		Operations:    map[OperationType]bool{"read": true},
+		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reader$`)},
+		Destinations:  []Destination{{Pool: "gpu", Weight: 1}},
+	})
+
+	routing := RoutingContext{
+		Headers:      map[string]string{"x-antfly-inference-pool": "cpu"},
+		ExplicitPool: "cpu",
+	}
+	endpoints := p.catalogEndpointsForRequest(routing, "owner/reader", "read")
+	if len(endpoints) != 1 || endpoints[0].Address != "http://gpu.internal" {
+		t.Fatalf("routed capability cohort = %#v, want gpu endpoint only", endpoints)
+	}
+	token, err := p.issueCapabilityLease(
+		"owner/reader",
+		"read",
+		"revision-a",
+		"",
+		capabilityEndpointSet(p.registry, endpoints),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routing.Headers[capabilityTokenHeader] = token
+	routing.Headers[capabilityRevisionHeader] = "revision-a"
+
+	resolution, err := p.ResolveRequest(context.Background(), ResolveRequest{
+		Operation: "read",
+		Model:     "owner/reader",
+		Headers:   routing.Headers,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Pool != "gpu" || resolution.Endpoint.Address != "http://gpu.internal" || resolution.Route == nil {
+		t.Fatalf("routed resolution = %#v, want route-selected gpu resolution", resolution)
+	}
+}
+
+func TestTerminalRejectRouteDoesNotExposeDefaultPool(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:          "reject-reader",
+		Operations:    map[OperationType]bool{"read": true},
+		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reader$`)},
+		Fallback:      &Fallback{Action: "reject", StatusCode: http.StatusForbidden},
+	})
+	routing := RoutingContext{}
+	cohort := p.Router().RouteManager().PotentialCohortFor(routing.routeRequest("read", "owner/reader"))
+	if !cohort.Matched || !cohort.Terminal || len(cohort.Pools) != 0 {
+		t.Fatalf("reject cohort = %#v, want matched terminal cohort without pools", cohort)
+	}
+	if endpoints := p.catalogEndpointsForRequest(routing, "owner/reader", "read"); len(endpoints) != 0 {
+		t.Fatalf("reject catalog = %#v, want no default-pool endpoints", endpoints)
+	}
+}
+
+func TestMultimodalRerankHandlerPreservesConcreteOperation(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.registry.RegisterEndpoint("http://multimodal.internal", "gpu", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://cpu.internal", "rerank", "owner/reranker")
+	advertiseModelOperation(p.registry, "http://multimodal.internal", "rerank_multimodal", "owner/reranker")
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:          "multimodal-rerank",
+		Operations:    map[OperationType]bool{"rerank_multimodal": true},
+		ModelPatterns: []*regexp.Regexp{regexp.MustCompile(`^owner/reranker$`)},
+		Destinations:  []Destination{{Pool: "gpu", Weight: 1}},
+	})
+	var forwardedHost string
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		forwardedHost = req.URL.Host
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"results":[]}`)),
+			Request:    req,
+		}, nil
+	})}
+
+	request := httptest.NewRequest(http.MethodPost, "/ai/v1/rerank_multimodal", strings.NewReader(`{"model":"owner/reranker","query":{"text":"q"},"documents":[]}`))
+	recorder := httptest.NewRecorder()
+	p.handleRerankMultimodal(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if forwardedHost != "multimodal.internal" {
+		t.Fatalf("forwarded host = %q, want multimodal.internal", forwardedHost)
 	}
 }
 

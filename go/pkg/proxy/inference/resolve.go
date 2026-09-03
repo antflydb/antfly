@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +41,34 @@ type ResolveRequest struct {
 	Headers   map[string]string
 	Source    VerifiedSource
 	Timestamp time.Time
+}
+
+// RoutingContext is the normalized, authenticated request context shared by
+// capability discovery and execution. ExplicitPool is the caller-selected
+// fallback when no configured route matches; route policy takes precedence in
+// both paths.
+type RoutingContext struct {
+	Headers      map[string]string
+	Source       VerifiedSource
+	ExplicitPool string
+	Timestamp    time.Time
+}
+
+func (c RoutingContext) routeRequest(operation OperationType, model string) *RouteRequest {
+	timestamp := c.Timestamp
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+	return &RouteRequest{
+		Operation:          operation,
+		Model:              model,
+		Headers:            c.Headers,
+		SourceTable:        firstNonEmpty(c.Source.Table, headerValue(c.Headers, "X-Antfly-Source-Table", "X-Antfly-Table")),
+		SourceOrganization: c.Source.OrganizationID,
+		SourceProject:      c.Source.ProjectID,
+		SourceAPIKey:       c.Source.APIKeyPrefix,
+		Timestamp:          timestamp,
+	}
 }
 
 // Resolution is the result of routing a request to a specific endpoint.
@@ -100,26 +129,31 @@ func (e *ResolutionError) Error() string {
 
 // ResolveRequest resolves a request to an endpoint without forwarding it.
 func (p *Proxy) ResolveRequest(ctx context.Context, req ResolveRequest) (*Resolution, error) {
-	return p.resolveResolveRequest(ctx, req, false)
+	routing := routingContextForResolveRequest(req)
+	return p.resolve(ctx, routing.routeRequest(req.Operation, req.Model), routing, false)
 }
 
 // AcquireRequestResolution resolves and reserves an endpoint for forwarding.
 // Callers must Admit the request before forwarding, then finish the returned
 // lease with RecordSuccess, RecordFailure, or Release.
 func (p *Proxy) AcquireRequestResolution(ctx context.Context, req ResolveRequest) (*ResolutionLease, error) {
-	resolution, err := p.resolveResolveRequest(ctx, req, true)
+	return p.acquireRequestResolution(ctx, req.Operation, req.Model, routingContextForResolveRequest(req))
+}
+
+func (p *Proxy) acquireRequestResolution(ctx context.Context, operation OperationType, model string, routing RoutingContext) (*ResolutionLease, error) {
+	resolution, err := p.resolve(ctx, routing.routeRequest(operation, model), routing, true)
 	if err != nil {
 		return nil, err
 	}
 	return &ResolutionLease{
 		Resolution:                    resolution,
 		proxy:                         p,
-		model:                         req.Model,
-		operation:                     req.Operation,
-		capabilityToken:               headerValue(req.Headers, capabilityTokenHeader),
-		capabilityRevision:            headerValue(req.Headers, capabilityRevisionHeader),
-		capabilityAuthorizationDigest: sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(req.Headers))),
-		workloadType:                  resolveWorkloadType(req.Operation, req.Headers),
+		model:                         model,
+		operation:                     operation,
+		capabilityToken:               headerValue(routing.Headers, capabilityTokenHeader),
+		capabilityRevision:            headerValue(routing.Headers, capabilityRevisionHeader),
+		capabilityAuthorizationDigest: sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(routing.Headers))),
+		workloadType:                  resolveWorkloadType(operation, routing.Headers),
 		admission:                     &leaseAdmission{},
 		attempts:                      newLeaseAttempts(),
 	}, nil
@@ -274,24 +308,13 @@ func (a *leaseAttempts) excludeAndSnapshot(endpoint *Endpoint) map[string]bool {
 	return snapshot
 }
 
-func (p *Proxy) resolveResolveRequest(ctx context.Context, req ResolveRequest, reserve bool) (*Resolution, error) {
-	timestamp := req.Timestamp
-	if timestamp.IsZero() {
-		timestamp = time.Now()
+func routingContextForResolveRequest(req ResolveRequest) RoutingContext {
+	return RoutingContext{
+		Headers:      req.Headers,
+		Source:       req.Source,
+		ExplicitPool: headerValue(req.Headers, "X-Antfly-Inference-Pool"),
+		Timestamp:    req.Timestamp,
 	}
-
-	routeReq := &RouteRequest{
-		Operation:          req.Operation,
-		Model:              req.Model,
-		Headers:            req.Headers,
-		SourceTable:        firstNonEmpty(req.Source.Table, headerValue(req.Headers, "X-Antfly-Source-Table", "X-Antfly-Table")),
-		SourceOrganization: req.Source.OrganizationID,
-		SourceProject:      req.Source.ProjectID,
-		SourceAPIKey:       req.Source.APIKeyPrefix,
-		Timestamp:          timestamp,
-	}
-
-	return p.resolve(ctx, routeReq, req.Headers, reserve)
 }
 
 // StartBackground starts background refresh and route watching without an HTTP listener.
@@ -315,22 +338,23 @@ func (p *Proxy) startBackgroundWorkers(ctx context.Context) {
 	}()
 }
 
-func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map[string]string, reserve bool) (*Resolution, error) {
+func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing RoutingContext, reserve bool) (*Resolution, error) {
 	var pool string
 	var matchedRoute *Route
 	var selectedDest *Destination
 	allowed, err := p.capabilityLeaseEndpoints(
-		headerValue(headers, capabilityTokenHeader),
-		headerValue(headers, capabilityRevisionHeader),
+		headerValue(routing.Headers, capabilityTokenHeader),
+		headerValue(routing.Headers, capabilityRevisionHeader),
 		routeReq.Model,
 		routeReq.Operation,
-		sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(headers))),
+		sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(routing.Headers))),
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	if matchedRoute = p.router.RouteManager().Match(routeReq); matchedRoute != nil {
+	matchedRoute = p.router.RouteManager().Match(routeReq)
+	if matchedRoute != nil {
 		dest, err := p.router.RouteManager().SelectDestinationWithin(matchedRoute, routeReq, p.registry, allowed)
 		if err != nil {
 			return nil, &ResolutionError{
@@ -353,12 +377,12 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 	}
 
 	if pool == "" {
-		pool = headerValue(headers, "X-Antfly-Inference-Pool")
+		pool = strings.TrimSpace(routing.ExplicitPool)
 	}
 	if pool == "" {
 		pool = p.defaultPool
 	}
-	workloadType := resolveWorkloadType(routeReq.Operation, headers)
+	workloadType := resolveWorkloadType(routeReq.Operation, routing.Headers)
 	endpoint, err := p.resolveEndpoint(ctx, routeReq.Model, pool, workloadType, routeReq.Operation, reserve, allowed)
 	if err != nil {
 		return nil, &ResolutionError{
@@ -435,10 +459,10 @@ func resolveWorkloadType(operation OperationType, headers map[string]string) Wor
 		return workloadType
 	}
 
-	switch operation {
-	case "embed", "embeddings", "rerank", "extract":
+	switch semanticTaskForOperation(operation) {
+	case "embed", "rerank", "extract":
 		return WorkloadTypeReadHeavy
-	case "chunk", "generate", "chat.completions":
+	case "chunk", "generate":
 		return WorkloadTypeWriteHeavy
 	default:
 		return WorkloadTypeGeneral
@@ -447,11 +471,27 @@ func resolveWorkloadType(operation OperationType, headers map[string]string) Wor
 
 func headerValue(headers map[string]string, names ...string) string {
 	for _, name := range names {
-		if value := headers[name]; value != "" {
+		if value, ok := lookupHeader(headers, name); ok && value != "" {
 			return value
 		}
 	}
 	return ""
+}
+
+func lookupHeader(headers map[string]string, name string) (string, bool) {
+	if value, ok := headers[name]; ok {
+		return value, true
+	}
+	canonical := http.CanonicalHeaderKey(name)
+	if value, ok := headers[canonical]; ok {
+		return value, true
+	}
+	for candidate, value := range headers {
+		if strings.EqualFold(candidate, name) {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 func firstNonEmpty(values ...string) string {

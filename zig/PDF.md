@@ -1218,9 +1218,10 @@ document. They are architectural requirements, not Florence-specific cleanup:
     context is unavailable or a time window may change during the lease—the
     priority-bounded union of operation/model-compatible route pools. It no
     longer intersects a GPU route with unrelated slow or serial pools merely
-    because they host the same model name. Execution still evaluates the normal
-    route manager and intersects the selected pool and concrete operation with
-    the immutable endpoint set.
+    because they host the same model name. Discovery and execution now share
+    one normalized routing context and precedence rule: configured routes win,
+    then the explicit pool, then the process default. Execution intersects the
+    selected pool and concrete operation with the immutable endpoint set.
 126. **Caller-visible models were prefiltered through service-credential
     inventory.** Scoped discovery begins from healthy endpoint incarnations and
     treats each caller-authorized catalog as the eligibility authority. Leased
@@ -1273,6 +1274,34 @@ document. They are architectural requirements, not Florence-specific cleanup:
     and mutex by value. Distributed text and visual embedding therefore share
     the same synchronized discovery flights and renewable leases as the other
     task executors.
+133. **Discovery and execution disagreed about explicit-pool precedence.** The
+    proxy now derives both paths from the same `RoutingContext`: canonicalized
+    headers, verified source identity, explicit fallback pool, and timestamp.
+    Configured route policy takes precedence, followed by the explicit pool and
+    then the process default. A capability lease therefore contains every pool
+    that its eventual concrete request can reach, without letting an
+    unauthenticated pool header bypass route policy.
+134. **Source-scoped discovery trusted identity headers that execution
+    ignored.** Organization, project, and API-key routing fields now come only
+    from the configured `VerifiedSourceResolver`; the resolver is invoked for
+    both model discovery and inference execution. Without one, those fields
+    remain unknown during conservative discovery and empty during exact
+    execution. The legacy table routing attribute remains a non-identity header
+    fallback. Resolver failure rejects the request before catalog or model
+    routing.
+135. **An empty potential-pool list conflated fallthrough with a terminal
+    route.** Potential planning now returns a structured `RouteCohort` with
+    `Matched`, `Terminal`, and ordered `Pools`. A definite reject is terminal
+    with no pools and cannot silently expose the default pool; a conditional or
+    time-window route remains non-terminal and includes the explicit/default
+    fallback that execution may later select.
+136. **Multimodal reranking was routed as text reranking.** The
+    `/rerank_multimodal` handler now preserves its concrete operation through
+    route matching, endpoint operation inventory, capability fencing, workload
+    classification, metrics, and forwarding. The semantic `rerank` lease still
+    spans both aliases, but execution intersects the lease with the exact
+    operation. Other model families retain the same pattern: semantic task for
+    discovery and caching, concrete operation for policy and execution.
 
 ### Post-review implementation contract
 
@@ -1305,10 +1334,16 @@ The hardening above follows these long-term rules:
 - Discovery and execution form one capability lease. A scoped catalog response
   carries an opaque token and revision bound to model, semantic task, effective
   authorization, exact descriptor bytes, and the exact eligible endpoint
-  incarnations. The endpoint set is a route capability cohort, not a
-  cluster-wide union: execution selects within the configured route and then
-  intersects its pool with the leased endpoints. Equivalent immutable snapshots
-  renew and reuse their token rather than consuming another bounded table slot.
+  incarnations. Both phases construct the same normalized routing context;
+  source identity is supplied by an authenticated resolver, never copied from
+  caller identity headers. The endpoint set is a structured route capability
+  cohort, not a cluster-wide union: a definite terminal reject cannot fall
+  through, while an unresolved conditional route includes every reachable
+  route and fallback pool. Configured route policy precedes an explicit pool,
+  which precedes the process default. Execution then intersects the selected
+  pool and concrete operation with the leased endpoints. Equivalent immutable
+  snapshots renew and reuse their token rather than consuming another bounded
+  table slot.
   Antfly clients attach both values to read,
   generation, embedding, reranking, chunking, extraction, and transcription
   transports; rewrite and classification use the same task contract when their

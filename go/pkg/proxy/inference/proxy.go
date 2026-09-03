@@ -828,7 +828,7 @@ var modelCategoryOperations = map[string][]OperationType{
 	"embedders":    {"embed", "embeddings"},
 	"generators":   {"generate", "generate.batch", "chat.completions"},
 	"readers":      {"read"},
-	"rerankers":    {"rerank"},
+	"rerankers":    {"rerank", "rerank_multimodal"},
 	"chunkers":     {"chunk"},
 	"extractors":   {"extract"},
 	"rewriters":    {"rewrite"},
@@ -1223,7 +1223,13 @@ type Proxy struct {
 	capabilityLeaseMu   sync.Mutex
 	capabilityLeases    map[string]proxyCapabilityLease
 	capabilityLeaseByID map[[sha256.Size]byte]string
+	verifiedSource      VerifiedSourceResolver
 }
+
+// VerifiedSourceResolver authenticates source-scoped routing attributes for an
+// HTTP request. Raw organization, project, and API-key headers are deliberately
+// not treated as trusted identity when no resolver is configured.
+type VerifiedSourceResolver func(*http.Request) (VerifiedSource, error)
 
 const defaultMaxProxyRequestBodyBytes int64 = 256 << 20
 const defaultMaxProxyRetainedBodyBytes int64 = 768 << 20
@@ -1254,14 +1260,15 @@ type Config struct {
 	ListenAddr              string
 	DefaultPool             string
 	RefreshInterval         time.Duration
-	EnableRouteWatching     bool        // Enable watching InferenceProxy CRs
-	RouteWatchNamespace     string      // Namespace to watch for routes (empty for all)
-	RouteWatchKubeconfig    string      // Optional kubeconfig path for route watching
-	UpstreamAuthorization   string      // Optional Authorization header value for upstream refreshes and requests
-	MaxRequestBodyBytes     int64       // Optional retained request-body ceiling; defaults to 256 MiB
-	MaxRetainedBodyBytes    int64       // Optional process-wide body+decode working-set ceiling; defaults to 768 MiB
-	MaxRetainedCatalogBytes int64       // Optional process-wide model-catalog ceiling; defaults to 256 MiB
-	Logger                  *zap.Logger // Optional logger (defaults to production logger)
+	EnableRouteWatching     bool                   // Enable watching InferenceProxy CRs
+	RouteWatchNamespace     string                 // Namespace to watch for routes (empty for all)
+	RouteWatchKubeconfig    string                 // Optional kubeconfig path for route watching
+	UpstreamAuthorization   string                 // Optional Authorization header value for upstream refreshes and requests
+	MaxRequestBodyBytes     int64                  // Optional retained request-body ceiling; defaults to 256 MiB
+	MaxRetainedBodyBytes    int64                  // Optional process-wide body+decode working-set ceiling; defaults to 768 MiB
+	MaxRetainedCatalogBytes int64                  // Optional process-wide model-catalog ceiling; defaults to 256 MiB
+	Logger                  *zap.Logger            // Optional logger (defaults to production logger)
+	VerifiedSourceResolver  VerifiedSourceResolver // Optional authenticated source resolver shared by discovery and execution
 }
 
 // NewProxy creates a new Proxy
@@ -1284,6 +1291,7 @@ func NewProxy(cfg Config) *Proxy {
 		refreshWake:         make(chan struct{}, 1),
 		capabilityLeases:    make(map[string]proxyCapabilityLease),
 		capabilityLeaseByID: make(map[[sha256.Size]byte]string),
+		verifiedSource:      cfg.VerifiedSourceResolver,
 	}
 	p.maxRequestBodyBytes = cfg.MaxRequestBodyBytes
 	if p.maxRequestBodyBytes <= 0 {
@@ -1328,7 +1336,7 @@ func (p *Proxy) Start(ctx context.Context) error {
 	apiMux.HandleFunc("/ai/v1/embeddings", p.handleEmbeddings)
 	apiMux.HandleFunc("/ai/v1/chunk", p.handleChunk)
 	apiMux.HandleFunc("/ai/v1/rerank", p.handleRerank)
-	apiMux.HandleFunc("/ai/v1/rerank_multimodal", p.handleRerank)
+	apiMux.HandleFunc("/ai/v1/rerank_multimodal", p.handleRerankMultimodal)
 	apiMux.HandleFunc("/ai/v1/extract", p.handleExtract)
 	apiMux.HandleFunc("/ai/v1/rewrite", p.handleRewrite)
 	apiMux.HandleFunc("/ai/v1/classify", p.handleClassify)
@@ -1402,6 +1410,12 @@ func (p *Proxy) handleRerank(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "rerank")
 }
 
+// handleRerankMultimodal preserves the concrete operation so route rules and
+// capability leases can distinguish multimodal rerankers from text rerankers.
+func (p *Proxy) handleRerankMultimodal(w http.ResponseWriter, r *http.Request) {
+	p.proxyRequest(w, r, "rerank_multimodal")
+}
+
 func (p *Proxy) handleExtract(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "extract")
 }
@@ -1444,39 +1458,55 @@ func requestHeaderMap(header http.Header) map[string]string {
 	return result
 }
 
+func (p *Proxy) routingContextForRequest(r *http.Request, timestamp time.Time) (RoutingContext, error) {
+	headers := requestHeaderMap(r.Header)
+	source := VerifiedSource{
+		// Table is a request routing attribute, not authenticated caller
+		// identity, and retains its legacy header fallback.
+		Table: headerValue(headers, "X-Antfly-Source-Table", "X-Antfly-Table"),
+	}
+	if p.verifiedSource != nil {
+		verified, err := p.verifiedSource(r)
+		if err != nil {
+			return RoutingContext{}, err
+		}
+		if verified.Table == "" {
+			verified.Table = source.Table
+		}
+		source = verified
+	}
+	return RoutingContext{
+		Headers:      headers,
+		Source:       source,
+		ExplicitPool: strings.TrimSpace(headerValue(headers, "X-Antfly-Inference-Pool")),
+		Timestamp:    timestamp,
+	}, nil
+}
+
 // catalogEndpointsForRequest returns one route capability cohort: every pool
 // the matching request may select, rather than every inference node in the
 // cluster. If source-scoped fields are not present on the discovery request,
-// PotentialPoolsFor conservatively includes routes whose operation/model match
-// while still excluding unrelated model families and pools.
-func (p *Proxy) catalogEndpointsForRequest(r *http.Request, model string, operation OperationType, explicitPool string) []*Endpoint {
-	if explicitPool != "" {
-		return p.registry.GetEndpointsForPool(explicitPool)
-	}
-	headers := requestHeaderMap(r.Header)
-	routeRequest := &RouteRequest{
-		Operation:          operation,
-		Model:              model,
-		Headers:            headers,
-		SourceTable:        headerValue(headers, "X-Antfly-Source-Table", "X-Antfly-Table"),
-		SourceOrganization: headerValue(headers, "X-Antfly-Source-Organization"),
-		SourceProject:      headerValue(headers, "X-Antfly-Source-Project"),
-		SourceAPIKey:       headerValue(headers, "X-Antfly-Source-API-Key"),
-		Timestamp:          time.Now(),
-	}
+// PotentialCohortFor conservatively includes routes whose operation/model
+// match while still excluding unrelated model families and pools.
+func (p *Proxy) catalogEndpointsForRequest(routing RoutingContext, model string, operation OperationType) []*Endpoint {
 	var pools []string
 	seenPools := make(map[string]bool)
 	for _, semanticOperation := range semanticOperationsForTask(semanticTaskForOperation(operation), operation) {
-		routeRequest.Operation = semanticOperation
-		for _, candidate := range p.router.RouteManager().PotentialPoolsFor(routeRequest) {
+		cohort := p.router.RouteManager().PotentialCohortFor(routing.routeRequest(semanticOperation, model))
+		for _, candidate := range cohort.Pools {
 			if !seenPools[candidate] {
 				seenPools[candidate] = true
 				pools = append(pools, candidate)
 			}
 		}
-	}
-	if len(pools) == 0 && p.defaultPool != "" {
-		pools = append(pools, p.defaultPool)
+		// Without a definite route, this concrete operation can fall through to
+		// its explicit pool and then the process default. A definite terminal
+		// reject intentionally contributes neither fallback.
+		fallbackPool := firstNonEmpty(strings.TrimSpace(routing.ExplicitPool), p.defaultPool)
+		if !cohort.Terminal && fallbackPool != "" && !seenPools[fallbackPool] {
+			seenPools[fallbackPool] = true
+			pools = append(pools, fallbackPool)
+		}
 	}
 	seen := make(map[string]bool)
 	var endpoints []*Endpoint
@@ -1514,7 +1544,12 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "model and a valid task must be provided together", http.StatusBadRequest)
 		return
 	}
-	pool := strings.TrimSpace(r.Header.Get("X-Antfly-Inference-Pool"))
+	routing, err := p.routingContextForRequest(r, time.Now())
+	if err != nil {
+		http.Error(w, "source authentication failed", http.StatusUnauthorized)
+		return
+	}
+	pool := routing.ExplicitPool
 	if pool == "" && model == "" {
 		pool = p.defaultPool
 	}
@@ -1526,7 +1561,8 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		// cluster-wide limits even though execution can never reach those nodes.
 		// Caller-scoped upstream catalogs still provide the authorization proof;
 		// this is only a route-cohort prefilter.
-		endpoints = p.catalogEndpointsForRequest(r, model, taskScope.Operation, pool)
+		routing.ExplicitPool = pool
+		endpoints = p.catalogEndpointsForRequest(routing, model, taskScope.Operation)
 	} else if pool == "" {
 		endpoints = p.registry.GetAvailableEndpoints()
 	} else {
@@ -2608,6 +2644,11 @@ func intersectStringValues(left, right any) []string {
 
 func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation string) {
 	start := time.Now()
+	routing, err := p.routingContextForRequest(r, start)
+	if err != nil {
+		http.Error(w, "source authentication failed", http.StatusUnauthorized)
+		return
+	}
 
 	// Parse request to get model
 	if r.ContentLength > p.maxRequestBodyBytes {
@@ -2653,21 +2694,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		return
 	}
 
-	// Build headers map for route matching
-	headers := make(map[string]string)
-	for k := range r.Header {
-		headers[k] = r.Header.Get(k)
-	}
-
-	lease, err := p.AcquireRequestResolution(r.Context(), ResolveRequest{
-		Operation: OperationType(operation),
-		Model:     model,
-		Headers:   headers,
-		Source: VerifiedSource{
-			Table: firstHeader(r, "X-Antfly-Source-Table", "X-Antfly-Table"),
-		},
-		Timestamp: start,
-	})
+	lease, err := p.acquireRequestResolution(r.Context(), OperationType(operation), model, routing)
 	if err != nil {
 		if resolutionErr, ok := err.(*ResolutionError); ok {
 			if resolutionErr.StatusCode == http.StatusConflict {
@@ -3192,13 +3219,4 @@ func (p *Proxy) waitForQueuedDestination(ctx context.Context, route *Route, req 
 			}
 		}
 	}
-}
-
-func firstHeader(r *http.Request, names ...string) string {
-	for _, name := range names {
-		if value := r.Header.Get(name); value != "" {
-			return value
-		}
-	}
-	return ""
 }
