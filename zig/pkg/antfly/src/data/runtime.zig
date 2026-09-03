@@ -17218,6 +17218,9 @@ const RemoteMetadataSource = struct {
         const discovery_budget = antfly.metadata_http_client.RequestBudget{ .deadline_ns = deadline_ns };
         var mutation_driver = antfly.public_api.raft_mutation_forwarding.AbsoluteDriver.init(deadline_ns);
         var last_pre_admission_err: anyerror = error.MissingMetadataApi;
+        const fallback_indices = try std.heap.page_allocator.alloc(usize, self.base_uris.len);
+        defer std.heap.page_allocator.free(fallback_indices);
+        var endpoint_discovery = MetadataMutationEndpointDiscovery.init(fallback_indices);
         for (0..self.base_uris.len) |attempt| {
             if (platform_time.monotonicNs() >= deadline_ns)
                 return error.NotLeader;
@@ -17226,46 +17229,138 @@ const RemoteMetadataSource = struct {
             defer arena.deinit();
             const scratch = arena.allocator();
             var metadata_client = self.metadataClient(scratch);
-            const head = metadata_client.fetchHeadWithBudget(self.base_uris[index], discovery_budget) catch |err| {
+            const status = metadata_client.fetchStatusWithBudget(self.base_uris[index], discovery_budget) catch |err| {
                 if (platform_time.monotonicNs() >= deadline_ns)
                     return error.NotLeader;
                 last_pre_admission_err = err;
                 continue;
             };
-            self.acceptMetadataIdentity(head.metadata_group_id, head.metadata_incarnation) catch |err| {
+            self.acceptMetadataIdentity(status.metadata_group_id, status.metadata_incarnation) catch |err| {
                 last_pre_admission_err = err;
                 continue;
             };
-            if (mutation_driver.forwards_remaining == 0)
-                return error.NotLeader;
-            const forwarding = mutation_driver.nextContext(
-                platform_time.monotonicNs(),
-                50 * std.time.ns_per_ms,
-            ) orelse return error.NotLeader;
-            const result = callFn(
-                self,
+            // Configured endpoint discovery is not a forwarding hop. Search
+            // every reachable endpoint for the reported leader before
+            // delivering the mutation to a follower: otherwise two followers
+            // can spend the bounded forwarding budget before a later
+            // configured leader is reached. Keep non-leaders as fallbacks so
+            // follower-only discovery and leaderless recovery still work.
+            const leader_index = endpoint_discovery.observe(index, status) orelse {
+                last_pre_admission_err = error.NotLeader;
+                continue;
+            };
+            const result = self.deliverMetadataMutation(
+                T,
+                callFn,
                 &metadata_client,
-                self.base_uris[index],
-                forwarding,
+                leader_index,
+                &mutation_driver,
                 ctx,
             ) catch |err| {
-                if (err == error.RaftMutationRequestNotSent) {
-                    // The executor proved that no peer observed the child
-                    // context. Preserve both its hop and the single campaign
-                    // privilege for the next configured endpoint.
-                    last_pre_admission_err = error.NotLeader;
-                    continue;
-                }
-                mutation_driver.recordDelivered(forwarding);
                 if (!remoteMetadataMutationRetryable(err)) return err;
-                last_pre_admission_err = err;
+                last_pre_admission_err = if (err == error.RaftMutationRequestNotSent)
+                    error.NotLeader
+                else
+                    err;
                 continue;
             };
-            mutation_driver.recordDelivered(forwarding);
+            self.noteMetadataAuthoritySuccess(leader_index);
+            return result;
+        }
+        for (endpoint_discovery.fallbacks()) |index| {
+            if (platform_time.monotonicNs() >= deadline_ns)
+                return error.NotLeader;
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var metadata_client = self.metadataClient(scratch);
+            const result = self.deliverMetadataMutation(
+                T,
+                callFn,
+                &metadata_client,
+                index,
+                &mutation_driver,
+                ctx,
+            ) catch |err| {
+                if (!remoteMetadataMutationRetryable(err)) return err;
+                last_pre_admission_err = if (err == error.RaftMutationRequestNotSent)
+                    error.NotLeader
+                else
+                    err;
+                continue;
+            };
             self.noteMetadataAuthoritySuccess(index);
             return result;
         }
         return last_pre_admission_err;
+    }
+
+    const MetadataMutationEndpointDiscovery = struct {
+        fallback_indices: []usize,
+        fallback_count: usize = 0,
+
+        fn init(fallback_storage: []usize) MetadataMutationEndpointDiscovery {
+            return .{ .fallback_indices = fallback_storage };
+        }
+
+        /// Return a directly usable leader immediately and retain every other
+        /// reachable endpoint in discovery order for bounded fallback after
+        /// all possible leaders have been inspected.
+        fn observe(
+            self: *MetadataMutationEndpointDiscovery,
+            index: usize,
+            status: antfly.metadata_api.MetadataStatus,
+        ) ?usize {
+            if (metadataMutationEndpointReportsLocalLeader(status)) return index;
+            std.debug.assert(self.fallback_count < self.fallback_indices.len);
+            self.fallback_indices[self.fallback_count] = index;
+            self.fallback_count += 1;
+            return null;
+        }
+
+        fn fallbacks(self: *const MetadataMutationEndpointDiscovery) []const usize {
+            return self.fallback_indices[0..self.fallback_count];
+        }
+    };
+
+    fn metadataMutationEndpointReportsLocalLeader(status: antfly.metadata_api.MetadataStatus) bool {
+        const leader_id = status.metadata_raft_leader_id orelse return false;
+        return leader_id == status.metadata_raft_local_node_id and
+            std.mem.eql(u8, status.metadata_raft_role, "leader");
+    }
+
+    fn deliverMetadataMutation(
+        self: *RemoteMetadataSource,
+        comptime T: type,
+        comptime callFn: anytype,
+        metadata_client: *antfly.metadata_http_client.MetadataHttpClient,
+        index: usize,
+        mutation_driver: *antfly.public_api.raft_mutation_forwarding.AbsoluteDriver,
+        ctx: anytype,
+    ) !T {
+        if (mutation_driver.forwards_remaining == 0)
+            return error.NotLeader;
+        const forwarding = mutation_driver.nextContext(
+            platform_time.monotonicNs(),
+            50 * std.time.ns_per_ms,
+        ) orelse return error.NotLeader;
+        const result = callFn(
+            self,
+            metadata_client,
+            self.base_uris[index],
+            forwarding,
+            ctx,
+        ) catch |err| {
+            // The executor proved that no peer observed the child context, so
+            // preserve its hop and the single campaign privilege for the next
+            // configured endpoint. Every other result crossed the process
+            // boundary and consumes the delivery.
+            if (err != error.RaftMutationRequestNotSent)
+                mutation_driver.recordDelivered(forwarding);
+            return err;
+        };
+        mutation_driver.recordDelivered(forwarding);
+        return result;
     }
 
     fn remoteMetadataMutationRetryable(err: anyerror) bool {
@@ -33556,6 +33651,69 @@ test "remote metadata mutation failover preserves ambiguous and deterministic ou
     try std.testing.expect(!RemoteMetadataSource.remoteMetadataMutationRetryable(error.TableNotFound));
     try std.testing.expect(!RemoteMetadataSource.remoteMetadataMutationRetryable(error.TableAlreadyExists));
     try std.testing.expect(!RemoteMetadataSource.remoteMetadataMutationRetryable(error.OutOfMemory));
+}
+
+test "remote metadata mutation discovery preserves forwarding budget for the configured leader" {
+    const follower_one = antfly.metadata_api.MetadataStatus{
+        .metadata_group_id = 9,
+        .metadata_raft_local_node_id = 1,
+        .metadata_raft_role = "follower",
+        .metadata_raft_leader_id = 3,
+        .metrics = .{},
+    };
+    const follower_two = antfly.metadata_api.MetadataStatus{
+        .metadata_group_id = 9,
+        .metadata_raft_local_node_id = 2,
+        .metadata_raft_role = "follower",
+        .metadata_raft_leader_id = 3,
+        .metrics = .{},
+    };
+    const leader = antfly.metadata_api.MetadataStatus{
+        .metadata_group_id = 9,
+        .metadata_raft_local_node_id = 3,
+        .metadata_raft_role = "leader",
+        .metadata_raft_leader_id = 3,
+        .metrics = .{},
+    };
+    const leaderless = antfly.metadata_api.MetadataStatus{
+        .metadata_group_id = 9,
+        .metadata_raft_local_node_id = 1,
+        .metadata_raft_role = "candidate",
+        .metadata_raft_leader_id = null,
+        .metrics = .{},
+    };
+
+    var fallback_storage: [3]usize = undefined;
+    var discovery = RemoteMetadataSource.MetadataMutationEndpointDiscovery.init(&fallback_storage);
+    var delivery_order: [3]usize = undefined;
+    var delivery_count: usize = 0;
+    for ([_]antfly.metadata_api.MetadataStatus{ follower_one, follower_two, leader }, 0..) |status, index| {
+        if (discovery.observe(index, status)) |leader_index| {
+            delivery_order[delivery_count] = leader_index;
+            delivery_count += 1;
+        }
+    }
+    for (discovery.fallbacks()) |fallback_index| {
+        delivery_order[delivery_count] = fallback_index;
+        delivery_count += 1;
+    }
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 2, 0, 1 }, delivery_order[0..delivery_count]);
+
+    var driver = antfly.public_api.raft_mutation_forwarding.AbsoluteDriver.init(2_000 * std.time.ns_per_ms);
+    const forwarding = driver.nextContext(1_000 * std.time.ns_per_ms, 50 * std.time.ns_per_ms).?;
+    driver.recordDelivered(forwarding);
+    try std.testing.expectEqual(@as(u8, 1), driver.forwards_remaining);
+
+    var follower_only_storage: [2]usize = undefined;
+    var follower_only = RemoteMetadataSource.MetadataMutationEndpointDiscovery.init(&follower_only_storage);
+    try std.testing.expect(follower_only.observe(7, follower_one) == null);
+    try std.testing.expect(follower_only.observe(8, follower_two) == null);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 7, 8 }, follower_only.fallbacks());
+
+    var leaderless_storage: [1]usize = undefined;
+    var leaderless_discovery = RemoteMetadataSource.MetadataMutationEndpointDiscovery.init(&leaderless_storage);
+    try std.testing.expect(leaderless_discovery.observe(9, leaderless) == null);
+    try std.testing.expectEqualSlices(usize, &[_]usize{9}, leaderless_discovery.fallbacks());
 }
 
 test "remote metadata source retains mutation authority across cache invalidation" {
