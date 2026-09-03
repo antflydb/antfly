@@ -402,6 +402,21 @@ pub const TerminalCommit = struct {
     }
 };
 
+/// An immutable, ownership-independent view of a committed idempotent
+/// operation. Terminal receipt replay must remain available after process
+/// restart even while the prior writer lease is still fencing mutable work.
+pub const IdempotentTerminalCommitSnapshot = struct {
+    request: OwnedTransactionCommitRequest,
+    terminal: TerminalCommit,
+    owns_mutation_lease: bool,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.request.deinit(alloc);
+        self.terminal.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const PendingTerminalAcknowledgement = struct {
     txn_id: db_mod.types.TxnId,
     owner_node_id: u64,
@@ -2423,6 +2438,38 @@ pub const SessionRegistry = struct {
         defer session.deinit(alloc);
         const terminal = session.terminal_commit orelse return null;
         return try terminal.clone(alloc);
+    }
+
+    /// Returns a self-consistent terminal receipt without renewing or taking
+    /// the session lease. The supplied request is revalidated under the same
+    /// stripe lock, so ownership-independent replay cannot disclose a receipt
+    /// for a colliding body.
+    pub fn getIdempotentTerminalCommitSnapshot(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        supplied_request: *const OwnedTransactionCommitRequest,
+    ) !?IdempotentTerminalCommitSnapshot {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var session = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        defer session.deinit(alloc);
+        if (!session.idempotent_receipt) return error.SessionKindMismatch;
+        const terminal = session.terminal_commit orelse return null;
+        const sealed_digest = session.commit_body_digest orelse return error.InvalidTransactionSessionRecord;
+        const supplied_digest = try commitBodyDigest(alloc, supplied_request);
+        if (!std.mem.eql(u8, &sealed_digest, &supplied_digest))
+            return error.TransactionCommitRequestMismatch;
+        const sealed_request = session.staged orelse return error.InvalidTransactionSessionRecord;
+        var snapshot: IdempotentTerminalCommitSnapshot = .{
+            .request = try sealed_request.clone(alloc),
+            .terminal = undefined,
+            .owns_mutation_lease = session.owner_incarnation == self.owner_incarnation,
+        };
+        errdefer snapshot.request.deinit(alloc);
+        snapshot.terminal = try terminal.clone(alloc);
+        return snapshot;
     }
 
     pub fn getIdempotentOutcome(
@@ -6464,6 +6511,55 @@ test "shared session mutations and cleanup reject an adopted owner incarnation" 
     try std.testing.expect((try durable.load(txn_id)) == null);
 }
 
+test "terminal idempotent receipt replay does not require mutation lease ownership" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-terminal-receipt-replay", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    const leases = SessionLeaseStore.init(alloc, &store);
+
+    var owner = SessionRegistry.initWithLeaseTtl(&durable, leases, std.time.ns_per_s);
+    defer owner.deinit(alloc);
+    const txn_id = idempotentTransactionId("alice", "docs", "completed-operation");
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}},"sync_level":"write"}
+    );
+    defer request.deinit(alloc);
+    _ = try owner.beginIdempotentForPrincipal(alloc, txn_id, .{ .sync_level = .write }, 7, "alice", &request);
+    _ = (try owner.markCommitExecutionStarted(alloc, txn_id)).?;
+    _ = (try owner.recordTerminalCommit(alloc, txn_id, .committed, 7001, "docs")).?;
+    _ = (try owner.markTerminalCoordinatorAcknowledged(alloc, txn_id)).?;
+
+    // A restarted process has a new incarnation and cannot mutate while the
+    // old lease is live, but immutable replay remains immediately available.
+    var restarted = SessionRegistry.initWithLeaseTtl(&durable, leases, std.time.ns_per_s);
+    defer restarted.deinit(alloc);
+    var snapshot = (try restarted.getIdempotentTerminalCommitSnapshot(alloc, txn_id, &request)).?;
+    defer snapshot.deinit(alloc);
+    try std.testing.expect(snapshot.terminal.coordinator_acknowledged);
+    try std.testing.expect(!snapshot.owns_mutation_lease);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.request.tables.len);
+    try std.testing.expectError(
+        error.SessionLeaseLost,
+        restarted.cloneIdempotentCommitRequest(alloc, txn_id, &request),
+    );
+
+    var different = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":2}}}},"sync_level":"write"}
+    );
+    defer different.deinit(alloc);
+    try std.testing.expectError(
+        error.TransactionCommitRequestMismatch,
+        restarted.getIdempotentTerminalCommitSnapshot(alloc, txn_id, &different),
+    );
+}
+
 test "durable recovery index tracks only validated commit execution and terminal handoff" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7466,7 +7562,7 @@ test "lease renewal retries transient failure and excludes terminal receipts" {
         5 * std.time.ns_per_ms,
         sessionLeaseExpirationNs(ttl_ns, now_ns),
     );
-    var future = std.Io.async(io_impl.io(), OwnedSessionLeaseHeartbeat.run, .{&heartbeat});
+    var future = try io_impl.io().concurrent(OwnedSessionLeaseHeartbeat.run, .{&heartbeat});
     io_impl.io().sleep(std.Io.Duration.fromMilliseconds(18), .awake) catch {};
     heartbeat.stop();
     future.await(io_impl.io());
@@ -7560,7 +7656,7 @@ test "lease cancellation observes deadline while renewal IO is blocked" {
     );
     const lease_cancellation = OwnedSessionLeaseCancellation{ .heartbeat = &heartbeat };
     const token = lease_cancellation.token();
-    var future = std.Io.async(io_impl.io(), OwnedSessionLeaseHeartbeat.run, .{&heartbeat});
+    var future = try io_impl.io().concurrent(OwnedSessionLeaseHeartbeat.run, .{&heartbeat});
     defer {
         renewal_release.set(io_impl.io());
         heartbeat.stop();

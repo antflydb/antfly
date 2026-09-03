@@ -869,7 +869,18 @@ pub const AntflyApiHandler = struct {
                     interval_ns,
                     heartbeat_confirmed_expiry_ns,
                 );
-                var heartbeat_future = std.Io.async(io, transactions_api.OwnedSessionLeaseHeartbeat.run, .{&heartbeat});
+                // This job already runs on the threaded backend executor.
+                // `std.Io.async` may execute inline there until its first
+                // operation completes, which would make the heartbeat wait
+                // consume the lease before 2PC can even start. A concurrent
+                // task is the required independent lifetime.
+                var heartbeat_future = io.concurrent(
+                    transactions_api.OwnedSessionLeaseHeartbeat.run,
+                    .{&heartbeat},
+                ) catch {
+                    self.result.lease_ownership_uncertain = true;
+                    return;
+                };
                 const lease_cancellation = transactions_api.OwnedSessionLeaseCancellation{
                     .upstream = self.cancellation,
                     .heartbeat = &heartbeat,
@@ -5098,6 +5109,26 @@ pub const AntflyApiHandler = struct {
             },
         };
 
+        // Terminal receipts are immutable reads. Serve them before consulting
+        // owner routing so a process restart does not turn a completed keyed
+        // write into a transient 409 while the prior mutation lease expires.
+        if (try self.api_server.txn_sessions.getIdempotentTerminalReceipt(alloc, txn_id)) |receipt_value| {
+            var receipt = receipt_value;
+            defer receipt.deinit(alloc);
+            return try respondIdempotentBatchRejection(ctx, txn_id, receipt);
+        }
+        if (try self.api_server.txn_sessions.getIdempotentTerminalCommitSnapshot(alloc, txn_id, &supplied)) |snapshot_value| {
+            var snapshot = snapshot_value;
+            defer snapshot.deinit(alloc);
+            return try self.respondIdempotentBatchTerminal(
+                ctx,
+                txn_id,
+                &snapshot.request,
+                &snapshot.terminal,
+                snapshot.owns_mutation_lease,
+            );
+        }
+
         const owner_node_id = (try self.api_server.txn_sessions.getOwnerNodeId(alloc, txn_id)) orelse sessionOwner: {
             break :sessionOwner self.api_server.localSessionNodeId();
         };
@@ -5122,16 +5153,6 @@ pub const AntflyApiHandler = struct {
                 return try idempotentBatchError(ctx, 409, "unknown", "idempotency_owner_unavailable", "the durable operation owner is temporarily unavailable", true, &txn_hex);
             if (refreshed_owner != self.api_server.localSessionNodeId())
                 return try idempotentBatchError(ctx, 409, "unknown", "idempotency_owner_unavailable", "the durable operation owner is temporarily unavailable", true, &txn_hex);
-        }
-
-        // The begin path has already compared the supplied digest for every
-        // newly written receipt. Read terminal rejection state before cloning
-        // the retained body so compatibility records that predate atomic
-        // create-and-seal can remain bodyless and safely non-applied.
-        if (try self.api_server.txn_sessions.getIdempotentTerminalReceipt(alloc, txn_id)) |receipt_value| {
-            var receipt = receipt_value;
-            defer receipt.deinit(alloc);
-            return try respondIdempotentBatchRejection(ctx, txn_id, receipt);
         }
 
         var adopted_incarnation = false;
@@ -5164,7 +5185,7 @@ pub const AntflyApiHandler = struct {
         if (try self.api_server.txn_sessions.getTerminalCommit(alloc, txn_id)) |terminal_value| {
             var terminal = terminal_value;
             defer terminal.deinit(alloc);
-            return try self.respondIdempotentBatchTerminal(ctx, txn_id, &commit_req, &terminal);
+            return try self.respondIdempotentBatchTerminal(ctx, txn_id, &commit_req, &terminal, true);
         }
 
         const distributed_tables = try commit_req.distributedTables(alloc);
@@ -5377,7 +5398,7 @@ pub const AntflyApiHandler = struct {
         if (try self.api_server.txn_sessions.getTerminalCommit(alloc, txn_id)) |terminal_value| {
             var terminal = terminal_value;
             defer terminal.deinit(alloc);
-            return try self.respondIdempotentBatchTerminal(ctx, txn_id, request, &terminal);
+            return try self.respondIdempotentBatchTerminal(ctx, txn_id, request, &terminal, true);
         }
         return try idempotentBatchError(ctx, 409, "unknown", "transaction_outcome_unknown", "receipt changed during reconciliation; retry with the same Idempotency-Key", true, &txn_hex);
     }
@@ -5388,9 +5409,10 @@ pub const AntflyApiHandler = struct {
         txn_id: db_mod.types.TxnId,
         request: *transactions_api.OwnedTransactionCommitRequest,
         terminal: *transactions_api.TerminalCommit,
+        reconcile_coordinator: bool,
     ) !httpx.Response {
         var effective_status = transactions_api.effectiveTerminalCommitStatus(terminal.*);
-        if (terminal.status == .committed and !terminal.coordinator_acknowledged) {
+        if (reconcile_coordinator and terminal.status == .committed and !terminal.coordinator_acknowledged) {
             if (terminal.coordinator_group_id) |group_id| {
                 const source = self.api_server.table_writes;
                 const table_name = terminal.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;

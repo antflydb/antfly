@@ -3754,7 +3754,15 @@ pub const ApiHttpServer = struct {
                     interval_ns,
                     confirmed_expiry_ns,
                 );
-                var heartbeat_future = std.Io.async(io, transactions_api.OwnedSessionLeaseHeartbeat.run, .{&heartbeat});
+                var heartbeat_future = io.concurrent(
+                    transactions_api.OwnedSessionLeaseHeartbeat.run,
+                    .{&heartbeat},
+                ) catch |err| {
+                    // Recovery has not entered storage work yet. Leave the
+                    // durable handoff pending for the next bounded pass.
+                    std.log.warn("stable transaction recovery heartbeat dispatch deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                    continue;
+                };
                 const lease_cancellation = transactions_api.OwnedSessionLeaseCancellation{
                     .heartbeat = &heartbeat,
                 };
@@ -3799,11 +3807,12 @@ pub const ApiHttpServer = struct {
                     return;
                 };
                 defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
-                const outcome = (source.commitTransactionWithIdAndCancellation(
-                    self.alloc,
-                    txn_id,
-                    commit.begin_timestamp,
-                    distributed_tables,
+                // A lease-backed recovery always carries a real cancellation
+                // token. Keep the legacy unfenced/in-memory recovery path on
+                // the non-cancellation callback: sources may intentionally
+                // distinguish that compatibility surface, and `.none` is not
+                // a useful cancellation capability.
+                const recovery_sync_level: db_mod.types.SyncLevel =
                     // Proposal-only delivery is insufficient for recovery:
                     // a new leader may discard it before apply. Upgrade
                     // only the weakest level, preserving stronger caller
@@ -3811,9 +3820,25 @@ pub const ApiHttpServer = struct {
                     if (commit.repair_handoff_needs_coordinator or commit.sync_level == .propose)
                         .write
                     else
-                        commit.sync_level,
-                    cancellation,
-                ) catch |err| switch (err) {
+                        commit.sync_level;
+                const recovery_result = if (cancellation.ptr == null)
+                    source.commitTransactionWithId(
+                        self.alloc,
+                        txn_id,
+                        commit.begin_timestamp,
+                        distributed_tables,
+                        recovery_sync_level,
+                    )
+                else
+                    source.commitTransactionWithIdAndCancellation(
+                        self.alloc,
+                        txn_id,
+                        commit.begin_timestamp,
+                        distributed_tables,
+                        recovery_sync_level,
+                        cancellation,
+                    );
+                const outcome = (recovery_result catch |err| switch (err) {
                     error.EnrichmentWorkerFailed => {
                         // Older records and third-party sources may expose a
                         // committed terminal repair only as an error. Persist

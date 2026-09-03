@@ -5950,6 +5950,7 @@ pub fn build(b: *std.Build) void {
             "transaction session registry reports status and cleans expired durable sessions",
             "transaction session registry enforces savepoint limits and reports remaining capacity",
             "transaction session registry can renew owned leases opportunistically",
+            "terminal idempotent receipt replay does not require mutation lease ownership",
             "api http server keeps session maintenance off public request paths",
             "api http server can renew owned session leases via explicit maintenance hook",
             "session lease renewal remains independent while recovery is blocked",
