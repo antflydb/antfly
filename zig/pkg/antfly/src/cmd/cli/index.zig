@@ -97,7 +97,6 @@ fn parseRoute(iterator: std.process.Args.Iterator) Route {
             route.index_name = nextRouteValue(&args, arg, &route.missing_value_arg);
         } else if (std.mem.eql(u8, arg, "--type") or std.mem.eql(u8, arg, "--field") or
             std.mem.eql(u8, arg, "--template") or std.mem.eql(u8, arg, "--embedder") or
-            std.mem.eql(u8, arg, "--generator") or std.mem.eql(u8, arg, "--summarizer") or
             std.mem.eql(u8, arg, "--chunker") or std.mem.eql(u8, arg, "--dimension") or
             std.mem.eql(u8, arg, "--coverage-policy") or std.mem.eql(u8, arg, "--publication-policy"))
         {
@@ -217,7 +216,6 @@ const IndexCreateConfigInput = struct {
     field: ?[]const u8 = null,
     template: ?[]const u8 = null,
     embedder_json: ?[]const u8 = null,
-    summarizer_json: ?[]const u8 = null,
     chunker_json: ?[]const u8 = null,
     dimension: ?i64 = null,
     coverage_policy: ?[]const u8 = null,
@@ -253,9 +251,6 @@ fn buildIndexCreateConfig(
     if (input.embedder_json) |raw| {
         if (!try isValidJsonObject(allocator, raw)) return error.InvalidEmbedderJson;
     }
-    if (input.summarizer_json) |raw| {
-        if (!try isValidJsonObject(allocator, raw)) return error.InvalidSummarizerJson;
-    }
     if (input.chunker_json) |raw| {
         if (!try isValidJsonObject(allocator, raw)) return error.InvalidChunkerJson;
     }
@@ -268,7 +263,6 @@ fn buildIndexCreateConfig(
     if (input.field) |field| try writer.print(",\"field\":{f}", .{std.json.fmt(field, .{})});
     if (input.template) |template| try writer.print(",\"template\":{f}", .{std.json.fmt(template, .{})});
     if (input.embedder_json) |embedder| try writer.print(",\"embedder\":{s}", .{embedder});
-    if (input.summarizer_json) |summarizer| try writer.print(",\"summarizer\":{s}", .{summarizer});
     if (input.chunker_json) |chunker| try writer.print(",\"chunker\":{s}", .{chunker});
     if (input.dimension) |dimension| try writer.print(",\"dimension\":{d}", .{dimension});
     if (input.coverage_policy) |policy| try writer.print(",\"coverage_policy\":{f}", .{std.json.fmt(policy, .{})});
@@ -286,7 +280,6 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
     var field: ?[]const u8 = null;
     var template: ?[]const u8 = null;
     var embedder_json: ?[]const u8 = null;
-    var summarizer_json: ?[]const u8 = null;
     var chunker_json: ?[]const u8 = null;
     var dimension: ?i64 = null;
     var coverage_policy: ?[]const u8 = null;
@@ -309,9 +302,6 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
         } else if (std.mem.eql(u8, arg, "--embedder")) {
             if (embedder_json != null) cli.fatal("--embedder may only be provided once", .{});
             embedder_json = args.next() orelse cli.fatal("--embedder requires a JSON value", .{});
-        } else if (std.mem.eql(u8, arg, "--generator") or std.mem.eql(u8, arg, "--summarizer")) {
-            if (summarizer_json != null) cli.fatal("use only one of --summarizer or its legacy --generator alias", .{});
-            summarizer_json = args.next() orelse cli.fatal("{s} requires a JSON value", .{arg});
         } else if (std.mem.eql(u8, arg, "--chunker")) {
             if (chunker_json != null) cli.fatal("--chunker may only be provided once", .{});
             chunker_json = args.next() orelse cli.fatal("--chunker requires a JSON value", .{});
@@ -358,7 +348,6 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
         .field = field,
         .template = template,
         .embedder_json = embedder_json,
-        .summarizer_json = summarizer_json,
         .chunker_json = chunker_json,
         .dimension = dimension,
         .coverage_policy = coverage_policy,
@@ -366,7 +355,6 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
     }) catch |err| switch (err) {
         error.InvalidIndexType => cli.fatal("unsupported --type: {s}; expected full_text, embeddings, graph, or algebraic", .{index_type}),
         error.InvalidEmbedderJson => cli.fatal("--embedder must be a valid JSON object", .{}),
-        error.InvalidSummarizerJson => cli.fatal("--summarizer must be a valid JSON object", .{}),
         error.InvalidChunkerJson => cli.fatal("--chunker must be a valid JSON object", .{}),
         else => cli.fatal("failed to build index config: {}", .{err}),
     };
@@ -1107,14 +1095,13 @@ test "index wait parses bounded human durations" {
     try std.testing.expectError(error.InvalidDuration, parseDurationMs("10"));
 }
 
-test "index create config preserves dimension escaping and summarizer" {
+test "index create config preserves dimension and escaping" {
     var parsed = try buildIndexCreateConfig(std.testing.allocator, .{
         .index_type = "embeddings",
         .field = "body\"quoted",
         .template = "{{title}}\n{{body}}",
         .dimension = 512,
         .embedder_json = "{\"provider\":\"openai\",\"model\":\"embed\"}",
-        .summarizer_json = "{\"provider\":\"openai\",\"model\":\"summary\"}",
         .coverage_policy = "partial",
         .publication_policy = "atomic",
     });
@@ -1127,7 +1114,6 @@ test "index create config preserves dimension escaping and summarizer" {
     try std.testing.expectEqual(@as(?i64, 512), config.dimension);
     try std.testing.expectEqualStrings("body\"quoted", config.field.?);
     try std.testing.expectEqualStrings("{{title}}\n{{body}}", config.template.?);
-    try std.testing.expectEqualStrings("summary", config.summarizer.?.model.?);
     try std.testing.expectEqual(antfly_client.types.DerivedCoveragePolicy.partial, config.coverage_policy.?);
     try std.testing.expectEqual(antfly_client.types.IndexPublicationPolicy.atomic, config.publication_policy.?);
 }
@@ -1141,10 +1127,6 @@ test "index create config rejects malformed nested JSON and unknown types" {
     try std.testing.expectError(error.InvalidEmbedderJson, buildIndexCreateConfig(std.testing.allocator, .{
         .index_type = "embeddings",
         .embedder_json = "{",
-    }));
-    try std.testing.expectError(error.InvalidSummarizerJson, buildIndexCreateConfig(std.testing.allocator, .{
-        .index_type = "embeddings",
-        .summarizer_json = "[]",
     }));
     try std.testing.expectError(error.InvalidChunkerJson, buildIndexCreateConfig(std.testing.allocator, .{
         .index_type = "embeddings",

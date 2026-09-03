@@ -216,7 +216,7 @@ func (h *Handler) ensureNamespace(ctx context.Context, namespace string) error {
 		},
 	}
 
-	embedder, err := client.NewEmbedderConfig(client.AntflyEmbedderConfig{Model: embedderModel})
+	embedder, err := client.NewIndexEmbedderConfig(client.AntflyEmbedderConfig{Model: embedderModel})
 	if err != nil {
 		return fmt.Errorf("build embedder config: %w", err)
 	}

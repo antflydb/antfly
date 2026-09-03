@@ -10,6 +10,7 @@ from .client import (
     EmbedderProvider,
     GraphQueriesInput,
     GraphQueryInput,
+    IndexEmbedderConfig,
     IndexOperations,
     antfly_embedder,
 )
@@ -91,6 +92,7 @@ __all__ = [
     "DerivedCoveragePolicy",
     "DistanceMetric",
     "EmbedderConfig",
+    "IndexEmbedderConfig",
     "EmbedderProvider",
     "antfly_embedder",
     "AntflyException",

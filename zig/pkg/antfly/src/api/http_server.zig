@@ -35714,6 +35714,7 @@ test "api http server serves table create and drop" {
         projection_wait_calls: std.atomic.Value(u32) = .init(0),
         indexes_json: []const u8,
         owns_indexes_json: bool = false,
+        owns_schema_json: bool = false,
         table_record: metadata_table_manager.TableRecord = .{
             .table_id = 1,
             .name = "docs",
@@ -35744,6 +35745,7 @@ test "api http server serves table create and drop" {
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             if (self.owns_indexes_json) alloc.free(self.indexes_json);
+            if (self.owns_schema_json) alloc.free(self.table_record.schema_json);
         }
 
         fn replaceIndexesJson(self: *@This(), alloc: std.mem.Allocator, next: []const u8, owns_next: bool) void {
@@ -35772,6 +35774,7 @@ test "api http server serves table create and drop" {
                     .create_table = createTable,
                     .drop_table = dropTable,
                     .update_schema = updateSchema,
+                    .mutate_schema = mutateSchema,
                     .replace_table_definition = replaceTableDefinition,
                     .drop_index = dropIndex,
                     .wait_table_projection = waitTableProjection,
@@ -35835,6 +35838,36 @@ test "api http server serves table create and drop" {
             try std.testing.expect(std.mem.indexOf(u8, schema_json, "\"document_schemas\"") != null);
             self.created = true;
             self.table_record.schema_json = schema_json;
+        }
+
+        fn mutateSchema(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            mode: tables_api.SchemaMutationMode,
+            body: []const u8,
+            expected_version: ?u32,
+        ) !tables_api.SchemaMutationResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            if (expected_version) |expected| {
+                if (try tables_api.schemaVersion(self.table_record.schema_json) != expected)
+                    return error.SchemaVersionChanged;
+            }
+            const updated = try tables_api.applySchemaMutationRecord(alloc, &self.table_record, mode, body);
+            defer metadata_table_manager.freeTable(alloc, updated);
+            const version = try tables_api.schemaVersion(updated.schema_json);
+            const stored_schema = try alloc.dupe(u8, updated.schema_json);
+            errdefer alloc.free(stored_schema);
+            const response_schema = try alloc.dupe(u8, updated.schema_json);
+            if (self.owns_schema_json) alloc.free(self.table_record.schema_json);
+            self.table_record.schema_json = stored_schema;
+            self.owns_schema_json = true;
+            self.created = true;
+            return .{
+                .version = version,
+                .schema_json = response_schema,
+            };
         }
 
         fn createIndex(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {

@@ -43,6 +43,9 @@ from antfly.client_generated.models import (
     QueryResponses,
 )
 from antfly.client_generated.models import (
+    EmbedderConfig as EmbedderConfig,
+)
+from antfly.client_generated.models import (
     EmbedderProvider as EmbedderProvider,
 )
 from antfly.client_generated.types import UNSET
@@ -75,7 +78,9 @@ MAX_GRAPH_MATCH_QUERIES = 8
 CreateIndexRequest: TypeAlias = (
     CreateFullTextIndexRequest | CreateEmbeddingsIndexRequest | CreateGraphIndexRequest | CreateAlgebraicIndexRequest
 )
-EmbedderConfig: TypeAlias = AntflyEmbedderConfig | BedrockEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig
+IndexEmbedderConfig: TypeAlias = (
+    AntflyEmbedderConfig | BedrockEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig
+)
 CreatedIndex: TypeAlias = CreatedFullTextIndex | CreatedEmbeddingsIndex | CreatedGraphIndex | CreatedAlgebraicIndex
 GraphQueryInput: TypeAlias = GraphMatchQuery | GraphTraverseQuery | GraphShortestPathQuery | GraphKShortestPathsQuery
 GraphQueriesInput: TypeAlias = GraphQueries | Mapping[str, GraphQueryInput | Mapping[str, Any]]
@@ -340,7 +345,7 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
     return encoded
 
 
-def antfly_embedder(model: str, *, api_url: str | None = None) -> EmbedderConfig:
+def antfly_embedder(model: str, *, api_url: str | None = None) -> AntflyEmbedderConfig:
     """Build a typed Antfly inference embedder configuration."""
     return AntflyEmbedderConfig(
         provider=AntflyEmbedderConfigProvider.ANTFLY,

@@ -5116,17 +5116,19 @@ pub const AntflyApiHandler = struct {
             .schema_json = try alloc.dupe(u8, mutation.schema_json),
         };
         defer expectation.deinit(alloc);
-        self.api_server.waitForSchemaUpdateProjection(decoded_table_name, expectation, committed_version) catch |err| switch (err) {
-            error.TableVisibilityTimeout => {
-                _ = ctx.status(500);
-                return ctx.text("schema update did not converge");
-            },
-            error.TableGenerationChanged => {
-                _ = ctx.status(409);
-                return ctx.text("schema update was superseded; retry request");
-            },
-            else => return err,
-        };
+        if (!local_schema_applied) {
+            self.api_server.waitForSchemaUpdateProjection(decoded_table_name, expectation, committed_version) catch |err| switch (err) {
+                error.TableVisibilityTimeout => {
+                    _ = ctx.status(500);
+                    return ctx.text("schema update did not converge");
+                },
+                error.TableGenerationChanged => {
+                    _ = ctx.status(409);
+                    return ctx.text("schema update was superseded; retry request");
+                },
+                else => return err,
+            };
+        }
         self.api_server.reconcileProjectedSchemaUpdate(alloc, decoded_table_name, mutation.schema_json, local_schema_applied) catch |write_err| switch (write_err) {
             error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
                 _ = ctx.status(400);
