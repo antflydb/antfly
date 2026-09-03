@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphResolverConfigCandidateSearch(str, Enum):
+class GraphResolverConfigCandidateSearch(StrEnum):
     ANN = "ann"
     EXACT_KEY = "exact_key"
     PREFIX = "prefix"

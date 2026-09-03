@@ -1,13 +1,13 @@
 [tool.poetry]
-name = "antfly"
-version = "0.0.1"
-description = "A client library for accessing Antfly Public API"
+name = "{{ project_name }}"
+version = "{{ package_version }}"
+description = "{{ package_description }}"
 authors = []
 readme = "README.md"
 packages = [
-    { include = "client_generated" },
+    { include = "{{ package_name }}" },
 ]
-include = ["client_generated/py.typed"]
+include = ["{{ package_name }}/py.typed"]
 
 [tool.poetry.dependencies]
 python = "^3.11"
@@ -18,10 +18,3 @@ python-dateutil = "^2.8.0"
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
-
-[tool.ruff]
-line-length = 120
-target-version = "py311"
-
-[tool.ruff.lint]
-select = ["F", "I", "UP"]

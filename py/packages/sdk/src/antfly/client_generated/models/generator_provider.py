@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GeneratorProvider(str, Enum):
+class GeneratorProvider(StrEnum):
     ANTFLY = "antfly"
     ANTHROPIC = "anthropic"
     BEDROCK = "bedrock"

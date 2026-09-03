@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class PackageManifestManifestApiVersion(str, Enum):
+class PackageManifestManifestApiVersion(StrEnum):
     EXTENSIONSV1 = "extensions/v1"
 
     def __str__(self) -> str:

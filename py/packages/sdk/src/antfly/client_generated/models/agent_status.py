@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class AgentStatus(str, Enum):
+class AgentStatus(StrEnum):
     CLARIFICATION_REQUIRED = "clarification_required"
     COMPLETED = "completed"
     FAILED = "failed"

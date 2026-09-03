@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ConnectionKind(str, Enum):
+class ConnectionKind(StrEnum):
     CDC = "cdc"
     EXTERNAL_IO = "external_io"
     INFERENCE = "inference"

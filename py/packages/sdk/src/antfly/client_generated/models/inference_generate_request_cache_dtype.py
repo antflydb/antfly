@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceGenerateRequestCacheDtype(str, Enum):
+class InferenceGenerateRequestCacheDtype(StrEnum):
     F16 = "f16"
     F32 = "f32"
     FP8 = "fp8"

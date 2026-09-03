@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GetDocumentArtifactManifestDetail(str, Enum):
+class GetDocumentArtifactManifestDetail(StrEnum):
     RAW = "raw"
     SUMMARY = "summary"
 

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class StorageResourceExhaustedErrorError(str, Enum):
+class StorageResourceExhaustedErrorError(StrEnum):
     STORAGE_RESOURCE_EXHAUSTED = "storage_resource_exhausted"
 
     def __str__(self) -> str:

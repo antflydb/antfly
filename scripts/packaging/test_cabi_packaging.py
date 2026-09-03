@@ -517,6 +517,22 @@ class CAbiPackagingTests(unittest.TestCase):
         legacy_sdk_pyproject = (
             REPO_ROOT / "py" / "packages" / "sdk" / "src" / "antfly" / "pyproject.toml"
         ).read_text()
+        generated_poetry_template = (
+            REPO_ROOT
+            / "py"
+            / "packages"
+            / "sdk"
+            / "templates"
+            / "pyproject_poetry.toml.jinja"
+        ).read_text()
+        generated_ruff_template = (
+            REPO_ROOT
+            / "py"
+            / "packages"
+            / "sdk"
+            / "templates"
+            / "pyproject_ruff.toml.jinja"
+        ).read_text()
 
         expected_requires_python = f'requires-python = ">={minimum_version}"'
         expected_classifiers = [
@@ -534,6 +550,8 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn(f'pythonVersion = "{minimum_version}"', sdk_pyproject)
         self.assertIn(f'python = "^{minimum_version}"', legacy_sdk_pyproject)
         self.assertIn('target-version = "py311"', legacy_sdk_pyproject)
+        self.assertIn(f'python = "^{minimum_version}"', generated_poetry_template)
+        self.assertIn('target-version = "py311"', generated_ruff_template)
 
         python_ci = (REPO_ROOT / ".github" / "workflows" / "py-ci.yml").read_text()
         matrix_line = next(

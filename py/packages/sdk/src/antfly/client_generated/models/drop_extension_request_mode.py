@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class DropExtensionRequestMode(str, Enum):
+class DropExtensionRequestMode(StrEnum):
     CASCADE = "cascade"
     RESTRICT = "restrict"
 

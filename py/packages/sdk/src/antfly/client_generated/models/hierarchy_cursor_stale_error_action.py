@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class HierarchyCursorStaleErrorAction(str, Enum):
+class HierarchyCursorStaleErrorAction(StrEnum):
     RESTART_HIERARCHY_TRAVERSAL = "restart_hierarchy_traversal"
 
     def __str__(self) -> str:

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class AntflyType(str, Enum):
+class AntflyType(StrEnum):
     BLOB = "blob"
     BOOLEAN = "boolean"
     DATETIME = "datetime"

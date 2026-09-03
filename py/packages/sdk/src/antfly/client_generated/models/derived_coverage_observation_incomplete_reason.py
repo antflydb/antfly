@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class DerivedCoverageObservationIncompleteReason(str, Enum):
+class DerivedCoverageObservationIncompleteReason(StrEnum):
     CONFIG_MISMATCH = "config_mismatch"
     COUNTER_MISMATCH = "counter_mismatch"
     MISSING_GROUP = "missing_group"
