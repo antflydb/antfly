@@ -1002,7 +1002,6 @@ var modelCategoryOperations = map[string][]OperationType{
 	"chunkers":     {"chunk"},
 	"extractors":   {"extract"},
 	"rewriters":    {"rewrite"},
-	"classifiers":  {"classify"},
 	"transcribers": {"transcribe"},
 }
 
@@ -1597,7 +1596,6 @@ func (p *Proxy) Start(ctx context.Context) error {
 	apiMux.HandleFunc("/ai/v1/rerank_multimodal", p.handleRerankMultimodal)
 	apiMux.HandleFunc("/ai/v1/extract", p.handleExtract)
 	apiMux.HandleFunc("/ai/v1/rewrite", p.handleRewrite)
-	apiMux.HandleFunc("/ai/v1/classify", p.handleClassify)
 	apiMux.HandleFunc("/ai/v1/transcribe", p.handleTranscribe)
 	apiMux.HandleFunc("/ai/v1/read", p.handleRead)
 	apiMux.HandleFunc("/ai/v1/generate", p.handleGenerate)
@@ -1680,10 +1678,6 @@ func (p *Proxy) handleExtract(w http.ResponseWriter, r *http.Request) {
 
 func (p *Proxy) handleRewrite(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "rewrite")
-}
-
-func (p *Proxy) handleClassify(w http.ResponseWriter, r *http.Request) {
-	p.proxyRequest(w, r, "classify")
 }
 
 func (p *Proxy) handleTranscribe(w http.ResponseWriter, r *http.Request) {
@@ -2296,7 +2290,6 @@ var catalogTaskScopes = map[string]catalogTaskScope{
 	"chunk":      {Operation: "chunk", Category: "chunkers"},
 	"extract":    {Operation: "extract", Category: "extractors"},
 	"rewrite":    {Operation: "rewrite", Category: "rewriters"},
-	"classify":   {Operation: "classify", Category: "classifiers"},
 	"transcribe": {Operation: "transcribe", Category: "transcribers"},
 }
 
@@ -2382,7 +2375,7 @@ func modelCatalogEncodedBytes(categories map[string]map[string]json.RawMessage) 
 
 var modelCatalogCategories = []string{
 	"embedders", "generators", "readers", "rerankers", "chunkers",
-	"extractors", "rewriters", "classifiers", "transcribers",
+	"extractors", "rewriters", "transcribers",
 }
 
 func mergeModelCatalog(target map[string]map[string]json.RawMessage, source map[string]json.RawMessage) {
@@ -2650,7 +2643,7 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 
 var exactTasks = map[string]bool{
 	"read": true, "generate": true, "embed": true, "rerank": true, "chunk": true,
-	"extract": true, "rewrite": true, "classify": true, "transcribe": true,
+	"extract": true, "rewrite": true, "transcribe": true,
 }
 var exactModalities = map[string]bool{"text": true, "image": true, "audio": true, "document": true}
 var canonicalBuiltInMIMETypes = map[string]bool{
@@ -2668,7 +2661,7 @@ const (
 var exactGranularities = map[string]bool{"item": true, "chunk": true, "page": true, "document": true}
 var exactOutputs = map[string]bool{
 	"read_result": true, "generated_text": true, "embedding": true, "ranked_items": true,
-	"chunks": true, "extraction": true, "rewritten_text": true, "classification": true,
+	"chunks": true, "extraction": true, "rewritten_text": true,
 	"transcription": true,
 }
 var exactCardinalities = map[string]bool{"one_per_item": true, "one_per_request": true}
@@ -2706,7 +2699,7 @@ func validExactInferenceCapabilities(capabilities map[string]any, version int) b
 	expectedOutput := map[string]string{
 		"read": "read_result", "generate": "generated_text", "embed": "embedding",
 		"rerank": "ranked_items", "chunk": "chunks", "extract": "extraction",
-		"rewrite": "rewritten_text", "classify": "classification", "transcribe": "transcription",
+		"rewrite": "rewritten_text", "transcribe": "transcription",
 	}[task]
 	if capabilities["output"] != expectedOutput {
 		return false

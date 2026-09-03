@@ -1039,7 +1039,20 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             var parsed = try std.json.parseFromSlice(ClassifyTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
             const request = parsed.value.request;
-            try validateLinkedTextInvocation(&state.node, state.io, parsed.value.model, .classify, request.texts, 0, request.labels.len, 0);
+            // Classification is an internal extraction executor, not a public
+            // inference task. Resolve the physical classifier bucket while
+            // enforcing the canonical extraction contract.
+            try validateLinkedTextInvocationInScope(
+                &state.node,
+                state.io,
+                parsed.value.model,
+                .extract,
+                "classifiers",
+                request.texts,
+                0,
+                request.labels.len,
+                0,
+            );
             const result = try state.node.classifyTextsDirect(
                 alloc,
                 parsed.value.model,
@@ -1852,7 +1865,31 @@ fn validateLinkedTextInvocation(
     candidates: usize,
     schema_bytes: usize,
 ) !void {
-    const capabilities = try localModelCapabilities(node, io, model, task);
+    return validateLinkedTextInvocationInScope(
+        node,
+        io,
+        model,
+        task,
+        null,
+        items,
+        additional_text_bytes,
+        candidates,
+        schema_bytes,
+    );
+}
+
+fn validateLinkedTextInvocationInScope(
+    node: *inference.server.Node,
+    io: std.Io,
+    model: []const u8,
+    task: antfly.inference.work.Task,
+    scope_override: ?[]const u8,
+    items: []const []const u8,
+    additional_text_bytes: usize,
+    candidates: usize,
+    schema_bytes: usize,
+) !void {
+    const capabilities = try localModelCapabilitiesInScope(node, io, model, task, scope_override);
     try capabilities.validateMimeType("text/plain");
     var shape = antfly.inference.work.InvocationShape{
         .item_count = if (task == .generate) 1 else switch (capabilities.result_cardinality) {
@@ -1879,6 +1916,16 @@ fn localModelCapabilities(
     model: []const u8,
     task: antfly.inference.work.Task,
 ) !antfly.inference.work.InferenceCapabilities {
+    return localModelCapabilitiesInScope(node, io, model, task, null);
+}
+
+fn localModelCapabilitiesInScope(
+    node: *inference.server.Node,
+    io: std.Io,
+    model: []const u8,
+    task: antfly.inference.work.Task,
+    scope_override: ?[]const u8,
+) !antfly.inference.work.InferenceCapabilities {
     if (task == .chunk and
         (std.mem.eql(u8, model, "fixed") or
             std.mem.eql(u8, model, "fixed_bert") or
@@ -1902,7 +1949,7 @@ fn localModelCapabilities(
             .borrowed_attachments = false,
         };
     }
-    const scope = switch (task) {
+    const scope = scope_override orelse switch (task) {
         .read => "readers",
         .generate => "generators",
         .embed => "embedders",
@@ -1910,7 +1957,6 @@ fn localModelCapabilities(
         .chunk => "chunkers",
         .extract => "extractors",
         .rewrite => "rewriters",
-        .classify => "classifiers",
         .transcribe => "transcribers",
     };
     const model_path = try node.resolveModelPath(io, if (model.len > 0) model else null, scope);
@@ -1938,7 +1984,7 @@ fn localModelCapabilities(
             modalities.image = manifest.native_arch_hint == .clip;
             modalities.audio = manifest.native_arch_hint == .clap;
         },
-        .rerank, .chunk, .rewrite, .classify => modalities.text = true,
+        .rerank, .chunk, .rewrite => modalities.text = true,
         .extract => modalities.text = true,
         .transcribe => modalities.audio = true,
     };

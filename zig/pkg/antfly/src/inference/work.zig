@@ -31,7 +31,6 @@ pub const Task = enum {
     chunk,
     extract,
     rewrite,
-    classify,
     transcribe,
 };
 
@@ -50,7 +49,6 @@ pub const Operation = enum {
     chunk,
     extract,
     rewrite,
-    classify,
     transcribe,
 
     pub fn task(self: Operation) Task {
@@ -62,7 +60,6 @@ pub const Operation = enum {
             .chunk => .chunk,
             .extract => .extract,
             .rewrite => .rewrite,
-            .classify => .classify,
             .transcribe => .transcribe,
         };
     }
@@ -100,7 +97,6 @@ pub const OutputKind = enum {
     chunks,
     extraction,
     rewritten_text,
-    classification,
     transcription,
 };
 
@@ -800,7 +796,6 @@ pub const InferenceCapabilities = struct {
             .chunk => .chunks,
             .extract => .extraction,
             .rewrite => .rewritten_text,
-            .classify => .classification,
             .transcribe => .transcription,
         };
         if (self.output != expected_output) return error.InvalidInferenceCapabilities;
@@ -1116,7 +1111,6 @@ test "inference capabilities keep every model family output typed" {
         .{ .chunk, .chunks },
         .{ .extract, .extraction },
         .{ .rewrite, .rewritten_text },
-        .{ .classify, .classification },
         .{ .transcribe, .transcription },
     };
     for (cases) |case| {

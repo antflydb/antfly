@@ -577,37 +577,6 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/TransientCapacity'
-  /classify:
-    post:
-      summary: Classify text with a resolved classifier model
-      operationId: classifyText
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ClassifyRequest'
-      responses:
-        '200':
-          description: Classification completed successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ClassifyResponse'
-        '400':
-          description: Invalid classification request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '404':
-          description: Classifier model not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '503':
-          $ref: '#/components/responses/TransientCapacity'
   /read:
     post:
       summary: Read text from images (OCR/document understanding)
@@ -1622,112 +1591,6 @@ components:
           items:
             type: string
           description: Rewritten texts for this input, one per beam.
-    ClassifyRequest:
-      type: object
-      required:
-        - model
-        - texts
-        - labels
-      properties:
-        model:
-          type: string
-          description: Name of classifier model from models_dir/classifiers/
-          example: MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
-        texts:
-          type: array
-          minItems: 1
-          maxItems: 128
-          items:
-            type: string
-          description: Texts to classify
-          example:
-            - I love this product!
-            - The service was terrible.
-        labels:
-          type: array
-          minItems: 1
-          maxItems: 128
-          items:
-            type: string
-            minLength: 1
-          description: |
-            Candidate labels for zero-shot classification.
-            The model will predict which label(s) best describe each text.
-          example:
-            - positive
-            - negative
-            - neutral
-        hypothesis_template:
-          type: string
-          description: |
-            Custom hypothesis template for NLI-based classification.
-            Use "{}" as placeholder for the label.
-            Default: "This example is {}."
-          example: This text expresses a {} sentiment.
-        multi_label:
-          type: boolean
-          default: false
-          description: |
-            If true, allows multiple labels per text (independent scoring).
-            If false (default), scores are normalized across labels.
-    ClassifyResult:
-      type: object
-      required:
-        - label
-        - score
-      properties:
-        label:
-          type: string
-          description: The predicted class/category
-          example: positive
-        score:
-          type: number
-          format: float
-          description: Confidence score (0.0 to 1.0)
-          example: 0.95
-    ClassifyResponse:
-      type: object
-      required:
-        - object
-        - data
-        - model
-        - usage
-      properties:
-        object:
-          type: string
-          enum:
-            - list
-          description: Object type, always "list"
-        data:
-          type: array
-          items:
-            $ref: '#/components/schemas/ClassifyObject'
-          description: Classification result objects, one per input text.
-        model:
-          type: string
-          description: Name of model used for classification
-        usage:
-          $ref: '#/components/schemas/GenerateUsage'
-    ClassifyObject:
-      type: object
-      required:
-        - object
-        - index
-        - classifications
-      properties:
-        object:
-          type: string
-          enum:
-            - classification
-        index:
-          type: integer
-          description: Original input text index.
-        classifications:
-          type: array
-          items:
-            $ref: '#/components/schemas/ClassifyResult'
-          description: |
-            Classification results for this input text.
     DocumentClassificationRequest:
       type: object
       required:
@@ -2263,7 +2126,6 @@ components:
         - generators
         - extractors
         - rewriters
-        - classifiers
         - readers
         - transcribers
       properties:
@@ -2294,11 +2156,6 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/ModelInfo'
           description: Available reranking models
-        classifiers:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/ModelInfo'
-          description: Available zero-shot classification models
         embedders:
           type: object
           additionalProperties:

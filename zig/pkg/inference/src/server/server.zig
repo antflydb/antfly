@@ -2773,7 +2773,6 @@ const ModelCounts = struct {
     rerankers: usize = 0,
     chunkers: usize = 0,
     generators: usize = 0,
-    classifiers: usize = 0,
     rewriters: usize = 0,
     readers: usize = 0,
     transcribers: usize = 0,
@@ -2784,7 +2783,6 @@ const ModelCounts = struct {
             self.rerankers +
             self.chunkers +
             self.generators +
-            self.classifiers +
             self.rewriters +
             self.readers +
             self.transcribers +
@@ -2823,14 +2821,14 @@ const ReadinessInventory = struct {
 const readiness_inventory_refresh_interval_ms: u64 = 60_000;
 
 fn incrementModelCount(counts: *ModelCounts, task: []const u8) void {
-    if (std.mem.eql(u8, task, "embedders")) counts.embedders += 1 else if (std.mem.eql(u8, task, "rerankers")) counts.rerankers += 1 else if (std.mem.eql(u8, task, "chunkers")) counts.chunkers += 1 else if (std.mem.eql(u8, task, "generators")) counts.generators += 1 else if (std.mem.eql(u8, task, "classifiers")) counts.classifiers += 1 else if (std.mem.eql(u8, task, "rewriters")) counts.rewriters += 1 else if (std.mem.eql(u8, task, "readers")) counts.readers += 1 else if (std.mem.eql(u8, task, "transcribers")) counts.transcribers += 1 else if (std.mem.eql(u8, task, "extractors")) counts.extractors += 1;
+    if (std.mem.eql(u8, task, "embedders")) counts.embedders += 1 else if (std.mem.eql(u8, task, "rerankers")) counts.rerankers += 1 else if (std.mem.eql(u8, task, "chunkers")) counts.chunkers += 1 else if (std.mem.eql(u8, task, "generators")) counts.generators += 1 else if (std.mem.eql(u8, task, "rewriters")) counts.rewriters += 1 else if (std.mem.eql(u8, task, "readers")) counts.readers += 1 else if (std.mem.eql(u8, task, "transcribers")) counts.transcribers += 1 else if (std.mem.eql(u8, task, "extractors")) counts.extractors += 1;
 }
 
 fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) ModelCounts {
     const task_names = [_][]const u8{
-        "embedders",  "rerankers",   "chunkers",
-        "generators", "classifiers", "extractors",
-        "rewriters",  "readers",     "transcribers",
+        "embedders",  "rerankers",    "chunkers",
+        "generators", "extractors",   "rewriters",
+        "readers",    "transcribers",
     };
     var counts = ModelCounts{};
 
@@ -2899,9 +2897,9 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
 
 fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) !ModelCounts {
     const task_names = [_][]const u8{
-        "embedders",  "rerankers",   "chunkers",
-        "generators", "classifiers", "extractors",
-        "rewriters",  "readers",     "transcribers",
+        "embedders",  "rerankers",    "chunkers",
+        "generators", "extractors",   "rewriters",
+        "readers",    "transcribers",
     };
     var counts = ModelCounts{};
 
@@ -3950,7 +3948,7 @@ pub const Node = struct {
         };
         if (classifier_path) |model_path| {
             defer self.allocator.free(model_path);
-            const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "classify");
+            const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "extract");
             const hypothesis = hypothesis_template orelse "This example is {}.";
             const additional_text_bytes = std.math.add(usize, maxTextBytes(labels), hypothesis.len) catch
                 return error.InferenceTextBytesExceeded;
@@ -3998,7 +3996,7 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io_impl.io(), requested, "extractors");
         defer self.allocator.free(model_path);
-        const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "classify");
+        const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "extract");
         try validateTextExecutorInvocation(
             executor_contract,
             texts.len,
@@ -11528,129 +11526,6 @@ pub const Node = struct {
         return null;
     }
 
-    pub fn classifyText(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        var parsed = (try ctx.parseJson(api.ClassifyRequest)) orelse
-            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-        defer parsed.deinit();
-        const body = parsed.value;
-        validateClassificationInvocation(body.texts, body.labels) catch |err|
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
-        const admission_units = self.estimateHttpRequestAdmissionUnits(ctx);
-        if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
-        defer self.releaseSlotUnits(admission_units);
-        self.metrics.incRequest("classify");
-        defer self.metrics.decActive();
-
-        const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "classifiers")) |model_path| {
-            defer ctx.allocator.free(model_path);
-            const executor_contract = resolvedInferenceExecutorContractFromDir(self, ctx.allocator, model_path, "classify") catch |err|
-                return inferenceExecutorContractFailureResponse(ctx, err);
-            const hypothesis: []const u8 = body.hypothesis_template orelse "This example is {}.";
-            const hypothesis_bytes = hypothesis.len;
-            const label_and_template_bytes = std.math.add(usize, maxTextBytes(body.labels), hypothesis_bytes) catch
-                return inferenceExecutorContractFailureResponse(ctx, error.InferenceTextBytesExceeded);
-            validateTextExecutorInvocation(
-                executor_contract,
-                body.texts.len,
-                body.texts,
-                label_and_template_bytes,
-                0,
-                body.labels.len,
-                0,
-            ) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
-            if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-            var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
-                return modelLoadFailureResponse(ctx, err);
-            defer model_handle.release();
-            const model = model_handle.get();
-
-            // Detect entailment index from id2label (varies by NLI model)
-            const entailment_idx: ?usize = if (model.manifest.id2label) |labels| blk: {
-                for (labels, 0..) |label, i| {
-                    if (std.mem.eql(u8, label, "entailment") or std.mem.eql(u8, label, "ENTAILMENT")) {
-                        break :blk i;
-                    }
-                }
-                break :blk null;
-            } else null;
-
-            const config = @import("../pipelines/classification.zig").ClassificationConfig{
-                .max_length = model.manifest.max_position_embeddings,
-                .hypothesis_template = body.hypothesis_template orelse "This example is {}.",
-                .multi_label = body.multi_label orelse false,
-                .entailment_index = entailment_idx,
-            };
-            var pipeline = model.classificationPipeline(ctx.allocator, config);
-            const input_tokens = pipeline.maxInputTokensPerItem(body.texts, body.labels) catch |err|
-                return inferenceFailureResponse(ctx, err);
-            validateTextExecutorInvocation(executor_contract, body.texts.len, body.texts, label_and_template_bytes, input_tokens, body.labels.len, 0) catch |err|
-                return inferenceExecutorContractFailureResponse(ctx, err);
-
-            const all_results = pipeline.classifyBatch(body.texts, body.labels) catch |err|
-                return inferenceFailureResponse(ctx, err);
-            defer {
-                for (all_results) |r| ctx.allocator.free(r);
-                ctx.allocator.free(all_results);
-            }
-
-            const prompt_tokens =
-                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.texts) catch estimateTextsTokens(body.texts)) +
-                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.labels) catch estimateTextsTokens(body.labels));
-            return buildClassificationResponse(ctx, body.model, all_results, prompt_tokens);
-        } else |err| switch (requestModelResolutionErrorKind(err)) {
-            .missing => {},
-            .invalid, .internal => return requestModelResolutionError(ctx, err),
-        }
-
-        if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "extractors")) |model_path| {
-            defer ctx.allocator.free(model_path);
-            const executor_contract = resolvedInferenceExecutorContractFromDir(self, ctx.allocator, model_path, "classify") catch |err|
-                return inferenceExecutorContractFailureResponse(ctx, err);
-            const hypothesis: []const u8 = body.hypothesis_template orelse "This example is {}.";
-            const hypothesis_bytes = hypothesis.len;
-            const label_and_template_bytes = std.math.add(usize, maxTextBytes(body.labels), hypothesis_bytes) catch
-                return inferenceExecutorContractFailureResponse(ctx, error.InferenceTextBytesExceeded);
-            validateTextExecutorInvocation(executor_contract, body.texts.len, body.texts, label_and_template_bytes, 0, body.labels.len, 0) catch |err|
-                return inferenceExecutorContractFailureResponse(ctx, err);
-            if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-            var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
-                return modelLoadFailureResponse(ctx, err);
-            defer model_handle.release();
-            const model = model_handle.get();
-            if (!model.isGlinerModel() or !model.supportsClassification()) {
-                return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
-            }
-
-            var pipeline = model.glinerPipeline(ctx.allocator);
-            const input_tokens = pipeline.maxClassificationInputTokens(body.texts, body.labels) catch |err|
-                return inferenceFailureResponse(ctx, err);
-            validateTextExecutorInvocation(executor_contract, body.texts.len, body.texts, label_and_template_bytes, input_tokens, body.labels.len, 0) catch |err|
-                return inferenceExecutorContractFailureResponse(ctx, err);
-            const all_results = pipeline.classifyBatch(body.texts, body.labels, .{
-                .threshold = 0.0,
-                .multi_label = body.multi_label orelse false,
-            }) catch |err| switch (err) {
-                error.MissingSpecialTokenIds => return ctx.status(500).json(.{ .@"error" = "MODEL_CONFIG_INVALID", .message = @errorName(err) }),
-                else => return inferenceFailureResponse(ctx, err),
-            };
-            defer {
-                for (all_results) |r| ctx.allocator.free(r);
-                ctx.allocator.free(all_results);
-            }
-
-            const prompt_tokens =
-                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.texts) catch estimateTextsTokens(body.texts)) +
-                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.labels) catch estimateTextsTokens(body.labels));
-            return buildClassificationResponse(ctx, body.model, all_results, prompt_tokens);
-        } else |err| switch (requestModelResolutionErrorKind(err)) {
-            .missing => {},
-            .invalid, .internal => return requestModelResolutionError(ctx, err),
-        }
-
-        return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
-    }
-
     pub fn classifyDocument(self: *Node, ctx: *httpx.Context) !httpx.Response {
         var parsed = (try ctx.parseJson(api.DocumentClassificationRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -12828,7 +12703,7 @@ pub const Node = struct {
         }
 
         const task_names = [_][]const u8{
-            "embedders",  "rerankers", "chunkers", "generators",   "classifiers",
+            "embedders",  "rerankers", "chunkers", "generators",
             "extractors", "rewriters", "readers",  "transcribers",
         };
         // Keep every snapshotted model alive while filesystem canonicalization
@@ -13500,35 +13375,6 @@ fn predictorTaskFromTabular(task: @import("ml_tabular").ir.TaskType) api.Predict
         .multiclass => .multiclass,
         .ranking => .ranking,
     };
-}
-
-fn buildClassificationResponse(
-    ctx: *httpx.Context,
-    model_name: []const u8,
-    all_results: anytype,
-    prompt_tokens: usize,
-) !httpx.Response {
-    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const data = try alloc.alloc(api.ClassifyObject, all_results.len);
-    for (all_results, 0..) |results, ti| {
-        const inner = try alloc.alloc(api.ClassifyResult, results.len);
-        for (results, 0..) |r, ri| inner[ri] = .{ .label = r.label, .score = r.score };
-        data[ti] = .{
-            .object = "classification",
-            .index = @intCast(ti),
-            .classifications = inner,
-        };
-    }
-
-    return ctx.json(api.ClassifyResponse{
-        .object = "list",
-        .data = data,
-        .model = model_name,
-        .usage = tokenUsage(prompt_tokens, 0),
-    });
 }
 
 fn extractionResponseJsonAlloc(
@@ -14822,11 +14668,9 @@ fn taskMatchesModelListing(
     capabilities: []const []const u8,
     zero_shot_classification: bool,
 ) bool {
-    if (std.mem.eql(u8, task, "classifiers") and
-        model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification"))
-    {
-        return true;
-    }
+    // Classification is a public extraction capability. Keep `classifier` as
+    // an internal pipeline kind without publishing a parallel API/catalog task.
+    if (std.mem.eql(u8, task, "classifiers")) return false;
     if (std.mem.eql(u8, task, "extractors") and
         model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification"))
     {
@@ -14841,8 +14685,6 @@ fn taskMatchesModelListing(
             "chunk"
         else if (std.mem.eql(u8, task, "generators"))
             "generate"
-        else if (std.mem.eql(u8, task, "classifiers"))
-            "classify"
         else if (std.mem.eql(u8, task, "rewriters"))
             "rewrite"
         else if (std.mem.eql(u8, task, "readers"))
@@ -15028,7 +14870,6 @@ fn normalizedInferenceTask(task: []const u8) ?[]const u8 {
         .{ "chunkers", "chunk" },
         .{ "extractors", "extract" },
         .{ "rewriters", "rewrite" },
-        .{ "classifiers", "classify" },
         .{ "transcribers", "transcribe" },
     };
     for (mappings) |mapping| {
@@ -15071,8 +14912,7 @@ pub fn resolvedExecutorModalities(
         .image = manifest_image,
     };
     if (std.mem.eql(u8, resolved_task, "chunk") or
-        std.mem.eql(u8, resolved_task, "rewrite") or
-        std.mem.eql(u8, resolved_task, "classify")) return .{ .text = manifest_text };
+        std.mem.eql(u8, resolved_task, "rewrite")) return .{ .text = manifest_text };
     if (std.mem.eql(u8, resolved_task, "transcribe")) return .{ .audio = manifest_audio };
     return .{};
 }
@@ -15096,7 +14936,7 @@ pub fn resolvedTaskPromptPolicy(resolved_task: []const u8) []const u8 {
 }
 
 test "executor capability resolution never advertises raw documents" {
-    for ([_][]const u8{ "read", "generate", "embed", "rerank", "chunk", "extract", "rewrite", "classify", "transcribe" }) |task| {
+    for ([_][]const u8{ "read", "generate", "embed", "rerank", "chunk", "extract", "rewrite", "transcribe" }) |task| {
         const modalities = resolvedExecutorModalities(task, true, true, true, true);
         try std.testing.expect(!modalities.document);
     }
@@ -15301,7 +15141,6 @@ pub fn resolvedTaskOutput(resolved_task: []const u8) []const u8 {
     if (std.mem.eql(u8, resolved_task, "chunk")) return "chunks";
     if (std.mem.eql(u8, resolved_task, "extract")) return "extraction";
     if (std.mem.eql(u8, resolved_task, "rewrite")) return "rewritten_text";
-    if (std.mem.eql(u8, resolved_task, "classify")) return "classification";
     if (std.mem.eql(u8, resolved_task, "transcribe")) return "transcription";
     unreachable;
 }
@@ -15335,7 +15174,6 @@ pub fn resolvedTaskMaxItems(resolved_task: []const u8) usize {
     else if (std.mem.eql(u8, resolved_task, "embed"))
         64
     else if (std.mem.eql(u8, resolved_task, "rewrite") or
-        std.mem.eql(u8, resolved_task, "classify") or
         std.mem.eql(u8, resolved_task, "extract"))
         max_serial_family_batch_items
     else
@@ -15381,7 +15219,7 @@ pub fn resolveInferenceBatchCapabilities(
     var max_text_bytes_per_item: ?usize = null;
     var max_input_tokens_per_item: ?usize = null;
     var max_output_tokens_per_item: ?usize = if (std.mem.eql(u8, resolved_task, "read")) max_read_tokens else null;
-    var max_candidates_per_request: ?usize = if (std.mem.eql(u8, resolved_task, "classify")) max_classification_labels else null;
+    var max_candidates_per_request: ?usize = if (std.mem.eql(u8, resolved_task, "extract")) max_classification_labels else null;
     var max_schema_bytes: ?usize = null;
 
     for (manifest_capabilities) |capability| {
@@ -15799,7 +15637,7 @@ fn resolvedManifestLimit(
 }
 
 test "resolved capability item ceilings cover array-oriented model families" {
-    for ([_][]const u8{ "rewrite", "classify", "extract" }) |task|
+    for ([_][]const u8{ "rewrite", "extract" }) |task|
         try std.testing.expectEqual(max_serial_family_batch_items, resolvedTaskMaxItems(task));
     try std.testing.expectEqual(@as(usize, 1), resolvedTaskMaxItems("rerank"));
     try std.testing.expectEqual(@as(usize, 1), resolvedTaskMaxItems("transcribe"));
@@ -16007,7 +15845,6 @@ test "normalized inference capabilities cover every model family" {
         .{ .category = "chunkers", .task = "chunk", .kind = "chunker", .input = "text" },
         .{ .category = "extractors", .task = "extract", .kind = "extractor", .input = "text" },
         .{ .category = "rewriters", .task = "rewrite", .kind = "rewriter", .input = "text" },
-        .{ .category = "classifiers", .task = "classify", .kind = "classifier", .input = "text" },
         .{ .category = "transcribers", .task = "transcribe", .kind = "transcriber", .input = "audio" },
     };
     for (cases) |case| {
@@ -16058,7 +15895,6 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
         if (comptime std.mem.eql(u8, path, "/models") or std.mem.eql(u8, path, "/predictors")) return .none;
     } else if (comptime std.mem.eql(u8, method, "POST")) {
         if (comptime std.mem.eql(u8, path, "/chat/completions") or
-            std.mem.eql(u8, path, "/classify") or
             std.mem.eql(u8, path, "/chunk") or
             std.mem.eql(u8, path, "/embed") or
             std.mem.eql(u8, path, "/embeddings") or
@@ -17774,7 +17610,7 @@ test "generate HTTP enforces resolved manifest media limits before model loading
     try std.testing.expect(std.mem.indexOf(u8, bytes_batch_response.body.?, "INVALID_MEDIA_BASE64") == null);
 }
 
-test "classification HTTP enforces resolved candidate limit before model loading" {
+test "internal classification executor uses extraction candidate limits before model loading" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -17795,17 +17631,17 @@ test "classification HTTP enforces resolved candidate limit before model loading
     var node = try Node.init(allocator, .{ .models_dir = models_root });
     defer node.deinit();
     resetRequestWorkTestCounters();
-    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/classify");
-    defer request.deinit();
-    try request.setJson(
-        "{\"model\":\"owner/model\",\"texts\":[\"page\"],\"labels\":[\"invoice\",\"receipt\"]}",
+    try std.testing.expectError(
+        error.InferenceCandidateLimitExceeded,
+        node.classifyTextsDirect(
+            allocator,
+            "owner/model",
+            &.{"page"},
+            &.{ "invoice", "receipt" },
+            null,
+            false,
+        ),
     );
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
-    defer ctx.deinit();
-    var response = try node.classifyText(&ctx);
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 413), response.status.code);
-    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "CANDIDATE_LIMIT_EXCEEDED") != null);
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
 }
 
@@ -19168,7 +19004,7 @@ test "failed readiness refresh preserves the last known good inventory" {
 
     var node = try Node.init(allocator, .{ .models_dir = models_path });
     defer node.deinit();
-    node.readiness_inventory.publish(.{ .classifiers = 1 });
+    node.readiness_inventory.publish(.{ .extractors = 1 });
 
     try std.testing.expectError(
         error.NotDir,
@@ -19176,7 +19012,7 @@ test "failed readiness refresh preserves the last known good inventory" {
     );
     const snapshot = node.readiness_inventory.load();
     try std.testing.expect(snapshot.initialized);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.counts.classifiers);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.counts.extractors);
 }
 
 test "readiness refresh observes an externally published model" {
@@ -19428,8 +19264,8 @@ test "taskMatchesModelListing exposes extraction-capable models only as extracto
     try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2", &.{}, &.{"labels"}, true));
     try std.testing.expect(taskMatchesModelListing("extractors", "classifier", "", &.{"classify"}, &.{}, true));
     try std.testing.expect(!taskMatchesModelListing("extractors", "classifier", "", &.{"classify"}, &.{}, false));
-    try std.testing.expect(taskMatchesModelListing("classifiers", "classifier", "", &.{"classify"}, &.{}, true));
-    try std.testing.expect(taskMatchesModelListing("classifiers", "recognizer", "gliner2", &.{}, &.{"classification"}, true));
+    try std.testing.expect(!taskMatchesModelListing("classifiers", "classifier", "", &.{"classify"}, &.{}, true));
+    try std.testing.expect(!taskMatchesModelListing("classifiers", "recognizer", "gliner2", &.{}, &.{"classification"}, true));
 }
 
 test "classification extraction applies top-k to single-label and threshold to multi-label taxonomies" {

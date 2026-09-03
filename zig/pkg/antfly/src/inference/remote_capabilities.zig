@@ -625,7 +625,6 @@ fn primaryOperationSuffix(task: work.Task) []const u8 {
         .chunk => "/chunk",
         .extract => "/extract",
         .rewrite => "/rewrite",
-        .classify => "/classify",
         .transcribe => "/transcribe",
     };
 }
@@ -713,7 +712,6 @@ fn taskCatalogName(task: work.Task) []const u8 {
         .chunk => "chunkers",
         .extract => "extractors",
         .rewrite => "rewriters",
-        .classify => "classifiers",
         .transcribe => "transcribers",
     };
 }
@@ -727,7 +725,6 @@ fn outputForTask(task: work.Task) work.OutputKind {
         .chunk => .chunks,
         .extract => .extraction,
         .rewrite => .rewritten_text,
-        .classify => .classification,
         .transcribe => .transcription,
     };
 }
@@ -1196,7 +1193,6 @@ test "remote Antfly capability parser supports every model family" {
         .{ .task = .chunk, .category = "chunkers", .output = .chunks, .input = "text" },
         .{ .task = .extract, .category = "extractors", .output = .extraction, .input = "text" },
         .{ .task = .rewrite, .category = "rewriters", .output = .rewritten_text, .input = "text" },
-        .{ .task = .classify, .category = "classifiers", .output = .classification, .input = "text" },
         .{ .task = .transcribe, .category = "transcribers", .output = .transcription, .input = "audio" },
     };
     for (cases) |case| {
@@ -1237,7 +1233,6 @@ test "remote Antfly model catalog URL normalizes service and operation URLs" {
         "generate/batch",
         "chat/completions",
         "rewrite",
-        "classify",
         "transcribe",
     }) |operation| {
         const operation_url = try std.fmt.allocPrint(std.testing.allocator, "http://localhost:8082/ai/v1/{s}", .{operation});

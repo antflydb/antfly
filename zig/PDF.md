@@ -9,8 +9,9 @@ This document describes how Antfly turns documents into bounded inference work.
 PDF extraction, page rendering, OCR, generation, and embedding share document
 preparation, media transport, scheduling, admission, identity, and failure
 semantics. The same model-work contract also covers reranking, chunking,
-extraction, rewriting, classification, and transcription. Every family keeps
-its own typed request and output semantics.
+schema-driven extraction (including classification), rewriting, and
+transcription. Every public task keeps its own typed request and output
+semantics; classifier remains an internal extraction executor kind.
 
 Florence 2 is the first natively batched reader implementation, not the
 architecture boundary. Gemma4 multimodal is a generator: PDF OCR with Gemma4 is
@@ -44,7 +45,8 @@ bounded transformation stream
       |
       +--> EmbedderExecutor  -> vectors
       +--> Other typed model-family executors
-           rerank | chunk | extract | rewrite | classify | transcribe
+           rerank | chunk | extract | rewrite | transcribe
+           (`classifier` is an internal extraction executor)
 ```
 
 The reusable abstraction is document preparation plus typed work scheduling,
@@ -81,9 +83,8 @@ render profile; it must never be keyed by URL alone.
 | Embed | ClipClap | page image, text chunk, or audio | vector |
 | Rerank | text or multimodal reranker | query plus prepared candidates | ranked candidates |
 | Chunk | tokenizer/semantic chunker | extracted page/document text | chunks |
-| Extract | GLiNER or multimodal extractor | text, page image, or prepared item | structured extraction |
+| Extract | GLiNER, classifier, or multimodal extractor | text, page image, or prepared item | structured extraction, including classifications |
 | Rewrite | rewriter model | extracted or generated text | rewritten text |
-| Classify | classifier | one prepared logical item | classifications |
 | Transcribe | Whisper-family model | prepared audio item | transcription |
 
 A generator used for OCR is still a generator. It keeps generator sampling,
@@ -122,7 +123,7 @@ const InferenceCapabilities = struct {
     },
     output: enum {
         read_result, generated_text, embedding, ranked_items, chunks,
-        extraction, rewritten_text, classification, transcription,
+        extraction, rewritten_text, transcription,
     },
     result_cardinality: enum { one_per_item, one_per_request },
     prompt_policy: enum { explicit, model_default, structured_schema },
@@ -163,8 +164,8 @@ implicit remote state.
 Capability discovery is scoped to the model, semantic task, concrete transport
 operation, and effective authentication identity. Antfly clients query
 `/ai/v1/models?model=<model>&task=<task>&operation=<operation>`, where task is
-one of `read`, `generate`, `embed`, `rerank`, `chunk`, `extract`, `rewrite`,
-`classify`, or `transcribe`, and operation names the endpoint that will actually
+one of `read`, `generate`, `embed`, `rerank`, `chunk`, `extract`, `rewrite`, or
+`transcribe`, and operation names the endpoint that will actually
 execute (for example `generate.batch`, `generate`, `rerank_multimodal`, or
 `embeddings`). The same authorization is used for discovery and execution. The
 proxy validates that the operation belongs to the task, resolves only that
@@ -210,7 +211,8 @@ observed execution reports without assuming completion order.
 
 The Go inference proxy exposes `GET /ai/v1/models` and the reader, generator,
 embedding, reranking (including multimodal), chunking, extraction, rewriting,
-classification, and transcription surfaces. It routes a
+and transcription surfaces. Classification is selected by an extraction
+schema rather than a parallel route. The proxy routes a
 homogeneous bounded batch intact by its nested model identity and rejects
 mixed-model batches before forwarding. Refreshed endpoint inventory retains
 the advertised task for each model; selection and failover filter by both model
@@ -555,13 +557,13 @@ document. They are architectural requirements, not Florence-specific cleanup:
 41. **The normalized contract and distributed catalog still stopped at three
     model families.** `Task`, typed output kinds, local/remote capability
     resolution, server descriptors, and proxy-scoped discovery now cover all
-    nine current families: readers, generators, embedders, rerankers, chunkers,
-    extractors, rewriters, classifiers, and transcribers. Array-oriented
-    extract, rewrite, and classify executors advertise bounded
+    eight public tasks: readers, generators, embedders, rerankers, chunkers,
+    extractors, rewriters, and transcribers. Classifier models remain an
+    internal extraction implementation. Array-oriented extract and rewrite
+    executors advertise bounded
     `serial_compatibility`; single-operation families advertise `mode = none`,
     `max_items = 1`. No family borrows native-batch claims from another family.
-    The proxy also forwards rerank-multimodal, rewrite, classify, and transcribe
-    routes.
+    The proxy also forwards rerank-multimodal, rewrite, and transcribe routes.
 42. **Chunk routing inspected the wrong model field and execution ignored the
     selected model.** `/chunk` carries model identity in `config.model`, not the
     request root. The proxy now extracts that nested identity and canonicalizes
@@ -570,15 +572,18 @@ document. They are architectural requirements, not Florence-specific cleanup:
     semantic model instead of silently executing the fixed tokenizer. A future
     semantic chunker is added only when model resolution and a concrete direct
     executor land together.
-43. **Classification was a descriptor without a routable operation.** The
-    inference OpenAPI and generated router now expose `POST /classify`; server
-    catalog discovery advertises classification-capable classifier or
-    extraction models; the distributed proxy routes and scopes the family as
-    `classifiers`; and linked execution has a typed classification call.
+43. **Classification was incorrectly promoted from an internal executor to a
+    public task.** Classification is part of the canonical schema-driven
+    `POST /extract` API. The public OpenAPI, proxy route, capability task,
+    output kind, lease scope, and `classifiers` catalog surface therefore do
+    not expose `classify`. Classification-capable models are advertised as
+    extractors and execute under the bounded extraction contract. The linked
+    classification callback remains an internal convenience for that executor.
 44. **Several embedded model families stopped at catalog discovery.** Provider
-    ABI v23 includes typed chunk, rewrite, and classify operations alongside the
-    existing embed, rerank, generate, read, transcribe, and extract operations.
-    Linked providers wire all nine current task families to concrete server
+    ABI v23 includes typed chunk and rewrite operations plus an internal
+    classification callback alongside the existing embed, rerank, generate,
+    read, transcribe, and extract operations. Linked providers wire all eight
+    public task families plus that internal callback to concrete server
     executors. Descriptor presence is therefore no longer used as a substitute
     for an executable callback.
 45. **Catalog and execution used different authorization identities.** Both
@@ -592,8 +597,8 @@ document. They are architectural requirements, not Florence-specific cleanup:
     governed by tokenizer/request limits, and remote URLs are admitted after
     download by the provider-owned request boundary. Inline binary PDF, image,
     and audio attachments are charged before dispatch.
-47. **Array-oriented families advertised single-item execution.** Rewrite,
-    classify, and extract requests already carry multiple logical inputs. They
+47. **Array-oriented families advertised single-item execution.** Rewrite and
+    extract requests already carry multiple logical inputs. They
     now publish a shared hard item ceiling and `serial_compatibility` rather
     than `max_items = 1`; HTTP and direct/linked executors enforce the same
     ceiling. This preserves batching across a distributed hop without claiming
@@ -611,10 +616,11 @@ document. They are architectural requirements, not Florence-specific cleanup:
 49. **Capability truth was duplicated across the server catalog, embedded
     resolver, and asset scheduler.** One exported resolver now derives task
     ceilings, execution mode, media limits, and manifest reductions for both
-    local callbacks and `/ai/v1/models`. Extract, rewrite, and classify resolve
-    to the same bounded serial-compatibility contract in either deployment;
-    callers no longer upgrade an extractor merely because its provider is
-    Antfly.
+    local callbacks and `/ai/v1/models`. Extract and rewrite resolve to bounded
+    serial-compatibility contracts in either deployment; classification
+    executors inherit the extraction contract rather than inventing a public
+    classifier task. Callers no longer upgrade an extractor merely because its
+    provider is Antfly.
 50. **Extractor asset requests dropped prepared media.** Extraction requests
     now carry input-indexed borrowed attachments. Provider ABI v23 transports
     those bytes without JSON/base64 through the linked boundary, the inference
@@ -634,9 +640,10 @@ document. They are architectural requirements, not Florence-specific cleanup:
     bounded batch descriptor. The proxy conservatively intersects arrays and
     boolean support and requires scalar semantics to agree. V1/V2 remain
     readable at their legacy boundary but cannot acquire V3 claims.
-53. **HTTP and linked classification/extraction admitted different request
-    shapes.** Both paths now call the same validators. Extraction requires
-    1..128 logical inputs; classification requires nonempty texts and labels,
+53. **HTTP extraction and linked classification admitted different request
+    shapes.** Both paths now call the same extraction-family validators.
+    Extraction requires 1..128 logical inputs; classification schemas require
+    nonempty texts and labels,
     caps each dimension at 128, and caps Cartesian text-label work at 4,096.
     The source OpenAPI schemas publish the same array limits.
 54. **Extractor windowing validated the whole document against one window's
@@ -730,11 +737,10 @@ document. They are architectural requirements, not Florence-specific cleanup:
     independently and matches only the path. The full generation/reader target
     consequently exercises successful scoped discovery without 404 fallback,
     excess requests, or a blocked server fiber.
-66. **Operation URL normalization could drift from the task enum.** Classifier
-    URLs were omitted from a hand-maintained suffix list. Primary operation
-    suffixes now come from an exhaustive `Task` switch; only explicit
-    compatibility aliases remain separate, longest-first. Every current model
-    family, including classifiers, normalizes to the scoped model catalog.
+66. **Operation URL normalization could drift from the task enum.** Primary
+    public operation suffixes now come from an exhaustive `Task` switch;
+    only explicit compatibility aliases remain separate, longest-first.
+    Classifiers have no operation URL because they execute through `/extract`.
 67. **Extraction used caller item IDs as provider demultiplexing keys.** Page
     identities are intentionally local to a source, so two documents may both
     contain `page:000001`. Extraction now generates opaque invocation-local
@@ -1012,8 +1018,8 @@ document. They are architectural requirements, not Florence-specific cleanup:
     adds optional task-resource ceilings for text bytes, input and output tokens,
     candidate counts, and schema bytes. Manifest limits reduce executor defaults;
     remote discovery and proxy intersection preserve unknowns conservatively;
-    and linked read, generate, embed, rerank, chunk, extract, rewrite, classify,
-    and transcribe boundaries validate the dimensions they can measure before
+    and linked read, generate, embed, rerank, chunk, extract, rewrite, and
+    transcribe boundaries validate the dimensions they can measure before
     model work. Request-scoped limits such as schema and encoded bytes remain
     active even for a malformed zero-item invocation. Exact tokenizer-dependent
     counts remain executor-owned when a planner cannot compute them.
@@ -1136,8 +1142,9 @@ document. They are architectural requirements, not Florence-specific cleanup:
 114. **Linked text-family wrappers were treated as the final trust boundary.**
     Early linked-ABI checks are useful for cheap rejection, but another
     in-process caller could invoke the node directly. Dense and sparse
-    embedding, reranking, rewriting, classification, generation, transcription,
-    reading, and extraction now resolve and enforce their model contract again
+    embedding, reranking, rewriting, generation, transcription, reading, and
+    extraction—including its classification executors—now resolve and enforce
+    their model contract again
     inside the concrete node executor. Tokenizer-dependent limits are measured
     there after model acquisition; media and schema limits remain available for
     pre-load rejection. The same invariant therefore holds behind HTTP, the
@@ -1163,8 +1170,8 @@ document. They are architectural requirements, not Florence-specific cleanup:
     per-endpoint model/task advertisement. Bootstrap names remain available only
     for task-unscoped legacy inventory, so topology churn produces temporary
     unavailability rather than capability-unsafe execution. This applies to
-    read, generate, embed, rerank, chunk, extract, rewrite, classify, and
-    transcribe equally.
+    read, generate, embed, rerank, chunk, extract, rewrite, and transcribe
+    equally.
 118. **Artifact execution could inherit a colliding query index after rebasing.**
     Public query aliases and durable embedding artifacts are distinct
     namespaces. Dense execution, media-part limits, capability discovery, and
@@ -1456,9 +1463,9 @@ The hardening above follows these long-term rules:
   token if discovery raced a policy or endpoint replacement. Validation also
   removes a lease immediately after detecting either lifecycle mismatch.
   Antfly clients attach both values to read,
-  generation, embedding, reranking, chunking, extraction, and transcription
-  transports; rewrite and classification use the same task contract when their
-  remote adapters are enabled. An expired lease, replaced endpoint, or mismatched
+  generation, embedding, reranking, chunking, extraction, rewriting, and
+  transcription transports; classification uses the extraction task and lease.
+  An expired lease, replaced endpoint, or mismatched
   task, authorization, or revision returns an explicit stale-plan 409,
   invalidates the client snapshot, and requires rediscovery and replanning
   before retry. Legacy clients may omit the token, but never receive the
@@ -1564,8 +1571,8 @@ The hardening above follows these long-term rules:
    paths borrow the same representation; remote transports encode only at the
    HTTP boundary and explicitly select their resident representation for
    admission. The version also makes capability v2 media-limit semantics and
-   executable chunk, rewrite, classification, and borrowed extraction
-   operations an explicit
+   executable chunk and rewrite operations, the internal classification
+   callback, and borrowed extraction an explicit
    host/component compatibility boundary.
 4. **Implemented:** document OCR selects `reader` or `generator` explicitly.
    The generation batch endpoint accepts bounded multimodal requests and uses
@@ -1590,8 +1597,9 @@ The hardening above follows these long-term rules:
    retries it or records terminal repair debt.
 6. **Implemented:** capability lookup participates in reader, generator,
    dense-embedder, and extractor planning. The same normalized catalog covers
-   rerank, chunk, rewrite, classify, and transcribe even when their current
-   executor is singleton or serial compatibility. MIME acceptance, item count,
+   rerank, chunk, rewrite, and transcribe even when their current executor is
+   singleton or serial compatibility. Classification-capable models use the
+   extraction descriptor. MIME acceptance, item count,
    encoded bytes, decoded pixels, media cardinality, and result cardinality are
    validated at executor boundaries. Unknown remote capabilities remain
    conservative.

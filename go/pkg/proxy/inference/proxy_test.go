@@ -1769,7 +1769,6 @@ func TestCatalogTaskScopesCoverEveryRoutableModelFamily(t *testing.T) {
 		{"chunk", "chunk", "chunkers"},
 		{"extract", "extract", "extractors"},
 		{"rewrite", "rewrite", "rewriters"},
-		{"classify", "classify", "classifiers"},
 		{"transcribe", "transcribe", "transcribers"},
 	}
 	for _, test := range tests {
@@ -1798,6 +1797,9 @@ func TestCatalogTaskScopeValidatesConcreteOperationFamily(t *testing.T) {
 	}
 	if _, err := catalogTaskScopeForOperation("", "read"); err == nil {
 		t.Fatal("operation without task was accepted")
+	}
+	if _, err := catalogTaskScopeForOperation("classify", "classify"); err == nil {
+		t.Fatal("classification escaped the canonical extraction task")
 	}
 }
 
@@ -1851,15 +1853,15 @@ func TestScopedCatalogForwardsCallerAuthorization(t *testing.T) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"classifiers":{"owner/classifier":{"inputs":["text"]}}}`)),
+			Body:       io.NopCloser(strings.NewReader(`{"extractors":{"owner/classifier":{"inputs":["text"]}}}`)),
 			Request:    req,
 		}, nil
 	})}
 	p.RegisterEndpoint("http://classifier.internal", "primary", WorkloadTypeGeneral)
 	p.registry.UpdateModelOperations("http://classifier.internal", map[string]map[OperationType]bool{
-		"owner/classifier": {"classify": true},
+		"owner/classifier": {"extract": true},
 	})
-	request := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Fclassifier&task=classify", nil)
+	request := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Fclassifier&task=extract", nil)
 	request.Header.Set("Authorization", caller)
 	recorder := httptest.NewRecorder()
 	p.handleModels(recorder, request)

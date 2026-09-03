@@ -190,69 +190,6 @@ pub const ChunkResponse = struct {
     cache_hit: bool,
 };
 
-pub const ClassifyRequest = struct {
-    /// Name of classifier model from models_dir/classifiers/
-    model: []const u8,
-    /// Texts to classify
-    texts: []const []const u8,
-    /// Candidate labels for zero-shot classification. The model will predict which label(s) best describe each text.
-    labels: []const []const u8,
-    /// Custom hypothesis template for NLI-based classification. Use "{}" as placeholder for the label. Default: "This example is {}."
-    hypothesis_template: ?[]const u8 = null,
-    /// If true, allows multiple labels per text (independent scoring). If false (default), scores are normalized across labels.
-    multi_label: ?bool = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "texts", "texts", false },
-        .{ "labels", "labels", false },
-        .{ "hypothesis_template", "hypothesis_template", true },
-        .{ "multi_label", "multi_label", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        try jw.objectField("texts");
-        try jw.write(self.texts);
-        try jw.objectField("labels");
-        try jw.write(self.labels);
-        if (self.hypothesis_template) |value| {
-            try jw.objectField("hypothesis_template");
-            try jw.write(value);
-        }
-        if (self.multi_label) |value| {
-            try jw.objectField("multi_label");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const ClassifyResponse = struct {
-    /// Name of model used for classification
-    model: []const u8,
-    /// Array of classification results (one per input text). Each result is an array of ClassifyResult sorted by score descending.
-    classifications: []const []const ClassifyResult,
-};
-
-pub const ClassifyResult = struct {
-    /// The predicted class/category
-    label: []const u8,
-    /// Confidence score (0.0 to 1.0)
-    score: f32,
-};
-
 pub const Config = struct {
     /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
     max_concurrent_requests: ?i64 = null,
@@ -1555,8 +1492,6 @@ pub const ModelsResponse = struct {
     chunkers: std.json.ArrayHashMap(ModelInfo),
     /// Available reranking models
     rerankers: std.json.ArrayHashMap(ModelInfo),
-    /// Available zero-shot classification models
-    classifiers: std.json.ArrayHashMap(ModelInfo),
     /// Available embedding models from models_dir/embedders/
     embedders: std.json.ArrayHashMap(ModelInfo),
     /// Available extractor models (NER models with 'extraction' capability)
