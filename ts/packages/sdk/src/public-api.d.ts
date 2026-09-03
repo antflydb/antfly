@@ -2267,7 +2267,9 @@ export interface paths {
          *     each source edge; malformed images return 400 and dimension or aggregate excess
          *     returns 413. The same decoded-pixel policy covers generate/chat, dense embedding,
          *     multimodal reranking, image `/extract`, and the embedded read, extract, and dense
-         *     embedding APIs. Batch generation rejects multimodal content before media fetch.
+         *     embedding APIs. Batch generation accepts bounded image and audio media parts,
+         *     applies the same aggregate encoded-byte and decoded-image admission before model
+         *     execution, and rejects malformed or unsupported parts before dispatch.
          */
         post: operations["readImages"];
         delete?: never;
@@ -8582,6 +8584,11 @@ export interface components {
              * @description Approximate maximum source bytes to process in one batch for this operation.
              */
             batch_bytes?: number;
+            /**
+             * Format: uint32
+             * @description Maximum PDF pages admitted for one request-atomic document operation.
+             */
+            max_document_pages?: number;
         };
         /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
         EnrichmentConfig: {
@@ -13516,6 +13523,8 @@ export interface components {
             /** @description Name of model used for reading */
             model: string;
             usage: components["schemas"]["InferenceGenerateUsage"];
+            /** @description Observed execution path. Omitted by older compatible servers. */
+            execution?: components["schemas"]["InferenceBatchExecutionReport"];
         };
         InferenceReadObject: components["schemas"]["InferenceReadResult"] & {
             /** @enum {string} */
@@ -13597,10 +13606,6 @@ export interface components {
             };
             /** @description Available reranking models */
             rerankers: {
-                [key: string]: components["schemas"]["InferenceModelInfo"];
-            };
-            /** @description Available zero-shot classification models */
-            classifiers: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
             };
             /** @description Available embedding models from models_dir/embedders/ */
@@ -13953,11 +13958,24 @@ export interface components {
             succeeded: number;
             failed: number;
         };
+        /** @description Observed executor behavior, not a capability prediction. */
+        InferenceBatchExecutionReport: {
+            requested_items: number;
+            native_batches: number;
+            native_items: number;
+            serial_items: number;
+            /** @description Items rejected before model execution by validation, resolution, or admission. */
+            rejected_items: number;
+            fallback_items: number;
+            fallback_reason?: string | null;
+        };
         InferenceGenerateBatchResponse: {
             /** @enum {string} */
             object: "generate.batch";
             data: components["schemas"]["InferenceGenerateBatchResultItem"][];
             summary: components["schemas"]["InferenceGenerateBatchSummary"];
+            /** @description Observed execution path. Omitted by older compatible servers. */
+            execution?: components["schemas"]["InferenceBatchExecutionReport"];
         };
         InferenceGenerateChoice: {
             /** @description Index of this choice in the list */
@@ -14216,7 +14234,7 @@ export interface components {
              * @example ~/.antfly/inference/ml
              */
             ml_dir?: string;
-            /** @description Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline. */
+            /** @description Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline. */
             content_security?: components["schemas"]["InferenceContentSecurityConfig"];
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
             s3_credentials?: components["schemas"]["InferenceCredentials"];
@@ -14407,7 +14425,7 @@ export interface components {
              * @default 30
              */
             download_timeout_seconds?: number;
-            /** @description Maximum source-image width or height for accepted inference image inputs, including generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation rejects multimodal content before fetch. Non-inference scraping consumers do not enforce this setting. */
+            /** @description Maximum source-image width or height for accepted inference image inputs, including generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation applies the same image-header admission before model execution. Non-inference scraping consumers do not enforce this setting. */
             max_image_dimension?: number;
             /**
              * @description Explicit path-prefix allowlist for inference file:// and s3:// URLs. Omission and an explicit empty list both deny all file and S3 paths. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).

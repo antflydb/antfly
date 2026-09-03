@@ -496,6 +496,7 @@ from .inference_a4b_residency_mode import InferenceA4BResidencyMode
 from .inference_admission_config import InferenceAdmissionConfig
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
 from .inference_backend_runtimes import InferenceBackendRuntimes
+from .inference_batch_execution_report import InferenceBatchExecutionReport
 from .inference_binary_content import InferenceBinaryContent
 from .inference_capacity_error import InferenceCapacityError
 from .inference_capacity_error_reason import InferenceCapacityErrorReason
@@ -575,7 +576,6 @@ from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
-from .inference_models_response_classifiers import InferenceModelsResponseClassifiers
 from .inference_models_response_data_item import InferenceModelsResponseDataItem
 from .inference_models_response_embedders import InferenceModelsResponseEmbedders
 from .inference_models_response_extractors import InferenceModelsResponseExtractors
@@ -1471,6 +1471,7 @@ __all__ = (
     "InferenceAdmissionConfig",
     "InferenceAudioChunkConfig",
     "InferenceBackendRuntimes",
+    "InferenceBatchExecutionReport",
     "InferenceBinaryContent",
     "InferenceCapacityError",
     "InferenceCapacityErrorReason",
@@ -1550,7 +1551,6 @@ __all__ = (
     "InferenceModelRef",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
-    "InferenceModelsResponseClassifiers",
     "InferenceModelsResponseDataItem",
     "InferenceModelsResponseEmbedders",
     "InferenceModelsResponseExtractors",

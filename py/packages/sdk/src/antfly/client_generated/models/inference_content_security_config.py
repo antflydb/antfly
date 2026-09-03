@@ -30,9 +30,10 @@ class InferenceContentSecurityConfig:
             download_timeout_seconds (int | Unset): Maximum HTTP download duration in seconds. Defaults to 30; 0 disables
                 the deadline. Default: 30.
             max_image_dimension (int | Unset): Maximum source-image width or height for accepted inference image inputs,
-                including generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct
-                APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation
-                rejects multimodal content before fetch. Non-inference scraping consumers do not enforce this setting.
+                including generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`, and their
+                embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized.
+                Batch generation applies the same image-header admission before model execution. Non-inference scraping
+                consumers do not enforce this setting.
             allowed_paths (list[str] | Unset): Explicit path-prefix allowlist for inference file:// and s3:// URLs. Omission
                 and an explicit empty list both deny all file and S3 paths. For file:// use absolute paths (e.g., /Users/data/).
                 For s3:// use bucket/prefix (e.g., my-bucket/uploads/). Example: ['/Users/data/', 'my-bucket/uploads/'].
