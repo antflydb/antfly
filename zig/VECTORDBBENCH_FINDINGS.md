@@ -4096,8 +4096,9 @@ one logical value at a time, copied, and immediately released; they never enter
 the query-lifetime patch cache. This changes peak reconstruction heap from the
 sum of all patched values to the largest active patched value. On the measured
 1M generation, streaming removes the extra value plane and joined directory
-copy while retaining roughly the 58 MB compatibility index; a future format
-version may shrink that index, but is not required for this memory fix.
+copy while retaining roughly the 58 MB compatibility index. That bounded
+publication fix establishes a clean baseline before changing the physical
+format.
 
 Search scratch now uses a resource-manager-admitted pool capped at 32 entries
 per index, matching the qualification's maximum fanout without becoming an
@@ -4138,6 +4139,190 @@ and pressure testing proves secondary entries are reclaimable while the serial
 slot remains hot. This preserves the PR's query performance while removing the
 publication peak and steady high-concurrency allocator churn that motivated
 the follow-up.
+
+### Experimental V2 vector directory: kind-separated blocks
+
+The native index has not shipped, so this branch can evaluate the intended
+physical layout without carrying an avoidable permanent V1 tax. V1 stores a
+29-byte generic index entry for every `(kind, vector_id)` pair. With both leaf
+assignment and external metadata present, that is 58 MB of index at 1M vectors,
+in addition to the eight-byte leaf values and metadata payload. Its streaming
+writer avoids a second value copy, but still retains the entire index until
+publication; its reader also hashes and walks that full index at open.
+
+The V2 experiment changes the directory to independently checksummed,
+kind-separated blocks:
+
+- leaf values keep their fixed eight-byte representation and need no generic
+  offsets, lengths, or per-value checksums;
+- metadata stores block-local cumulative end offsets, making value bounds O(1)
+  while retaining a compact four-byte plane;
+- sorted external IDs use delta varints when smaller and raw u64 values for
+  sparse or adversarial IDs, so correctness never assumes user IDs are dense;
+- blocks are capped at 256 entries and approximately 64 KiB of values;
+- a small checksummed root contains block ranges, locations, and checksums;
+  open validates only that root and structural bounds, while lookup validates
+  the touched index and value block; and
+- the streaming writer retains one block plus root descriptors, making its
+  workspace O(blocks), with a sub-megabyte root at 1M rather than a 58 MB
+  compatibility index.
+
+A deterministic compactness test covers 4,096 vectors and requires the entire
+directory—including leaf values, both kind indexes, checksums, descriptors,
+header, and footer—to remain below 16 bytes per vector for compressible IDs.
+Sparse-ID, block-boundary, streaming-equivalence, lazy-corruption, and wrapped-
+region tests preserve the non-benchmark invariants. This is intentionally a
+format experiment: 50K and 1M public-API results must still establish load,
+restart, disk, recall, and the full concurrency latency curve before V2 replaces
+the V1 baseline.
+
+The first contended 50K V2 run completed the public lifecycle in 33.6910 seconds
+(21.9621 seconds insert plus 11.7289 seconds optimize) at 0.9880 recall. Its full
+posting segment was 178,868,456 bytes (170.6 MiB), about 1.4--1.5 MiB below the
+V1 sample, and live peak RSS was effectively unchanged at 1.516 GB versus
+1.519 GB. Restart RSS was 348 MB versus 341 MB. However, throughput regressed
+to 241.45 / 1,025.42 / 1,102.51 / 1,089.58 QPS at concurrency 1/10/20/30, and
+the detailed warm server mean increased from 2.93 ms to 3.97 ms. Recall and
+candidate work remained essentially unchanged, so this cannot be attributed to
+a different quality/effort point.
+
+Host compiler contention affected the sample, but it also exposed a format
+implementation mistake worth fixing independently: lazy block verification was
+recalculating CRCs on every lookup. The follow-up reader retains two atomic
+verification bitmaps (index and value, approximately 2 KiB total even at 1M).
+The first concurrent reader to validate an immutable block publishes that fact;
+all later readers under the same generation lease skip its CRC and structural
+walk. Corruption still fails closed before a block is exposed, restart remains
+root-only, and verification state disappears with the generation. A fresh V2
+run is required after this change; the first latency curve is diagnostic, not an
+accepted result.
+
+The post-cache 50K run recovered the load target: 26.6993 seconds total
+(13.9129 seconds insert plus 12.7864 seconds optimize) at 0.9862 recall. The
+segment was 179,058,453 bytes, live peak RSS was 2.03 GB, and restarted RSS was
+339 MB. Throughput was 243.94 / 1,002.52 / 1,075.69 / 1,082.55 QPS at
+concurrency 1/10/20/30. The detailed warm server mean recovered from the flawed
+V2 sample's 3.97 ms to 3.28 ms, versus 2.93 ms in the prior V1 sample. The host
+remained compiler-contended, and all 137.4 exact vectors per query came from the
+artifact cache with zero metadata-vector loads, proving that the vector
+directory is not on this workload's scored query path. The remaining latency
+difference therefore is not evidence for adding speculative directory indexes.
+
+Before the 1M run, metadata's four-byte length plane was changed to cumulative
+block-local end offsets. This is byte-for-byte the same size but changes random
+metadata offset recovery from scanning up to 255 lengths to O(1); validation is
+now a monotonic/end-bound check. Publication also reports exact directory entry,
+block, value, index, root, and total byte counts so topology variation cannot be
+mistaken for format savings. The 1M qualification should use this final shape.
+
+The final-shape 1M lifecycle completed without capture, publication, restart,
+or query failures. The published directory contains 2,000,000 logical entries
+in 7,814 blocks and occupies 35,908,804 bytes: 17,888,890 value bytes,
+17,519,770 index bytes, and a 500,096-byte root. The equivalent V1 value plane
+plus 29-byte-per-entry index would occupy approximately 75,888,890 bytes, so V2
+removes 39,980,086 bytes (52.7 percent) before counting its lower publication
+workspace. Recall remained 0.9927, candidate work remained 238,867 approximate
+and 146.5 exact vectors per query, and restarted demand/RSS were 379 MB/2.37 GB.
+Live peak RSS was 5.73 GB versus 7.05 GB in the prior V1 qualification.
+
+The run took 716.4625 seconds to readiness (630.0084 seconds insert plus
+86.4541 seconds final catch-up). Its concurrency-1/10/20/30 throughput was
+58.48 / 568.41 / 596.16 / 584.99 QPS, with p95 latency of
+15.05 / 27.96 / 78.99 / 105.61 ms. Those timing numbers are recorded as a
+contended qualification, not a clean V1/V2 comparison: other worktree test
+servers and a CPU-heavy compiler/agent process were active during the run.
+The directory is not on the scored candidate path, and the unchanged candidate
+and exact-completion counts support that interpretation. A controlled rerun is
+still required before attributing either the timing regression or the RSS gain
+entirely to V2.
+
+#### V2 row-block revision before the controlled rerun
+
+The first block format still encoded the sorted vector-ID stream twice: once
+for leaf assignments and once for sparse external metadata. It also decoded up
+to 255 varints for a point lookup and issued one physical sink append for every
+small leaf value. Those costs were implementation artifacts rather than useful
+A/B variables, so the controlled rerun uses the completed row-block shape:
+
+- each block is the ordered union of vector IDs and encodes every ID once;
+- independent presence bitmaps select the required leaf-assignment plane and
+  optional metadata plane, preserving metadata-only recovery rows and the
+  distinction between absent and present-empty metadata;
+- delta IDs have an absolute restart every 16 rows, bounding point lookup to a
+  binary search over restarts plus at most 15 varint decodes;
+- index, leaf, and metadata planes have independent checksums and independent
+  once-per-generation verification bits, so touching one value family does not
+  fault or hash the other;
+- checkpoint publication performs two ordered base/overlay merges and pairs
+  them by ID online. It retains one block and the bounded live overlay, not a
+  corpus-sized join table; and
+- data, index, and root bytes are each emitted in bounded sequential writes.
+  A 2,048-value unit fixture now proves physical append count is proportional
+  to blocks rather than entries.
+
+The row count is at most the former leaf-entry count when every live vector has
+a leaf assignment, while sparse metadata adds no duplicate row or ID. This
+should reduce both the 7,814-block/500-KiB root and the 17.5-MB index observed
+at 1M. The exact reduction and any publication/lookup CPU tradeoff remain
+measurements; no result is claimed until a fresh public-API 50K qualification.
+Adaptive leaf dictionaries remain a possible follow-up, but they depend on
+observed per-block cardinality and are intentionally excluded from this
+structural A/B. Metadata cumulative ends now select a two-byte representation
+when a block's metadata plane is at most 65,535 bytes and widen to four bytes
+only for a larger block. This preserves O(1) offset lookup and arbitrary value
+sizes while avoiding a permanent four-byte-per-value tax.
+
+Two controlled public-API 50K qualifications now validate the row-block
+revision. Both used batch 100, four load workers, native HBC, float16 vector
+blocks, the normal boundary-rerank policy, and 30-second concurrency
+1/10/20/30 query phases:
+
+| Directory | Ready (insert + catch-up) | Recall | QPS at 1 / 10 / 20 / 30 | p95 ms at 1 / 10 / 20 / 30 | Live RSS | Restart RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| V1 control | 27.37 s (17.50 + 9.87) | 0.9860 | 231 / 910 / 967 / 1,040 | 4.95 / 19.28 / 52.69 / 77.77 | 1.76 GB | 350 MB |
+| Kind-separated V2 | 33.52 s (21.07 + 12.45) | 0.9857 | 225 / 920 / 996 / 953 | 5.28 / 19.04 / 48.66 / 81.75 | 1.46 GB | 337 MB |
+| Row-block V2, run A | 28.48 s (12.64 + 15.84) | 0.9853 | 271 / 1,096 / 1,189 / 1,233 | 4.16 / 14.86 / 33.31 / 61.78 | 1.82 GB | 340 MB |
+| Row-block V2, run B | 24.38 s (15.30 + 9.08) | 0.9857 | 284 / 1,084 / 1,203 / 1,245 | 3.99 / 15.32 / 32.87 / 58.69 | 2.08 GB | 340 MB |
+
+The two row-block runs average 26.43 seconds to readiness and
+277 / 1,090 / 1,196 / 1,239 QPS. Relative to the V1 control, that is 3.4
+percent faster readiness and approximately 20 / 20 / 24 / 19 percent more
+throughput. Mean recall differs by 0.0005, or 0.05 percentage point. Before the
+adaptive metadata-end follow-up, the directory itself was 1,439,976 bytes
+(838,890 values, 587,710 index, and 13,328 root) in 196 blocks. The earlier
+kind-separated V2 used 1,781,658 bytes and 392 blocks; the equivalent V1
+directory is approximately 3,738,930 bytes. Thus the row form removed another
+19.2 percent from the first V2 and 61.5 percent from V1 while also eliminating
+the duplicated ID decode and per-value sink calls. Normal 50K blocks carry
+50,000 metadata ends, so the adaptive encoding should remove another 100,000
+bytes; the 1M qualification will report the measured final size.
+
+Cache-inclusive live RSS is not a demonstrated win: its 1.82--2.08 GB range is
+above the 1.76 GB V1 sample even though the post-run attributable-demand
+samples ranged from 517 MB to 1.17 GB and restart consistently returned to
+340 MB. The RSS maximum occurred at the end of the fixed-duration query matrix,
+not during directory construction. That points to mapped posting/projection
+page residency and run-to-run reclaim timing rather than a retained V2 writer
+allocation. Generation-aware page eviction under the resource governor should
+be evaluated separately; changing the directory format to fit this cache high
+water would conflate storage layout with serving-cache policy.
+
+No further mandatory encoding is justified before a 1M row-block run. A
+per-block leaf dictionary is beneficial only when leaf cardinality is low
+enough to offset its dictionary and ordinal planes; more aggressive metadata
+length compression needs the real length distribution.
+Page-aligning this small point-lookup directory would add padding and resident
+pages without helping the posting-local candidate scan. Record those
+distributions during the 1M qualification, then make each encoding an adaptive
+block-level choice if the measured saving pays for its decode branch.
+
+Two non-format follow-ups remain substantive but should retain independent
+A/Bs. Legacy first-generation migration still builds an owned directory before
+publication and should eventually use the same staged streaming writer to keep
+upgrade memory bounded. Separately, adversarial online insertion can produce a
+deep tree; a bulk-balanced/recursive initial topology or bounded rebuild fixes
+that structural problem, but mixing it into the directory qualification would
+change routing, candidate work, and recall at the same time.
 
 ## Next checks
 

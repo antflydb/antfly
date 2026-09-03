@@ -14089,13 +14089,18 @@ test "raw multi-source member search avoids fixed-factor reranking" {
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
 
-    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+    const index = try alloc.create(hbc_mod.HBCIndex);
+    errdefer alloc.destroy(index);
+    index.* = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
         .dims = 2,
         .leaf_size = 32,
         .branching_factor = 8,
     });
     var index_owned = true;
-    defer if (index_owned) index.close();
+    defer if (index_owned) {
+        index.close();
+        alloc.destroy(index);
+    };
 
     const vectors = try alloc.alloc(f32, active_count * 2);
     defer alloc.free(vectors);
@@ -14136,7 +14141,10 @@ test "raw multi-source member search avoids fixed-factor reranking" {
         .index = index,
     };
     index_owned = false;
-    defer entry.index.close();
+    defer {
+        entry.index.close();
+        alloc.destroy(entry.index);
+    }
 
     const Harness = struct {
         alloc: Allocator,
@@ -14382,13 +14390,18 @@ test "built-in exact dense scorer filters metadata before vector reads" {
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
 
-    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+    const index = try alloc.create(hbc_mod.HBCIndex);
+    errdefer alloc.destroy(index);
+    index.* = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
         .dims = 2,
         .leaf_size = 2,
         .branching_factor = 2,
     });
     var index_owned = true;
-    defer if (index_owned) index.close();
+    defer if (index_owned) {
+        index.close();
+        alloc.destroy(index);
+    };
     try index.bulkBuildWithMetadata(&.{
         .{ .vector_id = 1, .vector = &.{ 0.0, 0.0 }, .metadata = "doc:keep:a" },
         .{ .vector_id = 2, .vector = &.{ 1.0, 0.0 }, .metadata = "doc:keep:b" },
@@ -14409,7 +14422,10 @@ test "built-in exact dense scorer filters metadata before vector reads" {
         .index = index,
     };
     index_owned = false;
-    defer entry.index.close();
+    defer {
+        entry.index.close();
+        alloc.destroy(entry.index);
+    }
 
     const VectorLoadCounter = struct {
         count: usize = 0,
@@ -14452,13 +14468,18 @@ test "one percent filtered route preserves exact recall with candidate-linear IO
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
 
-    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+    const index = try alloc.create(hbc_mod.HBCIndex);
+    errdefer alloc.destroy(index);
+    index.* = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
         .dims = dims,
         .leaf_size = 64,
         .branching_factor = 8,
     });
     var index_owned = true;
-    defer if (index_owned) index.close();
+    defer if (index_owned) {
+        index.close();
+        alloc.destroy(index);
+    };
 
     const vectors = try alloc.alloc(f32, candidate_count * dims);
     defer alloc.free(vectors);
@@ -14489,7 +14510,10 @@ test "one percent filtered route preserves exact recall with candidate-linear IO
         .index = index,
     };
     index_owned = false;
-    defer entry.index.close();
+    defer {
+        entry.index.close();
+        alloc.destroy(entry.index);
+    }
 
     const route = denseSearchRoute(true, candidate_count, candidate_count * 100, dims, result_count, 32, 64, false, false);
     try std.testing.expect(route.exact_native_filter);
@@ -14557,13 +14581,18 @@ test "one percent native filter routes through integrated dense search exactly" 
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
 
-    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+    const index = try alloc.create(hbc_mod.HBCIndex);
+    errdefer alloc.destroy(index);
+    index.* = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
         .dims = dims,
         .leaf_size = 128,
         .branching_factor = 16,
     });
     var index_owned = true;
-    defer if (index_owned) index.close();
+    defer if (index_owned) {
+        index.close();
+        alloc.destroy(index);
+    };
 
     const vectors = try alloc.alloc(f32, active_count * dims);
     defer alloc.free(vectors);
@@ -14594,7 +14623,10 @@ test "one percent native filter routes through integrated dense search exactly" 
         .index = index,
     };
     index_owned = false;
-    defer entry.index.close();
+    defer {
+        entry.index.close();
+        alloc.destroy(entry.index);
+    }
 
     const Harness = struct {
         entry: *index_manager_mod.IndexManager.DenseIndex,

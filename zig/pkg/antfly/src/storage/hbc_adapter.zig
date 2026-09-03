@@ -2630,6 +2630,7 @@ const ExperimentalPostingReadState = struct {
         while (values.next()) |slot| if (slot.owned) if (slot.bytes) |owned| self.alloc.free(owned);
         self.materialized.deinit(self.alloc);
         for (&self.patch_cache) |*shard| shard.deinit(self.alloc);
+        if (self.vector_directory) |*directory| directory.deinit();
         if (self.quantized_directory) |*directory| directory.deinit();
         if (self.wal_bytes) |bytes| self.alloc.free(bytes);
         for (self.segments) |*segment| segment.deinit();
@@ -3379,9 +3380,112 @@ const ExperimentalVectorOverride = struct {
         if (lhs_kind > rhs_kind) return .gt;
         return std.math.order(lhs.id, rhs.id);
     }
+};
 
-    fn compareItem(lhs: ExperimentalVectorOverride, rhs: vectorindex_hbc_vector_directory.Reader.Item) std.math.Order {
-        return compare(lhs, .{ .kind = rhs.kind, .id = rhs.id, .value = rhs.value });
+const ExperimentalVectorDirectoryValue = struct {
+    id: u64,
+    value: []const u8,
+};
+
+/// Ordered merge of one immutable directory plane and its newest mutation
+/// overlay. Tombstones disappear here; pairing the two plane iterators below
+/// then produces union rows without materializing corpus-sized ID arrays.
+const ExperimentalVectorKindMergeIterator = struct {
+    base: vectorindex_hbc_vector_directory.Reader.Iterator,
+    overrides: []const ExperimentalVectorOverride,
+    override_index: usize = 0,
+    base_item: ?vectorindex_hbc_vector_directory.Reader.Item = null,
+    base_loaded: bool = false,
+
+    fn init(
+        directory: vectorindex_hbc_vector_directory.Reader,
+        overrides: []const ExperimentalVectorOverride,
+        kind: vectorindex_hbc_vector_directory.Kind,
+    ) ExperimentalVectorKindMergeIterator {
+        return .{ .base = directory.kindIterator(kind), .overrides = overrides };
+    }
+
+    fn next(self: *ExperimentalVectorKindMergeIterator) !?ExperimentalVectorDirectoryValue {
+        while (true) {
+            if (!self.base_loaded) {
+                self.base_item = try self.base.next();
+                self.base_loaded = true;
+            }
+            const replacement = if (self.override_index < self.overrides.len)
+                self.overrides[self.override_index]
+            else
+                null;
+            if (self.base_item == null and replacement == null) return null;
+            if (replacement) |override| {
+                if (self.base_item == null or override.id < self.base_item.?.id) {
+                    self.override_index += 1;
+                    if (override.value) |value| return .{ .id = override.id, .value = value };
+                    continue;
+                }
+                if (override.id == self.base_item.?.id) {
+                    self.override_index += 1;
+                    self.base_loaded = false;
+                    if (override.value) |value| return .{ .id = override.id, .value = value };
+                    continue;
+                }
+            }
+            const base = self.base_item.?;
+            self.base_loaded = false;
+            return .{ .id = base.id, .value = base.value };
+        }
+    }
+};
+
+const ExperimentalVectorDirectoryRow = struct {
+    id: u64,
+    leaf: ?[]const u8,
+    metadata: ?[]const u8,
+};
+
+const ExperimentalVectorRowIterator = struct {
+    leaves: ExperimentalVectorKindMergeIterator,
+    metadata: ExperimentalVectorKindMergeIterator,
+    next_leaf: ?ExperimentalVectorDirectoryValue = null,
+    next_metadata: ?ExperimentalVectorDirectoryValue = null,
+    leaf_loaded: bool = false,
+    metadata_loaded: bool = false,
+
+    fn init(
+        directory: vectorindex_hbc_vector_directory.Reader,
+        overrides: []const ExperimentalVectorOverride,
+    ) ExperimentalVectorRowIterator {
+        var metadata_start: usize = 0;
+        while (metadata_start < overrides.len and overrides[metadata_start].kind == .leaf) : (metadata_start += 1) {}
+        return .{
+            .leaves = .init(directory, overrides[0..metadata_start], .leaf),
+            .metadata = .init(directory, overrides[metadata_start..], .metadata),
+        };
+    }
+
+    fn next(self: *ExperimentalVectorRowIterator) !?ExperimentalVectorDirectoryRow {
+        if (!self.leaf_loaded) {
+            self.next_leaf = try self.leaves.next();
+            self.leaf_loaded = true;
+        }
+        if (!self.metadata_loaded) {
+            self.next_metadata = try self.metadata.next();
+            self.metadata_loaded = true;
+        }
+        if (self.next_leaf == null and self.next_metadata == null) return null;
+        const id = if (self.next_leaf) |leaf|
+            if (self.next_metadata) |metadata| @min(leaf.id, metadata.id) else leaf.id
+        else
+            self.next_metadata.?.id;
+        var row: ExperimentalVectorDirectoryRow = .{ .id = id, .leaf = null, .metadata = null };
+        if (self.next_leaf) |leaf| if (leaf.id == id) {
+            row.leaf = leaf.value;
+            self.leaf_loaded = false;
+        };
+        if (self.next_metadata) |metadata| if (metadata.id == id) {
+            row.metadata = metadata.value;
+            self.metadata_loaded = false;
+        };
+        return row;
     }
 };
 
@@ -8659,34 +8763,14 @@ pub const HBCIndex = struct {
 
         var directory_writer = try vectorindex_hbc_vector_directory.Writer.init(alloc);
         defer directory_writer.deinit();
-        var base_it = base_directory.iterator();
-        var override_index: usize = 0;
+        var rows = ExperimentalVectorRowIterator.init(base_directory, vector_overrides.items);
         var directory_items: usize = 0;
-        while (try base_it.next()) |base| {
+        while (try rows.next()) |row| {
             directory_items += 1;
             if (directory_items % 256 == 0) {
                 yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
             }
-            while (override_index < vector_overrides.items.len and
-                ExperimentalVectorOverride.compareItem(vector_overrides.items[override_index], base) == .lt)
-            {
-                const replacement = vector_overrides.items[override_index];
-                if (replacement.value) |value| try directory_writer.append(replacement.kind, replacement.id, value);
-                override_index += 1;
-            }
-            if (override_index < vector_overrides.items.len and
-                ExperimentalVectorOverride.compareItem(vector_overrides.items[override_index], base) == .eq)
-            {
-                const replacement = vector_overrides.items[override_index];
-                if (replacement.value) |value| try directory_writer.append(replacement.kind, replacement.id, value);
-                override_index += 1;
-            } else {
-                try directory_writer.append(base.kind, base.id, base.value);
-            }
-        }
-        while (override_index < vector_overrides.items.len) : (override_index += 1) {
-            const replacement = vector_overrides.items[override_index];
-            if (replacement.value) |value| try directory_writer.append(replacement.kind, replacement.id, value);
+            try directory_writer.appendRow(row.id, row.leaf, row.metadata);
         }
         const vector_directory = try directory_writer.build();
         try writer.appendValueOwnedAt(0, .vector_directory, covered_source_sequence, vector_directory);
@@ -9004,50 +9088,38 @@ pub const HBCIndex = struct {
         try writer.alignForValue(sink, .vector_directory);
         var directory_writer = try vectorindex_hbc_vector_directory.StreamingWriter.init(alloc, sink);
         defer directory_writer.deinit();
-        var directory_entry_count = base_directory.entryCount();
-        for (vector_overrides.items) |replacement| {
-            const existed = try base_directory.contains(replacement.kind, replacement.id);
-            if (existed and replacement.value == null) {
-                directory_entry_count = std.math.sub(usize, directory_entry_count, 1) catch
-                    return error.Corrupted;
-            } else if (!existed and replacement.value != null) {
-                directory_entry_count = std.math.add(usize, directory_entry_count, 1) catch
-                    return error.OutOfMemory;
-            }
-        }
-        try directory_writer.reserveEntries(directory_entry_count);
-        var base_it = base_directory.iterator();
-        var override_index: usize = 0;
+        // Row count is at most the old row count plus the number of overlay
+        // keys. Reserving this upper bound avoids corpus scans and descriptor
+        // reallocations; unused descriptor capacity remains small and bounded.
+        const directory_entry_bound = std.math.add(usize, base_directory.entryCount(), vector_overrides.items.len) catch
+            return error.OutOfMemory;
+        try directory_writer.reserveEntries(directory_entry_bound);
+        var rows = ExperimentalVectorRowIterator.init(base_directory, vector_overrides.items);
         var directory_items: usize = 0;
-        while (try base_it.next()) |base| {
+        while (try rows.next()) |row| {
             directory_items += 1;
             if (directory_items % 256 == 0) {
                 base_reclaimer.reclaimObserved();
                 yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
             }
-            while (override_index < vector_overrides.items.len and
-                ExperimentalVectorOverride.compareItem(vector_overrides.items[override_index], base) == .lt)
-            {
-                const replacement = vector_overrides.items[override_index];
-                if (replacement.value) |value| try directory_writer.append(sink, replacement.kind, replacement.id, value);
-                override_index += 1;
-            }
-            if (override_index < vector_overrides.items.len and
-                ExperimentalVectorOverride.compareItem(vector_overrides.items[override_index], base) == .eq)
-            {
-                const replacement = vector_overrides.items[override_index];
-                if (replacement.value) |value| try directory_writer.append(sink, replacement.kind, replacement.id, value);
-                override_index += 1;
-            } else {
-                try directory_writer.append(sink, base.kind, base.id, base.value);
-            }
-            base_reclaimer.observe(base.value);
-        }
-        while (override_index < vector_overrides.items.len) : (override_index += 1) {
-            const replacement = vector_overrides.items[override_index];
-            if (replacement.value) |value| try directory_writer.append(sink, replacement.kind, replacement.id, value);
+            try directory_writer.appendRow(sink, row.id, row.leaf, row.metadata);
+            if (row.leaf) |value| base_reclaimer.observe(value);
+            if (row.metadata) |value| base_reclaimer.observe(value);
         }
         const vector_directory_finish = try directory_writer.finish(sink);
+        std.log.info(
+            "dense vector directory staged format=v2 rows={} leaves={} metadata={} blocks={} bytes={} values={} index={} root={}",
+            .{
+                vector_directory_finish.entry_count,
+                vector_directory_finish.leaf_entry_count,
+                vector_directory_finish.metadata_entry_count,
+                vector_directory_finish.block_count,
+                vector_directory_finish.len,
+                vector_directory_finish.value_bytes,
+                vector_directory_finish.index_bytes,
+                vector_directory_finish.root_bytes,
+            },
+        );
         try writer.appendWrittenValueAt(
             sink,
             0,
@@ -9371,16 +9443,35 @@ pub const HBCIndex = struct {
             // checkpoints merge the immutable directory with live overlays.
             var vector_directory_writer = try vectorindex_hbc_vector_directory.Writer.init(self.alloc);
             defer vector_directory_writer.deinit();
-            var vec_cursor = try txn.openCursor(.vecs);
-            defer vec_cursor.close();
-            var vec_entry = try vec_cursor.first();
-            while (vec_entry) |entry| : (vec_entry = try vec_cursor.next()) {
-                const decoded = decodeVectorDerivedKey(entry.key) orelse continue;
-                try vector_directory_writer.append(switch (decoded.kind) {
-                    .vector_leaf => .leaf,
-                    .vector_metadata => .metadata,
-                    else => unreachable,
-                }, decoded.vector_id, entry.value);
+            var leaf_cursor = try txn.openCursor(.vecs);
+            defer leaf_cursor.close();
+            var metadata_cursor = try txn.openCursor(.vecs);
+            defer metadata_cursor.close();
+            var leaf_key: [10]u8 = undefined;
+            var metadata_key: [10]u8 = undefined;
+            var leaf_entry = try leaf_cursor.seekAtOrAfter(encodeVecLeafKey(&leaf_key, 0));
+            var metadata_entry = try metadata_cursor.seekAtOrAfter(encodeVecMetaKey(&metadata_key, 0));
+            while (true) {
+                const leaf_decoded = if (leaf_entry) |entry| decodeVectorDerivedKey(entry.key) else null;
+                const metadata_decoded = if (metadata_entry) |entry| decodeVectorDerivedKey(entry.key) else null;
+                const leaf_id = if (leaf_decoded) |decoded|
+                    if (decoded.kind == .vector_leaf) decoded.vector_id else null
+                else
+                    null;
+                const metadata_id = if (metadata_decoded) |decoded|
+                    if (decoded.kind == .vector_metadata) decoded.vector_id else null
+                else
+                    null;
+                if (leaf_id == null and metadata_id == null) break;
+                const id = if (leaf_id) |value|
+                    if (metadata_id) |metadata_value| @min(value, metadata_value) else value
+                else
+                    metadata_id.?;
+                const leaf_value = if (leaf_id != null and leaf_id.? == id) leaf_entry.?.value else null;
+                const metadata_value = if (metadata_id != null and metadata_id.? == id) metadata_entry.?.value else null;
+                try vector_directory_writer.appendRow(id, leaf_value, metadata_value);
+                if (leaf_value != null) leaf_entry = try leaf_cursor.next();
+                if (metadata_value != null) metadata_entry = try metadata_cursor.next();
             }
             const vector_directory = try vector_directory_writer.build();
             try writer.appendValueOwnedAt(0, .vector_directory, covered_source_sequence, vector_directory);
@@ -9590,13 +9681,16 @@ pub const HBCIndex = struct {
             .centroid_directory, .commit => return error.UnsupportedExperimentalPostingWalRecord,
         };
 
-        // The directory validates its compact index eagerly and values lazily.
-        // Avoid the generic segment payload CRC here: hashing the entire nested
-        // container would fault every metadata page on an otherwise cold mmap.
-        const vector_directory = if (try segments[0].getNestedContainer(0, .vector_directory)) |bytes|
-            try vectorindex_hbc_vector_directory.Reader.init(bytes)
+        // The directory validates its compact root eagerly and each immutable
+        // block once when first touched. Avoid the generic segment payload CRC
+        // here: hashing the entire nested container would fault every metadata
+        // page on an otherwise cold mmap.
+        var vector_directory = if (try segments[0].getNestedContainer(0, .vector_directory)) |bytes|
+            try vectorindex_hbc_vector_directory.Reader.init(self.alloc, bytes)
         else
             null;
+        var vector_directory_owned = vector_directory != null;
+        errdefer if (vector_directory_owned) if (vector_directory) |*directory| directory.deinit();
         var quantized_directory = if (try segments[0].getNestedContainer(0, .quantized_directory)) |bytes|
             try vectorindex_quantized_directory.VerifiedReader.init(self.alloc, bytes)
         else
@@ -9617,6 +9711,7 @@ pub const HBCIndex = struct {
         };
         retained_segments_owned = false;
         segments_owned = false;
+        vector_directory_owned = false;
         quantized_directory_owned = false;
         var state_initialized = true;
         errdefer if (state_initialized) state.deinit();
