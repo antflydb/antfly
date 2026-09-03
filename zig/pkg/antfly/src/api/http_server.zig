@@ -6814,17 +6814,17 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn validateTableWritesAgainstSchema(self: *ApiHttpServer, table_name: []const u8, writes: anytype) !void {
-        if (writes.len == 0) return;
         var snapshot = (try self.source.adminSnapshot()) orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
 
-        if (table.schema_json.len != 0) {
+        if (writes.len > 0 and table.schema_json.len != 0) {
             var parsed_schema = try tables_api.parseValidatedTableSchema(self.alloc, table.schema_json);
             defer parsed_schema.deinit(self.alloc);
             try tables_api.validateWritesAgainstTableSchema(self.alloc, parsed_schema, writes);
         }
-        try validateWritesAgainstExtensionDataShapes(self.alloc, &snapshot, table_name, writes);
+        if (writes.len > 0)
+            try validateWritesAgainstExtensionDataShapes(self.alloc, &snapshot, table_name, writes);
     }
 
     pub fn validateCommitTablesAgainstSchema(self: *ApiHttpServer, tables: []const distributed_txn.TableCommitRequest) !void {

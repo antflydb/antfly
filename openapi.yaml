@@ -4094,8 +4094,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/IdempotentBatchError'
         '429':
-          description: Request was not applied because write admission or durable receipt capacity is
-            exhausted
+          description: >
+            Write admission or durable receipt capacity is exhausted. Because an
+
+            identical concurrent request may already own execution capacity, the
+
+            keyed response can conservatively report `unknown`; retry the same key.
           content:
             application/json:
               schema:
