@@ -2011,11 +2011,7 @@ pub fn build(b: *std.Build) void {
     transcribing_mod.addImport("inference_api", inference_api_mod);
     transcribing_mod.addImport("antfly_scraping", scraping_mod);
     transcribing_mod.addImport("antfly_google", google_mod);
-    const reader_config_mod = b.createModule(.{
-        .root_source_file = b.path("lib/readers/src/config.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const reader_config_mod = inference_graph.reader_config_mod;
     const readers_mod = b.createModule(.{
         .root_source_file = b.path("lib/readers/src/mod.zig"),
         .target = target,

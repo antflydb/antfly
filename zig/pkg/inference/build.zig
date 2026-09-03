@@ -271,6 +271,7 @@ pub fn build(b: *std.Build) void {
     const generating_openapi_mod = runtime_graph.generating_openapi_mod;
     const extraction_openapi_mod = runtime_graph.extraction_openapi_mod;
     const extracting_mod = runtime_graph.extracting_mod;
+    const reader_config_mod = runtime_graph.reader_config_mod;
     const client_mod = runtime_graph.inference_client_mod;
     const inference_internal_mod = runtime_graph.inference_internal_mod;
 
@@ -1532,6 +1533,7 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addImport("prometheus", prometheus_mod);
     tests.root_module.addImport("structlog", structlog_mod);
     tests.root_module.addImport("antfly_platform", platform_mod);
+    tests.root_module.addImport("antfly_reader_config", reader_config_mod);
     tests.root_module.addImport("inference_internal", tests.root_module);
     if (client_mod) |mod| {
         tests.root_module.addImport("inference_client", mod);
@@ -1661,6 +1663,7 @@ pub fn build(b: *std.Build) void {
     wasm_compute_tests.root_module.addImport("pjrt", pjrt_mod);
     wasm_compute_tests.root_module.addImport("prometheus", prometheus_mod);
     wasm_compute_tests.root_module.addImport("structlog", structlog_mod);
+    wasm_compute_tests.root_module.addImport("antfly_reader_config", reader_config_mod);
     if (client_mod) |mod| {
         wasm_compute_tests.root_module.addImport("inference_client", mod);
     }
@@ -1716,6 +1719,7 @@ pub fn build(b: *std.Build) void {
     web_projector_tests.root_module.addImport("pjrt", pjrt_mod);
     web_projector_tests.root_module.addImport("prometheus", prometheus_mod);
     web_projector_tests.root_module.addImport("structlog", structlog_mod);
+    web_projector_tests.root_module.addImport("antfly_reader_config", reader_config_mod);
     if (client_mod) |mod| {
         web_projector_tests.root_module.addImport("inference_client", mod);
     }

@@ -73,6 +73,7 @@ pub const SharedModules = struct {
     chunking_api_openapi: ?*std.Build.Module = null,
     extraction_openapi: ?*std.Build.Module = null,
     extracting: ?*std.Build.Module = null,
+    reader_config: ?*std.Build.Module = null,
     inference_client: ?*std.Build.Module = null,
 };
 
@@ -120,6 +121,7 @@ pub const Graph = struct {
     chunking_api_openapi_mod: *std.Build.Module,
     extraction_openapi_mod: *std.Build.Module,
     extracting_mod: *std.Build.Module,
+    reader_config_mod: *std.Build.Module,
     inference_mod: *std.Build.Module,
     inference_internal_mod: *std.Build.Module,
 };
@@ -227,6 +229,7 @@ pub fn create(config: Config) Graph {
         mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
         break :blk mod;
     };
+    const reader_config_mod = shared.reader_config orelse createSharedModule(config, "lib/readers/src/config.zig");
     const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared_with_generating);
     const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
         const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{
@@ -310,6 +313,7 @@ pub fn create(config: Config) Graph {
         .pjrt_mod = pjrt_mod,
         .platform_mod = platform_mod,
         .protobuf_mod = protobuf_mod,
+        .reader_config_mod = reader_config_mod,
         .inference_client_mod = inference_client_mod,
     });
     inference_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -376,6 +380,7 @@ pub fn create(config: Config) Graph {
         .chunking_api_openapi_mod = chunking_api_openapi_mod,
         .extraction_openapi_mod = extraction_openapi_mod,
         .extracting_mod = extracting_mod,
+        .reader_config_mod = reader_config_mod,
         .inference_mod = inference_mod,
         .inference_internal_mod = inference_internal_mod,
     };
@@ -422,6 +427,7 @@ const InferenceRootImports = struct {
     pjrt_mod: *std.Build.Module,
     platform_mod: *std.Build.Module,
     protobuf_mod: *std.Build.Module,
+    reader_config_mod: *std.Build.Module,
     inference_client_mod: ?*std.Build.Module,
 };
 
@@ -448,6 +454,7 @@ pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRoot
     module.addImport("pjrt", imports.pjrt_mod);
     module.addImport("antfly_platform", imports.platform_mod);
     module.addImport("protobuf", imports.protobuf_mod);
+    module.addImport("antfly_reader_config", imports.reader_config_mod);
     if (imports.inference_client_mod) |mod| {
         module.addImport("inference_client", mod);
     }

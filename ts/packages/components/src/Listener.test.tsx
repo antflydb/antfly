@@ -973,7 +973,7 @@ describe("Listener", () => {
           const fts = queries?.[0]?.query?.full_text_search as Record<string, unknown>;
           if (fts?.disjuncts) {
             const disjuncts = fts.disjuncts as Array<Record<string, unknown>>;
-            return disjuncts.some((q) => "match_phrase" in q);
+            return disjuncts.some((q) => q.match_phrase === "hello world");
           }
           return false;
         });
@@ -986,7 +986,7 @@ describe("Listener", () => {
         const fts = queries?.[0]?.query?.full_text_search as Record<string, unknown>;
         if (fts?.disjuncts) {
           const disjuncts = fts.disjuncts as Array<Record<string, unknown>>;
-          return disjuncts.some((q) => "match_phrase" in q);
+          return disjuncts.some((q) => q.match_phrase === "hello world");
         }
         return false;
       });
