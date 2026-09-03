@@ -1875,12 +1875,14 @@ The hardening above follows these long-term rules:
     rewrites that choice. Unscoped model discovery without an explicit or
     configured default pool fails closed instead of merging a cluster-wide
     cross-namespace catalog.
-    Route policy carries `Namespace` separately from `Name`; slashes in a
-    display/identity name have no scheduling meaning. Route installation,
-    equality, ordering, removal, cohort discovery, activation, and execution
-    all use the complete `(namespace, name)` or `(namespace, pool)` identity as
-    appropriate, so programmatic and informer-installed routes have identical
-    namespace semantics.
+    Route policy carries `Namespace` separately from `Name`; a slash in `Name`
+    has no namespace-scoping meaning. The complete `(namespace, name)` identity
+    is deliberately the stable salt for deterministic weighted selection, so a
+    route rename is an identity change and may redistribute traffic. Route
+    installation, equality, ordering, removal, cohort discovery, activation,
+    and execution use `(namespace, name)` or `(namespace, pool)` as appropriate,
+    so programmatic and informer-installed routes have identical namespace
+    semantics.
 52. **Implemented after route-generation review:** potential cohort discovery
     and exact activation matching bind to the same immutable route generation.
     A mutation observed while constructing that plan causes no activation. A

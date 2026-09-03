@@ -204,6 +204,27 @@ func TestSelectDestinationUsesWeights(t *testing.T) {
 	}
 }
 
+func TestWeightedSelectionUsesCompleteRouteIdentityAsStableSalt(t *testing.T) {
+	t.Parallel()
+	req := &RouteRequest{
+		Operation:          "generate",
+		Model:              "gemma4",
+		SourceOrganization: "org-a",
+		Timestamp:          time.Date(2026, time.September, 3, 12, 0, 0, 0, time.UTC),
+	}
+	const totalWeight = int32(1 << 30)
+	base := weightedSelectionValue(&Route{Namespace: "tenant-a", Name: "generator"}, req, totalWeight)
+	if same := weightedSelectionValue(&Route{Namespace: "tenant-a", Name: "generator"}, req, totalWeight); same != base {
+		t.Fatalf("same route identity produced selection values %d and %d", base, same)
+	}
+	if renamed := weightedSelectionValue(&Route{Namespace: "tenant-a", Name: "generator-v2"}, req, totalWeight); renamed == base {
+		t.Fatalf("route rename did not change deterministic selection salt: %d", base)
+	}
+	if moved := weightedSelectionValue(&Route{Namespace: "tenant-b", Name: "generator"}, req, totalWeight); moved == base {
+		t.Fatalf("route namespace did not change deterministic selection salt: %d", base)
+	}
+}
+
 func TestProxyRequestRetriesRetryableStatus(t *testing.T) {
 	t.Parallel()
 

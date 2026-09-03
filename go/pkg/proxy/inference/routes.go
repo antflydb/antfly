@@ -28,8 +28,9 @@ import (
 // Route represents a compiled InferenceProxy for fast matching
 type Route struct {
 	// Namespace is the immutable routing scope for every destination in this
-	// route. Empty namespace denotes explicitly global standalone pools. Name is
-	// only the route identity and has no routing semantics.
+	// route. Empty namespace denotes explicitly global standalone pools.
+	// Namespace and Name together form the route identity and the stable salt for
+	// deterministic weighted selection; Name is never parsed for scope.
 	Namespace string
 	Name      string
 	Priority  int32
