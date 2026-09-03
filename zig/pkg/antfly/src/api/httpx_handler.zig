@@ -5026,7 +5026,7 @@ pub const AntflyApiHandler = struct {
             &supplied,
         ) catch |err| switch (err) {
             error.IdempotencyConflict, error.TransactionCommitRequestMismatch => return try idempotentBatchError(ctx, 409, "not_applied", "idempotency_conflict", "idempotency key is already bound to a different request", false, &txn_hex),
-            error.SessionLimitExceeded, error.SessionCapacityUnavailable => return try idempotentBatchError(ctx, 429, "not_applied", "idempotency_capacity_exhausted", "durable idempotency capacity is exhausted", true, &txn_hex),
+            error.SessionLimitExceeded, error.SessionCapacityUnavailable => return try idempotentBatchError(ctx, 429, "unknown", "idempotency_capacity_exhausted", "durable idempotency capacity is exhausted; retry the same Idempotency-Key", true, &txn_hex),
             error.SessionRecordTooLarge => return respondJsonErrorBody(ctx, 413, "{\"error\":\"idempotent batch exceeds durable receipt capacity\"}"),
             else => return err,
         };
@@ -5035,7 +5035,7 @@ pub const AntflyApiHandler = struct {
             break :sessionOwner self.api_server.localSessionNodeId();
         };
         if (owner_node_id != 0 and owner_node_id != self.api_server.localSessionNodeId()) {
-            var forwarded = (try self.api_server.forwardSessionOperation(txn_id, .{
+            if (try self.api_server.forwardSessionOperation(txn_id, .{
                 .method = .post,
                 .target = ctx.request.uri.raw,
                 .authorization = ctx.header("authorization"),
@@ -5043,8 +5043,18 @@ pub const AntflyApiHandler = struct {
                 .idempotency_key = idempotency_key,
                 .content_type = ctx.header("content-type"),
                 .body = body_data,
-            })) orelse return try idempotentBatchError(ctx, 409, "unknown", "idempotency_owner_unavailable", "the durable operation owner is temporarily unavailable", true, &txn_hex);
-            return try respondOwnedContextualResponse(ctx, &forwarded, alloc);
+            })) |forwarded_value| {
+                var forwarded = forwarded_value;
+                return try respondOwnedContextualResponse(ctx, &forwarded, alloc);
+            }
+            // A failed forward may atomically transfer an expired durable
+            // lease to this node. Re-read the authoritative owner and finish
+            // the same request locally when that transfer won; forcing a
+            // second client retry would make owner recovery an API-level race.
+            const refreshed_owner = (try self.api_server.txn_sessions.getOwnerNodeId(alloc, txn_id)) orelse
+                return try idempotentBatchError(ctx, 409, "unknown", "idempotency_owner_unavailable", "the durable operation owner is temporarily unavailable", true, &txn_hex);
+            if (refreshed_owner != self.api_server.localSessionNodeId())
+                return try idempotentBatchError(ctx, 409, "unknown", "idempotency_owner_unavailable", "the durable operation owner is temporarily unavailable", true, &txn_hex);
         }
 
         // The begin path has already compared the supplied digest for every
@@ -5265,7 +5275,10 @@ pub const AntflyApiHandler = struct {
         const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
         const transition = (self.api_server.txn_sessions.recordIdempotentPreExecutionRejection(alloc, txn_id) catch |err| switch (err) {
             error.SessionLeaseLost => return try idempotentBatchError(ctx, 409, "unknown", "idempotency_owner_changed", "the durable operation owner changed; retry the same request", true, &txn_hex),
-            else => return err,
+            else => {
+                std.log.warn("idempotent batch was rejected before execution but receipt persistence is pending txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                return try idempotentBatchError(ctx, 409, "unknown", "idempotency_receipt_pending", "the operation was rejected before execution but its durable API receipt is still being reconciled; retry the same Idempotency-Key", true, &txn_hex);
+            },
         }) orelse return try idempotentBatchError(ctx, 409, "not_applied", "operation_not_found", "durable batch operation not found", false, &txn_hex);
         switch (transition) {
             .recorded => return try idempotentBatchError(ctx, 409, "not_applied", code, message, false, &txn_hex),
@@ -8028,8 +8041,11 @@ test "httpx idempotent batch terminalizes missing tables before every operation 
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
     const MissingTableStatus = struct {
-        fn iface(_: *@This()) http_server_mod.StatusSource {
-            return .{ .ptr = undefined, .vtable = &.{
+        durable: ?*transactions_api.DurableSessionStore = null,
+        fail_receipt_once: bool = false,
+
+        fn iface(self: *@This()) http_server_mod.StatusSource {
+            return .{ .ptr = self, .vtable = &.{
                 .status = status,
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
@@ -8040,7 +8056,12 @@ test "httpx idempotent batch terminalizes missing tables before every operation 
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_receipt_once) {
+                self.fail_receipt_once = false;
+                self.durable.?.fail_writes_for_test = true;
+            }
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
@@ -8096,7 +8117,42 @@ test "httpx idempotent batch terminalizes missing tables before every operation 
         .session_store_path = session_path,
     }, status.iface(), null, writes.source());
     defer api_server.deinit();
+    status.durable = api_server.opened_session_store.?.durableStore();
     var handler = AntflyApiHandler{ .api_server = &api_server };
+
+    // Losing the receipt write after deterministic preflight rejection keeps
+    // the response typed and the sealed request available for exact retry.
+    status.fail_receipt_once = true;
+    const failed_body = "{\"deletes\":[\"doc:pending\"]}";
+    var failed_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/missing/idempotent-batch");
+    defer failed_request.deinit();
+    failed_request.body = failed_body;
+    try failed_request.headers.append("idempotency-key", "missing-receipt-pending");
+    var failed_ctx = httpx.Context.init(alloc, std.testing.io, &failed_request);
+    defer failed_ctx.deinit();
+    var failed = try handler.idempotentBatchWrite(&failed_ctx, "missing");
+    defer failed.deinit();
+    try std.testing.expectEqual(@as(u16, 409), failed.status.code);
+    var parsed_failed = try std.json.parseFromSlice(std.json.Value, alloc, failed.body.?, .{});
+    defer parsed_failed.deinit();
+    try std.testing.expectEqualStrings("unknown", parsed_failed.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("idempotency_receipt_pending", parsed_failed.value.object.get("code").?.string);
+    try std.testing.expect(parsed_failed.value.object.get("retryable").?.bool);
+
+    status.durable.?.fail_writes_for_test = false;
+    var failed_replay_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/missing/idempotent-batch");
+    defer failed_replay_request.deinit();
+    failed_replay_request.body = failed_body;
+    try failed_replay_request.headers.append("idempotency-key", "missing-receipt-pending");
+    var failed_replay_ctx = httpx.Context.init(alloc, std.testing.io, &failed_replay_request);
+    defer failed_replay_ctx.deinit();
+    var failed_replay = try handler.idempotentBatchWrite(&failed_replay_ctx, "missing");
+    defer failed_replay.deinit();
+    try std.testing.expectEqual(@as(u16, 409), failed_replay.status.code);
+    var parsed_failed_replay = try std.json.parseFromSlice(std.json.Value, alloc, failed_replay.body.?, .{});
+    defer parsed_failed_replay.deinit();
+    try std.testing.expectEqualStrings("not_applied", parsed_failed_replay.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("table_not_found", parsed_failed_replay.value.object.get("code").?.string);
 
     const cases = [_]struct { key: []const u8, body: []const u8 }{
         .{ .key = "missing-insert", .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}}}" },
@@ -9421,6 +9477,7 @@ test "httpx idempotent batch admission returns its documented JSON receipt error
         .deployment_mode = .standalone,
         .session_store_path = session_path,
         .write_max_concurrent_requests = 1,
+        .session_max_count = 2,
         .backend_runtime = &runtime,
     }, source.iface(), null, writes.source());
     defer api_server.deinit();
@@ -9474,6 +9531,145 @@ test "httpx idempotent batch admission returns its documented JSON receipt error
     try std.testing.expectEqualStrings("write_capacity_exhausted", parsed.value.object.get("code").?.string);
     try std.testing.expect(parsed.value.object.get("transaction_id") != null);
     try std.testing.expect(parsed.value.object.get("reconcile") != null);
+
+    // Receipt capacity has the same cross-request ambiguity as execution
+    // admission and therefore uses the same conservative outcome vocabulary.
+    var capacity_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/idempotent-batch");
+    defer capacity_request.deinit();
+    capacity_request.body = body;
+    try capacity_request.headers.append("idempotency-key", "receipt-capacity-saturated");
+    var capacity_ctx = httpx.Context.init(alloc, std.testing.io, &capacity_request);
+    defer capacity_ctx.deinit();
+    var capacity = try handler.idempotentBatchWrite(&capacity_ctx, "docs");
+    defer capacity.deinit();
+    try std.testing.expectEqual(@as(u16, 429), capacity.status.code);
+    var parsed_capacity = try std.json.parseFromSlice(std.json.Value, alloc, capacity.body.?, .{});
+    defer parsed_capacity.deinit();
+    try std.testing.expectEqualStrings("unknown", parsed_capacity.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("idempotency_capacity_exhausted", parsed_capacity.value.object.get("code").?.string);
+    try std.testing.expect(parsed_capacity.value.object.get("retryable").?.bool);
+}
+
+test "httpx idempotent batch continues after adopting an expired remote owner" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const table_router = @import("table_router.zig");
+    const FakeRouter = struct {
+        local_node_id: u64,
+
+        fn iface(self: *@This()) table_router.HostedGroupRouter {
+            return .{ .ptr = self, .vtable = &.{
+                .local_node_id = localNodeId,
+                .local_status = localStatus,
+                .node_base_uri = nodeBaseUri,
+            } };
+        }
+
+        fn localNodeId(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.local_node_id;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.host.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+    const FakeExecutor = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.TestUnexpectedResult;
+        }
+    };
+    const FakeWrites = struct {
+        commit_calls: usize = 0,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .commit_transaction_with_id = commitTransactionWithId,
+            } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn commitTransactionWithId(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.commit_calls += 1;
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const session_path = "/tmp/antfly-httpx-idempotent-owner-adoption";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
+
+    var router = FakeRouter{ .local_node_id = 8 };
+    var executor = FakeExecutor{};
+    var status = AuthStatusSource{};
+    var writes = FakeWrites{};
+    var api_server = try ApiHttpServer.initWithConfig(alloc, .{
+        .deployment_mode = .distributed,
+        .session_store_path = session_path,
+        .session_store_scope = .cluster_shared,
+        .session_owner_lease_ttl_ns = 1,
+        .session_router = router.iface(),
+        .session_executor = executor.iface(),
+    }, status.iface(), null, writes.source());
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+
+    const body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"sync_level\":\"write\"}";
+    var parsed_batch = try batch_api.parseBatchRequest(alloc, body);
+    defer parsed_batch.deinit(alloc);
+    var sealed = try transactions_api.ownedRequestFromBatch(alloc, "docs", parsed_batch);
+    defer sealed.deinit(alloc);
+    const txn_id = transactions_api.idempotentTransactionId(null, "docs", "expired-owner");
+    _ = try api_server.txn_sessions.beginIdempotentForPrincipal(
+        alloc,
+        txn_id,
+        .{ .sync_level = .write },
+        7,
+        null,
+        &sealed,
+    );
+    std.testing.io.sleep(std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/idempotent-batch");
+    defer request.deinit();
+    request.body = body;
+    try request.headers.append("idempotency-key", "expired-owner");
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try handler.idempotentBatchWrite(&ctx, "docs");
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 201), response.status.code);
+    try std.testing.expectEqual(@as(?u64, 8), try api_server.txn_sessions.getOwnerNodeId(alloc, txn_id));
+    try std.testing.expectEqual(@as(usize, 1), writes.commit_calls);
+    try std.testing.expectEqual(@as(usize, 0), executor.calls);
 }
 
 test "httpx HA rejection preserves the idempotent batch error contract" {

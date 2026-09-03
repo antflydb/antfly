@@ -16562,7 +16562,11 @@ export interface operations {
                 };
             };
             413: components["responses"]["PayloadTooLarge"];
-            /** @description Request was not applied because write admission or durable receipt capacity is exhausted */
+            /**
+             * @description Write admission or durable receipt capacity is exhausted. Because an
+             *     identical concurrent request may already own execution capacity, the
+             *     keyed response can conservatively report `unknown`; retry the same key.
+             */
             429: {
                 headers: {
                     [name: string]: unknown;
