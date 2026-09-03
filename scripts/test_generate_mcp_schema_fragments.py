@@ -83,7 +83,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
 
         generated = generator.compact_query_request_schema(schemas)
 
-        self.assertNotIn("table", generated["properties"])
+        self.assertEqual({"type": "null"}, generated["properties"]["table"])
         self.assertIn("hierarchy", generated["properties"])
         invalid_states = generated["not"]["anyOf"]
         missing_group_fields = next(
@@ -130,7 +130,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
         self.assertEqual(
             set(query_schema["properties"]),
             allowed_child_fields | rejected_child_fields,
-            "every QueryRequest property must be explicitly allowed or rejected for hierarchy.children",
+            "every canonical query property must be explicitly allowed or rejected for hierarchy.children",
         )
 
         validator = Draft202012Validator(generator.compact_query_request_schema(schemas))
@@ -216,6 +216,15 @@ class McpSchemaFragmentTests(unittest.TestCase):
             "semanticSearch": "hello",
         }
         self.assertEqual([], list(validator.iter_errors(shorthand_with_null_raw)))
+
+        named_full_text = {
+            "tableName": "docs",
+            "fullTextSearch": "hello",
+            "fullTextIndex": "document_text",
+        }
+        self.assertEqual([], list(validator.iter_errors(named_full_text)))
+        del named_full_text["fullTextSearch"]
+        self.assertNotEqual([], list(validator.iter_errors(named_full_text)))
 
 
 if __name__ == "__main__":

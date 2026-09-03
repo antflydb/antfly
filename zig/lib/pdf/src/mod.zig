@@ -31,11 +31,35 @@ pub const RenderedPagePng = struct {
     effective_dpi: u16,
     width: u32,
     height: u32,
+    quality: RenderQuality = .native,
+    diagnostics: ?reader.PageRenderDiagnostics = null,
 
     pub fn deinit(self: *RenderedPagePng, alloc: Allocator) void {
         alloc.free(self.png);
         self.* = undefined;
     }
+};
+
+pub const RenderQuality = enum {
+    /// Every supported page paint operation was rendered by the native Zig
+    /// path within its deterministic limits.
+    native,
+    /// Native rendering completed, but one or more text groups used the
+    /// bounded raster-font fallback. Callers may still OCR the result while
+    /// surfacing the diagnostic counters.
+    degraded,
+    /// Native decoding rejected an unsupported construct and a compatibility
+    /// backend produced the pixels. This is never selected on platforms
+    /// without such a backend.
+    compatibility_backend,
+};
+
+pub const RenderProfile = enum {
+    /// Preserve PDF sampling semantics exactly, including nearest-neighbor
+    /// minification when /Interpolate is absent.
+    exact,
+    /// Preserve bilevel ink coverage during minification for OCR inputs.
+    ocr,
 };
 
 pub const Backend = struct {
@@ -89,13 +113,13 @@ pub fn renderPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: 
 
 pub fn renderParsedPagePngAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
     if (dpi < minimum_requested_render_dpi or dpi > 600) return error.InvalidRenderDpi;
-    return try renderParsedPagePngEffectiveAlloc(alloc, parsed, page_number, dpi, max_pixels);
+    return try renderParsedPagePngEffectiveAlloc(alloc, parsed, page_number, dpi, max_pixels, .exact);
 }
 
-fn renderParsedPagePngEffectiveAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+fn renderParsedPagePngEffectiveAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64, profile: RenderProfile) ![]u8 {
     if (page_number == 0 or page_number > try parsed.pageCount()) return error.InvalidPageNumber;
     const rotation = try normalizedPageRotation(try parsed.extractPageRotation(page_number));
-    return try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation);
+    return try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation, profile, null);
 }
 
 fn renderParsedPagePngEffectiveWithRotationAlloc(
@@ -105,18 +129,21 @@ fn renderParsedPagePngEffectiveWithRotationAlloc(
     dpi: u16,
     max_pixels: u64,
     rotation: render.PageRotation,
+    profile: RenderProfile,
+    used_compatibility_backend: ?*bool,
 ) ![]u8 {
-    return renderParsedPagePngNativeAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation) catch |err| switch (err) {
+    if (used_compatibility_backend) |value| value.* = false;
+    return renderParsedPagePngNativeAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation, profile) catch |err| switch (err) {
         error.UnsupportedStreamFilter,
         error.UnsupportedNativeDecode,
         error.UnsupportedPdfRendering,
         error.InvalidFlateStream,
         error.MissingEndStream,
         error.UnexpectedEof,
-        => if (builtin.os.tag == .macos)
-            try darwin_render.renderPagePngAlloc(alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation)
-        else
-            return err,
+        => if (builtin.os.tag == .macos) blk: {
+            if (used_compatibility_backend) |value| value.* = true;
+            break :blk try darwin_render.renderPagePngAlloc(alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation);
+        } else return err,
         else => return err,
     };
 }
@@ -128,18 +155,26 @@ fn renderParsedPagePngNativeAlloc(
     dpi: u16,
     max_pixels: u64,
     rotation: render.PageRotation,
+    profile: RenderProfile,
 ) ![]u8 {
     const reader_alloc = parsed.allocator();
+    try parsed.checkCancellation();
     if (dpi < minimum_direct_render_dpi or dpi > 600) return error.InvalidRenderDpi;
     // Reject oversized pages before decoding page images and font resources.
     const unscaled_box = try parsed.extractPageBox(page_number);
     const scale = @as(f64, @floatFromInt(dpi)) / 72.0;
-    const preflight_width = @max(1.0, unscaled_box.max_x - unscaled_box.min_x) * scale;
-    const preflight_height = @max(1.0, unscaled_box.max_y - unscaled_box.min_y) * scale;
+    const preflight_width = rasterAxisExtent(unscaled_box.min_x, unscaled_box.max_x, scale);
+    const preflight_height = rasterAxisExtent(unscaled_box.min_y, unscaled_box.max_y, scale);
     if (preflight_width * preflight_height > @as(f64, @floatFromInt(max_pixels))) return error.RenderedPageTooLarge;
-    var render_runs = try parsed.extractPageRenderRunsAlloc(page_number);
+    if (preflight_width > std.math.maxInt(u32) or preflight_height > std.math.maxInt(u32)) return error.RenderedPageTooLarge;
+    var render_runs = try parsed.extractPageRenderRunsForRasterAlloc(page_number, @intFromFloat(preflight_width), @intFromFloat(preflight_height));
     defer render_runs.deinit(reader_alloc);
+    try parsed.checkCancellation();
+    if (profile == .ocr) {
+        try reader.prepareOcrRenderRunsAlloc(reader_alloc, render_runs.image_runs, render_runs.pattern_runs, parsed.cancellationProbe());
+    }
     scalePageRenderRuns(&render_runs, scale);
+    alignPageBoxToPixelGrid(&render_runs.page_box);
     const page_box = render_runs.page_box;
     const page_width = @max(1.0, page_box.max_x - page_box.min_x);
     const page_height = @max(1.0, page_box.max_y - page_box.min_y);
@@ -149,83 +184,33 @@ fn renderParsedPagePngNativeAlloc(
     const shading_runs = render_runs.shading_runs;
     const pattern_runs = render_runs.pattern_runs;
     const shape_runs = render_runs.shape_runs;
-    var text_pattern_runs: []reader.PatternRun = &.{};
-    var text_shape_runs: []reader.ShapeRun = &.{};
-    defer {
-        for (text_pattern_runs) |*run| run.deinit(reader_alloc);
-        if (text_pattern_runs.len > 0) reader_alloc.free(text_pattern_runs);
-        for (text_shape_runs) |*run| run.deinit(reader_alloc);
-        if (text_shape_runs.len > 0) reader_alloc.free(text_shape_runs);
-    }
     var plain_runs = std.ArrayList(reader.TextRun).empty;
     defer plain_runs.deinit(alloc);
-    var needs_vector_text_patterns = false;
-    var needs_vector_text_shapes = false;
     for (runs) |run| {
         const has_pattern = run.fill_pattern_name != null or run.stroke_pattern_name != null;
-        if (has_pattern) {
-            needs_vector_text_patterns = true;
-        }
-        if (run.vectorizable) {
-            needs_vector_text_shapes = true;
-        }
         if (has_pattern or run.vectorizable) continue;
         try plain_runs.append(alloc, run);
-    }
-    if (needs_vector_text_patterns) {
-        text_pattern_runs = try parsed.extractPageVectorTextPatternRunsAlloc(page_number);
-        scalePatternRuns(text_pattern_runs, scale);
-    }
-    if (needs_vector_text_shapes) {
-        text_shape_runs = try parsed.extractPageVectorTextShapeRunsAlloc(page_number);
-        scaleShapeRuns(text_shape_runs, scale);
-    }
-    var all_shape_runs = std.ArrayList(reader.ShapeRun).empty;
-    defer {
-        for (all_shape_runs.items) |*run| run.deinit(alloc);
-        all_shape_runs.deinit(alloc);
-    }
-    for (shape_runs) |run| {
-        var cloned = try dupShapeRunAlloc(alloc, run);
-        errdefer cloned.deinit(alloc);
-        try all_shape_runs.append(alloc, cloned);
-    }
-    for (text_shape_runs) |run| {
-        var cloned = try dupShapeRunAlloc(alloc, run);
-        errdefer cloned.deinit(alloc);
-        try all_shape_runs.append(alloc, cloned);
-    }
-    var all_pattern_runs = std.ArrayList(reader.PatternRun).empty;
-    defer {
-        for (all_pattern_runs.items) |*run| run.deinit(alloc);
-        all_pattern_runs.deinit(alloc);
-    }
-    for (pattern_runs) |run| {
-        var cloned = try dupPatternRunAlloc(alloc, run);
-        errdefer cloned.deinit(alloc);
-        try all_pattern_runs.append(alloc, cloned);
-    }
-    for (text_pattern_runs) |run| {
-        var cloned = try dupPatternRunAlloc(alloc, run);
-        errdefer cloned.deinit(alloc);
-        try all_pattern_runs.append(alloc, cloned);
     }
     std.mem.sort(reader.TextRun, plain_runs.items, {}, struct {
         fn lessThan(_: void, a: reader.TextRun, b: reader.TextRun) bool {
             return a.paint_order < b.paint_order;
         }
     }.lessThan);
-    std.mem.sort(reader.ShapeRun, all_shape_runs.items, {}, struct {
+    std.mem.sort(reader.ShapeRun, shape_runs, {}, struct {
         fn lessThan(_: void, a: reader.ShapeRun, b: reader.ShapeRun) bool {
             return a.paint_order < b.paint_order;
         }
     }.lessThan);
-    std.mem.sort(reader.PatternRun, all_pattern_runs.items, {}, struct {
+    std.mem.sort(reader.PatternRun, pattern_runs, {}, struct {
         fn lessThan(_: void, a: reader.PatternRun, b: reader.PatternRun) bool {
             return a.paint_order < b.paint_order;
         }
     }.lessThan);
-    return try render.renderPageContentPngInBoxRotated(alloc, page_box, plain_runs.items, image_runs, shading_runs, all_pattern_runs.items, all_shape_runs.items, rotation);
+    try parsed.checkCancellation();
+    const png = try render.renderPageContentPngInBoxRotatedCancelable(alloc, page_box, plain_runs.items, image_runs, shading_runs, pattern_runs, shape_runs, rotation, parsed.cancellationProbe());
+    errdefer alloc.free(png);
+    try parsed.checkCancellation();
+    return png;
 }
 
 fn normalizedPageRotation(rotation: ?i32) !render.PageRotation {
@@ -251,6 +236,18 @@ pub fn renderParsedPagePngAdaptiveAlloc(
     max_pixels: u64,
     max_dimension: u32,
 ) !RenderedPagePng {
+    return try renderParsedPagePngAdaptiveWithProfileAlloc(alloc, parsed, page_number, requested_dpi, max_pixels, max_dimension, .exact);
+}
+
+pub fn renderParsedPagePngAdaptiveWithProfileAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    requested_dpi: u16,
+    max_pixels: u64,
+    max_dimension: u32,
+    profile: RenderProfile,
+) !RenderedPagePng {
     if (page_number == 0) return error.InvalidPageNumber;
     if (requested_dpi < 72 or requested_dpi > 600) return error.InvalidRenderDpi;
     if (max_pixels == 0 or max_dimension == 0) return error.RenderedPageTooLarge;
@@ -258,19 +255,17 @@ pub fn renderParsedPagePngAdaptiveAlloc(
     if (page_number > page_count) return error.InvalidPageNumber;
     const box = try parsed.extractPageBox(page_number);
     const rotation = try normalizedPageRotation(try parsed.extractPageRotation(page_number));
-    const unrotated_width = @max(1.0, box.max_x - box.min_x);
-    const unrotated_height = @max(1.0, box.max_y - box.min_y);
     const swaps_dimensions = rotation == .clockwise_90 or rotation == .clockwise_270;
-    const page_width = if (swaps_dimensions) unrotated_height else unrotated_width;
-    const page_height = if (swaps_dimensions) unrotated_width else unrotated_height;
 
     var effective_dpi = requested_dpi;
     var width: u32 = 0;
     var height: u32 = 0;
     while (true) {
         const scale = @as(f64, @floatFromInt(effective_dpi)) / 72.0;
-        const width_f = @ceil(page_width * scale);
-        const height_f = @ceil(page_height * scale);
+        const unrotated_width = rasterAxisExtent(box.min_x, box.max_x, scale);
+        const unrotated_height = rasterAxisExtent(box.min_y, box.max_y, scale);
+        const width_f = if (swaps_dimensions) unrotated_height else unrotated_width;
+        const height_f = if (swaps_dimensions) unrotated_width else unrotated_height;
         const fits_integer = width_f <= @as(f64, @floatFromInt(std.math.maxInt(u32))) and
             height_f <= @as(f64, @floatFromInt(std.math.maxInt(u32)));
         if (fits_integer) {
@@ -283,12 +278,19 @@ pub fn renderParsedPagePngAdaptiveAlloc(
         effective_dpi -= 1;
     }
 
+    parsed.clearRenderDiagnostics();
+    var used_compatibility_backend = false;
+    const png = try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, effective_dpi, max_pixels, rotation, profile, &used_compatibility_backend);
+    const diagnostics = if (used_compatibility_backend) null else parsed.lastRenderDiagnostics();
+    const degraded = if (diagnostics) |value| value.fallback_text_groups != 0 else false;
     return .{
-        .png = try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, effective_dpi, max_pixels, rotation),
+        .png = png,
         .requested_dpi = requested_dpi,
         .effective_dpi = effective_dpi,
         .width = width,
         .height = height,
+        .quality = if (used_compatibility_backend) .compatibility_backend else if (degraded) .degraded else .native,
+        .diagnostics = diagnostics,
     };
 }
 
@@ -381,6 +383,11 @@ fn scalePatternRuns(runs: []reader.PatternRun, scale: f64) void {
         }
         if (run.clip_box) |*box| scaleBox(box, scale);
         scalePoints(run.clip_points, scale);
+        // A retained stencil is the page-space target of the Pattern paint,
+        // unlike tile-local image runs. Scale it exactly once with the outer
+        // pattern occurrence.
+        if (run.stencil_mask) |*mask|
+            scaleImageRuns(@as(*[1]reader.ImageRun, @ptrCast(mask))[0..], scale);
         // Tiling geometry and tile-local runs remain in pattern space. The
         // pattern matrix is the single mapping into the scaled page space;
         // scaling both produced tiles that grew by scale^2 at higher DPI.
@@ -401,6 +408,35 @@ fn scalePageRenderRuns(runs: *reader.PageRenderRuns, scale: f64) void {
     scaleShadingRuns(runs.shading_runs, scale);
     scalePatternRuns(runs.pattern_runs, scale);
     scaleShapeRuns(runs.shape_runs, scale);
+}
+
+fn rasterAxisExtent(min_value: f64, max_value: f64, scale: f64) f64 {
+    return @max(1.0, @ceil((max_value - min_value) * scale));
+}
+
+fn alignPageBoxToPixelGrid(box: *reader.PageBox) void {
+    box.max_x = box.min_x + @max(1.0, @ceil(box.max_x - box.min_x));
+    box.max_y = box.min_y + @max(1.0, @ceil(box.max_y - box.min_y));
+}
+
+test "raster extents include fractional crop-box edges" {
+    const box: reader.PageBox = .{
+        .min_x = 0.720001,
+        .min_y = 0.479996,
+        .max_x = 595.92,
+        .max_y = 842.16,
+    };
+    const scale = 150.0 / 72.0;
+    try std.testing.expectEqual(@as(f64, 1240), rasterAxisExtent(box.min_x, box.max_x, scale));
+    try std.testing.expectEqual(@as(f64, 1754), rasterAxisExtent(box.min_y, box.max_y, scale));
+
+    var scaled = box;
+    scaleBox(&scaled, scale);
+    alignPageBoxToPixelGrid(&scaled);
+    try std.testing.expectApproxEqAbs(1.500002083, scaled.min_x, 0.000001);
+    try std.testing.expectApproxEqAbs(0.999991667, scaled.min_y, 0.000001);
+    try std.testing.expectApproxEqAbs(1241.500002083, scaled.max_x, 0.000001);
+    try std.testing.expectApproxEqAbs(1754.999991667, scaled.max_y, 0.000001);
 }
 
 fn dupTextRunAlloc(alloc: Allocator, run: reader.TextRun) !reader.TextRun {
@@ -445,11 +481,13 @@ fn dupShapeRunAlloc(alloc: Allocator, run: reader.ShapeRun) !reader.ShapeRun {
     out.dash_array = null;
     out.clip_points = null;
     out.points = &.{};
+    out.subpath_starts = null;
     errdefer out.deinit(alloc);
 
     if (run.dash_array) |dash| out.dash_array = try alloc.dupe(f64, dash);
     if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
     out.points = try alloc.dupe([2]f64, run.points);
+    if (run.subpath_starts) |starts| out.subpath_starts = try alloc.dupe(usize, starts);
     return out;
 }
 
@@ -458,6 +496,7 @@ fn dupPatternRunAlloc(alloc: Allocator, run: reader.PatternRun) !reader.PatternR
     out.dash_array = null;
     out.clip_points = null;
     out.points = &.{};
+    out.subpath_starts = null;
     out.shading = null;
     out.tile_text_runs = &.{};
     out.tile_image_runs = &.{};
@@ -469,6 +508,7 @@ fn dupPatternRunAlloc(alloc: Allocator, run: reader.PatternRun) !reader.PatternR
     if (run.dash_array) |dash| out.dash_array = try alloc.dupe(f64, dash);
     if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
     out.points = try alloc.dupe([2]f64, run.points);
+    if (run.subpath_starts) |starts| out.subpath_starts = try alloc.dupe(usize, starts);
     if (run.shading) |shading| out.shading = try dupShadingRunAlloc(alloc, shading);
 
     if (run.tile_text_runs.len > 0) {
@@ -2329,8 +2369,8 @@ test "reader extracts vector text shapes for embedded FontFile type1 seac glyph"
         "/CharStrings 4 dict dup begin\n" ++
         "/.notdef <8B8B150E> def\n" ++
         "/A <8B8B15F77C8B05FB7CFA7C05FB7CFB7C050E> def\n" ++
-        "/period <8B8B15938B058B93058D8B058B8D050E> def\n" ++
-        "/Aperiod <8BF75CF7C0CCB90C060E> def\n" ++
+        "/acute <8B8B15938B058B93058D8B058B8D050E> def\n" ++
+        "/Aacute <8BF75CF7C0CCF7560C060E> def\n" ++
         "end readonly def\n";
 
     const content = "BT\n/F1 20 Tf\n10 10 Td\n(A) Tj\nET\n";
@@ -2339,7 +2379,7 @@ test "reader extracts vector text shapes for embedded FontFile type1 seac glyph"
     const obj3 = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n";
     const obj4 = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
     defer alloc.free(obj4);
-    const obj5 = "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /TestT1 /FirstChar 65 /LastChar 65 /Widths [1000] /Encoding << /Differences [65 /Aperiod] >> /FontDescriptor 6 0 R >>\nendobj\n";
+    const obj5 = "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /TestT1 /FirstChar 65 /LastChar 65 /Widths [1000] /Encoding << /Differences [65 /Aacute] >> /FontDescriptor 6 0 R >>\nendobj\n";
     const obj6 = "6 0 obj\n<< /Type /FontDescriptor /FontName /TestT1 /FontFile 7 0 R >>\nendobj\n";
 
     var out = std.ArrayList(u8).empty;
@@ -2380,6 +2420,9 @@ test "reader extracts vector text shapes for embedded FontFile type1 seac glyph"
 
     var parsed = try reader.Reader.init(alloc, out.items);
     defer parsed.deinit();
+    const extracted = try parsed.extractPageTextAlloc(1);
+    defer alloc.free(extracted);
+    try std.testing.expectEqualStrings("Á\n", extracted);
     const runs = try parsed.extractPageVectorTextShapeRunsAlloc(1);
     defer {
         for (runs) |*run| run.deinit(alloc);
@@ -2470,16 +2513,20 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF glyph pdf 
     const font_bytes = try buildSimpleOpenTypeCffFontAlloc(alloc);
     defer alloc.free(font_bytes);
 
-    const content = "BT\n/F1 20 Tf\n10 10 Td\n<0041> Tj\nET\n";
+    const content = "BT\n/F1 20 Tf\n10 10 Td\n<00010001> Tj\nET\n";
     const cmap =
         "/CIDInit /ProcSet findresource begin\n" ++
         "12 dict begin\n" ++
         "begincmap\n" ++
         "1 begincodespacerange\n" ++
-        "<0000> <FFFF>\n" ++
+        // Extraction consumes the whole string as one four-byte code while
+        // Identity-H painting must still consume two fixed-width CIDs.
+        "<00000000> <FFFFFFFF>\n" ++
         "endcodespacerange\n" ++
         "1 beginbfchar\n" ++
-        "<0041> <0041>\n" ++
+        // Extraction deliberately disagrees with both the raw CID and the
+        // font's only cmap entry. Painting must still select both CFF CID 1s.
+        "<00010001> <0042>\n" ++
         "endbfchar\n" ++
         "endcmap\n" ++
         "end\n" ++
@@ -2491,7 +2538,7 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF glyph pdf 
     const obj4 = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
     defer alloc.free(obj4);
     const obj5 = "5 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /TestCID /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 8 0 R >>\nendobj\n";
-    const obj6 = "6 0 obj\n<< /Type /Font /Subtype /CIDFontType0 /BaseFont /TestCID /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R >>\nendobj\n";
+    const obj6 = "6 0 obj\n<< /Type /Font /Subtype /CIDFontType0 /BaseFont /TestCID /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /DW 700 /W [1 [250]] /FontDescriptor 7 0 R >>\nendobj\n";
     const obj7 = "7 0 obj\n<< /Type /FontDescriptor /FontName /TestCID /FontFile3 9 0 R >>\nendobj\n";
     const obj8 = try std.fmt.allocPrint(alloc, "8 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ cmap.len, cmap });
     defer alloc.free(obj8);
@@ -2536,6 +2583,21 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF glyph pdf 
     try out.appendSlice(alloc, startxref);
     try out.appendSlice(alloc, "%%EOF\n");
 
+    var parsed = try reader.Reader.init(alloc, out.items);
+    defer parsed.deinit();
+    var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    try std.testing.expectEqualStrings("B\n", analysis.text);
+    try std.testing.expectEqual(@as(usize, 1), analysis.runs.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 10), analysis.runs[0].advance_width, 0.001);
+    try std.testing.expect(!analysis.outline_fallback);
+    const native_shapes = try parsed.extractPageVectorTextShapeRunsAlloc(1);
+    defer {
+        for (native_shapes) |*shape| shape.deinit(alloc);
+        if (native_shapes.len > 0) alloc.free(native_shapes);
+    }
+    try std.testing.expect(native_shapes.len > 0);
+
     const backend = Backend.native();
     const png = try backend.renderFirstPagePng(alloc, out.items);
     defer alloc.free(png);
@@ -2547,7 +2609,7 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF fdselect g
     const font_bytes = try buildFdSelectOpenTypeCffFontAlloc(alloc);
     defer alloc.free(font_bytes);
 
-    const content = "BT\n/F1 20 Tf\n10 10 Td\n<00410042> Tj\nET\n";
+    const content = "BT\n/F1 20 Tf\n10 10 Td\n<00010002> Tj\nET\n";
     const cmap =
         "/CIDInit /ProcSet findresource begin\n" ++
         "12 dict begin\n" ++
@@ -2556,8 +2618,8 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF fdselect g
         "<0000> <FFFF>\n" ++
         "endcodespacerange\n" ++
         "2 beginbfchar\n" ++
-        "<0041> <0041>\n" ++
-        "<0042> <0042>\n" ++
+        "<0001> <0041>\n" ++
+        "<0002> <0042>\n" ++
         "endbfchar\n" ++
         "endcmap\n" ++
         "end\n" ++
@@ -2680,9 +2742,25 @@ test "OCR DPI scaling maps tiling patterns exactly once" {
         .points = tile_points,
     };
     const target_points = try alloc.dupe([2]f64, &.{ .{ 0, 0 }, .{ 20, 0 }, .{ 20, 20 }, .{ 0, 20 } });
+    const stencil_rgba = try alloc.dupe(u8, &.{ 0xff, 0xff, 0xff, 0xff });
     var runs = [_]reader.PatternRun{.{
         .kind = .fill,
         .points = target_points,
+        .stencil_mask = .{
+            .rgba = stencil_rgba,
+            .width = 1,
+            .height = 1,
+            .a = 20,
+            .b = 0,
+            .c = 0,
+            .d = 20,
+            .e = 3,
+            .f = 4,
+            .x = 3,
+            .y = 4,
+            .draw_width = 20,
+            .draw_height = 20,
+        },
         .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 5, .max_y = 5 },
         .pattern_x_step = 5,
         .pattern_y_step = 5,
@@ -2696,6 +2774,10 @@ test "OCR DPI scaling maps tiling patterns exactly once" {
     try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].pattern_x_step, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].pattern_bbox.max_x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].tile_shape_runs[0].points[1][0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 40), runs[0].stencil_mask.?.a, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 40), runs[0].stencil_mask.?.d, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 6), runs[0].stencil_mask.?.e, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 8), runs[0].stencil_mask.?.f, 0.001);
 }
 
 test "native page renderer renders the requested one-based PDF page" {

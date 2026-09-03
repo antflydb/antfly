@@ -63,6 +63,24 @@ describe("buildTableQueryRequest", () => {
     });
   });
 
+  it("targets a selected named full-text index", () => {
+    expect(
+      buildTableQueryRequest({
+        query: "singularity",
+        queryIndexes: [],
+        fullTextIndex: "document_text",
+        selectedFields: [],
+        semanticQuery: "{}",
+        filterQuery: "{}",
+        includeProfile: false,
+      })
+    ).toEqual({
+      full_text_index: "document_text",
+      full_text_search: { query: "singularity" },
+      limit: 10,
+    });
+  });
+
   it("keeps artifact-backed source queries identity-only without changing retrieval level", () => {
     expect(
       buildTableQueryRequest({
@@ -450,6 +468,124 @@ describe("table query builder UX", () => {
       projectionFields: ["text"],
       returnMatches: true,
     });
+  });
+
+  it("derives artifact query defaults only from the selected full-text index", () => {
+    const indexes = [
+      {
+        config: { name: "full_text_index_v0", type: "full_text" },
+        shard_status: {},
+        status: { index_type: "full_text" },
+      },
+      {
+        config: {
+          name: "document_text",
+          type: "full_text",
+          sources: [{ artifact: "document_chunks_v1" }],
+        },
+        shard_status: {},
+        status: { index_type: "full_text" },
+      },
+    ] as IndexStatus[];
+    const tableStatus = {
+      name: "docs",
+      indexes: {},
+      shards: {},
+      storage_status: {},
+      artifact_enrichments: [{ name: "document_chunks_v1", kind: "chunk", field: "text" }],
+    } as TableStatus;
+
+    expect(artifactRetrievalDefaults(indexes, [], tableStatus)).toBeNull();
+    expect(artifactRetrievalDefaults(indexes, [], tableStatus, "document_text")).toEqual({
+      searchFields: ["text"],
+      projectionFields: ["text"],
+      returnMatches: true,
+    });
+    expect(
+      requestArtifactRetrievalDefaults(
+        indexes,
+        {
+          full_text_index: "document_text",
+          full_text_search: { query: "text:singularity" },
+        },
+        tableStatus
+      )
+    ).toEqual({
+      searchFields: ["text"],
+      projectionFields: ["text"],
+      returnMatches: true,
+    });
+  });
+
+  it("detects canonical multi-source full-text and heterogeneous vector indexes", () => {
+    const indexes = [
+      {
+        config: {
+          name: "document_text",
+          type: "full_text",
+          sources: [{ artifact: "document_units_v1" }, { artifact: "document_chunks_v1" }],
+          enrichments: ["document_units_v1", "document_chunks_v1"],
+        },
+        shard_status: {},
+        status: { index_type: "full_text" },
+      },
+      {
+        config: {
+          name: "document_vectors",
+          type: "embeddings",
+          sources: [{ artifact: "document_dense_v1" }, { artifact: "document_chunk_dense_v1" }],
+          enrichments: ["document_dense_v1", "document_chunk_dense_v1"],
+        },
+        shard_status: {},
+        status: { index_type: "embeddings" },
+      },
+    ] as unknown as IndexStatus[];
+
+    const tableStatus = {
+      name: "docs",
+      artifact_enrichments: [
+        {
+          name: "document_units_v1",
+          kind: "asset",
+          field: "url",
+        },
+        {
+          name: "document_chunks_v1",
+          kind: "chunk",
+          field: "text",
+          source_artifact_name: "document_units_v1",
+        },
+        {
+          name: "document_dense_v1",
+          kind: "embedding",
+          field: "semantic_content",
+        },
+        {
+          name: "document_chunk_dense_v1",
+          kind: "embedding",
+          field: "text",
+          source_artifact_name: "document_chunks_v1",
+        },
+      ],
+      indexes: {
+        document_text: indexes[0].config,
+        document_vectors: indexes[1].config,
+      },
+      shards: {},
+      storage_status: {},
+    } as unknown as TableStatus;
+
+    expect(artifactRetrievalDefaults(indexes, ["document_vectors"], tableStatus)).toEqual({
+      searchFields: ["semantic_content", "text"],
+      projectionFields: ["semantic_content", "text"],
+      returnMatches: true,
+    });
+    expect(artifactRetrievalDefaults(indexes, [], tableStatus)).toEqual({
+      searchFields: ["_all"],
+      projectionFields: ["text"],
+      returnMatches: true,
+    });
+    expect(tableRequiresSafeProjection(indexes, tableStatus)).toBe(true);
   });
 
   it("detects separately registered chunk enrichments routed to full-text search", () => {

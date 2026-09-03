@@ -67,3 +67,15 @@ class StorageResourceExhaustedError(AntflyException):
         self.retry_after_ms = retry_after_ms
         self.retry_after_seconds = retry_after_seconds
         super().__init__(f"storage resource exhausted (429): {message}")
+
+
+class IndexMutationTemporarilyUnavailableError(AntflyException):
+    """Retryable index mutation admission or validation failure."""
+
+    def __init__(self, code: str, message: str, retry_after_seconds: int | None = None) -> None:
+        self.status_code = 503
+        self.code = code
+        self.detail = message
+        self.retryable = True
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(f"index mutation temporarily unavailable (503): {message}")

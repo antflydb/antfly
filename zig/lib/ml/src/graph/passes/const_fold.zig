@@ -318,6 +318,7 @@ fn evalNode(
 
         // ── Reshape (data unchanged) ───────────────────────────
         .reshape => {
+            if (n.op.reshape.runtime_shape) return null;
             if (in0_data.len != num_elements) return null;
             return try allocator.dupe(f32, in0_data);
         },
@@ -628,6 +629,7 @@ fn foldGather(
     const out_shape = n.output_shape;
     if (table_shape.dtype != out_shape.dtype) return null;
     const attrs = n.op.gather;
+    if (attrs.elements) return null;
     const axis = attrs.axis;
     const rank = table_shape.rank();
     if (axis >= rank) return null;

@@ -29,7 +29,7 @@ script inside WSL2. Docker and every archive are on the
 Start Antfly in standalone mode:
 
 ```bash
-antfly standalone 2>&1 | tee "antfly.log"
+antfly standalone --inference-host-budget-mb 8192 2>&1 | tee "antfly.log"
 ```
 
 If you installed with Homebrew, you can run Antfly as a service instead:
@@ -41,6 +41,10 @@ brew services start antfly
 <Callout type="info">
 Standalone mode starts metadata, data nodes, and Antfly Inference in a single process — ideal for local development. You can also access the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080` to manage tables, run queries, and monitor your cluster.
 </Callout>
+
+The 8 GiB inference host budget lets the later all-local RAG example use the
+embedding, reranking, and Gemma models in one request. If you use a hosted
+generator instead, you can omit that option.
 
 ### Verify the basic data path
 
@@ -88,7 +92,7 @@ head -n 1 wiki-articles.jsonl | jq '.'
 ```
 
 The fixture is newline-delimited JSON (JSONL): one article per line. Every
-article has `title`, `body`, and `url`; 2,477 of the 10,000 articles also have
+article has `title`, `body`, and `url`; 2,446 of the 10,000 articles also have
 an optional `thumbnail_url` used later for image search.
 
 ## Create a Table
@@ -317,14 +321,14 @@ To wait only for that first queryable generation, run:
 ```bash
 antfly index wait --table wikipedia \
   --index title_body \
-  --queryable \
+  --until queryable \
   --timeout 20m
 ```
 
 Continue as soon as this command succeeds. The examples below search the safely
 published portion of the index while the remaining documents continue indexing,
 so result counts and rankings can improve as coverage grows. When an application
-requires a fixed, fully covered corpus, omit `--queryable` to wait for the
+requires a fixed, fully covered corpus, use `--until complete` to wait for the
 stronger `ready` state instead.
 
 Use `antfly index list --table wikipedia` for a compact progress summary, or
@@ -577,7 +581,7 @@ Hybrid search combines full-text and semantic search using Reciprocal Rank Fusio
 Pull the reranker model:
 
 ```bash
-antfly inference pull --variants i8 mixedbread-ai/mxbai-rerank-base-v1
+antfly inference pull --tasks rerank --variants f32 cross-encoder/ms-marco-MiniLM-L6-v2
 ```
 
 <Callout type="info">
@@ -604,7 +608,7 @@ antfly query --table wikipedia \
   --limit 10 \
   --reranker '{
       "provider": "antfly",
-      "model": "mixedbread-ai/mxbai-rerank-base-v1",
+      "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
       "field": "body"
     }' \
   --pruner '{"min_score_ratio": 0.01}'
@@ -624,7 +628,7 @@ curl -X POST http://localhost:8080/db/v1/query \
     "limit": 10,
     "reranker": {
       "provider": "antfly",
-      "model": "mixedbread-ai/mxbai-rerank-base-v1",
+      "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
       "field": "body"
     },
     "pruner": {"min_score_ratio": 0.01}
@@ -643,7 +647,7 @@ const results = await client.query({
   limit: 10,
   reranker: {
     provider: 'antfly',
-    model: 'mixedbread-ai/mxbai-rerank-base-v1',
+    model: 'cross-encoder/ms-marco-MiniLM-L6-v2',
     field: 'body',
   },
   pruner: { min_score_ratio: 0.01 },
@@ -662,7 +666,7 @@ results = client.query(
     limit=10,
     reranker={
         'provider': 'antfly',
-        'model': 'mixedbread-ai/mxbai-rerank-base-v1',
+        'model': 'cross-encoder/ms-marco-MiniLM-L6-v2',
         'field': 'body',
     },
     pruner={'min_score_ratio': 0.01},
@@ -673,7 +677,7 @@ results = client.query(
   <TabsContent value="go">
 ```go
 reranker, err := antfly.NewRerankerConfig(antfly.AntflyRerankerConfig{
-	Model: "mixedbread-ai/mxbai-rerank-base-v1",
+	Model: "cross-encoder/ms-marco-MiniLM-L6-v2",
 })
 if err != nil { log.Fatal(err) }
 reranker.Field = "body"
@@ -708,7 +712,7 @@ let resp = client
         limit: Some(10),
         reranker: Some(json!({
             "provider": "antfly",
-            "model": "mixedbread-ai/mxbai-rerank-base-v1",
+            "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
             "field": "body"
         })),
         pruner: Some(json!({"min_score_ratio": 0.01})),
@@ -872,7 +876,7 @@ Adding an index to a table with existing data triggers background embedding gene
 ```bash
 antfly index wait --table wikipedia \
   --index thumbnail \
-  --queryable \
+  --until queryable \
   --timeout 20m
 ```
 
@@ -1017,7 +1021,7 @@ antfly agents retrieval --table wikipedia \
   --limit 5 \
   --reranker '{
       "provider": "antfly",
-      "model": "mixedbread-ai/mxbai-rerank-base-v1",
+      "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
       "field": "body"
     }' \
   --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
@@ -1044,7 +1048,7 @@ curl -X POST http://localhost:8080/db/v1/agents/retrieval \
       "limit": 5,
       "reranker": {
         "provider": "antfly",
-        "model": "mixedbread-ai/mxbai-rerank-base-v1",
+        "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
         "field": "body"
       },
       "pruner": {"min_score_ratio": 0.6, "max_score_gap_percent": 40}
@@ -1074,7 +1078,7 @@ const result = await client.agents.retrieval({
     limit: 5,
     reranker: {
       provider: 'antfly',
-      model: 'mixedbread-ai/mxbai-rerank-base-v1',
+      model: 'cross-encoder/ms-marco-MiniLM-L6-v2',
       field: 'body',
     },
     pruner: { min_score_ratio: 0.6, max_score_gap_percent: 40 },
@@ -1104,7 +1108,7 @@ result = client.agents.retrieval(
         'limit': 5,
         'reranker': {
             'provider': 'antfly',
-            'model': 'mixedbread-ai/mxbai-rerank-base-v1',
+            'model': 'cross-encoder/ms-marco-MiniLM-L6-v2',
             'field': 'body',
         },
         'pruner': {'min_score_ratio': 0.6, 'max_score_gap_percent': 40},
@@ -1169,7 +1173,7 @@ let resp = client
             "limit": 5,
             "reranker": {
                 "provider": "antfly",
-                "model": "mixedbread-ai/mxbai-rerank-base-v1",
+                "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
                 "field": "body"
             },
             "pruner": {"min_score_ratio": 0.6, "max_score_gap_percent": 40}
@@ -1270,7 +1274,7 @@ antfly agents retrieval --table wikipedia \
 
 ### Structured output
 
-Add `--streaming=false` to get structured JSON output with source references instead of streaming text:
+Add `--no-streaming` to get structured JSON output with source references instead of streaming text:
 
 ```bash
 antfly agents retrieval --table wikipedia \
@@ -1279,7 +1283,7 @@ antfly agents retrieval --table wikipedia \
   --fields "title,body,url" \
   --limit 5 \
   --generator '{"provider": "gemini", "model": "gemini-2.5-flash"}' \
-  --streaming=false --generate
+  --no-streaming --generate
 ```
 
 ### Evaluation
@@ -1347,7 +1351,7 @@ Pull the missing model again, or pass the intended directory explicitly with
 
 Do not continue to semantic, image, or RAG steps until the relevant index is
 queryable. `queryable_partial` is safe to use while coverage grows; `pending` is
-not. If `index wait --queryable` times out, capture the full status and recent
+not. If `index wait --until queryable` times out, capture the full status and recent
 watchdog messages:
 
 ```bash

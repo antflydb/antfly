@@ -180,6 +180,7 @@ pub const TextProjectionBatchBuilder = struct {
     text_analysis: introducer_mod.TextAnalysisConfig,
     schema: ?runtime_schema.TableSchema,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
+    selected_field: ?[]const u8 = null,
     text_docs: std.ArrayListUnmanaged(introducer_mod.TextDocument) = .empty,
 
     pub fn init(
@@ -196,14 +197,40 @@ pub const TextProjectionBatchBuilder = struct {
         };
     }
 
+    pub fn initWithSelectedField(
+        arena: Allocator,
+        text_analysis: introducer_mod.TextAnalysisConfig,
+        schema: ?runtime_schema.TableSchema,
+        observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
+        selected_field: ?[]const u8,
+    ) TextProjectionBatchBuilder {
+        var builder = init(arena, text_analysis, schema, observed_field_analyzers);
+        builder.selected_field = selected_field;
+        return builder;
+    }
+
     pub fn deinit(self: *TextProjectionBatchBuilder) void {
         self.text_docs.deinit(self.arena);
         self.* = undefined;
     }
 
     pub fn appendSourceDoc(self: *TextProjectionBatchBuilder, doc: TextProjectionSourceDoc) !void {
+        return try self.appendSourceDocWithSelectedField(doc, self.selected_field);
+    }
+
+    /// Append one source document with a source-local field projection. This
+    /// keeps one analyzer/schema-aware batch builder while allowing a union
+    /// index to consume artifact streams with different record shapes.
+    pub fn appendSourceDocWithSelectedField(
+        self: *TextProjectionBatchBuilder,
+        doc: TextProjectionSourceDoc,
+        selected_field: ?[]const u8,
+    ) !void {
+        const has_selected_field = selected_field != null;
         const extraction_root = doc.typed_source orelse doc.root;
-        const extracted = if (self.schema == null and doc.schema_less_fast_projection)
+        const extracted = if (selected_field) |field|
+            try extractSelectedTextField(self.arena, extraction_root, field)
+        else if (self.schema == null and doc.schema_less_fast_projection)
             ExtractedTextFields{ .fields = doc.schema_less_text_fields }
         else
             try extractTextFieldsFromValue(self.arena, extraction_root, self.text_analysis, self.schema, self.observed_field_analyzers);
@@ -216,8 +243,12 @@ pub const TextProjectionBatchBuilder = struct {
             .text_fields = extracted.fields,
             .recursive_typed_fields = extracted.recursive_typed_fields,
             .infer_type_dynamic_paths = extracted.infer_type_dynamic_paths,
-            .typed_fields = extracted.typed_fields orelse if (doc.typed_source == null) &.{} else null,
-            .typed_source = if (extracted.typed_fields == null) doc.typed_source else null,
+            // A selected-field index must not inherit typed doc values from the
+            // whole source document. Besides violating the projection contract,
+            // doing so would let filters and sorts observe fields the index was
+            // explicitly configured not to consume.
+            .typed_fields = if (has_selected_field) &.{} else extracted.typed_fields orelse if (doc.typed_source == null) &.{} else null,
+            .typed_source = if (has_selected_field) null else if (extracted.typed_fields == null) doc.typed_source else null,
         });
     }
 
@@ -228,6 +259,25 @@ pub const TextProjectionBatchBuilder = struct {
         };
     }
 };
+
+/// Project exactly one source field while retaining the original stored
+/// document. Missing, null, and non-text values produce no postings. Arrays
+/// are traversed so a selected multi-valued string field remains searchable.
+fn extractSelectedTextField(
+    alloc: Allocator,
+    root: std.json.Value,
+    field: []const u8,
+) !ExtractedTextFields {
+    var values = std.ArrayListUnmanaged([]const u8).empty;
+    defer values.deinit(alloc);
+    try collectFieldValues(alloc, &values, root, field);
+    if (values.items.len == 0) return .{ .fields = &.{} };
+
+    var fields = std.ArrayListUnmanaged(introducer_mod.TextField).empty;
+    defer fields.deinit(alloc);
+    for (values.items) |value| try appendSchemaLessStringTextFields(alloc, &fields, field, value);
+    return .{ .fields = try alloc.dupe(introducer_mod.TextField, fields.items) };
+}
 
 pub const TextProjectionSourceDoc = struct {
     key: []const u8,
@@ -3290,6 +3340,39 @@ test "document mapper builds text segment from nested string fields without sche
     try std.testing.expect((try reader.invertedIndex("meta.summary")) != null);
     try std.testing.expect((try reader.invertedIndex("meta.tags")) != null);
     try std.testing.expect((try reader.invertedIndex("_all")) != null);
+}
+
+test "document mapper selected full text field excludes unrelated source content" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const source_batch = try buildTextProjectionSourceBatch(arena, &.{.{
+        .key = "artifact:1",
+        .value = "{\"payload\":{\"text\":[\"alpha\",\"beta\"]},\"secret\":\"sentinel\",\"internal_rank\":42}",
+    }});
+    var builder = TextProjectionBatchBuilder.initWithSelectedField(
+        arena,
+        text_analysis,
+        null,
+        null,
+        "payload.text",
+    );
+    defer builder.deinit();
+    try builder.appendSourceDoc(source_batch.docs[0]);
+    const batch = builder.batch();
+
+    try std.testing.expectEqual(@as(usize, 1), batch.docs.len);
+    try std.testing.expect(batch.docs[0].typed_source == null);
+    try std.testing.expectEqual(@as(usize, 0), batch.docs[0].typed_fields.?.len);
+    var selected_values: usize = 0;
+    for (batch.docs[0].text_fields) |field| {
+        try std.testing.expect(!std.mem.eql(u8, field.field_name, "secret"));
+        if (std.mem.eql(u8, field.field_name, "payload.text")) selected_values += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), selected_values);
 }
 
 test "document mapper schema-less fast projection indexes nested string fields" {

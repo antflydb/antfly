@@ -19,6 +19,8 @@ class TransformOp:
         op (TransformOpType): MongoDB-style update operator
         path (str): JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name") Example: $.views.
         value (Any | Unset): Value for operation (not required for $unset). Type depends on the supported operator.
+            `$pull` removes every array element exactly equal to this JSON value; projected graph-edge values identify the
+            relationship by `target`.
     """
 
     op: TransformOpType

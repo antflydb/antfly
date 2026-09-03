@@ -7,10 +7,10 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 if TYPE_CHECKING:
-    from ..models.algebraic_index_config import AlgebraicIndexConfig
-    from ..models.embeddings_index_config import EmbeddingsIndexConfig
-    from ..models.full_text_index_config import FullTextIndexConfig
-    from ..models.graph_index_config import GraphIndexConfig
+    from ..models.created_algebraic_index import CreatedAlgebraicIndex
+    from ..models.created_embeddings_index import CreatedEmbeddingsIndex
+    from ..models.created_full_text_index import CreatedFullTextIndex
+    from ..models.created_graph_index import CreatedGraphIndex
 
 
 T = TypeVar("T", bound="TableIndexes")
@@ -21,21 +21,21 @@ class TableIndexes:
     """ """
 
     additional_properties: dict[
-        str, AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig | GraphIndexConfig
+        str, CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex
     ] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.embeddings_index_config import EmbeddingsIndexConfig
-        from ..models.full_text_index_config import FullTextIndexConfig
-        from ..models.graph_index_config import GraphIndexConfig
+        from ..models.created_embeddings_index import CreatedEmbeddingsIndex
+        from ..models.created_full_text_index import CreatedFullTextIndex
+        from ..models.created_graph_index import CreatedGraphIndex
 
         field_dict: dict[str, Any] = {}
         for prop_name, prop in self.additional_properties.items():
-            if isinstance(prop, FullTextIndexConfig):
+            if isinstance(prop, CreatedFullTextIndex):
                 field_dict[prop_name] = prop.to_dict()
-            elif isinstance(prop, EmbeddingsIndexConfig):
+            elif isinstance(prop, CreatedEmbeddingsIndex):
                 field_dict[prop_name] = prop.to_dict()
-            elif isinstance(prop, GraphIndexConfig):
+            elif isinstance(prop, CreatedGraphIndex):
                 field_dict[prop_name] = prop.to_dict()
             else:
                 field_dict[prop_name] = prop.to_dict()
@@ -44,10 +44,10 @@ class TableIndexes:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.algebraic_index_config import AlgebraicIndexConfig
-        from ..models.embeddings_index_config import EmbeddingsIndexConfig
-        from ..models.full_text_index_config import FullTextIndexConfig
-        from ..models.graph_index_config import GraphIndexConfig
+        from ..models.created_algebraic_index import CreatedAlgebraicIndex
+        from ..models.created_embeddings_index import CreatedEmbeddingsIndex
+        from ..models.created_full_text_index import CreatedFullTextIndex
+        from ..models.created_graph_index import CreatedGraphIndex
 
         d = dict(src_dict)
         table_indexes = cls()
@@ -57,36 +57,36 @@ class TableIndexes:
 
             def _parse_additional_property(
                 data: object,
-            ) -> AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig | GraphIndexConfig:
+            ) -> CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_index_config_type_0 = FullTextIndexConfig.from_dict(data)
+                    componentsschemas_created_index_type_0 = CreatedFullTextIndex.from_dict(data)
 
-                    return componentsschemas_index_config_type_0
+                    return componentsschemas_created_index_type_0
                 except (TypeError, ValueError, AttributeError, KeyError):
                     pass
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_index_config_type_1 = EmbeddingsIndexConfig.from_dict(data)
+                    componentsschemas_created_index_type_1 = CreatedEmbeddingsIndex.from_dict(data)
 
-                    return componentsschemas_index_config_type_1
+                    return componentsschemas_created_index_type_1
                 except (TypeError, ValueError, AttributeError, KeyError):
                     pass
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_index_config_type_2 = GraphIndexConfig.from_dict(data)
+                    componentsschemas_created_index_type_2 = CreatedGraphIndex.from_dict(data)
 
-                    return componentsschemas_index_config_type_2
+                    return componentsschemas_created_index_type_2
                 except (TypeError, ValueError, AttributeError, KeyError):
                     pass
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_index_config_type_3 = AlgebraicIndexConfig.from_dict(data)
+                componentsschemas_created_index_type_3 = CreatedAlgebraicIndex.from_dict(data)
 
-                return componentsschemas_index_config_type_3
+                return componentsschemas_created_index_type_3
 
             additional_property = _parse_additional_property(prop_dict)
 
@@ -101,11 +101,11 @@ class TableIndexes:
 
     def __getitem__(
         self, key: str
-    ) -> AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig | GraphIndexConfig:
+    ) -> CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex:
         return self.additional_properties[key]
 
     def __setitem__(
-        self, key: str, value: AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig | GraphIndexConfig
+        self, key: str, value: CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex
     ) -> None:
         self.additional_properties[key] = value
 
