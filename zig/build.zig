@@ -5916,6 +5916,12 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "durable session mutations publish only after persistence succeeds",
             "cluster shared session capacity is enforced by the durable create transaction",
+            "idempotent batch identities are scoped and session bodies are sealed",
+            "idempotent receipt creation does not publish an unsealed oversized key",
+            "legacy unsealed idempotent receipt is terminalized without binding a retry body",
+            "retention never removes an idempotent receipt with live recovery",
+            "retention scan rotates past pinned recovery receipts",
+            "session lease storage duration covers nanosecond to millisecond rounding",
             "durable transaction sessions retain terminal commit coordinator handoff",
             "repair-required transaction sessions replay propagation once then release coordination",
             "committed repair session without coordinator replays a write handoff",
@@ -5939,6 +5945,7 @@ pub fn build(b: *std.Build) void {
             "stable transaction recovery heartbeat interval stays inside the lease",
             "stable transaction recovery retains ambiguity and heartbeats its lease",
             "httpx HA rejection preserves the idempotent batch error contract",
+            "httpx oversized idempotent batch leaves no unsealed receipt",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

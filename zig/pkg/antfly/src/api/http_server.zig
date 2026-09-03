@@ -3714,15 +3714,20 @@ pub const ApiHttpServer = struct {
 
     fn sessionRecoveryLeaseDurationNs(self: *const ApiHttpServer) ?u64 {
         const configured_ns = self.cfg.session_owner_lease_ttl_ns orelse return null;
-        const ttl_ms = @max(@as(u64, 1), configured_ns / std.time.ns_per_ms);
+        const ttl_ms = @max(
+            @as(u64, 1),
+            (configured_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms,
+        );
         return ttl_ms *| std.time.ns_per_ms;
     }
 
     fn sessionRecoveryLeaseExpirationNs(self: *const ApiHttpServer, now_ns: u64) ?u64 {
-        const duration_ns = self.sessionRecoveryLeaseDurationNs() orelse return null;
+        const configured_ns = self.cfg.session_owner_lease_ttl_ns orelse return null;
+        const storage_duration_ns = transactions_api.sessionLeaseStorageTtlMs(configured_ns) *| std.time.ns_per_ms;
         // Durable lease timestamps have millisecond resolution. Mirror the
-        // stored floor exactly instead of tracking an optimistic local expiry.
-        return (now_ns / std.time.ns_per_ms) *| std.time.ns_per_ms +| duration_ns;
+        // stored floor and its rounding guard exactly instead of tracking an
+        // optimistic local expiry.
+        return (now_ns / std.time.ns_per_ms) *| std.time.ns_per_ms +| storage_duration_ns;
     }
 
     fn retryPendingTransactionRecovery(self: *ApiHttpServer, limit: usize) !void {
@@ -26503,6 +26508,10 @@ test "stable transaction recovery heartbeat interval stays inside the lease" {
     }, source.iface(), null, null);
     defer server.deinit();
     try std.testing.expectEqual(@as(?u64, 5 * std.time.ns_per_ms), server.sessionRecoveryLeaseRenewInterval());
+    const edge_now = std.time.ns_per_ms - 1;
+    try std.testing.expect(
+        server.sessionRecoveryLeaseExpirationNs(edge_now).? - edge_now >= 10 * std.time.ns_per_ms,
+    );
 }
 
 test "stable transaction recovery retains ambiguity and heartbeats its lease" {
@@ -26553,6 +26562,10 @@ test "stable transaction recovery retains ambiguity and heartbeats its lease" {
     }, source.iface(), null, writes.source());
     defer server.deinit();
 
+    var request = try transactions_api.parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}},"sync_level":"write"}
+    );
+    defer request.deinit(alloc);
     const txn_id = transactions_api.idempotentTransactionId("alice", "docs", "ambiguous-recovery");
     _ = try server.txn_sessions.beginIdempotentForPrincipal(
         alloc,
@@ -26560,11 +26573,8 @@ test "stable transaction recovery retains ambiguity and heartbeats its lease" {
         .{ .sync_level = .write },
         server.localSessionNodeId(),
         "alice",
+        &request,
     );
-    var request = try transactions_api.parseCommitRequest(alloc,
-        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}},"sync_level":"write"}
-    );
-    defer request.deinit(alloc);
     var sealed = (try server.txn_sessions.cloneCommitRequest(alloc, txn_id, &request)) orelse return error.TestExpectedEqual;
     sealed.deinit(alloc);
     _ = (try server.txn_sessions.markCommitExecutionStarted(alloc, txn_id)) orelse return error.TestExpectedEqual;

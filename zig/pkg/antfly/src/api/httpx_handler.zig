@@ -4912,9 +4912,11 @@ pub const AntflyApiHandler = struct {
             .{ .sync_level = parsed_batch.req.sync_level },
             self.api_server.localSessionNodeId(),
             principal,
+            &supplied,
         ) catch |err| switch (err) {
-            error.IdempotencyConflict => return try idempotentBatchError(ctx, 409, "not_applied", "idempotency_conflict", "idempotency key is already bound to incompatible request options", false, &txn_hex),
+            error.IdempotencyConflict, error.TransactionCommitRequestMismatch => return try idempotentBatchError(ctx, 409, "not_applied", "idempotency_conflict", "idempotency key is already bound to a different request", false, &txn_hex),
             error.SessionLimitExceeded, error.SessionCapacityUnavailable => return try idempotentBatchError(ctx, 429, "not_applied", "idempotency_capacity_exhausted", "durable idempotency capacity is exhausted", true, &txn_hex),
+            error.SessionRecordTooLarge => return respondJsonErrorBody(ctx, 413, "{\"error\":\"idempotent batch exceeds durable receipt capacity\"}"),
             else => return err,
         };
 
@@ -4934,10 +4936,20 @@ pub const AntflyApiHandler = struct {
             return try respondOwnedContextualResponse(ctx, &forwarded, alloc);
         }
 
+        // The begin path has already compared the supplied digest for every
+        // newly written receipt. Read terminal rejection state before cloning
+        // the retained body so compatibility records that predate atomic
+        // create-and-seal can remain bodyless and safely non-applied.
+        if (try self.api_server.txn_sessions.getIdempotentOutcome(alloc, txn_id)) |receipt_outcome| {
+            return try respondIdempotentBatchRejection(ctx, txn_id, receipt_outcome);
+        }
+
         var adopted_incarnation = false;
         var commit_req = while (true) {
             const cloned = self.api_server.txn_sessions.cloneCommitRequest(alloc, txn_id, &supplied) catch |err| switch (err) {
                 error.TransactionCommitRequestMismatch => return try idempotentBatchError(ctx, 409, "not_applied", "idempotency_conflict", "idempotency key was reused for a different batch body", false, &txn_hex),
+                error.UnsealedIdempotencyReceipt => return try idempotentBatchError(ctx, 409, "not_applied", "idempotency_receipt_incomplete", "the key was created by an older server before its payload was sealed; use a new Idempotency-Key", false, &txn_hex),
+                error.SessionRecordTooLarge => return respondJsonErrorBody(ctx, 413, "{\"error\":\"idempotent batch exceeds durable receipt capacity\"}"),
                 error.SessionLeaseLost => {
                     if (!adopted_incarnation and self.api_server.localSessionNodeId() != 0 and
                         try self.api_server.txn_sessions.adoptIfLeaseExpired(
@@ -4958,9 +4970,6 @@ pub const AntflyApiHandler = struct {
         };
         defer commit_req.deinit(alloc);
 
-        if (try self.api_server.txn_sessions.getIdempotentOutcome(alloc, txn_id)) |receipt_outcome| {
-            return try respondIdempotentBatchRejection(ctx, txn_id, receipt_outcome);
-        }
         if (try self.api_server.txn_sessions.getTerminalCommit(alloc, txn_id)) |terminal_value| {
             var terminal = terminal_value;
             defer terminal.deinit(alloc);
@@ -7724,6 +7733,64 @@ test "httpx idempotent batch replay retains and repairs coordinator acknowledgem
     try std.testing.expectEqualStrings("committed", parsed_replay.value.object.get("status").?.string);
     try std.testing.expectEqual(@as(usize, 1), writes.commit_calls);
     try std.testing.expectEqual(@as(usize, 2), writes.acknowledge_calls);
+}
+
+test "httpx oversized idempotent batch leaves no unsealed receipt" {
+    const FakeWrites = struct {
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .commit_transaction_with_id = commitTransactionWithId,
+            } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn commitTransactionWithId(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const session_path = "/tmp/antfly-httpx-idempotent-batch-oversized";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
+
+    var status = AuthStatusSource{};
+    var writes = FakeWrites{};
+    var api_server = try ApiHttpServer.initWithConfig(alloc, .{
+        .deployment_mode = .standalone,
+        .session_store_path = session_path,
+        .session_max_record_bytes = 256,
+    }, status.iface(), null, writes.source());
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    const body = "{\"inserts\":{\"doc:a\":{\"value\":\"this payload is deliberately long enough that its durable session encoding cannot fit inside the configured two hundred and fifty six byte receipt limit\"}},\"sync_level\":\"write\"}";
+
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/idempotent-batch");
+    defer request.deinit();
+    request.body = body;
+    try request.headers.append("idempotency-key", "oversized");
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try handler.idempotentBatchWrite(&ctx, "docs");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 413), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "durable receipt capacity") != null);
+
+    const txn_id = transactions_api.idempotentTransactionId(null, "docs", "oversized");
+    try std.testing.expect(api_server.txn_sessions.getInfo(txn_id) == null);
 }
 
 test "httpx MCP route preserves protocol session headers" {
