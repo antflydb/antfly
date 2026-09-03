@@ -11,25 +11,36 @@ order: 3
 - How do I run Antfly with Docker?
 </Questions>
 
-## Download Antfly
+## Install Antfly
 
-The reference for every platform archive, checksums, and container setup. For the short version (one command and a first query), see [antfly.io/download](/download).
+One command on macOS or Linux:
 
-Antfly ships the native Zig runtime as the `antfly` binary; Antfly Inference is built into it.
+```bash
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh
+```
 
-### Back up before upgrading
+Or pin a specific version:
 
-A new release may migrate table files in place when opening an
-existing data directory. That migration can be one-way: an older Zig binary
-may subsequently fail to open the directory with `InvalidTableFile`.
+```bash
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- {ANTFLY_VERSION}
+```
 
-Create and verify a portable backup before upgrading, and restore that backup
-into a fresh data directory if you need to roll back. Do not rely on swapping
-the binary while reusing a directory that a newer Zig release has opened.
+On macOS you can also use Homebrew:
+
+```bash
+brew install antflydb/taps/antfly
+```
+
+Either way you get the `antfly` binary — the native Zig runtime with Antfly
+Inference built in. From here, the [Quickstart](/docs/guides/quickstart) takes
+you to a running engine and your first query.
+
+## Platform Archives
+
+The full matrix of platform archives and checksums, for manual and automated
+installs:
 
 <DownloadLink version={ANTFLY_VERSION} baseUrl={RELEASES_BASE_URL} />
-
-### Installation Instructions
 
 <PlatformTabs defaultValue="macos-manual" macos="macos-manual" linux="linux" windows="windows">
   <TabsList>
@@ -55,7 +66,7 @@ brew install antfly
 
 The trust step is required for short-name installs from non-official taps.
 
-This installs the native Zig runtime as `antfly`. CLI commands are available directly as `antfly <command>` (e.g., `antfly query`, `antfly table create`).
+CLI commands are available directly as `antfly <command>` (e.g., `antfly query`, `antfly table create`).
 
 To run Antfly as a local service:
 
@@ -67,19 +78,7 @@ brew services start antfly
 
   <TabsContent value="macos-manual">
 <Steps>
-### Install using the install script (recommended)
-
-```bash
-curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh
-```
-
-Or install a specific version:
-
-```bash
-curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- {ANTFLY_VERSION}
-```
-
-### Or manually extract the binaries
+### Extract the binaries
 
 ```bash
 tar -xzf antfly_{ANTFLY_VERSION}_Darwin_arm64.tar.gz
@@ -110,19 +109,7 @@ export PATH=$PATH:$(pwd)
 
   <TabsContent value="linux">
 <Steps>
-### Install using the install script (recommended)
-
-```bash
-curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh
-```
-
-Or install a specific version:
-
-```bash
-curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- {ANTFLY_VERSION}
-```
-
-### Or manually extract the binaries
+### Extract the binaries
 
 ```bash
 tar -xzf antfly_{ANTFLY_VERSION}_Linux_x86_64.tar.gz
@@ -148,9 +135,7 @@ export PATH=$PATH:$(pwd)
   </TabsContent>
 
   <TabsContent value="windows">
-<Callout type="warning">
-Native Windows archives are not currently published. Use the Linux container image or WSL2.
-</Callout>
+Use the Linux container image or WSL2 — native Windows archives are not published.
   </TabsContent>
 
   <TabsContent value="docker">
@@ -174,3 +159,13 @@ volumes:
 Antfly Inference runs inside the same process, so no separate model server is needed. Pull models with `docker exec <container> antfly inference pull <model>`.
   </TabsContent>
 </PlatformTabs>
+
+## Upgrading
+
+A new release may migrate table files in place when opening an existing data
+directory, and that migration can be one-way: an older binary may subsequently
+fail to open the directory with `InvalidTableFile`.
+
+Create and verify a portable backup before upgrading, and restore that backup
+into a fresh data directory if you need to roll back. Do not rely on swapping
+the binary while reusing a directory that a newer release has opened.
