@@ -6333,6 +6333,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (buf.quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
         if (buf.runtime_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
         if (buf.owned_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
+        if (buf.native_dense_bytes != null and buf.native_dense_dtype != null and buf.data.len == 0) {
+            const expected_count = if (buf.logical_shape) |shape| try shapeNumel(shape) else 0;
+            return convertNativeDenseBytesToOwnedF32(
+                allocator,
+                buf.native_dense_bytes.?,
+                buf.native_dense_dtype.?,
+                expected_count,
+            );
+        }
         // A pending lazy multiply has no concrete storage (`data` is the
         // empty placeholder); reading it through the generic host path
         // would silently yield an empty/zero result. Compute the product
@@ -34159,6 +34168,33 @@ test "metal_compute: dynamic rms norm slot key distinguishes native dense buffer
     try std.testing.expectEqual(@intFromPtr(bytes_a[0..].ptr), key_a.weight_buf);
     try std.testing.expectEqual(@intFromPtr(bytes_b[0..].ptr), key_b.weight_buf);
     try std.testing.expect(key_a.weight_buf != key_b.weight_buf);
+}
+
+test "metal_compute: toFloat32 materializes zero-copy bf16 weights" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+
+    var empty: [0]f32 = .{};
+    var bytes = [_]u8{
+        0x80, 0x3f, // 1.0
+        0x20, 0xc0, // -2.5
+        0x00, 0x3f, // 0.5
+        0x40, 0x40, // 3.0
+    };
+    var logical_shape = [_]i64{ 2, 2 };
+    var buf = MetalCompute.Buf{
+        .data = empty[0..],
+        .allocator = std.testing.allocator,
+        .owned = false,
+        .logical_shape = logical_shape[0..],
+        .native_dense_bytes = bytes[0..],
+        .native_dense_dtype = .bf16,
+    };
+    var fake_ctx: u8 align(@alignOf(MetalCompute)) = 0;
+
+    const values = try MetalCompute.toFloat32Op(&fake_ctx, @ptrCast(&buf), std.testing.allocator);
+    defer std.testing.allocator.free(values);
+
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, -2.5, 0.5, 3.0 }, values);
 }
 
 test "metal_compute: training AdamW updates device-resident weights" {

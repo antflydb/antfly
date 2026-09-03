@@ -356,9 +356,9 @@ const WeightCache = struct {
                         // outcome. Unsupported IQ-family formats still have a
                         // valid host-dequantized path below, so only propagate
                         // genuine upload/allocation failures.
-                        const maybe_tensor: ?CT = metal_compute_mod.MetalCompute.takeQuantizedStorage(self.cb, storage) catch |err| switch (err) {
-                            error.UnsupportedTensorType => null,
-                            else => return err,
+                        const maybe_tensor: ?CT = metal_compute_mod.MetalCompute.takeQuantizedStorage(self.cb, storage) catch |err| fallback: {
+                            if (@as(anyerror, err) == error.UnsupportedTensorType) break :fallback null;
+                            return err;
                         };
                         if (maybe_tensor) |tensor| {
                             errdefer self.cb.free(tensor);
