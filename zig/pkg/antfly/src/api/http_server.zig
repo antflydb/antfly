@@ -1112,6 +1112,23 @@ pub const ApiHttpServerConfig = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
+const default_session_owner_lease_ttl_ns: u64 = 30 * std.time.ns_per_s;
+
+/// A durable receipt without a fenced owner lease cannot be recovered safely
+/// after a process restart: the persisted process incarnation changes, while
+/// an unfenced writer could still overwrite a successor. Make fencing an
+/// invariant of every durable session configuration, not an HA-only option.
+fn withDurableSessionLeaseDefaults(input: ApiHttpServerConfig) ApiHttpServerConfig {
+    var cfg = input;
+    if (cfg.session_store != null or cfg.session_store_path != null) {
+        if (cfg.session_owner_lease_ttl_ns == null)
+            cfg.session_owner_lease_ttl_ns = default_session_owner_lease_ttl_ns;
+        if (cfg.session_owner_lease_renew_interval_ns == null)
+            cfg.session_owner_lease_renew_interval_ns = @max(@as(u64, 1), cfg.session_owner_lease_ttl_ns.? / 3);
+    }
+    return cfg;
+}
+
 pub const RaftQuarantineAdminSource = struct {
     ptr: *anyopaque,
     list_fn: *const fn (
@@ -2790,13 +2807,14 @@ pub const ApiHttpServer = struct {
         table_read_source: ?table_reads.TableReadSource,
         table_write_source: ?table_writes.TableWriteSource,
     ) ApiHttpServer {
-        const owner_ids = allocRuntimeOwnerIds(cfg.backend_runtime) catch {
+        const effective_cfg = withDurableSessionLeaseDefaults(cfg);
+        const owner_ids = allocRuntimeOwnerIds(effective_cfg.backend_runtime) catch {
             @panic("API background owner registration failed");
         };
         return initWithRequestAllocatorAndOwners(
             owner_alloc,
             request_alloc,
-            cfg,
+            effective_cfg,
             source,
             table_read_source,
             table_write_source,
@@ -3122,7 +3140,7 @@ pub const ApiHttpServer = struct {
         table_read_source: ?table_reads.TableReadSource,
         table_write_source: ?table_writes.TableWriteSource,
     ) !ApiHttpServer {
-        var effective_cfg = cfg;
+        var effective_cfg = withDurableSessionLeaseDefaults(cfg);
         const request_alloc = if (builtin.is_test)
             alloc
         else
@@ -3149,8 +3167,8 @@ pub const ApiHttpServer = struct {
         );
         owner_ids_transferred = true;
         errdefer server.deinit();
-        if (cfg.session_store_path) |path| {
-            if (cfg.session_store != null) return error.InvalidApiServerConfig;
+        if (effective_cfg.session_store_path) |path| {
+            if (effective_cfg.session_store != null) return error.InvalidApiServerConfig;
             const opened = try alloc.create(transactions_api.OpenedSessionStore);
             errdefer alloc.destroy(opened);
             opened.* = try transactions_api.OpenedSessionStore.open(alloc, path);
@@ -3642,6 +3660,8 @@ pub const ApiHttpServer = struct {
         _ = (self.txn_sessions.recordIdempotentDurableAbort(
             self.alloc,
             txn_id,
+            "transaction_conflict",
+            "batch transaction conflicted and was durably aborted",
         ) catch |err| {
             std.log.warn("stable idempotent batch rejection persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
             return;
@@ -3822,11 +3842,9 @@ pub const ApiHttpServer = struct {
                         return;
                     },
                     else => {
-                        if (transactions_api.durableAbortOutcomeForExecutionError(err)) |abort_outcome| {
-                            std.debug.assert(abort_outcome == .aborted);
-                            self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt);
-                            return;
-                        }
+                        // A bare execution error does not identify the
+                        // coordinator's durable decision. Leave the receipt
+                        // pending until a typed outcome is observed.
                         std.log.warn("stable transaction commit recovery deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                         return;
                     },
@@ -9968,7 +9986,6 @@ pub const ApiHttpServer = struct {
         _ = ttl_ns;
         const interval_ns = self.cfg.session_owner_lease_renew_interval_ns orelse return;
         const owner_node_id = self.localSessionNodeId();
-        if (owner_node_id == 0) return;
         const schedule_now_ns = platform_time.monotonicNs();
         const previous_ns = self.last_session_lease_renew_ns.load(.acquire);
         if (previous_ns != 0 and schedule_now_ns -| previous_ns < interval_ns) return;
@@ -26481,18 +26498,6 @@ test "continuous HA freezes pre-existing restore workers and resumption" {
     try std.testing.expect(!server.restore_jobs_resumed.load(.acquire));
 }
 
-test "stable transaction recovery only terminalizes durable abort evidence" {
-    try std.testing.expectEqual(
-        transactions_api.IdempotentReceiptOutcome.aborted,
-        transactions_api.durableAbortOutcomeForExecutionError(error.DecisionConflict).?,
-    );
-    try std.testing.expect(transactions_api.durableAbortOutcomeForExecutionError(error.DocIdentityNamespaceMismatch) == null);
-    try std.testing.expect(transactions_api.durableAbortOutcomeForExecutionError(error.InvalidBatchRequest) == null);
-    try std.testing.expect(transactions_api.durableAbortOutcomeForExecutionError(error.TopologyChanged) == null);
-    try std.testing.expect(transactions_api.durableAbortOutcomeForExecutionError(error.TableNotFound) == null);
-    try std.testing.expect(transactions_api.durableAbortOutcomeForExecutionError(error.UnknownGroup) == null);
-}
-
 test "stable transaction recovery heartbeat interval stays inside the lease" {
     const FakeSource = struct {
         fn iface(self: *@This()) StatusSource {
@@ -26503,6 +26508,9 @@ test "stable transaction recovery heartbeat interval stays inside the lease" {
         }
     };
     var source = FakeSource{};
+    const durable_defaults = withDurableSessionLeaseDefaults(.{ .session_store_path = "/tmp/unused-session-store" });
+    try std.testing.expectEqual(@as(?u64, default_session_owner_lease_ttl_ns), durable_defaults.session_owner_lease_ttl_ns);
+    try std.testing.expectEqual(@as(?u64, default_session_owner_lease_ttl_ns / 3), durable_defaults.session_owner_lease_renew_interval_ns);
     var server = ApiHttpServer.init(std.testing.allocator, .{
         .session_owner_lease_ttl_ns = 10 * std.time.ns_per_ms,
         .session_owner_lease_renew_interval_ns = std.time.ns_per_s,
@@ -26515,7 +26523,100 @@ test "stable transaction recovery heartbeat interval stays inside the lease" {
     );
 }
 
-test "stable transaction recovery retains ambiguity and heartbeats its lease" {
+test "standalone durable receipt is recovered after owner process restart without client replay" {
+    const alloc = std.testing.allocator;
+    const session_path = "/tmp/antfly-api-standalone-receipt-restart-recovery";
+    var cleanup_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer cleanup_io.deinit();
+    std.Io.Dir.cwd().deleteTree(cleanup_io.io(), session_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(cleanup_io.io(), session_path) catch {};
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const FakeWrites = struct {
+        commit_calls: usize = 0,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .commit_transaction_with_id = commitTransactionWithId,
+            } };
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TestUnexpectedResult;
+        }
+        fn commitTransactionWithId(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.commit_calls += 1;
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+    };
+
+    var source = FakeSource{};
+    var writes = FakeWrites{};
+    const txn_id = transactions_api.idempotentTransactionId(null, "docs", "crash-window");
+    {
+        var owner = try ApiHttpServer.initWithConfig(alloc, .{
+            .deployment_mode = .standalone,
+            .session_store_path = session_path,
+            .session_owner_lease_ttl_ns = 5 * std.time.ns_per_ms,
+            .session_owner_lease_renew_interval_ns = std.time.ns_per_ms,
+        }, source.iface(), null, writes.source());
+        defer owner.deinit();
+        try std.testing.expect(owner.txn_sessions.hasAtomicDurableStore());
+        try std.testing.expectEqual(transactions_api.SessionStoreScope.node_local, owner.txn_sessions.durable_scope);
+        try std.testing.expectEqual(@as(u64, 0), owner.localSessionNodeId());
+
+        var request = try transactions_api.parseCommitRequest(alloc,
+            \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}},"sync_level":"write"}
+        );
+        defer request.deinit(alloc);
+        _ = try owner.txn_sessions.beginIdempotentForPrincipal(
+            alloc,
+            txn_id,
+            .{ .sync_level = .write },
+            0,
+            null,
+            &request,
+        );
+        _ = (try owner.txn_sessions.markCommitExecutionStarted(alloc, txn_id)) orelse return error.TestExpectedEqual;
+        // Deinit models a process disappearing in the exact window after the
+        // execution marker and before any terminal receipt is written.
+    }
+
+    sleepNs(8 * std.time.ns_per_ms);
+    var successor = try ApiHttpServer.initWithConfig(alloc, .{
+        .deployment_mode = .standalone,
+        .session_store_path = session_path,
+        .session_owner_lease_ttl_ns = 5 * std.time.ns_per_ms,
+        .session_owner_lease_renew_interval_ns = std.time.ns_per_ms,
+    }, source.iface(), null, writes.source());
+    defer successor.deinit();
+    try successor.runSessionMaintenanceOnce();
+
+    try std.testing.expectEqual(@as(usize, 1), writes.commit_calls);
+    var terminal = (try successor.txn_sessions.getTerminalCommit(alloc, txn_id)) orelse return error.TestExpectedEqual;
+    defer terminal.deinit(alloc);
+    try std.testing.expectEqual(transactions_api.TerminalCommitStatus.committed, terminal.status);
+    const pending = try successor.txn_sessions.listPendingRecoveryIds(alloc, 8);
+    defer alloc.free(pending);
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
+}
+
+test "stable transaction recovery retains bare decision conflict ambiguity and heartbeats its lease" {
     const alloc = std.testing.allocator;
     const session_path = "/tmp/antfly-api-recovery-ambiguity-heartbeat";
     var cleanup_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -26550,7 +26651,9 @@ test "stable transaction recovery retains ambiguity and heartbeats its lease" {
             _: db_mod.types.SyncLevel,
         ) anyerror!?distributed_txn.CommitOutcome {
             sleepNs(80 * std.time.ns_per_ms);
-            return error.InvalidBatchRequest;
+            // DecisionConflict reports contradictory/torn decision evidence;
+            // it does not prove that abort rather than commit won.
+            return error.DecisionConflict;
         }
     };
 

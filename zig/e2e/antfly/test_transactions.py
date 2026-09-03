@@ -396,6 +396,37 @@ def test_idempotent_batch_survives_lost_response_and_restart(stateful_api):
     assert stateful_api.lookup_key(table_name, "counter")["value"] == 1
 
 
+def test_idempotent_batch_replays_exact_terminal_error_after_restart(stateful_api):
+    """A durable rejection retains its precise public error envelope."""
+    if not stateful_api.supports_restart:
+        pytest.skip("durable receipt replay requires a real server restart")
+
+    table_name = f"missing_idempotent_{int(time.time_ns())}"
+    path = f"/tables/{quote(table_name, safe='')}/idempotent-batch"
+    payload = {"deletes": ["doc:missing"], "sync_level": "write"}
+    headers = {"Idempotency-Key": "missing-table-terminal-envelope"}
+
+    first = stateful_api.s.post(
+        f"{stateful_api.url}{path}", json=payload, headers=headers, timeout=30
+    )
+    assert first.status_code == 409, first.text
+    first_receipt = first.json()
+    assert first_receipt["status"] == "not_applied"
+    assert first_receipt["code"] == "table_not_found"
+    assert first_receipt["message"] == "table not found"
+    assert first_receipt["retryable"] is False
+
+    stateful_api.restart_server()
+
+    replay = stateful_api.s.post(
+        f"{stateful_api.url}{path}", json=payload, headers=headers, timeout=30
+    )
+    assert replay.status_code == first.status_code, replay.text
+    replay_receipt = replay.json()
+    for field in ("status", "code", "message", "retryable", "transaction_id"):
+        assert replay_receipt[field] == first_receipt[field]
+
+
 def test_multi_batch_mixed_ops(stateful_api):
     table_a, table_b = _create_tables(stateful_api, "multi_batch_mixed")
 

@@ -305,15 +305,22 @@ pub const IdempotentReceiptOutcome = enum {
     }
 };
 
-/// After execution begins, only an error that proves the coordinator durably
-/// chose abort may terminalize a keyed receipt. Everything else is ambiguous
-/// and must remain pending for same-ID recovery.
-pub fn durableAbortOutcomeForExecutionError(err: anyerror) ?IdempotentReceiptOutcome {
-    return switch (err) {
-        error.DecisionConflict => .aborted,
-        else => null,
-    };
-}
+/// The complete terminal API result is part of the durable idempotency
+/// contract. Replays must return the same machine-readable reason as the
+/// request that established the terminal receipt, not merely the same broad
+/// applied/not-applied classification.
+pub const IdempotentTerminalReceipt = struct {
+    outcome: IdempotentReceiptOutcome,
+    code: []u8,
+    message: []u8,
+    retryable: bool = false,
+
+    pub fn deinit(self: *IdempotentTerminalReceipt, alloc: std.mem.Allocator) void {
+        alloc.free(self.code);
+        alloc.free(self.message);
+        self.* = undefined;
+    }
+};
 
 /// Repair debt is terminal and independently persisted. Only live propagation
 /// or retryable visibility debt keeps coordinator recovery active.
@@ -714,6 +721,12 @@ pub const Session = struct {
     /// Terminal rejection is deliberately distinct from commit visibility and
     /// recovery status.
     idempotent_outcome: ?IdempotentReceiptOutcome = null,
+    /// Additive fields preserve the exact terminal HTTP error envelope. Older
+    /// records that contain only `idempotent_outcome` remain readable and use
+    /// the legacy generic replay response.
+    idempotent_error_code: ?[]u8 = null,
+    idempotent_error_message: ?[]u8 = null,
+    idempotent_error_retryable: bool = false,
     /// Persisted before releasing the retained coordinator's topology fence.
     terminal_commit: ?TerminalCommit = null,
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
@@ -732,6 +745,8 @@ pub const Session = struct {
     pub fn deinit(self: *Session, alloc: std.mem.Allocator) void {
         if (self.principal) |principal| alloc.free(principal);
         if (self.staged) |*staged| staged.deinit(alloc);
+        if (self.idempotent_error_code) |code| alloc.free(code);
+        if (self.idempotent_error_message) |message| alloc.free(message);
         if (self.terminal_commit) |*terminal| terminal.deinit(alloc);
         deinitReadSnapshotMap(alloc, &self.read_snapshots);
         var it = self.savepoints.iterator();
@@ -754,8 +769,11 @@ pub const Session = struct {
             .commit_execution_started = self.commit_execution_started,
             .idempotent_receipt = self.idempotent_receipt,
             .idempotent_outcome = self.idempotent_outcome,
+            .idempotent_error_retryable = self.idempotent_error_retryable,
         };
         errdefer out.deinit(alloc);
+        if (self.idempotent_error_code) |code| out.idempotent_error_code = try alloc.dupe(u8, code);
+        if (self.idempotent_error_message) |message| out.idempotent_error_message = try alloc.dupe(u8, message);
         if (self.staged) |staged| out.staged = try staged.clone(alloc);
         if (self.terminal_commit) |terminal| out.terminal_commit = try terminal.clone(alloc);
         out.read_snapshots = try cloneReadSnapshotMap(alloc, self.read_snapshots);
@@ -1750,15 +1768,18 @@ pub const SessionRegistry = struct {
         return self.durable != null;
     }
 
+    pub fn hasAtomicDurableStore(self: *const SessionRegistry) bool {
+        return self.durable != null and
+            self.lease_store != null and
+            self.owner_lease_ttl_ns != null and
+            self.owner_incarnation != 0;
+    }
+
     /// A scope declaration alone is not a concurrency primitive. Distributed
     /// idempotency is safe only when receipt creation and ownership transfer
     /// are fenced atomically in the shared keyspace.
     pub fn hasAtomicClusterSharedStore(self: *const SessionRegistry) bool {
-        return self.durable != null and
-            self.durable_scope == .cluster_shared and
-            self.lease_store != null and
-            self.owner_lease_ttl_ns != null and
-            self.owner_incarnation != 0;
+        return self.durable_scope == .cluster_shared and self.hasAtomicDurableStore();
     }
 
     pub fn durableMissIsAuthoritative(self: *const SessionRegistry) bool {
@@ -2086,7 +2107,14 @@ pub const SessionRegistry = struct {
         if (candidate.idempotent_receipt and candidate.commit_body_digest == null) {
             if (candidate.commit_execution_started or candidate.terminal_commit != null)
                 return error.InvalidTransactionSessionRecord;
-            candidate.idempotent_outcome = .not_applied;
+            try setIdempotentTerminalReceipt(
+                alloc,
+                &candidate,
+                .not_applied,
+                "idempotency_receipt_incomplete",
+                "the key was created by an older server before its payload was sealed; use a new Idempotency-Key",
+                false,
+            );
             touchSession(&candidate);
             try self.persistOwnedLocked(candidate);
             self.mutex.lock();
@@ -2173,6 +2201,8 @@ pub const SessionRegistry = struct {
         self: *SessionRegistry,
         alloc: std.mem.Allocator,
         txn_id: db_mod.types.TxnId,
+        code: []const u8,
+        message: []const u8,
     ) !?PreExecutionRejectionResult {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
@@ -2189,7 +2219,7 @@ pub const SessionRegistry = struct {
             candidate.deinit(alloc);
             return .execution_started;
         }
-        candidate.idempotent_outcome = .not_applied;
+        try setIdempotentTerminalReceipt(alloc, &candidate, .not_applied, code, message, false);
         touchSession(&candidate);
         try self.persistOwnedLocked(candidate);
 
@@ -2207,6 +2237,8 @@ pub const SessionRegistry = struct {
         self: *SessionRegistry,
         alloc: std.mem.Allocator,
         txn_id: db_mod.types.TxnId,
+        code: []const u8,
+        message: []const u8,
     ) !?void {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
@@ -2222,7 +2254,7 @@ pub const SessionRegistry = struct {
             candidate.deinit(alloc);
             return {};
         }
-        candidate.idempotent_outcome = .aborted;
+        try setIdempotentTerminalReceipt(alloc, &candidate, .aborted, code, message, false);
         touchSession(&candidate);
         try self.persistOwnedLocked(candidate);
 
@@ -2366,6 +2398,30 @@ pub const SessionRegistry = struct {
         return session.idempotent_outcome;
     }
 
+    pub fn getIdempotentTerminalReceipt(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+    ) !?IdempotentTerminalReceipt {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var session = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        defer session.deinit(alloc);
+        const outcome = session.idempotent_outcome orelse return null;
+        const code = session.idempotent_error_code orelse "transaction_not_applied";
+        const message = session.idempotent_error_message orelse "the durable batch transaction was not applied";
+        var receipt: IdempotentTerminalReceipt = .{
+            .outcome = outcome,
+            .code = try alloc.dupe(u8, code),
+            .message = undefined,
+            .retryable = session.idempotent_error_retryable,
+        };
+        errdefer alloc.free(receipt.code);
+        receipt.message = try alloc.dupe(u8, message);
+        return receipt;
+    }
+
     /// Returns a bounded, rotating batch of stable transactions that require
     /// either idempotent commit replay or a coordinator acknowledgement.
     pub fn listPendingRecoveryIds(
@@ -2481,7 +2537,11 @@ pub const SessionRegistry = struct {
             candidate.owner_incarnation != self.owner_incarnation)
         {
             const durable = self.durable orelse return null;
-            if (self.durable_scope != .cluster_shared or self.lease_store == null or self.owner_lease_ttl_ns == null or owner_node_id == 0) return null;
+            // Scope controls whether a miss is authoritative; it does not
+            // control whether an existing row can be safely transferred. The
+            // atomic row+lease CAS fences restart recovery for node-local and
+            // cluster-shared stores alike, including standalone owner node 0.
+            if (self.lease_store == null or self.owner_lease_ttl_ns == null) return null;
             var adopted = try candidate.clone(alloc);
             var adopted_owned = true;
             defer if (adopted_owned) adopted.deinit(alloc);
@@ -4641,6 +4701,23 @@ fn touchSession(session: *Session) void {
     session.last_touched_timestamp = nextTxnTimestamp();
 }
 
+fn setIdempotentTerminalReceipt(
+    alloc: std.mem.Allocator,
+    session: *Session,
+    outcome: IdempotentReceiptOutcome,
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+) !void {
+    std.debug.assert(session.idempotent_outcome == null);
+    std.debug.assert(session.idempotent_error_code == null);
+    std.debug.assert(session.idempotent_error_message == null);
+    session.idempotent_outcome = outcome;
+    session.idempotent_error_code = try alloc.dupe(u8, code);
+    session.idempotent_error_message = try alloc.dupe(u8, message);
+    session.idempotent_error_retryable = retryable;
+}
+
 fn stagedCounts(staged: ?OwnedTransactionCommitRequest) struct { tables: usize, reads: usize, writes: usize, deletes: usize } {
     if (staged) |req| {
         var write_count: usize = 0;
@@ -5023,6 +5100,20 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     } else {
         try out.appendSlice(alloc, "null");
     }
+    try out.appendSlice(alloc, ",\"idempotent_error_code\":");
+    if (session.idempotent_error_code) |code| {
+        try appendJsonString(alloc, &out, code);
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
+    try out.appendSlice(alloc, ",\"idempotent_error_message\":");
+    if (session.idempotent_error_message) |message| {
+        try appendJsonString(alloc, &out, message);
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
+    try out.appendSlice(alloc, ",\"idempotent_error_retryable\":");
+    try out.appendSlice(alloc, if (session.idempotent_error_retryable) "true" else "false");
     try out.appendSlice(alloc, ",\"terminal_commit\":");
     if (session.terminal_commit) |terminal| {
         try out.appendSlice(alloc, "{\"status\":");
@@ -5162,6 +5253,25 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
         .null => {},
         else => return error.InvalidTransactionSessionRecord,
     };
+    if (obj.get("idempotent_error_code")) |value| switch (value) {
+        .string => |code| session.idempotent_error_code = try alloc.dupe(u8, code),
+        .null => {},
+        else => return error.InvalidTransactionSessionRecord,
+    };
+    if (obj.get("idempotent_error_message")) |value| switch (value) {
+        .string => |message| session.idempotent_error_message = try alloc.dupe(u8, message),
+        .null => {},
+        else => return error.InvalidTransactionSessionRecord,
+    };
+    session.idempotent_error_retryable = if (obj.get("idempotent_error_retryable")) |value| switch (value) {
+        .bool => |retryable| retryable,
+        else => return error.InvalidTransactionSessionRecord,
+    } else false;
+    if ((session.idempotent_error_code == null) != (session.idempotent_error_message == null))
+        return error.InvalidTransactionSessionRecord;
+    if (session.idempotent_outcome == null and
+        (session.idempotent_error_code != null or session.idempotent_error_retryable))
+        return error.InvalidTransactionSessionRecord;
     if (obj.get("terminal_commit")) |terminal_value| {
         if (terminal_value != .null) {
             const terminal_obj = switch (terminal_value) {
@@ -6594,7 +6704,7 @@ test "idempotent batch identities are scoped and session bodies are sealed" {
     var recovery = (try registry.claimPendingRecovery(alloc, alice_docs, 7, nextTxnTimestamp())).?;
     defer recovery.deinit(alloc);
     try std.testing.expect(recovery.commit.idempotent_receipt);
-    _ = (try registry.recordIdempotentDurableAbort(alloc, alice_docs)).?;
+    _ = (try registry.recordIdempotentDurableAbort(alloc, alice_docs, "transaction_conflict", "conflict")).?;
     const status = (try registry.getStatus(alloc, alice_docs)).?;
     try std.testing.expectEqualStrings("aborted", status.outcome.?);
 
@@ -6606,6 +6716,12 @@ test "idempotent batch identities are scoped and session bodies are sealed" {
     const reloaded_status = (try reloaded.getStatus(alloc, alice_docs)).?;
     try std.testing.expectEqualStrings("aborted", reloaded_status.outcome.?);
     try std.testing.expectEqual(IdempotentReceiptOutcome.aborted, (try reloaded.getIdempotentOutcome(alloc, alice_docs)).?);
+    var reloaded_receipt = (try reloaded.getIdempotentTerminalReceipt(alloc, alice_docs)).?;
+    defer reloaded_receipt.deinit(alloc);
+    try std.testing.expectEqual(IdempotentReceiptOutcome.aborted, reloaded_receipt.outcome);
+    try std.testing.expectEqualStrings("transaction_conflict", reloaded_receipt.code);
+    try std.testing.expectEqualStrings("conflict", reloaded_receipt.message);
+    try std.testing.expect(!reloaded_receipt.retryable);
     const listed = try reloaded.listStatusesForPrincipal(alloc, "alice");
     defer alloc.free(listed);
     try std.testing.expectEqual(@as(usize, 1), listed.len);
@@ -6709,7 +6825,7 @@ test "retention never removes an idempotent receipt with live recovery" {
     var retained = (try durable.load(txn_id)).?;
     retained.deinit(alloc);
 
-    _ = (try registry.recordIdempotentDurableAbort(alloc, txn_id)).?;
+    _ = (try registry.recordIdempotentDurableAbort(alloc, txn_id, "transaction_conflict", "conflict")).?;
     try std.testing.expectEqual(@as(usize, 1), try registry.cleanupExpired(alloc, std.math.maxInt(u64)));
     try std.testing.expect((try durable.load(txn_id)) == null);
 }
@@ -6770,10 +6886,10 @@ test "idempotent receipt transitions serialize rejection against execution start
 
     const rejected_id = idempotentTransactionId("alice", "docs", "rejection-wins");
     _ = try registry.beginIdempotentForPrincipal(alloc, rejected_id, .{ .sync_level = .write }, 7, "alice", &request);
-    try std.testing.expectError(error.TransactionExecutionNotStarted, registry.recordIdempotentDurableAbort(alloc, rejected_id));
+    try std.testing.expectError(error.TransactionExecutionNotStarted, registry.recordIdempotentDurableAbort(alloc, rejected_id, "transaction_conflict", "conflict"));
     try std.testing.expectEqual(
         SessionRegistry.PreExecutionRejectionResult.recorded,
-        (try registry.recordIdempotentPreExecutionRejection(alloc, rejected_id)).?,
+        (try registry.recordIdempotentPreExecutionRejection(alloc, rejected_id, "table_not_found", "table not found")).?,
     );
     try std.testing.expectError(error.TransactionOutcomeMismatch, registry.markCommitExecutionStarted(alloc, rejected_id));
     try std.testing.expectEqual(IdempotentReceiptOutcome.not_applied, (try registry.getIdempotentOutcome(alloc, rejected_id)).?);
@@ -6783,10 +6899,10 @@ test "idempotent receipt transitions serialize rejection against execution start
     _ = (try registry.markCommitExecutionStarted(alloc, started_id)).?;
     try std.testing.expectEqual(
         SessionRegistry.PreExecutionRejectionResult.execution_started,
-        (try registry.recordIdempotentPreExecutionRejection(alloc, started_id)).?,
+        (try registry.recordIdempotentPreExecutionRejection(alloc, started_id, "table_not_found", "table not found")).?,
     );
     try std.testing.expect((try registry.getIdempotentOutcome(alloc, started_id)) == null);
-    _ = (try registry.recordIdempotentDurableAbort(alloc, started_id)).?;
+    _ = (try registry.recordIdempotentDurableAbort(alloc, started_id, "transaction_conflict", "conflict")).?;
     try std.testing.expectEqual(IdempotentReceiptOutcome.aborted, (try registry.getIdempotentOutcome(alloc, started_id)).?);
 }
 
