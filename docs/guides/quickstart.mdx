@@ -1392,10 +1392,21 @@ npx skills add antflydb/antfly-skills
 ```
 
 From there, your agent can create tables, build indexes, and write queries
-against your running instance — and each [guide](/docs/guides) ends with a
-prompt you can hand it directly.
+against your running instance.
 
 ## Next Steps
+
+You now have a running instance, an indexed table, and an agent that knows
+Antfly. Pick an outcome — each of these guides ends with a prompt you can hand
+straight to the agent you just set up:
+
+- **[Build a Support Answer Agent](/docs/guides/support-answer-agent)** — auto-answering RAG over your help content: retrieve, rerank, prune, and answer in one call
+- **[Add Search and AI Answers to Your Site](/docs/guides/site-search-and-answers)** — a React search page with facets, plus a streaming answer box
+- **[Use Antfly from n8n](/docs/guides/n8n)** — grounded retrieval for a no-code agent workflow over hosted MCP
+- **[Route Tickets with Retrieval](/docs/guides/ticket-routing)** — stream tickets from Postgres with CDC and classify them against resolved history
+- **[Power a Coding Copilot's Retrieval](/docs/guides/coding-copilot-retrieval)** — hybrid code search, exact symbols plus intent, sized to a context budget
+
+Going deeper:
 
 1. **[Explore the Dashboard](/docs/guides/dashboard)** — Manage tables, run queries, and monitor your cluster at `http://localhost:8080`
 2. **[Multimodal Search](/docs/guides/multimodal)** — Build image and mixed-media search
