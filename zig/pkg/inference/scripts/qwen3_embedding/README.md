@@ -23,6 +23,10 @@ Matryoshka truncation to 32-1024 dims).
   — offline unit tests (no network, no model downloads).
 - `benchmark_qwen3_embedding_endpoint.py` — throughput/latency benchmark against
   `/v1/embeddings` (separate lane; see its docstring and `BASELINE.md`).
+- `fixtures/qwen3_embedding_0_6b_exact_tokens.json` — compact, benchmark-only
+  recipe for the cache-neutral 511- and 2551-token comparison prompts. The
+  benchmark expands it in memory and verifies the canonical expanded-case
+  SHA-256 before making a request. Production serving does not read it.
 
 ## Produce the oracle
 

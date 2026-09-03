@@ -27,7 +27,8 @@ import urllib.request
 
 DEFAULT_SEED = 20260901
 COSINE_WARN_THRESHOLD = 0.98
-FIXTURE_SCHEMA = "antfly.qwen3_embedding.benchmark_fixture.v1"
+FIXTURE_SCHEMA = "antfly.qwen3_embedding.benchmark_fixture.v2"
+LEGACY_FIXTURE_SCHEMA = "antfly.qwen3_embedding.benchmark_fixture.v1"
 REPORT_SCHEMA = "antfly.qwen3_embedding.endpoint_benchmark.v2"
 
 VOCABULARY = [
@@ -166,6 +167,110 @@ def build_corpus(corpus: str, count: int, seed: int = DEFAULT_SEED) -> list[str]
     ]
 
 
+def fixture_cases_sha256(cases: list[dict[str, Any]]) -> str:
+    encoded = json.dumps(
+        cases, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def expand_fixture_recipe(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    recipe = payload.get("recipe")
+    if not isinstance(recipe, dict):
+        raise ValueError("compact fixture recipe is missing or invalid")
+
+    lengths = recipe.get("token_counts")
+    if (
+        not isinstance(lengths, list)
+        or not lengths
+        or not all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 2
+            for value in lengths
+        )
+        or len(set(lengths)) != len(lengths)
+    ):
+        raise ValueError("compact fixture token_counts must be distinct integers >= 2")
+
+    continuation = recipe.get("continuation")
+    if not isinstance(continuation, dict):
+        raise ValueError("compact fixture continuation is missing or invalid")
+    continuation_text = continuation.get("text")
+    continuation_token_id = continuation.get("token_id")
+    if not isinstance(continuation_text, str) or not continuation_text:
+        raise ValueError("compact fixture continuation text is empty")
+    if not isinstance(continuation_token_id, int) or isinstance(
+        continuation_token_id, bool
+    ):
+        raise ValueError("compact fixture continuation token_id is invalid")
+
+    eos_token_id = recipe.get("eos_token_id")
+    if not isinstance(eos_token_id, int) or isinstance(eos_token_id, bool):
+        raise ValueError("compact fixture eos_token_id is invalid")
+
+    raw_prefixes = recipe.get("prefixes")
+    if not isinstance(raw_prefixes, list) or not raw_prefixes:
+        raise ValueError("compact fixture has no prefixes")
+    prefixes = []
+    seen_ids: set[str] = set()
+    seen_texts: set[str] = set()
+    seen_token_ids: set[int] = set()
+    for raw in raw_prefixes:
+        if not isinstance(raw, dict):
+            raise ValueError("compact fixture prefix is not an object")
+        prefix_id = raw.get("id")
+        prefix_text = raw.get("text")
+        prefix_token_id = raw.get("token_id")
+        if not isinstance(prefix_id, str) or not prefix_id or prefix_id in seen_ids:
+            raise ValueError(f"invalid or duplicate compact fixture prefix id: {prefix_id!r}")
+        if (
+            not isinstance(prefix_text, str)
+            or not prefix_text
+            or prefix_text in seen_texts
+        ):
+            raise ValueError(
+                f"invalid or duplicate compact fixture prefix text: {prefix_text!r}"
+            )
+        if (
+            not isinstance(prefix_token_id, int)
+            or isinstance(prefix_token_id, bool)
+            or prefix_token_id in seen_token_ids
+        ):
+            raise ValueError(
+                "invalid or duplicate compact fixture prefix token_id: "
+                f"{prefix_token_id!r}"
+            )
+        seen_ids.add(prefix_id)
+        seen_texts.add(prefix_text)
+        seen_token_ids.add(prefix_token_id)
+        prefixes.append((prefix_id, prefix_text, prefix_token_id))
+
+    cases = []
+    for token_count in lengths:
+        continuation_count = token_count - 2
+        for prefix_id, prefix_text, prefix_token_id in prefixes:
+            cases.append(
+                {
+                    "id": f"tokens_{token_count}_{prefix_id}",
+                    "text": prefix_text + continuation_text * continuation_count,
+                    "token_ids": [prefix_token_id]
+                    + [continuation_token_id] * continuation_count
+                    + [eos_token_id],
+                }
+            )
+
+    expected_sha256 = payload.get("expanded_cases_sha256")
+    actual_sha256 = fixture_cases_sha256(cases)
+    if (
+        not isinstance(expected_sha256, str)
+        or expected_sha256.lower() != actual_sha256
+    ):
+        raise ValueError(
+            "compact fixture expanded case SHA-256 "
+            f"{actual_sha256} does not match {expected_sha256!r}"
+        )
+    return cases
+
+
 def load_fixture(
     path: Path, expected_model_sha256: str | None = None
 ) -> list[dict[str, Any]]:
@@ -173,8 +278,13 @@ def load_fixture(
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid fixture {path}: {exc}") from exc
-    if not isinstance(payload, dict) or payload.get("schema") != FIXTURE_SCHEMA:
-        raise ValueError(f"fixture must use schema {FIXTURE_SCHEMA}")
+    if not isinstance(payload, dict) or payload.get("schema") not in {
+        FIXTURE_SCHEMA,
+        LEGACY_FIXTURE_SCHEMA,
+    }:
+        raise ValueError(
+            f"fixture must use schema {FIXTURE_SCHEMA} or {LEGACY_FIXTURE_SCHEMA}"
+        )
     if expected_model_sha256 is not None:
         fixture_sha256 = payload.get("model_sha256")
         if (
@@ -185,7 +295,11 @@ def load_fixture(
                 f"fixture model SHA-256 {fixture_sha256!r} does not match "
                 f"benchmark model {expected_model_sha256}"
             )
-    cases = payload.get("cases")
+    cases = (
+        expand_fixture_recipe(payload)
+        if payload["schema"] == FIXTURE_SCHEMA
+        else payload.get("cases")
+    )
     if not isinstance(cases, list) or not cases:
         raise ValueError("fixture has no cases")
     validated = []

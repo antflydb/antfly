@@ -239,7 +239,7 @@ class RunCellTests(unittest.TestCase):
 class FixtureTests(unittest.TestCase):
     def test_exact_token_fixture_round_trip(self) -> None:
         payload = {
-            "schema": benchmark.FIXTURE_SCHEMA,
+            "schema": benchmark.LEGACY_FIXTURE_SCHEMA,
             "cases": [
                 {"id": "a", "text": "alpha", "token_ids": [1, 2]},
                 {"id": "b", "text": "beta", "token_ids": [3, 4, 5]},
@@ -253,6 +253,47 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(["alpha", "beta", "alpha"], texts)
         self.assertEqual([2, 3, 2], counts)
 
+    def test_compact_fixture_expands_deterministically(self) -> None:
+        expected_cases = [
+            {
+                "id": "tokens_4_alpha",
+                "text": "alpha token token",
+                "token_ids": [1, 2, 2, 3],
+            }
+        ]
+        payload = {
+            "schema": benchmark.FIXTURE_SCHEMA,
+            "expanded_cases_sha256": benchmark.fixture_cases_sha256(expected_cases),
+            "recipe": {
+                "token_counts": [4],
+                "continuation": {"text": " token", "token_id": 2},
+                "eos_token_id": 3,
+                "prefixes": [{"id": "alpha", "text": "alpha", "token_id": 1}],
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "fixture.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            cases = benchmark.load_fixture(path)
+        self.assertEqual(expected_cases, cases)
+
+    def test_compact_fixture_rejects_expansion_hash_mismatch(self) -> None:
+        payload = {
+            "schema": benchmark.FIXTURE_SCHEMA,
+            "expanded_cases_sha256": "0" * 64,
+            "recipe": {
+                "token_counts": [2],
+                "continuation": {"text": " token", "token_id": 2},
+                "eos_token_id": 3,
+                "prefixes": [{"id": "alpha", "text": "alpha", "token_id": 1}],
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "fixture.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "expanded case SHA-256"):
+                benchmark.load_fixture(path)
+
     def test_fixture_rejects_wrong_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "fixture.json"
@@ -262,7 +303,7 @@ class FixtureTests(unittest.TestCase):
 
     def test_fixture_rejects_model_sha_mismatch(self) -> None:
         payload = {
-            "schema": benchmark.FIXTURE_SCHEMA,
+            "schema": benchmark.LEGACY_FIXTURE_SCHEMA,
             "model_sha256": "a" * 64,
             "cases": [{"id": "a", "text": "alpha", "token_ids": [1]}],
         }
@@ -337,6 +378,9 @@ class FixtureTests(unittest.TestCase):
 
     def test_checked_in_fixture_has_cache_neutral_exact_lengths_and_eos(self) -> None:
         path = Path(__file__).resolve().parent / "fixtures/qwen3_embedding_0_6b_exact_tokens.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(benchmark.FIXTURE_SCHEMA, payload["schema"])
+        self.assertNotIn("cases", payload)
         cases = benchmark.load_fixture(path)
         by_length = {
             length: benchmark.select_fixture_token_count(cases, length)

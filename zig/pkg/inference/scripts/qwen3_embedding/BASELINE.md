@@ -80,7 +80,8 @@ equal-length prompts with globally distinct first tokens to defeat active-slot
 longest-common-prefix reuse; validates every server-reported prompt count;
 alternates AB/BA order; cross-checks every measured embedding pair; and reports
 a deterministic paired-bootstrap 95% interval for the throughput ratio. The
-checked-in fixture includes the model-required EOS in its exact token counts.
+checked-in compact fixture expands to exact token sequences that include the
+model-required EOS in their counts.
 Antfly's usage field excludes that injected EOS while llama.cpp's includes it,
 hence the documented `-1` Antfly offset.
 
