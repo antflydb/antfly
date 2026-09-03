@@ -1749,6 +1749,8 @@ pub const SessionRegistry = struct {
     lease_renewal_failures_for_test: usize = 0,
     lease_renewal_delay_ns_for_test: u64 = 0,
     lease_renewal_io_for_test: ?std.Io = null,
+    lease_renewal_entered_for_test: ?*std.Io.Event = null,
+    lease_renewal_release_for_test: ?*std.Io.Event = null,
 
     pub fn init(durable: ?*DurableSessionStore) SessionRegistry {
         return initWithOptions(durable, null, null, null, null, null);
@@ -3494,9 +3496,17 @@ pub const SessionRegistry = struct {
     }
 
     fn delayLeaseMutationForTest(self: *SessionRegistry) !void {
-        if (self.lease_renewal_delay_ns_for_test == 0) return;
         const io = self.lease_renewal_io_for_test orelse return;
-        try io.sleep(
+        if (self.lease_renewal_entered_for_test) |entered| entered.set(io);
+        if (self.lease_renewal_release_for_test) |release| while (!release.isSet()) {
+            release.waitTimeout(io, .{
+                .duration = .{ .raw = std.Io.Duration.fromMilliseconds(100), .clock = .awake },
+            }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return err,
+            };
+        };
+        if (self.lease_renewal_delay_ns_for_test > 0) try io.sleep(
             std.Io.Duration.fromNanoseconds(self.lease_renewal_delay_ns_for_test),
             .awake,
         );
@@ -3611,11 +3621,15 @@ pub const OwnedSessionLeaseHeartbeat = struct {
     }
 
     pub fn isLost(self: *const @This()) bool {
-        return self.lost.load(.acquire);
+        // The renewal task may itself be blocked in storage. Ownership expiry
+        // must therefore be observable directly from the confirmed deadline,
+        // without waiting for that task to return and publish `lost`.
+        return self.lost.load(.acquire) or
+            platform_time.realtimeNs() >= self.expires_at_ns.load(.acquire);
     }
 
     pub fn isConfirmedAt(self: *const @This(), now_ns: u64) bool {
-        return !self.isLost() and now_ns < self.expires_at_ns.load(.acquire);
+        return !self.lost.load(.acquire) and now_ns < self.expires_at_ns.load(.acquire);
     }
 };
 
@@ -7505,6 +7519,68 @@ test "lease confirmation rejects windows consumed by storage latency" {
         error.SessionLeaseRunwayUnavailable,
         registry.confirmOwnedLeaseRunway(session.txn_id, 0, std.time.ns_per_ms),
     );
+}
+
+test "lease cancellation observes deadline while renewal IO is blocked" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-lease-deadline-cancel", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    const leases = SessionLeaseStore.init(alloc, &store);
+    const ttl_ns = 30 * std.time.ns_per_ms;
+    var registry = SessionRegistry.initWithLeaseTtl(&durable, leases, ttl_ns);
+    defer registry.deinit(alloc);
+    const session = try registry.begin(alloc, .{ .sync_level = .write }, 0);
+    const confirmed_expiry_ns = try registry.confirmOwnedLeaseRunway(
+        session.txn_id,
+        0,
+        10 * std.time.ns_per_ms,
+    );
+
+    registry.lease_renewal_io_for_test = io_impl.io();
+    var renewal_entered: std.Io.Event = .unset;
+    var renewal_release: std.Io.Event = .unset;
+    registry.lease_renewal_entered_for_test = &renewal_entered;
+    registry.lease_renewal_release_for_test = &renewal_release;
+    var heartbeat = OwnedSessionLeaseHeartbeat.init(
+        &registry,
+        io_impl.io(),
+        session.txn_id,
+        0,
+        std.time.ns_per_ms,
+        confirmed_expiry_ns,
+    );
+    const lease_cancellation = OwnedSessionLeaseCancellation{ .heartbeat = &heartbeat };
+    const token = lease_cancellation.token();
+    var future = std.Io.async(io_impl.io(), OwnedSessionLeaseHeartbeat.run, .{&heartbeat});
+    defer {
+        renewal_release.set(io_impl.io());
+        heartbeat.stop();
+        future.await(io_impl.io());
+    }
+
+    const entered_deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+    while (!renewal_entered.isSet()) {
+        if (platform_time.monotonicNs() >= entered_deadline_ns) return error.TestUnexpectedResult;
+        try io_impl.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const now_ns = platform_time.realtimeNs();
+    if (now_ns < confirmed_expiry_ns) try io_impl.io().sleep(
+        std.Io.Duration.fromNanoseconds(confirmed_expiry_ns - now_ns +| std.time.ns_per_ms),
+        .awake,
+    );
+    // The renewal task remains blocked on the explicit std.Io event. The
+    // absolute deadline, not completion of that task, cancels fenced work.
+    try std.testing.expect(!heartbeat.lost.load(.acquire));
+    try std.testing.expect(token.isCancelled());
 }
 
 test "session lease storage duration covers nanosecond to millisecond rounding" {
