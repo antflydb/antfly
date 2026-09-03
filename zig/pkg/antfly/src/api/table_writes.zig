@@ -28762,7 +28762,7 @@ fn finishManagedMaintenanceStatusPublication(
         // owner. Otherwise the maintenance owner can retire after its final
         // idle snapshot loses the fence, leaving the preceding catching-up
         // heartbeat visible indefinitely even though durable work completed.
-        error.RuntimeStatusPublicationFenced => {
+        error.RuntimeStatusPublicationFenced, error.WriterLocked => {
             source.markWriteCacheDirty(table_name);
             source.notifyLocalChange(table_name, .runtime_status);
             return;
@@ -45311,13 +45311,18 @@ test "runtime status hook orders completed observation without crossing invalida
     try std.testing.expectEqualStrings("docs", hook.table_name.?);
     try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.runtime_status, hook.kind.?);
 
+    // A consistent snapshot can miss a concurrently mutating resident writer.
+    // That is the same observational deferral, not failed durable catch-up.
+    try finishManagedMaintenanceStatusPublication(&source, "docs", error.WriterLocked);
+    try std.testing.expectEqual(@as(usize, 2), hook.calls);
+
     try finishManagedMaintenanceStatusPublication(&source, "docs", {});
-    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(@as(usize, 2), hook.calls);
     try std.testing.expectError(
         error.OutOfMemory,
         finishManagedMaintenanceStatusPublication(&source, "docs", error.OutOfMemory),
     );
-    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(@as(usize, 2), hook.calls);
 }
 
 test "structural runtime observations publish as one table-epoch batch" {
