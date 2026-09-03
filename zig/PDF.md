@@ -1178,6 +1178,16 @@ The hardening above follows these long-term rules:
   planner snapshot may make a request temporarily too ambitious after topology
   change, but the proxy never sends it to an endpoint whose operation is still
   bootstrap-unknown; the concrete node remains the final limit validator.
+- Discovery and execution form one capability lease. A scoped catalog response
+  carries an opaque token bound to model, task, pool, effective authorization,
+  and the exact eligible endpoint incarnations. Antfly clients attach it to
+  read, generation, embedding, reranking, and extraction transports; the same
+  cache API accepts every other task family. A changed or expired route returns
+  an explicit stale-plan 409,
+  invalidates the client snapshot, and requires rediscovery and replanning
+  before retry. Legacy clients may omit the token, but never receive the
+  planner/executor consistency guarantee. A lease-aware client never silently
+  downgrades when its discovered snapshot is missing or evicted.
 - Every executor owns final admission. Remote read and generation calls and
   multimodal embedding calls are split at both model item and encoded-byte
   ceilings. Image-bearing readers, generators, embedders, and extractors also
@@ -1469,6 +1479,37 @@ The hardening above follows these long-term rules:
 41. **Implemented during the semantic rebase:** every dense artifact hook uses
     artifact-first lookup, including invocation-memory planning; query lookup
     precedence remains confined to query execution.
+42. **Implemented after endpoint-lifecycle review:** registration wakes an
+    event-driven catalog refresh worker even when periodic refresh is disabled.
+    Initial startup also refreshes immediately, and refresh completion is
+    pointer-fenced so an unregistered endpoint or a new endpoint reusing the
+    same address cannot be mutated by an older in-flight request.
+43. **Implemented after conservative-fallback review:** PDF page-image
+    embedding no longer invents a 256-MiB media ceiling when remote discovery
+    omits one. An explicit operator batch-byte ceiling may safely supply the
+    missing host bound; otherwise unknown encoded-media capacity is a retryable
+    capability gap. It cannot create an impossible reservation equal to the
+    default whole inference budget and terminalize otherwise recoverable work.
+44. **Implemented after allocator-ownership review:** a PDF embedding window
+    reserves renderer scratch separately from the complete caller-owned output
+    peak. The output grant includes retained raw PNG bytes, exact base64/request
+    transport residency, fixed provider/result allocation, and vector result
+    capacity. Window formation derives its raw-media limit by inverting that
+    same accounting instead of treating wire bytes as total resident bytes.
+45. **Implemented after capability-TOCTOU review:** scoped model discovery now
+    returns a bounded opaque capability token. The proxy validates its
+    model/task/pool, authorization digest, and eligible endpoint incarnations
+    before every initial route and retry. Remote capability caches retain the
+    token with the normalized descriptor; reader, generator, dense embedder,
+    reranker-provider, and extractor HTTP boundaries can carry it. A stale
+    response invalidates the exact model/task/auth cache entry so durable retry
+    rediscovers and replans.
+46. **Implemented after catalog-admission review:** cluster model-catalog
+    fan-out is covered by a process-wide weighted byte admission in addition to
+    per-response and merged-output limits. The reservation accounts for the
+    merged catalog plus each concurrent raw body, decoded catalog, and task
+    inventory parse, rejects an impossible request immediately, and observes
+    request cancellation while queued.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

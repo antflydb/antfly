@@ -16,6 +16,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -53,14 +54,16 @@ type Resolution struct {
 type ResolutionLease struct {
 	Resolution *Resolution
 
-	proxy        *Proxy
-	model        string
-	operation    OperationType
-	workloadType WorkloadType
-	once         sync.Once
-	completed    uint32
-	admission    *leaseAdmission
-	attempts     *leaseAttempts
+	proxy                         *Proxy
+	model                         string
+	operation                     OperationType
+	capabilityToken               string
+	capabilityAuthorizationDigest [sha256.Size]byte
+	workloadType                  WorkloadType
+	once                          sync.Once
+	completed                     uint32
+	admission                     *leaseAdmission
+	attempts                      *leaseAttempts
 }
 
 // ForwardingLease tracks in-flight load for a concrete forwarding attempt.
@@ -108,13 +111,15 @@ func (p *Proxy) AcquireRequestResolution(ctx context.Context, req ResolveRequest
 		return nil, err
 	}
 	return &ResolutionLease{
-		Resolution:   resolution,
-		proxy:        p,
-		model:        req.Model,
-		operation:    req.Operation,
-		workloadType: resolveWorkloadType(req.Operation, req.Headers),
-		admission:    &leaseAdmission{},
-		attempts:     newLeaseAttempts(),
+		Resolution:                    resolution,
+		proxy:                         p,
+		model:                         req.Model,
+		operation:                     req.Operation,
+		capabilityToken:               headerValue(req.Headers, capabilityTokenHeader),
+		capabilityAuthorizationDigest: sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(req.Headers))),
+		workloadType:                  resolveWorkloadType(req.Operation, req.Headers),
+		admission:                     &leaseAdmission{},
+		attempts:                      newLeaseAttempts(),
 	}, nil
 }
 
@@ -159,6 +164,9 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 	}
 
 	excluded := l.attempts.excludeAndSnapshot(l.Resolution.Endpoint)
+	if err := l.proxy.validateCapabilityLeaseDigest(l.capabilityToken, l.model, l.operation, l.Resolution.Pool, l.capabilityAuthorizationDigest); err != nil {
+		return nil, err
+	}
 	endpoint, err := l.proxy.router.RouteRequest(ctx, l.model, l.Resolution.Pool, l.workloadType, excluded, l.operation)
 	if err != nil {
 		return nil, err
@@ -171,12 +179,14 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 			Endpoint:    endpoint,
 			Pool:        l.Resolution.Pool,
 		},
-		proxy:        l.proxy,
-		model:        l.model,
-		operation:    l.operation,
-		workloadType: l.workloadType,
-		admission:    l.admission,
-		attempts:     l.attempts,
+		proxy:                         l.proxy,
+		model:                         l.model,
+		operation:                     l.operation,
+		capabilityToken:               l.capabilityToken,
+		capabilityAuthorizationDigest: l.capabilityAuthorizationDigest,
+		workloadType:                  l.workloadType,
+		admission:                     l.admission,
+		attempts:                      l.attempts,
 	}, nil
 }
 
@@ -286,9 +296,11 @@ func (p *Proxy) StartBackground(ctx context.Context) {
 }
 
 func (p *Proxy) startBackgroundWorkers(ctx context.Context) {
-	if p.registry.refreshInterval > 0 {
-		go p.refreshLoop(ctx)
-	}
+	// Registration-driven discovery remains active even when periodic
+	// reconciliation is disabled. This lets deployments use event-driven
+	// endpoint discovery without making the refresh interval a correctness
+	// requirement.
+	go p.refreshLoop(ctx)
 	if p.routeWatcher == nil {
 		return
 	}
@@ -331,6 +343,15 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 	}
 	if pool == "" {
 		pool = p.defaultPool
+	}
+	if err := p.validateCapabilityLease(
+		headerValue(headers, capabilityTokenHeader),
+		routeReq.Model,
+		routeReq.Operation,
+		pool,
+		p.upstreamAuthorizationForHeaders(headers),
+	); err != nil {
+		return nil, err
 	}
 
 	workloadType := resolveWorkloadType(routeReq.Operation, headers)

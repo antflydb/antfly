@@ -18,6 +18,7 @@ const lib = @import("antfly_reranking");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const antfly_provider = @import("../inference/local.zig");
+const remote_capabilities = @import("../inference/remote_capabilities.zig");
 const common_secrets = @import("../common/secrets.zig");
 
 pub const Config = lib.Config;
@@ -76,12 +77,54 @@ pub fn rerankDocumentsWithOptions(
             }
             var provider = antfly_provider.Provider.init(alloc, http, cfg.defaultedUrl());
             defer provider.deinit();
-            var result = try provider.reranker().rerank(alloc, cfg.model, query, documents);
+            var authorization_header: ?[]u8 = null;
+            defer if (authorization_header) |value| alloc.free(value);
+            var header_storage: [1][2][]const u8 = undefined;
+            const headers: []const [2][]const u8 = if (api_key) |value| blk: {
+                authorization_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value});
+                header_storage[0] = .{ "Authorization", authorization_header.? };
+                break :blk &header_storage;
+            } else &.{};
+            if (authorization_header) |value| try provider.setAuthorizationHeader(value);
+            var capability_cache = remote_capabilities.Cache.init(alloc, http.io);
+            defer capability_cache.deinit();
+            if (try capability_cache.getOrDiscover(http, cfg.defaultedUrl(), cfg.model, .rerank, headers)) |capabilities| {
+                try capabilities.validateInvocation(.rerank, .{
+                    .item_count = 1,
+                    .modalities = .{ .text = true },
+                    .text_bytes = query.len +| documentBytes(documents),
+                    .max_text_bytes_per_item = query.len +| maximumDocumentBytes(documents),
+                    .max_candidates_per_request = documents.len,
+                });
+            }
+            if (try capability_cache.routingToken(cfg.defaultedUrl(), cfg.model, .rerank, headers)) |token|
+                try provider.setCapabilityToken(token.slice());
+            var result = provider.reranker().rerank(alloc, cfg.model, query, documents) catch |err| {
+                if (err == error.InferenceCapabilitiesStale)
+                    try capability_cache.invalidate(cfg.defaultedUrl(), cfg.model, .rerank, headers);
+                return err;
+            };
             defer result.deinit();
             return try alloc.dupe(f32, result.scores);
         },
         else => return error.UnsupportedRerankerProvider,
     }
+}
+
+fn documentBytes(documents: []const []const u8) usize {
+    var total: usize = 0;
+    for (documents) |document| total +|= document.len;
+    return total;
+}
+
+fn maximumDocumentBytes(documents: []const []const u8) usize {
+    var maximum: usize = 0;
+    for (documents) |document| maximum = @max(maximum, document.len);
+    return maximum;
+}
+
+fn expectRerankerAuthorization(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqualStrings("Bearer test-token", req.header("Authorization") orelse "");
 }
 
 test "reranking runtime delegates to antfly provider" {
@@ -91,7 +134,10 @@ test "reranking runtime delegates to antfly provider" {
     const io = io_impl.io();
 
     var ts = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/rerank", .respond = .{
+        .{ .method = .GET, .path = "/ai/v1/models", .assert_request = expectRerankerAuthorization, .respond = .{
+            .body = "{\"rerankers\":{\"cross-encoder/ms-marco-MiniLM-L-6-v2\":{}}}",
+        } },
+        .{ .method = .POST, .path = "/rerank", .assert_request = expectRerankerAuthorization, .respond = .{
             .body = "{\"object\":\"list\",\"data\":[{\"object\":\"rerank.score\",\"index\":0,\"score\":0.9},{\"object\":\"rerank.score\",\"index\":1,\"score\":0.25}],\"model\":\"cross-encoder/ms-marco-MiniLM-L-6-v2\",\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":0,\"total_tokens\":4}}",
         } },
     });
@@ -121,6 +167,7 @@ test "reranking runtime delegates to antfly provider" {
                 .provider = .antfly,
                 .model = "cross-encoder/ms-marco-MiniLM-L-6-v2",
                 .url = reranker_url,
+                .api_key = "test-token",
                 .field = "body",
             };
             out.* = rerankDocuments(a, test_client, cfg, "query", &.{ "doc1", "doc2" }) catch |err| {
@@ -131,6 +178,7 @@ test "reranking runtime delegates to antfly provider" {
     };
 
     group.concurrent(io, Fiber.run, .{ alloc, io, &client, url, &scores, &run_err }) catch return;
+    try ts.handleOne();
     try ts.handleOne();
     group.await(io) catch {};
     if (run_err) |err| return err;

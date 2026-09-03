@@ -25,9 +25,21 @@ const extraction_api = @import("antfly_extraction_openapi");
 const asset_producer = @import("storage/db/enrichment/asset_producer.zig");
 const inference_work = @import("inference/work.zig");
 const remote_capabilities = @import("inference/remote_capabilities.zig");
+const inference = @import("inference_server");
 
 const Allocator = std.mem.Allocator;
 const local_reader_batch_ceiling: usize = 64;
+const test_png_data_uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+const test_png_2x3 = [_]u8{
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+};
+const test_png_3x3 = [_]u8{
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x03,
+};
 const max_asset_provider_timeout_ms: u64 = 300_000;
 const default_asset_provider_response_bytes: usize = 64 << 20;
 const max_asset_http_response_bytes: usize = 64 << 20;
@@ -802,6 +814,33 @@ pub const Runtime = struct {
         };
     }
 
+    fn bindExtractorCapabilityLease(self: *Runtime, alloc: Allocator, cfg: *extracting.Config) !void {
+        if (cfg.provider != .antfly or cfg.resolvedUrl() == null) return;
+        var auth_value: ?[]u8 = null;
+        defer if (auth_value) |value| alloc.free(value);
+        var header_storage: [1][2][]const u8 = undefined;
+        const headers: []const [2][]const u8 = if (cfg.bearer_token orelse cfg.api_key) |token| blk: {
+            auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
+            header_storage[0] = .{ "Authorization", auth_value.? };
+            break :blk &header_storage;
+        } else &.{};
+        if (try self.capability_cache.routingToken(cfg.resolvedUrl().?, cfg.model, .extract, headers)) |token|
+            cfg.capability_token = try alloc.dupe(u8, token.slice());
+    }
+
+    fn invalidateExtractorCapabilityLease(self: *Runtime, alloc: Allocator, cfg: extracting.Config) !void {
+        if (cfg.provider != .antfly or cfg.resolvedUrl() == null) return;
+        var auth_value: ?[]u8 = null;
+        defer if (auth_value) |value| alloc.free(value);
+        var header_storage: [1][2][]const u8 = undefined;
+        const headers: []const [2][]const u8 = if (cfg.bearer_token orelse cfg.api_key) |token| blk: {
+            auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
+            header_storage[0] = .{ "Authorization", auth_value.? };
+            break :blk &header_storage;
+        } else &.{};
+        try self.capability_cache.invalidate(cfg.resolvedUrl().?, cfg.model, .extract, headers);
+    }
+
     fn produceOne(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         return switch (request.producer_type) {
             .copy => try alloc.dupe(u8, request.source_text),
@@ -991,6 +1030,7 @@ pub const Runtime = struct {
     fn tryExtractBatchChunk(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
         var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
         defer cfg.deinit(alloc);
+        try self.bindExtractorCapabilityLease(alloc, &cfg);
 
         const inputs = try alloc.alloc(extracting.Input, requests.len);
         var inputs_filled: usize = 0;
@@ -1047,7 +1087,11 @@ pub const Runtime = struct {
             const local = self.antfly_provider orelse return error.BatchIncompatible;
             const extract_fn = local.extract orelse return error.BatchIncompatible;
             break :blk try extract_fn(local.ptr, alloc, cfg.model, extract_request);
-        } else try extracting.extractWithConfig(alloc, self.http, cfg, extract_request);
+        } else extracting.extractWithConfig(alloc, self.http, cfg, extract_request) catch |err| {
+            if (err == error.InferenceCapabilitiesStale)
+                try self.invalidateExtractorCapabilityLease(alloc, cfg);
+            return err;
+        };
         defer response.deinit();
 
         return try extractionResultsJsonAlloc(alloc, response.json, cfg.model, input_ids, output_ids);
@@ -1101,12 +1145,19 @@ pub const Runtime = struct {
         defer if (token) |value| alloc.free(value);
         var auth_value: ?[]u8 = null;
         defer if (auth_value) |value| alloc.free(value);
-        var header_storage: [1][2][]const u8 = undefined;
-        const headers: []const [2][]const u8 = if (token) |value| auth: {
+        var header_storage: [2][2][]const u8 = undefined;
+        const auth_headers: []const [2][]const u8 = if (token) |value| auth: {
             auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value});
             header_storage[0] = .{ "Authorization", auth_value.? };
-            break :auth &header_storage;
+            break :auth header_storage[0..1];
         } else &.{};
+        var header_count = auth_headers.len;
+        var routing_token = try self.capability_cache.routingToken(cfg.url, cfg.model, .generate, auth_headers);
+        if (routing_token) |*value| {
+            header_storage[header_count] = .{ remote_capabilities.capability_token_header, value.slice() };
+            header_count += 1;
+        }
+        const headers = header_storage[0..header_count];
 
         const items = try alloc.alloc(asset_producer.ProducedItem, requests.len);
         var initialized: usize = 0;
@@ -1137,7 +1188,16 @@ pub const Runtime = struct {
                 .max_response_size = self.responseLimitForTask(.generator, chunk.len),
             });
             defer resp.deinit();
-            if (!resp.ok()) return mapAntflyGenerateBatchStatus(resp.status.code);
+            if (!resp.ok()) {
+                const stale_value = resp.headers.get(remote_capabilities.capability_stale_header);
+                if (resp.status.code == 409 and stale_value != null and
+                    std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale_value.?, " \t"), "true"))
+                {
+                    try self.capability_cache.invalidate(cfg.url, cfg.model, .generate, auth_headers);
+                    return error.InferenceCapabilitiesStale;
+                }
+                return mapAntflyGenerateBatchStatus(resp.status.code);
+            }
             const payload = resp.body orelse return error.EmptyGenerateBatchResponse;
             const chunk_response = try parseAntflyGenerateBatchResponseAlloc(alloc, payload, chunk);
             defer alloc.free(chunk_response.items);
@@ -1171,6 +1231,57 @@ pub const Runtime = struct {
             408, 409, 425, 429 => error.GenerateBatchTransientFailure,
             else => if (status >= 500 and status <= 599) error.GenerateBatchTransientFailure else error.GenerateBatchRequestFailed,
         };
+    }
+
+    fn bindGeneratorCapabilityLease(
+        self: *Runtime,
+        alloc: Allocator,
+        cfg: *generating_runtime.GeneratorConfig,
+    ) !void {
+        if (cfg.provider != .antfly or cfg.url.len == 0) return;
+        var secret = try common_secrets.SecretValue.initConfigOrEnv(
+            alloc,
+            cfg.api_key,
+            "ANTFLY_INFERENCE_API_KEY",
+        );
+        defer secret.deinit(alloc);
+        const secret_value = try secret.resolveOwned(alloc, self.secret_store);
+        defer if (secret_value) |value| alloc.free(value);
+        var auth_value: ?[]u8 = null;
+        defer if (auth_value) |value| alloc.free(value);
+        var header_storage: [1][2][]const u8 = undefined;
+        const headers: []const [2][]const u8 = if (secret_value) |value| blk: {
+            auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value});
+            header_storage[0] = .{ "Authorization", auth_value.? };
+            break :blk &header_storage;
+        } else &.{};
+        if (try self.capability_cache.routingToken(cfg.url, cfg.model, .generate, headers)) |token|
+            cfg.capability_token = try alloc.dupe(u8, token.slice());
+    }
+
+    fn invalidateGeneratorCapabilityLease(
+        self: *Runtime,
+        alloc: Allocator,
+        cfg: generating_runtime.GeneratorConfig,
+    ) !void {
+        if (cfg.provider != .antfly or cfg.url.len == 0) return;
+        var secret = try common_secrets.SecretValue.initConfigOrEnv(
+            alloc,
+            cfg.api_key,
+            "ANTFLY_INFERENCE_API_KEY",
+        );
+        defer secret.deinit(alloc);
+        const secret_value = try secret.resolveOwned(alloc, self.secret_store);
+        defer if (secret_value) |value| alloc.free(value);
+        var auth_value: ?[]u8 = null;
+        defer if (auth_value) |value| alloc.free(value);
+        var header_storage: [1][2][]const u8 = undefined;
+        const headers: []const [2][]const u8 = if (secret_value) |value| blk: {
+            auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value});
+            header_storage[0] = .{ "Authorization", auth_value.? };
+            break :blk &header_storage;
+        } else &.{};
+        try self.capability_cache.invalidate(cfg.url, cfg.model, .generate, headers);
     }
 
     fn tryTranscribeBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
@@ -1402,7 +1513,7 @@ pub const Runtime = struct {
     fn generate(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         var parsed_cfg = try parseGeneratorProducerConfig(alloc, request.config_json);
         defer parsed_cfg.deinit(alloc);
-        const cfg = parsed_cfg.generator;
+        var cfg = parsed_cfg.generator;
         if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
         for (request.media) |media| try validateEncodedMedia(media);
         const local_attachments = cfg.provider == .antfly and cfg.url.len == 0 and
@@ -1455,12 +1566,21 @@ pub const Runtime = struct {
             );
             return result;
         }
+        if (cfg.provider == .antfly and cfg.url.len > 0) {
+            _ = try capabilitiesForRequests(self, alloc, &.{request});
+            try self.bindGeneratorCapabilityLease(alloc, &cfg);
+            parsed_cfg.generator.capability_token = cfg.capability_token;
+        }
         const link = generating_runtime.ChainLink{ .generator = cfg };
-        var result = try generating_runtime.executeChainWithOptions(alloc, self.http, &.{link}, .{
+        var result = generating_runtime.executeChainWithOptions(alloc, self.http, &.{link}, .{
             .antfly_provider = self.antfly_provider,
             .secret_store = self.secret_store,
             .max_response_bytes = self.responseLimitForTask(.generator, 1),
-        }, &messages);
+        }, &messages) catch |err| {
+            if (err == error.InferenceCapabilitiesStale)
+                try self.invalidateGeneratorCapabilityLease(alloc, cfg);
+            return err;
+        };
         defer result.deinit();
         if (parsed_cfg.tool_output == .arguments) {
             return try toolCallArgumentsOutputAlloc(alloc, result.tool_calls, parsed_cfg.tool_name);
@@ -1522,6 +1642,18 @@ pub const Runtime = struct {
 
     fn readImagesWithConfigReported(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) !readers.BatchResult {
         const local_reader = isLocalReaderProvider(cfg.provider, cfg.resolvedUrl());
+        var execution_cfg = cfg;
+        var capability_auth_value: ?[]u8 = null;
+        defer if (capability_auth_value) |value| alloc.free(value);
+        var capability_auth_storage: [1][2][]const u8 = undefined;
+        const capability_auth_headers: []const [2][]const u8 = if (!local_reader and cfg.provider == .antfly and
+            (cfg.bearer_token orelse cfg.api_key) != null)
+        blk: {
+            capability_auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{cfg.bearer_token orelse cfg.api_key.?});
+            capability_auth_storage[0] = .{ "Authorization", capability_auth_value.? };
+            break :blk &capability_auth_storage;
+        } else &.{};
+        var routing_token: ?remote_capabilities.RoutingToken = null;
         if (try self.readerCapabilities(alloc, cfg)) |capabilities| {
             const inline_shape = try readerUriInvocationShape(alloc, capabilities, request);
             try capabilities.validateInvocation(.read, .{
@@ -1543,6 +1675,16 @@ pub const Runtime = struct {
             // retain their provider-owned validation until they expose one.
             return error.InvalidInferenceCapabilities;
         }
+        if (!local_reader and cfg.provider == .antfly) {
+            const endpoint = cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
+            routing_token = try self.capability_cache.routingToken(
+                endpoint,
+                cfg.model orelse "",
+                .read,
+                capability_auth_headers,
+            );
+            if (routing_token) |*token| execution_cfg.capability_token = token.slice();
+        }
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             const read_images = local.read_images orelse return error.UnsupportedReaderProvider;
@@ -1552,14 +1694,20 @@ pub const Runtime = struct {
 
         var registry = readers.Registry.init(alloc);
         defer registry.deinit();
-        try registry.registerConfig("asset", cfg);
+        try registry.registerConfig("asset", execution_cfg);
 
         var runtime = readers.Runtime.init(alloc);
         defer runtime.deinit();
         try runtime.loadFromRegistry(self.http, &registry);
 
         const provider = try runtime.get("asset");
-        return try provider.readReported(alloc, request);
+        return provider.readReported(alloc, request) catch |err| {
+            if (err == error.InferenceCapabilitiesStale and cfg.provider == .antfly) {
+                const endpoint = cfg.resolvedUrl() orelse return err;
+                try self.capability_cache.invalidate(endpoint, cfg.model orelse "", .read, capability_auth_headers);
+            }
+            return err;
+        };
     }
 
     const ReaderUriInvocationShape = struct {
@@ -1752,6 +1900,7 @@ pub const Runtime = struct {
                 &.{request},
             );
         }
+        try self.bindExtractorCapabilityLease(alloc, &cfg);
 
         const content_json = try extractionContentJsonAlloc(alloc, request.source_text, request.source_parts_json);
         defer alloc.free(content_json);
@@ -1775,7 +1924,11 @@ pub const Runtime = struct {
             const local = self.antfly_provider orelse return error.UnsupportedExtractionProvider;
             const extract_fn = local.extract orelse return error.UnsupportedExtractionProvider;
             break :blk try extract_fn(local.ptr, alloc, cfg.model, extract_request);
-        } else try extracting.extractWithConfig(alloc, self.http, cfg, extract_request);
+        } else extracting.extractWithConfig(alloc, self.http, cfg, extract_request) catch |err| {
+            if (err == error.InferenceCapabilitiesStale)
+                try self.invalidateExtractorCapabilityLease(alloc, cfg);
+            return err;
+        };
         defer response.deinit();
 
         if (isJsonContentType(request.content_type) or request.content_type.len == 0) {
@@ -4283,7 +4436,10 @@ test "asset producer runtime preserves remote reader identity and native executi
         .{server.baseUrl()},
     );
     defer alloc.free(cfg_json);
-    const png = [_]u8{ 1, 2, 3 };
+    var png = [_]u8{0} ** 24;
+    @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, png[16..20], 2, .big);
+    std.mem.writeInt(u32, png[20..24], 3, .big);
     const media = [_][1]asset_producer.EncodedMedia{
         .{.{ .bytes = &png, .mime_type = "image/png" }},
         .{.{ .bytes = &png, .mime_type = "image/png" }},
@@ -4453,7 +4609,7 @@ test "asset producer runtime routes antfly reader without url to local provider"
             self.read_calls += 1;
             try std.testing.expectEqualStrings("local-reader", model);
             try std.testing.expectEqual(@as(usize, 1), request.images.len);
-            try std.testing.expectEqualStrings("data:image/png;base64,YWFh", request.images[0]);
+            try std.testing.expectEqualStrings(test_png_data_uri, request.images[0]);
             try std.testing.expectEqualStrings("extract", request.prompt.?);
             try std.testing.expectEqual(readers.InlineContentTrust.untrusted, request.inline_content_trust);
 
@@ -4474,7 +4630,7 @@ test "asset producer runtime routes antfly reader without url to local provider"
         .producer_type = .reader,
         .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
         .source_text = "",
-        .source_parts_json = "[{\"type\":\"text\",\"text\":\"extract\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,YWFh\"}]",
+        .source_parts_json = "[{\"type\":\"text\",\"text\":\"extract\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD\"}]",
         .content_type = "text/plain",
     });
     defer alloc.free(result);
@@ -4516,8 +4672,8 @@ test "asset producer runtime batches compatible antfly reader requests" {
             self.read_calls += 1;
             try std.testing.expectEqualStrings("local-reader", model);
             try std.testing.expectEqual(@as(usize, 2), request.images.len);
-            try std.testing.expectEqualStrings("data:image/png;base64,YWFh", request.images[0]);
-            try std.testing.expectEqualStrings("data:image/png;base64,YmJi", request.images[1]);
+            try std.testing.expectEqualStrings(test_png_data_uri, request.images[0]);
+            try std.testing.expectEqualStrings(test_png_data_uri, request.images[1]);
             try std.testing.expect(request.prompt == null);
             try std.testing.expectEqual(readers.InlineContentTrust.trusted_internal, request.inline_content_trust);
 
@@ -4539,14 +4695,14 @@ test "asset producer runtime batches compatible antfly reader requests" {
         .{
             .producer_type = .reader,
             .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
-            .source_text = "data:image/png;base64,YWFh",
+            .source_text = test_png_data_uri,
             .content_type = "text/plain",
             .inline_media_trusted = true,
         },
         .{
             .producer_type = .reader,
             .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
-            .source_text = "data:image/png;base64,YmJi",
+            .source_text = test_png_data_uri,
             .content_type = "text/plain",
             .inline_media_trusted = true,
         },
@@ -4602,8 +4758,8 @@ test "asset producer runtime batches local encoded media without base64 adaptati
             try std.testing.expectEqualStrings("local-reader", model);
             try std.testing.expectEqual(@as(usize, 2), request.images.len);
             for (request.images, 0..) |image, i| {
-                const expected_suffix: u8 = @intCast(i + 1);
-                try std.testing.expectEqualSlices(u8, &.{ 0x89, 0x50, 0x4e, 0x47, expected_suffix }, image.bytes);
+                const expected = if (i == 0) &test_png_2x3 else &test_png_3x3;
+                try std.testing.expectEqualSlices(u8, expected, image.bytes);
                 try std.testing.expectEqualStrings("image/png", image.mime_type);
                 try std.testing.expectEqualStrings(if (i == 0) "first-source" else "second-source", image.source_fingerprint.?);
             }
@@ -4618,8 +4774,6 @@ test "asset producer runtime batches local encoded media without base64 adaptati
         }
     };
 
-    const first_png = [_]u8{ 0x89, 0x50, 0x4e, 0x47, 1 };
-    const second_png = [_]u8{ 0x89, 0x50, 0x4e, 0x47, 2 };
     var local = Local{};
     var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
     defer client.deinit();
@@ -4636,7 +4790,7 @@ test "asset producer runtime batches local encoded media without base64 adaptati
             .content_type = "text/plain",
             .inline_media_trusted = true,
             .source_fingerprint = "first-source",
-            .media = &.{.{ .bytes = &first_png, .mime_type = "image/png" }},
+            .media = &.{.{ .bytes = &test_png_2x3, .mime_type = "image/png" }},
         },
         .{
             .producer_type = .reader,
@@ -4646,7 +4800,7 @@ test "asset producer runtime batches local encoded media without base64 adaptati
             .content_type = "text/plain",
             .inline_media_trusted = true,
             .source_fingerprint = "second-source",
-            .media = &.{.{ .bytes = &second_png, .mime_type = "image/png" }},
+            .media = &.{.{ .bytes = &test_png_3x3, .mime_type = "image/png" }},
         },
     };
     try std.testing.expect(try producer.canProduceBatch(alloc, &requests));
@@ -4808,7 +4962,7 @@ test "asset producer runtime chunks local antfly reader batches to inference cap
     const requests = try alloc.alloc(asset_producer.Request, request_count);
     defer alloc.free(requests);
     for (0..request_count) |i| {
-        urls[i] = try alloc.dupe(u8, "data:image/png;base64,AQ==");
+        urls[i] = try alloc.dupe(u8, test_png_data_uri);
         urls_filled += 1;
         requests[i] = .{
             .producer_type = .reader,

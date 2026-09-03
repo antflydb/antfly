@@ -6257,6 +6257,55 @@ fn splitPdfInvocationRenderMemoryBudget(
     return splitPdfRenderMemoryBudget(available_bytes, retained_limit);
 }
 
+/// Plan a render window when native renderer scratch and allocator-owned
+/// media/provider memory have already been admitted as separate credits.
+/// Unlike splitPdfInvocationRenderMemoryBudget, this must not numerically
+/// subtract caller-owned provider memory from the native scratch owner.
+fn splitOwnedPdfInvocationMemoryBudget(
+    scratch_bytes: usize,
+    output_bytes: usize,
+    wire_limit: usize,
+    invocation: inference_work.InvocationMemoryPlan,
+    mime_type_len: usize,
+    item_count: usize,
+) !PdfRenderMemoryBudget {
+    if (scratch_bytes == 0 or invocation.allocator_limit_bytes >= output_bytes)
+        return error.DocumentExtractionWorkingSetTooLarge;
+    const media_resident_bytes = output_bytes - invocation.allocator_limit_bytes;
+    const retained_bytes = try invocation.attachment_transport.maxRawBytesForLimits(
+        mime_type_len,
+        item_count,
+        wire_limit,
+        media_resident_bytes,
+    );
+    if (retained_bytes == 0) return error.DocumentExtractionWorkingSetTooLarge;
+    return .{ .scratch_bytes = scratch_bytes, .retained_bytes = retained_bytes };
+}
+
+fn pdfInvocationOutputReservationBytes(
+    wire_limit: usize,
+    invocation: inference_work.InvocationMemoryPlan,
+    mime_type_len: usize,
+    item_count: usize,
+    maximum_retained_raw_bytes: usize,
+) !usize {
+    const raw_by_wire = try invocation.attachment_transport.maxRawBytesForLimits(
+        mime_type_len,
+        item_count,
+        wire_limit,
+        std.math.maxInt(usize),
+    );
+    const retained_raw = @min(raw_by_wire, maximum_retained_raw_bytes);
+    if (retained_raw == 0) return error.DocumentExtractionWorkingSetTooLarge;
+    const media_peak = try invocation.attachment_transport.batchPeakResidentSize(
+        retained_raw,
+        mime_type_len,
+        item_count,
+    );
+    return std.math.add(usize, media_peak, invocation.allocator_limit_bytes) catch
+        error.DocumentExtractionWorkingSetTooLarge;
+}
+
 /// A render batch must not give any page less encoded-output headroom than the
 /// same page would receive as a singleton invocation. Batch pressure is
 /// resolved by shortening the window, never by silently lowering page quality.
@@ -6328,6 +6377,25 @@ test "PDF render budget reserves the complete invocation peak" {
         error.DocumentExtractionWorkingSetTooLarge,
         splitPdfInvocationRenderMemoryBudget(10, 10, 10, .base64_payload, "image/png".len, 1),
     );
+}
+
+test "PDF separately owned invocation budget follows allocator ownership" {
+    const invocation = inference_work.InvocationMemoryPlan{
+        .attachment_transport = .base64_payload,
+        .fixed_bytes = 20,
+        .allocator_limit_bytes = 20,
+        .max_result_bytes_per_item = 4,
+        .max_result_bytes = 8,
+    };
+    const output = try pdfInvocationOutputReservationBytes(100, invocation, "image/png".len, 2, 40);
+    const budget = try splitOwnedPdfInvocationMemoryBudget(80, output, 100, invocation, "image/png".len, 2);
+    const media_peak = try inference_work.AttachmentTransport.base64_payload.batchPeakResidentSize(
+        budget.retained_bytes,
+        "image/png".len,
+        2,
+    );
+    try std.testing.expectEqual(@as(usize, 80), budget.scratch_bytes);
+    try std.testing.expect(media_peak + invocation.allocator_limit_bytes <= output);
 }
 
 test "PDF output allowance makes window size quality neutral" {
@@ -10969,8 +11037,15 @@ fn processPdfPageImageEmbedding(
     const capability_items = @max(@as(usize, 1), capabilities.batch.max_items);
     const default_items = @max(@as(usize, 1), capabilities.batch.preferred_items);
     const batch_items = @min(policy.batch_items orelse default_items, capability_items);
-    const capability_bytes = capabilities.batch.max_encoded_media_bytes orelse generated_ocr_default_render_inflight_bytes;
-    const batch_bytes = @min(policy.batch_bytes orelse capability_bytes, capability_bytes);
+    // Page-image planning requires an exact encoded-media ceiling. Treat a
+    // temporarily unavailable remote catalog as retryable capability
+    // discovery; inventing the 256 MiB renderer ceiling here makes the output
+    // reservation impossible under the default 256 MiB extraction budget.
+    const capability_bytes = capabilities.batch.max_encoded_media_bytes;
+    const batch_bytes = if (capability_bytes) |model_limit|
+        @min(policy.batch_bytes orelse model_limit, model_limit)
+    else
+        policy.batch_bytes orelse return error.InferenceCapabilitiesUnavailable;
     if (batch_bytes == 0) return error.InvalidInferenceCapabilities;
 
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
@@ -11017,10 +11092,28 @@ fn processPdfPageImageEmbedding(
     // start, and transfer a separate output grant to the allocator retaining
     // PNG/provider buffers. Concurrent PDF embedding operations now compose
     // under the same process-wide document working-set limit as OCR.
+    const maximum_invocation_memory = try dense_embedder.partInvocationMemoryForMime(
+        embedding_name,
+        batch_items,
+        "image/png",
+        request.expected_dims,
+    );
+    const maximum_retained_raw_bytes = std.math.mul(
+        usize,
+        batch_items,
+        maximum_pdf_page_inline_png_bytes,
+    ) catch return error.DocumentExtractionWorkingSetTooLarge;
+    const output_reservation_bytes = try pdfInvocationOutputReservationBytes(
+        batch_bytes,
+        maximum_invocation_memory,
+        "image/png".len,
+        batch_items,
+        maximum_retained_raw_bytes,
+    );
     const pdf_operation_budget = try resource_tracker.reservePdfOperation(
         0,
         render_config.pdf_render_max_inflight_bytes,
-        batch_bytes,
+        output_reservation_bytes,
     );
     if (download_budgeted) |*budgeted| try resource_tracker.transferPdfOutputCredit(budgeted);
     render_config.pdf_render_max_inflight_bytes = pdf_operation_budget.render_bytes;
@@ -11112,11 +11205,11 @@ fn processPdfPageImageEmbedding(
             "image/png",
             request.expected_dims,
         );
-        const singleton_budget = try splitPdfInvocationRenderMemoryBudget(
+        const singleton_budget = try splitOwnedPdfInvocationMemoryBudget(
             available_bytes,
+            pdf_operation_budget.output_bytes,
             batch_bytes,
-            singleton_memory.fixed_bytes,
-            singleton_memory.attachment_transport,
+            singleton_memory,
             "image/png".len,
             1,
         );
@@ -11128,11 +11221,11 @@ fn processPdfPageImageEmbedding(
                 "image/png",
                 request.expected_dims,
             );
-            const candidate_budget = splitPdfInvocationRenderMemoryBudget(
+            const candidate_budget = splitOwnedPdfInvocationMemoryBudget(
                 available_bytes,
+                pdf_operation_budget.output_bytes,
                 batch_bytes,
-                invocation_memory.fixed_bytes,
-                invocation_memory.attachment_transport,
+                invocation_memory,
                 "image/png".len,
                 count,
             ) catch |err| {

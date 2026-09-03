@@ -4455,15 +4455,28 @@ fn embedPartItemsWithEntry(
     var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
     defer provider.deinit();
     provider.setRequestCancellation(entry.cancellation);
+    var auth_header_owned: ?[]u8 = null;
+    defer if (auth_header_owned) |value| alloc.free(value);
+    var capability_header_storage: [1][2][]const u8 = undefined;
+    var capability_headers: []const [2][]const u8 = &.{};
     if (entry.api_key) |*api_key_ref| {
         if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
-            defer alloc.free(auth_header);
+            auth_header_owned = auth_header;
             try provider.setAuthorizationHeader(auth_header);
+            capability_header_storage[0] = .{ "Authorization", auth_header };
+            capability_headers = &capability_header_storage;
         }
     }
+    const capability_cache = &@constCast(entry).remote_capability_cache.?;
+    if (try capability_cache.routingToken(entry.base_url, entry.model, .embed, capability_headers)) |token|
+        try provider.setCapabilityToken(token.slice());
 
     var result = provider.embedParts(alloc, entry.model, items) catch |err| switch (err) {
         error.EmptyResponse => return error.EmptyEmbeddingResponse,
+        error.InferenceCapabilitiesStale => {
+            try capability_cache.invalidate(entry.base_url, entry.model, .embed, capability_headers);
+            return err;
+        },
         else => return err,
     };
     errdefer result.deinit();
@@ -4962,9 +4975,9 @@ fn appendExecutionObjectIfPresent(
 ) !void {
     const execution = root.get("execution") orelse return;
     if (execution != .object) return error.InvalidCreateTableRequest;
+    try validateIndexExecutionObjectForCreateTable(execution);
     var parsed = try std.json.parseFromValue(indexes_openapi.IndexExecutionConfig, alloc, execution, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    try validateIndexExecutionObjectForCreateTable(execution);
     const encoded = try std.json.Stringify.valueAlloc(alloc, execution, .{});
     defer alloc.free(encoded);
     try out.appendSlice(alloc, ",\"execution\":");
@@ -5035,6 +5048,7 @@ const TestLocalDenseProvider = struct {
             .ptr = self,
             .embed_dense_texts = dense,
             .embed_sparse_texts = sparse,
+            .owns_invocation_admission = true,
         };
     }
 
@@ -5560,16 +5574,17 @@ pub fn testArtifactBackedEmbeddingRequestsWithoutIndexEmbedder() !void {
         \\    {"name":"shared_name","kind":"embedding","field":"body","expected_dims":384,"producer_json":"{\"provider\":\"antfly\",\"model\":\"artifact-model\",\"multimodal\":true}"},
         \\    {"name":"reference_artifact","kind":"embedding","field":"body","expected_dims":384,"producer_json":"{\"provider\":\"antfly\",\"model\":\"artifact-model\",\"multimodal\":true}"}
         \\  ],
-        \\  "artifact_consumer":{"type":"embeddings","dimension":384,"sources":[{"artifact":"shared_name"}]}
+        \\  "artifact_consumer":{"type":"embeddings","dimension":384,"sources":[{"artifact":"shared_name"}]},
+        \\  "reference_consumer":{"type":"embeddings","dimension":384,"sources":[{"artifact":"reference_artifact"}]}
         \\}
     , .{ .antfly_provider = local.provider() });
     defer colliding.deinit();
-    try std.testing.expectEqual(@as(usize, 2), colliding.entries.len);
+    try std.testing.expectEqual(@as(usize, 3), colliding.entries.len);
     try std.testing.expectEqualStrings("direct-model", colliding.findQueryEntry("shared_name").?.model);
     try std.testing.expectEqualStrings("artifact-model", colliding.findArtifactEntry("shared_name").?.model);
-    try std.testing.expectEqual(@as(?usize, 1), denseMediaPartLimit(&colliding, "shared_name"));
-    const colliding_plan = try densePartInvocationMemory(&colliding, "shared_name", .{ .item_count = 1 }, 384);
-    const reference_plan = try densePartInvocationMemory(&colliding, "reference_artifact", .{ .item_count = 1 }, 384);
+    try std.testing.expectEqual(@as(?usize, 1), ManagedEmbedder.denseMediaPartLimit(&colliding, "shared_name"));
+    const colliding_plan = try ManagedEmbedder.densePartInvocationMemory(&colliding, "shared_name", .{ .item_count = 1 }, 384);
+    const reference_plan = try ManagedEmbedder.densePartInvocationMemory(&colliding, "reference_artifact", .{ .item_count = 1 }, 384);
     try std.testing.expectEqual(reference_plan, colliding_plan);
 
     // Public query aliases outrank every legacy artifact name globally, not
@@ -5778,14 +5793,18 @@ test "managed embedder rejects conflicting embedding name aliases" {
     , local.provider()));
 }
 
-test "managed embedder rejects index name and embedding name collisions with different configs" {
+test "managed embedder keeps public query and artifact lookup namespaces distinct" {
     var local = TestLocalDenseProvider{ .dimensions = 384 };
-    try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
         \\{
         \\  "aliased_vectors":{"type":"embeddings","field":"embedding","embedding_name":"document_vectors","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
         \\  "document_vectors":{"type":"embeddings","field":"embedding","embedding_name":"document_vectors_v2","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/other"}}
         \\}
-    , local.provider()));
+    , local.provider());
+    defer managed.deinit();
+
+    try std.testing.expectEqualStrings("antflydb/other", managed.findQueryEntry("document_vectors").?.model);
+    try std.testing.expectEqualStrings("antflydb/clipclap", managed.findArtifactEntry("document_vectors").?.model);
 }
 
 test "managed embedder translates managed embeddings config with probed dimension" {
@@ -5830,7 +5849,9 @@ test "managed embedder validates sparse config with probe during normalization" 
     defer parsed.deinit();
 
     const normalized = try normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "sparse_idx", parsed.value, .{ .antfly_provider = local.provider() });
-    try std.testing.expect(normalized == null);
+    defer if (normalized) |value| std.testing.allocator.free(value);
+    try std.testing.expect(normalized != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized.?, "\"semantic_producer\"") != null);
     try std.testing.expectEqual(@as(usize, 1), local.sparse_calls);
 }
 

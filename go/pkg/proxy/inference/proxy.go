@@ -18,6 +18,9 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -407,20 +410,28 @@ func (r *ModelRegistry) UpdateModels(address string, models []string) {
 // task inventory. Routing uses this snapshot so a generator-only node cannot be
 // selected for reads merely because it loads a model with the same name.
 func (r *ModelRegistry) UpdateModelOperations(address string, operations map[string]map[OperationType]bool) {
+	r.updateModelOperationsForEndpoint(address, nil, operations)
+}
+
+func (r *ModelRegistry) updateModelOperationsForEndpoint(address string, expected *Endpoint, operations map[string]map[OperationType]bool) {
 	models := make([]string, 0, len(operations))
 	for model := range operations {
 		models = append(models, model)
 	}
 	sort.Strings(models)
-	r.updateModels(address, models, operations, true)
+	r.updateModelsForEndpoint(address, expected, models, operations, true)
 }
 
 func (r *ModelRegistry) updateModels(address string, models []string, operations map[string]map[OperationType]bool, catalogKnown bool) {
+	r.updateModelsForEndpoint(address, nil, models, operations, catalogKnown)
+}
+
+func (r *ModelRegistry) updateModelsForEndpoint(address string, expected *Endpoint, models []string, operations map[string]map[OperationType]bool, catalogKnown bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	ep, exists := r.endpoints[address]
-	if !exists {
+	if !exists || (expected != nil && ep != expected) {
 		return
 	}
 
@@ -684,11 +695,21 @@ func (r *ModelRegistry) isEndpointAvailableLocked(ep *Endpoint) bool {
 
 // RefreshEndpoint fetches current model list and health from an endpoint
 func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) error {
+	r.mu.RLock()
+	expected := r.endpoints[address]
+	var healthURL string
+	if expected != nil {
+		healthURL = expected.HealthURL
+	}
+	r.mu.RUnlock()
+	if expected == nil {
+		return errors.New("inference endpoint is no longer registered")
+	}
 	authorization := r.upstreamAuthorizationValue()
-	if healthURL := r.endpointHealthURL(address); healthURL != "" {
+	if healthURL != "" {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
 		if err != nil {
-			r.markUnhealthy(address)
+			r.markEndpointHealth(address, expected, false)
 			return err
 		}
 		if authorization != "" {
@@ -696,19 +717,19 @@ func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) err
 		}
 		resp, err := r.client.Do(req)
 		if err != nil {
-			r.markUnhealthy(address)
+			r.markEndpointHealth(address, expected, false)
 			return err
 		}
 		_ = resp.Body.Close()
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest {
-			r.markUnhealthy(address)
+			r.markEndpointHealth(address, expected, false)
 			return fmt.Errorf("health check returned %d", resp.StatusCode)
 		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address+"/ai/v1/models", nil)
 	if err != nil {
-		r.markUnhealthy(address)
+		r.markEndpointHealth(address, expected, false)
 		return err
 	}
 	if authorization != "" {
@@ -717,29 +738,29 @@ func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) err
 
 	resp, err := r.client.Do(req)
 	if err != nil {
-		r.markUnhealthy(address)
+		r.markEndpointHealth(address, expected, false)
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		r.markUnhealthy(address)
+		r.markEndpointHealth(address, expected, false)
 		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxModelCatalogBytes+1))
 	if err != nil || len(body) > maxModelCatalogBytes {
-		r.markUnhealthy(address)
+		r.markEndpointHealth(address, expected, false)
 		return errors.New("upstream model catalog is unreadable or too large")
 	}
 	models, err := extractModelOperations(bytes.NewReader(body))
 	if err != nil {
-		r.markUnhealthy(address)
+		r.markEndpointHealth(address, expected, false)
 		return err
 	}
 
-	r.UpdateModelOperations(address, models)
-	r.markHealthy(address)
+	r.updateModelOperationsForEndpoint(address, expected, models)
+	r.markEndpointHealth(address, expected, true)
 	return nil
 }
 
@@ -835,22 +856,27 @@ func extractModelOperations(r io.Reader) (map[string]map[OperationType]bool, err
 }
 
 func (r *ModelRegistry) markHealthy(address string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if ep, exists := r.endpoints[address]; exists {
-		ep.Healthy = true
-		endpointHealth.WithLabelValues(ep.Pool, address).Set(1)
-	}
+	r.markEndpointHealth(address, nil, true)
 }
 
 func (r *ModelRegistry) markUnhealthy(address string) {
+	r.markEndpointHealth(address, nil, false)
+}
+
+func (r *ModelRegistry) markEndpointHealth(address string, expected *Endpoint, healthy bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if ep, exists := r.endpoints[address]; exists {
-		ep.Healthy = false
-		endpointHealth.WithLabelValues(ep.Pool, address).Set(0)
+		if expected != nil && ep != expected {
+			return
+		}
+		ep.Healthy = healthy
+		value := float64(0)
+		if healthy {
+			value = 1
+		}
+		endpointHealth.WithLabelValues(ep.Pool, address).Set(value)
 	}
 }
 
@@ -1101,23 +1127,42 @@ type Proxy struct {
 	listenAddr          string
 	maxRequestBodyBytes int64
 	bodyAdmission       *byteAdmission
+	catalogAdmission    *byteAdmission
+	refreshWake         chan struct{}
+	capabilityLeaseMu   sync.Mutex
+	capabilityLeases    map[string]proxyCapabilityLease
 }
 
 const defaultMaxProxyRequestBodyBytes int64 = 256 << 20
 const defaultMaxProxyRetainedBodyBytes int64 = 512 << 20
+const defaultMaxProxyRetainedCatalogBytes int64 = 256 << 20
+const capabilityLeaseTTL = 5 * time.Minute
+const maxCapabilityLeases = 1024
+const capabilityTokenHeader = "X-Antfly-Capability-Token"
+const capabilityStaleHeader = "X-Antfly-Capability-Stale"
+
+type proxyCapabilityLease struct {
+	model               string
+	operation           OperationType
+	pool                string
+	authorizationDigest [sha256.Size]byte
+	endpoints           map[string]*Endpoint
+	expiresAt           time.Time
+}
 
 // Config holds proxy configuration
 type Config struct {
-	ListenAddr            string
-	DefaultPool           string
-	RefreshInterval       time.Duration
-	EnableRouteWatching   bool        // Enable watching InferenceProxy CRs
-	RouteWatchNamespace   string      // Namespace to watch for routes (empty for all)
-	RouteWatchKubeconfig  string      // Optional kubeconfig path for route watching
-	UpstreamAuthorization string      // Optional Authorization header value for upstream refreshes and requests
-	MaxRequestBodyBytes   int64       // Optional retained request-body ceiling; defaults to 256 MiB
-	MaxRetainedBodyBytes  int64       // Optional process-wide retained request-body ceiling; defaults to 512 MiB
-	Logger                *zap.Logger // Optional logger (defaults to production logger)
+	ListenAddr              string
+	DefaultPool             string
+	RefreshInterval         time.Duration
+	EnableRouteWatching     bool        // Enable watching InferenceProxy CRs
+	RouteWatchNamespace     string      // Namespace to watch for routes (empty for all)
+	RouteWatchKubeconfig    string      // Optional kubeconfig path for route watching
+	UpstreamAuthorization   string      // Optional Authorization header value for upstream refreshes and requests
+	MaxRequestBodyBytes     int64       // Optional retained request-body ceiling; defaults to 256 MiB
+	MaxRetainedBodyBytes    int64       // Optional process-wide retained request-body ceiling; defaults to 512 MiB
+	MaxRetainedCatalogBytes int64       // Optional process-wide model-catalog ceiling; defaults to 256 MiB
+	Logger                  *zap.Logger // Optional logger (defaults to production logger)
 }
 
 // NewProxy creates a new Proxy
@@ -1132,11 +1177,13 @@ func NewProxy(cfg Config) *Proxy {
 	}
 
 	p := &Proxy{
-		registry:    registry,
-		router:      router,
-		defaultPool: cfg.DefaultPool,
-		listenAddr:  cfg.ListenAddr,
-		logger:      logger,
+		registry:         registry,
+		router:           router,
+		defaultPool:      cfg.DefaultPool,
+		listenAddr:       cfg.ListenAddr,
+		logger:           logger,
+		refreshWake:      make(chan struct{}, 1),
+		capabilityLeases: make(map[string]proxyCapabilityLease),
 	}
 	p.maxRequestBodyBytes = cfg.MaxRequestBodyBytes
 	if p.maxRequestBodyBytes <= 0 {
@@ -1150,6 +1197,11 @@ func NewProxy(cfg Config) *Proxy {
 		maxRetainedBodyBytes = p.maxRequestBodyBytes
 	}
 	p.bodyAdmission = newByteAdmission(maxRetainedBodyBytes)
+	maxRetainedCatalogBytes := cfg.MaxRetainedCatalogBytes
+	if maxRetainedCatalogBytes <= 0 {
+		maxRetainedCatalogBytes = defaultMaxProxyRetainedCatalogBytes
+	}
+	p.catalogAdmission = newByteAdmission(maxRetainedCatalogBytes)
 
 	// Initialize RouteWatcher if enabled
 	if cfg.EnableRouteWatching {
@@ -1284,6 +1336,7 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 const maxModelCatalogBytes = 8 << 20
 const maxMergedModelCatalogBytes = 32 << 20
 const maxConcurrentModelCatalogRequests = 8
+const maxModelCatalogWorkingBytes = 3 * maxModelCatalogBytes
 
 // handleModels publishes a conservative catalog for one routing scope. Antfly
 // clients provide model+task query parameters, allowing the proxy to aggregate
@@ -1323,16 +1376,33 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no operation-eligible inference endpoints", http.StatusServiceUnavailable)
 		return
 	}
+	// Bound the complete fan-out rather than each HTTP response in isolation.
+	// The merged catalog and up to maxConcurrentModelCatalogRequests decoded
+	// upstream catalogs can coexist while results are drained. Charge the raw
+	// body, RawMessage copy, and transient task-inventory parse for each slot.
+	catalogBytes := int64(maxMergedModelCatalogBytes) +
+		int64(min(len(addresses), maxConcurrentModelCatalogRequests))*int64(maxModelCatalogWorkingBytes)
+	if err := p.catalogAdmission.Acquire(r.Context(), catalogBytes); err != nil {
+		status := http.StatusServiceUnavailable
+		if !errors.Is(err, errByteAdmissionRequestTooLarge) {
+			status = http.StatusRequestTimeout
+		}
+		http.Error(w, "inference model catalog admission unavailable", status)
+		return
+	}
+	defer p.catalogAdmission.Release(catalogBytes)
 
 	type catalogResult struct {
-		catalog map[string]json.RawMessage
-		err     error
+		endpoint *Endpoint
+		catalog  map[string]json.RawMessage
+		err      error
 	}
 	resultBuffer := min(len(addresses), maxConcurrentModelCatalogRequests)
 	results := make(chan catalogResult, resultBuffer)
 	catalogSlots := make(chan struct{}, maxConcurrentModelCatalogRequests)
-	for _, address := range addresses {
-		go func(address string) {
+	for _, endpoint := range endpoints {
+		go func(endpoint *Endpoint) {
+			address := endpoint.Address
 			select {
 			case catalogSlots <- struct{}{}:
 				defer func() { <-catalogSlots }()
@@ -1372,14 +1442,15 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 				results <- catalogResult{err: errors.New("upstream catalog no longer advertises the scoped model task")}
 				return
 			}
-			results <- catalogResult{catalog: catalog}
-		}(address)
+			results <- catalogResult{endpoint: endpoint, catalog: catalog}
+		}(endpoint)
 	}
 
 	categories := map[string]map[string]json.RawMessage{}
 	successes := 0
 	failures := 0
 	mergedTooLarge := false
+	leaseEndpoints := make(map[string]*Endpoint, len(endpoints))
 	for range addresses {
 		result := <-results
 		if result.err != nil {
@@ -1387,6 +1458,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		successes++
+		leaseEndpoints[result.endpoint.Address] = result.endpoint
 		if !mergedTooLarge {
 			if model != "" {
 				mergeScopedModelCatalog(categories, result.catalog, taskScope, model)
@@ -1430,10 +1502,94 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		data = append(data, map[string]string{"id": model})
 	}
 	response["data"] = data
+	if model != "" {
+		token, err := p.issueCapabilityLease(
+			model,
+			taskScope.Operation,
+			pool,
+			p.upstreamAuthorizationForRequest(r),
+			leaseEndpoints,
+		)
+		if err != nil {
+			http.Error(w, "failed to issue inference capability lease", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set(capabilityTokenHeader, token)
+		w.Header().Set("Access-Control-Expose-Headers", capabilityTokenHeader)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		p.logger.Warn("failed to encode merged inference model catalog", zap.Error(err))
 	}
+}
+
+func (p *Proxy) issueCapabilityLease(model string, operation OperationType, pool, authorization string, endpoints map[string]*Endpoint) (string, error) {
+	var random [32]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(random[:])
+	allowed := make(map[string]*Endpoint, len(endpoints))
+	for address, endpoint := range endpoints {
+		allowed[address] = endpoint
+	}
+	now := time.Now()
+	p.capabilityLeaseMu.Lock()
+	defer p.capabilityLeaseMu.Unlock()
+	for key, lease := range p.capabilityLeases {
+		if !now.Before(lease.expiresAt) {
+			delete(p.capabilityLeases, key)
+		}
+	}
+	if len(p.capabilityLeases) >= maxCapabilityLeases {
+		var oldestKey string
+		var oldest time.Time
+		for key, lease := range p.capabilityLeases {
+			if oldestKey == "" || lease.expiresAt.Before(oldest) {
+				oldestKey, oldest = key, lease.expiresAt
+			}
+		}
+		delete(p.capabilityLeases, oldestKey)
+	}
+	p.capabilityLeases[token] = proxyCapabilityLease{
+		model: model, operation: operation, pool: pool,
+		authorizationDigest: sha256.Sum256([]byte(authorization)),
+		endpoints:           allowed, expiresAt: now.Add(capabilityLeaseTTL),
+	}
+	return token, nil
+}
+
+func (p *Proxy) validateCapabilityLease(token, model string, operation OperationType, pool, authorization string) error {
+	return p.validateCapabilityLeaseDigest(token, model, operation, pool, sha256.Sum256([]byte(authorization)))
+}
+
+func (p *Proxy) validateCapabilityLeaseDigest(token, model string, operation OperationType, pool string, authorizationDigest [sha256.Size]byte) error {
+	if token == "" {
+		return nil
+	}
+	now := time.Now()
+	p.capabilityLeaseMu.Lock()
+	lease, ok := p.capabilityLeases[token]
+	if ok && !now.Before(lease.expiresAt) {
+		delete(p.capabilityLeases, token)
+		ok = false
+	}
+	p.capabilityLeaseMu.Unlock()
+	if !ok || lease.model != model || lease.operation != operation || lease.pool != pool ||
+		lease.authorizationDigest != authorizationDigest {
+		return &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
+	}
+	candidates := p.router.ResolveEndpointCandidates(model, pool, nil, operation)
+	if len(candidates) != len(lease.endpoints) {
+		return &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
+	}
+	for _, endpoint := range candidates {
+		expected, allowed := lease.endpoints[endpoint.Address]
+		if !allowed || expected != endpoint {
+			return &ResolutionError{StatusCode: http.StatusConflict, Message: "inference capability lease is stale"}
+		}
+	}
+	return nil
 }
 
 type catalogTaskScope struct {
@@ -2219,6 +2375,9 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 	})
 	if err != nil {
 		if resolutionErr, ok := err.(*ResolutionError); ok {
+			if resolutionErr.StatusCode == http.StatusConflict {
+				w.Header().Set(capabilityStaleHeader, "true")
+			}
 			if resolutionErr.RetryAfter > 0 {
 				w.Header().Set("Retry-After", fmt.Sprintf("%d", resolutionErr.RetryAfter))
 			}
@@ -2414,42 +2573,61 @@ func (p *Proxy) handleReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) refreshLoop(ctx context.Context) {
-	if p.registry.refreshInterval <= 0 {
-		return
+	var ticker *time.Ticker
+	var periodic <-chan time.Time
+	if p.registry.refreshInterval > 0 {
+		ticker = time.NewTicker(p.registry.refreshInterval)
+		periodic = ticker.C
+		defer ticker.Stop()
 	}
 
-	ticker := time.NewTicker(p.registry.refreshInterval)
-	defer ticker.Stop()
+	// Cover endpoints registered before Start/StartBackground. Later
+	// registrations coalesce on refreshWake.
+	p.refreshAllEndpoints(ctx)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			p.registry.mu.RLock()
-			endpoints := make([]string, 0, len(p.registry.endpoints))
-			for addr := range p.registry.endpoints {
-				endpoints = append(endpoints, addr)
-			}
-			p.registry.mu.RUnlock()
-
-			for _, addr := range endpoints {
-				// Ignore refresh errors - continue to try other endpoints
-				_ = p.registry.RefreshEndpoint(ctx, addr)
-			}
-
-			// Update pool queue depth metrics
-			p.registry.mu.RLock()
-			for pool, eps := range p.registry.pools {
-				var totalQueue int32
-				for _, ep := range eps {
-					totalQueue += atomic.LoadInt32(&ep.QueueDepth)
-				}
-				queueDepth.WithLabelValues(pool).Set(float64(totalQueue))
-			}
-			p.registry.mu.RUnlock()
+		case <-periodic:
+			p.refreshAllEndpoints(ctx)
+		case <-p.refreshWake:
+			p.refreshAllEndpoints(ctx)
 		}
 	}
+}
+
+func (p *Proxy) requestEndpointRefresh() {
+	select {
+	case p.refreshWake <- struct{}{}:
+	default:
+		// One pending full refresh already covers every registration observed
+		// before it snapshots the registry.
+	}
+}
+
+func (p *Proxy) refreshAllEndpoints(ctx context.Context) {
+	p.registry.mu.RLock()
+	endpoints := make([]string, 0, len(p.registry.endpoints))
+	for addr := range p.registry.endpoints {
+		endpoints = append(endpoints, addr)
+	}
+	p.registry.mu.RUnlock()
+
+	for _, addr := range endpoints {
+		// A failed endpoint remains quarantined; other endpoints still refresh.
+		_ = p.registry.RefreshEndpoint(ctx, addr)
+	}
+
+	p.registry.mu.RLock()
+	for pool, eps := range p.registry.pools {
+		var totalQueue int32
+		for _, ep := range eps {
+			totalQueue += atomic.LoadInt32(&ep.QueueDepth)
+		}
+		queueDepth.WithLabelValues(pool).Set(float64(totalQueue))
+	}
+	p.registry.mu.RUnlock()
 }
 
 // Registry returns the model registry for external access
@@ -2465,11 +2643,13 @@ func (p *Proxy) Router() *Router {
 // RegisterEndpoint adds an endpoint (called from K8s watcher)
 func (p *Proxy) RegisterEndpoint(address, pool string, workloadType WorkloadType) {
 	p.registry.RegisterEndpoint(address, pool, workloadType)
+	p.requestEndpointRefresh()
 }
 
 // RegisterEndpointWithHealth adds an endpoint with a distinct operational health URL.
 func (p *Proxy) RegisterEndpointWithHealth(address, healthURL, pool string, workloadType WorkloadType) {
 	p.registry.RegisterEndpointWithHealth(address, healthURL, pool, workloadType)
+	p.requestEndpointRefresh()
 }
 
 // UnregisterEndpoint removes an endpoint (called from K8s watcher)
@@ -2515,6 +2695,13 @@ func (p *Proxy) upstreamAuthorizationForRequest(r *http.Request) string {
 		return configured
 	}
 	return strings.TrimSpace(r.Header.Get("Authorization"))
+}
+
+func (p *Proxy) upstreamAuthorizationForHeaders(headers map[string]string) string {
+	if configured := p.registry.upstreamAuthorizationValue(); configured != "" {
+		return configured
+	}
+	return strings.TrimSpace(headerValue(headers, "Authorization"))
 }
 
 func (p *Proxy) recordProxyMetrics(pool, model, operation string, started time.Time, status string) {

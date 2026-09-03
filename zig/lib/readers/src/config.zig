@@ -51,6 +51,7 @@ pub const Config = struct {
     max_tokens: ?i64 = null,
     api_key: ?[]const u8 = null,
     bearer_token: ?[]const u8 = null,
+    capability_token: ?[]const u8 = null,
     base_url: ?[]const u8 = null,
     url: ?[]const u8 = null,
     api_url: ?[]const u8 = null,

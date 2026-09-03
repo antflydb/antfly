@@ -22,7 +22,14 @@ const data_uri = @import("antfly_scraping").data_uri;
 const Allocator = std.mem.Allocator;
 const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
 
-fn readHttpStatusError(status: u16) anyerror {
+fn responseCapabilityStale(response: httpx.Response) bool {
+    if (response.status.code != 409) return false;
+    const value = response.headers.get("X-Antfly-Capability-Stale") orelse return false;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "true");
+}
+
+fn readHttpStatusError(status: u16, capability_stale: bool) anyerror {
+    if (status == 409 and capability_stale) return error.InferenceCapabilitiesStale;
     return if (status == 408 or status == 409 or status == 425 or status == 429 or status >= 500)
         error.ReadTransientFailure
     else
@@ -30,9 +37,11 @@ fn readHttpStatusError(status: u16) anyerror {
 }
 
 test "reader classifies retryable HTTP statuses" {
-    try std.testing.expect(readHttpStatusError(429) == error.ReadTransientFailure);
-    try std.testing.expect(readHttpStatusError(503) == error.ReadTransientFailure);
-    try std.testing.expect(readHttpStatusError(400) == error.ReadRequestFailed);
+    try std.testing.expect(readHttpStatusError(429, false) == error.ReadTransientFailure);
+    try std.testing.expect(readHttpStatusError(503, false) == error.ReadTransientFailure);
+    try std.testing.expect(readHttpStatusError(400, false) == error.ReadRequestFailed);
+    try std.testing.expect(readHttpStatusError(409, false) == error.ReadTransientFailure);
+    try std.testing.expect(readHttpStatusError(409, true) == error.InferenceCapabilitiesStale);
 }
 
 pub const Provider = config.Provider;
@@ -323,6 +332,7 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
         .max_tokens = cfg.max_tokens,
         .api_key = try dupOpt(alloc, cfg.api_key),
         .bearer_token = try dupOpt(alloc, cfg.bearer_token),
+        .capability_token = try dupOpt(alloc, cfg.capability_token),
         .base_url = try dupOpt(alloc, cfg.base_url),
         .url = try dupOpt(alloc, cfg.url),
         .api_url = try dupOpt(alloc, cfg.api_url),
@@ -337,6 +347,7 @@ pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
     freeOpt(alloc, cfg.prompt);
     freeOpt(alloc, cfg.api_key);
     freeOpt(alloc, cfg.bearer_token);
+    freeOpt(alloc, cfg.capability_token);
     freeOpt(alloc, cfg.base_url);
     freeOpt(alloc, cfg.url);
     freeOpt(alloc, cfg.api_url);
@@ -364,6 +375,7 @@ const AntflyReaderState = struct {
     http: *httpx.Client,
     api_url: []const u8,
     auth_header: ?[2][]const u8 = null,
+    capability_token: ?[]const u8 = null,
     model: []const u8,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -371,13 +383,22 @@ const AntflyReaderState = struct {
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Reader {
         const state = try alloc.create(AntflyReaderState);
         errdefer alloc.destroy(state);
+        const api_url = try alloc.dupe(u8, cfg.resolvedUrl() orelse "http://127.0.0.1:8080");
+        errdefer alloc.free(api_url);
+        const model = try alloc.dupe(u8, cfg.model orelse "");
+        errdefer alloc.free(model);
+        const prompt = try dupOpt(alloc, cfg.prompt);
+        errdefer freeOpt(alloc, prompt);
+        const capability_token = try dupOpt(alloc, cfg.capability_token);
+        errdefer freeOpt(alloc, capability_token);
         state.* = .{
             .alloc = alloc,
             .http = http,
-            .api_url = try alloc.dupe(u8, cfg.resolvedUrl() orelse "http://127.0.0.1:8080"),
-            .model = try alloc.dupe(u8, cfg.model orelse ""),
-            .prompt = try dupOpt(alloc, cfg.prompt),
+            .api_url = api_url,
+            .model = model,
+            .prompt = prompt,
             .max_tokens = cfg.max_tokens,
+            .capability_token = capability_token,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
@@ -391,6 +412,7 @@ const AntflyReaderState = struct {
         self.alloc.free(self.model);
         freeOpt(self.alloc, self.prompt);
         if (self.auth_header) |header| self.alloc.free(header[1]);
+        freeOpt(self.alloc, self.capability_token);
         self.alloc.destroy(self);
     }
 
@@ -419,18 +441,24 @@ const AntflyReaderState = struct {
 
         const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
         defer alloc.free(url);
-        var header_buf: [1][2][]const u8 = undefined;
-        const headers: []const [2][]const u8 = if (self.auth_header) |header| blk: {
-            header_buf[0] = header;
-            break :blk header_buf[0..];
-        } else &.{};
+        var header_buf: [2][2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (self.auth_header) |header| {
+            header_buf[header_count] = header;
+            header_count += 1;
+        }
+        if (self.capability_token) |token| {
+            header_buf[header_count] = .{ "X-Antfly-Capability-Token", token };
+            header_count += 1;
+        }
+        const headers = header_buf[0..header_count];
         var resp = try self.http.post(url, .{
             .json = body,
             .headers = headers,
             .max_response_size = req.max_response_bytes,
         });
         defer resp.deinit();
-        if (!resp.ok()) return readHttpStatusError(resp.status.code);
+        if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
 
         const payload = resp.body orelse return error.EmptyResponse;
         var parsed = try std.json.parseFromSlice(inference_api.ReadResponse, alloc, payload, .{
@@ -676,7 +704,7 @@ fn CloudReaderState(comptime provider: Provider) type {
                 .max_response_size = req.max_response_bytes,
             });
             defer resp.deinit();
-            if (!resp.ok()) return readHttpStatusError(resp.status.code);
+            if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
             const Response = struct { choices: []const struct { message: struct { content: ?[]const u8 = null } } = &.{} };
             var parsed = try std.json.parseFromSlice(Response, alloc, resp.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
@@ -716,7 +744,7 @@ fn CloudReaderState(comptime provider: Provider) type {
                 .max_response_size = req.max_response_bytes,
             });
             defer resp.deinit();
-            if (!resp.ok()) return readHttpStatusError(resp.status.code);
+            if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
             const Response = struct {
                 candidates: []const struct {
                     content: struct {

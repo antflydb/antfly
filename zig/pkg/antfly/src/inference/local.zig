@@ -179,6 +179,8 @@ pub const Provider = struct {
     base_url: []const u8,
     cancellation: ?CancellationToken = null,
     auth_header: ?[2][]const u8 = null,
+    capability_token: ?[]u8 = null,
+    request_header_storage: [2][2][]const u8 = undefined,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -202,6 +204,10 @@ pub const Provider = struct {
             self.allocator.free(h[1]);
             self.auth_header = null;
         }
+        if (self.capability_token) |token| {
+            self.allocator.free(token);
+            self.capability_token = null;
+        }
     }
 
     pub fn setApiKey(self: *Provider, api_key: []const u8) !void {
@@ -216,6 +222,16 @@ pub const Provider = struct {
             self.allocator.free(h[1]);
         }
         self.auth_header = .{ "Authorization", try self.allocator.dupe(u8, auth_header) };
+    }
+
+    /// Bind execution to the distributed capability snapshot used by the
+    /// planner. The proxy rejects this token when its eligible route changes.
+    pub fn setCapabilityToken(self: *Provider, token: []const u8) !void {
+        if (self.capability_token) |existing| {
+            if (std.mem.eql(u8, existing, token)) return;
+            self.allocator.free(existing);
+        }
+        self.capability_token = try self.allocator.dupe(u8, token);
     }
 
     pub fn setRequestCancellation(self: *Provider, cancellation: ?CancellationToken) void {
@@ -250,9 +266,17 @@ pub const Provider = struct {
         self.presence_penalty = presence_penalty;
     }
 
-    fn authHeaders(self: *const Provider) ?[]const [2][]const u8 {
-        if (self.auth_header) |*h| return @as(*const [1][2][]const u8, h);
-        return null;
+    fn requestHeaders(self: *Provider) ?[]const [2][]const u8 {
+        var count: usize = 0;
+        if (self.auth_header) |header| {
+            self.request_header_storage[count] = header;
+            count += 1;
+        }
+        if (self.capability_token) |token| {
+            self.request_header_storage[count] = .{ "X-Antfly-Capability-Token", token };
+            count += 1;
+        }
+        return if (count == 0) null else self.request_header_storage[0..count];
     }
 
     pub fn embedder(self: *Provider) inference.Embedder {
@@ -289,7 +313,7 @@ pub const Provider = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
             .json = json_body,
-            .headers = self.authHeaders(),
+            .headers = self.requestHeaders(),
             .cancellation = if (self.cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
             else
@@ -299,6 +323,7 @@ pub const Provider = struct {
 
         if (!resp.ok()) {
             logEmbedFailure("sparse", url, resp.status.code, resp.body);
+            if (isCapabilityStaleResponse(resp)) return error.InferenceCapabilitiesStale;
             return mapEmbedStatus(resp.status.code);
         }
 
@@ -383,7 +408,7 @@ pub const Provider = struct {
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{
             .json = json_body,
-            .headers = self.authHeaders(),
+            .headers = self.requestHeaders(),
             .cancellation = if (self.cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
             else
@@ -393,6 +418,7 @@ pub const Provider = struct {
 
         if (!resp.ok()) {
             logEmbedFailure("dense", url, resp.status.code, resp.body);
+            if (isCapabilityStaleResponse(resp)) return error.InferenceCapabilitiesStale;
             return mapEmbedStatus(resp.status.code);
         }
 
@@ -447,12 +473,15 @@ pub const Provider = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
             .json = json_body,
-            .headers = self.authHeaders(),
+            .headers = self.requestHeaders(),
             .timeout_ms = 300_000,
             .max_response_size = self.max_response_bytes,
         });
         defer resp.deinit();
-        if (!resp.ok()) return error.GenerateRequestFailed;
+        if (!resp.ok()) return if (isCapabilityStaleResponse(resp))
+            error.InferenceCapabilitiesStale
+        else
+            error.GenerateRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
@@ -513,9 +542,12 @@ pub const Provider = struct {
             .prompts = documents,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.requestHeaders() });
         defer resp.deinit();
-        if (!resp.ok()) return error.RerankRequestFailed;
+        if (!resp.ok()) return if (isCapabilityStaleResponse(resp))
+            error.InferenceCapabilitiesStale
+        else
+            error.RerankRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
@@ -551,6 +583,12 @@ fn mapEmbedStatus(status: u16) anyerror {
     };
 }
 
+fn isCapabilityStaleResponse(response: httpx.Response) bool {
+    if (response.status.code != 409) return false;
+    const value = response.headers.get("X-Antfly-Capability-Stale") orelse return false;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "true");
+}
+
 fn logEmbedFailure(kind: []const u8, url: []const u8, status: u16, body: ?[]const u8) void {
     const raw = body orelse "";
     const clipped = raw[0..@min(raw.len, 512)];
@@ -559,6 +597,23 @@ fn logEmbedFailure(kind: []const u8, url: []const u8, status: u16, body: ?[]cons
 
 test "antfly provider compiles" {
     _ = Provider;
+}
+
+test "antfly provider composes authorization and capability lease headers" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var http = httpx.Client.init(std.testing.allocator, io_impl.io());
+    defer http.deinit();
+    var provider = Provider.init(std.testing.allocator, &http, "http://inference");
+    defer provider.deinit();
+    try provider.setAuthorizationHeader("Bearer secret");
+    try provider.setCapabilityToken("route-token");
+    const headers = provider.requestHeaders() orelse return error.TestExpectedHeaders;
+    try std.testing.expectEqual(@as(usize, 2), headers.len);
+    try std.testing.expectEqualStrings("Authorization", headers[0][0]);
+    try std.testing.expectEqualStrings("Bearer secret", headers[0][1]);
+    try std.testing.expectEqualStrings("X-Antfly-Capability-Token", headers[1][0]);
+    try std.testing.expectEqualStrings("route-token", headers[1][1]);
 }
 
 test "antfly embed request omits nullable generated fields" {

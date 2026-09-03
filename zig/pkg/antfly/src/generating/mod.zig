@@ -160,8 +160,11 @@ const BackendState = struct {
             },
             .antfly => if (cfg.url.len == 0 and embedded_antfly_provider != null)
                 .{ .embedded_antfly = embedded_antfly_provider.? }
-            else
-                .{ .remote_antfly = antfly_provider.Provider.init(alloc, http, if (cfg.url.len > 0) cfg.url else "http://127.0.0.1:8082") },
+            else blk: {
+                var provider = antfly_provider.Provider.init(alloc, http, if (cfg.url.len > 0) cfg.url else "http://127.0.0.1:8082");
+                if (cfg.capability_token) |token| try provider.setCapabilityToken(token);
+                break :blk .{ .remote_antfly = provider };
+            },
             else => return error.UnsupportedGeneratorProvider,
         };
 
