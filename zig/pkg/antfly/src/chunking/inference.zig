@@ -106,10 +106,19 @@ pub fn chunkInputWithProvider(
     if (cfg.api_url.len == 0) return try chunkInputDirect(alloc, cfg, input);
     if (cfg.model.len == 0) return error.InvalidChunkerConfig;
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
+    var fallback_io: ?std.Io.Threaded = null;
+    defer if (fallback_io) |*io_impl| io_impl.deinit();
+    const io = if (antfly_provider) |provider|
+        provider.io orelse blk: {
+            fallback_io = std.Io.Threaded.init(alloc, .{});
+            break :blk fallback_io.?.io();
+        }
+    else blk: {
+        fallback_io = std.Io.Threaded.init(alloc, .{});
+        break :blk fallback_io.?.io();
+    };
 
-    var http = httpx.Client.init(alloc, io_impl.io());
+    var http = httpx.Client.init(alloc, io);
     defer http.deinit();
 
     var fallback_capability_cache: ?remote_capabilities.Cache = null;

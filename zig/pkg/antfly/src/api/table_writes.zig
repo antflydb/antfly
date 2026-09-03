@@ -763,6 +763,7 @@ const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const remote_capabilities = @import("../inference/remote_capabilities.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const asset_producer_runtime = @import("../asset_producer_runtime.zig");
 const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
@@ -4951,6 +4952,7 @@ const HostedManagedDbCache = struct {
     replica_root_dir: []u8,
     mutex: std.atomic.Mutex = .unlocked,
     write_cache: ProvisionedTableWriteCache,
+    remote_capability_cache: remote_capabilities.Cache,
     runtime_status_cache: runtime_status.TableRuntimeSnapshotCache,
     drop_cleanup_source: ?*ProvisionedTableWriteSource = null,
 
@@ -4960,6 +4962,10 @@ const HostedManagedDbCache = struct {
         cache.* = .{
             .replica_root_dir = try alloc.dupe(u8, replica_root_dir),
             .write_cache = ProvisionedTableWriteCache.init(alloc),
+            .remote_capability_cache = remote_capabilities.Cache.init(
+                alloc,
+                std.Io.Threaded.global_single_threaded.io(),
+            ),
             .runtime_status_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc),
         };
         return cache;
@@ -5017,6 +5023,7 @@ pub fn closeHostedManagedDbCacheForRoot(replica_root_dir: []const u8) void {
     }
     lockAtomic(&cache.mutex);
     cache.write_cache.deinit();
+    cache.remote_capability_cache.deinit();
     cache.runtime_status_cache.deinit();
     cache.mutex.unlock();
     alloc.free(cache.replica_root_dir);
@@ -7583,6 +7590,7 @@ pub const ProvisionedTableWriteSource = struct {
     seed_create_table_writers: bool = true,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    remote_capability_cache: ?*remote_capabilities.Cache = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
@@ -7969,9 +7977,20 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         provider: ?managed_embedder.AntflyProvider,
     ) *ProvisionedTableWriteSource {
-        self.antfly_provider = provider;
-        if (self.write_cache) |cache| cache.antfly_provider = provider;
-        if (self.startup_write_cache) |cache| cache.antfly_provider = provider;
+        self.antfly_provider = providerWithRemoteCapabilityCache(provider, self.remote_capability_cache);
+        if (self.write_cache) |cache| cache.antfly_provider = self.antfly_provider;
+        if (self.startup_write_cache) |cache| cache.antfly_provider = self.antfly_provider;
+        return self;
+    }
+
+    pub fn withRemoteCapabilityCache(
+        self: *ProvisionedTableWriteSource,
+        cache: ?*remote_capabilities.Cache,
+    ) *ProvisionedTableWriteSource {
+        self.remote_capability_cache = cache;
+        self.antfly_provider = providerWithRemoteCapabilityCache(self.antfly_provider, cache);
+        if (self.write_cache) |write_cache| write_cache.antfly_provider = self.antfly_provider;
+        if (self.startup_write_cache) |write_cache| write_cache.antfly_provider = self.antfly_provider;
         return self;
     }
 
@@ -21636,7 +21655,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) *HostedProvisionedTableWriteSource {
         self.antfly_provider = provider;
         if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
-            cache.write_cache.antfly_provider = provider;
+            cache.write_cache.antfly_provider = providerWithRemoteCapabilityCache(provider, &cache.remote_capability_cache);
         }
         return self;
     }
@@ -21774,7 +21793,10 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !ProvisionedTableWriteCache.CachedDb {
         const lsm_root_generation = self.visibleRootGeneration(group_id);
         if (self.backend_runtime) |runtime| cache.write_cache.backend_runtime = runtime;
-        cache.write_cache.antfly_provider = self.antfly_provider;
+        cache.write_cache.antfly_provider = providerWithRemoteCapabilityCache(
+            self.antfly_provider,
+            &cache.remote_capability_cache,
+        );
         cache.write_cache.inference_api_url = self.inference_api_url;
         cache.write_cache.secret_store = self.secret_store;
         cache.write_cache.remote_content = self.remote_content;
@@ -26373,6 +26395,7 @@ const ManagedDbEnrichmentSet = struct {
     sparse: ?db_embedder.SparseEmbedder = null,
     asset_runtime: ?*asset_producer_runtime.Runtime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    chunk_io: ?std.Io = null,
     generated: bool = false,
 
     fn deinit(self: @This(), allocator: std.mem.Allocator) void {
@@ -26393,7 +26416,7 @@ const ManagedDbEnrichmentSet = struct {
             .dense_embedder = self.dense,
             .sparse_embedder = self.sparse,
             .asset_producer = if (self.asset_runtime) |runtime| runtime.ownedProducer() else null,
-            .chunk_provider = chunkProviderFromAntflyProvider(self.antfly_provider),
+            .chunk_provider = chunkProviderFromAntflyProvider(self.antfly_provider, self.chunk_io),
             .enable_without_producers = self.generated,
         };
     }
@@ -26403,6 +26426,7 @@ const ManagedDbEnrichmentSet = struct {
         self.sparse = null;
         self.asset_runtime = null;
         self.antfly_provider = null;
+        self.chunk_io = null;
         self.generated = false;
     }
 
@@ -26413,7 +26437,19 @@ const ManagedDbEnrichmentSet = struct {
     }
 };
 
-fn chunkProviderFromAntflyProvider(provider: ?managed_embedder.AntflyProvider) ?db_mod.enrichment_runtime.ChunkProvider {
+fn providerWithRemoteCapabilityCache(
+    provider: ?managed_embedder.AntflyProvider,
+    cache: ?*remote_capabilities.Cache,
+) ?managed_embedder.AntflyProvider {
+    var bound = provider orelse return null;
+    if (cache) |resolved| bound.remote_capability_cache = resolved;
+    return bound;
+}
+
+fn chunkProviderFromAntflyProvider(
+    provider: ?managed_embedder.AntflyProvider,
+    io: ?std.Io,
+) ?db_mod.enrichment_runtime.ChunkProvider {
     const resolved = provider orelse return null;
     const callback = resolved.chunk_input orelse return null;
     return .{
@@ -26421,6 +26457,7 @@ fn chunkProviderFromAntflyProvider(provider: ?managed_embedder.AntflyProvider) ?
         .boundary_dispatch = resolved.boundary_dispatch,
         .chunk_input_callback = @ptrCast(callback),
         .remote_capability_cache = resolved.remote_capability_cache,
+        .io = io,
     };
 }
 
@@ -26454,6 +26491,7 @@ fn createManagedDbEnrichments(
         .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
         .asset_runtime = asset_runtime,
         .antfly_provider = local_provider,
+        .chunk_io = managed_io,
         .generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json),
     };
 }

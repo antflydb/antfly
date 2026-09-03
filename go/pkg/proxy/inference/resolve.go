@@ -166,7 +166,7 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 	}
 
 	excluded := l.attempts.excludeAndSnapshot(l.Resolution.Endpoint)
-	allowed, err := l.proxy.capabilityLeaseEndpointsDigest(l.capabilityToken, l.capabilityRevision, l.model, l.operation, l.Resolution.Pool, l.capabilityAuthorizationDigest)
+	allowed, err := l.proxy.capabilityLeaseEndpoints(l.capabilityToken, l.capabilityRevision, l.model, l.operation, l.capabilityAuthorizationDigest)
 	if err != nil {
 		return nil, err
 	}
@@ -319,9 +319,19 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 	var pool string
 	var matchedRoute *Route
 	var selectedDest *Destination
+	allowed, err := p.capabilityLeaseEndpoints(
+		headerValue(headers, capabilityTokenHeader),
+		headerValue(headers, capabilityRevisionHeader),
+		routeReq.Model,
+		routeReq.Operation,
+		sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(headers))),
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	if matchedRoute = p.router.RouteManager().Match(routeReq); matchedRoute != nil {
-		dest, err := p.router.RouteManager().SelectDestination(matchedRoute, routeReq, p.registry)
+		dest, err := p.router.RouteManager().SelectDestinationWithin(matchedRoute, routeReq, p.registry, allowed)
 		if err != nil {
 			return nil, &ResolutionError{
 				StatusCode: http.StatusServiceUnavailable,
@@ -332,7 +342,7 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 			selectedDest = dest
 			pool = dest.Pool
 		} else if matchedRoute.Fallback != nil {
-			fallbackPool, fallbackErr := p.resolveRouteFallback(ctx, matchedRoute, routeReq)
+			fallbackPool, fallbackErr := p.resolveRouteFallback(ctx, matchedRoute, routeReq, allowed)
 			if fallbackErr != nil {
 				return nil, fallbackErr
 			}
@@ -348,18 +358,6 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 	if pool == "" {
 		pool = p.defaultPool
 	}
-	allowed, err := p.capabilityLeaseEndpointsDigest(
-		headerValue(headers, capabilityTokenHeader),
-		headerValue(headers, capabilityRevisionHeader),
-		routeReq.Model,
-		routeReq.Operation,
-		pool,
-		sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(headers))),
-	)
-	if err != nil {
-		return nil, err
-	}
-
 	workloadType := resolveWorkloadType(routeReq.Operation, headers)
 	endpoint, err := p.resolveEndpoint(ctx, routeReq.Model, pool, workloadType, routeReq.Operation, reserve, allowed)
 	if err != nil {
@@ -392,7 +390,7 @@ func (p *Proxy) resolveEndpoint(ctx context.Context, model, pool string, workloa
 	return p.router.selectEndpoint(model, workloadType, candidates, false)
 }
 
-func (p *Proxy) resolveRouteFallback(ctx context.Context, route *Route, routeReq *RouteRequest) (string, *ResolutionError) {
+func (p *Proxy) resolveRouteFallback(ctx context.Context, route *Route, routeReq *RouteRequest, allowed map[string]*Endpoint) (string, *ResolutionError) {
 	switch route.Fallback.Action {
 	case "reject":
 		statusCode := route.Fallback.StatusCode
@@ -411,7 +409,7 @@ func (p *Proxy) resolveRouteFallback(ctx context.Context, route *Route, routeReq
 	case "redirect":
 		return route.Fallback.RedirectPool, nil
 	case "queue":
-		queuedPool, queueErr := p.waitForQueuedDestination(ctx, route, routeReq)
+		queuedPool, queueErr := p.waitForQueuedDestination(ctx, route, routeReq, allowed)
 		if queueErr != nil {
 			return "", &ResolutionError{
 				StatusCode: http.StatusServiceUnavailable,

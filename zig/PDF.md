@@ -160,13 +160,15 @@ remote executor then sends that already-bounded window to the inference node.
 The PDF container and an unbounded set of page images are never forwarded as
 implicit remote state.
 
-Capability discovery is scoped to the selected/default inference pool, model,
-task, and authentication identity. Antfly clients query
+Capability discovery is scoped to the model, task, and effective authentication
+identity. Antfly clients query
 `/ai/v1/models?model=<model>&task=<task>`, where task is one of `read`,
 `generate`, `embed`, `rerank`, `chunk`, `extract`, `rewrite`, `classify`, or
-`transcribe`, with the same pool and
-authorization headers used for execution. The proxy intersects only healthy
-endpoints that explicitly advertise the corresponding operation. Bootstrap
+`transcribe`, with the same authorization used for execution. The proxy surveys
+healthy endpoint incarnations across pools under that authorization and leases
+only nodes that explicitly advertise the corresponding operation. Execution
+first selects its configured route and pool, then intersects that concrete route
+with the leased endpoint set. Bootstrap
 inventory is eligible only before the first successful catalog refresh;
 successfully discovered generic inventory is task-unknown and fails closed.
 Thus admission uses limits that every routing candidate can honor rather than
@@ -213,9 +215,10 @@ before that endpoint's first successful catalog refresh. The cluster catalog
 is assembled from healthy inference nodes and merges duplicate descriptors conservatively:
 accepted inputs and boolean support are intersected, numeric ceilings use the
 minimum, and native batching is advertised only when every eligible duplicate
-supports it. If any currently routable node's catalog cannot be read, discovery
-fails closed rather than publishing a partial union that routing could violate.
-Upstream authorization is forwarded for both discovery and execution.
+supports it. A failed or authorization-ineligible node is omitted from the
+immutable lease, making a partial successful merge safe because execution cannot
+expand back to omitted nodes. Discovery fails only when no safe candidate
+remains. Upstream authorization is forwarded for both discovery and execution.
 
 The long-term proxy contract is model-aware rather than a transparent
 round-robin surface:
@@ -484,8 +487,9 @@ document. They are architectural requirements, not Florence-specific cleanup:
     and partial catalog fan-out could overstate the capabilities of another
     still-routable node. Registry snapshots now retain per-model operations,
     every initial and retry selection applies that filter, executable routes
-    never use unknown bootstrap inventory, and cluster discovery fails closed
-    if any eligible catalog is unavailable.
+    never use unknown bootstrap inventory, and scoped cluster discovery leases
+    only successful task-eligible responders so omitted nodes cannot become
+    routing candidates.
 33. **Generic generator media bypassed generation-batch byte and decoded-pixel
     admission.** Preflight now includes raw `media` parts in the aggregate
     resident-byte shape. Parsing uses that admitted byte ceiling; image headers,
@@ -523,11 +527,10 @@ document. They are architectural requirements, not Florence-specific cleanup:
     legacy inventory; a legacy generic entry cannot receive any executable
     model-family traffic merely because its model name matches.
 38. **The proxy catalog described a different pool from request execution.**
-    Capability discovery now carries model and task scope and honors the same
-    explicit/default pool as execution. The proxy fans out only to healthy
-    operation-eligible endpoints in that scope and rejects a refresh if any
-    candidate no longer advertises the requested model/task. Unscoped legacy
-    listing remains pool-scoped rather than publishing a cluster-wide union.
+    Capability discovery now carries model and task scope and builds an
+    immutable lease from caller-authorized healthy responders across pools.
+    Execution selects the configured route and intersects its concrete pool and
+    operation with that lease. Unscoped legacy listing remains pool-scoped.
 39. **Zero overloaded both an unknown limit and a real numeric value.** Version
     2 capability descriptors use null for unknown/not published and preserve
     zero as a known disabled ceiling. The media field is named
@@ -1173,12 +1176,14 @@ document. They are architectural requirements, not Florence-specific cleanup:
 120. **The token did not identify the descriptor revision.** Scoped catalogs
     now return a SHA-256 capability revision alongside the opaque token. The
     client cache stores descriptor, token, and revision as one value and every
-    lease-aware transport sends both headers. The proxy also binds every lease
-    endpoint to the exact upstream catalog digest observed during the merge;
-    a refreshed in-place model descriptor, leased endpoint incarnation,
-    authorization scope, pool, or task makes execution return the same explicit
-    stale-plan conflict. A newly joining endpoint does not invalidate existing
-    work; it is excluded from that lease until rediscovery.
+    lease-aware transport sends both headers. The proxy binds the immutable
+    lease to the exact merged descriptor bytes, authorization scope, semantic
+    task, and endpoint incarnations observed during discovery. A later catalog
+    refresh cannot mutate or evict that admitted snapshot; a replaced endpoint,
+    changed authorization/task/revision header, or expired token returns an
+    explicit stale-plan conflict. Newly joining endpoints remain excluded until
+    rediscovery. If a model tightens its live contract during the short lease,
+    the concrete node's final executor validation rejects over-limit work.
 121. **Planning and execution read capability state in separate cache calls.**
     `CapabilityLease` is now the atomic cache API. Single-flight publication,
     stale-if-error fallback, and allocation failure publish or reject the whole
@@ -1186,12 +1191,14 @@ document. They are architectural requirements, not Florence-specific cleanup:
     extractor, chunker, and transcriber execution consume that tuple directly;
     cache-admission OOM is no longer silently ignored.
 122. **Proxy admission charged logical body length rather than live memory.**
-    Known-length bodies now receive an exact-size replay allocation. Chunked
-    bodies reserve and allocate the configured maximum. Admission charges both
-    the replay buffer and JSON model-extraction working representation, uses
-    saturating arithmetic, and holds the grant through retries. The process
-    ceiling is raised to at least one maximum-size request's complete charged
-    working set.
+    Known-length bodies receive an exact-size replay allocation. Unknown-length
+    bodies reserve the configured maximum only while their bounded stream is
+    being read, grow storage in proportion to bytes actually received, and
+    immediately return unused admission once their retained buffer capacity is
+    known. Admission then charges that physical replay capacity and JSON
+    model-extraction working representation through retries, using saturating
+    arithmetic. A tiny chunked request therefore neither allocates nor retains
+    admission for the full 256-MiB ceiling.
 123. **Remote reranking recreated discovery state for every query.** The
     provisioned table-read runtime now owns one bounded capability cache and
     lends it through the typed provider descriptor to reranking. Stateless API
@@ -1203,6 +1210,40 @@ document. They are architectural requirements, not Florence-specific cleanup:
     revision, recognize stale-plan responses, and invalidate the tuple before
     retry. This completes lease-aware HTTP transport for all currently routed
     families; task-specific request and result types remain separate.
+125. **Pool-bound discovery could not execute a non-default configured route.**
+    Scoped discovery now produces a route-independent, authorization-scoped
+    endpoint lease across healthy pools. Execution evaluates the normal route
+    manager first and intersects the selected pool and concrete operation with
+    that immutable endpoint set. Weighted, conditional, header, and table routes
+    can therefore reuse the same semantic model lease without rebinding work to
+    a node that was absent from discovery.
+126. **Caller-visible models were prefiltered through service-credential
+    inventory.** Scoped discovery begins from healthy endpoint incarnations and
+    treats each caller-authorized catalog as the eligibility authority. Leased
+    execution consumes the operation set captured by that scoped result rather
+    than rechecking the global background inventory, so tenant-only models are
+    discoverable without weakening legacy bootstrap rules.
+127. **One failed catalog node disabled the entire distributed pool.** Catalog
+    aggregation now merges successful eligible responders and places only those
+    exact endpoint incarnations in the lease. Destination eligibility and
+    condition statistics are evaluated against that set before weighted route
+    selection, and endpoint selection intersects it again. Omitted failures
+    therefore cannot make the descriptor an over-promise or steer an otherwise
+    serviceable request into an uncovered pool.
+128. **Mutable per-authorization revision slots evicted live work.** Capability
+    leases are now immutable snapshots and endpoint state no longer carries a
+    capped authorization-revision map. The bounded lease table removes expired
+    entries but refuses new issuance under live saturation instead of evicting
+    an admitted lease. Refresh changes affect new leases; endpoint replacement,
+    expiry, or mismatched headers still invalidate old work explicitly.
+129. **Write-side semantic chunking recreated discovery and I/O state per
+    document.** Provisioned storage binds its runtime-owned capability cache
+    into both read and write providers, and durable chunk calls borrow the
+    table backend's long-lived I/O executor. Hosted writers own one cache per
+    hosted root. Durable chunking, embedding, and other enrichment traffic now
+    reuse bounded single-flight snapshots without constructing a threaded
+    runtime for every document, while stateless compatibility entry points
+    retain local cache and I/O fallbacks.
 
 ### Post-review implementation contract
 
@@ -1217,21 +1258,31 @@ The hardening above follows these long-term rules:
   waits are deadline-bounded and cancelable; runtime shutdown drains owners.
   Valid catalog failures may use stale or conservative capabilities, but an
   expired or canceled caller never does.
+- Capability caches and concurrent I/O executors are runtime-owned services,
+  not document-owned implementation details. Read and write enrichment borrow
+  them for their invocation lifetimes; shutdown destroys them only after their
+  dependent DB/runtime owners have drained. Stateless APIs may construct a
+  bounded fallback, but durable PDF and semantic-chunk pipelines do not.
 - Distributed execution re-resolves endpoint eligibility from a current
   per-endpoint model/task catalog on every initial attempt and retry, then
-  intersects it with the exact endpoint identities in the lease. A cached
+  intersects it with the exact endpoint identities in the lease. Weighted
+  destination selection and route conditions see only leased endpoint
+  incarnations, so a partially unavailable catalog fan-out cannot select an
+  uncovered pool while a covered destination remains. A cached
   planner snapshot may make a request temporarily too ambitious after topology
   change, but the proxy neither expands the allowed set to a newly joined node
   nor sends work to a node whose operation is bootstrap-unknown; the concrete
   node remains the final limit validator.
 - Discovery and execution form one capability lease. A scoped catalog response
-  carries an opaque token and revision bound to model, semantic task, pool,
-  effective authorization, exact descriptor bytes, and the exact eligible
-  endpoint catalog incarnations. Antfly clients attach both values to read,
+  carries an opaque token and revision bound to model, semantic task, effective
+  authorization, exact descriptor bytes, and the exact eligible endpoint
+  incarnations. It is intentionally not bound to a pool: execution selects the
+  configured route and then intersects its pool with the leased endpoints.
+  Antfly clients attach both values to read,
   generation, embedding, reranking, chunking, extraction, and transcription
   transports; rewrite and classification use the same task contract when their
-  remote adapters are enabled. A changed or expired route returns
-  an explicit stale-plan 409,
+  remote adapters are enabled. An expired lease, replaced endpoint, or mismatched
+  task, authorization, or revision returns an explicit stale-plan 409,
   invalidates the client snapshot, and requires rediscovery and replanning
   before retry. Legacy clients may omit the token, but never receive the
   planner/executor consistency guarantee. A lease-aware client never silently
@@ -1446,8 +1497,8 @@ The hardening above follows these long-term rules:
     regression coverage proves no reclaimer callback can run on that path.
 23. **Implemented after distributed routing review:** endpoint catalogs retain
     task identity, routing and retry are operation-aware, known-missing models
-    no longer use pool fallback, and an incomplete cluster catalog is not
-    published.
+    no longer use pool fallback, and partial scoped catalogs are published only
+    with an endpoint-constraining lease that excludes every omitted node.
 24. **Implemented after admission review:** generic generator media participates
     in batch byte, image-header, dimension, decoded-pixel, and slot admission;
     the advertised media-part ceiling is a hard parser limit.
@@ -1546,8 +1597,9 @@ The hardening above follows these long-term rules:
     same accounting instead of treating wire bytes as total resident bytes.
 45. **Implemented after capability-TOCTOU review:** scoped model discovery now
     returns a bounded opaque capability token. The proxy validates its
-    model/task/pool, authorization digest, and eligible endpoint incarnations
-    before every initial route and retry. Remote capability caches retain the
+    model/task, authorization digest, revision header, and eligible endpoint
+    incarnations before every initial route and retry, then intersects the
+    configured execution pool. Remote capability caches retain the
     token with the normalized descriptor; reader, generator, dense embedder,
     reranker-provider, and extractor HTTP boundaries can carry it. A stale
     response invalidates the exact model/task/auth cache entry so durable retry

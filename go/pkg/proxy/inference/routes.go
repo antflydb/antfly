@@ -369,13 +369,19 @@ func (rm *RouteManager) matchRoute(route *Route, req *RouteRequest) bool {
 // SelectDestination chooses a destination from a matched route
 // based on weights and conditions
 func (rm *RouteManager) SelectDestination(route *Route, req *RouteRequest, registry *ModelRegistry) (*Destination, error) {
+	return rm.SelectDestinationWithin(route, req, registry, nil)
+}
+
+// SelectDestinationWithin applies route weights and conditions only to pools
+// containing a currently healthy endpoint from the immutable capability lease.
+func (rm *RouteManager) SelectDestinationWithin(route *Route, req *RouteRequest, registry *ModelRegistry, allowed map[string]*Endpoint) (*Destination, error) {
 	// Collect eligible destinations
 	eligible := make([]Destination, 0)
 	totalWeight := int32(0)
 
 	for _, dest := range route.Destinations {
 		// Check conditions
-		if !rm.evaluateConditions(&dest, req, registry) {
+		if !rm.evaluateConditionsWithin(&dest, req, registry, allowed) {
 			continue
 		}
 
@@ -411,7 +417,11 @@ func (rm *RouteManager) SelectDestination(route *Route, req *RouteRequest, regis
 }
 
 func (rm *RouteManager) evaluateConditions(dest *Destination, req *RouteRequest, registry *ModelRegistry) bool {
-	stats := registry.PoolConditionStats(dest.Pool, req.Model)
+	return rm.evaluateConditionsWithin(dest, req, registry, nil)
+}
+
+func (rm *RouteManager) evaluateConditionsWithin(dest *Destination, req *RouteRequest, registry *ModelRegistry, allowed map[string]*Endpoint) bool {
+	stats := registry.PoolConditionStatsWithin(dest.Pool, req.Model, allowed)
 	if stats.HealthyEndpoints == 0 {
 		return false // Pool has no healthy endpoints
 	}

@@ -360,6 +360,11 @@ pub const ProvisionedGroupStorage = struct {
         self.read_cache.backend_runtime = self.backend_runtime;
         self.read_cache.antfly_provider = read_source.antfly_provider;
         self.read_cache.secret_store = read_source.secret_store;
+        // Capability discovery is a storage-runtime service, not a query-only
+        // concern. Bind the same cache into writer enrichment so semantic
+        // chunking and every other remote family reuse planner/executor leases
+        // across documents.
+        _ = write_source.withRemoteCapabilityCache(&self.read_cache.remote_capability_cache);
         // Resident writer DBs also serve freshness-sensitive reads. Leaving
         // their cache unset makes the LSM backend retain a private decoded
         // index for every run, bypassing both the shared cache bound and the
@@ -628,6 +633,7 @@ test "provisioned group storage wires remote content to writer caches" {
     try std.testing.expectEqual(&storage.lsm_cache, storage.read_cache.lsm_cache.?);
     try std.testing.expectEqual(&storage.lsm_cache, storage.write_cache.lsm_cache.?);
     try std.testing.expectEqual(&storage.lsm_cache, storage.startup_write_cache.lsm_cache.?);
+    try std.testing.expectEqual(&storage.read_cache.remote_capability_cache, write_source.remote_capability_cache.?);
 
     // Keep the production aggregate LSM admission policy covered by the API
     // module's permanent root-test filter as well as the exhaustive budget
