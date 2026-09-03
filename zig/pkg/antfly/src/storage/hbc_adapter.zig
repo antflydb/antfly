@@ -3522,13 +3522,15 @@ fn shouldStartExperimentalPostingIdleCheckpoint(wal_bytes: u64, delta_segment_co
         wal_bytes >= managedPostingIdleCheckpointWalBytes;
 }
 
-fn shouldStartExperimentalPostingReadinessCheckpoint(wal_bytes: u64, delta_segment_count: usize) bool {
+fn shouldStartExperimentalPostingReadinessCheckpoint(wal_has_state_records: bool, delta_segment_count: usize) bool {
     // A lifecycle owner has already proved a stable source tip and will join
-    // the build before publication. Any remaining overlay is therefore both
-    // avoidable cold-read amplification and work that could otherwise race
-    // the first query wave; unlike opportunistic idle work, no size floor is
-    // appropriate here.
-    return wal_bytes != 0 or delta_segment_count != 0;
+    // the build before publication. Any remaining state overlay is therefore
+    // both avoidable cold-read amplification and work that could otherwise
+    // race the first query wave; unlike opportunistic idle work, no size floor
+    // is appropriate here. A coverage-only WAL changes no query state and is
+    // already a durable HBC-native watermark, so rewriting a multi-gigabyte
+    // base to absorb it would be pure amplification.
+    return wal_has_state_records or delta_segment_count != 0;
 }
 
 const ExperimentalPostingMaintenanceCapture = struct {
@@ -7507,7 +7509,7 @@ pub const HBCIndex = struct {
         _ = try self.publishCompletedExperimentalPostingCheckpointBuild(posting_store);
         if (self.experimental_posting_checkpoint_build != null) return true;
         if (!shouldStartExperimentalPostingReadinessCheckpoint(
-            posting_store.wal_committed_bytes,
+            posting_store.wal_has_state_records,
             posting_store.deltaSegmentCount(),
         )) return false;
         return try self.startExperimentalPostingCheckpointBuild(posting_store, .full);
@@ -19849,9 +19851,9 @@ test "idle posting checkpoint flattens a max-depth patch chain" {
         0,
         managedPostingMaxDeltaSegments + 1,
     ));
-    try std.testing.expect(!shouldStartExperimentalPostingReadinessCheckpoint(0, 0));
-    try std.testing.expect(shouldStartExperimentalPostingReadinessCheckpoint(1, 0));
-    try std.testing.expect(shouldStartExperimentalPostingReadinessCheckpoint(0, 1));
+    try std.testing.expect(!shouldStartExperimentalPostingReadinessCheckpoint(false, 0));
+    try std.testing.expect(shouldStartExperimentalPostingReadinessCheckpoint(true, 0));
+    try std.testing.expect(shouldStartExperimentalPostingReadinessCheckpoint(false, 1));
 }
 
 test "max-chain full checkpoint starts below the hard WAL budget" {

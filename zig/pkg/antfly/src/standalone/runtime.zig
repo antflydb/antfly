@@ -2394,6 +2394,18 @@ pub fn runFromIterator(
         } else .{},
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
+    // A non-HA standalone process is the complete set of readers and writers
+    // for its local generations; there is no older peer whose storage
+    // capability must be negotiated. Provisioned storage defaults closed for
+    // distributed startup, but LocalStandaloneMetadata has no remote store
+    // reporter that could ever open that gate. Authorize the current native
+    // format before the public listener becomes reachable so a freshly
+    // created dense index is v2 from its first catalog publication. HA roles
+    // remain closed until their replication protocol has an equivalent
+    // all-peer capability fence.
+    if (standaloneNativeAuthorityInitiallyPermitted(cli)) {
+        data_server.provisioned_storage.setDenseNativeAuthorityPermitted(true);
+    }
     defer data_server.deinitWithDeadline(supervisor.deadline());
     const managed_memory = data_server.provisioned_storage.resource_manager.snapshot().memory;
     std.log.info(
@@ -4235,6 +4247,10 @@ fn haStandbyRequested(cli: CliConfig) bool {
         cli.ha_standby_slot != null;
 }
 
+fn standaloneNativeAuthorityInitiallyPermitted(cli: CliConfig) bool {
+    return !haPrimaryRequested(cli) and !haStandbyRequested(cli);
+}
+
 fn haContinuousMutationGuardEnabled(cli: CliConfig) bool {
     // A standby can never acknowledge public state changes: its only legal
     // mutation source is the authenticated replication stream. A primary,
@@ -5927,6 +5943,9 @@ test "standalone runtime leaves auth disabled unless config or cli enables it" {
 }
 
 test "standalone continuous HA mutation guard follows role lifecycle" {
+    try std.testing.expect(standaloneNativeAuthorityInitiallyPermitted(.{}));
+    try std.testing.expect(!standaloneNativeAuthorityInitiallyPermitted(.{ .ha_primary_log = "/ha/primary.wal" }));
+    try std.testing.expect(!standaloneNativeAuthorityInitiallyPermitted(.{ .ha_standby_log = "/ha/standby.wal" }));
     try std.testing.expect(!haContinuousMutationGuardEnabled(.{}));
     try std.testing.expect(!haContinuousMutationGuardEnabled(.{ .ha_primary_log = "/ha/primary.wal" }));
     try std.testing.expect(!haContinuousMutationGuardEnabled(.{

@@ -4004,6 +4004,45 @@ to r126-class performance. The deterministic checkpoint test now proves that a
 non-authoritative v1 mirror can flatten while retaining a concurrently appended
 WAL tail and remaining non-authoritative throughout publication.
 
+The first 1M validation then exposed a coverage-only amplification edge. The
+intended generation 15 full checkpoint published a 1.877 GB flat base, but a
+concurrent 188-byte record which only repeated source coverage caused readiness
+to start an identical generation 16 rewrite. That rewrite overlapped the first
+query curve: concurrency 10 collapsed to 9.05 QPS while the uncontaminated
+concurrency 20/30 waves reached 781.51/838.70 QPS at 0.9924 recall. Live RSS
+peaked at 8.24 GB. This run is diagnostic, not a publishable performance result.
+
+The posting store now durably distinguishes state-bearing WAL records from
+coverage-only records across append, checkpoint-tail publication, and reopen.
+Repeating the current coverage watermark is an idempotent no-op. A newer
+coverage-only watermark remains in the HBC-native WAL for crash-safe recovery,
+but is not query-state debt and cannot trigger a corpus rewrite. Tests include
+a coverage tail arriving after a zero-WAL checkpoint source boundary.
+
+The same A/B also explained the remaining insert regression. Standalone uses
+`LocalStandaloneMetadata`, not the distributed store reporter, so its
+provisioned native-authority gate could never open. It therefore created a v1
+mirror and paid both compatibility-LSM mutation work and native WAL publication;
+1M dense finalization accumulated 259.43 seconds. A non-HA standalone process
+has no mixed-version peer, so it now authorizes native v2 before exposing the
+public listener. Standalone HA remains closed until its replication protocol
+has an all-peer capability fence, and distributed deployments retain their
+durable catalog capability floor.
+
+A clean post-fix 50K public-API qualification confirmed the combined result:
+
+- native-authoritative from initial catalog publication, with the legacy HBC
+  LSM released before ingest;
+- 24.8254 s readiness: 12.5043 s insert plus 12.3211 s optimize;
+- 0.9863 recall;
+- 280.50 / 1092.67 / 1218.01 / 1174.47 QPS at concurrency 1/10/20/30;
+- 4.03 / 14.94 / 34.02 / 60.25 ms p95 at concurrency 1/10/20/30;
+- exactly 208 native leaf-scan hits, zero leaf fallbacks, and zero approximate
+  projection reads per query;
+- one 172 MiB full posting segment, an empty WAL, and no post-readiness rewrite;
+- 2.54 GB cache-inclusive live peak RSS and 339 MB restarted peak RSS, with
+  post-phase attributable demand of 848 MB and 103 MB respectively.
+
 ## Next checks
 
 1. Narrow broad persisted L0 source ranges with adaptive, workload-independent

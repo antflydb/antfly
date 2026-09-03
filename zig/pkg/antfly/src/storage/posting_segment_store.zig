@@ -165,6 +165,13 @@ pub const RecoveredWal = struct {
     }
 };
 
+fn replayHasStateRecords(replay: *const posting_wal.Replay) bool {
+    for (replay.records.items) |record| {
+        if (record.kind != .coverage) return true;
+    }
+    return false;
+}
+
 pub const Store = struct {
     alloc: Allocator,
     storage: lsm_backend.Storage,
@@ -172,6 +179,7 @@ pub const Store = struct {
     checkpoint: ?posting_wal.Checkpoint,
     wal_generation: u64,
     wal_committed_bytes: u64,
+    wal_has_state_records: bool,
     last_committed_batch: ?u64,
     covered_source_sequence: u64,
     segment_bytes: u64,
@@ -214,6 +222,7 @@ pub const Store = struct {
             .checkpoint = null,
             .wal_generation = 1,
             .wal_committed_bytes = 0,
+            .wal_has_state_records = false,
             .last_committed_batch = null,
             .covered_source_sequence = 0,
             .segment_bytes = 0,
@@ -268,6 +277,7 @@ pub const Store = struct {
             try store.replaceWal(recovered.bytes[0..recovered.replay.committed_bytes]);
         }
         store.wal_committed_bytes = recovered.replay.committed_bytes;
+        store.wal_has_state_records = replayHasStateRecords(&recovered.replay);
         store.last_committed_batch = recovered.replay.last_committed_batch;
         store.covered_source_sequence = @max(
             checkpoint.covered_source_sequence,
@@ -371,11 +381,26 @@ pub const Store = struct {
             return err;
         };
         self.wal_committed_bytes = next_committed_bytes;
+        if (!self.wal_has_state_records) {
+            for (records) |record| {
+                if (record.kind != .coverage) {
+                    self.wal_has_state_records = true;
+                    break;
+                }
+            }
+        }
         self.last_committed_batch = batch_id;
         self.covered_source_sequence = covered_source_sequence;
     }
 
     pub fn appendCoverage(self: *Store, batch_id: u64, covered_source_sequence: u64, options: AppendOptions) !void {
+        if (self.poisoned) return error.PostingStoreRequiresReopen;
+        if (covered_source_sequence < self.covered_source_sequence) return error.PostingWalOverlapsCheckpoint;
+        // Coverage is a watermark, not a transaction identity. Re-emitting the
+        // current watermark after a long-running checkpoint only creates a
+        // non-empty WAL tail and can provoke an otherwise identical full
+        // rewrite at the next readiness fence.
+        if (covered_source_sequence == self.covered_source_sequence) return;
         return try self.appendBatchWithOptions(batch_id, &.{.{
             .kind = .coverage,
             .posting_id = 0,
@@ -591,6 +616,7 @@ pub const Store = struct {
         var tail: []const u8 = &.{};
         var tail_last_committed_batch: ?u64 = null;
         var tail_covered_source_sequence = covered_source_sequence;
+        var tail_has_state_records = false;
         if (flattened_wal_bytes) |prefix_bytes_u64| {
             const prefix_bytes = std.math.cast(usize, prefix_bytes_u64) orelse return error.InvalidPostingWalBoundary;
             retained_wal = try self.recoverWal();
@@ -602,8 +628,12 @@ pub const Store = struct {
             }
             var prefix_replay = try posting_wal.Replay.parse(self.alloc, wal.bytes[0..prefix_bytes]);
             defer prefix_replay.deinit();
+            const prefix_covered_source_sequence = if (prefix_bytes == 0)
+                (self.checkpoint orelse return error.MissingPostingCheckpoint).covered_source_sequence
+            else
+                prefix_replay.covered_source_sequence;
             if (prefix_replay.committed_bytes != prefix_bytes or
-                prefix_replay.covered_source_sequence != covered_source_sequence)
+                prefix_covered_source_sequence != covered_source_sequence)
             {
                 return error.InvalidPostingWalBoundary;
             }
@@ -615,6 +645,7 @@ pub const Store = struct {
                 for (tail_replay.records.items) |record| {
                     if (record.source_sequence < covered_source_sequence) return error.PostingWalOverlapsCheckpoint;
                 }
+                tail_has_state_records = replayHasStateRecords(&tail_replay);
                 tail_last_committed_batch = tail_replay.last_committed_batch;
                 tail_covered_source_sequence = @max(covered_source_sequence, tail_replay.covered_source_sequence);
             }
@@ -702,6 +733,7 @@ pub const Store = struct {
         self.checkpoint = next_checkpoint;
         self.wal_generation = next_wal_generation;
         self.wal_committed_bytes = @intCast(tail.len);
+        self.wal_has_state_records = tail_has_state_records;
         self.last_committed_batch = tail_last_committed_batch;
         self.covered_source_sequence = tail_covered_source_sequence;
         self.segment_bytes = next_segment_bytes;
@@ -1093,6 +1125,52 @@ test "storage.posting segment store orders maintenance batches independently fro
     try store.appendCoverage(try store.nextBatchId(), 11, .{ .sync = false });
     try std.testing.expectEqual(@as(u64, 11), store.covered_source_sequence);
     try std.testing.expectEqual(@as(?u64, 3), store.last_committed_batch);
+}
+
+test "storage.posting segment store keeps coverage-only WAL tails out of state debt" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+
+    var store = try Store.open(alloc, memory.storage(), "/posting-coverage-only-tail");
+    var segment_writer = posting_segment.Writer.init(alloc);
+    defer segment_writer.deinit();
+    try segment_writer.appendBaseAt(3, 10, "initial");
+    const segment = try segment_writer.build();
+    defer alloc.free(segment);
+    try store.publishCheckpoint(1, 10, segment);
+
+    try store.appendCoverage(try store.nextBatchId(), 11, .{ .sync = false });
+    try std.testing.expect(store.wal_committed_bytes > 0);
+    try std.testing.expect(!store.wal_has_state_records);
+    const coverage_wal_bytes = store.wal_committed_bytes;
+    const coverage_batch = store.last_committed_batch;
+
+    // Repeating the same watermark is a durable no-op, including when a
+    // checkpoint finished concurrently with its caller.
+    try store.appendCoverage(try store.nextBatchId(), 11, .{ .sync = false });
+    try std.testing.expectEqual(coverage_wal_bytes, store.wal_committed_bytes);
+    try std.testing.expectEqual(coverage_batch, store.last_committed_batch);
+
+    // A checkpoint may retain a coverage-only tail that arrived after its
+    // zero-WAL source boundary. It advances recovery coverage without turning
+    // into query-state debt.
+    try store.publishCheckpointPreservingWalTail(2, 10, segment, 0);
+    try std.testing.expectEqual(coverage_wal_bytes, store.wal_committed_bytes);
+    try std.testing.expectEqual(@as(u64, 11), store.covered_source_sequence);
+    try std.testing.expect(!store.wal_has_state_records);
+    store.deinit();
+
+    store = try Store.open(alloc, memory.storage(), "/posting-coverage-only-tail");
+    defer store.deinit();
+    try std.testing.expect(!store.wal_has_state_records);
+    try store.appendBatch(try store.nextBatchId(), &.{.{
+        .kind = .base,
+        .posting_id = 3,
+        .source_sequence = 11,
+        .payload = "maintenance",
+    }}, 11);
+    try std.testing.expect(store.wal_has_state_records);
 }
 
 test "storage.posting segment publication preserves the exact committed WAL tail" {
