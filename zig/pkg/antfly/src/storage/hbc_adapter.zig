@@ -75,6 +75,8 @@ const vectorindex_hbc_debug = @import("antfly_vectorindex").hbc_debug;
 var temp_path_nonce: u64 = 0;
 const default_deferred_hbc_leaf_splits_per_publish: usize = 256;
 const default_bulk_split_vector_workspace_budget_bytes: u64 = 256 * 1024 * 1024;
+const max_cached_search_scratches: usize = 32;
+const max_retained_posting_commit_entries: usize = 4096;
 
 pub const TestGetVectorViewOrScratchHook = *const fn (?*anyopaque, *HBCIndex, u64) void;
 var test_get_vector_view_or_scratch_ctx: ?*anyopaque = null;
@@ -3172,6 +3174,7 @@ fn experimentalPostingValueKeyId(key: u128) u64 {
 }
 
 const ExperimentalPostingLatestValues = std.AutoHashMapUnmanaged(u128, ?[]const u8);
+const ExperimentalPostingDeferredPatches = std.AutoHashMapUnmanaged(u128, void);
 const ExperimentalPostingCapturedValues = std.AutoHashMapUnmanaged(u128, ?[]u8);
 
 pub const ExperimentalExactVectorMutation = struct {
@@ -3267,6 +3270,64 @@ fn collectExperimentalPostingCompactionValues(
             }
         }
     }
+}
+
+/// Streaming full publication records replacement patches as lightweight
+/// keys. Each patched value is reconstructed immediately before its one use
+/// and released immediately after it has been copied to the staged file. This
+/// keeps peak heap proportional to the largest patched posting rather than the
+/// sum of every patch in the immutable delta chain.
+fn collectExperimentalPostingStreamingCompactionValues(
+    alloc: Allocator,
+    generation: *ExperimentalPostingReadGeneration,
+    latest: *ExperimentalPostingLatestValues,
+    deferred_patches: *ExperimentalPostingDeferredPatches,
+) !void {
+    try collectExperimentalPostingLatestValues(alloc, generation, latest);
+    const root = experimentalPostingRootState(generation) orelse return error.Corrupted;
+    var segment_index = root.segments.len;
+    while (segment_index > 1) {
+        segment_index -= 1;
+        var entries = root.segments[segment_index].entries();
+        while (try entries.next()) |entry| {
+            const decoded = experimentalPostingWalKindFromSegment(entry.kind) orelse continue;
+            const key = experimentalPostingValueKey(entry.id, decoded.kind);
+            const result = try latest.getOrPut(alloc, key);
+            if (result.found_existing) continue;
+            if (decoded.patch) {
+                // A null placeholder prevents an older delta from superseding
+                // this newest entry; the side set distinguishes it from a
+                // tombstone without widening every hot-path map value.
+                result.value_ptr.* = null;
+                try deferred_patches.putNoClobber(alloc, key, {});
+            } else {
+                result.value_ptr.* = if (decoded.tombstone) null else entry.value;
+            }
+        }
+    }
+}
+
+fn experimentalPostingStreamingCheckpointValue(
+    alloc: Allocator,
+    latest: *const ExperimentalPostingLatestValues,
+    deferred_patches: *const ExperimentalPostingDeferredPatches,
+    root: *ExperimentalPostingReadState,
+    id: u64,
+    kind: vectorindex_posting_wal.RecordKind,
+) !?ExperimentalPostingResolvedValue {
+    const key = experimentalPostingValueKey(id, kind);
+    if (deferred_patches.contains(key)) {
+        return (try root.resolveSegmentValueAlloc(alloc, root.segments.len, id, kind)) orelse
+            return error.PostingPatchBaseMismatch;
+    }
+    if (latest.get(key)) |value| {
+        return if (value) |bytes| .{ .bytes = bytes } else null;
+    }
+    const bytes = root.value(id, kind) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return if (bytes) |value| .{ .bytes = value } else null;
 }
 
 /// Collects only live overlays above the immutable root. This is used to
@@ -3640,6 +3701,7 @@ pub const HBCIndex = struct {
     // owns for the checkpoint step.
     experimental_posting_maintenance_capture_active: bool = false,
     experimental_posting_captured_values: ExperimentalPostingCapturedValues = .empty,
+    experimental_posting_commit_workspace: PostingCommitWorkspace = .{},
     experimental_exact_vector_capture_enabled: bool = false,
     experimental_exact_vector_mutations: ExperimentalExactVectorMutations = .empty,
     // Publishers take the exclusive side before mutating topology or caches.
@@ -3748,6 +3810,10 @@ pub const HBCIndex = struct {
     hilbert: ?vec.Hilbert,
     scratch_mu: std.atomic.Mutex,
     cached_scratch: ?SearchScratch,
+    /// The first slot remains separate for the serial fast path and test
+    /// visibility. Additional entries absorb normal concurrent-query fanout
+    /// without retaining an unbounded request-sized cache.
+    cached_search_scratches: std.ArrayListUnmanaged(SearchScratch) = .empty,
     routing_scratch_mu: std.atomic.Mutex,
     cached_routing_scratch: ?RoutingScratch,
     flat_centroid_mu: std.atomic.Mutex,
@@ -3932,6 +3998,13 @@ pub const HBCIndex = struct {
         map: std.AutoHashMapUnmanaged(u64, usize) = .empty,
         vectors: std.ArrayListUnmanaged(f32) = .empty,
         ids: std.ArrayListUnmanaged(u64) = .empty,
+        load_ids: std.ArrayListUnmanaged(u64) = .empty,
+        load_positions: std.ArrayListUnmanaged(usize) = .empty,
+        load_lookups: std.ArrayListUnmanaged(FixedKeyLookup) = .empty,
+        load_key_views: std.ArrayListUnmanaged([]const u8) = .empty,
+        load_values: std.ArrayListUnmanaged(?[]const u8) = .empty,
+        load_metadata: std.ArrayListUnmanaged(?[]const u8) = .empty,
+        transform_scratch: std.ArrayListUnmanaged(f32) = .empty,
         next_victim: usize = 0,
         replacements_since_rebuild: usize = 0,
         accounted_bytes: u64 = 0,
@@ -3939,6 +4012,13 @@ pub const HBCIndex = struct {
         fn bytes(self: *const SplitVectorWorkspace) u64 {
             return @as(u64, @intCast(self.vectors.capacity)) * @sizeOf(f32) +
                 @as(u64, @intCast(self.ids.capacity)) * @sizeOf(u64) +
+                @as(u64, @intCast(self.load_ids.capacity)) * @sizeOf(u64) +
+                @as(u64, @intCast(self.load_positions.capacity)) * @sizeOf(usize) +
+                @as(u64, @intCast(self.load_lookups.capacity)) * @sizeOf(FixedKeyLookup) +
+                @as(u64, @intCast(self.load_key_views.capacity)) * @sizeOf([]const u8) +
+                @as(u64, @intCast(self.load_values.capacity)) * @sizeOf(?[]const u8) +
+                @as(u64, @intCast(self.load_metadata.capacity)) * @sizeOf(?[]const u8) +
+                @as(u64, @intCast(self.transform_scratch.capacity)) * @sizeOf(f32) +
                 @as(u64, @intCast(self.map.capacity())) * (@sizeOf(u64) + @sizeOf(usize));
         }
 
@@ -3946,6 +4026,13 @@ pub const HBCIndex = struct {
             self.map.clearRetainingCapacity();
             self.vectors.clearRetainingCapacity();
             self.ids.clearRetainingCapacity();
+            self.load_ids.clearRetainingCapacity();
+            self.load_positions.clearRetainingCapacity();
+            self.load_lookups.clearRetainingCapacity();
+            self.load_key_views.clearRetainingCapacity();
+            self.load_values.clearRetainingCapacity();
+            self.load_metadata.clearRetainingCapacity();
+            self.transform_scratch.clearRetainingCapacity();
             self.next_victim = 0;
             self.replacements_since_rebuild = 0;
         }
@@ -3954,6 +4041,50 @@ pub const HBCIndex = struct {
             self.map.deinit(alloc);
             self.vectors.deinit(alloc);
             self.ids.deinit(alloc);
+            self.load_ids.deinit(alloc);
+            self.load_positions.deinit(alloc);
+            self.load_lookups.deinit(alloc);
+            self.load_key_views.deinit(alloc);
+            self.load_values.deinit(alloc);
+            self.load_metadata.deinit(alloc);
+            self.transform_scratch.deinit(alloc);
+            self.* = .{};
+        }
+    };
+
+    const PostingCommitWorkspace = struct {
+        touched_keys: std.ArrayListUnmanaged(u128) = .empty,
+        records: std.ArrayListUnmanaged(posting_segment_store_mod.BatchRecord) = .empty,
+        owned_patches: std.ArrayListUnmanaged([]u8) = .empty,
+
+        fn bytes(self: *const PostingCommitWorkspace) u64 {
+            var total = @as(u64, @intCast(self.touched_keys.capacity)) * @sizeOf(u128) +
+                @as(u64, @intCast(self.records.capacity)) * @sizeOf(posting_segment_store_mod.BatchRecord) +
+                @as(u64, @intCast(self.owned_patches.capacity)) * @sizeOf([]u8);
+            for (self.owned_patches.items) |payload| total +|= payload.len;
+            return total;
+        }
+
+        fn reset(self: *PostingCommitWorkspace, alloc: Allocator) void {
+            // Records borrow patch payloads, so retire the views before their
+            // storage. Ordinary batch-sized capacities remain hot; an
+            // exceptional transaction cannot permanently pin its peak.
+            self.records.clearRetainingCapacity();
+            for (self.owned_patches.items) |payload| alloc.free(payload);
+            self.owned_patches.clearRetainingCapacity();
+            self.touched_keys.clearRetainingCapacity();
+            if (self.touched_keys.capacity > max_retained_posting_commit_entries) {
+                self.touched_keys.clearAndFree(alloc);
+                self.records.clearAndFree(alloc);
+                self.owned_patches.clearAndFree(alloc);
+            }
+        }
+
+        fn deinit(self: *PostingCommitWorkspace, alloc: Allocator) void {
+            self.reset(alloc);
+            self.touched_keys.deinit(alloc);
+            self.records.deinit(alloc);
+            self.owned_patches.deinit(alloc);
             self.* = .{};
         }
     };
@@ -4742,7 +4873,7 @@ pub const HBCIndex = struct {
         errdefer alloc.destroy(published_spare_flight);
         published_spare_flight.* = .{};
 
-        const idx = HBCIndex{
+        var idx = HBCIndex{
             .alloc = alloc,
             .env_owner = env_owner,
             .store = store,
@@ -4815,11 +4946,20 @@ pub const HBCIndex = struct {
             .hilbert = null,
             .scratch_mu = .unlocked,
             .cached_scratch = null,
+            .cached_search_scratches = .empty,
             .routing_scratch_mu = .unlocked,
             .cached_routing_scratch = null,
             .flat_centroid_mu = .unlocked,
             .flat_centroid_directory = null,
         };
+        errdefer idx.cached_search_scratches.deinit(alloc);
+        // Reserve only the entry-array metadata at open. Scratch payloads
+        // remain lazy and resource-manager admitted, while release never has
+        // to enter the allocator under `scratch_mu` during a concurrency wave.
+        try idx.cached_search_scratches.ensureTotalCapacity(
+            alloc,
+            max_cached_search_scratches - 1,
+        );
         return idx;
     }
 
@@ -5622,15 +5762,55 @@ pub const HBCIndex = struct {
         const self: *HBCIndex = @ptrCast(@alignCast(context));
         if (target_bytes == 0 or !self.scratch_mu.tryLock()) return 0;
         defer self.scratch_mu.unlock();
-        const scratch = if (self.cached_scratch) |*cached| cached else return 0;
         const max_candidates = @max(
             @as(usize, @intCast(self.metadata.branching_factor)),
             @as(usize, @intCast(self.metadata.leaf_size)),
         );
-        const reclaimed = scratch.reclaimRetainedWorkspace(self.alloc, target_bytes, max_candidates);
-        if (reclaimed == 0) return 0;
-        self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| reclaimed);
+        var reclaimed: u64 = 0;
+        if (self.cached_scratch) |*scratch| {
+            reclaimed +|= scratch.reclaimRetainedWorkspace(self.alloc, target_bytes, max_candidates);
+        }
+        for (self.cached_search_scratches.items) |*scratch| {
+            if (reclaimed >= target_bytes) break;
+            reclaimed +|= scratch.reclaimRetainedWorkspace(self.alloc, target_bytes - reclaimed, max_candidates);
+        }
+        // If trimming oversized buffers was insufficient, discard secondary
+        // baseline entries. Keep one serial slot hot unless the index has no
+        // such slot, balancing prompt pressure relief with steady-state UX.
+        while (reclaimed < target_bytes) {
+            const scratch_value = self.cached_search_scratches.pop() orelse break;
+            var scratch = scratch_value;
+            const bytes = scratch.bytes();
+            scratch.deinit(self.alloc);
+            reclaimed +|= bytes;
+        }
+        if (reclaimed != 0) {
+            self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| reclaimed);
+        }
         return reclaimed;
+    }
+
+    pub fn searchScratchCacheLimit(self: *const HBCIndex) usize {
+        _ = self;
+        return max_cached_search_scratches;
+    }
+
+    pub fn admitNewSearchScratchBytes(self: *HBCIndex, bytes: u64) !void {
+        lockAtomic(&self.scratch_mu);
+        defer self.scratch_mu.unlock();
+        const next = std.math.add(u64, self.search_workspace_bytes_accounted, bytes) catch
+            return error.ResourceBudgetExceeded;
+        if (self.resource_manager) |manager| {
+            try manager.adjustUsage(.dense_search_working_set, &self.search_workspace_bytes_accounted, next);
+        } else {
+            self.search_workspace_bytes_accounted = next;
+        }
+    }
+
+    pub fn releaseSearchScratchBytes(self: *HBCIndex, bytes: u64) void {
+        lockAtomic(&self.scratch_mu);
+        defer self.scratch_mu.unlock();
+        self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| bytes);
     }
 
     pub fn attachSharedCache(self: *HBCIndex, cache: *Cache) void {
@@ -5809,6 +5989,7 @@ pub const HBCIndex = struct {
         const staged_node_key_bytes = @as(u64, @intCast(self.deferred_node_keys.count())) *
             @as(u64, @intCast(@sizeOf(u128) + @sizeOf(DeferredNodeValue)));
         return self.apply_workspace_split_bytes +
+            self.experimental_posting_commit_workspace.bytes() +
             @as(u64, @intCast(self.deferred_oversized_leaves.count() * @sizeOf(u64))) +
             self.deferred_node_key_value_bytes +
             staged_node_key_bytes;
@@ -6416,6 +6597,7 @@ pub const HBCIndex = struct {
         }
         self.clearExperimentalPostingCapturedValues();
         self.experimental_posting_captured_values.deinit(self.alloc);
+        self.experimental_posting_commit_workspace.deinit(self.alloc);
         self.clearExperimentalExactVectorMutations();
         self.experimental_exact_vector_mutations.deinit(self.alloc);
         if (self.resource_manager) |manager| {
@@ -6455,6 +6637,11 @@ pub const HBCIndex = struct {
             self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| scratch.bytes());
             scratch.deinit(self.alloc);
         }
+        for (self.cached_search_scratches.items) |*scratch| {
+            self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| scratch.bytes());
+            scratch.deinit(self.alloc);
+        }
+        self.cached_search_scratches.deinit(self.alloc);
         if (self.cached_routing_scratch) |*scratch| {
             self.observeRoutingScratchBytes(self.routing_scratch_bytes_accounted -| scratch.bytes());
             scratch.deinit(self.alloc);
@@ -8062,22 +8249,25 @@ pub const HBCIndex = struct {
         else
             null;
 
-        const touched_keys = try self.alloc.alloc(u128, self.experimental_posting_captured_values.count());
-        defer self.alloc.free(touched_keys);
+        var commit_workspace = &self.experimental_posting_commit_workspace;
+        commit_workspace.reset(self.alloc);
+        defer {
+            commit_workspace.reset(self.alloc);
+            self.observeApplyWorkspaceBytes();
+        }
+        try commit_workspace.touched_keys.resize(
+            self.alloc,
+            self.experimental_posting_captured_values.count(),
+        );
+        const touched_keys = commit_workspace.touched_keys.items;
         var touched_index: usize = 0;
         var touched_it = self.experimental_posting_captured_values.keyIterator();
         while (touched_it.next()) |key| : (touched_index += 1) touched_keys[touched_index] = key.*;
         std.mem.sort(u128, touched_keys, {}, std.sort.asc(u128));
 
-        var records = std.ArrayListUnmanaged(posting_segment_store_mod.BatchRecord).empty;
-        defer records.deinit(self.alloc);
-        var owned_patches = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (owned_patches.items) |payload| self.alloc.free(payload);
-            owned_patches.deinit(self.alloc);
-        }
-        try records.ensureTotalCapacity(self.alloc, @max(touched_keys.len, 1));
-        try owned_patches.ensureTotalCapacity(self.alloc, touched_keys.len);
+        try commit_workspace.records.ensureTotalCapacity(self.alloc, @max(touched_keys.len, 1));
+        try commit_workspace.owned_patches.ensureTotalCapacity(self.alloc, touched_keys.len);
+        self.observeApplyWorkspaceBytes();
 
         for (touched_keys) |key| {
             const posting_id = experimentalPostingValueKeyId(key);
@@ -8097,8 +8287,8 @@ pub const HBCIndex = struct {
                     if (previous) |base| {
                         const patch = try vectorindex_posting_wal.encodeReplacementPatchAlloc(self.alloc, kind, base, value);
                         if (patch.len < value.len) {
-                            owned_patches.appendAssumeCapacity(patch);
-                            records.appendAssumeCapacity(.{
+                            commit_workspace.owned_patches.appendAssumeCapacity(patch);
+                            commit_workspace.records.appendAssumeCapacity(.{
                                 .kind = .mutation,
                                 .posting_id = posting_id,
                                 .source_sequence = covered_source_sequence,
@@ -8111,7 +8301,7 @@ pub const HBCIndex = struct {
                     }
                 }
                 if (!emitted_patch) {
-                    records.appendAssumeCapacity(.{
+                    commit_workspace.records.appendAssumeCapacity(.{
                         .kind = kind,
                         .posting_id = posting_id,
                         .source_sequence = covered_source_sequence,
@@ -8119,7 +8309,7 @@ pub const HBCIndex = struct {
                     });
                 }
             } else {
-                records.appendAssumeCapacity(.{
+                commit_workspace.records.appendAssumeCapacity(.{
                     .kind = switch (kind) {
                         .base => .base_tombstone,
                         .quantized_checkpoint => .quantized_checkpoint_tombstone,
@@ -8136,15 +8326,21 @@ pub const HBCIndex = struct {
                 });
             }
         }
-        if (records.items.len == 0) {
-            records.appendAssumeCapacity(.{
+        if (commit_workspace.records.items.len == 0) {
+            commit_workspace.records.appendAssumeCapacity(.{
                 .kind = .coverage,
                 .posting_id = 0,
                 .source_sequence = covered_source_sequence,
                 .payload = &.{},
             });
         }
-        try self.appendExperimentalPostingBatchDurably(batch_id, records.items, covered_source_sequence, options);
+        self.observeApplyWorkspaceBytes();
+        try self.appendExperimentalPostingBatchDurably(
+            batch_id,
+            commit_workspace.records.items,
+            covered_source_sequence,
+            options,
+        );
 
         // Patch construction and rollback no longer need their old-generation
         // leases after the WAL commit. Release them before publication so the
@@ -8177,7 +8373,7 @@ pub const HBCIndex = struct {
         const append_stats: PostingWalAppendStats = .{
             .batch_id = batch_id,
             .covered_source_sequence = covered_source_sequence,
-            .record_count = @intCast(records.items.len),
+            .record_count = @intCast(commit_workspace.records.items.len),
             .wal_committed_bytes = posting_store.wal_committed_bytes,
         };
         self.detachLegacyLsmAfterNativeActivationBestEffort();
@@ -8519,12 +8715,14 @@ pub const HBCIndex = struct {
 
         var latest: ExperimentalPostingLatestValues = .empty;
         defer latest.deinit(alloc);
-        var reconstructed_values = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (reconstructed_values.items) |value| alloc.free(value);
-            reconstructed_values.deinit(alloc);
-        }
-        try collectExperimentalPostingCompactionValues(alloc, generation, &latest, &reconstructed_values);
+        var deferred_patches: ExperimentalPostingDeferredPatches = .empty;
+        defer deferred_patches.deinit(alloc);
+        try collectExperimentalPostingStreamingCompactionValues(
+            alloc,
+            generation,
+            &latest,
+            &deferred_patches,
+        );
         root.discardDeltaPayloadResidency();
         var base_reclaimer = ExperimentalPostingSequentialReclaimer.init(root.retained_segments[0]);
         defer base_reclaimer.reclaimObserved();
@@ -8585,7 +8783,16 @@ pub const HBCIndex = struct {
                 base_reclaimer.reclaimObserved();
                 yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
             }
-            const packed_node = (try experimentalPostingCheckpointValue(&latest, root, node_id, .base)) orelse continue;
+            var packed_node_value = (try experimentalPostingStreamingCheckpointValue(
+                alloc,
+                &latest,
+                &deferred_patches,
+                root,
+                node_id,
+                .base,
+            )) orelse continue;
+            defer packed_node_value.deinit(alloc);
+            const packed_node = packed_node_value.bytes;
             try writer.appendValueAt(sink, node_id, .base, covered_source_sequence, packed_node);
             base_reclaimer.observe(packed_node);
             posting_count += 1;
@@ -8600,16 +8807,46 @@ pub const HBCIndex = struct {
                 };
                 try centroid_directory.append(node_id, decoded_node.covering_radius, centroid_scratch, measure);
             }
-            if (try experimentalPostingCheckpointValue(&latest, root, node_id, .node_range)) |range| {
+            if (try experimentalPostingStreamingCheckpointValue(
+                alloc,
+                &latest,
+                &deferred_patches,
+                root,
+                node_id,
+                .node_range,
+            )) |resolved_range| {
+                var range_value = resolved_range;
+                defer range_value.deinit(alloc);
+                const range = range_value.bytes;
                 try writer.appendValueAt(sink, node_id, .node_range, covered_source_sequence, range);
                 base_reclaimer.observe(range);
             }
-            if (try experimentalPostingCheckpointValue(&latest, root, node_id, .posting_state)) |posting_state| {
+            if (try experimentalPostingStreamingCheckpointValue(
+                alloc,
+                &latest,
+                &deferred_patches,
+                root,
+                node_id,
+                .posting_state,
+            )) |resolved_posting_state| {
+                var posting_state_value = resolved_posting_state;
+                defer posting_state_value.deinit(alloc);
+                const posting_state = posting_state_value.bytes;
                 try writer.appendValueAt(sink, node_id, .posting_state, covered_source_sequence, posting_state);
                 base_reclaimer.observe(posting_state);
             }
             if (node_id == metadata.root_node) {
-                if (try experimentalPostingCheckpointValue(&latest, root, node_id, .quantized_checkpoint)) |quantized| {
+                if (try experimentalPostingStreamingCheckpointValue(
+                    alloc,
+                    &latest,
+                    &deferred_patches,
+                    root,
+                    node_id,
+                    .quantized_checkpoint,
+                )) |resolved_quantized| {
+                    var quantized_value = resolved_quantized;
+                    defer quantized_value.deinit(alloc);
+                    const quantized = quantized_value.bytes;
                     try writer.appendValueAt(sink, node_id, .quantized_checkpoint, covered_source_sequence, quantized);
                     base_reclaimer.observe(quantized);
                 }
@@ -8617,9 +8854,11 @@ pub const HBCIndex = struct {
         }
         base_reclaimer.reclaimObserved();
 
-        const encoded_centroid_directory = try centroid_directory.build();
-        defer alloc.free(encoded_centroid_directory);
-        try writer.appendValueAt(sink, 0, .centroid_directory, covered_source_sequence, encoded_centroid_directory);
+        {
+            const encoded_centroid_directory = try centroid_directory.build();
+            defer alloc.free(encoded_centroid_directory);
+            try writer.appendValueAt(sink, 0, .centroid_directory, covered_source_sequence, encoded_centroid_directory);
+        }
 
         // The nested directory begins on the same 64-byte boundary required by
         // mmap readers. Its header is patched in place before the enclosing
@@ -8648,7 +8887,16 @@ pub const HBCIndex = struct {
                 yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
             }
             if (node_id == metadata.root_node) continue;
-            const packed_node = (try experimentalPostingCheckpointValue(&latest, root, node_id, .base)) orelse continue;
+            var packed_node_value = (try experimentalPostingStreamingCheckpointValue(
+                alloc,
+                &latest,
+                &deferred_patches,
+                root,
+                node_id,
+                .base,
+            )) orelse continue;
+            defer packed_node_value.deinit(alloc);
+            const packed_node = packed_node_value.bytes;
             const decoded_node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
             const leaf_projections = if (decoded_node.header.is_leaf)
                 try loadExperimentalLeafProjectionPlane(
@@ -8665,7 +8913,17 @@ pub const HBCIndex = struct {
                 )
             else
                 &.{};
-            if (try experimentalPostingCheckpointValue(&latest, root, node_id, .quantized_checkpoint)) |quantized| {
+            if (try experimentalPostingStreamingCheckpointValue(
+                alloc,
+                &latest,
+                &deferred_patches,
+                root,
+                node_id,
+                .quantized_checkpoint,
+            )) |resolved_quantized| {
+                var quantized_value = resolved_quantized;
+                defer quantized_value.deinit(alloc);
+                const quantized = quantized_value.bytes;
                 var decoded_quantized = proto.RaBitQuantizedVectorSet.decode(alloc, quantized) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.Corrupted,
@@ -8743,8 +9001,21 @@ pub const HBCIndex = struct {
         }
         std.mem.sort(ExperimentalVectorOverride, vector_overrides.items, {}, ExperimentalVectorOverride.lessThan);
 
-        var directory_writer = try vectorindex_hbc_vector_directory.Writer.init(alloc);
+        try writer.alignForValue(sink, .vector_directory);
+        var directory_writer = try vectorindex_hbc_vector_directory.StreamingWriter.init(alloc, sink);
         defer directory_writer.deinit();
+        var directory_entry_count = base_directory.entryCount();
+        for (vector_overrides.items) |replacement| {
+            const existed = try base_directory.contains(replacement.kind, replacement.id);
+            if (existed and replacement.value == null) {
+                directory_entry_count = std.math.sub(usize, directory_entry_count, 1) catch
+                    return error.Corrupted;
+            } else if (!existed and replacement.value != null) {
+                directory_entry_count = std.math.add(usize, directory_entry_count, 1) catch
+                    return error.OutOfMemory;
+            }
+        }
+        try directory_writer.reserveEntries(directory_entry_count);
         var base_it = base_directory.iterator();
         var override_index: usize = 0;
         var directory_items: usize = 0;
@@ -8758,27 +9029,34 @@ pub const HBCIndex = struct {
                 ExperimentalVectorOverride.compareItem(vector_overrides.items[override_index], base) == .lt)
             {
                 const replacement = vector_overrides.items[override_index];
-                if (replacement.value) |value| try directory_writer.append(replacement.kind, replacement.id, value);
+                if (replacement.value) |value| try directory_writer.append(sink, replacement.kind, replacement.id, value);
                 override_index += 1;
             }
             if (override_index < vector_overrides.items.len and
                 ExperimentalVectorOverride.compareItem(vector_overrides.items[override_index], base) == .eq)
             {
                 const replacement = vector_overrides.items[override_index];
-                if (replacement.value) |value| try directory_writer.append(replacement.kind, replacement.id, value);
+                if (replacement.value) |value| try directory_writer.append(sink, replacement.kind, replacement.id, value);
                 override_index += 1;
             } else {
-                try directory_writer.append(base.kind, base.id, base.value);
+                try directory_writer.append(sink, base.kind, base.id, base.value);
             }
             base_reclaimer.observe(base.value);
         }
         while (override_index < vector_overrides.items.len) : (override_index += 1) {
             const replacement = vector_overrides.items[override_index];
-            if (replacement.value) |value| try directory_writer.append(replacement.kind, replacement.id, value);
+            if (replacement.value) |value| try directory_writer.append(sink, replacement.kind, replacement.id, value);
         }
-        const vector_directory = try directory_writer.build();
-        defer alloc.free(vector_directory);
-        try writer.appendValueAt(sink, 0, .vector_directory, covered_source_sequence, vector_directory);
+        const vector_directory_finish = try directory_writer.finish(sink);
+        try writer.appendWrittenValueAt(
+            sink,
+            0,
+            .vector_directory,
+            covered_source_sequence,
+            vector_directory_finish.offset,
+            vector_directory_finish.len,
+            vector_directory_finish.outer_checksum,
+        );
         base_reclaimer.reclaimObserved();
 
         const finish = try writer.finish(sink);
@@ -12575,6 +12853,86 @@ pub const HBCIndex = struct {
             values_storage,
             scratch,
         );
+    }
+
+    /// The replay/split path already owns one bounded, transaction-scoped
+    /// vector workspace. Reuse it for lookup metadata as well as its recent
+    /// transformed-vector ring so thousands of leaf splits do not allocate
+    /// and destroy seven parallel arrays per split. Returning false preserves
+    /// the generic LSM/LMDB fallback for non-replay callers and adapters that
+    /// do not provide the transformed external loader.
+    pub fn loadTransformedVectorIdsIntoMatrixWithWorkspace(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        matrix: []f32,
+        options: anytype,
+    ) !bool {
+        var workspace = &self.bulk_split_vector_workspace;
+        if (!workspace.active) return false;
+        const loader = self.external_vector_batch_transformed_matrix_loader orelse return false;
+        const ctx = self.external_vector_ctx orelse return false;
+        const matrix_floats = std.math.mul(usize, vector_ids.len, self.config.dims) catch
+            return error.BufferTooSmall;
+        if (matrix.len < matrix_floats) return error.BufferTooSmall;
+
+        defer self.observeBulkSplitVectorWorkspaceBytes();
+        try workspace.load_ids.resize(self.alloc, vector_ids.len);
+        try workspace.load_positions.resize(self.alloc, vector_ids.len);
+        try workspace.load_lookups.resize(self.alloc, vector_ids.len);
+        try workspace.load_key_views.resize(self.alloc, vector_ids.len);
+        try workspace.load_values.resize(self.alloc, vector_ids.len);
+        try workspace.load_metadata.resize(self.alloc, vector_ids.len);
+        try workspace.transform_scratch.resize(self.alloc, self.config.dims);
+
+        const Options = @TypeOf(options);
+        const batch_vectors = if (comptime @hasField(Options, "batch_vectors"))
+            options.batch_vectors
+        else
+            null;
+        var missing_count: usize = 0;
+        for (vector_ids, 0..) |vector_id, matrix_position| {
+            const transformed = matrix[matrix_position * self.config.dims ..][0..self.config.dims];
+            if (batch_vectors) |lookup| {
+                if (lookup.get(vector_id)) |vector| {
+                    _ = self.transformVector(vector, transformed);
+                    continue;
+                }
+            }
+            if (self.bulkSplitVectorWorkspaceLookup(vector_id, transformed)) continue;
+            workspace.load_ids.items[missing_count] = vector_id;
+            workspace.load_positions.items[missing_count] = matrix_position;
+            missing_count += 1;
+        }
+        if (missing_count == 0) return true;
+
+        try self.getMetadataManySortedInTxnWithScratchUncached(
+            txn,
+            workspace.load_ids.items[0..missing_count],
+            workspace.load_metadata.items[0..missing_count],
+            workspace.load_lookups.items[0..missing_count],
+            workspace.load_key_views.items[0..missing_count],
+            workspace.load_values.items[0..missing_count],
+        );
+        loader(
+            ctx,
+            workspace.load_ids.items[0..missing_count],
+            workspace.load_metadata.items[0..missing_count],
+            workspace.load_positions.items[0..missing_count],
+            matrix,
+            workspace.transform_scratch.items,
+            self.config.dims,
+            self,
+            transformExternalVectorForMatrix,
+        ) catch |err| switch (err) {
+            error.Unsupported => return false,
+            else => return err,
+        };
+        for (workspace.load_ids.items[0..missing_count], workspace.load_positions.items[0..missing_count]) |vector_id, matrix_position| {
+            const transformed = matrix[matrix_position * self.config.dims ..][0..self.config.dims];
+            self.bulkSplitVectorWorkspaceAdmit(vector_id, transformed);
+        }
+        return true;
     }
 
     pub fn loadPostingVectorsTransformed(
@@ -18578,6 +18936,56 @@ test "hbc cache reports byte usage to resource manager" {
     try std.testing.expectEqual(@as(u64, 0), stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)].used_bytes);
 }
 
+test "hbc retains a bounded pool of concurrent search scratch" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 8,
+        .leaf_size = 4,
+        .branching_factor = 4,
+    });
+    defer idx.close();
+    idx.attachResourceManager(&resource_manager);
+
+    var handles: [4]ScratchHandle = undefined;
+    for (&handles) |*handle| handle.* = try idx.acquireSearchScratch();
+    const allocated = idx.search_workspace_bytes_accounted;
+    try std.testing.expect(allocated > 0);
+    for (&handles) |*handle| idx.releaseSearchScratch(handle);
+
+    try std.testing.expect(idx.cached_scratch != null);
+    try std.testing.expectEqual(@as(usize, handles.len - 1), idx.cached_search_scratches.items.len);
+    try std.testing.expectEqual(allocated, idx.search_workspace_bytes_accounted);
+    try std.testing.expectEqual(
+        allocated,
+        resource_manager.sliceStats(.dense_search_working_set).used_bytes,
+    );
+
+    // A second fanout reuses all payload allocations and accounting rather
+    // than returning to the allocator for every request beyond the first.
+    for (&handles) |*handle| {
+        handle.* = try idx.acquireSearchScratch();
+        try std.testing.expect(handle.from_cache);
+    }
+    try std.testing.expectEqual(allocated, idx.search_workspace_bytes_accounted);
+    for (&handles) |*handle| idx.releaseSearchScratch(handle);
+
+    const primary_bytes = idx.cached_scratch.?.bytes();
+    const reclaimed = HBCIndex.reclaimSearchWorkspaceForResourceManager(&idx, allocated);
+    try std.testing.expect(reclaimed > 0);
+    try std.testing.expectEqual(@as(usize, 0), idx.cached_search_scratches.items.len);
+    try std.testing.expectEqual(primary_bytes, idx.search_workspace_bytes_accounted);
+    try std.testing.expectEqual(
+        primary_bytes,
+        resource_manager.sliceStats(.dense_search_working_set).used_bytes,
+    );
+}
+
 test "hbc resource manager reattachment is idempotent and transfers local cache usage" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -19316,6 +19724,35 @@ test "immutable posting replacement patches resolve bounded chains and compact l
         &replacement_two,
         compacted.get(experimentalPostingValueKey(id, .base)).?.?,
     );
+    for (&state.patch_cache) |*shard| try std.testing.expectEqual(@as(usize, 0), shard.values.count());
+
+    var streaming_latest: ExperimentalPostingLatestValues = .empty;
+    defer streaming_latest.deinit(alloc);
+    var deferred_patches: ExperimentalPostingDeferredPatches = .empty;
+    defer deferred_patches.deinit(alloc);
+    try collectExperimentalPostingStreamingCompactionValues(
+        alloc,
+        root,
+        &streaming_latest,
+        &deferred_patches,
+    );
+    const key = experimentalPostingValueKey(id, .base);
+    try std.testing.expect(streaming_latest.contains(key));
+    try std.testing.expect(streaming_latest.get(key).? == null);
+    try std.testing.expect(deferred_patches.contains(key));
+    var streamed = (try experimentalPostingStreamingCheckpointValue(
+        alloc,
+        &streaming_latest,
+        &deferred_patches,
+        state,
+        id,
+        .base,
+    )).?;
+    defer streamed.deinit(alloc);
+    try std.testing.expect(streamed.owned != null);
+    try std.testing.expectEqualSlices(u8, &replacement_two, streamed.bytes);
+    // Publication reconstruction is one-shot and must not populate the
+    // query-lifetime patch cache with an entire flattening generation.
     for (&state.patch_cache) |*shard| try std.testing.expectEqual(@as(usize, 0), shard.values.count());
 
     const first = (try root.value(id, .base)).?;
@@ -25143,45 +25580,26 @@ test "bulk split workspace reuses transformed external vectors and reports apply
     }
 
     const ids = [_]u64{ 1, 2, 3 };
-    const positions = [_]usize{ 0, 1, 2 };
     var matrix: [6]f32 = .{0} ** 6;
     var matrix_again: [6]f32 = .{0} ** 6;
-    var lookups: [ids.len]FixedKeyLookup = undefined;
-    var key_views: [ids.len][]const u8 = undefined;
-    var values: [ids.len]?[]const u8 = undefined;
-    var scratch: [2]f32 = undefined;
 
     const baseline_apply_bytes = resource_manager.sliceStats(.dense_apply_working_set).used_bytes;
     idx.beginBulkSplitVectorWorkspace();
     var workspace_active = true;
     defer if (workspace_active) idx.endBulkSplitVectorWorkspace();
 
-    try std.testing.expect(try idx.loadExternalVectorsTransformedIntoMatrix(
-        &txn,
-        &ids,
-        &positions,
-        &matrix,
-        &lookups,
-        &key_views,
-        &values,
-        &scratch,
-    ));
+    try idx.loadPostingVectorsTransformed(&txn, &ids, &matrix);
     try std.testing.expectEqual(@as(usize, 1), loader_ctx.calls);
     try std.testing.expectEqual(@as(usize, ids.len), loader_ctx.loaded);
     try std.testing.expect(resource_manager.sliceStats(.dense_apply_working_set).used_bytes > baseline_apply_bytes);
+    const load_ids_capacity = idx.bulk_split_vector_workspace.load_ids.capacity;
+    const load_metadata_capacity = idx.bulk_split_vector_workspace.load_metadata.capacity;
 
-    try std.testing.expect(try idx.loadExternalVectorsTransformedIntoMatrix(
-        &txn,
-        &ids,
-        &positions,
-        &matrix_again,
-        &lookups,
-        &key_views,
-        &values,
-        &scratch,
-    ));
+    try idx.loadPostingVectorsTransformed(&txn, &ids, &matrix_again);
     try std.testing.expectEqual(@as(usize, 1), loader_ctx.calls);
     try std.testing.expectEqualSlices(f32, &matrix, &matrix_again);
+    try std.testing.expectEqual(load_ids_capacity, idx.bulk_split_vector_workspace.load_ids.capacity);
+    try std.testing.expectEqual(load_metadata_capacity, idx.bulk_split_vector_workspace.load_metadata.capacity);
 
     idx.endBulkSplitVectorWorkspace();
     workspace_active = false;

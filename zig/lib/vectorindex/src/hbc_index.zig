@@ -5102,6 +5102,16 @@ fn loadTransformedVectorIdsIntoMatrix(
     const matrix_floats = std.math.mul(usize, vector_ids.len, dims) catch return error.BufferTooSmall;
     if (matrix.len < matrix_floats) return error.BufferTooSmall;
 
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "loadTransformedVectorIdsIntoMatrixWithWorkspace")) {
+        if (try self.loadTransformedVectorIdsIntoMatrixWithWorkspace(
+            txn,
+            vector_ids,
+            matrix,
+            options,
+        )) return;
+    }
+
     const missing_ids = try self.alloc.alloc(u64, vector_ids.len);
     defer self.alloc.free(missing_ids);
     const missing_positions = try self.alloc.alloc(usize, vector_ids.len);
@@ -5132,7 +5142,6 @@ fn loadTransformedVectorIdsIntoMatrix(
     const vector_scratch = try self.alloc.alloc(f32, dims);
     defer self.alloc.free(vector_scratch);
 
-    const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "loadExternalVectorsTransformedIntoMatrix")) {
         if (try self.loadExternalVectorsTransformedIntoMatrix(
             txn,

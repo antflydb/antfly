@@ -16,6 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vec = @import("antfly_vector").vector;
 const quantizer = @import("antfly_vector").quantizer;
+const rabitq = @import("antfly_vector").rabitq;
 const types = @import("types.zig");
 const search_results = @import("search_results.zig");
 const search_types = @import("search_types.zig");
@@ -58,6 +59,37 @@ pub const SearchScratch = struct {
     flat_probe_merge: []search_types.FlatCentroidProbe,
     coverage_members: []CoverageMember,
     coverage_visited_words: []usize,
+
+    /// Exact logical payload allocated by `init`. Resource-governed adapters
+    /// use this before touching the allocator, so a concurrent fanout cannot
+    /// transiently exceed its hard search-workspace budget and only discover
+    /// that after allocation.
+    pub fn initialBytes(dims: usize, max_branching: usize, max_leaf: usize) !u64 {
+        const max_candidates = @max(max_branching, max_leaf);
+        const vector_value_count = std.math.mul(usize, dims, max_candidates) catch
+            return error.OutOfMemory;
+        const score_bound_count = std.math.mul(usize, max_candidates, 2) catch
+            return error.OutOfMemory;
+        var total: u64 = 0;
+        total = try addSliceGrowthBytes(f32, total, 0, dims); // estimate query_diff
+        const code_width = rabitq.codeWidth(dims);
+        inline for (0..4) |_| total = try addSliceGrowthBytes(u64, total, 0, code_width);
+        inline for (0..3) |_| total = try addSliceGrowthBytes(f32, total, 0, dims);
+        total = try addSliceGrowthBytes(f32, total, 0, vector_value_count);
+        total = try addSliceGrowthBytes(u64, total, 0, max_leaf);
+        total = try addSliceGrowthBytes(u64, total, 0, max_candidates);
+        total = try addSliceGrowthBytes(?[]const u8, total, 0, max_candidates);
+        total = try addSliceGrowthBytes(bool, total, 0, max_candidates);
+        total = try addSliceGrowthBytes(usize, total, 0, max_candidates);
+        total = try addSliceGrowthBytes(RerankLookup, total, 0, max_candidates);
+        total = try addSliceGrowthBytes([]const u8, total, 0, max_candidates);
+        total = try addSliceGrowthBytes(?[]const u8, total, 0, max_candidates);
+        total = try addSliceGrowthBytes([]const f32, total, 0, max_candidates);
+        total = try addSliceGrowthBytes(?search_results.BoundedProjection, total, 0, max_candidates);
+        inline for (0..2) |_| total = try addSliceGrowthBytes(f32, total, 0, max_candidates);
+        total = try addSliceGrowthBytes(f32, total, 0, score_bound_count);
+        return total;
+    }
 
     pub fn init(alloc: Allocator, dims: usize, max_branching: usize, max_leaf: usize) !SearchScratch {
         const max_candidates = @max(max_branching, max_leaf);
@@ -398,6 +430,16 @@ test "SearchScratch grows error bounds with vector fetch capacity" {
     try std.testing.expect(scratch.distances.len >= 5);
     try std.testing.expect(scratch.error_bounds.len >= 5);
     try std.testing.expect(scratch.vector_batch.len >= 4 * 5);
+}
+
+test "SearchScratch initial byte projection matches its initialized payload" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 1_536, 16, 64);
+    defer scratch.deinit(alloc);
+    try std.testing.expectEqual(
+        try SearchScratch.initialBytes(1_536, 16, 64),
+        scratch.bytes(),
+    );
 }
 
 test "SearchScratch accounts coverage buffers and detects repeated nodes" {

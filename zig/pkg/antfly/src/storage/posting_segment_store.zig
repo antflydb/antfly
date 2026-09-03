@@ -395,12 +395,28 @@ pub const Store = struct {
 
     pub fn appendCoverage(self: *Store, batch_id: u64, covered_source_sequence: u64, options: AppendOptions) !void {
         if (self.poisoned) return error.PostingStoreRequiresReopen;
+        if (self.checkpoint == null) return error.MissingPostingCheckpoint;
         if (covered_source_sequence < self.covered_source_sequence) return error.PostingWalOverlapsCheckpoint;
         // Coverage is a watermark, not a transaction identity. Re-emitting the
         // current watermark after a long-running checkpoint only creates a
         // non-empty WAL tail and can provoke an otherwise identical full
         // rewrite at the next readiness fence.
-        if (covered_source_sequence == self.covered_source_sequence) return;
+        if (covered_source_sequence == self.covered_source_sequence) {
+            // An equal watermark may have come from an earlier unsynced append.
+            // Preserve the caller-visible durability meaning of `sync=true`
+            // without manufacturing another logical WAL transaction.
+            if (options.sync and self.wal_committed_bytes != 0) {
+                const wal_path = try self.walPathAlloc(self.wal_generation);
+                defer self.alloc.free(wal_path);
+                self.storage.syncFileContentsAbsolute(wal_path) catch |err| {
+                    // As with append+fsync, the durability outcome can be
+                    // ambiguous. Reopen before permitting another write.
+                    self.poisoned = true;
+                    return err;
+                };
+            }
+            return;
+        }
         return try self.appendBatchWithOptions(batch_id, &.{.{
             .kind = .coverage,
             .posting_id = 0,
@@ -1152,6 +1168,12 @@ test "storage.posting segment store keeps coverage-only WAL tails out of state d
     try std.testing.expectEqual(coverage_wal_bytes, store.wal_committed_bytes);
     try std.testing.expectEqual(coverage_batch, store.last_committed_batch);
 
+    const syncs_before = memory.sync_contents_calls;
+    try store.appendCoverage(try store.nextBatchId(), 11, .{ .sync = true });
+    try std.testing.expectEqual(syncs_before + 1, memory.sync_contents_calls);
+    try std.testing.expectEqual(coverage_wal_bytes, store.wal_committed_bytes);
+    try std.testing.expectEqual(coverage_batch, store.last_committed_batch);
+
     // A checkpoint may retain a coverage-only tail that arrived after its
     // zero-WAL source boundary. It advances recovery coverage without turning
     // into query-state debt.
@@ -1171,6 +1193,19 @@ test "storage.posting segment store keeps coverage-only WAL tails out of state d
         .payload = "maintenance",
     }}, 11);
     try std.testing.expect(store.wal_has_state_records);
+}
+
+test "storage.posting segment coverage requires a published checkpoint" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+
+    var store = try Store.open(alloc, memory.storage(), "/posting-coverage-missing-checkpoint");
+    defer store.deinit();
+    try std.testing.expectError(
+        error.MissingPostingCheckpoint,
+        store.appendCoverage(1, 0, .{}),
+    );
 }
 
 test "storage.posting segment publication preserves the exact committed WAL tail" {

@@ -648,18 +648,37 @@ pub fn cacheMetadata(self: anytype, vector_id: u64, metadata: []const u8) ![]con
 
 pub fn acquireSearchScratch(self: anytype) !ScratchHandle {
     lockAtomic(&self.scratch_mu);
-    defer self.scratch_mu.unlock();
     if (self.cached_scratch) |scratch| {
         self.cached_scratch = null;
+        self.scratch_mu.unlock();
         return .{ .scratch = scratch, .from_cache = true, .accounted_bytes = scratch.bytes() };
     }
-    const scratch = try SearchScratch.init(
+    const Index = @TypeOf(self.*);
+    if (comptime @hasField(Index, "cached_search_scratches")) {
+        if (self.cached_search_scratches.pop()) |scratch| {
+            self.scratch_mu.unlock();
+            return .{ .scratch = scratch, .from_cache = true, .accounted_bytes = scratch.bytes() };
+        }
+    }
+    self.scratch_mu.unlock();
+
+    const dims: usize = @intCast(self.metadata.dims);
+    const branching_factor: usize = @intCast(self.metadata.branching_factor);
+    const leaf_size: usize = @intCast(self.metadata.leaf_size);
+    const initial_bytes = try SearchScratch.initialBytes(dims, branching_factor, leaf_size);
+    const pre_admitted = comptime @hasDecl(Index, "admitNewSearchScratchBytes") and
+        @hasDecl(Index, "releaseSearchScratchBytes");
+    if (pre_admitted) try self.admitNewSearchScratchBytes(initial_bytes);
+    errdefer if (pre_admitted) self.releaseSearchScratchBytes(initial_bytes);
+    var scratch = try SearchScratch.init(
         self.alloc,
-        @intCast(self.metadata.dims),
-        @intCast(self.metadata.branching_factor),
-        @intCast(self.metadata.leaf_size),
+        dims,
+        branching_factor,
+        leaf_size,
     );
-    if (comptime @hasDecl(@TypeOf(self.*), "observeSearchWorkspaceBytes")) {
+    errdefer scratch.deinit(self.alloc);
+    std.debug.assert(scratch.bytes() == initial_bytes);
+    if (!pre_admitted and comptime @hasDecl(Index, "observeSearchWorkspaceBytes")) {
         self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted + scratch.bytes());
     }
     return .{
@@ -696,16 +715,37 @@ pub fn endSearchEpoch(self: anytype) void {
 
 pub fn releaseSearchScratch(self: anytype, handle: *ScratchHandle) void {
     lockAtomic(&self.scratch_mu);
-    defer self.scratch_mu.unlock();
     if (self.cached_scratch == null) {
         self.cached_scratch = handle.scratch;
-    } else {
-        var scratch = handle.scratch;
-        if (comptime @hasDecl(@TypeOf(self.*), "observeSearchWorkspaceBytes")) {
-            self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| handle.accounted_bytes);
-        }
-        scratch.deinit(self.alloc);
+        self.scratch_mu.unlock();
+        return;
     }
+    const Index = @TypeOf(self.*);
+    if (comptime @hasField(Index, "cached_search_scratches") and @hasDecl(Index, "searchScratchCacheLimit")) {
+        const cached_count = self.cached_search_scratches.items.len + 1;
+        if (cached_count < self.searchScratchCacheLimit()) {
+            self.cached_search_scratches.append(self.alloc, handle.scratch) catch {
+                self.scratch_mu.unlock();
+                deinitReleasedSearchScratch(self, handle);
+                return;
+            };
+            self.scratch_mu.unlock();
+            return;
+        }
+    }
+    self.scratch_mu.unlock();
+    deinitReleasedSearchScratch(self, handle);
+}
+
+fn deinitReleasedSearchScratch(self: anytype, handle: *ScratchHandle) void {
+    var scratch = handle.scratch;
+    const Index = @TypeOf(self.*);
+    if (comptime @hasDecl(Index, "releaseSearchScratchBytes")) {
+        self.releaseSearchScratchBytes(handle.accounted_bytes);
+    } else if (comptime @hasDecl(Index, "observeSearchWorkspaceBytes")) {
+        self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| handle.accounted_bytes);
+    }
+    scratch.deinit(self.alloc);
 }
 
 pub fn transformVector(self: anytype, original: []const f32, transformed: []f32) []const f32 {

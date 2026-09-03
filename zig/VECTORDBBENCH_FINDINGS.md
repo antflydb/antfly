@@ -4071,6 +4071,74 @@ RSS was 34 MB lower. This classifies the remaining difference as transient
 publication/file-cache residency, not retained serving heap. It remains a real
 peak-RSS optimization target and must not be hidden by reporting demand alone.
 
+### Bounded publication and concurrent-request workspaces
+
+A follow-up allocation audit found that the remaining transient peaks were not
+one problem and should not be hidden behind a larger process reservation:
+
+- the V1 vector directory retained its value plane and 29-byte-per-entry index,
+  then allocated the joined result before copying it into the staged segment;
+- a full posting flatten reconstructed every immutable replacement patch before
+  writing any of them;
+- an index retained only one request scratch, so concurrent searches repeatedly
+  allocated and destroyed otherwise reusable bounded buffers;
+- replay leaf splits and posting commits rebuilt parallel lookup arrays for
+  every operation; and
+- an equal source-coverage append could skip the durability requested by a
+  later `sync=true` caller.
+
+The production shape now treats each category according to its lifetime. The
+vector-directory writer streams values directly to the unpublished generation
+and retains only its compact index, producing byte-identical V1 files. The
+centroid-directory allocation is released as soon as its staged copy completes.
+Immutable patch chains are represented by keys during a flatten, reconstructed
+one logical value at a time, copied, and immediately released; they never enter
+the query-lifetime patch cache. This changes peak reconstruction heap from the
+sum of all patched values to the largest active patched value. On the measured
+1M generation, streaming removes the extra value plane and joined directory
+copy while retaining roughly the 58 MB compatibility index; a future format
+version may shrink that index, but is not required for this memory fix.
+
+Search scratch now uses a resource-manager-admitted pool capped at 32 entries
+per index, matching the qualification's maximum fanout without becoming an
+unbounded per-request cache. Pool metadata is reserved at index open so normal
+acquire/release does not enter the allocator beneath the scratch lock. Pressure first trims
+oversized request buffers and then discards secondary baseline entries while
+keeping one serial fast-path slot. The replay split workspace likewise owns and
+reuses its metadata/lookup arrays, and posting-WAL commit arrays retain ordinary
+batch capacity but discard capacity above 4,096 entries. Both remain visible to
+the existing apply/search resource ledgers.
+
+Finally, equal-watermark coverage remains a logical no-op, but `sync=true` now
+fsyncs a non-empty WAL that may have been appended unsynced. Coverage still
+requires a published checkpoint, and an ambiguous sync failure poisons the
+store until reopen. These semantics preserve idempotence without weakening the
+caller's durability contract.
+
+A fresh ReleaseFast 50K public-API qualification validates the combined shape.
+The run used batch 100, four load workers, native HBC, float16 vector blocks,
+flat-exact centroid routing, and the concurrency 1/10/20/30 query curve. It
+completed in 30.3630 seconds (18.9887 seconds insert plus 11.3743 seconds
+optimize) while another repository workload was active on the host. Recall was
+0.9885. Throughput was 293.82 / 1,079.76 / 1,192.00 / 1,319.31 QPS and p95 was
+3.88 / 17.03 / 49.38 / 71.27 ms at concurrency 1/10/20/30. Compared with the
+clean pre-change qualification, concurrency-30 throughput increased 12.3%
+from 1,174.47 QPS; the middle p95s remain scheduler-sensitive and should not be
+claimed as latency wins from this contended sample.
+
+More importantly for this change, cache-inclusive live peak RSS fell from
+2.54 GB to 1.52 GB and restarted RSS remained essentially flat at 341 MB versus
+339 MB. The post-phase footprint sample reported 963 MB attributable demand.
+The detailed warm profile scored 24,412.5 approximate vectors and exactly
+completed 137.5 vectors per query, with 4.85 ms mean client latency, 4.71 ms
+p95, and 2.93 ms mean server time. Scratch acquisition itself averaged 0.0002
+ms. Baseline scratch bytes are now admitted before allocation; the capacity-
+stability test proves a second concurrent fanout reuses the existing payloads,
+and pressure testing proves secondary entries are reclaimable while the serial
+slot remains hot. This preserves the PR's query performance while removing the
+publication peak and steady high-concurrency allocator churn that motivated
+the follow-up.
+
 ## Next checks
 
 1. Narrow broad persisted L0 source ranges with adaptive, workload-independent

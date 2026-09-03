@@ -3326,6 +3326,7 @@ pub const MemoryStorage = struct {
     mutex: std.atomic.Mutex = .unlocked,
     files: std.StringHashMapUnmanaged([]u8) = .empty,
     tick: u64 = 1,
+    sync_contents_calls: u64 = 0,
 
     pub fn init(allocator: Allocator) MemoryStorage {
         return .{
@@ -3495,7 +3496,12 @@ fn memoryAppendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const
     try self.files.putNoClobber(self.allocator, owned_path, owned_contents);
 }
 
-fn memorySyncFileContentsAbsolute(_: *anyopaque, _: []const u8) !void {}
+fn memorySyncFileContentsAbsolute(ptr: *anyopaque, _: []const u8) !void {
+    const self: *MemoryStorage = @ptrCast(@alignCast(ptr));
+    const locked = lockAtomic(&self.mutex);
+    defer if (locked) self.mutex.unlock();
+    self.sync_contents_calls += 1;
+}
 
 fn memorySyncParentAbsolute(_: *anyopaque, _: []const u8) !void {}
 
