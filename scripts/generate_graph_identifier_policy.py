@@ -60,7 +60,9 @@ def merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
-def subtract_points(ranges: list[tuple[int, int]], points: set[int]) -> list[tuple[int, int]]:
+def subtract_points(
+    ranges: list[tuple[int, int]], points: set[int]
+) -> list[tuple[int, int]]:
     result: list[tuple[int, int]] = []
     for lo, hi in ranges:
         fragments = [(lo, hi)]
@@ -84,14 +86,20 @@ def load_policy() -> tuple[dict[str, Any], list[tuple[int, int]]]:
     if policy["policy_version"] != 1:
         raise ValueError("unsupported graph identifier policy version")
     if policy["max_utf8_bytes"] != policy["max_code_points"] * 4:
-        raise ValueError("max_utf8_bytes must cover exactly max_code_points UTF-8 scalars")
+        raise ValueError(
+            "max_utf8_bytes must cover exactly max_code_points UTF-8 scalars"
+        )
 
     allowed = {int(value, 16) for value in policy["allowed_whitespace"]}
     whitespace_ranges = subtract_points(
         merge_ranges(parse_ranges(policy["unicode_white_space_ranges"])), allowed
     )
     disallowed_ranges = whitespace_ranges
-    for key in ("general_category_cc_ranges", "general_category_cf_ranges", "invalid_scalar_ranges"):
+    for key in (
+        "general_category_cc_ranges",
+        "general_category_cf_ranges",
+        "invalid_scalar_ranges",
+    ):
         disallowed_ranges.extend(parse_ranges(policy[key]))
     disallowed = merge_ranges(disallowed_ranges)
 
@@ -117,7 +125,9 @@ def codepoint_disallowed(ranges: list[tuple[int, int]], codepoint: int) -> bool:
     return False
 
 
-def valid_identifier(policy: dict[str, Any], ranges: list[tuple[int, int]], value: str) -> bool:
+def valid_identifier(
+    policy: dict[str, Any], ranges: list[tuple[int, int]], value: str
+) -> bool:
     encoded = value.encode("utf-8")
     if not encoded or len(encoded) > policy["max_utf8_bytes"]:
         return False
@@ -150,14 +160,16 @@ def zig_string(value: str) -> str:
 
 
 def render_zig(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
-    range_rows = "\n".join(f"    .{{ .lo = 0x{lo:x}, .hi = 0x{hi:x} }}," for lo, hi in ranges)
+    range_rows = "\n".join(
+        f"    .{{ .lo = 0x{lo:x}, .hi = 0x{hi:x} }}," for lo, hi in ranges
+    )
     exact_rows = ", ".join(zig_string(value) for value in policy["reserved_exact"])
     prefix_rows = ", ".join(zig_string(value) for value in policy["reserved_prefixes"])
     case_rows = "\n".join(
         f"    .{{ .name = {zig_string(case['name'])}, .value = {zig_string(case['value'])}, .valid = {str(case['valid']).lower()} }},"
         for case in policy["conformance_cases"]
     )
-    return f'''// Copyright 2026 Antfly, Inc.
+    return f"""// Copyright 2026 Antfly, Inc.
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -176,10 +188,10 @@ def render_zig(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
 
 const std = @import("std");
 
-pub const policy_version: u32 = {policy['policy_version']};
-pub const unicode_version = {zig_string(policy['unicode_version'])};
-pub const max_codepoints: usize = {policy['max_code_points']};
-pub const max_utf8_bytes: usize = {policy['max_utf8_bytes']};
+pub const policy_version: u32 = {policy["policy_version"]};
+pub const unicode_version = {zig_string(policy["unicode_version"])};
+pub const max_codepoints: usize = {policy["max_code_points"]};
+pub const max_utf8_bytes: usize = {policy["max_utf8_bytes"]};
 
 const Range = struct {{ lo: u21, hi: u21 }};
 
@@ -238,18 +250,22 @@ pub const ConformanceCase = struct {{
 pub const conformance_cases = [_]ConformanceCase{{
 {case_rows}
 }};
-'''
+"""
 
 
 def render_go(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
     range_rows = "\n".join(f"\t{{lo: 0x{lo:X}, hi: 0x{hi:X}}}," for lo, hi in ranges)
-    exact_rows = ", ".join(json.dumps(value, ensure_ascii=True) for value in policy["reserved_exact"])
-    prefix_rows = ", ".join(json.dumps(value, ensure_ascii=True) for value in policy["reserved_prefixes"])
+    exact_rows = ", ".join(
+        json.dumps(value, ensure_ascii=True) for value in policy["reserved_exact"]
+    )
+    prefix_rows = ", ".join(
+        json.dumps(value, ensure_ascii=True) for value in policy["reserved_prefixes"]
+    )
     case_rows = "\n".join(
         f"\t{{name: {json.dumps(case['name'])}, value: {json.dumps(case['value'], ensure_ascii=True)}, valid: {str(case['valid']).lower()}}},"
         for case in policy["conformance_cases"]
     )
-    return f'''// Copyright 2026 The Antfly Contributors
+    return f"""// Copyright 2026 The Antfly Contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -268,10 +284,10 @@ import (
 )
 
 const (
-\tGraphIdentifierPolicyVersion  = {policy['policy_version']}
-\tGraphIdentifierUnicodeVersion = {json.dumps(policy['unicode_version'])}
-\tmaxGraphIdentifierRunes       = {policy['max_code_points']}
-\tmaxGraphIdentifierBytes       = {policy['max_utf8_bytes']}
+\tGraphIdentifierPolicyVersion  = {policy["policy_version"]}
+\tGraphIdentifierUnicodeVersion = {json.dumps(policy["unicode_version"])}
+\tmaxGraphIdentifierRunes       = {policy["max_code_points"]}
+\tmaxGraphIdentifierBytes       = {policy["max_utf8_bytes"]}
 )
 
 type graphIdentifierCodepointRange struct {{
@@ -347,13 +363,17 @@ type graphIdentifierConformanceCase struct {{
 var graphIdentifierConformanceCases = [...]graphIdentifierConformanceCase{{
 {case_rows}
 }}
-'''
+"""
 
 
 def render_python(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
     range_rows = "\n".join(f"    (0x{lo:X}, 0x{hi:X})," for lo, hi in ranges)
-    exact_rows = ", ".join(json.dumps(value, ensure_ascii=True) for value in policy["reserved_exact"])
-    prefix_rows = ", ".join(json.dumps(value, ensure_ascii=True) for value in policy["reserved_prefixes"])
+    exact_rows = ", ".join(
+        json.dumps(value, ensure_ascii=True) for value in policy["reserved_exact"]
+    )
+    prefix_rows = ", ".join(
+        json.dumps(value, ensure_ascii=True) for value in policy["reserved_prefixes"]
+    )
     case_rows = "\n".join(
         f"    ({json.dumps(case['name'])}, {json.dumps(case['value'], ensure_ascii=True)}, {case['valid']}),"
         for case in policy["conformance_cases"]
@@ -369,10 +389,10 @@ def render_python(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
 # Code generated by scripts/generate_graph_identifier_policy.py from
 # specs/graph_identifier_policy.json; DO NOT EDIT.
 
-GRAPH_IDENTIFIER_POLICY_VERSION = {policy['policy_version']}
-GRAPH_IDENTIFIER_UNICODE_VERSION = {json.dumps(policy['unicode_version'])}
-MAX_GRAPH_IDENTIFIER_CODE_POINTS = {policy['max_code_points']}
-MAX_GRAPH_IDENTIFIER_UTF8_BYTES = {policy['max_utf8_bytes']}
+GRAPH_IDENTIFIER_POLICY_VERSION = {policy["policy_version"]}
+GRAPH_IDENTIFIER_UNICODE_VERSION = {json.dumps(policy["unicode_version"])}
+MAX_GRAPH_IDENTIFIER_CODE_POINTS = {policy["max_code_points"]}
+MAX_GRAPH_IDENTIFIER_UTF8_BYTES = {policy["max_utf8_bytes"]}
 
 _DISALLOWED_RANGES = (
 {range_rows}
@@ -428,7 +448,7 @@ def render_typescript(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> 
         f"  {{ name: {json.dumps(case['name'])}, value: {json.dumps(case['value'], ensure_ascii=True)}, valid: {str(case['valid']).lower()} }},"
         for case in policy["conformance_cases"]
     )
-    return f'''// Copyright 2026 Antfly, Inc.
+    return f"""// Copyright 2026 Antfly, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -439,10 +459,10 @@ def render_typescript(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> 
 // Code generated by scripts/generate_graph_identifier_policy.py from
 // specs/graph_identifier_policy.json; DO NOT EDIT.
 
-export const GRAPH_IDENTIFIER_POLICY_VERSION = {policy['policy_version']};
-export const GRAPH_IDENTIFIER_UNICODE_VERSION = {json.dumps(policy['unicode_version'])};
-export const MAX_GRAPH_IDENTIFIER_CODE_POINTS = {policy['max_code_points']};
-export const MAX_GRAPH_IDENTIFIER_UTF8_BYTES = {policy['max_utf8_bytes']};
+export const GRAPH_IDENTIFIER_POLICY_VERSION = {policy["policy_version"]};
+export const GRAPH_IDENTIFIER_UNICODE_VERSION = {json.dumps(policy["unicode_version"])};
+export const MAX_GRAPH_IDENTIFIER_CODE_POINTS = {policy["max_code_points"]};
+export const MAX_GRAPH_IDENTIFIER_UTF8_BYTES = {policy["max_utf8_bytes"]};
 
 const DISALLOWED_RANGES: readonly (readonly [number, number])[] = [
 {range_rows}
@@ -502,7 +522,7 @@ export function isValidGraphIdentifier(value: string): boolean {{
 export const GRAPH_IDENTIFIER_CONFORMANCE_CASES = [
 {case_rows}
 ] as const;
-'''
+"""
 
 
 def rust_string(value: str) -> str:
@@ -536,7 +556,7 @@ def render_rust(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
         f"            ({rust_string(case['name'])}, {rust_string(case['value'])}, {str(case['valid']).lower()}),"
         for case in policy["conformance_cases"]
     )
-    return f'''// Copyright 2026 Antfly, Inc.
+    return f"""// Copyright 2026 Antfly, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -547,10 +567,10 @@ def render_rust(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
 // Code generated by scripts/generate_graph_identifier_policy.py from
 // specs/graph_identifier_policy.json; DO NOT EDIT.
 
-pub const GRAPH_IDENTIFIER_POLICY_VERSION: u32 = {policy['policy_version']};
-pub const GRAPH_IDENTIFIER_UNICODE_VERSION: &str = {rust_string(policy['unicode_version'])};
-pub const MAX_GRAPH_IDENTIFIER_CODE_POINTS: usize = {policy['max_code_points']};
-pub const MAX_GRAPH_IDENTIFIER_UTF8_BYTES: usize = {policy['max_utf8_bytes']};
+pub const GRAPH_IDENTIFIER_POLICY_VERSION: u32 = {policy["policy_version"]};
+pub const GRAPH_IDENTIFIER_UNICODE_VERSION: &str = {rust_string(policy["unicode_version"])};
+pub const MAX_GRAPH_IDENTIFIER_CODE_POINTS: usize = {policy["max_code_points"]};
+pub const MAX_GRAPH_IDENTIFIER_UTF8_BYTES: usize = {policy["max_utf8_bytes"]};
 
 const DISALLOWED_RANGES: &[(u32, u32)] = &[
 {range_rows}
@@ -617,25 +637,29 @@ mod tests {{
         }}
     }}
 }}
-'''
+"""
 
 
 def render_openapi(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
-    encoded_ranges = "\n".join(f"          - ['{lo:04X}', '{hi:04X}']" for lo, hi in ranges)
+    encoded_ranges = "\n".join(
+        f"          - ['{lo:04X}', '{hi:04X}']" for lo, hi in ranges
+    )
     reserved_exact = ", ".join(json.dumps(value) for value in policy["reserved_exact"])
-    reserved_prefixes = ", ".join(json.dumps(value) for value in policy["reserved_prefixes"])
+    reserved_prefixes = ", ".join(
+        json.dumps(value) for value in policy["reserved_prefixes"]
+    )
     return f'''# Code generated by scripts/generate_graph_identifier_policy.py from
 # specs/graph_identifier_policy.json; DO NOT EDIT.
 openapi: 3.0.3
 info:
   title: Antfly graph identifier policy
-  version: "{policy['policy_version']}"
+  version: "{policy["policy_version"]}"
 components:
   schemas:
     GraphIdentifier:
       type: string
       minLength: 1
-      maxLength: {policy['max_code_points']}
+      maxLength: {policy["max_code_points"]}
       # Keep reserved exact values machine-readable in the standard schema.
       # GraphCountAggregate relies on `*` being disjoint from identifiers for
       # standards-compliant oneOf validation; the vendor extension below
@@ -644,16 +668,16 @@ components:
         enum: [{reserved_exact}]
       description: >-
         User-visible graph alias or named result under Antfly graph identifier
-        policy v{policy['policy_version']} (Unicode {policy['unicode_version']}). Identifiers are exact UTF-8 strings
+        policy v{policy["policy_version"]} (Unicode {policy["unicode_version"]}). Identifiers are exact UTF-8 strings
         and are not normalized. Ordinary internal ASCII spaces are allowed.
         The value must not equal `*`, begin with `$`, have leading or trailing
         spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc
         control or Cf format code points. UTF-8 encoding is limited to
-        {policy['max_utf8_bytes']} bytes.
+        {policy["max_utf8_bytes"]} bytes.
       x-antfly-identifier-policy:
-        version: {policy['policy_version']}
-        unicodeVersion: "{policy['unicode_version']}"
-        maxUtf8Bytes: {policy['max_utf8_bytes']}
+        version: {policy["policy_version"]}
+        unicodeVersion: "{policy["unicode_version"]}"
+        maxUtf8Bytes: {policy["max_utf8_bytes"]}
         reservedExact: [{reserved_exact}]
         reservedPrefixes: [{reserved_prefixes}]
         disallowedCodePointRanges:
@@ -661,10 +685,10 @@ components:
     GraphCountTarget:
       type: string
       minLength: 1
-      maxLength: {policy['max_code_points']}
+      maxLength: {policy["max_code_points"]}
       description: >-
         Use the reserved token `*` to count rows, or a GraphIdentifier under
-        Antfly graph identifier policy v{policy['policy_version']} to count non-null bindings.
+        Antfly graph identifier policy v{policy["policy_version"]} to count non-null bindings.
       x-antfly-count-target:
         rowSentinel: '*'
         identifierSchema: '#/components/schemas/GraphIdentifier'
@@ -675,7 +699,10 @@ def write_or_check(path: Path, content: str, check: bool) -> bool:
     content = content.rstrip() + "\n"
     if check:
         if not path.exists() or path.read_text(encoding="utf-8") != content:
-            print(f"generated graph identifier policy is stale: {path.relative_to(ROOT)}", file=sys.stderr)
+            print(
+                f"generated graph identifier policy is stale: {path.relative_to(ROOT)}",
+                file=sys.stderr,
+            )
             return False
         return True
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -697,7 +724,11 @@ def main() -> int:
         (RUST_PATH, render_rust(policy, ranges)),
         (OPENAPI_PATH, render_openapi(policy, ranges)),
     )
-    return 0 if all(write_or_check(path, content, args.check) for path, content in outputs) else 1
+    return (
+        0
+        if all(write_or_check(path, content, args.check) for path, content in outputs)
+        else 1
+    )
 
 
 if __name__ == "__main__":

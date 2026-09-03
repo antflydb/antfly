@@ -27,7 +27,9 @@ from helpers import wait_until
 NUM_SHARDS = 4
 
 
-def _create_join_table(stateful_api, prefix: str, *, num_shards: int = NUM_SHARDS) -> str:
+def _create_join_table(
+    stateful_api, prefix: str, *, num_shards: int = NUM_SHARDS
+) -> str:
     table_name = f"{prefix}_{time.time_ns()}"
     created = stateful_api.create_table(table_name, num_shards=num_shards)
     assert (created.get("name") or created.get("table_name")) == table_name
@@ -138,7 +140,9 @@ def _joined_query_result(
 
 
 def test_distributed_shuffle_join_uses_antfly_to_antfly_execution(stateful_api):
-    docs_table, customers_table = _seed_join_tables(stateful_api, "distributed_shuffle_join")
+    docs_table, customers_table = _seed_join_tables(
+        stateful_api, "distributed_shuffle_join"
+    )
     joined_name = _joined_field(customers_table, "name")
 
     def query_result() -> dict[str, Any] | None:
@@ -175,7 +179,9 @@ def test_distributed_shuffle_join_uses_antfly_to_antfly_execution(stateful_api):
     assert int(profile["rows_matched"]) >= 80
     worker_attempts = profile.get("worker_attempts")
     assert isinstance(worker_attempts, list) and worker_attempts
-    assert all(isinstance(attempt.get("worker_group_id"), int) for attempt in worker_attempts)
+    assert all(
+        isinstance(attempt.get("worker_group_id"), int) for attempt in worker_attempts
+    )
 
     hits = _result_hits(result)
     assert any(hit["_source"]["title"] == "Doc 0" for hit in hits)
@@ -184,7 +190,9 @@ def test_distributed_shuffle_join_uses_antfly_to_antfly_execution(stateful_api):
 
 
 def test_distributed_right_join_returns_unmatched_right_rows(stateful_api):
-    docs_table, customers_table = _seed_join_tables(stateful_api, "distributed_right_join")
+    docs_table, customers_table = _seed_join_tables(
+        stateful_api, "distributed_right_join"
+    )
     joined_name = _joined_field(customers_table, "name")
     joined_tier = _joined_field(customers_table, "tier")
 
@@ -221,7 +229,9 @@ def test_distributed_join_still_works_after_standalone_restart(stateful_api):
     if not stateful_api.supports_restart:
         pytest.skip("restart is only available for locally managed stateful servers")
 
-    docs_table, customers_table = _seed_join_tables(stateful_api, "distributed_join_restart")
+    docs_table, customers_table = _seed_join_tables(
+        stateful_api, "distributed_join_restart"
+    )
 
     before_restart = wait_until(
         lambda: _joined_query_result(

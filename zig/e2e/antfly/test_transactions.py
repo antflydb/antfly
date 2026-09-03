@@ -36,7 +36,9 @@ pytestmark = pytest.mark.fresh_antfly_process
 NUM_SHARDS = 4
 
 
-def _transform(key: str, *operations: dict[str, object], upsert: bool = False) -> dict[str, object]:
+def _transform(
+    key: str, *operations: dict[str, object], upsert: bool = False
+) -> dict[str, object]:
     payload: dict[str, object] = {
         "key": key,
         "operations": list(operations),
@@ -64,7 +66,9 @@ class StatelessTransaction:
             timeout_s=10.0,
             interval_s=0.1,
         )
-        assert read_result is not None, f"lookup did not converge for {table_name}/{key}"
+        assert read_result is not None, (
+            f"lookup did not converge for {table_name}/{key}"
+        )
         doc, version = read_result
         assert version is not None, "lookup must return X-Antfly-Version for OCC"
         self.read_set.append(
@@ -76,7 +80,9 @@ class StatelessTransaction:
         )
         return doc
 
-    def commit(self, tables: dict[str, dict], *, sync_level: str | None = None) -> tuple[int, dict]:
+    def commit(
+        self, tables: dict[str, dict], *, sync_level: str | None = None
+    ) -> tuple[int, dict]:
         return self.stateful_api.commit_transaction(
             read_set=self.read_set,
             tables=tables,
@@ -137,7 +143,9 @@ def test_multi_shard_batch_commit(stateful_api):
         "8_account_c": {"name": "Charlie", "balance": 750},
         "c_account_d": {"name": "Diana", "balance": 250},
     }
-    seeded = stateful_api.batch_write(table_name, inserts=initial_docs, sync_level="write")
+    seeded = stateful_api.batch_write(
+        table_name, inserts=initial_docs, sync_level="write"
+    )
     assert seeded["inserted"] == 4
 
     visible_initial = wait_until(
@@ -155,7 +163,9 @@ def test_multi_shard_batch_commit(stateful_api):
         "8_account_c": {"name": "Charlie", "balance": 650},
         "c_account_d": {"name": "Diana", "balance": 150},
     }
-    result = stateful_api.batch_write(table_name, inserts=updated_docs, sync_level="write")
+    result = stateful_api.batch_write(
+        table_name, inserts=updated_docs, sync_level="write"
+    )
     assert result["inserted"] == 4
 
     visible_updated = wait_until(
@@ -175,7 +185,9 @@ def test_multi_key_batch_update_preserves_balance_sum(stateful_api):
         "0_alice": {"name": "Alice", "balance": 1000},
         "8_bob": {"name": "Bob", "balance": 0},
     }
-    seeded = stateful_api.batch_write(table_name, inserts=initial_docs, sync_level="write")
+    seeded = stateful_api.batch_write(
+        table_name, inserts=initial_docs, sync_level="write"
+    )
     assert seeded["inserted"] == 2
 
     alice = stateful_api.lookup_key(table_name, "0_alice")
@@ -187,7 +199,9 @@ def test_multi_key_batch_update_preserves_balance_sum(stateful_api):
         "0_alice": {"name": "Alice", "balance": 500},
         "8_bob": {"name": "Bob", "balance": 500},
     }
-    result = stateful_api.batch_write(table_name, inserts=transferred_docs, sync_level="write")
+    result = stateful_api.batch_write(
+        table_name, inserts=transferred_docs, sync_level="write"
+    )
     assert result["inserted"] == 2
 
     updated_docs = wait_until(
@@ -212,7 +226,9 @@ def test_multi_shard_transaction_recovery_health(stateful_api):
         "0_recovery_a": {"name": "Alpha", "value": 100},
         "8_recovery_b": {"name": "Beta", "value": 200},
     }
-    first_result = stateful_api.batch_write(table_name, inserts=docs, sync_level="write")
+    first_result = stateful_api.batch_write(
+        table_name, inserts=docs, sync_level="write"
+    )
     assert first_result["inserted"] == 2
 
     visible_first = wait_until(
@@ -235,7 +251,9 @@ def test_multi_shard_transaction_recovery_health(stateful_api):
         "4_recovery_c": {"name": "Gamma", "value": 300},
         "c_recovery_d": {"name": "Delta", "value": 400},
     }
-    second_result = stateful_api.batch_write(table_name, inserts=more_docs, sync_level="write")
+    second_result = stateful_api.batch_write(
+        table_name, inserts=more_docs, sync_level="write"
+    )
     assert second_result["inserted"] == 2
 
     all_docs = {}
@@ -258,7 +276,9 @@ def test_multi_shard_batch_timeout_converges_to_one_terminal_state(stateful_api)
         "8_account_c": {"name": "Charlie", "balance": 750},
         "c_account_d": {"name": "Diana", "balance": 250},
     }
-    seeded = stateful_api.batch_write(table_name, inserts=initial_docs, sync_level="write")
+    seeded = stateful_api.batch_write(
+        table_name, inserts=initial_docs, sync_level="write"
+    )
     assert seeded["inserted"] == 4
 
     updated_docs = {
@@ -291,11 +311,15 @@ def test_multi_shard_batch_timeout_converges_to_one_terminal_state(stateful_api)
     if timed_out:
         if not (all_original or all_updated):
             converged = wait_until(
-                lambda: _lookup_converged_many(stateful_api, table_name, initial_docs, updated_docs),
+                lambda: _lookup_converged_many(
+                    stateful_api, table_name, initial_docs, updated_docs
+                ),
                 timeout_s=10.0,
                 interval_s=0.1,
             )
-            assert converged is not None, "timed-out multi-shard batch did not converge to one terminal state"
+            assert converged is not None, (
+                "timed-out multi-shard batch did not converge to one terminal state"
+            )
     else:
         assert all_updated
 
@@ -376,13 +400,21 @@ def test_multi_batch_transforms(stateful_api):
         {
             table_a: {
                 "transforms": [
-                    _transform("user:1", _op("$inc", "visits", 2), _op("$set", "status", "active"))
+                    _transform(
+                        "user:1",
+                        _op("$inc", "visits", 2),
+                        _op("$set", "status", "active"),
+                    )
                 ],
                 "sync_level": "write",
             },
             table_b: {
                 "transforms": [
-                    _transform("order:1", _op("$max", "version", 3), _op("$set", "status", "rebuilt"))
+                    _transform(
+                        "order:1",
+                        _op("$max", "version", 3),
+                        _op("$set", "status", "rebuilt"),
+                    )
                 ],
                 "sync_level": "write",
             },
@@ -449,7 +481,10 @@ def test_occ_conflict_detection(stateful_api):
         {
             table_name: {
                 "inserts": {
-                    "account:shared": {"name": "Shared", "balance": doc1["balance"] + 100},
+                    "account:shared": {
+                        "name": "Shared",
+                        "balance": doc1["balance"] + 100,
+                    },
                 },
                 "sync_level": "write",
             }
@@ -461,7 +496,10 @@ def test_occ_conflict_detection(stateful_api):
         {
             table_name: {
                 "inserts": {
-                    "account:shared": {"name": "Shared", "balance": doc2["balance"] + 200},
+                    "account:shared": {
+                        "name": "Shared",
+                        "balance": doc2["balance"] + 200,
+                    },
                 },
                 "sync_level": "write",
             }
@@ -591,7 +629,9 @@ def test_occ_lost_update_protection(stateful_api):
         except Exception as exc:  # pragma: no cover
             errors.append(exc)
 
-    threads = [threading.Thread(target=worker, args=(worker_id,)) for worker_id in range(2)]
+    threads = [
+        threading.Thread(target=worker, args=(worker_id,)) for worker_id in range(2)
+    ]
     for thread in threads:
         thread.start()
 
@@ -649,7 +689,10 @@ def test_occ_concurrent_rmw_only_one_commits(stateful_api):
         except Exception as exc:  # pragma: no cover
             errors.append(exc)
 
-    threads = [threading.Thread(target=worker, args=(worker_id,)) for worker_id in range(worker_count)]
+    threads = [
+        threading.Thread(target=worker, args=(worker_id,))
+        for worker_id in range(worker_count)
+    ]
     for thread in threads:
         thread.start()
 
@@ -672,7 +715,9 @@ def test_session_stage_transform_commit(stateful_api):
 
     stateful_api.batch_write(
         table_name,
-        inserts={"account:alice": {"name": "Alice", "balance": 1000, "status": "pending"}},
+        inserts={
+            "account:alice": {"name": "Alice", "balance": 1000, "status": "pending"}
+        },
         sync_level="write",
     )
 
@@ -722,9 +767,7 @@ def test_session_transform_savepoint_rollback(stateful_api):
         txn_id,
         tables={
             table_name: {
-                "transforms": [
-                    _transform("account:alice", _op("$inc", "balance", 100))
-                ]
+                "transforms": [_transform("account:alice", _op("$inc", "balance", 100))]
             }
         },
     )
@@ -996,8 +1039,12 @@ def _visibility_diagnostic(
         f"[observed]\n{_format_json(observed)}",
     ]
     _append_response_diagnostic(parts, stateful_api, "public status", "GET", "/status")
-    _append_response_diagnostic(parts, stateful_api, "table status", "GET", f"/tables/{table_name}")
-    _append_response_diagnostic(parts, stateful_api, "table indexes", "GET", f"/tables/{table_name}/indexes")
+    _append_response_diagnostic(
+        parts, stateful_api, "table status", "GET", f"/tables/{table_name}"
+    )
+    _append_response_diagnostic(
+        parts, stateful_api, "table indexes", "GET", f"/tables/{table_name}/indexes"
+    )
     for key in expected:
         escaped_key = quote(key, safe="")
         path = f"/tables/{table_name}/documents/{escaped_key}"
@@ -1007,7 +1054,9 @@ def _visibility_diagnostic(
     metadata_admin_url = getattr(server, "metadata_admin_url", None)
     if metadata_admin_url:
         try:
-            response = requests.get(f"{metadata_admin_url}/metadata/v1/status", timeout=5)
+            response = requests.get(
+                f"{metadata_admin_url}/metadata/v1/status", timeout=5
+            )
         except Exception as exc:  # pragma: no cover - failure diagnostics only
             parts.append(f"[metadata status]\nrequest error: {exc!r}")
         else:
@@ -1070,14 +1119,18 @@ def _tail(value: str, limit: int) -> str:
     return f"... truncated {len(value) - limit} chars ...\n{value[-limit:]}"
 
 
-def _lookup_with_version(stateful_api, table_name: str, key: str) -> tuple[dict, str | None] | None:
+def _lookup_with_version(
+    stateful_api, table_name: str, key: str
+) -> tuple[dict, str | None] | None:
     try:
         return stateful_api.lookup_key_with_version(table_name, key)
     except requests.HTTPError:
         return None
 
 
-def _lookup_many(stateful_api, table_name: str, keys: list[str]) -> dict[str, dict] | None:
+def _lookup_many(
+    stateful_api, table_name: str, keys: list[str]
+) -> dict[str, dict] | None:
     docs: dict[str, dict] = {}
     for key in keys:
         try:

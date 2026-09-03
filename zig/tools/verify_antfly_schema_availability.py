@@ -12,7 +12,9 @@ import urllib.request
 from pathlib import Path
 
 
-def request_json(method: str, url: str, body: bytes | None, timeout: float) -> tuple[int, object, float]:
+def request_json(
+    method: str, url: str, body: bytes | None, timeout: float
+) -> tuple[int, object, float]:
     request = urllib.request.Request(
         url,
         data=body,
@@ -23,7 +25,11 @@ def request_json(method: str, url: str, body: bytes | None, timeout: float) -> t
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = response.read()
-            return response.status, json.loads(payload) if payload else None, time.monotonic() - started
+            return (
+                response.status,
+                json.loads(payload) if payload else None,
+                time.monotonic() - started,
+            )
     except urllib.error.HTTPError as error:
         payload = error.read()
         try:
@@ -97,7 +103,14 @@ def main() -> int:
                 )
                 latencies.append(elapsed)
                 if status != 200:
-                    failures.append({"poll": polls, "request": name, "status": status, "payload": payload})
+                    failures.append(
+                        {
+                            "poll": polls,
+                            "request": name,
+                            "status": status,
+                            "payload": payload,
+                        }
+                    )
                     continue
                 if name == "status" and isinstance(payload, dict):
                     migration = payload.get("migration")

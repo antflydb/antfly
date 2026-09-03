@@ -190,7 +190,6 @@ const SgemmTransBF16Ctx = SgemmDispatchCtx(f16, sgemmTransBF16AddSlice);
 
 // --- sgemm: C = alpha * A @ B + beta * C ---
 
-
 /// Pure Zig SGEMM: C = alpha * A @ B + beta * C
 pub fn sgemmSync(
     m: usize,
@@ -227,9 +226,6 @@ pub fn sgemmSync(
 // weight quantization.  Avoids the up-front f16 -> f32 weight materialization
 // that the previous path did via convertTensorToOwnedF32.
 
-
-
-
 /// Pure Zig SGEMM with B in f16 + transposed: C = alpha * A @ B^T + beta * C.
 /// A and C are f32; B is f16 and consumed directly without prior up-cast.
 pub fn sgemmTransBF16WeightsSync(
@@ -259,7 +255,6 @@ pub fn sgemmTransBF16WeightsSync(
 }
 
 // --- sgemmTransB: C = alpha * A @ B^T + beta * C ---
-
 
 /// Pure Zig SGEMM with B transposed: C = alpha * A @ B^T + beta * C
 pub fn sgemmTransBSync(
@@ -293,7 +288,6 @@ pub fn sgemmTransBSync(
 // kernel body, but on a row range rather than [0, m).
 
 /// Pure Zig SGEMM with A transposed: C = alpha * A^T @ B + beta * C
-
 /// L2 normalize a batch of vectors in-place.
 pub fn l2Normalize(embeddings: []f32, dim: usize) void {
     const batch = embeddings.len / dim;

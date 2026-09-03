@@ -149,7 +149,9 @@ def canonical_long_output_prompt(repeat: int = 36) -> str:
     """Render the raw long-context prompt shared by the gate and its tests."""
 
     if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat <= 0:
-        raise BenchmarkContractError(f"prompt repeat must be a positive integer: {repeat!r}")
+        raise BenchmarkContractError(
+            f"prompt repeat must be a positive integer: {repeat!r}"
+        )
     evidence = _CANONICAL_EVIDENCE_SENTENCE * repeat
     return (
         f"<|turn>user\n{evidence}\n\n"
@@ -224,7 +226,9 @@ def canonical_git_submodule_violations(repo_root: Path) -> tuple[str, ...]:
             relative = os.fsdecode(raw_path)
             display = f"{prefix}/{relative}" if prefix else relative
             if stage != b"0":
-                violations.append(f"{display}: unresolved gitlink stage {os.fsdecode(stage)}")
+                violations.append(
+                    f"{display}: unresolved gitlink stage {os.fsdecode(stage)}"
+                )
                 continue
             try:
                 submodule = (repo / relative).resolve(strict=True)
@@ -285,15 +289,24 @@ def llama_bundle_manifest(root: Path) -> dict[str, Any]:
     try:
         resolved_root = root.resolve(strict=True)
     except OSError as exc:
-        raise BenchmarkContractError(f"cannot resolve llama.cpp bundle root {root}: {exc}") from exc
+        raise BenchmarkContractError(
+            f"cannot resolve llama.cpp bundle root {root}: {exc}"
+        ) from exc
     if not resolved_root.is_dir():
-        raise BenchmarkContractError(f"llama.cpp bundle root is not a directory: {resolved_root}")
+        raise BenchmarkContractError(
+            f"llama.cpp bundle root is not a directory: {resolved_root}"
+        )
 
     entries: list[dict[str, Any]] = []
     try:
-        paths = sorted(resolved_root.rglob("*"), key=lambda path: path.relative_to(resolved_root).as_posix())
+        paths = sorted(
+            resolved_root.rglob("*"),
+            key=lambda path: path.relative_to(resolved_root).as_posix(),
+        )
     except OSError as exc:
-        raise BenchmarkContractError(f"cannot enumerate llama.cpp bundle {resolved_root}: {exc}") from exc
+        raise BenchmarkContractError(
+            f"cannot enumerate llama.cpp bundle {resolved_root}: {exc}"
+        ) from exc
     for path in paths:
         relative = path.relative_to(resolved_root).as_posix()
         try:
@@ -373,7 +386,9 @@ def parse_llama_verbose_prompt_token_ids(
         )
     ]
     if any(value < 0 for value in values):
-        raise BenchmarkContractError(f"llama.cpp verbose prompt contains a negative token ID: {path}")
+        raise BenchmarkContractError(
+            f"llama.cpp verbose prompt contains a negative token ID: {path}"
+        )
     if expected_count <= 0 or len(values) != expected_count:
         raise BenchmarkContractError(
             f"llama.cpp verbose prompt ID count={len(values)}, expected {expected_count}: {path}"
@@ -394,7 +409,9 @@ def audit_llama_loaded_libraries(
         resolved_bundle = bundle_root.resolve(strict=True)
         resolved_binary = comparator_binary.resolve(strict=True)
     except OSError as exc:
-        raise BenchmarkContractError(f"cannot resolve llama.cpp loader audit paths: {exc}") from exc
+        raise BenchmarkContractError(
+            f"cannot resolve llama.cpp loader audit paths: {exc}"
+        ) from exc
     try:
         resolved_binary.relative_to(resolved_bundle)
     except ValueError as exc:
@@ -410,7 +427,9 @@ def audit_llama_loaded_libraries(
         )
     ]
     if not reported:
-        raise BenchmarkContractError(f"llama.cpp dyld loader audit emitted no image paths: {path}")
+        raise BenchmarkContractError(
+            f"llama.cpp dyld loader audit emitted no image paths: {path}"
+        )
 
     bundle_images: set[str] = set()
     system_images: set[str] = set()
@@ -461,7 +480,9 @@ def audit_llama_loaded_libraries(
             for label, pattern in _REQUIRED_LLAMA_BUNDLE_LOAD_PATTERNS
         ],
     }
-    normalized_bytes = (json.dumps(normalized, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    normalized_bytes = (
+        json.dumps(normalized, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
     return {
         **normalized,
         "audit_sha256": hashlib.sha256(normalized_bytes).hexdigest(),
@@ -477,13 +498,19 @@ def validate_llama_prompt_preflight(
     comparator_binary: Path,
 ) -> dict[str, Any]:
     if re.fullmatch(r"[0-9a-f]{64}", expected_prompt_token_ids_sha256) is None:
-        raise BenchmarkContractError("preflight requires a lowercase prompt-token SHA-256 pin")
+        raise BenchmarkContractError(
+            "preflight requires a lowercase prompt-token SHA-256 pin"
+        )
     if expected_prompt_tokens < 0:
-        raise BenchmarkContractError("preflight expected prompt-token count must be non-negative")
+        raise BenchmarkContractError(
+            "preflight expected prompt-token count must be non-negative"
+        )
     try:
         text = log_path.read_text(errors="replace")
     except OSError as exc:
-        raise BenchmarkContractError(f"cannot read llama.cpp prompt preflight {log_path}: {exc}") from exc
+        raise BenchmarkContractError(
+            f"cannot read llama.cpp prompt preflight {log_path}: {exc}"
+        ) from exc
     normalized_ids, values = parse_llama_verbose_prompt_token_ids(text, log_path)
     prompt_digest = _digest(normalized_ids)
     if prompt_digest != expected_prompt_token_ids_sha256:
@@ -510,7 +537,9 @@ def validate_llama_prompt_preflight(
             "reason": "non-Mach-O comparator permitted only for a noncanonical artifact",
         }
     else:
-        raise BenchmarkContractError(f"unsupported llama.cpp loader-audit mode {loader_audit_mode!r}")
+        raise BenchmarkContractError(
+            f"unsupported llama.cpp loader-audit mode {loader_audit_mode!r}"
+        )
     return {
         "schema": "antfly.gemma4_metal_long_output.preflight.v1",
         "log_sha256": _file_sha256(log_path),
@@ -521,7 +550,9 @@ def validate_llama_prompt_preflight(
     }
 
 
-def _unique_match(text: str, pattern: str, label: str, path: Path | str) -> re.Match[str]:
+def _unique_match(
+    text: str, pattern: str, label: str, path: Path | str
+) -> re.Match[str]:
     matches = list(re.finditer(pattern, text))
     if len(matches) != 1:
         raise BenchmarkContractError(
@@ -585,7 +616,9 @@ def parse_llama_timing(text: str, path: Path | str = "<llama log>") -> LlamaTimi
         path,
     )
     if not (sampling.start() < prompt.start() < evaluation.start() < total.start()):
-        raise BenchmarkContractError(f"llama timing records are not in final-block order: {path}")
+        raise BenchmarkContractError(
+            f"llama timing records are not in final-block order: {path}"
+        )
 
     loggers = {match.group("logger") for match in (sampling, prompt, evaluation, total)}
     if len(loggers) != 1:
@@ -605,7 +638,9 @@ def parse_llama_timing(text: str, path: Path | str = "<llama log>") -> LlamaTimi
     )
     result = LlamaTiming(
         logger=next(iter(loggers)),
-        sampling_ms=_positive_finite(float(sampling.group(2)), "llama sampling time", path),
+        sampling_ms=_positive_finite(
+            float(sampling.group(2)), "llama sampling time", path
+        ),
         prompt_ms=_positive_finite(float(prompt.group(2)), "llama prompt time", path),
         prompt_tokens=int(prompt.group(3)),
         eval_ms=_positive_finite(float(evaluation.group(2)), "llama eval time", path),
@@ -616,9 +651,16 @@ def parse_llama_timing(text: str, path: Path | str = "<llama log>") -> LlamaTimi
         graphs_reused=int(graphs.group(2)) if graphs else None,
     )
     if result.prompt_tokens <= 0 or result.eval_runs <= 0:
-        raise BenchmarkContractError(f"llama timing block has non-positive token accounting: {path}")
+        raise BenchmarkContractError(
+            f"llama timing block has non-positive token accounting: {path}"
+        )
     if result.unaccounted_ms is not None:
-        accounted = result.sampling_ms + result.prompt_ms + result.eval_ms + result.unaccounted_ms
+        accounted = (
+            result.sampling_ms
+            + result.prompt_ms
+            + result.eval_ms
+            + result.unaccounted_ms
+        )
         tolerance_ms = max(1.0, result.total_ms * 0.001)
         if abs(accounted - result.total_ms) > tolerance_ms:
             raise BenchmarkContractError(
@@ -682,8 +724,12 @@ def parse_llama_metal_runtime(
 
 def stats(values: Iterable[float]) -> dict[str, float]:
     collected = [float(value) for value in values]
-    if not collected or any(not math.isfinite(value) or value <= 0 for value in collected):
-        raise BenchmarkContractError(f"statistics require non-empty positive finite values: {collected!r}")
+    if not collected or any(
+        not math.isfinite(value) or value <= 0 for value in collected
+    ):
+        raise BenchmarkContractError(
+            f"statistics require non-empty positive finite values: {collected!r}"
+        )
     mean = statistics.fmean(collected)
     return {
         "min": min(collected),
@@ -711,7 +757,9 @@ def _percentile(sorted_values: list[float], quantile: float) -> float:
     if lower == upper:
         return sorted_values[lower]
     fraction = position - lower
-    return sorted_values[lower] + fraction * (sorted_values[upper] - sorted_values[lower])
+    return sorted_values[lower] + fraction * (
+        sorted_values[upper] - sorted_values[lower]
+    )
 
 
 def paired_bootstrap_interval(
@@ -763,11 +811,18 @@ def paired_bootstrap_interval(
 def one_sided_sign_test_p(wins: int, samples: int) -> float:
     """Exact binomial tail under an equal-probability paired win/loss null."""
 
-    if isinstance(wins, bool) or isinstance(samples, bool) or samples <= 0 or not 0 <= wins <= samples:
+    if (
+        isinstance(wins, bool)
+        or isinstance(samples, bool)
+        or samples <= 0
+        or not 0 <= wins <= samples
+    ):
         raise BenchmarkContractError(
             f"invalid paired sign-test shape: wins={wins!r}, samples={samples!r}"
         )
-    return sum(math.comb(samples, count) for count in range(wins, samples + 1)) / (2**samples)
+    return sum(math.comb(samples, count) for count in range(wins, samples + 1)) / (
+        2**samples
+    )
 
 
 def _mapping(value: Any, label: str, path: Path) -> dict[str, Any]:
@@ -776,22 +831,30 @@ def _mapping(value: Any, label: str, path: Path) -> dict[str, Any]:
     return value
 
 
-def _exact_int(mapping: dict[str, Any], key: str, expected: int, label: str, path: Path) -> int:
+def _exact_int(
+    mapping: dict[str, Any], key: str, expected: int, label: str, path: Path
+) -> int:
     value = mapping.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
         raise BenchmarkContractError(f"missing integer {label}.{key}: {path}")
     if value != expected:
-        raise BenchmarkContractError(f"{label}.{key}={value}, expected {expected}: {path}")
+        raise BenchmarkContractError(
+            f"{label}.{key}={value}, expected {expected}: {path}"
+        )
     return value
 
 
 def _token_line(text: str, name: str, path: Path) -> tuple[str, list[int]]:
-    match = _unique_match(text, rf"(?m)^{re.escape(name)}:\s*(.*)$", f"Antfly {name}", path)
+    match = _unique_match(
+        text, rf"(?m)^{re.escape(name)}:\s*(.*)$", f"Antfly {name}", path
+    )
     raw = match.group(1).strip()
     try:
         values = [int(part) for part in raw.split()]
     except ValueError as exc:
-        raise BenchmarkContractError(f"invalid integer in Antfly {name}: {path}") from exc
+        raise BenchmarkContractError(
+            f"invalid integer in Antfly {name}: {path}"
+        ) from exc
     if not values or any(value < 0 for value in values):
         raise BenchmarkContractError(f"invalid Antfly {name}: {path}")
     normalized = " ".join(str(value) for value in values)
@@ -816,25 +879,44 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
             f"benchmark runs must be a positive even integer for balanced ordering: {runs!r}"
         )
     metadata_path = root / "metadata.json"
-    metadata = _mapping(json.loads(metadata_path.read_text()), "benchmark metadata", metadata_path)
+    metadata = _mapping(
+        json.loads(metadata_path.read_text()), "benchmark metadata", metadata_path
+    )
     if metadata.get("schema") != "antfly.gemma4_metal_long_output.metadata.v4":
-        raise BenchmarkContractError(f"unsupported benchmark metadata schema: {metadata_path}")
-    if metadata.get("runs") != runs or metadata.get("output_tokens") != requested_tokens:
-        raise BenchmarkContractError(f"benchmark metadata does not match requested run shape: {metadata_path}")
+        raise BenchmarkContractError(
+            f"unsupported benchmark metadata schema: {metadata_path}"
+        )
+    if (
+        metadata.get("runs") != runs
+        or metadata.get("output_tokens") != requested_tokens
+    ):
+        raise BenchmarkContractError(
+            f"benchmark metadata does not match requested run shape: {metadata_path}"
+        )
     warmups = metadata.get("warmups")
     if isinstance(warmups, bool) or not isinstance(warmups, int) or warmups < 0:
-        raise BenchmarkContractError(f"missing non-negative benchmark warmup count: {metadata_path}")
+        raise BenchmarkContractError(
+            f"missing non-negative benchmark warmup count: {metadata_path}"
+        )
     cooldown_seconds = metadata.get("cooldown_seconds")
     if (
         isinstance(cooldown_seconds, bool)
         or not isinstance(cooldown_seconds, int)
         or cooldown_seconds < 0
     ):
-        raise BenchmarkContractError(f"missing non-negative benchmark cooldown: {metadata_path}")
+        raise BenchmarkContractError(
+            f"missing non-negative benchmark cooldown: {metadata_path}"
+        )
     for key in ("max_total_ratio", "min_decode_ratio", "max_cv"):
         value = metadata.get(key)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-            raise BenchmarkContractError(f"missing finite benchmark threshold {key}: {metadata_path}")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise BenchmarkContractError(
+                f"missing finite benchmark threshold {key}: {metadata_path}"
+            )
     for key in (
         "gguf_sha256",
         "prompt_sha256",
@@ -852,18 +934,27 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
     ):
         value = metadata.get(key)
         if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
-            raise BenchmarkContractError(f"missing immutable metadata hash {key}: {metadata_path}")
+            raise BenchmarkContractError(
+                f"missing immutable metadata hash {key}: {metadata_path}"
+            )
     if not isinstance(metadata.get("git_dirty"), bool):
-        raise BenchmarkContractError(f"missing boolean source provenance git_dirty: {metadata_path}")
+        raise BenchmarkContractError(
+            f"missing boolean source provenance git_dirty: {metadata_path}"
+        )
     for key in ("repo_root", "git_revision", "git_revision_end"):
         if not isinstance(metadata.get(key), str) or not metadata[key].strip():
-            raise BenchmarkContractError(f"missing source provenance {key}: {metadata_path}")
+            raise BenchmarkContractError(
+                f"missing source provenance {key}: {metadata_path}"
+            )
     if (
         metadata["git_revision_end"] != metadata["git_revision"]
-        or metadata["git_tracked_diff_sha256_end"] != metadata["git_tracked_diff_sha256"]
+        or metadata["git_tracked_diff_sha256_end"]
+        != metadata["git_tracked_diff_sha256"]
         or metadata["git_status_sha256_end"] != metadata["git_status_sha256"]
     ):
-        raise BenchmarkContractError(f"Git state changed during benchmark: {metadata_path}")
+        raise BenchmarkContractError(
+            f"Git state changed during benchmark: {metadata_path}"
+        )
     repo_root = Path(metadata["repo_root"])
     try:
         git_environment = _sanitized_git_environment()
@@ -887,18 +978,36 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
         ).strip()
         current_tracked_diff_sha256 = hashlib.sha256(
             subprocess.check_output(
-                ["git", "-C", str(resolved_repo_root), "diff", "--binary", "--no-ext-diff", "HEAD", "--"],
+                [
+                    "git",
+                    "-C",
+                    str(resolved_repo_root),
+                    "diff",
+                    "--binary",
+                    "--no-ext-diff",
+                    "HEAD",
+                    "--",
+                ],
                 env=git_environment,
             )
         ).hexdigest()
         current_status_sha256 = hashlib.sha256(
             subprocess.check_output(
-                ["git", "-C", str(resolved_repo_root), "status", "--porcelain=v1", "--untracked-files=all"],
+                [
+                    "git",
+                    "-C",
+                    str(resolved_repo_root),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
                 env=git_environment,
             )
         ).hexdigest()
     except (OSError, subprocess.SubprocessError) as exc:
-        raise BenchmarkContractError(f"cannot revalidate benchmark Git state: {repo_root}: {exc}") from exc
+        raise BenchmarkContractError(
+            f"cannot revalidate benchmark Git state: {repo_root}: {exc}"
+        ) from exc
     if (
         current_revision != metadata["git_revision"]
         or current_tracked_diff_sha256 != metadata["git_tracked_diff_sha256"]
@@ -908,11 +1017,13 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
             f"current Git state differs from benchmark start/end provenance: {metadata_path}"
         )
     if metadata.get("prompt_file") != "prompt.txt":
-        raise BenchmarkContractError(f"missing canonical prompt artifact: {metadata_path}")
+        raise BenchmarkContractError(
+            f"missing canonical prompt artifact: {metadata_path}"
+        )
     source_paths = {
-        "benchmark_harness_sha256": Path(__file__).resolve().with_name(
-            "benchmark_metal_gemma4_long_output.sh"
-        ),
+        "benchmark_harness_sha256": Path(__file__)
+        .resolve()
+        .with_name("benchmark_metal_gemma4_long_output.sh"),
         "benchmark_parser_sha256": Path(__file__).resolve(),
     }
     for key, source_path in source_paths.items():
@@ -930,7 +1041,9 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
     }
     for key, raw_path in artifact_paths.items():
         if not isinstance(raw_path, str) or not raw_path.strip():
-            raise BenchmarkContractError(f"missing artifact path for {key}: {metadata_path}")
+            raise BenchmarkContractError(
+                f"missing artifact path for {key}: {metadata_path}"
+            )
         artifact_path = Path(raw_path)
         try:
             current_hash = _file_sha256(artifact_path)
@@ -943,31 +1056,53 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
                 f"benchmark artifact hash mismatch for {key}: "
                 f"recorded={metadata[key]}, current={current_hash}: {artifact_path}"
             )
-    for key in ("llama_cpp_resolved_bin", "llama_cpp_version_output", "llama_cpp_comparator_id"):
+    for key in (
+        "llama_cpp_resolved_bin",
+        "llama_cpp_version_output",
+        "llama_cpp_comparator_id",
+    ):
         if not isinstance(metadata.get(key), str) or not metadata[key].strip():
-            raise BenchmarkContractError(f"missing comparator provenance {key}: {metadata_path}")
+            raise BenchmarkContractError(
+                f"missing comparator provenance {key}: {metadata_path}"
+            )
     gguf_path = Path(str(metadata.get("gguf", ""))).resolve()
     for key in ("antfly_model_argument", "llama_model_argument"):
         raw_model_argument = metadata.get(key)
         if not isinstance(raw_model_argument, str) or not raw_model_argument.strip():
-            raise BenchmarkContractError(f"missing model-artifact binding {key}: {metadata_path}")
+            raise BenchmarkContractError(
+                f"missing model-artifact binding {key}: {metadata_path}"
+            )
         if Path(raw_model_argument).resolve() != gguf_path:
             raise BenchmarkContractError(
                 f"{key} does not match the hashed GGUF artifact: {metadata_path}"
             )
     for key in ("zig_bin", "zig_resolved_bin", "zig_version"):
         if not isinstance(metadata.get(key), str) or not metadata[key].strip():
-            raise BenchmarkContractError(f"missing Zig toolchain provenance {key}: {metadata_path}")
+            raise BenchmarkContractError(
+                f"missing Zig toolchain provenance {key}: {metadata_path}"
+            )
     if metadata.get("execution_order_file") != "execution-order.jsonl":
-        raise BenchmarkContractError(f"missing canonical execution-order artifact: {metadata_path}")
+        raise BenchmarkContractError(
+            f"missing canonical execution-order artifact: {metadata_path}"
+        )
     if metadata.get("llama_prompt_preflight_file") != "llama-prompt-preflight.log":
-        raise BenchmarkContractError(f"missing llama.cpp prompt preflight artifact: {metadata_path}")
-    if metadata.get("llama_prompt_preflight_validation_file") != "llama-prompt-preflight-validation.json":
+        raise BenchmarkContractError(
+            f"missing llama.cpp prompt preflight artifact: {metadata_path}"
+        )
+    if (
+        metadata.get("llama_prompt_preflight_validation_file")
+        != "llama-prompt-preflight-validation.json"
+    ):
         raise BenchmarkContractError(
             f"missing llama.cpp prompt preflight validation artifact: {metadata_path}"
         )
-    if metadata.get("llama_cpp_bundle_manifest_file") != "llama-cpp-bundle-manifest.json":
-        raise BenchmarkContractError(f"missing llama.cpp bundle manifest artifact: {metadata_path}")
+    if (
+        metadata.get("llama_cpp_bundle_manifest_file")
+        != "llama-cpp-bundle-manifest.json"
+    ):
+        raise BenchmarkContractError(
+            f"missing llama.cpp bundle manifest artifact: {metadata_path}"
+        )
     bundle_root_raw = metadata.get("llama_cpp_bundle_root")
     if not isinstance(bundle_root_raw, str) or not bundle_root_raw.strip():
         raise BenchmarkContractError(f"missing llama.cpp bundle root: {metadata_path}")
@@ -981,33 +1116,51 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
     manifest_path = root / metadata["llama_cpp_bundle_manifest_file"]
     try:
         recorded_manifest = _mapping(
-            json.loads(manifest_path.read_text()), "llama.cpp bundle manifest", manifest_path
+            json.loads(manifest_path.read_text()),
+            "llama.cpp bundle manifest",
+            manifest_path,
         )
     except (OSError, json.JSONDecodeError) as exc:
-        raise BenchmarkContractError(f"invalid llama.cpp bundle manifest {manifest_path}: {exc}") from exc
+        raise BenchmarkContractError(
+            f"invalid llama.cpp bundle manifest {manifest_path}: {exc}"
+        ) from exc
     current_manifest = llama_bundle_manifest(bundle_root)
     if recorded_manifest != current_manifest:
-        raise BenchmarkContractError(f"llama.cpp bundle changed after benchmark: {bundle_root}")
+        raise BenchmarkContractError(
+            f"llama.cpp bundle changed after benchmark: {bundle_root}"
+        )
     current_bundle_sha256 = llama_bundle_manifest_sha256(current_manifest)
     if current_bundle_sha256 != metadata["llama_cpp_bundle_sha256"]:
-        raise BenchmarkContractError(f"llama.cpp bundle manifest digest mismatch: {metadata_path}")
+        raise BenchmarkContractError(
+            f"llama.cpp bundle manifest digest mismatch: {metadata_path}"
+        )
     expected_bundle_sha256 = metadata.get("llama_cpp_expected_bundle_sha256")
     if (
         not isinstance(expected_bundle_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", expected_bundle_sha256) is None
         or expected_bundle_sha256 != current_bundle_sha256
     ):
-        raise BenchmarkContractError(f"llama.cpp bundle does not match its approved pin: {metadata_path}")
+        raise BenchmarkContractError(
+            f"llama.cpp bundle does not match its approved pin: {metadata_path}"
+        )
     if not isinstance(metadata.get("require_confidence"), bool):
-        raise BenchmarkContractError(f"missing confidence-gate provenance: {metadata_path}")
-    if not isinstance(metadata.get("allow_noncanonical_policy"), bool) or not isinstance(
-        metadata.get("canonical_policy"), bool
-    ):
-        raise BenchmarkContractError(f"missing canonical-policy provenance: {metadata_path}")
+        raise BenchmarkContractError(
+            f"missing confidence-gate provenance: {metadata_path}"
+        )
+    if not isinstance(
+        metadata.get("allow_noncanonical_policy"), bool
+    ) or not isinstance(metadata.get("canonical_policy"), bool):
+        raise BenchmarkContractError(
+            f"missing canonical-policy provenance: {metadata_path}"
+        )
     if metadata["canonical_policy"] == metadata["allow_noncanonical_policy"]:
-        raise BenchmarkContractError(f"inconsistent canonical-policy provenance: {metadata_path}")
+        raise BenchmarkContractError(
+            f"inconsistent canonical-policy provenance: {metadata_path}"
+        )
     if metadata.get("git_environment_prefixes") != list(_GIT_ENV_PREFIXES):
-        raise BenchmarkContractError(f"Git-environment isolation contract changed: {metadata_path}")
+        raise BenchmarkContractError(
+            f"Git-environment isolation contract changed: {metadata_path}"
+        )
     process_git_env = metadata.get("process_git_env")
     if not isinstance(process_git_env, dict) or any(
         not isinstance(name, str)
@@ -1015,11 +1168,17 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
         or not isinstance(value, str)
         for name, value in process_git_env.items()
     ):
-        raise BenchmarkContractError(f"invalid Git-environment provenance: {metadata_path}")
+        raise BenchmarkContractError(
+            f"invalid Git-environment provenance: {metadata_path}"
+        )
     if metadata.get("canonical_untracked_policy") != "reject":
-        raise BenchmarkContractError(f"untracked-worktree contract changed: {metadata_path}")
+        raise BenchmarkContractError(
+            f"untracked-worktree contract changed: {metadata_path}"
+        )
     if metadata.get("canonical_submodule_policy") != "clean_and_pinned":
-        raise BenchmarkContractError(f"submodule-worktree contract changed: {metadata_path}")
+        raise BenchmarkContractError(
+            f"submodule-worktree contract changed: {metadata_path}"
+        )
     if metadata["canonical_policy"]:
         if process_git_env:
             raise BenchmarkContractError(
@@ -1027,7 +1186,9 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
             )
         validate_canonical_git_worktree(repo_root)
     if not isinstance(metadata.get("prompt_override_set"), bool):
-        raise BenchmarkContractError(f"missing prompt-override provenance: {metadata_path}")
+        raise BenchmarkContractError(
+            f"missing prompt-override provenance: {metadata_path}"
+        )
     if metadata["canonical_policy"]:
         canonical_violations: list[str] = []
         if metadata.get("prompt_override_set") is not False:
@@ -1054,17 +1215,33 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
             canonical_violations.append("require_confidence must be enabled")
         if tuple(
             str(metadata.get(key, "")).lower()
-            for key in ("antfly_cache_dtype", "llama_cache_type_k", "llama_cache_type_v")
+            for key in (
+                "antfly_cache_dtype",
+                "llama_cache_type_k",
+                "llama_cache_type_v",
+            )
         ) != ("f16", "f16", "f16"):
             canonical_violations.append("all KV cache types must be f16")
         if metadata.get("llama_context_size") != 4096:
             canonical_violations.append("llama_context_size must equal 4096")
-        if metadata.get("expected_prompt_token_ids_sha256") != _CANONICAL_PROMPT_TOKEN_IDS_SHA256:
-            canonical_violations.append("expected prompt token digest is not the approved canonical digest")
-        if metadata.get("expected_token_ids_sha256") != _CANONICAL_OUTPUT_TOKEN_IDS_SHA256:
-            canonical_violations.append("expected output token digest is not the approved canonical digest")
+        if (
+            metadata.get("expected_prompt_token_ids_sha256")
+            != _CANONICAL_PROMPT_TOKEN_IDS_SHA256
+        ):
+            canonical_violations.append(
+                "expected prompt token digest is not the approved canonical digest"
+            )
+        if (
+            metadata.get("expected_token_ids_sha256")
+            != _CANONICAL_OUTPUT_TOKEN_IDS_SHA256
+        ):
+            canonical_violations.append(
+                "expected output token digest is not the approved canonical digest"
+            )
         if metadata.get("prompt_sha256") != _CANONICAL_PROMPT_SHA256:
-            canonical_violations.append("prompt_sha256 is not the approved canonical byte digest")
+            canonical_violations.append(
+                "prompt_sha256 is not the approved canonical byte digest"
+            )
         if metadata.get("llama_cpp_build") != _CANONICAL_LLAMA_CPP_BUILD:
             canonical_violations.append(
                 f"llama_cpp_build must equal approved b{_CANONICAL_LLAMA_CPP_BUILD}"
@@ -1074,11 +1251,20 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
                 f"llama_cpp_expected_build must equal approved b{_CANONICAL_LLAMA_CPP_BUILD}"
             )
         if metadata.get("llama_cpp_binary_sha256") != _CANONICAL_LLAMA_CPP_SHA256:
-            canonical_violations.append("llama_cpp_binary_sha256 is not the approved comparator")
+            canonical_violations.append(
+                "llama_cpp_binary_sha256 is not the approved comparator"
+            )
         if metadata.get("llama_cpp_expected_sha256") != _CANONICAL_LLAMA_CPP_SHA256:
-            canonical_violations.append("llama_cpp_expected_sha256 is not the approved comparator")
-        if metadata.get("llama_cpp_bundle_sha256") != _CANONICAL_LLAMA_CPP_BUNDLE_SHA256:
-            canonical_violations.append("llama_cpp_bundle_sha256 is not the approved comparator bundle")
+            canonical_violations.append(
+                "llama_cpp_expected_sha256 is not the approved comparator"
+            )
+        if (
+            metadata.get("llama_cpp_bundle_sha256")
+            != _CANONICAL_LLAMA_CPP_BUNDLE_SHA256
+        ):
+            canonical_violations.append(
+                "llama_cpp_bundle_sha256 is not the approved comparator bundle"
+            )
         if (
             metadata.get("llama_cpp_expected_bundle_sha256")
             != _CANONICAL_LLAMA_CPP_BUNDLE_SHA256
@@ -1101,7 +1287,9 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
                 f"{'; '.join(canonical_violations)}: {metadata_path}"
             )
     if metadata.get("policy_environment_prefixes") != list(_POLICY_ENV_PREFIXES):
-        raise BenchmarkContractError(f"policy-environment isolation contract changed: {metadata_path}")
+        raise BenchmarkContractError(
+            f"policy-environment isolation contract changed: {metadata_path}"
+        )
     process_policy_env = metadata.get("process_policy_env")
     if not isinstance(process_policy_env, dict) or any(
         not isinstance(name, str)
@@ -1109,7 +1297,9 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
         or not isinstance(value, str)
         for name, value in process_policy_env.items()
     ):
-        raise BenchmarkContractError(f"invalid process policy environment provenance: {metadata_path}")
+        raise BenchmarkContractError(
+            f"invalid process policy environment provenance: {metadata_path}"
+        )
     runner_policy_env = {"TERMITE_METAL_TRACE_DECODE_GQA_SPLIT_SCHEDULE": "1"}
     if metadata["canonical_policy"] and process_policy_env != runner_policy_env:
         raise BenchmarkContractError(
@@ -1118,22 +1308,31 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
     loader_audit_mode = metadata.get("llama_cpp_loader_audit_mode")
     binary_file_type = metadata.get("llama_cpp_binary_file_type")
     if not isinstance(binary_file_type, str) or not binary_file_type.strip():
-        raise BenchmarkContractError(f"missing llama.cpp binary file type: {metadata_path}")
+        raise BenchmarkContractError(
+            f"missing llama.cpp binary file type: {metadata_path}"
+        )
     expected_loader_audit_mode = (
         "dyld_print_libraries_preflight"
         if binary_file_type.startswith("Mach-O")
         else "skipped_non_macho_noncanonical"
     )
     if loader_audit_mode != expected_loader_audit_mode:
-        raise BenchmarkContractError(f"invalid llama.cpp loader-audit mode: {metadata_path}")
-    if metadata["canonical_policy"] and expected_loader_audit_mode != "dyld_print_libraries_preflight":
+        raise BenchmarkContractError(
+            f"invalid llama.cpp loader-audit mode: {metadata_path}"
+        )
+    if (
+        metadata["canonical_policy"]
+        and expected_loader_audit_mode != "dyld_print_libraries_preflight"
+    ):
         raise BenchmarkContractError(
             f"canonical llama.cpp comparator is not Mach-O: {metadata_path}"
         )
-    if metadata.get("loader_environment_prefixes") != list(_LOADER_ENV_PREFIXES) or metadata.get(
-        "loader_environment_names"
-    ) != list(_LOADER_ENV_NAMES):
-        raise BenchmarkContractError(f"loader-environment isolation contract changed: {metadata_path}")
+    if metadata.get("loader_environment_prefixes") != list(
+        _LOADER_ENV_PREFIXES
+    ) or metadata.get("loader_environment_names") != list(_LOADER_ENV_NAMES):
+        raise BenchmarkContractError(
+            f"loader-environment isolation contract changed: {metadata_path}"
+        )
     process_loader_env = metadata.get("process_loader_env")
     if not isinstance(process_loader_env, dict) or any(
         not isinstance(name, str)
@@ -1141,7 +1340,9 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
         or not isinstance(value, str)
         for name, value in process_loader_env.items()
     ):
-        raise BenchmarkContractError(f"invalid loader-environment provenance: {metadata_path}")
+        raise BenchmarkContractError(
+            f"invalid loader-environment provenance: {metadata_path}"
+        )
     if metadata["canonical_policy"] and process_loader_env:
         raise BenchmarkContractError(
             f"canonical benchmark inherited a dynamic-loader override: {metadata_path}"
@@ -1155,20 +1356,33 @@ def _load_metadata(root: Path, runs: int, requested_tokens: int) -> dict[str, An
             "1 for unmeasured llama prompt preflight only"
         )
     if metadata.get("runner_injected_env") != expected_runner_env:
-        raise BenchmarkContractError(f"runner-injected environment contract changed: {metadata_path}")
+        raise BenchmarkContractError(
+            f"runner-injected environment contract changed: {metadata_path}"
+        )
     expected_sha = metadata.get("llama_cpp_expected_sha256")
-    if not isinstance(expected_sha, str) or re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None:
-        raise BenchmarkContractError(f"missing pinned llama.cpp comparator hash: {metadata_path}")
+    if (
+        not isinstance(expected_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None
+    ):
+        raise BenchmarkContractError(
+            f"missing pinned llama.cpp comparator hash: {metadata_path}"
+        )
     if expected_sha != metadata["llama_cpp_binary_sha256"]:
-        raise BenchmarkContractError(f"llama.cpp comparator hash does not match pinned hash: {metadata_path}")
+        raise BenchmarkContractError(
+            f"llama.cpp comparator hash does not match pinned hash: {metadata_path}"
+        )
     policy_env = metadata.get("metal_policy_env")
     if not isinstance(policy_env, dict):
-        raise BenchmarkContractError(f"missing Metal policy environment provenance: {metadata_path}")
+        raise BenchmarkContractError(
+            f"missing Metal policy environment provenance: {metadata_path}"
+        )
     for name in _POLICY_ENV_NAMES:
         if name not in policy_env or (
             policy_env[name] is not None and not isinstance(policy_env[name], str)
         ):
-            raise BenchmarkContractError(f"missing Metal policy environment value {name}: {metadata_path}")
+            raise BenchmarkContractError(
+                f"missing Metal policy environment value {name}: {metadata_path}"
+            )
     for name in (
         "TERMITE_METAL_DECODE_GQA_SPLIT_SWA_VARIANT",
         "TERMITE_METAL_DECODE_GQA_SPLIT_GLOBAL_VARIANT",
@@ -1255,7 +1469,9 @@ def _load_execution_order(
         mismatch = next(
             (
                 index
-                for index, (actual, planned) in enumerate(zip(records, expected), start=1)
+                for index, (actual, planned) in enumerate(
+                    zip(records, expected), start=1
+                )
                 if actual != planned
             ),
             min(len(records), len(expected)) + 1,
@@ -1291,7 +1507,9 @@ def _load_execution_order(
 
 def _metadata_env_bool(metadata: dict[str, Any], name: str) -> bool | None:
     metadata_path = Path(str(metadata.get("_path", "metadata.json")))
-    policy_env = _mapping(metadata.get("metal_policy_env"), "Metal policy environment", metadata_path)
+    policy_env = _mapping(
+        metadata.get("metal_policy_env"), "Metal policy environment", metadata_path
+    )
     raw = policy_env.get(name)
     if raw is None or not raw.strip():
         return None
@@ -1300,12 +1518,16 @@ def _metadata_env_bool(metadata: dict[str, Any], name: str) -> bool | None:
         return True
     if normalized in _FALSE_ENV_VALUES:
         return False
-    raise BenchmarkContractError(f"invalid boolean Metal policy environment {name}={raw!r}: {metadata_path}")
+    raise BenchmarkContractError(
+        f"invalid boolean Metal policy environment {name}={raw!r}: {metadata_path}"
+    )
 
 
 def _required_metadata_env(metadata: dict[str, Any], name: str) -> str:
     metadata_path = Path(str(metadata.get("_path", "metadata.json")))
-    policy_env = _mapping(metadata.get("metal_policy_env"), "Metal policy environment", metadata_path)
+    policy_env = _mapping(
+        metadata.get("metal_policy_env"), "Metal policy environment", metadata_path
+    )
     raw = policy_env.get(name)
     if not isinstance(raw, str) or not raw.strip():
         raise BenchmarkContractError(
@@ -1332,10 +1554,14 @@ def _required_metadata_env_int(
 ) -> int:
     raw = _required_metadata_env(metadata, name)
     if re.fullmatch(r"[0-9]+", raw) is None:
-        raise BenchmarkContractError(f"invalid integer benchmark expectation {name}={raw!r}")
+        raise BenchmarkContractError(
+            f"invalid integer benchmark expectation {name}={raw!r}"
+        )
     value = int(raw)
     if positive and value <= 0:
-        raise BenchmarkContractError(f"benchmark expectation {name} must be positive, got {value}")
+        raise BenchmarkContractError(
+            f"benchmark expectation {name} must be positive, got {value}"
+        )
     return value
 
 
@@ -1374,7 +1600,9 @@ def _expect_q4_mmv_portfolio(metadata: dict[str, Any]) -> bool:
     variant = raw_variant.strip().lower() if raw_variant else "auto"
     valid_variants = {"auto", "legacy", "nr4-nsg2", "nr8-nsg2", "nr4-nsg4", "nr8-nsg4"}
     if variant not in valid_variants:
-        raise BenchmarkContractError(f"invalid Q4_0 MMV variant in benchmark metadata: {raw_variant!r}")
+        raise BenchmarkContractError(
+            f"invalid Q4_0 MMV variant in benchmark metadata: {raw_variant!r}"
+        )
     return disabled is not True and variant != "legacy"
 
 
@@ -1402,7 +1630,9 @@ def collect_rows(
         Path(metadata["llama_cpp_bundle_root"]),
         Path(metadata["llama_cpp_resolved_bin"]),
     )
-    preflight_validation_path = root / metadata["llama_prompt_preflight_validation_file"]
+    preflight_validation_path = (
+        root / metadata["llama_prompt_preflight_validation_file"]
+    )
     try:
         recorded_preflight = json.loads(preflight_validation_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -1423,12 +1653,22 @@ def collect_rows(
         metadata,
         "EXPECT_GENERATED_FLASH_PREFILL_HD512_CALLS",
     )
-    expect_prefill_direct_kv = _required_metadata_env_bool(metadata, "EXPECT_PREFILL_DIRECT_KV")
-    expect_fast_prepared_frame = _required_metadata_env_bool(metadata, "EXPECT_FAST_PREPARED_FRAME")
+    expect_prefill_direct_kv = _required_metadata_env_bool(
+        metadata, "EXPECT_PREFILL_DIRECT_KV"
+    )
+    expect_fast_prepared_frame = _required_metadata_env_bool(
+        metadata, "EXPECT_FAST_PREPARED_FRAME"
+    )
     expect_q4_mmv_variant = _expected_q4_mmv_variant(metadata)
-    expect_swa_scan_clamp = _required_metadata_env_bool(metadata, "EXPECT_SWA_SCAN_CLAMP")
-    expect_antfly_metal_device = _required_metadata_env(metadata, "EXPECT_ANTFLY_METAL_DEVICE")
-    expect_llama_metal_device = _required_metadata_env(metadata, "EXPECT_LLAMA_METAL_DEVICE")
+    expect_swa_scan_clamp = _required_metadata_env_bool(
+        metadata, "EXPECT_SWA_SCAN_CLAMP"
+    )
+    expect_antfly_metal_device = _required_metadata_env(
+        metadata, "EXPECT_ANTFLY_METAL_DEVICE"
+    )
+    expect_llama_metal_device = _required_metadata_env(
+        metadata, "EXPECT_LLAMA_METAL_DEVICE"
+    )
     expect_llama_offloaded_layers = _required_metadata_env_int(
         metadata,
         "EXPECT_LLAMA_OFFLOADED_LAYERS",
@@ -1453,37 +1693,54 @@ def collect_rows(
         try:
             antfly = json.loads(antfly_path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
-            raise BenchmarkContractError(f"invalid Antfly JSON: {antfly_path}: {exc}") from exc
+            raise BenchmarkContractError(
+                f"invalid Antfly JSON: {antfly_path}: {exc}"
+            ) from exc
         antfly_log = antfly_log_path.read_text(errors="replace")
         llama_log = llama_path.read_text(errors="replace")
 
         if antfly.get("backend") != "metal":
-            raise BenchmarkContractError(f"Antfly did not report the Metal backend: {antfly_path}")
-        if antfly.get("tokens") != requested_tokens or antfly.get("finish_reason") != "length":
+            raise BenchmarkContractError(
+                f"Antfly did not report the Metal backend: {antfly_path}"
+            )
+        if (
+            antfly.get("tokens") != requested_tokens
+            or antfly.get("finish_reason") != "length"
+        ):
             raise BenchmarkContractError(
                 f"Antfly did not generate exactly {requested_tokens} length-limited tokens: {antfly_path}"
             )
         if "speculative" not in antfly or antfly.get("speculative") is not None:
-            raise BenchmarkContractError(f"baseline benchmark unexpectedly used MTP/speculative decode: {antfly_path}")
+            raise BenchmarkContractError(
+                f"baseline benchmark unexpectedly used MTP/speculative decode: {antfly_path}"
+            )
         for draft_field in ("draft_cuda", "draft_cuda_generate"):
             if antfly.get(draft_field) is not None:
-                raise BenchmarkContractError(f"baseline benchmark reported {draft_field}: {antfly_path}")
+                raise BenchmarkContractError(
+                    f"baseline benchmark reported {draft_field}: {antfly_path}"
+                )
         if "generate-setup: live whole-model executor skipped" not in antfly_log:
-            raise BenchmarkContractError(f"Antfly did not enter the compiled generation pipeline: {antfly_log_path}")
+            raise BenchmarkContractError(
+                f"Antfly did not enter the compiled generation pipeline: {antfly_log_path}"
+            )
         if "gen_debug: executePrefill whole-model fast path" not in antfly_log:
             raise BenchmarkContractError(
                 f"Antfly silently fell back from compiled whole-model prefill: {antfly_log_path}"
             )
 
         ids, id_values = _token_line(antfly_log, "token_ids", antfly_log_path)
-        prompt_ids, prompt_id_values = _token_line(antfly_log, "prompt_token_ids", antfly_log_path)
+        prompt_ids, prompt_id_values = _token_line(
+            antfly_log, "prompt_token_ids", antfly_log_path
+        )
         if len(id_values) != requested_tokens:
             raise BenchmarkContractError(
                 f"Antfly token ID count={len(id_values)}, expected {requested_tokens}: {antfly_log_path}"
             )
         json_ids = antfly.get("token_ids")
         if json_ids is not None and json_ids != id_values:
-            raise BenchmarkContractError(f"Antfly JSON/log token IDs differ: {antfly_path}")
+            raise BenchmarkContractError(
+                f"Antfly JSON/log token IDs differ: {antfly_path}"
+            )
         if reference_ids is None:
             reference_ids = ids
             reference_prompt_ids = prompt_ids
@@ -1493,9 +1750,15 @@ def collect_rows(
             )
 
         timing = _mapping(antfly.get("timing_ms"), "Antfly timing", antfly_path)
-        antfly_total = _positive_finite(float(timing.get("generate") or 0), "Antfly total", antfly_path)
-        antfly_prefill = _positive_finite(float(timing.get("prefill_inner") or 0), "Antfly prefill", antfly_path)
-        antfly_decode = _positive_finite(float(timing.get("decode_inner") or 0), "Antfly decode", antfly_path)
+        antfly_total = _positive_finite(
+            float(timing.get("generate") or 0), "Antfly total", antfly_path
+        )
+        antfly_prefill = _positive_finite(
+            float(timing.get("prefill_inner") or 0), "Antfly prefill", antfly_path
+        )
+        antfly_decode = _positive_finite(
+            float(timing.get("decode_inner") or 0), "Antfly decode", antfly_path
+        )
         timing_tolerance = max(2.0, antfly_total * 0.001)
         if abs(antfly_prefill + antfly_decode - antfly_total) > timing_tolerance:
             raise BenchmarkContractError(
@@ -1533,12 +1796,17 @@ def collect_rows(
             raise BenchmarkContractError(
                 f"llama eval runs={llama.eval_runs}, expected {decode_frames}: {llama_path}"
             )
-        if llama.total_tokens is not None and llama.total_tokens != llama.prompt_tokens + llama.eval_runs:
+        if (
+            llama.total_tokens is not None
+            and llama.total_tokens != llama.prompt_tokens + llama.eval_runs
+        ):
             raise BenchmarkContractError(
                 f"llama total token accounting={llama.total_tokens}, expected "
                 f"{llama.prompt_tokens + llama.eval_runs}: {llama_path}"
             )
-        if llama.graphs_reused is not None and llama.graphs_reused < max(0, llama.eval_runs - 2):
+        if llama.graphs_reused is not None and llama.graphs_reused < max(
+            0, llama.eval_runs - 2
+        ):
             raise BenchmarkContractError(
                 f"llama graph reuse={llama.graphs_reused}, expected at least "
                 f"{max(0, llama.eval_runs - 2)}: {llama_path}"
@@ -1622,21 +1890,26 @@ def collect_rows(
                 f"{expect_generated_flash_prefill_calls}/"
                 f"{expect_generated_flash_prefill_hd512_calls}: {antfly_log_path}"
             )
-        if prefill_direct_kv_calls + prefill_paged_kv_calls != generated_flash_prefill_total:
+        if (
+            prefill_direct_kv_calls + prefill_paged_kv_calls
+            != generated_flash_prefill_total
+        ):
             raise BenchmarkContractError(
                 "prefill K/V routes do not reconcile with generated flash attention: "
                 f"direct+paged={prefill_direct_kv_calls + prefill_paged_kv_calls}, "
                 f"flash={generated_flash_prefill_total}: {antfly_log_path}"
             )
         if expect_prefill_direct_kv is True and (
-            prefill_direct_kv_calls != generated_flash_prefill_total or prefill_paged_kv_calls != 0
+            prefill_direct_kv_calls != generated_flash_prefill_total
+            or prefill_paged_kv_calls != 0
         ):
             raise BenchmarkContractError(
                 f"prefill direct K/V route={prefill_direct_kv_calls}/{prefill_paged_kv_calls}, "
                 f"expected {generated_flash_prefill_total}/0: {antfly_log_path}"
             )
         if expect_prefill_direct_kv is False and (
-            prefill_direct_kv_calls != 0 or prefill_paged_kv_calls != generated_flash_prefill_total
+            prefill_direct_kv_calls != 0
+            or prefill_paged_kv_calls != generated_flash_prefill_total
         ):
             raise BenchmarkContractError(
                 f"prefill direct K/V rollback={prefill_direct_kv_calls}/{prefill_paged_kv_calls}, "
@@ -1651,21 +1924,26 @@ def collect_rows(
         )
         prepared_frame_fast_path_calls = int(prepared_frame.group(1))
         prepared_frame_fallback_calls = int(prepared_frame.group(2))
-        if prepared_frame_fast_path_calls + prepared_frame_fallback_calls != decode_frames:
+        if (
+            prepared_frame_fast_path_calls + prepared_frame_fallback_calls
+            != decode_frames
+        ):
             raise BenchmarkContractError(
                 "prepared frame routes do not reconcile with decode frames: "
                 f"fast+fallback={prepared_frame_fast_path_calls + prepared_frame_fallback_calls}, "
                 f"decode_frames={decode_frames}: {antfly_log_path}"
             )
         if expect_fast_prepared_frame is True and (
-            prepared_frame_fast_path_calls != decode_frames or prepared_frame_fallback_calls != 0
+            prepared_frame_fast_path_calls != decode_frames
+            or prepared_frame_fallback_calls != 0
         ):
             raise BenchmarkContractError(
                 f"prepared frame routes={prepared_frame_fast_path_calls}/{prepared_frame_fallback_calls}, "
                 f"expected {decode_frames}/0: {antfly_log_path}"
             )
         if expect_fast_prepared_frame is False and (
-            prepared_frame_fast_path_calls != 0 or prepared_frame_fallback_calls != decode_frames
+            prepared_frame_fast_path_calls != 0
+            or prepared_frame_fallback_calls != decode_frames
         ):
             raise BenchmarkContractError(
                 f"prepared frame rollback={prepared_frame_fast_path_calls}/{prepared_frame_fallback_calls}, "
@@ -1679,7 +1957,9 @@ def collect_rows(
             antfly_log_path,
         )
         if int(runtime_memory.group(1)) != 0:
-            raise BenchmarkContractError(f"compiled decoder retained a speculative frame: {antfly_log_path}")
+            raise BenchmarkContractError(
+                f"compiled decoder retained a speculative frame: {antfly_log_path}"
+            )
 
         q4_rows = _last_match(
             antfly_log,
@@ -1751,7 +2031,9 @@ def collect_rows(
         if expect_q4_mmv_variant != "any":
             variant_names = ("nr4-nsg2", "nr8-nsg2", "nr4-nsg4", "nr8-nsg4")
             expected_variant_calls = [0, 0, 0, 0]
-            expected_variant_calls[variant_names.index(expect_q4_mmv_variant)] = expected_q4_calls
+            expected_variant_calls[variant_names.index(expect_q4_mmv_variant)] = (
+                expected_q4_calls
+            )
             if (
                 int(q4_rows.group(1)) != expected_q4_calls
                 or exact_q4_calls != 0
@@ -1761,7 +2043,9 @@ def collect_rows(
             ):
                 observed = ", ".join(
                     f"{name}={calls}"
-                    for name, calls in zip(variant_names, q4_mmv_variant_calls, strict=True)
+                    for name, calls in zip(
+                        variant_names, q4_mmv_variant_calls, strict=True
+                    )
                 )
                 raise BenchmarkContractError(
                     f"Q4_0 MMV one-hot route is not {expect_q4_mmv_variant}="
@@ -1774,14 +2058,24 @@ def collect_rows(
                 f"Q6_K LM-head routes={q6_rows.group(1)}, expected exactly {requested_tokens}: {antfly_log_path}"
             )
 
-        runtime = _mapping(antfly.get("runtime"), "Antfly runtime counters", antfly_path)
+        runtime = _mapping(
+            antfly.get("runtime"), "Antfly runtime counters", antfly_path
+        )
         decoder = _mapping(
             antfly.get("generation_decoder_runtime"),
             "Antfly generation decoder counters",
             antfly_path,
         )
-        _exact_int(runtime, "decode_greedy_calls", decode_frames, "runtime", antfly_path)
-        _exact_int(decoder, "forward_attempts", decode_frames, "generation_decoder_runtime", antfly_path)
+        _exact_int(
+            runtime, "decode_greedy_calls", decode_frames, "runtime", antfly_path
+        )
+        _exact_int(
+            decoder,
+            "forward_attempts",
+            decode_frames,
+            "generation_decoder_runtime",
+            antfly_path,
+        )
         metal = _mapping(antfly.get("metal"), "Metal counters", antfly_path)
         antfly_metal_device = metal.get("device")
         if antfly_metal_device != expect_antfly_metal_device:
@@ -1800,18 +2094,44 @@ def collect_rows(
                 f"{antfly_metal_device_registry_id!r}: {antfly_path}"
             )
         if metal.get("native_quant_null") is not False:
-            raise BenchmarkContractError(f"Metal native quant route was unavailable: {antfly_path}")
-        operators = _mapping(metal.get("runtime_command_operators"), "Metal operator counters", antfly_path)
-        _exact_int(operators, "fallback", 0, "metal.runtime_command_operators", antfly_path)
-        frame_fallbacks = _mapping(metal.get("frame_fallbacks"), "Metal frame fallback counters", antfly_path)
+            raise BenchmarkContractError(
+                f"Metal native quant route was unavailable: {antfly_path}"
+            )
+        operators = _mapping(
+            metal.get("runtime_command_operators"),
+            "Metal operator counters",
+            antfly_path,
+        )
+        _exact_int(
+            operators, "fallback", 0, "metal.runtime_command_operators", antfly_path
+        )
+        frame_fallbacks = _mapping(
+            metal.get("frame_fallbacks"), "Metal frame fallback counters", antfly_path
+        )
         for key in ("decode_fallback", "prefill_plan_fail", "prefill_execute_fail"):
             _exact_int(frame_fallbacks, key, 0, "metal.frame_fallbacks", antfly_path)
-        quant_plan = _mapping(metal.get("quant_kernel_plan"), "Metal quant plan counters", antfly_path)
+        quant_plan = _mapping(
+            metal.get("quant_kernel_plan"), "Metal quant plan counters", antfly_path
+        )
         for key in ("fast_path_misses", "unsupported_routes"):
             _exact_int(quant_plan, key, 0, "metal.quant_kernel_plan", antfly_path)
-        attention = _mapping(metal.get("attention_dispatch"), "Metal attention counters", antfly_path)
-        _exact_int(attention, "paged_1x", expected_paged, "metal.attention_dispatch", antfly_path)
-        _exact_int(attention, "decode_gqa_split", expected_split, "metal.attention_dispatch", antfly_path)
+        attention = _mapping(
+            metal.get("attention_dispatch"), "Metal attention counters", antfly_path
+        )
+        _exact_int(
+            attention,
+            "paged_1x",
+            expected_paged,
+            "metal.attention_dispatch",
+            antfly_path,
+        )
+        _exact_int(
+            attention,
+            "decode_gqa_split",
+            expected_split,
+            "metal.attention_dispatch",
+            antfly_path,
+        )
         _exact_int(
             attention,
             "generated_flash_prefill",
@@ -1840,7 +2160,9 @@ def collect_rows(
             "metal.attention_dispatch",
             antfly_path,
         )
-        prepared = _mapping(metal.get("prepared_frame"), "Metal prepared frame counters", antfly_path)
+        prepared = _mapping(
+            metal.get("prepared_frame"), "Metal prepared frame counters", antfly_path
+        )
         _exact_int(
             prepared,
             "fast_path",
@@ -1855,7 +2177,9 @@ def collect_rows(
             "metal.prepared_frame",
             antfly_path,
         )
-        q4_policy_json = _mapping(metal.get("q4_0_policy"), "Metal Q4_0 policy counters", antfly_path)
+        q4_policy_json = _mapping(
+            metal.get("q4_0_policy"), "Metal Q4_0 policy counters", antfly_path
+        )
         for key, expected in zip(
             ("mmv_nr4_nsg2", "mmv_nr8_nsg2", "mmv_nr4_nsg4", "mmv_nr8_nsg4"),
             q4_mmv_variant_calls,
@@ -1922,7 +2246,9 @@ def collect_rows(
                 "q4_0_exact_dispatches": exact_q4_calls,
                 "q4_0_pair_activation_dispatches": fused_q4_pairs,
                 "q6_k_linear_reduce_rows_1": int(q6_rows.group(1)),
-                "q4_0_linear_reduce_encode_us": int(q4_encode.group(1)) if q4_encode else None,
+                "q4_0_linear_reduce_encode_us": int(q4_encode.group(1))
+                if q4_encode
+                else None,
                 "no_mtp": True,
                 "route_contract_passed": True,
             }
@@ -1947,9 +2273,13 @@ def build_result(
         ("min_decode_ratio", min_decode_ratio),
     ):
         if not math.isfinite(value) or value <= 0.0:
-            raise BenchmarkContractError(f"{label} must be a positive finite value, got {value!r}")
+            raise BenchmarkContractError(
+                f"{label} must be a positive finite value, got {value!r}"
+            )
     if not math.isfinite(max_cv) or not 0.0 < max_cv < 1.0:
-        raise BenchmarkContractError(f"max_cv must be finite and in (0, 1), got {max_cv!r}")
+        raise BenchmarkContractError(
+            f"max_cv must be finite and in (0, 1), got {max_cv!r}"
+        )
     metadata = _load_metadata(root, runs, requested_tokens)
     for key, supplied in (
         ("max_total_ratio", max_total_ratio),
@@ -1962,13 +2292,17 @@ def build_result(
             )
     execution_order, execution_order_gate = _load_execution_order(root, metadata, runs)
     require_confidence = require_confidence or metadata["require_confidence"]
-    rows, token_ids, prompt_token_ids, llama_prompt_token_ids, llama_loader_audit = collect_rows(
-        root,
-        runs,
-        requested_tokens,
-        metadata,
+    rows, token_ids, prompt_token_ids, llama_prompt_token_ids, llama_loader_audit = (
+        collect_rows(
+            root,
+            runs,
+            requested_tokens,
+            metadata,
+        )
     )
-    if metadata["canonical_policy"] and any(row["prompt_tokens"] != 2003 for row in rows):
+    if metadata["canonical_policy"] and any(
+        row["prompt_tokens"] != 2003 for row in rows
+    ):
         raise BenchmarkContractError(
             "canonical benchmark prompt must tokenize to exactly 2003 tokens"
         )
@@ -2032,7 +2366,9 @@ def build_result(
     }
     paired_confidence_intervals = {
         "total_latency_ratio": paired_bootstrap_interval(rows, "total_ratio"),
-        "prefill_latency_ratio": paired_bootstrap_interval(rows, "prefill_latency_ratio"),
+        "prefill_latency_ratio": paired_bootstrap_interval(
+            rows, "prefill_latency_ratio"
+        ),
         "decode_latency_ratio": paired_bootstrap_interval(rows, "decode_latency_ratio"),
         "decode_throughput_ratio": paired_bootstrap_interval(rows, "decode_ratio"),
     }
@@ -2084,7 +2420,8 @@ def build_result(
         "metadata": metadata,
         "runs": runs,
         "canonical_policy": metadata["canonical_policy"],
-        "promotion_eligible_policy": metadata["canonical_policy"] and require_confidence,
+        "promotion_eligible_policy": metadata["canonical_policy"]
+        and require_confidence,
         "output_tokens": requested_tokens,
         "prompt_tokens": rows[0]["prompt_tokens"],
         **metric_stats,
@@ -2120,18 +2457,24 @@ def build_result(
                 metadata,
                 "EXPECT_GENERATED_FLASH_PREFILL_HD512_CALLS",
             ),
-            "prefill_direct_kv": _required_metadata_env_bool(metadata, "EXPECT_PREFILL_DIRECT_KV"),
+            "prefill_direct_kv": _required_metadata_env_bool(
+                metadata, "EXPECT_PREFILL_DIRECT_KV"
+            ),
             "fast_prepared_frame": _required_metadata_env_bool(
                 metadata,
                 "EXPECT_FAST_PREPARED_FRAME",
             ),
             "q4_0_mmv_variant": _expected_q4_mmv_variant(metadata),
             "q4_0_mmv_portfolio": _expect_q4_mmv_portfolio(metadata),
-            "swa_scan_clamp": _required_metadata_env_bool(metadata, "EXPECT_SWA_SCAN_CLAMP"),
+            "swa_scan_clamp": _required_metadata_env_bool(
+                metadata, "EXPECT_SWA_SCAN_CLAMP"
+            ),
             "decode_gqa_split_schedule": {"swa": "s32", "global": "s32"},
         },
         "llama_backend_expectations": {
-            "metal_device": _required_metadata_env(metadata, "EXPECT_LLAMA_METAL_DEVICE"),
+            "metal_device": _required_metadata_env(
+                metadata, "EXPECT_LLAMA_METAL_DEVICE"
+            ),
             "offloaded_layers": _required_metadata_env_int(
                 metadata,
                 "EXPECT_LLAMA_OFFLOADED_LAYERS",
@@ -2139,7 +2482,9 @@ def build_result(
             ),
         },
         "antfly_backend_expectations": {
-            "metal_device": _required_metadata_env(metadata, "EXPECT_ANTFLY_METAL_DEVICE"),
+            "metal_device": _required_metadata_env(
+                metadata, "EXPECT_ANTFLY_METAL_DEVICE"
+            ),
             "device_registry_id_positive": True,
             "device_registry_id": antfly_device_registry_id,
         },
@@ -2156,7 +2501,9 @@ def gate_errors(result: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     violations = result["cv_gate"]["violations"]
     if violations:
-        rendered = ", ".join(f"{name}={value:.3f}" for name, value in sorted(violations.items()))
+        rendered = ", ".join(
+            f"{name}={value:.3f}" for name, value in sorted(violations.items())
+        )
         errors.append(f"benchmark phase CV exceeded {result['max_cv']:.3f}: {rendered}")
     if result["total_ratio"] > result["max_total_ratio"]:
         errors.append(
@@ -2169,7 +2516,11 @@ def gate_errors(result: dict[str, Any]) -> list[str]:
             f"below {result['min_decode_ratio']:.3f}"
         )
     confidence_gate = result.get("confidence_gate")
-    if confidence_gate and confidence_gate.get("required") and not confidence_gate.get("passed"):
+    if (
+        confidence_gate
+        and confidence_gate.get("required")
+        and not confidence_gate.get("passed")
+    ):
         if not confidence_gate.get("eligible"):
             errors.append(
                 "paired bootstrap confidence gate requires at least "
@@ -2181,7 +2532,9 @@ def gate_errors(result: dict[str, Any]) -> list[str]:
                 "paired bootstrap total-latency upper bound "
                 f"{total_interval['upper']:.3f} is not below parity (1.000)"
             )
-        decode_interval = result["paired_confidence_intervals"]["decode_throughput_ratio"]
+        decode_interval = result["paired_confidence_intervals"][
+            "decode_throughput_ratio"
+        ]
         if not confidence_gate.get("decode_throughput_lower_above_parity"):
             errors.append(
                 "paired bootstrap decode-throughput lower bound "
@@ -2208,7 +2561,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         argv.insert(0, "summarize")
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    summarize = commands.add_parser("summarize", help="validate and summarize benchmark artifacts")
+    summarize = commands.add_parser(
+        "summarize", help="validate and summarize benchmark artifacts"
+    )
     summarize.add_argument("--out-dir", type=Path, required=True)
     summarize.add_argument("--runs", type=int, required=True)
     summarize.add_argument("--output-tokens", type=int, required=True)
@@ -2217,7 +2572,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     summarize.add_argument("--max-cv", type=float, required=True)
     summarize.add_argument("--expected-token-ids-sha256", default="")
     summarize.add_argument("--require-confidence", action="store_true")
-    bundle = commands.add_parser("bundle-manifest", help="write and hash a llama.cpp bundle manifest")
+    bundle = commands.add_parser(
+        "bundle-manifest", help="write and hash a llama.cpp bundle manifest"
+    )
     bundle.add_argument("--root", type=Path, required=True)
     bundle.add_argument("--output", type=Path, required=True)
     preflight = commands.add_parser(

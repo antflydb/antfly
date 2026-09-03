@@ -147,7 +147,9 @@ def check_plan_counters(row, path, label):
             f"does not match route total {route_total}"
         )
 
-    generated_candidates = int_field(row, "quant_plan_generated_candidates", path, label)
+    generated_candidates = int_field(
+        row, "quant_plan_generated_candidates", path, label
+    )
     if generated_candidates > planned:
         fail(
             f"{path}: row {label}: generated candidates {generated_candidates} "
@@ -187,7 +189,9 @@ def check_plan_counters(row, path, label):
 
 
 def row_bucket_dispatches(row, path, label):
-    return sum(int_field(row, STORED_TOTALS[key], path, label) for key in LINEAR_REDUCE_BUCKETS)
+    return sum(
+        int_field(row, STORED_TOTALS[key], path, label) for key in LINEAR_REDUCE_BUCKETS
+    )
 
 
 def quant_plan_totals(rows, path):
@@ -255,7 +259,9 @@ def check_runtime_fallback_totals(summary, measured, path):
     for key, want in expected.items():
         got = actual.get(key)
         if got != want:
-            fail(f"{path}: runtime_fallback_totals.{key}={got!r} does not match {want!r}")
+            fail(
+                f"{path}: runtime_fallback_totals.{key}={got!r} does not match {want!r}"
+            )
     return expected
 
 
@@ -293,7 +299,9 @@ def check_summary(path):
 
         if row_bucket_dispatches:
             planned = int_field(row, "quant_plan_planned", path, label)
-            handwritten = int_field(row, "quant_plan_handwritten_production", path, label)
+            handwritten = int_field(
+                row, "quant_plan_handwritten_production", path, label
+            )
             if planned < row_bucket_dispatches or handwritten < row_bucket_dispatches:
                 fail(
                     f"{path}: row {label}: quant row bucket dispatches "
@@ -373,7 +381,9 @@ def self_test():
         check_summary(good)
 
         missing_contract = tmp_path / "missing-contract.json"
-        missing_contract.write_text(json.dumps({"rows": [good_row]}) + "\n", encoding="utf-8")
+        missing_contract.write_text(
+            json.dumps({"rows": [good_row]}) + "\n", encoding="utf-8"
+        )
         try:
             check_summary(missing_contract)
         except SystemExit as err:
@@ -384,7 +394,8 @@ def self_test():
 
         missing_schema = tmp_path / "missing-schema.json"
         missing_schema.write_text(
-            json.dumps({"evidence_contract": EVIDENCE_CONTRACT, "rows": [good_row]}) + "\n",
+            json.dumps({"evidence_contract": EVIDENCE_CONTRACT, "rows": [good_row]})
+            + "\n",
             encoding="utf-8",
         )
         try:
@@ -465,7 +476,9 @@ def self_test():
                         **quant_plan_totals([good_row], bad_totals),
                         "quant_plan_planned": 11,
                     },
-                    "runtime_fallback_totals": runtime_fallback_totals([good_row], bad_totals),
+                    "runtime_fallback_totals": runtime_fallback_totals(
+                        [good_row], bad_totals
+                    ),
                     "rows": [good_row],
                 }
             )
@@ -486,7 +499,9 @@ def self_test():
                 {
                     "evidence_contract": EVIDENCE_CONTRACT,
                     "schema": SUMMARY_SCHEMA,
-                    "quant_plan_totals": quant_plan_totals([good_row], bad_runtime_totals),
+                    "quant_plan_totals": quant_plan_totals(
+                        [good_row], bad_runtime_totals
+                    ),
                     "runtime_fallback_totals": {
                         **runtime_fallback_totals([good_row], bad_runtime_totals),
                         "decode_fallbacks": 1,

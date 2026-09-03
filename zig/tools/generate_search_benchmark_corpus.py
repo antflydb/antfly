@@ -37,7 +37,9 @@ def document_text(ordinal: int) -> str:
         terms.extend(("gamma", "gamma"))
     if ordinal % 11 == 0:
         terms.extend(("rare", "signal"))
-    terms.extend([f"tail{(ordinal * 17 + offset) % 4093}" for offset in range(ordinal % 9)])
+    terms.extend(
+        [f"tail{(ordinal * 17 + offset) % 4093}" for offset in range(ordinal % 9)]
+    )
     return " ".join(terms)
 
 

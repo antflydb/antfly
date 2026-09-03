@@ -377,7 +377,10 @@ def ready_index_status(
     if readiness is not None:
         if readiness.get("state") != "ready":
             return None
-        if readiness.get("queryable") is not True or readiness.get("complete") is not True:
+        if (
+            readiness.get("queryable") is not True
+            or readiness.get("complete") is not True
+        ):
             return None
         published_revision = readiness.get("published_revision")
         target_revision = readiness.get("target_revision")
@@ -1540,8 +1543,7 @@ class OpenAiEmbeddingServer:
                     and (
                         rate_limit_input_substring is None
                         or any(
-                            rate_limit_input_substring in str(value)
-                            for value in inputs
+                            rate_limit_input_substring in str(value) for value in inputs
                         )
                     )
                 )

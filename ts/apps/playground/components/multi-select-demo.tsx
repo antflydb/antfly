@@ -24,7 +24,10 @@ export function MultiSelectDemo() {
     <div className="w-80 space-y-4">
       <MultiSelect value={selected} onValueChange={setSelected}>
         <MultiSelectTrigger placeholder="Pick frameworks…" />
-        <MultiSelectContent searchPlaceholder="Search frameworks…" emptyMessage="No framework found.">
+        <MultiSelectContent
+          searchPlaceholder="Search frameworks…"
+          emptyMessage="No framework found."
+        >
           {frameworks.map((fw) => (
             <MultiSelectItem key={fw.value} value={fw.value}>
               {fw.label}

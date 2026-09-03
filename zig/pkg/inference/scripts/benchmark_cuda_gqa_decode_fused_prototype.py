@@ -112,9 +112,7 @@ class Cuda:
                 f"prototype is qualified only on SM89; found {self.compute_capability}"
             )
         context = ctypes.c_void_p()
-        self.check(
-            self.cuCtxCreate(ctypes.byref(context), 0, device), "cuCtxCreate_v2"
-        )
+        self.check(self.cuCtxCreate(ctypes.byref(context), 0, device), "cuCtxCreate_v2")
         self.context = context
         self.allocations: list[int] = []
         self.modules: list[ctypes.c_void_p] = []
@@ -186,9 +184,7 @@ class Cuda:
         self.cuEventCreate = bind(
             "cuEventCreate", [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
         )
-        self.cuEventRecord = bind(
-            "cuEventRecord", [ctypes.c_void_p, ctypes.c_void_p]
-        )
+        self.cuEventRecord = bind("cuEventRecord", [ctypes.c_void_p, ctypes.c_void_p])
         self.cuEventSynchronize = bind("cuEventSynchronize", [ctypes.c_void_p])
         self.cuEventElapsedTime = bind(
             "cuEventElapsedTime",
@@ -339,9 +335,7 @@ class Case:
     def visible_range(self) -> tuple[int, int]:
         if self.query_position < self.kv_position_offset:
             return (0, 0)
-        end = min(
-            self.query_position - self.kv_position_offset + 1, self.kv_len
-        )
+        end = min(self.query_position - self.kv_position_offset + 1, self.kv_len)
         begin = 0
         if self.sliding_window:
             window_start = max(0, self.query_position + 1 - self.sliding_window)
@@ -398,7 +392,9 @@ def sha256_file(path: Path) -> str:
 
 
 def guarded_image(payload: bytes | bytearray) -> bytes:
-    return bytes([CANARY]) * GUARD_BYTES + bytes(payload) + bytes([CANARY]) * GUARD_BYTES
+    return (
+        bytes([CANARY]) * GUARD_BYTES + bytes(payload) + bytes([CANARY]) * GUARD_BYTES
+    )
 
 
 def upload_guarded(cuda: Cuda, payload: bytes | bytearray) -> Guarded:
@@ -479,7 +475,9 @@ def physical_token(logical: int, table: list[int] | None) -> int:
     return table[logical // PAGE_SIZE] * PAGE_SIZE + logical % PAGE_SIZE
 
 
-def make_inputs(case: Case) -> tuple[bytes, bytes, bytes, bytes | None, bytes, int, int]:
+def make_inputs(
+    case: Case,
+) -> tuple[bytes, bytes, bytes, bytes | None, bytes, int, int]:
     head_dim = case.head_dim
     block_count = (case.kv_len + PAGE_SIZE - 1) // PAGE_SIZE
     physical_capacity = block_count * PAGE_SIZE
@@ -509,11 +507,7 @@ def make_inputs(case: Case) -> tuple[bytes, bytes, bytes, bytes | None, bytes, i
                 "<e", v, (row + dimension) * 2, v_value(case, logical, dimension)
             )
 
-    table_bytes = (
-        None
-        if table is None
-        else struct.pack(f"<{len(table)}I", *table)
-    )
+    table_bytes = None if table is None else struct.pack(f"<{len(table)}I", *table)
     total_sequence_len = max(
         case.query_position + 1, case.kv_position_offset + case.kv_len
     )
@@ -525,7 +519,15 @@ def make_inputs(case: Case) -> tuple[bytes, bytes, bytes, bytes | None, bytes, i
         total_sequence_len,
         case.kv_position_offset,
     )
-    return bytes(q), bytes(k), bytes(v), table_bytes, scalars, block_count, physical_capacity
+    return (
+        bytes(q),
+        bytes(k),
+        bytes(v),
+        table_bytes,
+        scalars,
+        block_count,
+        physical_capacity,
+    )
 
 
 def prepare_buffers(cuda: Cuda, case: Case) -> Buffers:
@@ -579,19 +581,39 @@ def common_values(case: Case, buffers: Buffers) -> tuple[int, ...]:
 
 
 def launch_candidate(cuda: Cuda, fn: ctypes.c_void_p, case: Case, b: Buffers) -> None:
-    batch, q_len, kv_len, heads, kv_heads, hd, qpos, kvpos, window, total = common_values(case, b)
+    batch, q_len, kv_len, heads, kv_heads, hd, qpos, kvpos, window, total = (
+        common_values(case, b)
+    )
     cuda.launch(
         fn,
         (HEADS, 1, 1),
         (case.head_dim, 1, 1),
         [
-            ptr(b.candidate.pointer), ptr(b.q.pointer), ptr(b.k.pointer), ptr(b.v.pointer),
+            ptr(b.candidate.pointer),
+            ptr(b.q.pointer),
+            ptr(b.k.pointer),
+            ptr(b.v.pointer),
             ptr(0 if b.table is None else b.table.pointer),
-            u32(batch), u32(q_len), u32(kv_len), u32(heads), u32(kv_heads), u32(hd),
-            u32(qpos), u32(kvpos), u32(window), u32(total),
-            u32(b.key_row_bytes), u32(b.key_row_bytes), u32(b.value_row_bytes),
-            u32(b.block_count), u32(PAGE_SIZE), u32(2), u32(2),
-            u32(b.physical_capacity), u32(b.score_capacity), ptr(b.scalars.pointer),
+            u32(batch),
+            u32(q_len),
+            u32(kv_len),
+            u32(heads),
+            u32(kv_heads),
+            u32(hd),
+            u32(qpos),
+            u32(kvpos),
+            u32(window),
+            u32(total),
+            u32(b.key_row_bytes),
+            u32(b.key_row_bytes),
+            u32(b.value_row_bytes),
+            u32(b.block_count),
+            u32(PAGE_SIZE),
+            u32(2),
+            u32(2),
+            u32(b.physical_capacity),
+            u32(b.score_capacity),
+            ptr(b.scalars.pointer),
         ],
     )
 
@@ -603,17 +625,33 @@ def launch_coefficient(
     b: Buffers,
     block_size: int,
 ) -> None:
-    batch, q_len, kv_len, heads, kv_heads, hd, qpos, kvpos, window, total = common_values(case, b)
+    batch, q_len, kv_len, heads, kv_heads, hd, qpos, kvpos, window, total = (
+        common_values(case, b)
+    )
     cuda.launch(
         fn,
         (HEADS, 1, 1),
         (block_size, 1, 1),
         [
-            ptr(b.alpha.pointer), ptr(b.beta.pointer), ptr(b.denom.pointer),
-            ptr(b.scores.pointer), ptr(0 if b.table is None else b.table.pointer),
-            u32(batch), u32(q_len), u32(kv_len), u32(heads), u32(kv_heads), u32(hd),
-            u32(qpos), u32(kvpos), u32(window), u32(total), u32(b.block_count),
-            u32(PAGE_SIZE), u32(b.physical_capacity), u32(b.score_capacity),
+            ptr(b.alpha.pointer),
+            ptr(b.beta.pointer),
+            ptr(b.denom.pointer),
+            ptr(b.scores.pointer),
+            ptr(0 if b.table is None else b.table.pointer),
+            u32(batch),
+            u32(q_len),
+            u32(kv_len),
+            u32(heads),
+            u32(kv_heads),
+            u32(hd),
+            u32(qpos),
+            u32(kvpos),
+            u32(window),
+            u32(total),
+            u32(b.block_count),
+            u32(PAGE_SIZE),
+            u32(b.physical_capacity),
+            u32(b.score_capacity),
             ptr(b.scalars.pointer),
         ],
     )
@@ -625,38 +663,75 @@ def launch_coefficient_pv(
     case: Case,
     b: Buffers,
 ) -> None:
-    batch, q_len, kv_len, heads, kv_heads, hd, qpos, kvpos, window, total = common_values(case, b)
+    batch, q_len, kv_len, heads, kv_heads, hd, qpos, kvpos, window, total = (
+        common_values(case, b)
+    )
     cuda.launch(
         fn,
         (HEADS, case.head_dim // 64, 1),
         (64, 1, 1),
         [
-            ptr(b.candidate.pointer), ptr(b.alpha.pointer), ptr(b.beta.pointer),
-            ptr(b.denom.pointer), ptr(b.v.pointer),
+            ptr(b.candidate.pointer),
+            ptr(b.alpha.pointer),
+            ptr(b.beta.pointer),
+            ptr(b.denom.pointer),
+            ptr(b.v.pointer),
             ptr(0 if b.table is None else b.table.pointer),
-            u32(batch), u32(q_len), u32(kv_len), u32(heads), u32(kv_heads), u32(hd),
-            u32(qpos), u32(kvpos), u32(window), u32(total), u32(b.value_row_bytes),
-            u32(b.block_count), u32(PAGE_SIZE), u32(2), u32(b.physical_capacity),
-            u32(b.score_capacity), ptr(b.scalars.pointer),
+            u32(batch),
+            u32(q_len),
+            u32(kv_len),
+            u32(heads),
+            u32(kv_heads),
+            u32(hd),
+            u32(qpos),
+            u32(kvpos),
+            u32(window),
+            u32(total),
+            u32(b.value_row_bytes),
+            u32(b.block_count),
+            u32(PAGE_SIZE),
+            u32(2),
+            u32(b.physical_capacity),
+            u32(b.score_capacity),
+            ptr(b.scalars.pointer),
         ],
     )
 
 
 def launch_score(cuda: Cuda, fn: ctypes.c_void_p, case: Case, b: Buffers) -> None:
-    batch, q_len, kv_len, heads, kv_heads, hd, qpos, kvpos, window, total = common_values(case, b)
+    batch, q_len, kv_len, heads, kv_heads, hd, qpos, kvpos, window, total = (
+        common_values(case, b)
+    )
     chunk_size = (b.score_capacity + CHUNK_COUNT - 1) // CHUNK_COUNT
     cuda.launch(
         fn,
         (HEADS * CHUNK_COUNT, 1, 1),
         (case.head_dim, 1, 1),
         [
-            ptr(b.scores.pointer), ptr(b.q.pointer), ptr(b.k.pointer),
+            ptr(b.scores.pointer),
+            ptr(b.q.pointer),
+            ptr(b.k.pointer),
             ptr(0 if b.table is None else b.table.pointer),
-            u32(batch), u32(q_len), u32(kv_len), u32(heads), u32(kv_heads), u32(hd),
-            u32(qpos), u32(kvpos), u32(window), u32(total),
-            u32(b.key_row_bytes), u32(b.key_row_bytes), u32(b.block_count),
-            u32(PAGE_SIZE), u32(2), u32(b.physical_capacity), u32(b.score_capacity),
-            u32(chunk_size), u32(CHUNK_COUNT), ptr(b.scalars.pointer),
+            u32(batch),
+            u32(q_len),
+            u32(kv_len),
+            u32(heads),
+            u32(kv_heads),
+            u32(hd),
+            u32(qpos),
+            u32(kvpos),
+            u32(window),
+            u32(total),
+            u32(b.key_row_bytes),
+            u32(b.key_row_bytes),
+            u32(b.block_count),
+            u32(PAGE_SIZE),
+            u32(2),
+            u32(b.physical_capacity),
+            u32(b.score_capacity),
+            u32(chunk_size),
+            u32(CHUNK_COUNT),
+            ptr(b.scalars.pointer),
         ],
     )
 
@@ -669,18 +744,35 @@ def launch_consumer(
     case: Case,
     b: Buffers,
 ) -> None:
-    batch, q_len, kv_len, heads, kv_heads, hd, qpos, kvpos, window, total = common_values(case, b)
+    batch, q_len, kv_len, heads, kv_heads, hd, qpos, kvpos, window, total = (
+        common_values(case, b)
+    )
     cuda.launch(
         fn,
         (HEADS, case.head_dim // 64 if tiled else 1, 1),
         (64 if tiled else case.head_dim, 1, 1),
         [
-            ptr(destination.pointer), ptr(b.scores.pointer), ptr(b.v.pointer),
+            ptr(destination.pointer),
+            ptr(b.scores.pointer),
+            ptr(b.v.pointer),
             ptr(0 if b.table is None else b.table.pointer),
-            u32(batch), u32(q_len), u32(kv_len), u32(heads), u32(kv_heads), u32(hd),
-            u32(qpos), u32(kvpos), u32(window), u32(total), u32(b.value_row_bytes),
-            u32(b.block_count), u32(PAGE_SIZE), u32(2), u32(b.physical_capacity),
-            u32(b.score_capacity), ptr(b.scalars.pointer),
+            u32(batch),
+            u32(q_len),
+            u32(kv_len),
+            u32(heads),
+            u32(kv_heads),
+            u32(hd),
+            u32(qpos),
+            u32(kvpos),
+            u32(window),
+            u32(total),
+            u32(b.value_row_bytes),
+            u32(b.block_count),
+            u32(PAGE_SIZE),
+            u32(2),
+            u32(b.physical_capacity),
+            u32(b.score_capacity),
+            ptr(b.scalars.pointer),
         ],
     )
 
@@ -973,9 +1065,7 @@ def coefficient_integrity(
 
 
 def denom_integrity(image: bytes, guarded: Guarded) -> dict[str, int]:
-    return inspect_guarded(
-        image, guarded, DENOM_POISON_BITS, require_finite=True
-    )
+    return inspect_guarded(image, guarded, DENOM_POISON_BITS, require_finite=True)
 
 
 def run_case(
@@ -1030,9 +1120,7 @@ def run_case(
     launch_score(cuda, functions.score, case, b)
     launch_consumer(cuda, functions.serial, b.serial, False, case, b)
     launch_consumer(cuda, functions.tiled, b.tiled, True, case, b)
-    launch_two_stage_post_score(
-        cuda, functions, case, b, correctness_coefficient_block
-    )
+    launch_two_stage_post_score(cuda, functions, case, b, correctness_coefficient_block)
     cuda.synchronize()
 
     second_score = cuda.download(b.scores.allocation, len(b.scores.image))
@@ -1072,14 +1160,11 @@ def run_case(
         "alpha": coefficient_integrity(
             first_alpha, b.alpha, ALPHA_POISON_BITS, b, case
         ),
-        "beta": coefficient_integrity(
-            first_beta, b.beta, BETA_POISON_BITS, b, case
-        ),
+        "beta": coefficient_integrity(first_beta, b.beta, BETA_POISON_BITS, b, case),
         "denom": denom_integrity(first_denom, b.denom),
         "score_consumer_readonly": {
             "mutations": sum(
-                left != right
-                for left, right in zip(score_after_producer, first_score)
+                left != right for left, right in zip(score_after_producer, first_score)
             )
         },
         "coefficient_pv_readonly": {
@@ -1088,8 +1173,7 @@ def run_case(
                 for left, right in zip(alpha_after_precompute, first_alpha)
             ),
             "beta_mutations": sum(
-                left != right
-                for left, right in zip(beta_after_precompute, first_beta)
+                left != right for left, right in zip(beta_after_precompute, first_beta)
             ),
             "denom_mutations": sum(
                 left != right
@@ -1113,9 +1197,7 @@ def run_case(
         coefficient = lambda: launch_coefficient(
             cuda, functions.coefficient, case, b, selected_block
         )
-        pv = lambda: launch_coefficient_pv(
-            cuda, functions.coefficient_pv, case, b
-        )
+        pv = lambda: launch_coefficient_pv(cuda, functions.coefficient_pv, case, b)
         candidate_post_score = lambda: launch_two_stage_post_score(
             cuda, functions, case, b, selected_block
         )
@@ -1150,17 +1232,12 @@ def run_case(
             "hd512_consumer_speedup_target": 2.0 if case.head_dim == 512 else None,
         }
         timing["performance_target_met"] = (
-            case.head_dim != 512
-            or timing["post_score_vs_tiled64"]["speedup"] > 2.0
+            case.head_dim != 512 or timing["post_score_vs_tiled64"]["speedup"] > 2.0
         )
 
-    diff_pass = all(
-        value["bitwise_mismatches"] == 0 for value in diffs.values()
-    )
+    diff_pass = all(value["bitwise_mismatches"] == 0 for value in diffs.values())
     integrity_pass = all(
-        value == 0
-        for group in integrity.values()
-        for value in group.values()
+        value == 0 for group in integrity.values() for value in group.values()
     )
     timing_pass = True
     if timing is not None:
@@ -1222,7 +1299,10 @@ def locked_cases() -> list[Case]:
                         sliding_window=512 if head_dim == 256 else 0,
                         layout=layout,
                         pattern=pattern,
-                        seed=0x6A09E667F3BCC909 ^ (head_dim << 20) ^ (layout_index << 8) ^ pattern_index,
+                        seed=0x6A09E667F3BCC909
+                        ^ (head_dim << 20)
+                        ^ (layout_index << 8)
+                        ^ pattern_index,
                         timing_anchor=layout == "identity-null" and pattern == "random",
                     )
                 )

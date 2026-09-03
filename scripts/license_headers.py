@@ -248,7 +248,11 @@ def strip_existing_antfly_header(text: str, path: Path) -> tuple[str, int]:
         return text, offset
 
     first = lines[offset].strip()
-    if not first.startswith(prefix) or "Copyright " not in first or "Antfly, Inc." not in first:
+    if (
+        not first.startswith(prefix)
+        or "Copyright " not in first
+        or "Antfly, Inc." not in first
+    ):
         return text, offset
 
     end = offset + 1

@@ -55,7 +55,7 @@ test "enrichment worker collects changed documents from thin change journal" {
     const first_payload = try change_journal_mod.encodeRecord(alloc, .{
         .sequence = 1,
         .changed_doc_keys = &.{ "doc:a", "doc:b" },
-        .target_hints = &.{ .enrichment },
+        .target_hints = &.{.enrichment},
     });
     defer alloc.free(first_payload);
     _ = try journal.appendOpaque(first_payload);

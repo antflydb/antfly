@@ -11,11 +11,7 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 
@@ -49,7 +45,7 @@ function Switcher({
       if (!isControlled) setInternalOpen(next);
       onOpenChange?.(next);
     },
-    [isControlled, onOpenChange],
+    [isControlled, onOpenChange]
   );
 
   return (
@@ -153,26 +149,15 @@ function SwitcherItem({
     >
       <span
         aria-hidden
-        className={cn(
-          "size-1.5 shrink-0",
-          selected ? "bg-primary" : "bg-transparent",
-        )}
+        className={cn("size-1.5 shrink-0", selected ? "bg-primary" : "bg-transparent")}
       />
-      {icon && (
-        <span className="shrink-0 text-muted-foreground [&>svg]:size-4">
-          {icon}
-        </span>
-      )}
+      {icon && <span className="shrink-0 text-muted-foreground [&>svg]:size-4">{icon}</span>}
       <span className="flex-1 truncate">{children}</span>
     </CommandItem>
   );
 }
 
-function SwitcherFooter({
-  className,
-  children,
-  ...props
-}: React.ComponentProps<"div">) {
+function SwitcherFooter({ className, children, ...props }: React.ComponentProps<"div">) {
   const { setOpen } = useSwitcherContext();
 
   return (
@@ -184,7 +169,7 @@ function SwitcherFooter({
         tabIndex={0}
         className={cn(
           "flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground cursor-pointer hover:bg-accent rounded-b-md",
-          className,
+          className
         )}
         onKeyDown={(e) => {
           if (e.key === "Enter") {
@@ -204,10 +189,4 @@ function SwitcherFooter({
   );
 }
 
-export {
-  Switcher,
-  SwitcherContent,
-  SwitcherFooter,
-  SwitcherItem,
-  SwitcherTrigger,
-};
+export { Switcher, SwitcherContent, SwitcherFooter, SwitcherItem, SwitcherTrigger };

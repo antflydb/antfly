@@ -124,7 +124,9 @@ def load_order_reference(output: Path) -> dict | None:
     return None
 
 
-def order_like_reference(current: dict, reference: dict | None, map_path: tuple[str, ...]) -> None:
+def order_like_reference(
+    current: dict, reference: dict | None, map_path: tuple[str, ...]
+) -> None:
     if reference is None:
         return
 
@@ -211,7 +213,9 @@ def validate_openapi_spec(spec: dict, source: Path) -> None:
 
 
 def load_shared_joiner():
-    spec = importlib.util.spec_from_file_location("antfly_openapi_joiner", SHARED_JOINER)
+    spec = importlib.util.spec_from_file_location(
+        "antfly_openapi_joiner", SHARED_JOINER
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError(f"unable to load shared OpenAPI joiner at {SHARED_JOINER}")
     module = importlib.util.module_from_spec(spec)
@@ -238,13 +242,18 @@ def configure_for_repo_contracts(module) -> None:
     module.PATH_REWRITES["../../"] = ""
 
     def target_schema_name(source_path: Path, schema_name: str) -> str:
-        if source_path.resolve() == module.GO_SCHEMA_SPEC and schema_name == "AntflyType":
+        if (
+            source_path.resolve() == module.GO_SCHEMA_SPEC
+            and schema_name == "AntflyType"
+        ):
             return "AntflyType-2"
         return schema_name
 
     def target_schema_name_for_ref(ref_path: str, schema_name: str) -> str:
         rewritten = module.rewrite_ref_path(ref_path)
-        if (module.ROOT / rewritten).resolve() == module.GO_SCHEMA_SPEC and schema_name == "AntflyType":
+        if (
+            module.ROOT / rewritten
+        ).resolve() == module.GO_SCHEMA_SPEC and schema_name == "AntflyType":
             return "AntflyType-2"
         return schema_name
 
@@ -262,7 +271,9 @@ def main(argv: list[str]) -> int:
     push_root_security_to_operations(usermgr)
 
     if argv and argv[0] == "--joined-only":
-        joined_modular = joiner.rewrite_external_refs(joiner.join_specs(metadata, usermgr))
+        joined_modular = joiner.rewrite_external_refs(
+            joiner.join_specs(metadata, usermgr)
+        )
         add_redocly_tag_groups(joined_modular)
         output = ROOT / (argv[1] if len(argv) > 1 else "openapi.joined.yaml")
         dump_yaml(joined_modular, output)
@@ -272,7 +283,9 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "--compare":
         target = argv[1] if len(argv) > 1 else "openapi.yaml"
         current = joiner.load_yaml(ROOT / target)
-        joined = joiner.bundle_joined_spec(joiner.join_specs(metadata, usermgr), current)
+        joined = joiner.bundle_joined_spec(
+            joiner.join_specs(metadata, usermgr), current
+        )
         joined.pop("security", None)
         add_redocly_tag_groups(joined)
         has_drift = joiner.compare_specs(joined, current)

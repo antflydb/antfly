@@ -66,7 +66,9 @@ def _wait_for_graph_result(
     return wait_until(
         lambda: (
             result
-            if (result := _query_graph_result(api, table_name, payload, name)) is not None and predicate(result)
+            if (result := _query_graph_result(api, table_name, payload, name))
+            is not None
+            and predicate(result)
             else None
         ),
         timeout_s=timeout_s,
@@ -79,7 +81,9 @@ def _two_hop_documents_ready(api, table_name: str, payload: dict) -> dict | None
     if result is None:
         return None
     rows = result.get("rows", [])
-    return result if rows and all(alias in rows[0] for alias in ("a", "b", "c")) else None
+    return (
+        result if rows and all(alias in rows[0] for alias in ("a", "b", "c")) else None
+    )
 
 
 def _try_batch_write(api, table_name: str, **kwargs) -> dict | None:
@@ -156,7 +160,11 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
         "graph_queries": {
             "first_hop": {
                 "index": "graph_idx",
-                "traverse": {"start": {"keys": ["alice"]}, "edge_types": ["cites"], "max_depth": 1},
+                "traverse": {
+                    "start": {"keys": ["alice"]},
+                    "edge_types": ["cites"],
+                    "max_depth": 1,
+                },
             },
             "second_hop": {
                 "index": "graph_idx",
@@ -169,6 +177,7 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
         },
         "limit": 10,
     }
+
     def public_neighbors_query() -> dict | None:
         try:
             result = serverless_api.query_table(
@@ -229,7 +238,9 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
                 "bob",
                 json_doc(
                     text="Bob",
-                    graph_edges=[{"target": "carol", "edge_type": "cites", "weight": 1.0}],
+                    graph_edges=[
+                        {"target": "carol", "edge_type": "cites", "weight": 1.0}
+                    ],
                 ),
             ),
             upsert("carol", json_doc(text="Carol")),
@@ -245,7 +256,9 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
     neighbor_ids = {item["doc_id"] for item in neighbors["neighbors"]}
     assert {"bob", "carol"} <= neighbor_ids
 
-    public_neighbors = wait_until(public_neighbors_query, timeout_s=10.0, interval_s=0.1)
+    public_neighbors = wait_until(
+        public_neighbors_query, timeout_s=10.0, interval_s=0.1
+    )
     assert public_neighbors is not None
     public_neighbor_result = _graph_result(public_neighbors, "neighbors")
     assert public_neighbor_result is not None
@@ -277,7 +290,11 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
     assert public_traverse_result is not None
     assert len(public_traverse_result["nodes"]) == 2
     assert [node["key"] for node in public_traverse_result["nodes"]] == ["bob", "carol"]
-    assert _graph_identity_keys(public_traverse_result["nodes"][1]["path"]) == ["alice", "bob", "carol"]
+    assert _graph_identity_keys(public_traverse_result["nodes"][1]["path"]) == [
+        "alice",
+        "bob",
+        "carol",
+    ]
 
     shortest = serverless_api.graph_shortest_path(
         "graph",
@@ -317,7 +334,8 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
     chained = wait_until(
         lambda: (
             result
-            if (result := _try_query_table(serverless_api, "graph", chained_payload)) is not None
+            if (result := _try_query_table(serverless_api, "graph", chained_payload))
+            is not None
             and (first_hop_result := _graph_result(result, "first_hop")) is not None
             and (second_hop_result := _graph_result(result, "second_hop")) is not None
             and [node["key"] for node in first_hop_result["nodes"]] == ["bob"]
@@ -390,7 +408,11 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
         "graph_queries": {
             "neighbors": {
                 "index": "graph_idx",
-                "traverse": {"start": {"keys": ["doc-a"]}, "edge_types": ["cites", "related"], "max_depth": 1},
+                "traverse": {
+                    "start": {"keys": ["doc-a"]},
+                    "edge_types": ["cites", "related"],
+                    "max_depth": 1,
+                },
             }
         },
         "limit": 10,
@@ -427,7 +449,11 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
         "graph_queries": {
             "first_hop": {
                 "index": "graph_idx",
-                "traverse": {"start": {"keys": ["doc-a"]}, "edge_types": ["cites"], "max_depth": 1},
+                "traverse": {
+                    "start": {"keys": ["doc-a"]},
+                    "edge_types": ["cites"],
+                    "max_depth": 1,
+                },
             },
             "second_hop": {
                 "index": "graph_idx",
@@ -545,7 +571,11 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
     assert len(traverse_result["nodes"]) == 2
     assert [node["key"] for node in traverse_result["nodes"]] == ["doc-b", "doc-c"]
     assert traverse_result["nodes"][1]["depth"] == 2
-    assert _graph_identity_keys(traverse_result["nodes"][1]["path"]) == ["doc-a", "doc-b", "doc-c"]
+    assert _graph_identity_keys(traverse_result["nodes"][1]["path"]) == [
+        "doc-a",
+        "doc-b",
+        "doc-c",
+    ]
 
     shortest_result = _wait_for_graph_result(
         backup_api,
@@ -573,7 +603,8 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
     chained = wait_until(
         lambda: (
             result
-            if (result := _try_query_table(backup_api, table_name, chained_payload)) is not None
+            if (result := _try_query_table(backup_api, table_name, chained_payload))
+            is not None
             and (first_hop_result := _graph_result(result, "first_hop")) is not None
             and (second_hop_result := _graph_result(result, "second_hop")) is not None
             and [node["key"] for node in first_hop_result["nodes"]] == ["doc-b"]
@@ -596,7 +627,9 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
         table_name,
         from_search_payload,
         "neighbors_from_search",
-        lambda result: [node["key"] for node in result.get("nodes", [])] == ["doc-b", "doc-c"],
+        lambda result: (
+            [node["key"] for node in result.get("nodes", [])] == ["doc-b", "doc-c"]
+        ),
         timeout_s=120.0,
         interval_s=0.5,
     )
@@ -608,7 +641,9 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
         table_name,
         from_fused_payload,
         "neighbors_from_fused",
-        lambda result: [node["key"] for node in result.get("nodes", [])] == ["doc-b", "doc-c"],
+        lambda result: (
+            [node["key"] for node in result.get("nodes", [])] == ["doc-b", "doc-c"]
+        ),
         timeout_s=120.0,
         interval_s=0.5,
     )
@@ -628,14 +663,18 @@ def test_serverless_graph_pattern_two_hop_and_documents(serverless_api):
                 "doc-a",
                 json_doc(
                     title="alpha",
-                    graph_edges=[{"target": "doc-b", "edge_type": "cites", "weight": 1.0}],
+                    graph_edges=[
+                        {"target": "doc-b", "edge_type": "cites", "weight": 1.0}
+                    ],
                 ),
             ),
             upsert(
                 "doc-b",
                 json_doc(
                     title="beta",
-                    graph_edges=[{"target": "doc-c", "edge_type": "cites", "weight": 1.0}],
+                    graph_edges=[
+                        {"target": "doc-c", "edge_type": "cites", "weight": 1.0}
+                    ],
                 ),
             ),
             upsert("doc-c", json_doc(title="gamma")),
@@ -684,7 +723,9 @@ def test_serverless_graph_pattern_two_hop_and_documents(serverless_api):
     assert row["a"]["key"] == "doc-a"
     assert row["b"]["key"] == "doc-b"
     assert row["c"]["key"] == "doc-c"
-    count_result = _query_graph_result(serverless_api, table_name, query_payload, "two_hop_count")
+    count_result = _query_graph_result(
+        serverless_api, table_name, query_payload, "two_hop_count"
+    )
     assert count_result is not None
     assert count_result["aggregates"]["rows"] == {"value": "1", "exact": True}
 
@@ -712,28 +753,43 @@ def test_serverless_graph_pattern_optional_inequality_and_antijoin(serverless_ap
             upsert("message-q5", doc("Message", [edge("tag-left", "HAS_TAG")])),
             upsert(
                 "comment-q5",
-                doc("Comment", [edge("message-q5", "REPLY_OF"), edge("tag-right", "HAS_TAG")]),
+                doc(
+                    "Comment",
+                    [edge("message-q5", "REPLY_OF"), edge("tag-right", "HAS_TAG")],
+                ),
             ),
             upsert(
                 "comment-q8-blocked",
-                doc("Comment", [
-                    edge("message-q5", "REPLY_OF"),
-                    edge("tag-left", "HAS_TAG"),
-                    edge("tag-right", "HAS_TAG"),
-                ]),
+                doc(
+                    "Comment",
+                    [
+                        edge("message-q5", "REPLY_OF"),
+                        edge("tag-left", "HAS_TAG"),
+                        edge("tag-right", "HAS_TAG"),
+                    ],
+                ),
             ),
             upsert("tag-q7", doc("Tag")),
             upsert("creator", doc("Person")),
             upsert("liker", doc("Person", [edge("message-optional", "LIKES")])),
             upsert(
                 "message-optional",
-                doc("Message", [edge("tag-q7", "HAS_TAG"), edge("creator", "HAS_CREATOR")]),
+                doc(
+                    "Message",
+                    [edge("tag-q7", "HAS_TAG"), edge("creator", "HAS_CREATOR")],
+                ),
             ),
             upsert(
                 "message-no-optional",
-                doc("Message", [edge("tag-q7", "HAS_TAG"), edge("creator", "HAS_CREATOR")]),
+                doc(
+                    "Message",
+                    [edge("tag-q7", "HAS_TAG"), edge("creator", "HAS_CREATOR")],
+                ),
             ),
-            upsert("comment-optional", doc("Comment", [edge("message-optional", "REPLY_OF")])),
+            upsert(
+                "comment-optional",
+                doc("Comment", [edge("message-optional", "REPLY_OF")]),
+            ),
             upsert("person-1", doc("Person", [edge("person-2", "KNOWS")])),
             upsert("person-2", doc("Person", [edge("person-3", "KNOWS")])),
             upsert("person-3", doc("Person", [edge("interest-tag", "HAS_INTEREST")])),
@@ -800,32 +856,48 @@ def test_serverless_graph_pattern_optional_inequality_and_antijoin(serverless_ap
                 },
                 {
                     "nodes": {"reply": node("Comment")},
-                    "edges": [{"from": "reply", "to": "message", "types": ["REPLY_OF"]}],
+                    "edges": [
+                        {"from": "reply", "to": "message", "types": ["REPLY_OF"]}
+                    ],
                 },
             ],
         ),
         "q8_antijoin": count_query(
             q5_nodes,
             q5_edges,
-            where={"and": [
-                {"not_exists": {"edges": [
-                    {"from": "comment", "to": "tag1", "types": ["HAS_TAG"]}
-                ]}},
-                neq("tag1", "tag2"),
-            ]},
+            where={
+                "and": [
+                    {
+                        "not_exists": {
+                            "edges": [
+                                {"from": "comment", "to": "tag1", "types": ["HAS_TAG"]}
+                            ]
+                        }
+                    },
+                    neq("tag1", "tag2"),
+                ]
+            },
         ),
         "q9_antijoin": count_query(
             q9_nodes,
             q9_edges,
-            where={"and": [
-                {"not_exists": {"edges": [{
-                    "from": "person1",
-                    "to": "person3",
-                    "direction": "both",
-                    "types": ["KNOWS"],
-                }]}},
-                neq("person1", "person3"),
-            ]},
+            where={
+                "and": [
+                    {
+                        "not_exists": {
+                            "edges": [
+                                {
+                                    "from": "person1",
+                                    "to": "person3",
+                                    "direction": "both",
+                                    "types": ["KNOWS"],
+                                }
+                            ]
+                        }
+                    },
+                    neq("person1", "person3"),
+                ]
+            },
         ),
     }
     expected = {
@@ -843,12 +915,17 @@ def test_serverless_graph_pattern_optional_inequality_and_antijoin(serverless_ap
             name: result.get("aggregates", {}).get("count")
             for name, result in results.items()
         }
-        if all(actual.get(name) == {"value": count, "exact": True} for name, count in expected.items()):
+        if all(
+            actual.get(name) == {"value": count, "exact": True}
+            for name, count in expected.items()
+        ):
             return actual
         return None
 
     counts = wait_until(exact_counts, timeout_s=30.0, interval_s=0.25)
-    assert counts == {name: {"value": count, "exact": True} for name, count in expected.items()}
+    assert counts == {
+        name: {"value": count, "exact": True} for name, count in expected.items()
+    }
 
 
 def test_multi_batch_graph_push_preserves_boundary_error_and_existing_edges(backup_api):
@@ -874,7 +951,9 @@ def test_multi_batch_graph_push_preserves_boundary_error_and_existing_edges(back
         inserts={
             "doc-a": {
                 "title": "alpha",
-                "_edges": {"graph_idx": {"knows": [{"target": "doc-b", "weight": 1.0}]}},
+                "_edges": {
+                    "graph_idx": {"knows": [{"target": "doc-b", "weight": 1.0}]}
+                },
             },
             "doc-b": {"title": "beta"},
             "doc-c": {"title": "gamma"},
@@ -896,7 +975,11 @@ def test_multi_batch_graph_push_preserves_boundary_error_and_existing_edges(back
                         {
                             "key": "doc-a",
                             "operations": [
-                                {"op": "$set", "path": "title", "value": "must-not-commit"},
+                                {
+                                    "op": "$set",
+                                    "path": "title",
+                                    "value": "must-not-commit",
+                                },
                                 {
                                     "op": "$push",
                                     "path": "$._edges.graph_idx.knows",
@@ -918,7 +1001,11 @@ def test_multi_batch_graph_push_preserves_boundary_error_and_existing_edges(back
         "graph_queries": {
             "neighbors": {
                 "index": "graph_idx",
-                "traverse": {"start": {"keys": ["doc-a"]}, "edge_types": ["knows"], "max_depth": 1},
+                "traverse": {
+                    "start": {"keys": ["doc-a"]},
+                    "edge_types": ["knows"],
+                    "max_depth": 1,
+                },
             }
         },
         "limit": 10,
@@ -995,7 +1082,11 @@ def test_stateful_graph_field_edges_extract_and_update(backup_api):
     parent_result = wait_until(
         lambda: (
             result
-            if (result := _query_graph_result(backup_api, table_name, parent_query_payload, "parent"))
+            if (
+                result := _query_graph_result(
+                    backup_api, table_name, parent_query_payload, "parent"
+                )
+            )
             and result.get("rows")
             else None
         ),
@@ -1027,7 +1118,11 @@ def test_stateful_graph_field_edges_extract_and_update(backup_api):
     assert traverse_result is not None
     assert len(traverse_result["nodes"]) == 2
     assert [node["key"] for node in traverse_result["nodes"]] == ["child", "root-a"]
-    assert _graph_identity_keys(traverse_result["nodes"][1]["path"]) == ["grandchild", "child", "root-a"]
+    assert _graph_identity_keys(traverse_result["nodes"][1]["path"]) == [
+        "grandchild",
+        "child",
+        "root-a",
+    ]
 
     update = backup_api.batch_write(
         table_name,
@@ -1041,7 +1136,11 @@ def test_stateful_graph_field_edges_extract_and_update(backup_api):
     updated_parent_result = wait_until(
         lambda: (
             result
-            if (result := _query_graph_result(backup_api, table_name, parent_query_payload, "parent"))
+            if (
+                result := _query_graph_result(
+                    backup_api, table_name, parent_query_payload, "parent"
+                )
+            )
             and result.get("rows")
             and result["rows"][0]["parent"]["key"] == "root-b"
             else None
@@ -1079,8 +1178,18 @@ def test_stateful_graph_pattern_two_hop_and_documents(backup_api):
         backup_api,
         table_name,
         inserts={
-            "doc-a": {"title": "alpha", "_edges": {"graph_idx": {"knows": [{"target": "doc-b", "weight": 1.0}]}}},
-            "doc-b": {"title": "beta", "_edges": {"graph_idx": {"knows": [{"target": "doc-c", "weight": 1.0}]}}},
+            "doc-a": {
+                "title": "alpha",
+                "_edges": {
+                    "graph_idx": {"knows": [{"target": "doc-b", "weight": 1.0}]}
+                },
+            },
+            "doc-b": {
+                "title": "beta",
+                "_edges": {
+                    "graph_idx": {"knows": [{"target": "doc-c", "weight": 1.0}]}
+                },
+            },
             "doc-c": {"title": "gamma"},
         },
         sync_level="full_index",
@@ -1144,9 +1253,24 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
     batch = backup_api.batch_write(
         table_name,
         inserts={
-            "doc-a": {"title": "alpha", "_edges": {"graph_idx": {"knows": [{"target": "doc-b", "weight": 1.0}]}}},
-            "doc-b": {"title": "beta", "_edges": {"graph_idx": {"knows": [{"target": "doc-c", "weight": 1.0}]}}},
-            "doc-c": {"title": "gamma", "_edges": {"graph_idx": {"knows": [{"target": "doc-a", "weight": 1.0}]}}},
+            "doc-a": {
+                "title": "alpha",
+                "_edges": {
+                    "graph_idx": {"knows": [{"target": "doc-b", "weight": 1.0}]}
+                },
+            },
+            "doc-b": {
+                "title": "beta",
+                "_edges": {
+                    "graph_idx": {"knows": [{"target": "doc-c", "weight": 1.0}]}
+                },
+            },
+            "doc-c": {
+                "title": "gamma",
+                "_edges": {
+                    "graph_idx": {"knows": [{"target": "doc-a", "weight": 1.0}]}
+                },
+            },
         },
         sync_level="full_index",
     )
@@ -1180,7 +1304,13 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
                     "anchor": "x",
                     "nodes": {"x": {"filter": {"ids": ["doc-a"]}}},
                     "edges": [
-                        {"from": "x", "to": "x", "types": ["knows"], "min_hops": 1, "max_hops": 3}
+                        {
+                            "from": "x",
+                            "to": "x",
+                            "types": ["knows"],
+                            "min_hops": 1,
+                            "max_hops": 3,
+                        }
                     ],
                 },
                 "return": {"bindings": ["x"], "limit": 10},
@@ -1191,7 +1321,12 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
     var_length = wait_until(
         lambda: (
             result
-            if (result := _query_graph_result(backup_api, table_name, query_payload, "var_length")) is not None
+            if (
+                result := _query_graph_result(
+                    backup_api, table_name, query_payload, "var_length"
+                )
+            )
+            is not None
             and len(result.get("rows", [])) >= 2
             else None
         ),
@@ -1249,16 +1384,28 @@ def test_stateful_graph_pattern_diamond_and_edge_type_filter(backup_api):
                         },
                         "doc-b": {
                             "title": "beta",
-                            "_edges": {"graph_idx": {"knows": [{"target": "doc-d", "weight": 1.0}]}},
+                            "_edges": {
+                                "graph_idx": {
+                                    "knows": [{"target": "doc-d", "weight": 1.0}]
+                                }
+                            },
                         },
                         "doc-c": {
                             "title": "gamma",
-                            "_edges": {"graph_idx": {"knows": [{"target": "doc-d", "weight": 1.0}]}},
+                            "_edges": {
+                                "graph_idx": {
+                                    "knows": [{"target": "doc-d", "weight": 1.0}]
+                                }
+                            },
                         },
                         "doc-d": {"title": "delta"},
                         "doc-x": {
                             "title": "extra",
-                            "_edges": {"graph_idx": {"follows": [{"target": "doc-d", "weight": 1.0}]}},
+                            "_edges": {
+                                "graph_idx": {
+                                    "follows": [{"target": "doc-d", "weight": 1.0}]
+                                }
+                            },
                         },
                     },
                     sync_level="full_index",
@@ -1313,7 +1460,12 @@ def test_stateful_graph_pattern_diamond_and_edge_type_filter(backup_api):
     diamond = wait_until(
         lambda: (
             result
-            if (result := _query_graph_result(backup_api, table_name, query_payload, "diamond")) is not None
+            if (
+                result := _query_graph_result(
+                    backup_api, table_name, query_payload, "diamond"
+                )
+            )
+            is not None
             and len(result.get("rows", [])) >= 2
             else None
         ),
@@ -1325,7 +1477,9 @@ def test_stateful_graph_pattern_diamond_and_edge_type_filter(backup_api):
     assert middles >= {"doc-b", "doc-c"}
     assert all(row["d"]["key"] == "doc-d" for row in diamond["rows"])
 
-    edge_filter = _query_graph_result(backup_api, table_name, query_payload, "edge_filter")
+    edge_filter = _query_graph_result(
+        backup_api, table_name, query_payload, "edge_filter"
+    )
     assert edge_filter is not None
     assert edge_filter.get("rows") in (None, [])
 
@@ -1342,7 +1496,11 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
             {
                 "name": "graph_idx",
                 "type": "graph",
-                "edge_types": [{"name": "knows"}, {"name": "likes"}, {"name": "blocks"}],
+                "edge_types": [
+                    {"name": "knows"},
+                    {"name": "likes"},
+                    {"name": "blocks"},
+                ],
             },
         ),
         "graph_idx",
@@ -1402,7 +1560,13 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
                     "where": {
                         "and": [
                             branch["where"],
-                            {"not_exists": {"edges": [{"from": "b", "to": "c", "types": ["blocks"]}]}},
+                            {
+                                "not_exists": {
+                                    "edges": [
+                                        {"from": "b", "to": "c", "types": ["blocks"]}
+                                    ]
+                                }
+                            },
                         ]
                     },
                 },
@@ -1491,7 +1655,10 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
         "liked": {"value": "1", "exact": True},
         "unique_liked": {"value": "1", "exact": True},
     }
-    assert graph_results["counts"]["aggregates"]["neighbors"] == {"value": "2", "exact": True}
+    assert graph_results["counts"]["aggregates"]["neighbors"] == {
+        "value": "2",
+        "exact": True,
+    }
 
 
 def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
@@ -1661,7 +1828,9 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                 "HAS_CREATOR": [{"target": "creator"}],
             },
         ),
-        "comment-optional": doc("Comment", {"REPLY_OF": [{"target": "message-optional"}]}),
+        "comment-optional": doc(
+            "Comment", {"REPLY_OF": [{"target": "message-optional"}]}
+        ),
         "tag-q4": doc("Tag"),
         "message-q5": doc("Message", {"HAS_TAG": [{"target": "tag-left"}]}),
         "comment-q5": doc(
@@ -1705,7 +1874,9 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
             "return": {"aggregates": {"count": {"count": "*"}}},
         }
 
-    neq = lambda left, right: {"not_equal": {"left": {"alias": left}, "right": {"alias": right}}}
+    neq = lambda left, right: {
+        "not_equal": {"left": {"alias": left}, "right": {"alias": right}}
+    }
     queries = {
         "q1": count_query(
             {
@@ -1736,7 +1907,12 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                 "post": node("Post"),
             },
             [
-                {"from": "person1", "to": "person2", "direction": "both", "types": ["KNOWS"]},
+                {
+                    "from": "person1",
+                    "to": "person2",
+                    "direction": "both",
+                    "types": ["KNOWS"],
+                },
                 {"from": "comment", "to": "person1", "types": ["HAS_CREATOR"]},
                 {"from": "comment", "to": "post", "types": ["REPLY_OF"]},
                 {"from": "post", "to": "person2", "types": ["HAS_CREATOR"]},
@@ -1759,9 +1935,24 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                 {"from": "city2", "to": "country", "types": ["IS_PART_OF"]},
                 {"from": "person3", "to": "city3", "types": ["IS_LOCATED_IN"]},
                 {"from": "city3", "to": "country", "types": ["IS_PART_OF"]},
-                {"from": "person1", "to": "person2", "direction": "both", "types": ["KNOWS"]},
-                {"from": "person2", "to": "person3", "direction": "both", "types": ["KNOWS"]},
-                {"from": "person3", "to": "person1", "direction": "both", "types": ["KNOWS"]},
+                {
+                    "from": "person1",
+                    "to": "person2",
+                    "direction": "both",
+                    "types": ["KNOWS"],
+                },
+                {
+                    "from": "person2",
+                    "to": "person3",
+                    "direction": "both",
+                    "types": ["KNOWS"],
+                },
+                {
+                    "from": "person3",
+                    "to": "person1",
+                    "direction": "both",
+                    "types": ["KNOWS"],
+                },
             ],
         ),
         "q4": count_query(
@@ -1801,8 +1992,18 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                 "tag": node("Tag"),
             },
             [
-                {"from": "person1", "to": "person2", "direction": "both", "types": ["KNOWS"]},
-                {"from": "person2", "to": "person3", "direction": "both", "types": ["KNOWS"]},
+                {
+                    "from": "person1",
+                    "to": "person2",
+                    "direction": "both",
+                    "types": ["KNOWS"],
+                },
+                {
+                    "from": "person2",
+                    "to": "person3",
+                    "direction": "both",
+                    "types": ["KNOWS"],
+                },
                 {"from": "person3", "to": "tag", "types": ["HAS_INTEREST"]},
             ],
             where=neq("person1", "person3"),
@@ -1824,7 +2025,9 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                 },
                 {
                     "nodes": {"comment": node("Comment")},
-                    "edges": [{"from": "comment", "to": "message", "types": ["REPLY_OF"]}],
+                    "edges": [
+                        {"from": "comment", "to": "message", "types": ["REPLY_OF"]}
+                    ],
                 },
             ],
         ),
@@ -1842,7 +2045,13 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
             ],
             where={
                 "and": [
-                    {"not_exists": {"edges": [{"from": "comment", "to": "tag1", "types": ["HAS_TAG"]}]}},
+                    {
+                        "not_exists": {
+                            "edges": [
+                                {"from": "comment", "to": "tag1", "types": ["HAS_TAG"]}
+                            ]
+                        }
+                    },
                     neq("tag1", "tag2"),
                 ]
             },
@@ -1855,8 +2064,18 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                 "tag": node("Tag"),
             },
             [
-                {"from": "person1", "to": "person2", "direction": "both", "types": ["KNOWS"]},
-                {"from": "person2", "to": "person3", "direction": "both", "types": ["KNOWS"]},
+                {
+                    "from": "person1",
+                    "to": "person2",
+                    "direction": "both",
+                    "types": ["KNOWS"],
+                },
+                {
+                    "from": "person2",
+                    "to": "person3",
+                    "direction": "both",
+                    "types": ["KNOWS"],
+                },
                 {"from": "person3", "to": "tag", "types": ["HAS_INTEREST"]},
             ],
             where={
@@ -1878,7 +2097,17 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
             },
         ),
     }
-    expected = {"q1": "1", "q2": "1", "q3": "6", "q4": "1", "q5": "2", "q6": "1", "q7": "2", "q8": "1", "q9": "1"}
+    expected = {
+        "q1": "1",
+        "q2": "1",
+        "q3": "6",
+        "q4": "1",
+        "q5": "2",
+        "q6": "1",
+        "q7": "2",
+        "q8": "1",
+        "q9": "1",
+    }
     query_names = list(expected)
     # Keep each request within the public eight-MATCH admission budget while retaining named
     # multi-operation coverage. Raising the server budget here would weaken the production guard.
@@ -1890,15 +2119,27 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
     def exact_counts() -> dict | None:
         actual = {}
         for query_batch in query_batches:
-            response = backup_api.query_table(table_name, {"graph_queries": query_batch, "limit": 10})
+            response = backup_api.query_table(
+                table_name, {"graph_queries": query_batch, "limit": 10}
+            )
             graph_results = response.get("responses", [{}])[0].get("graph_results", {})
-            actual.update({name: result.get("aggregates", {}).get("count") for name, result in graph_results.items()})
-        if all(actual.get(name) == {"value": count, "exact": True} for name, count in expected.items()):
+            actual.update(
+                {
+                    name: result.get("aggregates", {}).get("count")
+                    for name, result in graph_results.items()
+                }
+            )
+        if all(
+            actual.get(name) == {"value": count, "exact": True}
+            for name, count in expected.items()
+        ):
             return actual
         return None
 
     counts = wait_until(exact_counts, timeout_s=120.0, interval_s=0.5)
-    assert counts == {name: {"value": count, "exact": True} for name, count in expected.items()}
+    assert counts == {
+        name: {"value": count, "exact": True} for name, count in expected.items()
+    }
 
 
 def test_stateful_graph_pattern_max_results_limit(backup_api):
@@ -1993,7 +2234,12 @@ def test_stateful_graph_pattern_max_results_limit(backup_api):
     limited = wait_until(
         lambda: (
             result
-            if (result := _query_graph_result(backup_api, table_name, query_payload, "limited")) is not None
+            if (
+                result := _query_graph_result(
+                    backup_api, table_name, query_payload, "limited"
+                )
+            )
+            is not None
             and len(result.get("rows", [])) == 2
             else None
         ),
@@ -2006,7 +2252,12 @@ def test_stateful_graph_pattern_max_results_limit(backup_api):
     counts = wait_until(
         lambda: (
             result
-            if (result := _query_graph_result(backup_api, table_name, query_payload, "counts")) is not None
+            if (
+                result := _query_graph_result(
+                    backup_api, table_name, query_payload, "counts"
+                )
+            )
+            is not None
             and result.get("aggregates", {}).get("rows", {}).get("value") == "5"
             else None
         ),

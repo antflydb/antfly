@@ -51,10 +51,15 @@ def summarize(payload: dict[str, Any], material_speedup: float) -> dict[str, Any
     if payload.get("pass") is not True:
         raise EvidenceError("input qualification did not pass")
     gates = payload.get("gates")
-    if not isinstance(gates, dict) or gates.get("require_bitwise_candidate") is not True:
+    if (
+        not isinstance(gates, dict)
+        or gates.get("require_bitwise_candidate") is not True
+    ):
         raise EvidenceError("strict candidate/canonical bitwise gate was not enabled")
     if not math.isfinite(material_speedup) or material_speedup <= 1.0:
-        raise EvidenceError("material speedup threshold must be finite and greater than 1")
+        raise EvidenceError(
+            "material speedup threshold must be finite and greater than 1"
+        )
 
     raw_results = payload.get("results")
     if not isinstance(raw_results, list):
@@ -70,13 +75,18 @@ def summarize(payload: dict[str, Any], material_speedup: float) -> dict[str, Any
         if head_dim not in LAYERS_BY_HEAD_DIM:
             raise EvidenceError(f"unexpected head dimension: {head_dim!r}")
         if result.get("layout") != "identity-null" or result.get("pattern") != "random":
-            raise EvidenceError("projection input must contain only identity-null/random cases")
+            raise EvidenceError(
+                "projection input must contain only identity-null/random cases"
+            )
         if key in indexed:
             raise EvidenceError(f"duplicate result for {key!r}")
         if result.get("pass") is not True:
             raise EvidenceError(f"case {key!r} did not pass")
         differential = result.get("candidate_vs_canonical")
-        if not isinstance(differential, dict) or differential.get("bitwise_mismatches") != 0:
+        if (
+            not isinstance(differential, dict)
+            or differential.get("bitwise_mismatches") != 0
+        ):
             raise EvidenceError(f"case {key!r} is not bitwise-identical to Flash-v1")
         indexed[key] = result
 
@@ -89,7 +99,9 @@ def summarize(payload: dict[str, Any], material_speedup: float) -> dict[str, Any
     if set(indexed) != required:
         missing = sorted(required - set(indexed))
         extra = sorted(set(indexed) - required)
-        raise EvidenceError(f"locked fixture mismatch; missing={missing!r} extra={extra!r}")
+        raise EvidenceError(
+            f"locked fixture mismatch; missing={missing!r} extra={extra!r}"
+        )
 
     per_head_dim: list[dict[str, Any]] = []
     projected_baseline_us = 0.0
@@ -222,7 +234,10 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout.write(rendered)
     if args.json_out is not None:
         args.json_out.write_text(rendered, encoding="utf-8")
-    if args.require_material and not summary["projected_35_layer_attention"]["material_pass"]:
+    if (
+        args.require_material
+        and not summary["projected_35_layer_attention"]["material_pass"]
+    ):
         return 1
     return 0
 

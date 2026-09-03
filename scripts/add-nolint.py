@@ -28,6 +28,7 @@ GOSEC_REASONS = {
     "G706": "internal structured logging",
 }
 
+
 def extract_gosec_rule(text):
     """Extract gosec rule ID like G304 from the issue text."""
     m = re.match(r"(G\d+)", text)
@@ -101,7 +102,10 @@ def main():
         for line_num, nolint_comment in sorted(line_comments.items()):
             idx = line_num - 1  # 0-indexed
             if idx < 0 or idx >= len(lines):
-                print(f"WARNING: Line {line_num} out of range in {file_path}", file=sys.stderr)
+                print(
+                    f"WARNING: Line {line_num} out of range in {file_path}",
+                    file=sys.stderr,
+                )
                 continue
 
             current_line = lines[idx].rstrip("\n")
@@ -124,9 +128,15 @@ def main():
             files_modified += 1
 
     if dry_run:
-        print(f"\nDry run: would modify {lines_modified} lines in {len(file_edits)} files", file=sys.stderr)
+        print(
+            f"\nDry run: would modify {lines_modified} lines in {len(file_edits)} files",
+            file=sys.stderr,
+        )
     else:
-        print(f"Modified {lines_modified} lines in {files_modified} files", file=sys.stderr)
+        print(
+            f"Modified {lines_modified} lines in {files_modified} files",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

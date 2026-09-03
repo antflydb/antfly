@@ -20,7 +20,9 @@ import urllib.request
 from typing import Any
 
 
-VALID_CACHE_DTYPES = frozenset({"f16", "f32", "int8", "fp8", "int4", "polar4", "turbo3"})
+VALID_CACHE_DTYPES = frozenset(
+    {"f16", "f32", "int8", "fp8", "int4", "polar4", "turbo3"}
+)
 SCHEDULER_COUNTERS = (
     "antfly_inference_native_scheduler_step_batches_total",
     "antfly_inference_native_scheduler_step_prefill_items_total",
@@ -58,7 +60,9 @@ def parse_prometheus_counters(text: str) -> dict[str, int | float]:
         try:
             value = float(fields[1])
         except ValueError as exc:
-            raise ValueError(f"invalid Prometheus counter value for {fields[0]}: {fields[1]}") from exc
+            raise ValueError(
+                f"invalid Prometheus counter value for {fields[0]}: {fields[1]}"
+            ) from exc
         samples[fields[0]] = int(value) if value.is_integer() else value
     return samples
 
@@ -67,7 +71,9 @@ def require_scheduler_counters(text: str) -> dict[str, int | float]:
     counters = parse_prometheus_counters(text)
     missing = [name for name in SCHEDULER_COUNTERS if name not in counters]
     if missing:
-        raise RuntimeError(f"scheduler metrics unavailable; missing counters: {', '.join(missing)}")
+        raise RuntimeError(
+            f"scheduler metrics unavailable; missing counters: {', '.join(missing)}"
+        )
     return {name: counters[name] for name in SCHEDULER_COUNTERS}
 
 
@@ -86,7 +92,9 @@ def counter_delta(
 
 def percentile(values: list[float], pct: float) -> float:
     ordered = sorted(values)
-    index = max(0, min(len(ordered) - 1, int((pct / 100.0) * len(ordered) + 0.999999) - 1))
+    index = max(
+        0, min(len(ordered) - 1, int((pct / 100.0) * len(ordered) + 0.999999) - 1)
+    )
     return ordered[index]
 
 
@@ -119,13 +127,17 @@ def post_json(url: str, body: dict, timeout: float = 600.0) -> tuple[float, dict
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"HTTP {exc.code}: {exc.read().decode(errors='replace')}") from exc
+        raise RuntimeError(
+            f"HTTP {exc.code}: {exc.read().decode(errors='replace')}"
+        ) from exc
     elapsed_ms = (time.monotonic() - started) * 1000.0
     return elapsed_ms, json.loads(raw)
 
 
 def response_fingerprint(response: dict) -> str:
-    encoded = json.dumps(response_summary(response), sort_keys=True, separators=(",", ":")).encode()
+    encoded = json.dumps(
+        response_summary(response), sort_keys=True, separators=(",", ":")
+    ).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -195,7 +207,9 @@ class Server:
         deadline = time.monotonic() + self.args.startup_timeout
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
-                raise RuntimeError(f"server {self.mode} exited with {self.process.returncode}")
+                raise RuntimeError(
+                    f"server {self.mode} exited with {self.process.returncode}"
+                )
             try:
                 with urllib.request.urlopen(health, timeout=1):
                     return self
@@ -227,9 +241,13 @@ class Server:
             with urllib.request.urlopen(self.metrics_url, timeout=5) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except Exception as exc:
-            raise RuntimeError(f"failed to read scheduler metrics from {self.metrics_url}: {exc}") from exc
+            raise RuntimeError(
+                f"failed to read scheduler metrics from {self.metrics_url}: {exc}"
+            ) from exc
         if not raw.strip():
-            raise RuntimeError(f"scheduler metrics endpoint returned an empty response: {self.metrics_url}")
+            raise RuntimeError(
+                f"scheduler metrics endpoint returned an empty response: {self.metrics_url}"
+            )
         return raw, require_scheduler_counters(raw)
 
 
@@ -258,12 +276,17 @@ def run_wave(
     started = time.monotonic()
     selected = [cases[(offset + index) % len(cases)] for index in range(concurrency)]
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = [pool.submit(request, index, case) for index, case in enumerate(selected)]
+        futures = [
+            pool.submit(request, index, case) for index, case in enumerate(selected)
+        ]
         results = [future.result() for future in futures]
     wall_ms = (time.monotonic() - started) * 1000.0
     case_ids = [case_id for case_id, _, _ in results]
     latencies = [elapsed for _, elapsed, _ in results]
-    tokens = [int(response.get("usage", {}).get("completion_tokens", 0)) for _, _, response in results]
+    tokens = [
+        int(response.get("usage", {}).get("completion_tokens", 0))
+        for _, _, response in results
+    ]
     return {
         "wall_ms": wall_ms,
         "latencies_ms": latencies,
@@ -283,7 +306,13 @@ def keyed_wave_values(waves: list[dict], field: str) -> dict[str, list[Any]]:
     return {case_id: sorted(items) for case_id, items in sorted(values.items())}
 
 
-def measure_mode(server: Server, cases: list[RequestCase], concurrencies: list[int], warmups: int, repeats: int) -> dict:
+def measure_mode(
+    server: Server,
+    cases: list[RequestCase],
+    concurrencies: list[int],
+    warmups: int,
+    repeats: int,
+) -> dict:
     for warmup in range(warmups):
         for case_offset in range(len(cases)):
             run_wave(server, cases, 1, offset=warmup + case_offset)
@@ -293,19 +322,28 @@ def measure_mode(server: Server, cases: list[RequestCase], concurrencies: list[i
     for concurrency in concurrencies:
         _, before = server.scheduler_metrics()
         wave_count = max(repeats, len(cases)) if concurrency == 1 else repeats
-        waves = [run_wave(server, cases, concurrency, offset=repeat) for repeat in range(wave_count)]
+        waves = [
+            run_wave(server, cases, concurrency, offset=repeat)
+            for repeat in range(wave_count)
+        ]
         final_metrics, after = server.scheduler_metrics()
         measured[str(concurrency)] = {
             "aggregate_tok_s": stats([wave["aggregate_tok_s"] for wave in waves]),
             "wall_ms": stats([wave["wall_ms"] for wave in waves]),
-            "request_latency_ms": stats([value for wave in waves for value in wave["latencies_ms"]]),
-            "fingerprints": sorted({fingerprint for wave in waves for fingerprint in wave["fingerprints"]}),
+            "request_latency_ms": stats(
+                [value for wave in waves for value in wave["latencies_ms"]]
+            ),
+            "fingerprints": sorted(
+                {fingerprint for wave in waves for fingerprint in wave["fingerprints"]}
+            ),
             "fingerprints_by_case": keyed_wave_values(waves, "fingerprints"),
             "prompt_tokens_by_case": keyed_wave_values(
                 [
                     {
                         "case_ids": wave["case_ids"],
-                        "prompt_tokens": [response["prompt_tokens"] for response in wave["responses"]],
+                        "prompt_tokens": [
+                            response["prompt_tokens"] for response in wave["responses"]
+                        ],
                     }
                     for wave in waves
                 ],
@@ -346,15 +384,25 @@ def evaluate_acceptance(
         return (
             bool(expected_fingerprints)
             and observed.keys() == expected_fingerprints.keys()
-            and all(len(values) == 1 and observed[case_id] == values for case_id, values in expected_fingerprints.items())
+            and all(
+                len(values) == 1 and observed[case_id] == values
+                for case_id, values in expected_fingerprints.items()
+            )
         )
 
-    expected_values = [values[0] for values in expected_fingerprints.values() if len(values) == 1]
-    baseline_cases_distinct = len(expected_values) == len(expected_fingerprints) and len(set(expected_values)) == len(expected_values)
+    expected_values = [
+        values[0] for values in expected_fingerprints.values() if len(values) == 1
+    ]
+    baseline_cases_distinct = len(expected_values) == len(
+        expected_fingerprints
+    ) and len(set(expected_values)) == len(expected_values)
     prompt_token_values = baseline_c1["prompt_tokens_by_case"]
     prompt_token_lengths_equal = (
         len(prompt_token_values) == len(expected_fingerprints)
-        and all(len(values) == 1 and values[0] > 0 for values in prompt_token_values.values())
+        and all(
+            len(values) == 1 and values[0] > 0
+            for values in prompt_token_values.values()
+        )
         and len({values[0] for values in prompt_token_values.values()}) == 1
     )
     c1_exact = exact_by_case(batched_c1)
@@ -368,7 +416,10 @@ def evaluate_acceptance(
         if int(concurrency) < 4:
             continue
         diagnostics[concurrency] = {
-            "aggregate_throughput_ratio_vs_off_c1": measurement["aggregate_tok_s"]["median"] / baseline_tok_s,
+            "aggregate_throughput_ratio_vs_off_c1": measurement["aggregate_tok_s"][
+                "median"
+            ]
+            / baseline_tok_s,
             "exact_response_fingerprints": exact_by_case(measurement),
             "scheduler_counter_delta": measurement["scheduler_counter_delta"],
         }
@@ -412,10 +463,15 @@ def evaluate_isolation_probe(
     exact = (
         observed.keys() == expected.keys()
         and bool(expected)
-        and all(len(values) == 1 and observed[case_id] == values for case_id, values in expected.items())
+        and all(
+            len(values) == 1 and observed[case_id] == values
+            for case_id, values in expected.items()
+        )
     )
     expected_values = [values[0] for values in expected.values() if len(values) == 1]
-    distinct = len(expected_values) == len(expected) and len(set(expected_values)) == len(expected_values)
+    distinct = len(expected_values) == len(expected) and len(
+        set(expected_values)
+    ) == len(expected_values)
     requested_limits = sorted({int(body["max_tokens"]) for _, body in cases})
     mixed_output_limits = len(requested_limits) > 1
     repeated_kv_growth = len(waves) >= 2 and max(requested_limits, default=0) > 16
@@ -446,7 +502,9 @@ def evaluate_isolation_probe(
 
 def parse_args() -> argparse.Namespace:
     repo = pathlib.Path(__file__).resolve().parents[5]
-    tuning_wrapper = repo / "zig/pkg/inference/scripts/gemma4/with_gemma4_qat_cuda_tuning.sh"
+    tuning_wrapper = (
+        repo / "zig/pkg/inference/scripts/gemma4/with_gemma4_qat_cuda_tuning.sh"
+    )
     default_server_prefix = shlex.join(
         [
             "env",
@@ -456,15 +514,30 @@ def parse_args() -> argparse.Namespace:
         ]
     )
     parser = argparse.ArgumentParser()
-    parser.add_argument("--antfly-bin", type=pathlib.Path, default=repo / "zig/pkg/inference/zig-out/bin/antfly-inference")
-    parser.add_argument("--model", type=pathlib.Path, default=repo / ".models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf")
+    parser.add_argument(
+        "--antfly-bin",
+        type=pathlib.Path,
+        default=repo / "zig/pkg/inference/zig-out/bin/antfly-inference",
+    )
+    parser.add_argument(
+        "--model",
+        type=pathlib.Path,
+        default=repo
+        / ".models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
+    )
     parser.add_argument("--models-dir", type=pathlib.Path, default=repo / ".models")
-    parser.add_argument("--output-dir", type=pathlib.Path, default=pathlib.Path("/tmp/antfly-gemma4-cuda-batching"))
+    parser.add_argument(
+        "--output-dir",
+        type=pathlib.Path,
+        default=pathlib.Path("/tmp/antfly-gemma4-cuda-batching"),
+    )
     parser.add_argument("--prompt", default="Write one sentence about ants.")
     parser.add_argument("--tokens", type=int, default=256)
     cache_group = parser.add_mutually_exclusive_group()
     cache_group.add_argument("--cache-dtypes", nargs="+", default=None)
-    cache_group.add_argument("--cache-dtype", default=None, help="Run one cache dtype (compatibility alias)")
+    cache_group.add_argument(
+        "--cache-dtype", default=None, help="Run one cache dtype (compatibility alias)"
+    )
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
@@ -479,7 +552,9 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("ANTFLY_BATCH_SERVER_PREFIX", default_server_prefix),
     )
     args = parser.parse_args()
-    args.cache_dtypes = args.cache_dtypes or ([args.cache_dtype] if args.cache_dtype else ["f32", "polar4"])
+    args.cache_dtypes = args.cache_dtypes or (
+        [args.cache_dtype] if args.cache_dtype else ["f32", "polar4"]
+    )
     return args
 
 
@@ -487,10 +562,19 @@ def validate_args(args: argparse.Namespace) -> None:
     if not args.antfly_bin.exists() or not args.model.exists():
         raise ValueError("antfly binary or model does not exist")
     if args.tokens < 32 or args.warmups < 0 or args.repeats < 1:
-        raise ValueError("tokens must be at least 32, repeats positive, and warmups non-negative")
+        raise ValueError(
+            "tokens must be at least 32, repeats positive, and warmups non-negative"
+        )
     if args.decode_wait_us < 0 or args.max_step_items < 2:
-        raise ValueError("decode wait must be non-negative and max-step-items must be at least 2")
-    if args.min_c2_speedup <= 0 or args.max_c1_p95_ratio <= 0 or args.startup_timeout <= 0 or args.stagger_ms <= 0:
+        raise ValueError(
+            "decode wait must be non-negative and max-step-items must be at least 2"
+        )
+    if (
+        args.min_c2_speedup <= 0
+        or args.max_c1_p95_ratio <= 0
+        or args.startup_timeout <= 0
+        or args.stagger_ms <= 0
+    ):
         raise ValueError("acceptance thresholds and startup timeout must be positive")
     if any(value < 1 for value in args.concurrency):
         raise ValueError("concurrency values must be positive")
@@ -500,7 +584,9 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--concurrency must include 1 and 2 for acceptance gates")
     if len(set(args.cache_dtypes)) != len(args.cache_dtypes):
         raise ValueError("cache dtype values must be unique")
-    invalid_dtypes = [dtype for dtype in args.cache_dtypes if dtype not in VALID_CACHE_DTYPES]
+    invalid_dtypes = [
+        dtype for dtype in args.cache_dtypes if dtype not in VALID_CACHE_DTYPES
+    ]
     if invalid_dtypes:
         raise ValueError(f"unsupported cache dtype(s): {', '.join(invalid_dtypes)}")
 
@@ -540,9 +626,13 @@ def benchmark_dtype(args: argparse.Namespace, cache_dtype: str) -> dict:
 
     with Server(args, "off", output_dir) as server:
         baseline = measure_mode(server, primary_cases, [1], args.warmups, args.repeats)
-        isolation_baseline = measure_mode(server, isolation_cases, [1], 0, max(2, args.repeats))
+        isolation_baseline = measure_mode(
+            server, isolation_cases, [1], 0, max(2, args.repeats)
+        )
     with Server(args, "on", output_dir) as server:
-        batched = measure_mode(server, primary_cases, args.concurrency, args.warmups, args.repeats)
+        batched = measure_mode(
+            server, primary_cases, args.concurrency, args.warmups, args.repeats
+        )
         _, isolation_before = server.scheduler_metrics()
         isolation_waves = [
             run_wave(
@@ -586,7 +676,9 @@ def benchmark_dtype(args: argparse.Namespace, cache_dtype: str) -> dict:
         "batched": batched,
         "acceptance": acceptance,
     }
-    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n"
+    )
     return summary
 
 

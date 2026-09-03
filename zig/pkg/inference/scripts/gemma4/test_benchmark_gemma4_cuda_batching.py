@@ -83,9 +83,13 @@ class CudaServerBenchmarkTests(unittest.TestCase):
             }
 
             with (
-                mock.patch.object(cuda_server_benchmark, "parse_args", return_value=args),
+                mock.patch.object(
+                    cuda_server_benchmark, "parse_args", return_value=args
+                ),
                 mock.patch.object(cuda_server_benchmark, "Server") as server_type,
-                mock.patch.object(cuda_server_benchmark, "measure_mode", return_value=result) as measure,
+                mock.patch.object(
+                    cuda_server_benchmark, "measure_mode", return_value=result
+                ) as measure,
                 mock.patch("builtins.print"),
             ):
                 cuda_server_benchmark.main()
@@ -119,7 +123,9 @@ fractional_total 1.5
 
     def test_required_scheduler_counters_reject_missing_samples(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "missing counters"):
-            require_scheduler_counters("# TYPE unrelated_total counter\nunrelated_total 1\n")
+            require_scheduler_counters(
+                "# TYPE unrelated_total counter\nunrelated_total 1\n"
+            )
 
     def test_required_scheduler_counters_accept_complete_exposition(self) -> None:
         text = "\n".join(
@@ -127,7 +133,9 @@ fractional_total 1.5
             for name in SCHEDULER_COUNTERS
             for line in (f"# TYPE {name} counter", f"{name} 3")
         )
-        self.assertEqual({name: 3 for name in SCHEDULER_COUNTERS}, require_scheduler_counters(text))
+        self.assertEqual(
+            {name: 3 for name in SCHEDULER_COUNTERS}, require_scheduler_counters(text)
+        )
 
 
 class ResponseFingerprintTests(unittest.TestCase):
@@ -141,17 +149,23 @@ class ResponseFingerprintTests(unittest.TestCase):
         baseline = self.response()
         changed = self.response()
         changed["choices"][0]["finish_reason"] = "length"
-        self.assertNotEqual(response_fingerprint(baseline), response_fingerprint(changed))
+        self.assertNotEqual(
+            response_fingerprint(baseline), response_fingerprint(changed)
+        )
 
     def test_prompt_usage_difference_changes_fingerprint(self) -> None:
         baseline = self.response()
         changed = self.response()
         changed["usage"]["prompt_tokens"] = 8
-        self.assertNotEqual(response_fingerprint(baseline), response_fingerprint(changed))
+        self.assertNotEqual(
+            response_fingerprint(baseline), response_fingerprint(changed)
+        )
 
 
 class AcceptanceTests(unittest.TestCase):
-    def test_staggered_isolation_does_not_require_homogeneous_row_two_step(self) -> None:
+    def test_staggered_isolation_does_not_require_homogeneous_row_two_step(
+        self,
+    ) -> None:
         baseline = {
             "fingerprints_by_case": {"long": ["long-fp"], "short": ["short-fp"]},
         }
@@ -164,7 +178,9 @@ class AcceptanceTests(unittest.TestCase):
             ("short", {"max_tokens": 24}),
         ]
 
-        probe = evaluate_isolation_probe(baseline, waves, scheduler_delta(), cases, 25.0)
+        probe = evaluate_isolation_probe(
+            baseline, waves, scheduler_delta(), cases, 25.0
+        )
 
         self.assertTrue(probe["passed"])
         self.assertFalse(probe["row_two_steps_positive"])
@@ -179,11 +195,17 @@ class AcceptanceTests(unittest.TestCase):
             }
         }
 
-        acceptance = evaluate_acceptance(baseline, batched, 1.5, 1.05, isolation_probe())
+        acceptance = evaluate_acceptance(
+            baseline, batched, 1.5, 1.05, isolation_probe()
+        )
 
         self.assertTrue(acceptance["passed"])
         self.assertEqual(12, acceptance["c2_step_batch_size_2_total"])
-        self.assertFalse(acceptance["concurrency_4_plus_diagnostics"]["4"]["exact_response_fingerprints"])
+        self.assertFalse(
+            acceptance["concurrency_4_plus_diagnostics"]["4"][
+                "exact_response_fingerprints"
+            ]
+        )
 
     def test_missing_row_two_steps_fails(self) -> None:
         baseline = {"measurements": {"1": measurement(100.0, 100.0)}}
@@ -194,7 +216,9 @@ class AcceptanceTests(unittest.TestCase):
             }
         }
 
-        acceptance = evaluate_acceptance(baseline, batched, 1.5, 1.05, isolation_probe())
+        acceptance = evaluate_acceptance(
+            baseline, batched, 1.5, 1.05, isolation_probe()
+        )
 
         self.assertFalse(acceptance["passed"])
         self.assertFalse(acceptance["c2_row_two_steps_positive"])
@@ -204,11 +228,15 @@ class AcceptanceTests(unittest.TestCase):
         batched = {
             "measurements": {
                 "1": measurement(100.0, 100.0),
-                "2": measurement(140.0, 180.0, ("swapped-b", "swapped-a"), row_two_steps=8),
+                "2": measurement(
+                    140.0, 180.0, ("swapped-b", "swapped-a"), row_two_steps=8
+                ),
             }
         }
 
-        acceptance = evaluate_acceptance(baseline, batched, 1.5, 1.05, isolation_probe())
+        acceptance = evaluate_acceptance(
+            baseline, batched, 1.5, 1.05, isolation_probe()
+        )
 
         self.assertFalse(acceptance["passed"])
         self.assertFalse(acceptance["c2_exact_response_fingerprints"])
@@ -223,7 +251,9 @@ class AcceptanceTests(unittest.TestCase):
             }
         }
 
-        acceptance = evaluate_acceptance(baseline, batched, 1.5, 1.05, isolation_probe(False))
+        acceptance = evaluate_acceptance(
+            baseline, batched, 1.5, 1.05, isolation_probe(False)
+        )
 
         self.assertFalse(acceptance["passed"])
 

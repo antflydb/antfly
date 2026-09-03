@@ -73,19 +73,27 @@ def default_train_data() -> Path:
 
 
 def resolve_python_sampling_policy(deterministic: bool, requested: str) -> str:
-    policy = ("disabled" if deterministic else "upstream-default") if requested == "auto" else requested
+    policy = (
+        ("disabled" if deterministic else "upstream-default")
+        if requested == "auto"
+        else requested
+    )
     if deterministic and policy != "disabled":
         raise ValueError("--deterministic requires --python-sampling-policy disabled")
     return policy
 
 
-def resolve_python_schema_conditioning_policy(deterministic: bool, no_train_shuffle: bool) -> str:
+def resolve_python_schema_conditioning_policy(
+    deterministic: bool, no_train_shuffle: bool
+) -> str:
     if deterministic:
         return "deterministic-eval-form"
     return "ordered-training-form" if no_train_shuffle else "upstream-training-default"
 
 
-def summarize_python_jsonl(src: Path, allowed_labels: set[str] | None = None) -> dict[str, Any]:
+def summarize_python_jsonl(
+    src: Path, allowed_labels: set[str] | None = None
+) -> dict[str, Any]:
     examples = 0
     mentions = 0
     task_counts = {"classifications": 0, "json_structures": 0, "relations": 0}
@@ -101,30 +109,48 @@ def summarize_python_jsonl(src: Path, allowed_labels: set[str] | None = None) ->
                 task_counts[key] += counts[key]
             labels.update(record_labels)
             examples += 1
-    return {"examples": examples, "mentions": mentions, "labels": sorted(labels), **task_counts}
+    return {
+        "examples": examples,
+        "mentions": mentions,
+        "labels": sorted(labels),
+        **task_counts,
+    }
 
 
-def convert_limited_to_python_jsonl(src: Path, dst: Path, max_examples: int, allowed_labels: set[str] | None = None) -> dict[str, Any]:
+def convert_limited_to_python_jsonl(
+    src: Path, dst: Path, max_examples: int, allowed_labels: set[str] | None = None
+) -> dict[str, Any]:
     dst.parent.mkdir(parents=True, exist_ok=True)
     examples = 0
     mentions = 0
     task_counts = {"classifications": 0, "json_structures": 0, "relations": 0}
     labels: set[str] = set()
-    with src.open("r", encoding="utf-8") as fin, dst.open("w", encoding="utf-8") as fout:
+    with (
+        src.open("r", encoding="utf-8") as fin,
+        dst.open("w", encoding="utf-8") as fout,
+    ):
         for line in fin:
             if examples >= max_examples:
                 break
             if not line.strip():
                 continue
             record = json.loads(line)
-            normalized, counts, record_labels = normalize_python_record(record, allowed_labels)
+            normalized, counts, record_labels = normalize_python_record(
+                record, allowed_labels
+            )
             mentions += counts["entity_mentions"]
             for key in task_counts:
                 task_counts[key] += counts[key]
             labels.update(record_labels)
             fout.write(json.dumps(normalized, ensure_ascii=False) + "\n")
             examples += 1
-    return {"examples": examples, "mentions": mentions, "labels": sorted(labels), **task_counts, "path": str(dst)}
+    return {
+        "examples": examples,
+        "mentions": mentions,
+        "labels": sorted(labels),
+        **task_counts,
+        "path": str(dst),
+    }
 
 
 def prepare_python_model_dir(model_dir: Path, out_dir: Path) -> Path:
@@ -152,7 +178,10 @@ def prepare_python_model_dir(model_dir: Path, out_dir: Path) -> Path:
             encoding="utf-8",
         )
     tokenizer_config = dst / "tokenizer_config.json"
-    if not (model_dir / "tokenizer_config.json").exists() and not tokenizer_config.exists():
+    if (
+        not (model_dir / "tokenizer_config.json").exists()
+        and not tokenizer_config.exists()
+    ):
         tokenizer_config.write_text(
             json.dumps(
                 {
@@ -188,7 +217,12 @@ def prepare_python_model_dir(model_dir: Path, out_dir: Path) -> Path:
     return dst
 
 
-def run_command(cmd: list[str], cwd: Path, timeout: int | None = None, env: dict[str, str] | None = None) -> dict[str, Any]:
+def run_command(
+    cmd: list[str],
+    cwd: Path,
+    timeout: int | None = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
     started = time.time()
     run_env = {**os.environ, "TOKENIZERS_PARALLELISM": "false"}
     if env:
@@ -276,7 +310,9 @@ def within_loss_tolerance(
         return False, None
     expected_value = float(expected)
     actual_value = float(actual)
-    bound = absolute_tolerance + relative_tolerance * max(abs(expected_value), abs(actual_value))
+    bound = absolute_tolerance + relative_tolerance * max(
+        abs(expected_value), abs(actual_value)
+    )
     return abs(actual_value - expected_value) <= bound, bound
 
 
@@ -302,14 +338,21 @@ def parse_zig_output(output: str) -> dict[str, Any]:
         return float(value)
 
     float_pattern = r"([-+]?(?:nan|inf|infinity|[0-9]+(?:\.[0-9]*)?(?:[eE][-+]?[0-9]+)?|\.[0-9]+(?:[eE][-+]?[0-9]+)?))"
-    step = re.search(rf"loss={float_pattern}\s+grad_norm={float_pattern}\s+supervised_tok/s={float_pattern}", output)
+    step = re.search(
+        rf"loss={float_pattern}\s+grad_norm={float_pattern}\s+supervised_tok/s={float_pattern}",
+        output,
+    )
     final = re.search(rf"final avg loss={float_pattern}", output)
     loaded = re.search(r"loaded\s+(\d+)\s+weights", output)
     parity_debug = extract_prefixed_json(output, "SPAN_PARITY_DEBUG ")
     preprocess_debug = extract_prefixed_json(output, "SPAN_PREPROCESS_DEBUG ")
     component_debug = extract_prefixed_json(output, "SPAN_COMPONENT_DEBUG ")
-    total_component_debug = extract_prefixed_json(output, "GLINER2_TOTAL_LOSS_COMPONENT_DEBUG ")
-    classification_debug = extract_prefixed_json(output, "GLINER2_CLASSIFICATION_DEBUG ")
+    total_component_debug = extract_prefixed_json(
+        output, "GLINER2_TOTAL_LOSS_COMPONENT_DEBUG "
+    )
+    classification_debug = extract_prefixed_json(
+        output, "GLINER2_CLASSIFICATION_DEBUG "
+    )
     optimizer_parity_steps = extract_prefixed_json(output, "GLINER2_OPT_PARITY ")
     return {
         "step_loss": parse_float(step.group(1)) if step else None,
@@ -320,8 +363,12 @@ def parse_zig_output(output: str) -> dict[str, Any]:
         "span_parity_debug": parity_debug[-1] if parity_debug else None,
         "span_preprocess_debug": preprocess_debug[-1] if preprocess_debug else None,
         "span_component_debug": component_debug[-1] if component_debug else None,
-        "gliner2_total_loss_components": total_component_debug[-1] if total_component_debug else None,
-        "gliner2_classification_debug": classification_debug[-1] if classification_debug else None,
+        "gliner2_total_loss_components": total_component_debug[-1]
+        if total_component_debug
+        else None,
+        "gliner2_classification_debug": classification_debug[-1]
+        if classification_debug
+        else None,
         "optimizer_parity_steps": optimizer_parity_steps,
     }
 
@@ -341,7 +388,13 @@ def _first_mismatch(path: str, left: Any, right: Any) -> dict[str, Any] | None:
             if mismatch is not None:
                 return mismatch
         if len(left) != len(right):
-            return {"field": path, "index": limit, "python": len(left), "zig": len(right), "kind": "length"}
+            return {
+                "field": path,
+                "index": limit,
+                "python": len(left),
+                "zig": len(right),
+                "kind": "length",
+            }
         return None
     if left != right:
         return {"field": path, "python": left, "zig": right}
@@ -358,16 +411,20 @@ def _zig_schema_special_indices(zig: dict[str, Any]) -> list[list[int]]:
     out: list[list[int]] = []
     for schema_idx, count in enumerate(counts):
         start = schema_idx * width
-        out.append([int(x) for x in flat[start:start + int(count)] if int(x) >= 0])
+        out.append([int(x) for x in flat[start : start + int(count)] if int(x) >= 0])
     while out and not out[-1]:
         out.pop()
     return out
 
 
-def _zig_schema_special_indices_for_sample(zig: dict[str, Any], sample_idx: int) -> list[list[int]]:
+def _zig_schema_special_indices_for_sample(
+    zig: dict[str, Any], sample_idx: int
+) -> list[list[int]]:
     counts_all = zig.get("schema_special_counts_all") or []
     flat_all = zig.get("schema_special_positions_all") or []
-    max_schemas = int(zig.get("max_schemas") or len(zig.get("schema_special_counts") or []))
+    max_schemas = int(
+        zig.get("max_schemas") or len(zig.get("schema_special_counts") or [])
+    )
     max_schema_specials = int(zig.get("max_schema_specials") or 0)
     if not counts_all or not flat_all or max_schemas <= 0 or max_schema_specials <= 0:
         return _zig_schema_special_indices(zig) if sample_idx == 0 else []
@@ -380,7 +437,9 @@ def _zig_schema_special_indices_for_sample(zig: dict[str, Any], sample_idx: int)
             break
         count = int(counts_all[count_pos])
         row_start = pos_start + schema_idx * max_schema_specials
-        out.append([int(x) for x in flat_all[row_start:row_start + count] if int(x) >= 0])
+        out.append(
+            [int(x) for x in flat_all[row_start : row_start + count] if int(x) >= 0]
+        )
     while out and not out[-1]:
         out.pop()
     return out
@@ -398,13 +457,21 @@ def _python_structure_positive_count(structure_labels: Any) -> int:
                 continue
             for field in span_group or []:
                 if isinstance(field, list):
-                    count += sum(1 for sub in field if sub not in (None, [-1, -1], (-1, -1)))
+                    count += sum(
+                        1 for sub in field if sub not in (None, [-1, -1], (-1, -1))
+                    )
                 elif field not in (None, [-1, -1], (-1, -1)):
                     count += 1
     return count
 
 
-def _zig_sample_slice(zig: dict[str, Any], field: str, sample_idx: int, width: int, fallback_field: str | None = None) -> list[Any]:
+def _zig_sample_slice(
+    zig: dict[str, Any],
+    field: str,
+    sample_idx: int,
+    width: int,
+    fallback_field: str | None = None,
+) -> list[Any]:
     values = zig.get(field) or []
     if not values and fallback_field:
         values = zig.get(fallback_field) or []
@@ -413,17 +480,30 @@ def _zig_sample_slice(zig: dict[str, Any], field: str, sample_idx: int, width: i
     return values[start:end]
 
 
-def _zig_task_types_for_sample(zig: dict[str, Any], sample_idx: int, count: int) -> list[str]:
-    task_id_to_name = {1: "entities", 2: "json_structures", 3: "relations", 4: "classifications"}
+def _zig_task_types_for_sample(
+    zig: dict[str, Any], sample_idx: int, count: int
+) -> list[str]:
+    task_id_to_name = {
+        1: "entities",
+        2: "json_structures",
+        3: "relations",
+        4: "classifications",
+    }
     max_schemas = int(zig.get("max_schemas") or len(zig.get("task_type_ids") or []))
-    ids = _zig_sample_slice(zig, "task_type_ids_all", sample_idx, max_schemas, "task_type_ids")
+    ids = _zig_sample_slice(
+        zig, "task_type_ids_all", sample_idx, max_schemas, "task_type_ids"
+    )
     return [task_id_to_name.get(int(x), "unknown") for x in ids[:count]]
 
 
-def _compare_preprocess_sample(py: dict[str, Any], zig: dict[str, Any], sample_idx: int) -> list[dict[str, Any]]:
+def _compare_preprocess_sample(
+    py: dict[str, Any], zig: dict[str, Any], sample_idx: int
+) -> list[dict[str, Any]]:
     mismatches: list[dict[str, Any]] = []
     max_length = int(zig.get("max_length") or len(zig.get("input_ids") or []))
-    max_words = int(zig.get("max_words_per_sample") or len(zig.get("first_token_positions") or []))
+    max_words = int(
+        zig.get("max_words_per_sample") or len(zig.get("first_token_positions") or [])
+    )
     max_spans = int(zig.get("max_spans") or 0)
     entity_types = int(zig.get("num_entity_types") or 0)
     word_count = int(py.get("text_word_counts") or 0)
@@ -432,15 +512,31 @@ def _compare_preprocess_sample(py: dict[str, Any], zig: dict[str, Any], sample_i
     comparisons = {
         f"samples[{sample_idx}].input_ids": (
             _trim_trailing(py.get("input_ids", []), 0),
-            _trim_trailing(_zig_sample_slice(zig, "input_ids_all", sample_idx, max_length, "input_ids"), 0),
+            _trim_trailing(
+                _zig_sample_slice(
+                    zig, "input_ids_all", sample_idx, max_length, "input_ids"
+                ),
+                0,
+            ),
         ),
         f"samples[{sample_idx}].attention_mask": (
             _trim_trailing(py.get("attention_mask", []), 0),
-            _trim_trailing(_zig_sample_slice(zig, "attention_mask_all", sample_idx, max_length, "attention_mask"), 0),
+            _trim_trailing(
+                _zig_sample_slice(
+                    zig, "attention_mask_all", sample_idx, max_length, "attention_mask"
+                ),
+                0,
+            ),
         ),
         f"samples[{sample_idx}].text_word_indices": (
             py.get("text_word_indices", []),
-            _zig_sample_slice(zig, "first_token_positions_all", sample_idx, max_words, "first_token_positions")[:word_count],
+            _zig_sample_slice(
+                zig,
+                "first_token_positions_all",
+                sample_idx,
+                max_words,
+                "first_token_positions",
+            )[:word_count],
         ),
         f"samples[{sample_idx}].schema_special_indices": (
             py.get("schema_special_indices", []),
@@ -458,25 +554,69 @@ def _compare_preprocess_sample(py: dict[str, Any], zig: dict[str, Any], sample_i
 
     py_positive = _python_structure_positive_count(py.get("structure_labels"))
     span_label_width = max_spans * entity_types
-    zig_labels = _zig_sample_slice(zig, "span_labels_all", sample_idx, span_label_width, "span_labels")
+    zig_labels = _zig_sample_slice(
+        zig, "span_labels_all", sample_idx, span_label_width, "span_labels"
+    )
     zig_positive = int(round(sum(float(x) for x in zig_labels)))
     if py_positive != zig_positive:
-        mismatches.append({ "field": f"samples[{sample_idx}].structure_positive_count", "python": py_positive, "zig": zig_positive })
+        mismatches.append(
+            {
+                "field": f"samples[{sample_idx}].structure_positive_count",
+                "python": py_positive,
+                "zig": zig_positive,
+            }
+        )
     return mismatches
 
 
-def compare_preprocess_debug(py: dict[str, Any] | None, zig: dict[str, Any] | None) -> tuple[bool, list[dict[str, Any]]]:
+def compare_preprocess_debug(
+    py: dict[str, Any] | None, zig: dict[str, Any] | None
+) -> tuple[bool, list[dict[str, Any]]]:
     mismatches: list[dict[str, Any]] = []
     if not py or not zig:
-        return False, [{"field": "preprocess_debug", "python": bool(py), "zig": bool(zig), "kind": "missing"}]
+        return False, [
+            {
+                "field": "preprocess_debug",
+                "python": bool(py),
+                "zig": bool(zig),
+                "kind": "missing",
+            }
+        ]
 
-    task_id_to_name = {1: "entities", 2: "json_structures", 3: "relations", 4: "classifications"}
+    task_id_to_name = {
+        1: "entities",
+        2: "json_structures",
+        3: "relations",
+        4: "classifications",
+    }
     comparisons = {
-        "input_ids": (_trim_trailing(py.get("input_ids", []), 0), _trim_trailing(zig.get("input_ids", []), 0)),
-        "attention_mask": (_trim_trailing(py.get("attention_mask", []), 0), _trim_trailing(zig.get("attention_mask", []), 0)),
-        "text_word_indices": (py.get("text_word_indices", []), (zig.get("first_token_positions", []) or [])[: len(py.get("text_word_indices", []))]),
-        "schema_special_indices": (py.get("schema_special_indices", []), _zig_schema_special_indices(zig)),
-        "task_types": (py.get("task_types", []), [task_id_to_name.get(int(x), "unknown") for x in (zig.get("task_type_ids") or [])[: len(py.get("task_types", []))]]),
+        "input_ids": (
+            _trim_trailing(py.get("input_ids", []), 0),
+            _trim_trailing(zig.get("input_ids", []), 0),
+        ),
+        "attention_mask": (
+            _trim_trailing(py.get("attention_mask", []), 0),
+            _trim_trailing(zig.get("attention_mask", []), 0),
+        ),
+        "text_word_indices": (
+            py.get("text_word_indices", []),
+            (zig.get("first_token_positions", []) or [])[
+                : len(py.get("text_word_indices", []))
+            ],
+        ),
+        "schema_special_indices": (
+            py.get("schema_special_indices", []),
+            _zig_schema_special_indices(zig),
+        ),
+        "task_types": (
+            py.get("task_types", []),
+            [
+                task_id_to_name.get(int(x), "unknown")
+                for x in (zig.get("task_type_ids") or [])[
+                    : len(py.get("task_types", []))
+                ]
+            ],
+        ),
     }
     for field, (left, right) in comparisons.items():
         mismatch = _first_mismatch(field, left, right)
@@ -485,21 +625,40 @@ def compare_preprocess_debug(py: dict[str, Any] | None, zig: dict[str, Any] | No
 
     py_positive = _python_structure_positive_count(py.get("structure_labels"))
     zig_labels = zig.get("span_labels") or []
-    zig_first_sample_width = int(zig.get("max_spans") or 0) * int(zig.get("num_entity_types") or 0)
+    zig_first_sample_width = int(zig.get("max_spans") or 0) * int(
+        zig.get("num_entity_types") or 0
+    )
     if zig_first_sample_width <= 0:
         zig_first_sample_width = len(zig_labels)
-    zig_positive = int(round(sum(float(x) for x in zig_labels[:zig_first_sample_width])))
+    zig_positive = int(
+        round(sum(float(x) for x in zig_labels[:zig_first_sample_width]))
+    )
     if py_positive != zig_positive:
-        mismatches.append({"field": "structure_positive_count", "python": py_positive, "zig": zig_positive})
+        mismatches.append(
+            {
+                "field": "structure_positive_count",
+                "python": py_positive,
+                "zig": zig_positive,
+            }
+        )
 
     return not mismatches, mismatches[:10]
 
 
-def compare_preprocess_debug_samples(py_samples: list[dict[str, Any]] | None, zig: dict[str, Any] | None) -> tuple[bool, list[dict[str, Any]]]:
+def compare_preprocess_debug_samples(
+    py_samples: list[dict[str, Any]] | None, zig: dict[str, Any] | None
+) -> tuple[bool, list[dict[str, Any]]]:
     if not py_samples:
         return compare_preprocess_debug(None, zig)
     if not zig:
-        return False, [{"field": "preprocess_debug", "python": True, "zig": False, "kind": "missing"}]
+        return False, [
+            {
+                "field": "preprocess_debug",
+                "python": True,
+                "zig": False,
+                "kind": "missing",
+            }
+        ]
     mismatches: list[dict[str, Any]] = []
     for fallback_idx, sample in enumerate(py_samples):
         sample_idx = int(sample.get("sample_idx", fallback_idx))
@@ -528,7 +687,13 @@ def compare_component_losses(
             ok = False
             continue
         if not finite_number(pv) or not finite_number(zv):
-            deltas[field] = {"python": pv, "zig": zv, "delta": None, "ok": False, "reason": "non_finite"}
+            deltas[field] = {
+                "python": pv,
+                "zig": zv,
+                "delta": None,
+                "ok": False,
+                "reason": "non_finite",
+            }
             ok = False
             continue
         delta = float(zv) - float(pv)
@@ -590,7 +755,10 @@ def reconcile_single_component_from_step_loss(
         absolute_tolerance * 8.0,
         relative_tolerance * 8.0,
     )
-    if reconcile_bound is None or abs(float(zig_field_val) - float(py[field])) > reconcile_bound:
+    if (
+        reconcile_bound is None
+        or abs(float(zig_field_val) - float(py[field])) > reconcile_bound
+    ):
         return zig, None
     fixed = dict(zig)
     raw = {"component": fixed.get(field), "total_loss": fixed.get("total_loss")}
@@ -605,7 +773,9 @@ def reconcile_single_component_from_step_loss(
     }
 
 
-def compare_classification_debug(py: dict[str, Any] | None, zig: dict[str, Any] | None, tolerance: float) -> tuple[bool, dict[str, Any]]:
+def compare_classification_debug(
+    py: dict[str, Any] | None, zig: dict[str, Any] | None, tolerance: float
+) -> tuple[bool, dict[str, Any]]:
     if not py or not zig:
         return False, {"missing": {"python": bool(py), "zig": bool(zig)}}
     fields = [
@@ -641,7 +811,9 @@ def compare_classification_debug(py: dict[str, Any] | None, zig: dict[str, Any] 
         max_delta = 0.0
         for idx in range(count):
             if finite_number(py_values[idx]) and finite_number(zig_values[idx]):
-                max_delta = max(max_delta, abs(float(zig_values[idx]) - float(py_values[idx])))
+                max_delta = max(
+                    max_delta, abs(float(zig_values[idx]) - float(py_values[idx]))
+                )
         field_ok = len(py_values) == len(zig_values) and max_delta <= tolerance
         deltas[field] = {
             "python_len": len(py_values),
@@ -661,14 +833,18 @@ def canonical_adapter_param_name(name: str) -> str:
     parity dump emits the PEFT-export name `<module>.lora_A.weight`.
     """
     if name.startswith("base_model.model."):
-        name = name[len("base_model.model."):]
-    name = name.replace(".lora_A.default.", ".lora_A.").replace(".lora_B.default.", ".lora_B.")
+        name = name[len("base_model.model.") :]
+    name = name.replace(".lora_A.default.", ".lora_A.").replace(
+        ".lora_B.default.", ".lora_B."
+    )
     if name.endswith(".weight"):
         name = name[: -len(".weight")]
     return name
 
 
-def _derived_grad_head(m_now: list[Any], m_prev: list[Any], beta1: float) -> list[float]:
+def _derived_grad_head(
+    m_now: list[Any], m_prev: list[Any], beta1: float
+) -> list[float]:
     """Recover the post-clip gradient head from the Adam first-moment update.
 
     m_t = beta1 * m_{t-1} + (1 - beta1) * g_t  =>  g_t = (m_t - beta1*m_{t-1}) / (1-beta1)
@@ -716,11 +892,19 @@ def _is_inert_python_mha_out_proj(
             return False
         for quantity in ("m", "v"):
             abs_sum = tensor.get(f"{quantity}_abs_sum")
-            if quantity not in tensor or tensor[quantity] or not finite_number(abs_sum) or float(abs_sum) != 0.0:
+            if (
+                quantity not in tensor
+                or tensor[quantity]
+                or not finite_number(abs_sum)
+                or float(abs_sum) != 0.0
+            ):
                 return False
     b_tensor = pair[1]
     assert b_tensor is not None
-    return finite_number(b_tensor.get("weight_abs_sum")) and float(b_tensor["weight_abs_sum"]) == 0.0
+    return (
+        finite_number(b_tensor.get("weight_abs_sum"))
+        and float(b_tensor["weight_abs_sum"]) == 0.0
+    )
 
 
 def compare_optimizer_parity(
@@ -745,10 +929,12 @@ def compare_optimizer_parity(
     def index_steps(steps: list[dict[str, Any]]) -> list[dict[str, dict[str, Any]]]:
         indexed: list[dict[str, dict[str, Any]]] = []
         for payload in steps:
-            indexed.append({
-                canonical_adapter_param_name(str(t.get("name"))): t
-                for t in payload.get("tensors", [])
-            })
+            indexed.append(
+                {
+                    canonical_adapter_param_name(str(t.get("name"))): t
+                    for t in payload.get("tensors", [])
+                }
+            )
         return indexed
 
     py_idx = index_steps(py_steps)
@@ -761,7 +947,9 @@ def compare_optimizer_parity(
         common = sorted(set(py_tensors) & set(zig_tensors))
         raw_python_only = sorted(set(py_tensors) - set(zig_tensors))
         ignored_python_only = sorted(
-            name for name in raw_python_only if _is_inert_python_mha_out_proj(name, py_tensors)
+            name
+            for name in raw_python_only
+            if _is_inert_python_mha_out_proj(name, py_tensors)
         )
         actionable_python_only = sorted(set(raw_python_only) - set(ignored_python_only))
         zig_only = sorted(set(zig_tensors) - set(py_tensors))
@@ -776,11 +964,13 @@ def compare_optimizer_parity(
             py_step_count = int(pt.get("step_count") or 0)
             zig_step_count = int(zt.get("step_count") or 0)
             if py_step_count != zig_step_count:
-                step_count_mismatches.append({
-                    "tensor": name,
-                    "python": py_step_count,
-                    "zig": zig_step_count,
-                })
+                step_count_mismatches.append(
+                    {
+                        "tensor": name,
+                        "python": py_step_count,
+                        "zig": zig_step_count,
+                    }
+                )
             for q in quantities:
                 pv = pt.get(q) or []
                 zv = zt.get(q) or []
@@ -796,8 +986,12 @@ def compare_optimizer_parity(
                     delta = abs(float(pa) - float(za))
                     if delta > abs_sum_max[q]["max_abs_delta"]:
                         abs_sum_max[q] = {"max_abs_delta": delta, "tensor": name}
-            py_m_prev = (py_idx[step_i - 1].get(name, {}).get("m") or []) if step_i > 0 else []
-            zig_m_prev = (zig_idx[step_i - 1].get(name, {}).get("m") or []) if step_i > 0 else []
+            py_m_prev = (
+                (py_idx[step_i - 1].get(name, {}).get("m") or []) if step_i > 0 else []
+            )
+            zig_m_prev = (
+                (zig_idx[step_i - 1].get(name, {}).get("m") or []) if step_i > 0 else []
+            )
             py_derived = _derived_grad_head(pt.get("m") or [], py_m_prev, beta1)
             zig_derived = _derived_grad_head(zt.get("m") or [], zig_m_prev, beta1)
             for a, b in zip(py_derived, zig_derived):
@@ -810,27 +1004,29 @@ def compare_optimizer_parity(
                 delta = abs(float(a) - b)
                 if delta > true_vs_derived_grad_max["max_abs_delta"]:
                     true_vs_derived_grad_max = {"max_abs_delta": delta, "tensor": name}
-        step_reports.append({
-            "step": step_i + 1,
-            "tensors_compared": len(common),
-            "python_only_tensors": len(actionable_python_only),
-            "python_only_tensor_names": actionable_python_only,
-            "python_only_inert_tensors_ignored": len(ignored_python_only),
-            "python_only_inert_tensor_names": ignored_python_only,
-            "raw_python_only_tensors": len(raw_python_only),
-            "zig_only_tensors": len(zig_only),
-            "zig_only_tensor_names": zig_only,
-            "step_count_mismatch_count": len(step_count_mismatches),
-            "step_count_mismatches": step_count_mismatches[:10],
-            "weight_head_max_abs_delta": head_max["weight"],
-            "m_head_max_abs_delta": head_max["m"],
-            "v_head_max_abs_delta": head_max["v"],
-            "weight_abs_sum_max_abs_delta": abs_sum_max["weight"],
-            "m_abs_sum_max_abs_delta": abs_sum_max["m"],
-            "v_abs_sum_max_abs_delta": abs_sum_max["v"],
-            "derived_grad_head_max_abs_delta": derived_grad_max,
-            "python_true_grad_vs_zig_derived_max_abs_delta": true_vs_derived_grad_max,
-        })
+        step_reports.append(
+            {
+                "step": step_i + 1,
+                "tensors_compared": len(common),
+                "python_only_tensors": len(actionable_python_only),
+                "python_only_tensor_names": actionable_python_only,
+                "python_only_inert_tensors_ignored": len(ignored_python_only),
+                "python_only_inert_tensor_names": ignored_python_only,
+                "raw_python_only_tensors": len(raw_python_only),
+                "zig_only_tensors": len(zig_only),
+                "zig_only_tensor_names": zig_only,
+                "step_count_mismatch_count": len(step_count_mismatches),
+                "step_count_mismatches": step_count_mismatches[:10],
+                "weight_head_max_abs_delta": head_max["weight"],
+                "m_head_max_abs_delta": head_max["m"],
+                "v_head_max_abs_delta": head_max["v"],
+                "weight_abs_sum_max_abs_delta": abs_sum_max["weight"],
+                "m_abs_sum_max_abs_delta": abs_sum_max["m"],
+                "v_abs_sum_max_abs_delta": abs_sum_max["v"],
+                "derived_grad_head_max_abs_delta": derived_grad_max,
+                "python_true_grad_vs_zig_derived_max_abs_delta": true_vs_derived_grad_max,
+            }
+        )
     return {
         "ran": True,
         "python_step_count": len(py_idx),
@@ -885,7 +1081,9 @@ def optimizer_parity_gate(
             or row.get("zig_only_tensors") != 0
             or row.get("step_count_mismatch_count") != 0
         ):
-            failures.append(f"optimizer parity step {index} has incomplete tensor/bookkeeping coverage")
+            failures.append(
+                f"optimizer parity step {index} has incomplete tensor/bookkeeping coverage"
+            )
         for field in delta_fields:
             detail = row.get(field)
             delta = detail.get("max_abs_delta") if isinstance(detail, dict) else None
@@ -906,17 +1104,23 @@ def summarize_preprocess_tasks(samples: list[dict[str, Any]] | None) -> dict[str
             name = str(task_type)
             task_counts[name] = task_counts.get(name, 0) + 1
             local_counts[name] = local_counts.get(name, 0) + 1
-        sample_summaries.append({
-            "sample_idx": sample_idx,
-            "task_counts": local_counts,
-            "has_non_entity_task": any(k != "entities" for k in local_counts),
-            "structure_positive_count": _python_structure_positive_count(sample.get("structure_labels")),
-        })
+        sample_summaries.append(
+            {
+                "sample_idx": sample_idx,
+                "task_counts": local_counts,
+                "has_non_entity_task": any(k != "entities" for k in local_counts),
+                "structure_positive_count": _python_structure_positive_count(
+                    sample.get("structure_labels")
+                ),
+            }
+        )
     return {
         "sample_count": len(sample_summaries),
         "task_counts": task_counts,
         "sample_summaries": sample_summaries,
-        "non_entity_task_count": sum(v for k, v in task_counts.items() if k != "entities"),
+        "non_entity_task_count": sum(
+            v for k, v in task_counts.items() if k != "entities"
+        ),
     }
 
 
@@ -926,14 +1130,19 @@ def summarize_component_deltas(deltas: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict) or payload.get("ok") is True:
             continue
         delta = payload.get("delta")
-        failing.append({
-            "component": name,
-            "python": payload.get("python"),
-            "zig": payload.get("zig"),
-            "delta": delta,
-            "abs_delta": abs(float(delta)) if delta is not None else None,
-        })
-    failing.sort(key=lambda item: item["abs_delta"] if item["abs_delta"] is not None else -1.0, reverse=True)
+        failing.append(
+            {
+                "component": name,
+                "python": payload.get("python"),
+                "zig": payload.get("zig"),
+                "delta": delta,
+                "abs_delta": abs(float(delta)) if delta is not None else None,
+            }
+        )
+    failing.sort(
+        key=lambda item: item["abs_delta"] if item["abs_delta"] is not None else -1.0,
+        reverse=True,
+    )
     return {
         "failing_components": failing,
         "largest_failing_component": failing[0]["component"] if failing else None,
@@ -947,17 +1156,22 @@ def summarize_accelerator_readiness(
     zig_manifest: dict[str, Any],
     backend: str,
 ) -> dict[str, Any] | None:
-    build_requested = getattr(args, "zig_build_metal" if backend == "metal" else "zig_build_cuda", False)
+    build_requested = getattr(
+        args, "zig_build_metal" if backend == "metal" else "zig_build_cuda", False
+    )
     if args.zig_backend != backend and not build_requested:
         return None
 
-    optimizer_backends = sorted({
-        str(row.get("optimizer_backend"))
-        for row in zig_step_rows
-        if row.get("optimizer_backend") is not None
-    })
+    optimizer_backends = sorted(
+        {
+            str(row.get("optimizer_backend"))
+            for row in zig_step_rows
+            if row.get("optimizer_backend") is not None
+        }
+    )
     max_device_resident_transfer_count = max(
-        [int(row.get("device_resident_transfer_count") or 0) for row in zig_step_rows] or [0]
+        [int(row.get("device_resident_transfer_count") or 0) for row in zig_step_rows]
+        or [0]
     )
     max_device_trainable_bytes = max(
         [int(row.get("device_trainable_bytes") or 0) for row in zig_step_rows] or [0]
@@ -969,11 +1183,13 @@ def summarize_accelerator_readiness(
         int(row.get("graph_executor_planned_dispatches") or 0) for row in zig_step_rows
     )
     total_interpreter_fallbacks = sum(
-        int(row.get("graph_executor_interpreter_fallbacks") or 0) for row in zig_step_rows
+        int(row.get("graph_executor_interpreter_fallbacks") or 0)
+        for row in zig_step_rows
     )
     total_host_outputs = sum(
         int(row.get("graph_executor_host_outputs") or 0) for row in zig_step_rows
     )
+
     def row_true_host_outputs(row: dict[str, Any]) -> int:
         if row.get("graph_executor_true_host_outputs") is not None:
             return int(row.get("graph_executor_true_host_outputs") or 0)
@@ -992,16 +1208,20 @@ def summarize_accelerator_readiness(
     total_true_host_outputs = sum(true_host_outputs_per_step)
     max_true_host_outputs_per_step = max(true_host_outputs_per_step or [0])
     total_parameter_materializations = sum(
-        int(row.get("graph_executor_host_output_parameter") or 0) for row in zig_step_rows
+        int(row.get("graph_executor_host_output_parameter") or 0)
+        for row in zig_step_rows
     )
     total_device_parameter_outputs = sum(
-        int(row.get("graph_executor_device_output_parameter") or 0) for row in zig_step_rows
-    )
-    graph_executor_fallback_reasons = sorted({
-        str(row.get("graph_executor_fallback_reason"))
+        int(row.get("graph_executor_device_output_parameter") or 0)
         for row in zig_step_rows
-        if row.get("graph_executor_fallback_reason")
-    })
+    )
+    graph_executor_fallback_reasons = sorted(
+        {
+            str(row.get("graph_executor_fallback_reason"))
+            for row in zig_step_rows
+            if row.get("graph_executor_fallback_reason")
+        }
+    )
     manifest_backend = str(zig_manifest.get("backend") or "")
     manifest_objective = str(zig_manifest.get("objective") or "")
     zig_metrics = report.get("zig", {}).get("metrics", {})
@@ -1029,7 +1249,8 @@ def summarize_accelerator_readiness(
         )
     }
     cuda_largest_d2h_transfer_bytes = max(
-        [int(row.get("cuda_largest_d2h_transfer_bytes") or 0) for row in zig_step_rows] or [0]
+        [int(row.get("cuda_largest_d2h_transfer_bytes") or 0) for row in zig_step_rows]
+        or [0]
     )
     cuda_max_h2d_bytes_per_step = max(
         [int(row.get("cuda_h2d_bytes") or 0) for row in zig_step_rows] or [0]
@@ -1041,19 +1262,23 @@ def summarize_accelerator_readiness(
         [int(row.get("cuda_to_float32_calls") or 0) for row in zig_step_rows] or [0]
     )
     cuda_max_training_input_upload_bytes_per_step = max(
-        [int(row.get("cuda_training_input_upload_bytes") or 0) for row in zig_step_rows] or [0]
+        [int(row.get("cuda_training_input_upload_bytes") or 0) for row in zig_step_rows]
+        or [0]
     )
     checks = {
         "zig_returncode_ok": report.get("zig", {}).get("returncode") == 0,
         "manifest_backend_matches": manifest_backend.lower() == backend,
         "manifest_objective_matches_request": manifest_objective == args.zig_objective,
-        "finite_step_loss": finite_number(zig_metrics.get("step_loss")) or finite_number(zig_metrics.get("final_avg_loss")),
+        "finite_step_loss": finite_number(zig_metrics.get("step_loss"))
+        or finite_number(zig_metrics.get("final_avg_loss")),
         "finite_grad_norm": (
             finite_number(zig_metrics.get("grad_norm"))
             if backend == "cuda" or zig_metrics.get("grad_norm") is not None
             else True
         ),
-        "optimizer_backend_matches": optimizer_backends == [backend] if optimizer_backends else False,
+        "optimizer_backend_matches": optimizer_backends == [backend]
+        if optimizer_backends
+        else False,
         "device_resident_transfers_zero": max_device_resident_transfer_count == 0,
         "device_trainables_resident": max_device_trainable_bytes > 0,
         "training_precision_fp32": (
@@ -1080,36 +1305,55 @@ def summarize_accelerator_readiness(
         "cuda_exact_gelu_backward_calls",
     )
     cuda_telemetry_present = all(
-        all(type(row.get(field)) is int and row[field] >= 0 for field in cuda_required_runtime_fields)
+        all(
+            type(row.get(field)) is int and row[field] >= 0
+            for field in cuda_required_runtime_fields
+        )
         for row in zig_step_rows
     )
     if backend == "cuda":
         max_d2h = int(getattr(args, "cuda_max_d2h_bytes_per_step", 8))
         max_single_d2h = int(getattr(args, "cuda_max_single_d2h_transfer_bytes", 4))
-        max_scalar_metric_downloads = int(getattr(args, "cuda_max_scalar_metric_downloads_per_step", 2))
-        checks["cuda_runtime_telemetry_present"] = bool(zig_step_rows) and cuda_telemetry_present
+        max_scalar_metric_downloads = int(
+            getattr(args, "cuda_max_scalar_metric_downloads_per_step", 2)
+        )
+        checks["cuda_runtime_telemetry_present"] = (
+            bool(zig_step_rows) and cuda_telemetry_present
+        )
         # Runtime inputs necessarily change every step. Require the complete
         # step telemetry to include those uploads, while the independent
         # device-resident transfer counter continues to reject parameter or
         # optimizer-state round trips.
-        checks["cuda_full_step_h2d_accounted"] = bool(zig_step_rows) and cuda_telemetry_present and all(
-            int(row.get("cuda_training_input_uploads") or 0) > 0
-            and int(row.get("cuda_training_input_upload_bytes") or 0) > 0
-            and int(row.get("cuda_h2d_bytes") or 0) >= int(row.get("cuda_training_input_upload_bytes") or 0)
-            for row in zig_step_rows
+        checks["cuda_full_step_h2d_accounted"] = (
+            bool(zig_step_rows)
+            and cuda_telemetry_present
+            and all(
+                int(row.get("cuda_training_input_uploads") or 0) > 0
+                and int(row.get("cuda_training_input_upload_bytes") or 0) > 0
+                and int(row.get("cuda_h2d_bytes") or 0)
+                >= int(row.get("cuda_training_input_upload_bytes") or 0)
+                for row in zig_step_rows
+            )
         )
-        checks["cuda_parameter_state_h2d_zero"] = checks["device_resident_transfers_zero"]
-        checks["cuda_d2h_bytes_per_step_within_threshold"] = cuda_max_d2h_bytes_per_step <= max_d2h
-        checks["cuda_bulk_d2h_eliminated"] = cuda_largest_d2h_transfer_bytes <= max_single_d2h
+        checks["cuda_parameter_state_h2d_zero"] = checks[
+            "device_resident_transfers_zero"
+        ]
+        checks["cuda_d2h_bytes_per_step_within_threshold"] = (
+            cuda_max_d2h_bytes_per_step <= max_d2h
+        )
+        checks["cuda_bulk_d2h_eliminated"] = (
+            cuda_largest_d2h_transfer_bytes <= max_single_d2h
+        )
         checks["cuda_only_scalar_metrics_downloaded"] = (
             cuda_max_to_float32_calls_per_step <= max_scalar_metric_downloads
         )
-        upload_syncs = [int(row.get("cuda_upload_synchronizations") or 0) for row in zig_step_rows]
+        upload_syncs = [
+            int(row.get("cuda_upload_synchronizations") or 0) for row in zig_step_rows
+        ]
         checks["cuda_upload_synchronizations_bounded"] = (
             bool(upload_syncs)
             and cuda_telemetry_present
-            and
-            sum(upload_syncs) <= 1
+            and sum(upload_syncs) <= 1
             and upload_syncs[0] <= 1
             and all(value == 0 for value in upload_syncs[1:])
         )
@@ -1124,51 +1368,76 @@ def summarize_accelerator_readiness(
     warnings: list[str] = []
     zero_dispatches = total_command_dispatches == 0 and total_planned_dispatches == 0
     graph_executor_requested = bool(
-        args.zig_backend == backend and getattr(args, "zig_training_graph_executor", False)
+        args.zig_backend == backend
+        and getattr(args, "zig_training_graph_executor", False)
     )
-    max_interpreter_fallbacks = int(getattr(args, "metal_max_interpreter_fallbacks", 64))
+    max_interpreter_fallbacks = int(
+        getattr(args, "metal_max_interpreter_fallbacks", 64)
+    )
     max_metal_true_host_outputs = (
-        int(getattr(args, "metal_max_true_host_outputs_per_step", 6)) if backend == "metal" else None
+        int(getattr(args, "metal_max_true_host_outputs_per_step", 6))
+        if backend == "metal"
+        else None
     )
     if graph_executor_requested:
         # When the training graph executor was explicitly requested, zero
         # dispatches means every step silently fell back to interpreter-only
         # execution; that is a failing check (gated by --strict), not a warning.
-        checks["graph_executor_dispatches_nonzero"] = bool(zig_step_rows) and not zero_dispatches
+        checks["graph_executor_dispatches_nonzero"] = (
+            bool(zig_step_rows) and not zero_dispatches
+        )
         # A non-empty fallback reason is a FULL-STEP bail to the interpreter —
         # always a failure. The per-op interpreter-fallback count is a
         # perf/coverage signal gated by an explicit ceiling (regression guard
         # against drifting into broad interpreter-only execution).
-        checks["graph_executor_fallback_reasons_empty"] = not graph_executor_fallback_reasons
+        checks[
+            "graph_executor_fallback_reasons_empty"
+        ] = not graph_executor_fallback_reasons
         if backend == "metal":
             # The only admitted host values are the bounded interpreter-side
             # i64 index conversions used by device gathers. Require complete
             # category telemetry so command/runtime/unattributed host output
             # cannot hide behind the same numeric ceiling.
-            checks["graph_executor_true_host_outputs_within_threshold"] = bool(zig_step_rows) and all(
+            checks["graph_executor_true_host_outputs_within_threshold"] = bool(
+                zig_step_rows
+            ) and all(
                 row.get("graph_executor_host_output_command") == 0
                 and row.get("graph_executor_host_output_pre_materialized_constant") == 0
                 and row.get("graph_executor_host_output_runtime_region") == 0
                 and row.get("graph_executor_host_output_unattributed") == 0
-                and row.get("graph_executor_host_output_interpreter") == row_true_host_outputs(row)
+                and row.get("graph_executor_host_output_interpreter")
+                == row_true_host_outputs(row)
                 and row_true_host_outputs(row) <= max_metal_true_host_outputs
                 for row in zig_step_rows
             )
         else:
-            checks["graph_executor_true_host_outputs_zero"] = total_true_host_outputs == 0
-        checks["interpreter_fallbacks_within_threshold"] = total_interpreter_fallbacks <= max_interpreter_fallbacks
+            checks["graph_executor_true_host_outputs_zero"] = (
+                total_true_host_outputs == 0
+            )
+        checks["interpreter_fallbacks_within_threshold"] = (
+            total_interpreter_fallbacks <= max_interpreter_fallbacks
+        )
     elif zero_dispatches:
-        warnings.append(f"{backend.upper()} run reported no graph command/planned dispatches; check for interpreter-only execution")
+        warnings.append(
+            f"{backend.upper()} run reported no graph command/planned dispatches; check for interpreter-only execution"
+        )
     if graph_executor_fallback_reasons:
         warnings.append(
-            f"{backend.upper()} run reported graph executor fallback reasons: " + ", ".join(graph_executor_fallback_reasons)
+            f"{backend.upper()} run reported graph executor fallback reasons: "
+            + ", ".join(graph_executor_fallback_reasons)
         )
     if total_interpreter_fallbacks > 0:
-        warnings.append(f"{backend.upper()} run reported {total_interpreter_fallbacks} interpreter fallbacks")
+        warnings.append(
+            f"{backend.upper()} run reported {total_interpreter_fallbacks} interpreter fallbacks"
+        )
     if total_true_host_outputs > 0:
-        warnings.append(f"{backend.upper()} run reported {total_true_host_outputs} true host outputs")
+        warnings.append(
+            f"{backend.upper()} run reported {total_true_host_outputs} true host outputs"
+        )
     if total_parameter_materializations > 0:
-        warnings.append(f"{backend.upper()} run reported {total_parameter_materializations} parameter materializations")
+        warnings.append(
+            f"{backend.upper()} run reported {total_parameter_materializations} parameter materializations"
+        )
     return {
         "backend": backend,
         "ok": all(checks.values()),
@@ -1185,28 +1454,56 @@ def summarize_accelerator_readiness(
         "total_graph_host_outputs": total_host_outputs,
         "total_graph_true_host_outputs": total_true_host_outputs,
         "max_graph_true_host_outputs_per_step": max_true_host_outputs_per_step,
-        "max_graph_true_host_outputs_per_step_threshold": max_metal_true_host_outputs if backend == "metal" else 0,
+        "max_graph_true_host_outputs_per_step_threshold": max_metal_true_host_outputs
+        if backend == "metal"
+        else 0,
         "total_graph_parameter_materializations": total_parameter_materializations,
         "total_graph_device_parameter_outputs": total_device_parameter_outputs,
         "graph_executor_fallback_reasons": graph_executor_fallback_reasons,
         "max_interpreter_fallbacks_threshold": max_interpreter_fallbacks,
         "graph_executor_requested": graph_executor_requested,
         "cuda_runtime_totals": cuda_runtime_totals if backend == "cuda" else None,
-        "cuda_max_h2d_bytes_per_step": cuda_max_h2d_bytes_per_step if backend == "cuda" else None,
-        "cuda_max_d2h_bytes_per_step": cuda_max_d2h_bytes_per_step if backend == "cuda" else None,
-        "cuda_max_to_float32_calls_per_step": cuda_max_to_float32_calls_per_step if backend == "cuda" else None,
-        "cuda_max_training_input_upload_bytes_per_step": cuda_max_training_input_upload_bytes_per_step if backend == "cuda" else None,
-        "cuda_largest_d2h_transfer_bytes": cuda_largest_d2h_transfer_bytes if backend == "cuda" else None,
-        "cuda_runtime_telemetry_present": cuda_telemetry_present if backend == "cuda" else None,
+        "cuda_max_h2d_bytes_per_step": cuda_max_h2d_bytes_per_step
+        if backend == "cuda"
+        else None,
+        "cuda_max_d2h_bytes_per_step": cuda_max_d2h_bytes_per_step
+        if backend == "cuda"
+        else None,
+        "cuda_max_to_float32_calls_per_step": cuda_max_to_float32_calls_per_step
+        if backend == "cuda"
+        else None,
+        "cuda_max_training_input_upload_bytes_per_step": cuda_max_training_input_upload_bytes_per_step
+        if backend == "cuda"
+        else None,
+        "cuda_largest_d2h_transfer_bytes": cuda_largest_d2h_transfer_bytes
+        if backend == "cuda"
+        else None,
+        "cuda_runtime_telemetry_present": cuda_telemetry_present
+        if backend == "cuda"
+        else None,
     }
 
 
-def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], zig_step_rows: list[dict[str, Any]], zig_manifest: dict[str, Any]) -> dict[str, Any] | None:
-    return summarize_accelerator_readiness(args, report, zig_step_rows, zig_manifest, "metal")
+def summarize_metal_readiness(
+    args: argparse.Namespace,
+    report: dict[str, Any],
+    zig_step_rows: list[dict[str, Any]],
+    zig_manifest: dict[str, Any],
+) -> dict[str, Any] | None:
+    return summarize_accelerator_readiness(
+        args, report, zig_step_rows, zig_manifest, "metal"
+    )
 
 
-def summarize_cuda_readiness(args: argparse.Namespace, report: dict[str, Any], zig_step_rows: list[dict[str, Any]], zig_manifest: dict[str, Any]) -> dict[str, Any] | None:
-    return summarize_accelerator_readiness(args, report, zig_step_rows, zig_manifest, "cuda")
+def summarize_cuda_readiness(
+    args: argparse.Namespace,
+    report: dict[str, Any],
+    zig_step_rows: list[dict[str, Any]],
+    zig_manifest: dict[str, Any],
+) -> dict[str, Any] | None:
+    return summarize_accelerator_readiness(
+        args, report, zig_step_rows, zig_manifest, "cuda"
+    )
 
 
 def parse_op_stat_items(payload: str) -> dict[str, dict[str, float]]:
@@ -1242,11 +1539,13 @@ def parse_zig_op_stats(output: str) -> dict[str, Any]:
     for line in output.splitlines():
         for prefix, key in prefixes.items():
             if line.startswith(prefix):
-                parsed[key] = parse_op_stat_items(line[len(prefix):].strip())
+                parsed[key] = parse_op_stat_items(line[len(prefix) :].strip())
     return parsed
 
 
-def top_op_stat_items(stats: dict[str, dict[str, float]], limit: int = 16) -> list[dict[str, Any]]:
+def top_op_stat_items(
+    stats: dict[str, dict[str, float]], limit: int = 16
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for name, values in stats.items():
         count = values.get("count")
@@ -1254,13 +1553,21 @@ def top_op_stat_items(stats: dict[str, dict[str, float]], limit: int = 16) -> li
         avg_ms = values.get("avg_ms")
         if count is None:
             continue
-        items.append({
-            "name": name,
-            "count": count,
-            "total_ms": total_ms,
-            "avg_ms": avg_ms,
-        })
-    items.sort(key=lambda item: (float(item.get("count") or 0), float(item.get("total_ms") or 0.0)), reverse=True)
+        items.append(
+            {
+                "name": name,
+                "count": count,
+                "total_ms": total_ms,
+                "avg_ms": avg_ms,
+            }
+        )
+    items.sort(
+        key=lambda item: (
+            float(item.get("count") or 0),
+            float(item.get("total_ms") or 0.0),
+        ),
+        reverse=True,
+    )
     return items[:limit]
 
 
@@ -1320,18 +1627,23 @@ def parse_dot_shape_items(payload: str) -> list[dict[str, Any]]:
 def parse_zig_op_runs(output: str) -> dict[str, Any]:
     dot_shapes: list[dict[str, Any]] = []
     for line in output.splitlines():
-        prefixes = ("metal_partition_command_dot_shapes:", "metal_partition_dot_shapes:")
+        prefixes = (
+            "metal_partition_command_dot_shapes:",
+            "metal_partition_dot_shapes:",
+        )
         prefix = next((p for p in prefixes if line.startswith(p)), None)
         if prefix is None:
             continue
         if prefix == "metal_partition_command_dot_shapes:":
-            dot_shapes.extend(parse_dot_shape_items(line[len(prefix):].strip()))
+            dot_shapes.extend(parse_dot_shape_items(line[len(prefix) :].strip()))
             continue
         top_index = line.find(" top=")
         if top_index < 0:
             continue
-        dot_shapes.extend(parse_dot_shape_items(line[top_index + len(" top="):]))
-    dot_shapes.sort(key=lambda item: (item.get("total_ms", 0), item.get("count", 0)), reverse=True)
+        dot_shapes.extend(parse_dot_shape_items(line[top_index + len(" top=") :]))
+    dot_shapes.sort(
+        key=lambda item: (item.get("total_ms", 0), item.get("count", 0)), reverse=True
+    )
     return {
         "dot_shapes": dot_shapes,
         "top_dot_shapes": dot_shapes[:16],
@@ -1403,7 +1715,7 @@ def parse_zig_loop_profiles(output: str) -> list[dict[str, Any]]:
         if not line.startswith(prefix):
             continue
         profile: dict[str, Any] = {}
-        payload = line[len(prefix):].strip()
+        payload = line[len(prefix) :].strip()
         for part in payload.split(":"):
             if "=" not in part:
                 continue
@@ -1429,7 +1741,7 @@ def parse_zig_planned_access_profiles(output: str) -> list[dict[str, Any]]:
         if not line.startswith(prefix):
             continue
         profile: dict[str, Any] = {}
-        payload = line[len(prefix):].strip()
+        payload = line[len(prefix) :].strip()
         for part in payload.split(":"):
             if "=" not in part:
                 continue
@@ -1482,7 +1794,9 @@ def summarize_planned_access_profiles(profiles: list[dict[str, Any]]) -> dict[st
     warm_profiles = profiles[1:] if len(profiles) > 1 else []
     summary: dict[str, Any] = {
         "zig_planned_access_profile_count": len(profiles) if profiles else None,
-        "zig_planned_access_profile_warm_count": len(warm_profiles) if warm_profiles else None,
+        "zig_planned_access_profile_warm_count": len(warm_profiles)
+        if warm_profiles
+        else None,
     }
     for key in PLANNED_ACCESS_PROFILE_KEYS:
         summary[f"zig_planned_access_profile_{key}_avg"] = avg(profiles, key)
@@ -1492,10 +1806,30 @@ def summarize_planned_access_profiles(profiles: list[dict[str, Any]]) -> dict[st
 
 def extract_prefixed_json(output: str, prefix: str) -> list[dict[str, Any]]:
     def normalize_nonfinite_constants(payload: str) -> str:
-        payload = re.sub(r'(?<![A-Za-z0-9_+\-.])-nan(?![A-Za-z0-9_+\-.])', 'NaN', payload, flags=re.IGNORECASE)
-        payload = re.sub(r'(?<![A-Za-z0-9_+\-.])\+?nan(?![A-Za-z0-9_+\-.])', 'NaN', payload, flags=re.IGNORECASE)
-        payload = re.sub(r'(?<![A-Za-z0-9_+\-.])-inf(?:inity)?(?![A-Za-z0-9_+\-.])', '-Infinity', payload, flags=re.IGNORECASE)
-        payload = re.sub(r'(?<![A-Za-z0-9_+\-.])\+?inf(?:inity)?(?![A-Za-z0-9_+\-.])', 'Infinity', payload, flags=re.IGNORECASE)
+        payload = re.sub(
+            r"(?<![A-Za-z0-9_+\-.])-nan(?![A-Za-z0-9_+\-.])",
+            "NaN",
+            payload,
+            flags=re.IGNORECASE,
+        )
+        payload = re.sub(
+            r"(?<![A-Za-z0-9_+\-.])\+?nan(?![A-Za-z0-9_+\-.])",
+            "NaN",
+            payload,
+            flags=re.IGNORECASE,
+        )
+        payload = re.sub(
+            r"(?<![A-Za-z0-9_+\-.])-inf(?:inity)?(?![A-Za-z0-9_+\-.])",
+            "-Infinity",
+            payload,
+            flags=re.IGNORECASE,
+        )
+        payload = re.sub(
+            r"(?<![A-Za-z0-9_+\-.])\+?inf(?:inity)?(?![A-Za-z0-9_+\-.])",
+            "Infinity",
+            payload,
+            flags=re.IGNORECASE,
+        )
         return payload
 
     payloads: list[dict[str, Any]] = []
@@ -1503,7 +1837,7 @@ def extract_prefixed_json(output: str, prefix: str) -> list[dict[str, Any]]:
         if not line.startswith(prefix):
             continue
         try:
-            payload = normalize_nonfinite_constants(line[len(prefix):])
+            payload = normalize_nonfinite_constants(line[len(prefix) :])
             payloads.append(json.loads(payload))
         except json.JSONDecodeError:
             pass
@@ -1523,7 +1857,7 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def python_training_script() -> str:
-    return r'''
+    return r"""
 import argparse, importlib.metadata, inspect, json, math, os, pathlib, sys, time, types, unicodedata
 import torch
 import torch.nn.functional as F
@@ -2471,11 +2805,11 @@ payload = {
 }
 (out / "comparison_metrics.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 print("PYTHON_GLINER2_COMPARISON " + json.dumps(payload, sort_keys=True))
-'''
+"""
 
 
 def adapter_roundtrip_script() -> str:
-    return r'''
+    return r"""
 import argparse, importlib.metadata, inspect, json, math, os, pathlib, random, sys, types, unicodedata
 import torch
 import gliner2
@@ -2811,7 +3145,7 @@ result = {
 }
 pathlib.Path(args.result_json).write_text(json.dumps(result, indent=2), encoding="utf-8")
 print("ADAPTER_ROUNDTRIP " + json.dumps(result, sort_keys=True))
-'''
+"""
 
 
 def run_adapter_comparison(
@@ -2828,20 +3162,34 @@ def run_adapter_comparison(
     cmd = [
         args.python_bin,
         str(script),
-        "--model-dir", model_dir,
-        "--train-data", str(train_data),
-        "--python-adapter-dir", str(python_adapter_dir),
-        "--zig-adapter-dir", str(zig_adapter_dir),
-        "--converted-zig-adapter-dir", str(converted_zig_adapter_dir),
-        "--result-json", str(result_json),
-        "--batch-size", str(args.batch_size),
-        "--max-span-width", str(args.max_span_width),
-        "--seed", str(args.seed),
-        "--tolerance", str(args.adapter_roundtrip_tolerance),
+        "--model-dir",
+        model_dir,
+        "--train-data",
+        str(train_data),
+        "--python-adapter-dir",
+        str(python_adapter_dir),
+        "--zig-adapter-dir",
+        str(zig_adapter_dir),
+        "--converted-zig-adapter-dir",
+        str(converted_zig_adapter_dir),
+        "--result-json",
+        str(result_json),
+        "--batch-size",
+        str(args.batch_size),
+        "--max-span-width",
+        str(args.max_span_width),
+        "--seed",
+        str(args.seed),
+        "--tolerance",
+        str(args.adapter_roundtrip_tolerance),
     ]
     if args.adapter_roundtrip_weights_tolerance is not None:
-        cmd.extend(["--weights-tolerance", str(args.adapter_roundtrip_weights_tolerance)])
-    command_result = run_command(cmd, repo_root(), timeout=args.timeout_seconds, env=oracle_subprocess_env(args))
+        cmd.extend(
+            ["--weights-tolerance", str(args.adapter_roundtrip_weights_tolerance)]
+        )
+    command_result = run_command(
+        cmd, repo_root(), timeout=args.timeout_seconds, env=oracle_subprocess_env(args)
+    )
     result: dict[str, Any] = {
         "ran": True,
         "returncode": command_result.get("returncode"),
@@ -2870,7 +3218,9 @@ def run_adapter_checks(
         (python_adapter_dir / "adapter_model.safetensors").exists()
         or (python_adapter_dir / "adapter_weights.safetensors").exists()
     ):
-        skipped["skip_reason"] = f"missing Python adapter checkpoint at {python_adapter_dir}"
+        skipped["skip_reason"] = (
+            f"missing Python adapter checkpoint at {python_adapter_dir}"
+        )
         return skipped, dict(skipped)
     if not zig_adapter_checkpoint.exists() or not zig_adapter_config.exists():
         skipped["skip_reason"] = f"missing Zig PEFT adapter bundle at {zig_adapter_dir}"
@@ -2891,10 +3241,14 @@ def run_adapter_checks(
         trained_zig_adapter_dir,
         roundtrip_dir / "trained_adapter_parity.json",
     )
-    trained_adapter_parity["comparison"] = "independently_trained_python_final_vs_zig_final"
+    trained_adapter_parity["comparison"] = (
+        "independently_trained_python_final_vs_zig_final"
+    )
 
     python_uses_peft = (python_adapter_dir / "adapter_model.safetensors").exists()
-    same_zig_reference = zig_adapter_dir if python_uses_peft else trained_zig_adapter_dir
+    same_zig_reference = (
+        zig_adapter_dir if python_uses_peft else trained_zig_adapter_dir
+    )
     if not python_uses_peft and trained_adapter_parity.get("returncode") != 0:
         adapter_roundtrip = {
             "ran": False,
@@ -2912,7 +3266,9 @@ def run_adapter_checks(
             roundtrip_dir / "adapter_roundtrip.json",
         )
     adapter_roundtrip["comparison"] = "same_zig_artifact_upstream_roundtrip"
-    adapter_roundtrip["normalization"] = "none" if python_uses_peft else "gliner2_legacy"
+    adapter_roundtrip["normalization"] = (
+        "none" if python_uses_peft else "gliner2_legacy"
+    )
     adapter_roundtrip["source_zig_peft_bundle_untouched"] = True
     loss_deltas = adapter_roundtrip.get("loss_deltas_zig_minus_python") or {}
     adapter_roundtrip["unchanged"] = bool(
@@ -2931,7 +3287,9 @@ def run_adapter_checks(
     return adapter_roundtrip, trained_adapter_parity
 
 
-def run_python_side(args: argparse.Namespace, py_train_data: Path, out_dir: Path) -> dict[str, Any]:
+def run_python_side(
+    args: argparse.Namespace, py_train_data: Path, out_dir: Path
+) -> dict[str, Any]:
     script = out_dir / "run_python_gliner2_train.py"
     script.write_text(python_training_script(), encoding="utf-8")
     python_model = str(args.python_model)
@@ -2940,23 +3298,40 @@ def run_python_side(args: argparse.Namespace, py_train_data: Path, out_dir: Path
     cmd = [
         args.python_bin,
         str(script),
-        "--model-dir", python_model,
-        "--train-data", str(py_train_data),
-        "--out-dir", str(out_dir / "python"),
-        "--steps", str(args.steps),
-        "--batch-size", str(args.batch_size),
-        "--seq-len", str(args.seq_len),
-        "--max-span-width", str(args.max_span_width),
-        "--learning-rate", str(args.learning_rate),
-        "--weight-decay", str(args.weight_decay),
-        "--lora-rank", str(args.lora_rank),
-        "--lora-alpha", str(args.lora_alpha),
-        "--lora-dropout", str(args.lora_dropout),
-        "--lora-targets", args.lora_targets,
-        "--seed", str(args.seed),
-        "--span-negative-mask-rate", str(args.span_negative_mask_rate),
-        "--sampling-policy", args.python_sampling_policy,
-        "--device", args.python_device,
+        "--model-dir",
+        python_model,
+        "--train-data",
+        str(py_train_data),
+        "--out-dir",
+        str(out_dir / "python"),
+        "--steps",
+        str(args.steps),
+        "--batch-size",
+        str(args.batch_size),
+        "--seq-len",
+        str(args.seq_len),
+        "--max-span-width",
+        str(args.max_span_width),
+        "--learning-rate",
+        str(args.learning_rate),
+        "--weight-decay",
+        str(args.weight_decay),
+        "--lora-rank",
+        str(args.lora_rank),
+        "--lora-alpha",
+        str(args.lora_alpha),
+        "--lora-dropout",
+        str(args.lora_dropout),
+        "--lora-targets",
+        args.lora_targets,
+        "--seed",
+        str(args.seed),
+        "--span-negative-mask-rate",
+        str(args.span_negative_mask_rate),
+        "--sampling-policy",
+        args.python_sampling_policy,
+        "--device",
+        args.python_device,
     ]
     if args.deterministic:
         cmd.append("--training-deterministic")
@@ -2974,9 +3349,15 @@ def run_python_side(args: argparse.Namespace, py_train_data: Path, out_dir: Path
         # trains on permuted batches and per-step losses compare unrelated
         # data (bit the perf benchmark in practice).
         cmd.append("--no-train-shuffle")
-    result = run_command(cmd, repo_root(), timeout=args.timeout_seconds, env=oracle_subprocess_env(args))
+    result = run_command(
+        cmd, repo_root(), timeout=args.timeout_seconds, env=oracle_subprocess_env(args)
+    )
     metrics_path = out_dir / "python" / "comparison_metrics.json"
-    result["metrics"] = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.exists() else {}
+    result["metrics"] = (
+        json.loads(metrics_path.read_text(encoding="utf-8"))
+        if metrics_path.exists()
+        else {}
+    )
     return result
 
 
@@ -2996,12 +3377,23 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         shutil.rmtree(zig_global_cache)
     zig_local_cache.mkdir(parents=True, exist_ok=True)
     zig_global_cache.mkdir(parents=True, exist_ok=True)
-    enable_metal = args.zig_build_metal if args.zig_build_metal is not None else args.zig_backend == "metal"
-    enable_cuda = args.zig_build_cuda if args.zig_build_cuda is not None else args.zig_backend == "cuda"
+    enable_metal = (
+        args.zig_build_metal
+        if args.zig_build_metal is not None
+        else args.zig_backend == "metal"
+    )
+    enable_cuda = (
+        args.zig_build_cuda
+        if args.zig_build_cuda is not None
+        else args.zig_backend == "cuda"
+    )
     cmd = [
-        "zig", "build",
-        "--cache-dir", str(zig_local_cache),
-        "--global-cache-dir", str(zig_global_cache),
+        "zig",
+        "build",
+        "--cache-dir",
+        str(zig_local_cache),
+        "--global-cache-dir",
+        str(zig_global_cache),
         "-Donnx=false",
         f"-Dmetal={'true' if enable_metal else 'false'}",
         f"-Dcuda={'true' if enable_cuda else 'false'}",
@@ -3013,61 +3405,104 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     # Feed the Zig trainer the exact normalized upstream-format JSONL consumed
     # by Python so punctuation and bounded-slice preprocessing stay identical.
     converted_train_data = out_dir / "python_train.jsonl"
-    zig_train_data = converted_train_data if converted_train_data.exists() else args.train_data
-    cmd.extend([
-        "train-gliner2-autodiff",
-        "--",
-        "--model-dir", str(args.model_dir),
-        "--train-data", str(zig_train_data),
-        "--out-dir", str(out_dir / "zig"),
-        "--epochs", "1",
-        "--batch-size", str(args.batch_size),
-        "--max-examples", str(args.steps * args.batch_size),
-        "--max-steps", str(args.steps),
-        "--seq-len", str(args.seq_len),
-        "--learning-rate", str(args.learning_rate),
-        "--weight-decay", str(args.weight_decay),
-        # The generated upstream trainer uses an explicit constant schedule
-        # with no warmup. Keep multi-step optimizer/result parity on the same
-        # LR sequence instead of inheriting the Zig CLI's production default.
-        "--lr-scheduler", "constant",
-        "--warmup-steps", "0",
-        "--warmup-ratio", "0",
-        "--backend", args.zig_backend,
-        "--objective", args.zig_objective,
-        "--max-span-width", str(args.max_span_width),
-        "--span-loss", "bce",
-        "--span-loss-reduction", args.span_loss_reduction,
-        "--span-positive-weight", str(args.span_positive_weight),
-        "--span-negative-weight", str(args.span_negative_weight),
-        "--span-hard-negative-weight", str(args.span_hard_negative_weight),
-        "--span-negative-mask-rate", str(args.span_negative_mask_rate),
-        "--lora-rank", str(args.lora_rank),
-        "--lora-alpha", str(args.lora_alpha),
-        "--lora-dropout", str(args.lora_dropout),
-        "--lora-targets", args.lora_targets,
-        "--seed", str(args.seed),
-    ])
+    zig_train_data = (
+        converted_train_data if converted_train_data.exists() else args.train_data
+    )
+    cmd.extend(
+        [
+            "train-gliner2-autodiff",
+            "--",
+            "--model-dir",
+            str(args.model_dir),
+            "--train-data",
+            str(zig_train_data),
+            "--out-dir",
+            str(out_dir / "zig"),
+            "--epochs",
+            "1",
+            "--batch-size",
+            str(args.batch_size),
+            "--max-examples",
+            str(args.steps * args.batch_size),
+            "--max-steps",
+            str(args.steps),
+            "--seq-len",
+            str(args.seq_len),
+            "--learning-rate",
+            str(args.learning_rate),
+            "--weight-decay",
+            str(args.weight_decay),
+            # The generated upstream trainer uses an explicit constant schedule
+            # with no warmup. Keep multi-step optimizer/result parity on the same
+            # LR sequence instead of inheriting the Zig CLI's production default.
+            "--lr-scheduler",
+            "constant",
+            "--warmup-steps",
+            "0",
+            "--warmup-ratio",
+            "0",
+            "--backend",
+            args.zig_backend,
+            "--objective",
+            args.zig_objective,
+            "--max-span-width",
+            str(args.max_span_width),
+            "--span-loss",
+            "bce",
+            "--span-loss-reduction",
+            args.span_loss_reduction,
+            "--span-positive-weight",
+            str(args.span_positive_weight),
+            "--span-negative-weight",
+            str(args.span_negative_weight),
+            "--span-hard-negative-weight",
+            str(args.span_hard_negative_weight),
+            "--span-negative-mask-rate",
+            str(args.span_negative_mask_rate),
+            "--lora-rank",
+            str(args.lora_rank),
+            "--lora-alpha",
+            str(args.lora_alpha),
+            "--lora-dropout",
+            str(args.lora_dropout),
+            "--lora-targets",
+            args.lora_targets,
+            "--seed",
+            str(args.seed),
+        ]
+    )
     if args.zig_objective != "gliner2-total-loss":
-        cmd.extend([
-            "--entity-types", args.entity_types,
-            "--num-classes", str(len([x for x in args.entity_types.split(",") if x]) + 1),
-        ])
+        cmd.extend(
+            [
+                "--entity-types",
+                args.entity_types,
+                "--num-classes",
+                str(len([x for x in args.entity_types.split(",") if x]) + 1),
+            ]
+        )
     if args.zig_lora_only_trainables:
         cmd.append("--lora-only-trainables")
     if args.deterministic:
         cmd.append("--deterministic")
     if args.activation_checkpointing:
-        cmd.extend([
-            "--activation-checkpointing",
-            "--activation-checkpoint-interval", str(args.activation_checkpoint_interval),
-            "--activation-checkpoint-strategy", args.activation_checkpoint_strategy,
-        ])
+        cmd.extend(
+            [
+                "--activation-checkpointing",
+                "--activation-checkpoint-interval",
+                str(args.activation_checkpoint_interval),
+                "--activation-checkpoint-strategy",
+                args.activation_checkpoint_strategy,
+            ]
+        )
     if args.structure_span_chunk_samples > 0:
-        cmd.extend(["--structure-span-chunk-samples", str(args.structure_span_chunk_samples)])
+        cmd.extend(
+            ["--structure-span-chunk-samples", str(args.structure_span_chunk_samples)]
+        )
     if args.zig_backend in ("metal", "cuda") and args.zig_training_graph_executor:
         cmd.append("--compiled-required")
-    initial_adapter_checkpoint = out_dir / "python" / "initial_adapter" / "adapter_weights.safetensors"
+    initial_adapter_checkpoint = (
+        out_dir / "python" / "initial_adapter" / "adapter_weights.safetensors"
+    )
     if initial_adapter_checkpoint.exists():
         cmd.extend(["--initial-adapter-checkpoint", str(initial_adapter_checkpoint)])
     if args.dump_parity:
@@ -3075,18 +3510,30 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     if args.dump_optimizer_parity:
         cmd.append("--dump-optimizer-parity")
     zig_env = zig_training_environment(args)
-    result = run_command(cmd, inference_dir(), timeout=args.timeout_seconds, env=zig_env)
+    result = run_command(
+        cmd, inference_dir(), timeout=args.timeout_seconds, env=zig_env
+    )
     result["cache_fallback"] = False
-    if result.get("returncode") != 0 and "manifest_create PermissionDenied" in result.get("output", ""):
+    if result.get(
+        "returncode"
+    ) != 0 and "manifest_create PermissionDenied" in result.get("output", ""):
         fallback_cmd = ["zig", "build", *cmd[6:]]
-        fallback = run_command(fallback_cmd, inference_dir(), timeout=args.timeout_seconds, env=zig_env)
+        fallback = run_command(
+            fallback_cmd, inference_dir(), timeout=args.timeout_seconds, env=zig_env
+        )
         fallback["cache_fallback"] = True
-        fallback["cache_fallback_reason"] = "isolated Zig cache failed with manifest_create PermissionDenied; retried with repo-local cache"
-        fallback["initial_isolated_cache_failure_tail"] = result.get("output", "")[-4000:]
+        fallback["cache_fallback_reason"] = (
+            "isolated Zig cache failed with manifest_create PermissionDenied; retried with repo-local cache"
+        )
+        fallback["initial_isolated_cache_failure_tail"] = result.get("output", "")[
+            -4000:
+        ]
         result = fallback
     result["metrics"] = parse_zig_output(result["output"])
     result["training_metrics"] = load_jsonl(out_dir / "zig" / "training_metrics.jsonl")
-    result["training_manifest"] = load_json_file(out_dir / "zig" / "training_manifest.json")
+    result["training_manifest"] = load_json_file(
+        out_dir / "zig" / "training_manifest.json"
+    )
     return result
 
 
@@ -3150,7 +3597,9 @@ def main() -> int:
         default=0,
         help="Split GLiNER2 structure-loss span work into sample chunks on the Zig side (0 disables)",
     )
-    p.add_argument("--zig-backend", default="native", choices=["native", "metal", "cuda", "auto"])
+    p.add_argument(
+        "--zig-backend", default="native", choices=["native", "metal", "cuda", "auto"]
+    )
     p.add_argument(
         "--zig-training-graph-executor",
         action=argparse.BooleanOptionalAction,
@@ -3160,15 +3609,23 @@ def main() -> int:
     # Default to the production parity objective so component-loss parity
     # (classification/structure/count vs upstream) runs unless a caller
     # explicitly narrows to a legacy objective.
-    p.add_argument("--zig-objective", default="gliner2-total-loss", choices=["token", "span-start", "gliner2-total-loss"])
+    p.add_argument(
+        "--zig-objective",
+        default="gliner2-total-loss",
+        choices=["token", "span-start", "gliner2-total-loss"],
+    )
     p.add_argument(
         "--zig-lora-only-trainables",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Match upstream GLiNER2 LoRA training by freezing regular task-head params and optimizing only LoRA params",
     )
-    p.add_argument("--zig-build-metal", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--zig-build-cuda", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument(
+        "--zig-build-metal", action=argparse.BooleanOptionalAction, default=None
+    )
+    p.add_argument(
+        "--zig-build-cuda", action=argparse.BooleanOptionalAction, default=None
+    )
     p.add_argument(
         "--zig-cuda-artifacts",
         choices=["portable", "sm89", "fatbin"],
@@ -3199,8 +3656,16 @@ def main() -> int:
         default="ReleaseFast",
         help="Zig optimization mode for the training binary (default: ReleaseFast; pass Debug for instrumentation-heavy debugging)",
     )
-    p.add_argument("--dump-parity", action="store_true", help="Collect first-batch span objective logits/label/mask stats from both implementations")
-    p.add_argument("--dump-preprocess-parity", action="store_true", help="Collect first-batch preprocessing metadata from both implementations")
+    p.add_argument(
+        "--dump-parity",
+        action="store_true",
+        help="Collect first-batch span objective logits/label/mask stats from both implementations",
+    )
+    p.add_argument(
+        "--dump-preprocess-parity",
+        action="store_true",
+        help="Collect first-batch preprocessing metadata from both implementations",
+    )
     p.add_argument(
         "--dump-optimizer-parity",
         action="store_true",
@@ -3322,8 +3787,14 @@ def main() -> int:
         p.error("--metal-max-interpreter-fallbacks must be non-negative")
     if args.metal_max_true_host_outputs_per_step < 0:
         p.error("--metal-max-true-host-outputs-per-step must be non-negative")
-    if args.zig_backend == "cuda" and not args.skip_python and args.python_device != "cuda":
-        p.error("CUDA comparisons require --python-device cuda; auto/CPU fallback is not release evidence")
+    if (
+        args.zig_backend == "cuda"
+        and not args.skip_python
+        and args.python_device != "cuda"
+    ):
+        p.error(
+            "CUDA comparisons require --python-device cuda; auto/CPU fallback is not release evidence"
+        )
     for name in (
         "loss_parity_tolerance",
         "loss_parity_relative_tolerance",
@@ -3349,10 +3820,14 @@ def main() -> int:
         args.dump_parity = True
     if args.deterministic:
         if args.lora_dropout != 0.0:
-            print(f"deterministic: overriding --lora-dropout {args.lora_dropout} -> 0.0")
+            print(
+                f"deterministic: overriding --lora-dropout {args.lora_dropout} -> 0.0"
+            )
             args.lora_dropout = 0.0
         if args.span_negative_mask_rate != 0.0:
-            print(f"deterministic: overriding --span-negative-mask-rate {args.span_negative_mask_rate} -> 0.0")
+            print(
+                f"deterministic: overriding --span-negative-mask-rate {args.span_negative_mask_rate} -> 0.0"
+            )
             args.span_negative_mask_rate = 0.0
         if not args.disable_python_model_dropout:
             print("deterministic: enabling --disable-python-model-dropout")
@@ -3429,7 +3904,9 @@ def main() -> int:
             "python_schema_conditioning_policy": resolve_python_schema_conditioning_policy(
                 args.deterministic, args.dump_preprocess_parity or args.deterministic
             ),
-            "python_train_shuffle": not (args.dump_preprocess_parity or args.deterministic),
+            "python_train_shuffle": not (
+                args.dump_preprocess_parity or args.deterministic
+            ),
             "disable_python_model_dropout": args.disable_python_model_dropout,
             "lora_rank": args.lora_rank,
             "lora_alpha": args.lora_alpha,
@@ -3465,12 +3942,20 @@ def main() -> int:
     }
 
     if not args.skip_python:
-        report["python"] = run_python_side(args, args.out_dir / "python_train.jsonl", args.out_dir)
+        report["python"] = run_python_side(
+            args, args.out_dir / "python_train.jsonl", args.out_dir
+        )
     if not args.skip_zig:
         report["zig"] = run_zig_side(args, args.out_dir)
 
-    adapter_roundtrip: dict[str, Any] = {"ran": False, "skip_reason": "disabled via --no-adapter-roundtrip"}
-    trained_adapter_parity: dict[str, Any] = {"ran": False, "skip_reason": "disabled via --no-adapter-roundtrip"}
+    adapter_roundtrip: dict[str, Any] = {
+        "ran": False,
+        "skip_reason": "disabled via --no-adapter-roundtrip",
+    }
+    trained_adapter_parity: dict[str, Any] = {
+        "ran": False,
+        "skip_reason": "disabled via --no-adapter-roundtrip",
+    }
     if args.adapter_roundtrip:
         if (
             not args.skip_python
@@ -3478,63 +3963,112 @@ def main() -> int:
             and report.get("python", {}).get("returncode") == 0
             and report.get("zig", {}).get("returncode") == 0
         ):
-            adapter_roundtrip, trained_adapter_parity = run_adapter_checks(args, args.out_dir, report)
+            adapter_roundtrip, trained_adapter_parity = run_adapter_checks(
+                args, args.out_dir, report
+            )
         else:
-            adapter_roundtrip = {"ran": False, "skip_reason": "python or zig side skipped or failed"}
+            adapter_roundtrip = {
+                "ran": False,
+                "skip_reason": "python or zig side skipped or failed",
+            }
             trained_adapter_parity = dict(adapter_roundtrip)
     report["adapter_roundtrip"] = adapter_roundtrip
     report["trained_adapter_parity"] = trained_adapter_parity
 
-    zig_step_rows = [row for row in report.get("zig", {}).get("training_metrics", []) if row.get("event") == "step"]
-    python_step_rows = report.get("python", {}).get("metrics", {}).get("train_metrics_history", [])
+    zig_step_rows = [
+        row
+        for row in report.get("zig", {}).get("training_metrics", [])
+        if row.get("event") == "step"
+    ]
+    python_step_rows = (
+        report.get("python", {}).get("metrics", {}).get("train_metrics_history", [])
+    )
     py_loss = None
     if python_step_rows:
         py_loss = as_float_or_none(python_step_rows[-1].get("loss"))
-    zig_final_step_loss = as_float_or_none(zig_step_rows[-1].get("loss")) if zig_step_rows else None
-    zig_epoch_avg_loss = as_float_or_none(report.get("zig", {}).get("metrics", {}).get("final_avg_loss"))
-    zig_loss = zig_final_step_loss if zig_final_step_loss is not None else zig_epoch_avg_loss
+    zig_final_step_loss = (
+        as_float_or_none(zig_step_rows[-1].get("loss")) if zig_step_rows else None
+    )
+    zig_epoch_avg_loss = as_float_or_none(
+        report.get("zig", {}).get("metrics", {}).get("final_avg_loss")
+    )
+    zig_loss = (
+        zig_final_step_loss if zig_final_step_loss is not None else zig_epoch_avg_loss
+    )
     step_loss_deltas: list[dict[str, Any]] = []
     for py_row, zig_row in zip(python_step_rows, zig_step_rows):
         py_step_loss = as_float_or_none(py_row.get("loss"))
         zig_step_loss = as_float_or_none(zig_row.get("loss"))
-        delta = zig_step_loss - py_step_loss if py_step_loss is not None and zig_step_loss is not None else None
+        delta = (
+            zig_step_loss - py_step_loss
+            if py_step_loss is not None and zig_step_loss is not None
+            else None
+        )
         step_ok, tolerance_bound = within_loss_tolerance(
             py_step_loss,
             zig_step_loss,
             args.loss_parity_tolerance,
             args.loss_parity_relative_tolerance,
         )
-        step_loss_deltas.append({
-            "step": py_row.get("step", zig_row.get("step")),
-            "python": py_step_loss,
-            "zig": zig_step_loss,
-            "delta": delta,
-            "tolerance_bound": tolerance_bound,
-            "ok": step_ok,
-        })
-    step_loss_counts_match = bool(python_step_rows) and len(python_step_rows) == len(zig_step_rows)
-    step_loss_parity_matches = step_loss_counts_match and all(row.get("ok") for row in step_loss_deltas)
+        step_loss_deltas.append(
+            {
+                "step": py_row.get("step", zig_row.get("step")),
+                "python": py_step_loss,
+                "zig": zig_step_loss,
+                "delta": delta,
+                "tolerance_bound": tolerance_bound,
+                "ok": step_ok,
+            }
+        )
+    step_loss_counts_match = bool(python_step_rows) and len(python_step_rows) == len(
+        zig_step_rows
+    )
+    step_loss_parity_matches = step_loss_counts_match and all(
+        row.get("ok") for row in step_loss_deltas
+    )
     largest_step_loss_delta = max(
         step_loss_deltas,
-        key=lambda row: abs(float(row["delta"])) if row.get("delta") is not None else -1.0,
+        key=lambda row: (
+            abs(float(row["delta"])) if row.get("delta") is not None else -1.0
+        ),
         default=None,
     )
     zig_op_stats = parse_zig_op_stats(report.get("zig", {}).get("output", ""))
     zig_op_runs = parse_zig_op_runs(report.get("zig", {}).get("output", ""))
     zig_loop_profiles = parse_zig_loop_profiles(report.get("zig", {}).get("output", ""))
-    zig_planned_access_profiles = parse_zig_planned_access_profiles(report.get("zig", {}).get("output", ""))
+    zig_planned_access_profiles = parse_zig_planned_access_profiles(
+        report.get("zig", {}).get("output", "")
+    )
     if "zig" in report:
         report["zig"]["op_stats"] = zig_op_stats
         report["zig"]["op_runs"] = zig_op_runs
         report["zig"]["loop_profiles"] = zig_loop_profiles
         report["zig"]["planned_access_profiles"] = zig_planned_access_profiles
-    python_trainer_elapsed = report.get("python", {}).get("metrics", {}).get("elapsed_seconds")
-    python_step_timings = report.get("python", {}).get("metrics", {}).get("step_timings", [])
-    python_total_step_ms = report.get("python", {}).get("metrics", {}).get("total_step_wall_ms")
-    python_avg_step_ms = report.get("python", {}).get("metrics", {}).get("avg_step_wall_ms")
-    zig_total_trainer_ms = sum(float(row.get("trainer_total_ms") or 0.0) for row in zig_step_rows) if zig_step_rows else None
-    zig_avg_trainer_ms = (zig_total_trainer_ms / len(zig_step_rows)) if zig_total_trainer_ms is not None and zig_step_rows else None
-    python_warm_step_timings = python_step_timings[1:] if len(python_step_timings) > 1 else []
+    python_trainer_elapsed = (
+        report.get("python", {}).get("metrics", {}).get("elapsed_seconds")
+    )
+    python_step_timings = (
+        report.get("python", {}).get("metrics", {}).get("step_timings", [])
+    )
+    python_total_step_ms = (
+        report.get("python", {}).get("metrics", {}).get("total_step_wall_ms")
+    )
+    python_avg_step_ms = (
+        report.get("python", {}).get("metrics", {}).get("avg_step_wall_ms")
+    )
+    zig_total_trainer_ms = (
+        sum(float(row.get("trainer_total_ms") or 0.0) for row in zig_step_rows)
+        if zig_step_rows
+        else None
+    )
+    zig_avg_trainer_ms = (
+        (zig_total_trainer_ms / len(zig_step_rows))
+        if zig_total_trainer_ms is not None and zig_step_rows
+        else None
+    )
+    python_warm_step_timings = (
+        python_step_timings[1:] if len(python_step_timings) > 1 else []
+    )
     python_warm_total_step_ms = (
         sum(float(row.get("step_wall_ms") or 0.0) for row in python_warm_step_timings)
         if python_warm_step_timings
@@ -3545,26 +4079,42 @@ def main() -> int:
         if python_warm_total_step_ms is not None and python_warm_step_timings
         else None
     )
-    python_preprocess_debug = report.get("python", {}).get("metrics", {}).get("span_preprocess_debug")
-    python_preprocess_debug_samples = report.get("python", {}).get("metrics", {}).get("span_preprocess_debug_samples")
+    python_preprocess_debug = (
+        report.get("python", {}).get("metrics", {}).get("span_preprocess_debug")
+    )
+    python_preprocess_debug_samples = (
+        report.get("python", {}).get("metrics", {}).get("span_preprocess_debug_samples")
+    )
     python_task_breakdown = summarize_preprocess_tasks(python_preprocess_debug_samples)
-    zig_preprocess_debug = report.get("zig", {}).get("metrics", {}).get("span_preprocess_debug")
+    zig_preprocess_debug = (
+        report.get("zig", {}).get("metrics", {}).get("span_preprocess_debug")
+    )
     if python_preprocess_debug_samples:
-        preprocess_matches, preprocess_mismatches = compare_preprocess_debug_samples(python_preprocess_debug_samples, zig_preprocess_debug)
+        preprocess_matches, preprocess_mismatches = compare_preprocess_debug_samples(
+            python_preprocess_debug_samples, zig_preprocess_debug
+        )
     else:
-        preprocess_matches, preprocess_mismatches = compare_preprocess_debug(python_preprocess_debug, zig_preprocess_debug)
-    python_total_components = report.get("python", {}).get("metrics", {}).get("gliner2_total_loss_components")
-    zig_total_components = report.get("zig", {}).get("metrics", {}).get("gliner2_total_loss_components")
+        preprocess_matches, preprocess_mismatches = compare_preprocess_debug(
+            python_preprocess_debug, zig_preprocess_debug
+        )
+    python_total_components = (
+        report.get("python", {}).get("metrics", {}).get("gliner2_total_loss_components")
+    )
+    zig_total_components = (
+        report.get("zig", {}).get("metrics", {}).get("gliner2_total_loss_components")
+    )
     component_loss_reconciliation = None
     if args.zig_backend == "metal" and args.zig_training_graph_executor:
         # ponytail: single-component tasks are fully determined by the real step loss; keep multi-component debug strict.
-        zig_total_components, component_loss_reconciliation = reconcile_single_component_from_step_loss(
-            python_total_components,
-            zig_total_components,
-            zig_loss,
-            step_loss_parity_matches,
-            args.loss_parity_tolerance,
-            args.loss_parity_relative_tolerance,
+        zig_total_components, component_loss_reconciliation = (
+            reconcile_single_component_from_step_loss(
+                python_total_components,
+                zig_total_components,
+                zig_loss,
+                step_loss_parity_matches,
+                args.loss_parity_tolerance,
+                args.loss_parity_relative_tolerance,
+            )
         )
     component_loss_matches, component_loss_deltas = compare_component_losses(
         python_total_components,
@@ -3573,20 +4123,38 @@ def main() -> int:
         args.loss_parity_relative_tolerance,
     )
     component_loss_focus = summarize_component_deltas(component_loss_deltas)
-    python_classification_debug = report.get("python", {}).get("metrics", {}).get("gliner2_classification_debug")
-    zig_classification_debug = report.get("zig", {}).get("metrics", {}).get("gliner2_classification_debug")
-    classification_debug_matches, classification_debug_deltas = compare_classification_debug(
-        python_classification_debug,
-        zig_classification_debug,
-        args.classification_debug_tolerance,
+    python_classification_debug = (
+        report.get("python", {}).get("metrics", {}).get("gliner2_classification_debug")
+    )
+    zig_classification_debug = (
+        report.get("zig", {}).get("metrics", {}).get("gliner2_classification_debug")
+    )
+    classification_debug_matches, classification_debug_deltas = (
+        compare_classification_debug(
+            python_classification_debug,
+            zig_classification_debug,
+            args.classification_debug_tolerance,
+        )
     )
     classification_debug_reconciliation = None
-    if args.zig_backend == "metal" and args.zig_training_graph_executor and not classification_debug_matches:
+    if (
+        args.zig_backend == "metal"
+        and args.zig_training_graph_executor
+        and not classification_debug_matches
+    ):
         label_checks_ok = all(
             (classification_debug_deltas.get(field) or {}).get("ok") is True
-            for field in ("valid_count", "positive_count", "label_sum", "mask_sum", "valid_labels_head")
+            for field in (
+                "valid_count",
+                "positive_count",
+                "label_sum",
+                "mask_sum",
+                "valid_labels_head",
+            )
         )
-        classification_loss_ok = (component_loss_deltas.get("classification_loss") or {}).get("ok") is True
+        classification_loss_ok = (
+            component_loss_deltas.get("classification_loss") or {}
+        ).get("ok") is True
         # Do NOT force a pass on matching label fields + aggregate classification
         # loss alone: that would mask a genuine per-logit forward divergence on
         # Metal. Only reconcile when the actual per-logit divergence (valid logits
@@ -3594,17 +4162,28 @@ def main() -> int:
         # i.e. it is fp-accumulation noise rather than a real divergence.
         classification_tol = args.classification_debug_tolerance
         logit_reconcile_bound = classification_tol * 4.0
-        logit_delta = (classification_debug_deltas.get("valid_logits_head") or {}).get("max_abs_delta")
-        logits_within_bound = finite_number(logit_delta) and abs(float(logit_delta)) <= logit_reconcile_bound
+        logit_delta = (classification_debug_deltas.get("valid_logits_head") or {}).get(
+            "max_abs_delta"
+        )
+        logits_within_bound = (
+            finite_number(logit_delta)
+            and abs(float(logit_delta)) <= logit_reconcile_bound
+        )
         if label_checks_ok and classification_loss_ok and logits_within_bound:
             classification_debug_matches = True
             classification_debug_reconciliation = {
                 "source": "component_classification_loss",
                 "logit_reconcile_bound": logit_reconcile_bound,
                 "raw_zig_debug": {
-                    "logits_max": (classification_debug_deltas.get("logits_max") or {}).get("zig"),
-                    "bce_sum": (classification_debug_deltas.get("bce_sum") or {}).get("zig"),
-                    "valid_logits_head_max_abs_delta": (classification_debug_deltas.get("valid_logits_head") or {}).get("max_abs_delta"),
+                    "logits_max": (
+                        classification_debug_deltas.get("logits_max") or {}
+                    ).get("zig"),
+                    "bce_sum": (classification_debug_deltas.get("bce_sum") or {}).get(
+                        "zig"
+                    ),
+                    "valid_logits_head_max_abs_delta": (
+                        classification_debug_deltas.get("valid_logits_head") or {}
+                    ).get("max_abs_delta"),
                 },
             }
     optimizer_parity: dict[str, Any] | None = None
@@ -3622,7 +4201,9 @@ def main() -> int:
         optimizer_parity["head_max_abs_tolerance"] = args.loss_parity_tolerance
         report["optimizer_parity"] = optimizer_parity
         if optimizer_parity.get("ran"):
-            print("optimizer parity (per-step max-abs deltas over common adapter tensors):")
+            print(
+                "optimizer parity (per-step max-abs deltas over common adapter tensors):"
+            )
             for row in optimizer_parity.get("steps", []):
                 print(
                     "  step {step}: tensors={tensors} step_count_mismatches={mismatches} "
@@ -3659,14 +4240,33 @@ def main() -> int:
         else None
     )
     zig_loop_profile_summary = summarize_loop_profiles(zig_loop_profiles)
-    zig_planned_access_profile_summary = summarize_planned_access_profiles(zig_planned_access_profiles)
-    zig_epoch_metrics = next((row for row in report.get("zig", {}).get("training_metrics", []) if row.get("event") == "epoch"), {})
-    python_step_count = len(python_step_timings) if python_step_timings else (len(python_step_rows) if python_step_rows else None)
+    zig_planned_access_profile_summary = summarize_planned_access_profiles(
+        zig_planned_access_profiles
+    )
+    zig_epoch_metrics = next(
+        (
+            row
+            for row in report.get("zig", {}).get("training_metrics", [])
+            if row.get("event") == "epoch"
+        ),
+        {},
+    )
+    python_step_count = (
+        len(python_step_timings)
+        if python_step_timings
+        else (len(python_step_rows) if python_step_rows else None)
+    )
     zig_step_count = len(zig_step_rows) if zig_step_rows else None
-    python_warm_step_count = len(python_warm_step_timings) if python_warm_step_timings else None
+    python_warm_step_count = (
+        len(python_warm_step_timings) if python_warm_step_timings else None
+    )
     zig_warm_step_count = len(zig_warm_step_rows) if zig_warm_step_rows else None
-    python_step_count_matches_requested = None if args.skip_python else python_step_count == args.steps
-    zig_step_count_matches_requested = None if args.skip_zig else zig_step_count == args.steps
+    python_step_count_matches_requested = (
+        None if args.skip_python else python_step_count == args.steps
+    )
+    zig_step_count_matches_requested = (
+        None if args.skip_zig else zig_step_count == args.steps
+    )
     step_count_match = (
         python_step_count == zig_step_count
         if python_step_count is not None and zig_step_count is not None
@@ -3685,6 +4285,7 @@ def main() -> int:
             step_count_match if not args.skip_python and not args.skip_zig else True,
         )
     )
+
     def zig_step_sum(key: str) -> float | None:
         if not zig_step_rows:
             return None
@@ -3692,7 +4293,11 @@ def main() -> int:
 
     def zig_step_avg(key: str) -> float | None:
         total = zig_step_sum(key)
-        return (total / len(zig_step_rows)) if total is not None and zig_step_rows else None
+        return (
+            (total / len(zig_step_rows))
+            if total is not None and zig_step_rows
+            else None
+        )
 
     def zig_step_sum_avg(keys: tuple[str, ...]) -> float | None:
         if not zig_step_rows:
@@ -3731,7 +4336,11 @@ def main() -> int:
             return 0.0
         return values.get(key)
 
-    trainable_parity_warning = None if args.zig_lora_only_trainables else "Zig is training regular task-head params in addition to LoRA params; upstream GLiNER2 LoRA freezes non-LoRA params"
+    trainable_parity_warning = (
+        None
+        if args.zig_lora_only_trainables
+        else "Zig is training regular task-head params in addition to LoRA params; upstream GLiNER2 LoRA freezes non-LoRA params"
+    )
     non_entity_task_count = (
         int(converted.get("classifications", 0))
         + int(converted.get("json_structures", 0))
@@ -3760,14 +4369,20 @@ def main() -> int:
     if args.zig_objective == "gliner2-total-loss":
         full_loss_components_supported = True
         upstream_preprocessing_supported = preprocess_matches
-        objective_parity_warning = None if preprocess_matches and component_loss_matches else (
-            "Zig gliner2-total-loss has graph-native structure/classification/count loss components, "
-            "but full accuracy parity still requires matching upstream multi-schema preprocessing and component-level Python/Zig loss checks"
+        objective_parity_warning = (
+            None
+            if preprocess_matches and component_loss_matches
+            else (
+                "Zig gliner2-total-loss has graph-native structure/classification/count loss components, "
+                "but full accuracy parity still requires matching upstream multi-schema preprocessing and component-level Python/Zig loss checks"
+            )
         )
         zig_objective_semantics = "flattened schema-conditioned structure_loss plus graph-native classification_loss and count_loss"
     elif entity_only_structure_parity:
         objective_parity_warning = "Current objective parity is scoped to upstream entity-only structure_loss with gold_count=1; GLiNER2 classification, count_loss, relations, and multi-structure count>1 losses are not covered by this benchmark"
-        zig_objective_semantics = "entity-only structure_loss-compatible flattened span/start-width BCE"
+        zig_objective_semantics = (
+            "entity-only structure_loss-compatible flattened span/start-width BCE"
+        )
     elif non_entity_task_warning is not None:
         objective_parity_warning = non_entity_task_warning
         zig_objective_semantics = "span-start BCE over extractive mentions derived from upstream-format records"
@@ -3777,7 +4392,9 @@ def main() -> int:
     else:
         objective_parity_warning = "Zig token-classification objective does not match upstream GLiNER2Trainer structure_loss training"
         zig_objective_semantics = "token classification"
-    loss_delta = (zig_loss - py_loss) if zig_loss is not None and py_loss is not None else None
+    loss_delta = (
+        (zig_loss - py_loss) if zig_loss is not None and py_loss is not None else None
+    )
     final_loss_matches, final_loss_tolerance_bound = within_loss_tolerance(
         py_loss,
         zig_loss,
@@ -3810,8 +4427,14 @@ def main() -> int:
         loss_parity_warning = f"Python/Zig step counts differ for loss parity: python={len(python_step_rows)} zig={len(zig_step_rows)}"
     elif not step_loss_parity_matches:
         step = largest_step_loss_delta.get("step") if largest_step_loss_delta else None
-        delta = largest_step_loss_delta.get("delta") if largest_step_loss_delta else None
-        bound = largest_step_loss_delta.get("tolerance_bound") if largest_step_loss_delta else None
+        delta = (
+            largest_step_loss_delta.get("delta") if largest_step_loss_delta else None
+        )
+        bound = (
+            largest_step_loss_delta.get("tolerance_bound")
+            if largest_step_loss_delta
+            else None
+        )
         loss_parity_warning = (
             f"Python/Zig per-step loss parity failed at step {step}: "
             f"delta {format_finite_number(delta)} exceeds combined tolerance {format_finite_number(bound)}"
@@ -3834,7 +4457,9 @@ def main() -> int:
         "python_schema_conditioning_policy": resolve_python_schema_conditioning_policy(
             args.deterministic, args.dump_preprocess_parity or args.deterministic
         ),
-        "python_model_dropout_policy": "disabled" if args.disable_python_model_dropout else "upstream-default",
+        "python_model_dropout_policy": "disabled"
+        if args.disable_python_model_dropout
+        else "upstream-default",
         "python_train_shuffle": not (args.dump_preprocess_parity or args.deterministic),
         "python_returncode": report.get("python", {}).get("returncode"),
         "zig_returncode": report.get("zig", {}).get("returncode"),
@@ -3860,148 +4485,372 @@ def main() -> int:
         "zig_warm_total_trainer_ms": zig_warm_total_trainer_ms,
         "zig_warm_avg_trainer_ms": zig_warm_avg_trainer_ms,
         "zig_epoch_wall_ms": zig_epoch_metrics.get("epoch_wall_ms"),
-        "zig_epoch_supervised_tokens_per_second": zig_epoch_metrics.get("supervised_tokens_per_second"),
+        "zig_epoch_supervised_tokens_per_second": zig_epoch_metrics.get(
+            "supervised_tokens_per_second"
+        ),
         "zig_graph_executor_partitions_avg": zig_step_avg("graph_executor_partitions"),
-        "zig_graph_executor_command_dispatches_avg": zig_step_avg("graph_executor_command_dispatches"),
-        "zig_graph_executor_planned_dispatches_avg": zig_step_avg("graph_executor_planned_dispatches"),
-        "zig_graph_executor_interpreter_fallbacks_avg": zig_step_avg("graph_executor_interpreter_fallbacks"),
-        "zig_graph_executor_host_outputs_avg": zig_step_avg("graph_executor_host_outputs"),
+        "zig_graph_executor_command_dispatches_avg": zig_step_avg(
+            "graph_executor_command_dispatches"
+        ),
+        "zig_graph_executor_planned_dispatches_avg": zig_step_avg(
+            "graph_executor_planned_dispatches"
+        ),
+        "zig_graph_executor_interpreter_fallbacks_avg": zig_step_avg(
+            "graph_executor_interpreter_fallbacks"
+        ),
+        "zig_graph_executor_host_outputs_avg": zig_step_avg(
+            "graph_executor_host_outputs"
+        ),
         "zig_graph_executor_true_host_outputs_avg": zig_step_true_host_outputs_avg(),
-        "zig_graph_executor_host_output_command_avg": zig_step_avg("graph_executor_host_output_command"),
-        "zig_graph_executor_host_output_interpreter_avg": zig_step_avg("graph_executor_host_output_interpreter"),
-        "zig_graph_executor_host_output_pre_materialized_constant_avg": zig_step_avg("graph_executor_host_output_pre_materialized_constant"),
-        "zig_graph_executor_host_output_runtime_region_avg": zig_step_avg("graph_executor_host_output_runtime_region"),
-        "zig_graph_executor_host_output_parameter_avg": zig_step_avg("graph_executor_host_output_parameter"),
-        "zig_graph_executor_parameter_materializations_avg": zig_step_avg("graph_executor_host_output_parameter"),
-        "zig_graph_executor_host_output_unattributed_avg": zig_step_avg("graph_executor_host_output_unattributed"),
-        "zig_graph_executor_device_output_parameter_avg": zig_step_avg("graph_executor_device_output_parameter"),
+        "zig_graph_executor_host_output_command_avg": zig_step_avg(
+            "graph_executor_host_output_command"
+        ),
+        "zig_graph_executor_host_output_interpreter_avg": zig_step_avg(
+            "graph_executor_host_output_interpreter"
+        ),
+        "zig_graph_executor_host_output_pre_materialized_constant_avg": zig_step_avg(
+            "graph_executor_host_output_pre_materialized_constant"
+        ),
+        "zig_graph_executor_host_output_runtime_region_avg": zig_step_avg(
+            "graph_executor_host_output_runtime_region"
+        ),
+        "zig_graph_executor_host_output_parameter_avg": zig_step_avg(
+            "graph_executor_host_output_parameter"
+        ),
+        "zig_graph_executor_parameter_materializations_avg": zig_step_avg(
+            "graph_executor_host_output_parameter"
+        ),
+        "zig_graph_executor_host_output_unattributed_avg": zig_step_avg(
+            "graph_executor_host_output_unattributed"
+        ),
+        "zig_graph_executor_device_output_parameter_avg": zig_step_avg(
+            "graph_executor_device_output_parameter"
+        ),
         "zig_cuda_device_allocations_avg": zig_step_avg("cuda_device_allocations"),
         "zig_cuda_device_frees_avg": zig_step_avg("cuda_device_frees"),
         "zig_cuda_h2d_bytes_avg": zig_step_avg("cuda_h2d_bytes"),
         "zig_cuda_h2d_bytes_max": max(
             [int(row.get("cuda_h2d_bytes") or 0) for row in zig_step_rows] or [0]
         ),
-        "zig_cuda_training_input_uploads_avg": zig_step_avg("cuda_training_input_uploads"),
-        "zig_cuda_training_input_upload_bytes_avg": zig_step_avg("cuda_training_input_upload_bytes"),
+        "zig_cuda_training_input_uploads_avg": zig_step_avg(
+            "cuda_training_input_uploads"
+        ),
+        "zig_cuda_training_input_upload_bytes_avg": zig_step_avg(
+            "cuda_training_input_upload_bytes"
+        ),
         "zig_cuda_training_input_upload_bytes_max": max(
-            [int(row.get("cuda_training_input_upload_bytes") or 0) for row in zig_step_rows] or [0]
+            [
+                int(row.get("cuda_training_input_upload_bytes") or 0)
+                for row in zig_step_rows
+            ]
+            or [0]
         ),
         "zig_cuda_d2h_bytes_avg": zig_step_avg("cuda_d2h_bytes"),
         "zig_cuda_d2h_bytes_max": max(
             [int(row.get("cuda_d2h_bytes") or 0) for row in zig_step_rows] or [0]
         ),
         "zig_cuda_largest_d2h_transfer_bytes_max": max(
-            [int(row.get("cuda_largest_d2h_transfer_bytes") or 0) for row in zig_step_rows] or [0]
+            [
+                int(row.get("cuda_largest_d2h_transfer_bytes") or 0)
+                for row in zig_step_rows
+            ]
+            or [0]
         ),
         "zig_cuda_to_float32_calls_avg": zig_step_avg("cuda_to_float32_calls"),
         "zig_cuda_to_float32_calls_max": max(
             [int(row.get("cuda_to_float32_calls") or 0) for row in zig_step_rows] or [0]
         ),
-        "zig_cuda_stream_synchronizations_avg": zig_step_avg("cuda_stream_synchronizations"),
-        "zig_cuda_upload_synchronizations_avg": zig_step_avg("cuda_upload_synchronizations"),
+        "zig_cuda_stream_synchronizations_avg": zig_step_avg(
+            "cuda_stream_synchronizations"
+        ),
+        "zig_cuda_upload_synchronizations_avg": zig_step_avg(
+            "cuda_upload_synchronizations"
+        ),
         "zig_cuda_temp_cache_hits_avg": zig_step_avg("cuda_temp_cache_hits"),
         "zig_cuda_temp_cache_misses_avg": zig_step_avg("cuda_temp_cache_misses"),
         "zig_cuda_kernel_launches_avg": zig_step_avg("cuda_kernel_launches"),
-        "zig_graph_executor_metal_gather_input_promotions_avg": zig_step_avg("graph_executor_metal_gather_input_promotions"),
-        "zig_graph_executor_metal_gather_input_promotion_bytes_avg": zig_step_avg("graph_executor_metal_gather_input_promotion_bytes"),
-        "zig_graph_executor_metal_gather_input_promotion_ms_avg": zig_step_avg("graph_executor_metal_gather_input_promotion_ms"),
-        "zig_graph_executor_metal_gather_output_promotions_avg": zig_step_avg("graph_executor_metal_gather_output_promotions"),
-        "zig_graph_executor_metal_gather_output_promotion_bytes_avg": zig_step_avg("graph_executor_metal_gather_output_promotion_bytes"),
-        "zig_graph_executor_metal_gather_output_promotion_ms_avg": zig_step_avg("graph_executor_metal_gather_output_promotion_ms"),
-        "zig_graph_executor_metal_reduce_input_promotions_avg": zig_step_avg("graph_executor_metal_reduce_input_promotions"),
-        "zig_graph_executor_metal_reduce_input_promotion_bytes_avg": zig_step_avg("graph_executor_metal_reduce_input_promotion_bytes"),
-        "zig_graph_executor_metal_reduce_input_promotion_ms_avg": zig_step_avg("graph_executor_metal_reduce_input_promotion_ms"),
-        "zig_graph_executor_metal_resident_input_cache_hits_avg": zig_step_avg("graph_executor_metal_resident_input_cache_hits"),
-        "zig_graph_executor_metal_resident_input_cache_misses_avg": zig_step_avg("graph_executor_metal_resident_input_cache_misses"),
-        "zig_graph_executor_metal_resident_input_cache_unique_promotions_avg": zig_step_avg("graph_executor_metal_resident_input_cache_unique_promotions"),
-        "zig_graph_executor_metal_resident_input_cache_retained_live_bytes_avg": zig_step_avg("graph_executor_metal_resident_input_cache_retained_live_bytes"),
-        "zig_graph_executor_metal_resident_input_cache_retained_peak_bytes_avg": zig_step_avg("graph_executor_metal_resident_input_cache_retained_peak_bytes"),
-        "zig_graph_executor_metal_resident_input_cache_reused_bytes_avg": zig_step_avg("graph_executor_metal_resident_input_cache_reused_bytes"),
-        "zig_graph_executor_metal_resident_input_cache_released_bytes_avg": zig_step_avg("graph_executor_metal_resident_input_cache_released_bytes"),
+        "zig_graph_executor_metal_gather_input_promotions_avg": zig_step_avg(
+            "graph_executor_metal_gather_input_promotions"
+        ),
+        "zig_graph_executor_metal_gather_input_promotion_bytes_avg": zig_step_avg(
+            "graph_executor_metal_gather_input_promotion_bytes"
+        ),
+        "zig_graph_executor_metal_gather_input_promotion_ms_avg": zig_step_avg(
+            "graph_executor_metal_gather_input_promotion_ms"
+        ),
+        "zig_graph_executor_metal_gather_output_promotions_avg": zig_step_avg(
+            "graph_executor_metal_gather_output_promotions"
+        ),
+        "zig_graph_executor_metal_gather_output_promotion_bytes_avg": zig_step_avg(
+            "graph_executor_metal_gather_output_promotion_bytes"
+        ),
+        "zig_graph_executor_metal_gather_output_promotion_ms_avg": zig_step_avg(
+            "graph_executor_metal_gather_output_promotion_ms"
+        ),
+        "zig_graph_executor_metal_reduce_input_promotions_avg": zig_step_avg(
+            "graph_executor_metal_reduce_input_promotions"
+        ),
+        "zig_graph_executor_metal_reduce_input_promotion_bytes_avg": zig_step_avg(
+            "graph_executor_metal_reduce_input_promotion_bytes"
+        ),
+        "zig_graph_executor_metal_reduce_input_promotion_ms_avg": zig_step_avg(
+            "graph_executor_metal_reduce_input_promotion_ms"
+        ),
+        "zig_graph_executor_metal_resident_input_cache_hits_avg": zig_step_avg(
+            "graph_executor_metal_resident_input_cache_hits"
+        ),
+        "zig_graph_executor_metal_resident_input_cache_misses_avg": zig_step_avg(
+            "graph_executor_metal_resident_input_cache_misses"
+        ),
+        "zig_graph_executor_metal_resident_input_cache_unique_promotions_avg": zig_step_avg(
+            "graph_executor_metal_resident_input_cache_unique_promotions"
+        ),
+        "zig_graph_executor_metal_resident_input_cache_retained_live_bytes_avg": zig_step_avg(
+            "graph_executor_metal_resident_input_cache_retained_live_bytes"
+        ),
+        "zig_graph_executor_metal_resident_input_cache_retained_peak_bytes_avg": zig_step_avg(
+            "graph_executor_metal_resident_input_cache_retained_peak_bytes"
+        ),
+        "zig_graph_executor_metal_resident_input_cache_reused_bytes_avg": zig_step_avg(
+            "graph_executor_metal_resident_input_cache_reused_bytes"
+        ),
+        "zig_graph_executor_metal_resident_input_cache_released_bytes_avg": zig_step_avg(
+            "graph_executor_metal_resident_input_cache_released_bytes"
+        ),
         "zig_graph_executor_regions_avg": zig_step_avg("graph_executor_regions"),
-        "zig_graph_executor_runtime_region_dispatches_avg": zig_step_avg("graph_executor_runtime_region_dispatches"),
-        "zig_graph_executor_runtime_region_active_regions_avg": zig_step_avg("graph_executor_runtime_region_active_regions"),
-        "zig_graph_executor_runtime_region_covered_nodes_avg": zig_step_avg("graph_executor_runtime_region_covered_nodes"),
-        "zig_graph_executor_runtime_region_elided_nodes_avg": zig_step_avg("graph_executor_runtime_region_elided_nodes"),
-        "zig_graph_executor_runtime_region_plan_compiles_avg": zig_step_avg("graph_executor_runtime_region_plan_compiles"),
-        "zig_graph_executor_runtime_region_plan_reuses_avg": zig_step_avg("graph_executor_runtime_region_plan_reuses"),
-        "zig_graph_executor_runtime_frame_candidates_avg": zig_step_avg("graph_executor_runtime_frame_candidates"),
-        "zig_graph_executor_runtime_frame_eligible_avg": zig_step_avg("graph_executor_runtime_frame_eligible"),
-        "zig_graph_executor_runtime_frame_metadata_ready_avg": zig_step_avg("graph_executor_runtime_frame_metadata_ready"),
-        "zig_graph_executor_runtime_frame_ineligible_no_regions_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_no_regions"),
-        "zig_graph_executor_runtime_frame_ineligible_missing_qkv_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_missing_qkv"),
-        "zig_graph_executor_runtime_frame_ineligible_missing_attention_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_missing_attention"),
-        "zig_graph_executor_runtime_frame_ineligible_missing_ffn_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_missing_ffn"),
-        "zig_graph_executor_runtime_frame_ineligible_missing_ple_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_missing_ple"),
-        "zig_graph_executor_runtime_frame_ineligible_single_row_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_single_row"),
-        "zig_graph_executor_runtime_frame_ineligible_non_layer_order_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_non_layer_order"),
-        "zig_graph_executor_runtime_frame_ineligible_shape_mismatch_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_shape_mismatch"),
-        "zig_graph_executor_runtime_frame_ineligible_missing_model_metadata_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_missing_model_metadata"),
-        "zig_graph_executor_plan_build_ms_avg": zig_step_avg("graph_executor_plan_build_ms"),
-        "zig_graph_executor_buffer_plan_build_ms_avg": zig_step_avg("graph_executor_buffer_plan_build_ms"),
-        "zig_graph_executor_plan_cache_hits_avg": zig_step_avg("graph_executor_plan_cache_hits"),
-        "zig_graph_executor_plan_cache_misses_avg": zig_step_avg("graph_executor_plan_cache_misses"),
+        "zig_graph_executor_runtime_region_dispatches_avg": zig_step_avg(
+            "graph_executor_runtime_region_dispatches"
+        ),
+        "zig_graph_executor_runtime_region_active_regions_avg": zig_step_avg(
+            "graph_executor_runtime_region_active_regions"
+        ),
+        "zig_graph_executor_runtime_region_covered_nodes_avg": zig_step_avg(
+            "graph_executor_runtime_region_covered_nodes"
+        ),
+        "zig_graph_executor_runtime_region_elided_nodes_avg": zig_step_avg(
+            "graph_executor_runtime_region_elided_nodes"
+        ),
+        "zig_graph_executor_runtime_region_plan_compiles_avg": zig_step_avg(
+            "graph_executor_runtime_region_plan_compiles"
+        ),
+        "zig_graph_executor_runtime_region_plan_reuses_avg": zig_step_avg(
+            "graph_executor_runtime_region_plan_reuses"
+        ),
+        "zig_graph_executor_runtime_frame_candidates_avg": zig_step_avg(
+            "graph_executor_runtime_frame_candidates"
+        ),
+        "zig_graph_executor_runtime_frame_eligible_avg": zig_step_avg(
+            "graph_executor_runtime_frame_eligible"
+        ),
+        "zig_graph_executor_runtime_frame_metadata_ready_avg": zig_step_avg(
+            "graph_executor_runtime_frame_metadata_ready"
+        ),
+        "zig_graph_executor_runtime_frame_ineligible_no_regions_avg": zig_step_avg(
+            "graph_executor_runtime_frame_ineligible_no_regions"
+        ),
+        "zig_graph_executor_runtime_frame_ineligible_missing_qkv_avg": zig_step_avg(
+            "graph_executor_runtime_frame_ineligible_missing_qkv"
+        ),
+        "zig_graph_executor_runtime_frame_ineligible_missing_attention_avg": zig_step_avg(
+            "graph_executor_runtime_frame_ineligible_missing_attention"
+        ),
+        "zig_graph_executor_runtime_frame_ineligible_missing_ffn_avg": zig_step_avg(
+            "graph_executor_runtime_frame_ineligible_missing_ffn"
+        ),
+        "zig_graph_executor_runtime_frame_ineligible_missing_ple_avg": zig_step_avg(
+            "graph_executor_runtime_frame_ineligible_missing_ple"
+        ),
+        "zig_graph_executor_runtime_frame_ineligible_single_row_avg": zig_step_avg(
+            "graph_executor_runtime_frame_ineligible_single_row"
+        ),
+        "zig_graph_executor_runtime_frame_ineligible_non_layer_order_avg": zig_step_avg(
+            "graph_executor_runtime_frame_ineligible_non_layer_order"
+        ),
+        "zig_graph_executor_runtime_frame_ineligible_shape_mismatch_avg": zig_step_avg(
+            "graph_executor_runtime_frame_ineligible_shape_mismatch"
+        ),
+        "zig_graph_executor_runtime_frame_ineligible_missing_model_metadata_avg": zig_step_avg(
+            "graph_executor_runtime_frame_ineligible_missing_model_metadata"
+        ),
+        "zig_graph_executor_plan_build_ms_avg": zig_step_avg(
+            "graph_executor_plan_build_ms"
+        ),
+        "zig_graph_executor_buffer_plan_build_ms_avg": zig_step_avg(
+            "graph_executor_buffer_plan_build_ms"
+        ),
+        "zig_graph_executor_plan_cache_hits_avg": zig_step_avg(
+            "graph_executor_plan_cache_hits"
+        ),
+        "zig_graph_executor_plan_cache_misses_avg": zig_step_avg(
+            "graph_executor_plan_cache_misses"
+        ),
         "zig_metal_frame_wait_ms_avg": zig_step_avg("metal_frame_wait_ms"),
         "zig_metal_frame_gpu_ms_avg": zig_step_avg("metal_frame_gpu_ms"),
-        "zig_metal_tensor_device_owned_peak_live_bytes_avg": zig_step_avg("metal_tensor_device_owned_peak_live_bytes"),
-        "zig_metal_tensor_device_owned_live_bytes_avg": zig_step_avg("metal_tensor_device_owned_live_bytes"),
+        "zig_metal_tensor_device_owned_peak_live_bytes_avg": zig_step_avg(
+            "metal_tensor_device_owned_peak_live_bytes"
+        ),
+        "zig_metal_tensor_device_owned_live_bytes_avg": zig_step_avg(
+            "metal_tensor_device_owned_live_bytes"
+        ),
         "zig_metal_runtime_total_bytes_avg": zig_step_avg("metal_runtime_total_bytes"),
-        "zig_metal_last_frame_compute_encoders_avg": zig_step_avg("metal_last_frame_compute_encoders"),
-        "zig_metal_last_frame_blit_encoders_avg": zig_step_avg("metal_last_frame_blit_encoders"),
-        "zig_metal_last_frame_planned_scopes_avg": zig_step_avg("metal_last_frame_planned_scopes"),
-        "zig_metal_last_frame_planned_barriers_avg": zig_step_avg("metal_last_frame_planned_barriers"),
-        "zig_metal_last_frame_planned_command_ops_avg": zig_step_avg("metal_last_frame_planned_command_ops"),
-        "zig_metal_deberta_encoder_plan_attempts_avg": zig_step_avg("metal_deberta_encoder_plan_attempts"),
-        "zig_metal_deberta_encoder_plan_successes_avg": zig_step_avg("metal_deberta_encoder_plan_successes"),
-        "zig_metal_deberta_encoder_plan_reuses_avg": zig_step_avg("metal_deberta_encoder_plan_reuses"),
-        "zig_metal_deberta_encoder_plan_failures_avg": zig_step_avg("metal_deberta_encoder_plan_failures"),
-        "zig_metal_deberta_encoder_layer_attempts_avg": zig_step_avg("metal_deberta_encoder_layer_attempts"),
-        "zig_metal_deberta_encoder_layer_successes_avg": zig_step_avg("metal_deberta_encoder_layer_successes"),
-        "zig_metal_deberta_encoder_layer_fallbacks_avg": zig_step_avg("metal_deberta_encoder_layer_fallbacks"),
-        "zig_metal_deberta_encoder_lora_layer_regions_avg": zig_step_avg("metal_deberta_encoder_lora_layer_regions"),
-        "zig_metal_deberta_encoder_lora_residual_layernorm_regions_avg": zig_step_avg("metal_deberta_encoder_lora_residual_layernorm_regions"),
-        "zig_metal_deberta_encoder_lora_layer_scaffold_regions_avg": zig_step_avg("metal_deberta_encoder_lora_layer_scaffold_regions"),
-        "zig_metal_deberta_encoder_lora_layer_fallbacks_avg": zig_step_avg("metal_deberta_encoder_lora_layer_fallbacks"),
-        "zig_metal_lora_backward_regions_avg": zig_step_avg("metal_lora_backward_regions"),
-        "zig_metal_low_rank_lora_backward_regions_avg": zig_step_avg("metal_low_rank_lora_backward_regions"),
-        "zig_metal_rank_adapter_backward_regions_avg": zig_step_avg("metal_rank_adapter_backward_regions"),
-        "zig_metal_lora_backward_total_regions_avg": zig_step_sum_avg((
-            "metal_lora_backward_regions",
-            "metal_low_rank_lora_backward_regions",
-            "metal_rank_adapter_backward_regions",
-        )),
-        "zig_metal_ffn_gelu_backward_regions_avg": zig_step_avg("metal_ffn_gelu_backward_regions"),
-        "zig_metal_head_mlp_forward_regions_avg": zig_step_avg("metal_head_mlp_forward_regions"),
-        "zig_metal_head_mlp_backward_regions_avg": zig_step_avg("metal_head_mlp_backward_regions"),
-        "zig_metal_command_dot_general_dispatches_avg": zig_step_avg("metal_command_dot_general_dispatches"),
-        "zig_metal_command_head_dot_dispatches_avg": zig_step_avg("metal_command_head_dot_dispatches"),
-        "zig_metal_command_transpose_dispatches_avg": zig_step_avg("metal_command_transpose_dispatches"),
-        "zig_metal_command_gather_dispatches_avg": zig_step_avg("metal_command_gather_dispatches"),
-        "zig_metal_command_reduce_dispatches_avg": zig_step_avg("metal_command_reduce_dispatches"),
-        "zig_metal_command_elementwise_dispatches_avg": zig_step_avg("metal_command_elementwise_dispatches"),
-        "zig_metal_command_activation_dispatches_avg": zig_step_avg("metal_command_activation_dispatches"),
-        "zig_metal_command_activation_backward_dispatches_avg": zig_step_avg("metal_command_activation_backward_dispatches"),
-        "zig_metal_command_other_dispatches_avg": zig_step_avg("metal_command_other_dispatches"),
-        "zig_metal_deberta_relative_qk_pair_calls_avg": zig_step_avg("metal_deberta_relative_qk_pair_calls"),
-        "zig_metal_deberta_relative_qk_pair_fallbacks_avg": zig_step_avg("metal_deberta_relative_qk_pair_fallbacks"),
-        "zig_metal_deberta_ffn_fused_calls_avg": zig_step_avg("metal_deberta_ffn_fused_calls"),
-        "zig_metal_deberta_ffn_fused_mps_matmuls_avg": zig_step_avg("metal_deberta_ffn_fused_mps_matmuls"),
-        "zig_metal_deberta_ffn_fused_fallbacks_avg": zig_step_avg("metal_deberta_ffn_fused_fallbacks"),
-        "zig_metal_deberta_attention_flash_calls_avg": zig_step_avg("metal_deberta_attention_flash_calls"),
-        "zig_metal_deberta_attention_gemm_calls_avg": zig_step_avg("metal_deberta_attention_gemm_calls"),
-        "zig_metal_deberta_attention_gemm_fallbacks_avg": zig_step_avg("metal_deberta_attention_gemm_fallbacks"),
-        "zig_metal_deberta_attention_legacy_calls_avg": zig_step_avg("metal_deberta_attention_legacy_calls"),
-        "zig_dot_general_command_count": zig_op_stats.get("command_ops", {}).get("dot_general", {}).get("count"),
-        "zig_dot_general_command_total_ms": zig_op_stats.get("command_ops", {}).get("dot_general", {}).get("total_ms"),
-        "zig_dot_general_command_avg_ms": zig_op_stats.get("command_ops", {}).get("dot_general", {}).get("avg_ms"),
-        "zig_gather_fallback_count": zig_op_stat_value("fallback_ops", "gather", "count"),
-        "zig_gather_fallback_total_ms": zig_op_stat_value("fallback_ops", "gather", "total_ms"),
-        "zig_gather_host_output_count": zig_op_stat_value("host_output_ops", "gather", "count"),
-        "zig_gather_host_output_total_ms": zig_op_stat_value("host_output_ops", "gather", "total_ms"),
+        "zig_metal_last_frame_compute_encoders_avg": zig_step_avg(
+            "metal_last_frame_compute_encoders"
+        ),
+        "zig_metal_last_frame_blit_encoders_avg": zig_step_avg(
+            "metal_last_frame_blit_encoders"
+        ),
+        "zig_metal_last_frame_planned_scopes_avg": zig_step_avg(
+            "metal_last_frame_planned_scopes"
+        ),
+        "zig_metal_last_frame_planned_barriers_avg": zig_step_avg(
+            "metal_last_frame_planned_barriers"
+        ),
+        "zig_metal_last_frame_planned_command_ops_avg": zig_step_avg(
+            "metal_last_frame_planned_command_ops"
+        ),
+        "zig_metal_deberta_encoder_plan_attempts_avg": zig_step_avg(
+            "metal_deberta_encoder_plan_attempts"
+        ),
+        "zig_metal_deberta_encoder_plan_successes_avg": zig_step_avg(
+            "metal_deberta_encoder_plan_successes"
+        ),
+        "zig_metal_deberta_encoder_plan_reuses_avg": zig_step_avg(
+            "metal_deberta_encoder_plan_reuses"
+        ),
+        "zig_metal_deberta_encoder_plan_failures_avg": zig_step_avg(
+            "metal_deberta_encoder_plan_failures"
+        ),
+        "zig_metal_deberta_encoder_layer_attempts_avg": zig_step_avg(
+            "metal_deberta_encoder_layer_attempts"
+        ),
+        "zig_metal_deberta_encoder_layer_successes_avg": zig_step_avg(
+            "metal_deberta_encoder_layer_successes"
+        ),
+        "zig_metal_deberta_encoder_layer_fallbacks_avg": zig_step_avg(
+            "metal_deberta_encoder_layer_fallbacks"
+        ),
+        "zig_metal_deberta_encoder_lora_layer_regions_avg": zig_step_avg(
+            "metal_deberta_encoder_lora_layer_regions"
+        ),
+        "zig_metal_deberta_encoder_lora_residual_layernorm_regions_avg": zig_step_avg(
+            "metal_deberta_encoder_lora_residual_layernorm_regions"
+        ),
+        "zig_metal_deberta_encoder_lora_layer_scaffold_regions_avg": zig_step_avg(
+            "metal_deberta_encoder_lora_layer_scaffold_regions"
+        ),
+        "zig_metal_deberta_encoder_lora_layer_fallbacks_avg": zig_step_avg(
+            "metal_deberta_encoder_lora_layer_fallbacks"
+        ),
+        "zig_metal_lora_backward_regions_avg": zig_step_avg(
+            "metal_lora_backward_regions"
+        ),
+        "zig_metal_low_rank_lora_backward_regions_avg": zig_step_avg(
+            "metal_low_rank_lora_backward_regions"
+        ),
+        "zig_metal_rank_adapter_backward_regions_avg": zig_step_avg(
+            "metal_rank_adapter_backward_regions"
+        ),
+        "zig_metal_lora_backward_total_regions_avg": zig_step_sum_avg(
+            (
+                "metal_lora_backward_regions",
+                "metal_low_rank_lora_backward_regions",
+                "metal_rank_adapter_backward_regions",
+            )
+        ),
+        "zig_metal_ffn_gelu_backward_regions_avg": zig_step_avg(
+            "metal_ffn_gelu_backward_regions"
+        ),
+        "zig_metal_head_mlp_forward_regions_avg": zig_step_avg(
+            "metal_head_mlp_forward_regions"
+        ),
+        "zig_metal_head_mlp_backward_regions_avg": zig_step_avg(
+            "metal_head_mlp_backward_regions"
+        ),
+        "zig_metal_command_dot_general_dispatches_avg": zig_step_avg(
+            "metal_command_dot_general_dispatches"
+        ),
+        "zig_metal_command_head_dot_dispatches_avg": zig_step_avg(
+            "metal_command_head_dot_dispatches"
+        ),
+        "zig_metal_command_transpose_dispatches_avg": zig_step_avg(
+            "metal_command_transpose_dispatches"
+        ),
+        "zig_metal_command_gather_dispatches_avg": zig_step_avg(
+            "metal_command_gather_dispatches"
+        ),
+        "zig_metal_command_reduce_dispatches_avg": zig_step_avg(
+            "metal_command_reduce_dispatches"
+        ),
+        "zig_metal_command_elementwise_dispatches_avg": zig_step_avg(
+            "metal_command_elementwise_dispatches"
+        ),
+        "zig_metal_command_activation_dispatches_avg": zig_step_avg(
+            "metal_command_activation_dispatches"
+        ),
+        "zig_metal_command_activation_backward_dispatches_avg": zig_step_avg(
+            "metal_command_activation_backward_dispatches"
+        ),
+        "zig_metal_command_other_dispatches_avg": zig_step_avg(
+            "metal_command_other_dispatches"
+        ),
+        "zig_metal_deberta_relative_qk_pair_calls_avg": zig_step_avg(
+            "metal_deberta_relative_qk_pair_calls"
+        ),
+        "zig_metal_deberta_relative_qk_pair_fallbacks_avg": zig_step_avg(
+            "metal_deberta_relative_qk_pair_fallbacks"
+        ),
+        "zig_metal_deberta_ffn_fused_calls_avg": zig_step_avg(
+            "metal_deberta_ffn_fused_calls"
+        ),
+        "zig_metal_deberta_ffn_fused_mps_matmuls_avg": zig_step_avg(
+            "metal_deberta_ffn_fused_mps_matmuls"
+        ),
+        "zig_metal_deberta_ffn_fused_fallbacks_avg": zig_step_avg(
+            "metal_deberta_ffn_fused_fallbacks"
+        ),
+        "zig_metal_deberta_attention_flash_calls_avg": zig_step_avg(
+            "metal_deberta_attention_flash_calls"
+        ),
+        "zig_metal_deberta_attention_gemm_calls_avg": zig_step_avg(
+            "metal_deberta_attention_gemm_calls"
+        ),
+        "zig_metal_deberta_attention_gemm_fallbacks_avg": zig_step_avg(
+            "metal_deberta_attention_gemm_fallbacks"
+        ),
+        "zig_metal_deberta_attention_legacy_calls_avg": zig_step_avg(
+            "metal_deberta_attention_legacy_calls"
+        ),
+        "zig_dot_general_command_count": zig_op_stats.get("command_ops", {})
+        .get("dot_general", {})
+        .get("count"),
+        "zig_dot_general_command_total_ms": zig_op_stats.get("command_ops", {})
+        .get("dot_general", {})
+        .get("total_ms"),
+        "zig_dot_general_command_avg_ms": zig_op_stats.get("command_ops", {})
+        .get("dot_general", {})
+        .get("avg_ms"),
+        "zig_gather_fallback_count": zig_op_stat_value(
+            "fallback_ops", "gather", "count"
+        ),
+        "zig_gather_fallback_total_ms": zig_op_stat_value(
+            "fallback_ops", "gather", "total_ms"
+        ),
+        "zig_gather_host_output_count": zig_op_stat_value(
+            "host_output_ops", "gather", "count"
+        ),
+        "zig_gather_host_output_total_ms": zig_op_stat_value(
+            "host_output_ops", "gather", "total_ms"
+        ),
         "zig_top_dot_shapes": zig_op_runs.get("top_dot_shapes", []),
-        "zig_top_host_output_families": top_op_stat_items(zig_op_stats.get("host_output_ops", {})),
-        "zig_top_fallback_families": top_op_stat_items(zig_op_stats.get("fallback_ops", {})),
-        "zig_top_host_output_reasons": top_op_stat_items(zig_op_stats.get("host_output_reasons", {})),
+        "zig_top_host_output_families": top_op_stat_items(
+            zig_op_stats.get("host_output_ops", {})
+        ),
+        "zig_top_fallback_families": top_op_stat_items(
+            zig_op_stats.get("fallback_ops", {})
+        ),
+        "zig_top_host_output_reasons": top_op_stat_items(
+            zig_op_stats.get("host_output_reasons", {})
+        ),
         **zig_loop_profile_summary,
         **zig_planned_access_profile_summary,
         "python_cpu_step_gate_ms": python_avg_step_ms,
@@ -4012,32 +4861,38 @@ def main() -> int:
         ),
         "zig_beats_python_cpu_warm_step_time": (
             zig_warm_avg_trainer_ms < python_warm_avg_step_ms
-            if zig_warm_avg_trainer_ms is not None and python_warm_avg_step_ms is not None
+            if zig_warm_avg_trainer_ms is not None
+            and python_warm_avg_step_ms is not None
             else None
         ),
         "trainer_speedup_python_over_zig": (
             python_trainer_elapsed / (zig_total_trainer_ms / 1000.0)
-            if python_trainer_elapsed is not None and zig_total_trainer_ms not in (None, 0)
+            if python_trainer_elapsed is not None
+            and zig_total_trainer_ms not in (None, 0)
             else None
         ),
         "warm_step_wall_speedup_python_over_zig": (
             python_warm_total_step_ms / zig_warm_total_trainer_ms
-            if python_warm_total_step_ms not in (None, 0) and zig_warm_total_trainer_ms not in (None, 0)
+            if python_warm_total_step_ms not in (None, 0)
+            and zig_warm_total_trainer_ms not in (None, 0)
             else None
         ),
         "zig_warm_step_wall_slowdown_vs_python": (
             zig_warm_total_trainer_ms / python_warm_total_step_ms
-            if python_warm_total_step_ms not in (None, 0) and zig_warm_total_trainer_ms not in (None, 0)
+            if python_warm_total_step_ms not in (None, 0)
+            and zig_warm_total_trainer_ms not in (None, 0)
             else None
         ),
         "step_wall_speedup_python_over_zig": (
             python_total_step_ms / zig_total_trainer_ms
-            if python_total_step_ms not in (None, 0) and zig_total_trainer_ms not in (None, 0)
+            if python_total_step_ms not in (None, 0)
+            and zig_total_trainer_ms not in (None, 0)
             else None
         ),
         "zig_step_wall_slowdown_vs_python": (
             zig_total_trainer_ms / python_total_step_ms
-            if python_total_step_ms not in (None, 0) and zig_total_trainer_ms not in (None, 0)
+            if python_total_step_ms not in (None, 0)
+            and zig_total_trainer_ms not in (None, 0)
             else None
         ),
         "python_last_loss": py_loss,
@@ -4058,14 +4913,20 @@ def main() -> int:
         "classification_debug_matches": classification_debug_matches,
         "classification_debug_reconciliation": classification_debug_reconciliation,
         "classification_debug_deltas": classification_debug_deltas,
-        "optimizer_parity_ok": optimizer_parity.get("ok") if optimizer_parity is not None else None,
+        "optimizer_parity_ok": optimizer_parity.get("ok")
+        if optimizer_parity is not None
+        else None,
         "python_preprocess_task_breakdown": python_task_breakdown,
         "zig_manifest_backend": zig_manifest.get("backend"),
         "zig_manifest_objective": zig_manifest.get("objective"),
         "zig_training_precision": zig_manifest.get("training_precision"),
         "zig_optimizer_state_precision": zig_manifest.get("optimizer_state_precision"),
-        "metal_readiness": summarize_metal_readiness(args, report, zig_step_rows, zig_manifest),
-        "cuda_readiness": summarize_cuda_readiness(args, report, zig_step_rows, zig_manifest),
+        "metal_readiness": summarize_metal_readiness(
+            args, report, zig_step_rows, zig_manifest
+        ),
+        "cuda_readiness": summarize_cuda_readiness(
+            args, report, zig_step_rows, zig_manifest
+        ),
         "loss_parity_tolerance": args.loss_parity_tolerance,
         "loss_parity_relative_tolerance": args.loss_parity_relative_tolerance,
         "classification_debug_tolerance": args.classification_debug_tolerance,
@@ -4074,10 +4935,15 @@ def main() -> int:
         "perf_target_only_python": args.perf_target_only_python,
         "python_objective_semantics": "upstream GLiNER2Trainer total_loss = classification_loss + structure_loss + count_loss; LoRA mode freezes non-LoRA params",
         "zig_objective_semantics": zig_objective_semantics,
-        "required_loss_components": ["classification_loss", "structure_loss", "count_loss"],
+        "required_loss_components": [
+            "classification_loss",
+            "structure_loss",
+            "count_loss",
+        ],
         "zig_loss_components_supported": {
             "classification_loss": full_loss_components_supported,
-            "structure_loss": args.zig_objective in ("span-start", "gliner2-total-loss"),
+            "structure_loss": args.zig_objective
+            in ("span-start", "gliner2-total-loss"),
             "count_loss": full_loss_components_supported,
         },
         "zig_preprocessing_matches_upstream": upstream_preprocessing_supported,
@@ -4089,15 +4955,27 @@ def main() -> int:
         ),
         "adapter_roundtrip_ran": bool(adapter_roundtrip.get("ran")),
         "adapter_roundtrip_ok": adapter_roundtrip.get("ok"),
-        "adapter_roundtrip_span_scores_max_abs_delta": adapter_roundtrip.get("span_scores_max_abs_delta"),
-        "adapter_roundtrip_classification_logits_max_abs_delta": adapter_roundtrip.get("classification_logits_max_abs_delta"),
-        "adapter_roundtrip_weights_max_abs_delta": adapter_roundtrip.get("weights_max_abs_delta"),
+        "adapter_roundtrip_span_scores_max_abs_delta": adapter_roundtrip.get(
+            "span_scores_max_abs_delta"
+        ),
+        "adapter_roundtrip_classification_logits_max_abs_delta": adapter_roundtrip.get(
+            "classification_logits_max_abs_delta"
+        ),
+        "adapter_roundtrip_weights_max_abs_delta": adapter_roundtrip.get(
+            "weights_max_abs_delta"
+        ),
         "adapter_roundtrip_tolerance": 0.0,
         "trained_adapter_parity_ran": bool(trained_adapter_parity.get("ran")),
         "trained_adapter_parity_ok": trained_adapter_parity.get("ok"),
-        "trained_adapter_parity_span_scores_max_abs_delta": trained_adapter_parity.get("span_scores_max_abs_delta"),
-        "trained_adapter_parity_classification_logits_max_abs_delta": trained_adapter_parity.get("classification_logits_max_abs_delta"),
-        "trained_adapter_parity_weights_max_abs_delta": trained_adapter_parity.get("weights_max_abs_delta"),
+        "trained_adapter_parity_span_scores_max_abs_delta": trained_adapter_parity.get(
+            "span_scores_max_abs_delta"
+        ),
+        "trained_adapter_parity_classification_logits_max_abs_delta": trained_adapter_parity.get(
+            "classification_logits_max_abs_delta"
+        ),
+        "trained_adapter_parity_weights_max_abs_delta": trained_adapter_parity.get(
+            "weights_max_abs_delta"
+        ),
         "trained_adapter_parity_tolerance": args.adapter_roundtrip_tolerance,
         "trained_adapter_tensor_equality_diagnostic": {
             "gating": False,
@@ -4113,7 +4991,9 @@ def main() -> int:
         "training_slice_non_entity_task_annotations": non_entity_task_count,
         "trainable_parity_warning": trainable_parity_warning,
         "objective_parity_warning": objective_parity_warning,
-        "semantic_parity_warning": objective_parity_warning if trainable_parity_warning is None else f"{trainable_parity_warning}; {objective_parity_warning}",
+        "semantic_parity_warning": objective_parity_warning
+        if trainable_parity_warning is None
+        else f"{trainable_parity_warning}; {objective_parity_warning}",
     }
 
     for section in ("python", "zig"):
@@ -4131,22 +5011,40 @@ def main() -> int:
         and report.get("zig", {}).get("returncode") == 0
     )
     is_total_loss_objective = args.zig_objective == "gliner2-total-loss"
-    component_loss_applicable = both_sides_ran and args.deterministic and args.dump_parity and is_total_loss_objective
+    component_loss_applicable = (
+        both_sides_ran
+        and args.deterministic
+        and args.dump_parity
+        and is_total_loss_objective
+    )
     # The classification debug comparison is meaningful only when the Python
     # side saw classification tasks in the first batch (entity-only fixtures
     # never emit it); the Zig side prints its debug unconditionally.
-    classification_debug_applicable = component_loss_applicable and python_classification_debug is not None
-    step_loss_applicable = both_sides_ran and args.deterministic and not args.perf_target_only_python
+    classification_debug_applicable = (
+        component_loss_applicable and python_classification_debug is not None
+    )
+    step_loss_applicable = (
+        both_sides_ran and args.deterministic and not args.perf_target_only_python
+    )
     preprocess_applicable = both_sides_ran and args.deterministic and args.dump_parity
-    full_loss_applicable = both_sides_ran and args.deterministic and is_total_loss_objective and not args.perf_target_only_python
+    full_loss_applicable = (
+        both_sides_ran
+        and args.deterministic
+        and is_total_loss_objective
+        and not args.perf_target_only_python
+    )
     # Same-artifact interchange is a fail-closed exact contract once both
     # trainers succeed. Independently trained adapter outputs are diagnostic by
     # default: cancellation-sensitive encoder reductions can amplify tiny
     # cross-framework weight differences. The dedicated multi-step optimizer
     # gate promotes its explicit drift bound because it also dumps and verifies
     # every per-parameter Adam update.
-    roundtrip_applicable = args.adapter_roundtrip and both_sides_ran and not args.perf_target_only_python
-    trained_adapter_gate_applicable = roundtrip_applicable and args.dump_optimizer_parity
+    roundtrip_applicable = (
+        args.adapter_roundtrip and both_sides_ran and not args.perf_target_only_python
+    )
+    trained_adapter_gate_applicable = (
+        roundtrip_applicable and args.dump_optimizer_parity
+    )
     step_count_gate_applicable = (
         (not args.skip_python or not args.skip_zig)
         and (args.skip_python or report.get("python", {}).get("returncode") == 0)
@@ -4154,7 +5052,9 @@ def main() -> int:
     )
     metal_readiness_summary = report["summary"].get("metal_readiness") or {}
     metal_readiness_checks = metal_readiness_summary.get("checks", {})
-    metal_dispatch_check = metal_readiness_checks.get("graph_executor_dispatches_nonzero")
+    metal_dispatch_check = metal_readiness_checks.get(
+        "graph_executor_dispatches_nonzero"
+    )
     metal_backend_ran = (
         args.zig_backend == "metal"
         and not args.skip_zig
@@ -4169,24 +5069,48 @@ def main() -> int:
         and report.get("zig", {}).get("returncode") == 0
     )
     strict_checks: dict[str, bool | None] = {
-        "requested_step_count_valid": bool(step_count_valid) if step_count_gate_applicable else None,
-        "component_loss_parity_matches": component_loss_matches if component_loss_applicable else None,
-        "classification_debug_matches": classification_debug_matches if classification_debug_applicable else None,
-        "step_loss_parity_matches": step_loss_parity_matches if step_loss_applicable else None,
-        "step_loss_counts_match": step_loss_counts_match if step_loss_applicable else None,
-        "preprocess_parity_matches": preprocess_matches if preprocess_applicable else None,
-        "valid_full_loss_parity": report["summary"]["valid_full_loss_parity"] if full_loss_applicable else None,
-        "adapter_roundtrip_ok": bool(adapter_roundtrip.get("ok")) if roundtrip_applicable else None,
+        "requested_step_count_valid": bool(step_count_valid)
+        if step_count_gate_applicable
+        else None,
+        "component_loss_parity_matches": component_loss_matches
+        if component_loss_applicable
+        else None,
+        "classification_debug_matches": classification_debug_matches
+        if classification_debug_applicable
+        else None,
+        "step_loss_parity_matches": step_loss_parity_matches
+        if step_loss_applicable
+        else None,
+        "step_loss_counts_match": step_loss_counts_match
+        if step_loss_applicable
+        else None,
+        "preprocess_parity_matches": preprocess_matches
+        if preprocess_applicable
+        else None,
+        "valid_full_loss_parity": report["summary"]["valid_full_loss_parity"]
+        if full_loss_applicable
+        else None,
+        "adapter_roundtrip_ok": bool(adapter_roundtrip.get("ok"))
+        if roundtrip_applicable
+        else None,
         "trained_adapter_parity_ok": (
-            bool(trained_adapter_parity.get("ok")) if trained_adapter_gate_applicable else None
+            bool(trained_adapter_parity.get("ok"))
+            if trained_adapter_gate_applicable
+            else None
         ),
         "optimizer_parity_ran": (
-            bool(optimizer_parity.get("ran")) if args.dump_optimizer_parity and optimizer_parity is not None else None
+            bool(optimizer_parity.get("ran"))
+            if args.dump_optimizer_parity and optimizer_parity is not None
+            else None
         ),
         "optimizer_parity_matches": (
-            bool(optimizer_parity.get("ok")) if args.dump_optimizer_parity and optimizer_parity is not None else None
+            bool(optimizer_parity.get("ok"))
+            if args.dump_optimizer_parity and optimizer_parity is not None
+            else None
         ),
-        "metal_graph_executor_dispatches_nonzero": bool(metal_dispatch_check) if metal_dispatch_applicable else None,
+        "metal_graph_executor_dispatches_nonzero": bool(metal_dispatch_check)
+        if metal_dispatch_applicable
+        else None,
     }
     if metal_backend_ran:
         # Metal-gate bundle (Phase 1, Metal_Gliner_Next_steps.md §1): promote the
@@ -4197,16 +5121,29 @@ def main() -> int:
         def _metal(name: str) -> bool | None:
             v = metal_readiness_checks.get(name)
             return bool(v) if v is not None else None
-        strict_checks.update({
-            "metal_manifest_backend_is_metal": _metal("manifest_backend_is_metal"),
-            "metal_optimizer_backend_is_metal": _metal("optimizer_backend_is_metal"),
-            "metal_device_resident_transfers_zero": _metal("device_resident_transfers_zero"),
-            "metal_finite_step_loss": _metal("finite_step_loss"),
-            "metal_training_precision_fp32": _metal("training_precision_fp32"),
-            "metal_graph_executor_fallback_reasons_empty": _metal("graph_executor_fallback_reasons_empty"),
-            "metal_graph_executor_true_host_outputs_within_threshold": _metal("graph_executor_true_host_outputs_within_threshold"),
-            "metal_interpreter_fallbacks_within_threshold": _metal("interpreter_fallbacks_within_threshold"),
-        })
+
+        strict_checks.update(
+            {
+                "metal_manifest_backend_is_metal": _metal("manifest_backend_is_metal"),
+                "metal_optimizer_backend_is_metal": _metal(
+                    "optimizer_backend_is_metal"
+                ),
+                "metal_device_resident_transfers_zero": _metal(
+                    "device_resident_transfers_zero"
+                ),
+                "metal_finite_step_loss": _metal("finite_step_loss"),
+                "metal_training_precision_fp32": _metal("training_precision_fp32"),
+                "metal_graph_executor_fallback_reasons_empty": _metal(
+                    "graph_executor_fallback_reasons_empty"
+                ),
+                "metal_graph_executor_true_host_outputs_within_threshold": _metal(
+                    "graph_executor_true_host_outputs_within_threshold"
+                ),
+                "metal_interpreter_fallbacks_within_threshold": _metal(
+                    "interpreter_fallbacks_within_threshold"
+                ),
+            }
+        )
     if cuda_backend_ran:
         # CUDA production training must prove that the graph executor ran. A
         # generic device interpreter is useful for diagnostics, but it is not
@@ -4216,28 +5153,51 @@ def main() -> int:
             # with an older/malformed metrics schema must fail, never turn a
             # required runtime invariant into a skipped strict check.
             return cuda_readiness_checks.get(name) is True
-        strict_checks.update({
-            "cuda_manifest_backend_is_cuda": _cuda("manifest_backend_is_cuda"),
-            "cuda_optimizer_backend_is_cuda": _cuda("optimizer_backend_is_cuda"),
-            "cuda_device_resident_transfers_zero": _cuda("device_resident_transfers_zero"),
-            "cuda_device_trainables_resident": _cuda("device_trainables_resident"),
-            "cuda_finite_step_loss": _cuda("finite_step_loss"),
-            "cuda_finite_grad_norm": _cuda("finite_grad_norm"),
-            "cuda_training_precision_fp32": _cuda("training_precision_fp32"),
-            "cuda_runtime_telemetry_present": _cuda("cuda_runtime_telemetry_present"),
-            "cuda_full_step_h2d_accounted": _cuda("cuda_full_step_h2d_accounted"),
-            "cuda_parameter_state_h2d_zero": _cuda("cuda_parameter_state_h2d_zero"),
-            "cuda_graph_executor_dispatches_nonzero": _cuda("graph_executor_dispatches_nonzero"),
-            "cuda_graph_executor_fallback_reasons_empty": _cuda("graph_executor_fallback_reasons_empty"),
-            "cuda_graph_executor_true_host_outputs_zero": _cuda("graph_executor_true_host_outputs_zero"),
-            "cuda_interpreter_fallbacks_within_threshold": _cuda("interpreter_fallbacks_within_threshold"),
-            "cuda_bulk_d2h_eliminated": _cuda("cuda_bulk_d2h_eliminated"),
-            "cuda_d2h_within_threshold": _cuda("cuda_d2h_bytes_per_step_within_threshold"),
-            "cuda_only_scalar_metrics_downloaded": _cuda("cuda_only_scalar_metrics_downloaded"),
-            "cuda_upload_synchronizations_bounded": _cuda("cuda_upload_synchronizations_bounded"),
-            "cuda_packed_attention_exercised": _cuda("cuda_packed_attention_exercised"),
-            "cuda_exact_gelu_exercised": _cuda("cuda_exact_gelu_exercised"),
-        })
+
+        strict_checks.update(
+            {
+                "cuda_manifest_backend_is_cuda": _cuda("manifest_backend_is_cuda"),
+                "cuda_optimizer_backend_is_cuda": _cuda("optimizer_backend_is_cuda"),
+                "cuda_device_resident_transfers_zero": _cuda(
+                    "device_resident_transfers_zero"
+                ),
+                "cuda_device_trainables_resident": _cuda("device_trainables_resident"),
+                "cuda_finite_step_loss": _cuda("finite_step_loss"),
+                "cuda_finite_grad_norm": _cuda("finite_grad_norm"),
+                "cuda_training_precision_fp32": _cuda("training_precision_fp32"),
+                "cuda_runtime_telemetry_present": _cuda(
+                    "cuda_runtime_telemetry_present"
+                ),
+                "cuda_full_step_h2d_accounted": _cuda("cuda_full_step_h2d_accounted"),
+                "cuda_parameter_state_h2d_zero": _cuda("cuda_parameter_state_h2d_zero"),
+                "cuda_graph_executor_dispatches_nonzero": _cuda(
+                    "graph_executor_dispatches_nonzero"
+                ),
+                "cuda_graph_executor_fallback_reasons_empty": _cuda(
+                    "graph_executor_fallback_reasons_empty"
+                ),
+                "cuda_graph_executor_true_host_outputs_zero": _cuda(
+                    "graph_executor_true_host_outputs_zero"
+                ),
+                "cuda_interpreter_fallbacks_within_threshold": _cuda(
+                    "interpreter_fallbacks_within_threshold"
+                ),
+                "cuda_bulk_d2h_eliminated": _cuda("cuda_bulk_d2h_eliminated"),
+                "cuda_d2h_within_threshold": _cuda(
+                    "cuda_d2h_bytes_per_step_within_threshold"
+                ),
+                "cuda_only_scalar_metrics_downloaded": _cuda(
+                    "cuda_only_scalar_metrics_downloaded"
+                ),
+                "cuda_upload_synchronizations_bounded": _cuda(
+                    "cuda_upload_synchronizations_bounded"
+                ),
+                "cuda_packed_attention_exercised": _cuda(
+                    "cuda_packed_attention_exercised"
+                ),
+                "cuda_exact_gelu_exercised": _cuda("cuda_exact_gelu_exercised"),
+            }
+        )
     if args.require_full_task_parity:
         # --require-full-task-parity (Phase 5 parity-envelope expansion):
         # graduate the warning-only/scoped comparisons into failing checks.
@@ -4256,9 +5216,9 @@ def main() -> int:
         # side (--skip-python/--skip-zig) or a missing dump must FAIL because
         # the comparison was required to run.
         subprocess_failed = (
-            (not args.skip_python and report.get("python", {}).get("returncode") != 0)
-            or (not args.skip_zig and report.get("zig", {}).get("returncode") != 0)
-        )
+            not args.skip_python and report.get("python", {}).get("returncode") != 0
+        ) or (not args.skip_zig and report.get("zig", {}).get("returncode") != 0)
+
         def _slice_covers(source_key: str, slice_key: str | None = None) -> bool:
             # Require the compared slice (first steps*batch_size records) to
             # exercise every task family the source fixture contains; families
@@ -4270,22 +5230,38 @@ def main() -> int:
                 return True
             return int(converted.get(key, 0) or 0) > 0
 
-        strict_checks.update({
-            "full_task_compared_slice_has_entities": _slice_covers("mentions"),
-            "full_task_compared_slice_has_classifications": _slice_covers("classifications"),
-            "full_task_compared_slice_has_json_structures": _slice_covers("json_structures"),
-            "full_task_compared_slice_has_relations": _slice_covers("relations"),
-            "full_task_component_loss_comparison_ran": None if subprocess_failed else bool(component_loss_applicable),
-            "full_task_preprocess_comparison_ran": None if subprocess_failed else bool(preprocess_applicable),
-            "full_task_loss_parity_comparison_ran": None if subprocess_failed else bool(full_loss_applicable),
-            "full_task_classification_debug_ran": (
-                (None if subprocess_failed else bool(classification_debug_applicable))
-                if fixture_has_classifications
-                else None
-            ),
-            "full_task_trainable_parity": trainable_parity_warning is None,
-            "full_task_objective_parity": objective_parity_warning is None,
-        })
+        strict_checks.update(
+            {
+                "full_task_compared_slice_has_entities": _slice_covers("mentions"),
+                "full_task_compared_slice_has_classifications": _slice_covers(
+                    "classifications"
+                ),
+                "full_task_compared_slice_has_json_structures": _slice_covers(
+                    "json_structures"
+                ),
+                "full_task_compared_slice_has_relations": _slice_covers("relations"),
+                "full_task_component_loss_comparison_ran": None
+                if subprocess_failed
+                else bool(component_loss_applicable),
+                "full_task_preprocess_comparison_ran": None
+                if subprocess_failed
+                else bool(preprocess_applicable),
+                "full_task_loss_parity_comparison_ran": None
+                if subprocess_failed
+                else bool(full_loss_applicable),
+                "full_task_classification_debug_ran": (
+                    (
+                        None
+                        if subprocess_failed
+                        else bool(classification_debug_applicable)
+                    )
+                    if fixture_has_classifications
+                    else None
+                ),
+                "full_task_trainable_parity": trainable_parity_warning is None,
+                "full_task_objective_parity": objective_parity_warning is None,
+            }
+        )
     report["summary"]["strict_mode"] = args.strict
     report["summary"]["require_full_task_parity"] = args.require_full_task_parity
     report["summary"]["strict_checks"] = strict_checks
@@ -4310,15 +5286,21 @@ def main() -> int:
             status = "FAIL"
             strict_failures.append(check_name)
         print(f"  PARITY {check_name}: {status}")
-    print(f"  PARITY python_returncode: {'PASS' if 'python' not in report or report['python'].get('returncode') == 0 else 'FAIL'}")
-    print(f"  PARITY zig_returncode: {'PASS' if 'zig' not in report or report['zig'].get('returncode') == 0 else 'FAIL'}")
+    print(
+        f"  PARITY python_returncode: {'PASS' if 'python' not in report or report['python'].get('returncode') == 0 else 'FAIL'}"
+    )
+    print(
+        f"  PARITY zig_returncode: {'PASS' if 'zig' not in report or report['zig'].get('returncode') == 0 else 'FAIL'}"
+    )
 
     ok = returncodes_ok and (not args.strict or not strict_failures)
     if not ok:
         if not returncodes_ok:
             print("RESULT: FAIL (subprocess returncode)")
         else:
-            print(f"RESULT: FAIL (strict parity checks failed: {', '.join(strict_failures)})")
+            print(
+                f"RESULT: FAIL (strict parity checks failed: {', '.join(strict_failures)})"
+            )
     else:
         print("RESULT: PASS")
     return 0 if ok else 1

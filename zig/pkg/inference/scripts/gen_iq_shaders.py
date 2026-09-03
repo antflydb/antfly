@@ -20,6 +20,7 @@ web/shaders/. Each shader inlines its grid as const arrays so it ships standalon
 
 Run from pkg/inference root: `python3 scripts/gen_iq_shaders.py`.
 """
+
 from __future__ import annotations
 
 import os
@@ -34,7 +35,9 @@ SHADERS_DIR = ROOT / "web" / "shaders"
 
 
 def parse_grid(name: str, text: str) -> list[int]:
-    pat = re.compile(rf"^(?:pub )?const {re.escape(name)} = \[_\](u16|u32)\{{(.*?)^\}};", re.M | re.S)
+    pat = re.compile(
+        rf"^(?:pub )?const {re.escape(name)} = \[_\](u16|u32)\{{(.*?)^\}};", re.M | re.S
+    )
     m = pat.search(text)
     if not m:
         raise SystemExit(f"grid {name!r} not found")
@@ -190,10 +193,12 @@ def fmt_array(name: str, values: list[int], width: int, per_line: int = 8) -> st
 
     lines = []
     for i in range(0, len(out), per_line):
-        chunk = ", ".join(f"0x{v:08x}u" for v in out[i:i + per_line])
+        chunk = ", ".join(f"0x{v:08x}u" for v in out[i : i + per_line])
         lines.append(f"    {chunk},")
     body = "\n".join(lines).rstrip(",")
-    return f"const {name}: array<u32, {len(out)}> = array<u32, {len(out)}>(\n{body}\n);\n"
+    return (
+        f"const {name}: array<u32, {len(out)}> = array<u32, {len(out)}>(\n{body}\n);\n"
+    )
 
 
 def grid_lookup_u16(grid_name: str) -> str:

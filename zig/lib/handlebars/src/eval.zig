@@ -1441,7 +1441,7 @@ test "eval each map with @key" {
     var m: ValueMap = .{};
     try m.put(arena, "obj", .{ .map = obj });
 
-    const result = try testRender(arena,"{{#each obj}}{{@key}}={{this}} {{/each}}", .{ .map = m });
+    const result = try testRender(arena, "{{#each obj}}{{@key}}={{this}} {{/each}}", .{ .map = m });
     try std.testing.expectEqualStrings("a=1 b=2 ", result);
 }
 
@@ -1454,7 +1454,7 @@ test "eval each with @first and @last" {
     var m: ValueMap = .{};
     try m.put(arena, "items", .{ .array = &items });
 
-    const result = try testRender(arena,"{{#each items}}{{#if @first}}[{{/if}}{{this}}{{#unless @last}},{{/unless}}{{#if @last}}]{{/if}}{{/each}}", .{ .map = m });
+    const result = try testRender(arena, "{{#each items}}{{#if @first}}[{{/if}}{{this}}{{#unless @last}},{{/unless}}{{#if @last}}]{{/if}}{{/each}}", .{ .map = m });
     try std.testing.expectEqualStrings("[a,b,c]", result);
 }
 
@@ -1467,7 +1467,7 @@ test "eval array index access" {
     var m: ValueMap = .{};
     try m.put(arena, "items", .{ .array = &items });
 
-    const result = try testRender(arena,"{{items.0}} and {{items.2}}", .{ .map = m });
+    const result = try testRender(arena, "{{items.0}} and {{items.2}}", .{ .map = m });
     try std.testing.expectEqualStrings("alpha and gamma", result);
 }
 
@@ -1483,7 +1483,7 @@ test "eval lookup helper" {
     try m.put(arena, "obj", .{ .map = obj });
     try m.put(arena, "field", Value.str("name"));
 
-    const result = try testRender(arena,"{{lookup obj field}}", .{ .map = m });
+    const result = try testRender(arena, "{{lookup obj field}}", .{ .map = m });
     try std.testing.expectEqualStrings("found", result);
 }
 
@@ -1498,7 +1498,7 @@ test "eval implicit block truthy" {
     var m: ValueMap = .{};
     try m.put(arena, "user", .{ .map = user });
 
-    const result = try testRender(arena,"{{#user}}Hello {{name}}{{/user}}", .{ .map = m });
+    const result = try testRender(arena, "{{#user}}Hello {{name}}{{/user}}", .{ .map = m });
     try std.testing.expectEqualStrings("Hello World", result);
 }
 
@@ -1510,7 +1510,7 @@ test "eval implicit block falsy" {
     var m: ValueMap = .{};
     try m.put(arena, "show", Value.bln(false));
 
-    const result = try testRender(arena,"{{#show}}yes{{else}}no{{/show}}", .{ .map = m });
+    const result = try testRender(arena, "{{#show}}yes{{else}}no{{/show}}", .{ .map = m });
     try std.testing.expectEqualStrings("no", result);
 }
 
@@ -1523,7 +1523,7 @@ test "eval else if chaining" {
     try m.put(arena, "a", Value.bln(false));
     try m.put(arena, "b", Value.bln(true));
 
-    const result = try testRender(arena,"{{#if a}}A{{else if b}}B{{else}}C{{/if}}", .{ .map = m });
+    const result = try testRender(arena, "{{#if a}}A{{else if b}}B{{else}}C{{/if}}", .{ .map = m });
     try std.testing.expectEqualStrings("B", result);
 }
 
@@ -1536,7 +1536,7 @@ test "eval else if chaining fallthrough" {
     try m.put(arena, "a", Value.bln(false));
     try m.put(arena, "b", Value.bln(false));
 
-    const result = try testRender(arena,"{{#if a}}A{{else if b}}B{{else}}C{{/if}}", .{ .map = m });
+    const result = try testRender(arena, "{{#if a}}A{{else if b}}B{{else}}C{{/if}}", .{ .map = m });
     try std.testing.expectEqualStrings("C", result);
 }
 
@@ -1548,7 +1548,7 @@ test "eval ampersand unescaped" {
     var m: ValueMap = .{};
     try m.put(arena, "html", Value.str("<b>bold</b>"));
 
-    const result = try testRender(arena,"{{&html}}", .{ .map = m });
+    const result = try testRender(arena, "{{&html}}", .{ .map = m });
     try std.testing.expectEqualStrings("<b>bold</b>", result);
 }
 
@@ -1578,7 +1578,7 @@ test "eval equal block helper" {
     var m: ValueMap = .{};
     try m.put(arena, "status", Value.str("active"));
 
-    const result = try testRender(arena,"{{#equal status \"active\"}}yes{{else}}no{{/equal}}", .{ .map = m });
+    const result = try testRender(arena, "{{#equal status \"active\"}}yes{{else}}no{{/equal}}", .{ .map = m });
     try std.testing.expectEqualStrings("yes", result);
 }
 
@@ -1590,7 +1590,7 @@ test "eval equal block helper mismatch" {
     var m: ValueMap = .{};
     try m.put(arena, "status", Value.str("inactive"));
 
-    const result = try testRender(arena,"{{#equal status \"active\"}}yes{{else}}no{{/equal}}", .{ .map = m });
+    const result = try testRender(arena, "{{#equal status \"active\"}}yes{{else}}no{{/equal}}", .{ .map = m });
     try std.testing.expectEqualStrings("no", result);
 }
 
@@ -1604,7 +1604,7 @@ test "eval parent ref in each" {
     try m.put(arena, "title", Value.str("List"));
     try m.put(arena, "items", .{ .array = &items });
 
-    const result = try testRender(arena,"{{#each items}}{{../title}}: {{this}} {{/each}}", .{ .map = m });
+    const result = try testRender(arena, "{{#each items}}{{../title}}: {{this}} {{/each}}", .{ .map = m });
     try std.testing.expectEqualStrings("List: a List: b ", result);
 }
 
@@ -1617,7 +1617,7 @@ test "eval each empty array inverse" {
     var m: ValueMap = .{};
     try m.put(arena, "items", .{ .array = &items });
 
-    const result = try testRender(arena,"{{#each items}}{{this}}{{else}}empty{{/each}}", .{ .map = m });
+    const result = try testRender(arena, "{{#each items}}{{this}}{{else}}empty{{/each}}", .{ .map = m });
     try std.testing.expectEqualStrings("empty", result);
 }
 
@@ -1640,7 +1640,7 @@ test "eval block params in each" {
     var m: ValueMap = .{};
     try m.put(arena, "items", .{ .array = &items });
 
-    const result = try testRender(arena,"{{#each items as |item idx|}}{{idx}}:{{item}} {{/each}}", .{ .map = m });
+    const result = try testRender(arena, "{{#each items as |item idx|}}{{idx}}:{{item}} {{/each}}", .{ .map = m });
     try std.testing.expectEqualStrings("0:x 1:y ", result);
 }
 
@@ -2332,7 +2332,7 @@ test "eval @root in each" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const items = [_]Value{ Value.str("x") };
+    const items = [_]Value{Value.str("x")};
     var m: ValueMap = .{};
     try m.put(arena, "sep", Value.str("|"));
     try m.put(arena, "items", .{ .array = &items });

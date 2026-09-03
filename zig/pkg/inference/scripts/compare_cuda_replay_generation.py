@@ -159,7 +159,12 @@ def run_generate(
         proc = subprocess.run(
             cmd,
             cwd=str(cwd),
-            env=env_for_run(persistent, capture_greedy_token, capture_min_alloc_seq, force_kv_capacity),
+            env=env_for_run(
+                persistent,
+                capture_greedy_token,
+                capture_min_alloc_seq,
+                force_kv_capacity,
+            ),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -171,12 +176,22 @@ def run_generate(
     except subprocess.TimeoutExpired as err:
         exit_code = 124
         output_raw = err.stdout or ""
-        output = output_raw if isinstance(output_raw, str) else output_raw.decode("utf-8", errors="replace")
+        output = (
+            output_raw
+            if isinstance(output_raw, str)
+            else output_raw.decode("utf-8", errors="replace")
+        )
         output += f"\ncommand timed out after {timeout_sec}s\n"
     elapsed = time.time() - started
     token_match = TOKEN_IDS_RE.search(output)
-    token_ids = [int(part) for part in token_match.group("ids").split()] if token_match else []
-    timing = json.loads(timing_path.read_text(encoding="utf-8")) if timing_path.is_file() else {}
+    token_ids = (
+        [int(part) for part in token_match.group("ids").split()] if token_match else []
+    )
+    timing = (
+        json.loads(timing_path.read_text(encoding="utf-8"))
+        if timing_path.is_file()
+        else {}
+    )
     return {
         "cmd": cmd,
         "exit_code": exit_code,
@@ -259,17 +274,23 @@ def validate_pair(
         )
 
     persistent_replays = cuda_counter(persistent, "graph_capture_persistent_replays")
-    recapture_persistent_replays = cuda_counter(recapture, "graph_capture_persistent_replays")
+    recapture_persistent_replays = cuda_counter(
+        recapture, "graph_capture_persistent_replays"
+    )
     persistent_skips = cuda_counter(persistent, "graph_capture_capacity_skips")
     recapture_skips = cuda_counter(recapture, "graph_capture_capacity_skips")
     if min_persistent_replays > 0 and persistent_replays <= 0:
-        errors.append("persistent run did not report graph_capture_persistent_replays > 0")
+        errors.append(
+            "persistent run did not report graph_capture_persistent_replays > 0"
+        )
     if persistent_replays < min_persistent_replays:
         errors.append(
             f"persistent run reported persistent_replays={persistent_replays}, below minimum {min_persistent_replays}"
         )
     if recapture_persistent_replays != 0:
-        errors.append(f"recapture run unexpectedly reported persistent_replays={recapture_persistent_replays}")
+        errors.append(
+            f"recapture run unexpectedly reported persistent_replays={recapture_persistent_replays}"
+        )
     if persistent_skips < min_capacity_skips:
         errors.append(
             f"persistent run reported capacity_skips={persistent_skips}, below minimum {min_capacity_skips}"
@@ -284,10 +305,16 @@ def validate_pair(
         errors.append(f"recapture run reported capacity_skips={recapture_skips}")
 
     require_launch_savings = min_capacity_skips == 0
-    if require_launch_savings and cuda_counter(persistent, "kernel_launches") > cuda_counter(recapture, "kernel_launches"):
+    if require_launch_savings and cuda_counter(
+        persistent, "kernel_launches"
+    ) > cuda_counter(recapture, "kernel_launches"):
         errors.append("persistent run used more kernel launches than recapture control")
 
-    token_count = len(persistent["token_ids"]) if persistent["token_ids"] else len(recapture["token_ids"])
+    token_count = (
+        len(persistent["token_ids"])
+        if persistent["token_ids"]
+        else len(recapture["token_ids"])
+    )
     errors.extend(
         validate_transfer_and_memory(
             label="persistent",
@@ -307,9 +334,15 @@ def validate_pair(
         )
     )
 
-    if "q4" in model.lower() and cuda_counter(persistent, "q4k_decode_fast_fallbacks") != 0:
+    if (
+        "q4" in model.lower()
+        and cuda_counter(persistent, "q4k_decode_fast_fallbacks") != 0
+    ):
         errors.append("persistent Q4 run reported q4k_decode_fast_fallbacks != 0")
-    if "q4" in model.lower() and cuda_counter(recapture, "q4k_decode_fast_fallbacks") != 0:
+    if (
+        "q4" in model.lower()
+        and cuda_counter(recapture, "q4k_decode_fast_fallbacks") != 0
+    ):
         errors.append("recapture Q4 run reported q4k_decode_fast_fallbacks != 0")
 
     if errors:
@@ -330,14 +363,27 @@ def main() -> int:
     inference_root = inference_root_from_script()
     default_prompt_file = inference_root / "testdata/gemma4_replay_prompts.txt"
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, default=repo_root / "zig/pkg/inference/zig-out/bin/antfly-inference")
-    parser.add_argument("--model", action="append", required=True, help="Model directory. Repeat for Q8/Q4.")
-    parser.add_argument("--prompt", action="append", default=[], help="Prompt to test. Can repeat.")
+    parser.add_argument(
+        "--binary",
+        type=Path,
+        default=repo_root / "zig/pkg/inference/zig-out/bin/antfly-inference",
+    )
+    parser.add_argument(
+        "--model",
+        action="append",
+        required=True,
+        help="Model directory. Repeat for Q8/Q4.",
+    )
+    parser.add_argument(
+        "--prompt", action="append", default=[], help="Prompt to test. Can repeat."
+    )
     parser.add_argument("--prompt-file", type=Path, default=None)
     parser.add_argument("--max-prompts", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=12)
     parser.add_argument("--timeout-sec", type=int, default=360)
-    parser.add_argument("--out-dir", type=Path, default=Path("/tmp/gemma-cuda-replay-compare"))
+    parser.add_argument(
+        "--out-dir", type=Path, default=Path("/tmp/gemma-cuda-replay-compare")
+    )
     parser.add_argument("--combined-budget-mb", type=int, default=22000)
     parser.add_argument("--backend-budget-mb", type=int, default=19000)
     parser.add_argument("--kv-budget-mb", type=int, default=512)
@@ -404,7 +450,10 @@ def main() -> int:
         raise SystemExit("--min-capacity-skips must be non-negative")
     if args.max_capacity_skips is not None and args.max_capacity_skips < 0:
         raise SystemExit("--max-capacity-skips must be non-negative")
-    if args.max_capacity_skips is not None and args.max_capacity_skips < args.min_capacity_skips:
+    if (
+        args.max_capacity_skips is not None
+        and args.max_capacity_skips < args.min_capacity_skips
+    ):
         raise SystemExit("--max-capacity-skips must be >= --min-capacity-skips")
     if args.force_kv_capacity is not None and args.min_capacity_skips == 0:
         args.min_capacity_skips = 1
@@ -473,8 +522,12 @@ def main() -> int:
                 capture_min_alloc_seq=args.capture_min_alloc_seq,
                 force_kv_capacity=args.force_kv_capacity,
             )
-            write_run_artifacts(base.with_name(base.name + "-persistent.json"), persistent)
-            write_run_artifacts(base.with_name(base.name + "-recapture.json"), recapture)
+            write_run_artifacts(
+                base.with_name(base.name + "-persistent.json"), persistent
+            )
+            write_run_artifacts(
+                base.with_name(base.name + "-recapture.json"), recapture
+            )
             pair_failures = validate_pair(
                 model,
                 prompt,
@@ -498,29 +551,59 @@ def main() -> int:
                     "kernel_launches": cuda_counter(persistent, "kernel_launches"),
                     "begins": cuda_counter(persistent, "graph_capture_begins"),
                     "replays": cuda_counter(persistent, "graph_capture_replays"),
-                    "persistent_replays": cuda_counter(persistent, "graph_capture_persistent_replays"),
-                    "capacity_skips": cuda_counter(persistent, "graph_capture_capacity_skips"),
+                    "persistent_replays": cuda_counter(
+                        persistent, "graph_capture_persistent_replays"
+                    ),
+                    "capacity_skips": cuda_counter(
+                        persistent, "graph_capture_capacity_skips"
+                    ),
                     "d2h_bytes": cuda_counter(persistent, "d2h_bytes"),
-                    "temp_buffer_evictions": cuda_counter(persistent, "temp_buffer_evictions"),
-                    "temp_buffer_cached_bytes": cuda_counter(persistent, "temp_buffer_cached_bytes"),
-                    "lm_head_argmax_fallbacks": cuda_counter(persistent, "lm_head_argmax_fallbacks"),
-                    "lm_head_argmax_fused_q8": cuda_counter(persistent, "lm_head_argmax_fused_q8"),
-                    "lm_head_argmax_fused_q4": cuda_counter(persistent, "lm_head_argmax_fused_q4"),
+                    "temp_buffer_evictions": cuda_counter(
+                        persistent, "temp_buffer_evictions"
+                    ),
+                    "temp_buffer_cached_bytes": cuda_counter(
+                        persistent, "temp_buffer_cached_bytes"
+                    ),
+                    "lm_head_argmax_fallbacks": cuda_counter(
+                        persistent, "lm_head_argmax_fallbacks"
+                    ),
+                    "lm_head_argmax_fused_q8": cuda_counter(
+                        persistent, "lm_head_argmax_fused_q8"
+                    ),
+                    "lm_head_argmax_fused_q4": cuda_counter(
+                        persistent, "lm_head_argmax_fused_q4"
+                    ),
                 },
                 "recapture": {
                     "decode_tok_per_s": decode_rate(recapture),
                     "kernel_launches": cuda_counter(recapture, "kernel_launches"),
                     "begins": cuda_counter(recapture, "graph_capture_begins"),
                     "replays": cuda_counter(recapture, "graph_capture_replays"),
-                    "update_successes": cuda_counter(recapture, "graph_capture_update_successes"),
-                    "persistent_replays": cuda_counter(recapture, "graph_capture_persistent_replays"),
-                    "capacity_skips": cuda_counter(recapture, "graph_capture_capacity_skips"),
+                    "update_successes": cuda_counter(
+                        recapture, "graph_capture_update_successes"
+                    ),
+                    "persistent_replays": cuda_counter(
+                        recapture, "graph_capture_persistent_replays"
+                    ),
+                    "capacity_skips": cuda_counter(
+                        recapture, "graph_capture_capacity_skips"
+                    ),
                     "d2h_bytes": cuda_counter(recapture, "d2h_bytes"),
-                    "temp_buffer_evictions": cuda_counter(recapture, "temp_buffer_evictions"),
-                    "temp_buffer_cached_bytes": cuda_counter(recapture, "temp_buffer_cached_bytes"),
-                    "lm_head_argmax_fallbacks": cuda_counter(recapture, "lm_head_argmax_fallbacks"),
-                    "lm_head_argmax_fused_q8": cuda_counter(recapture, "lm_head_argmax_fused_q8"),
-                    "lm_head_argmax_fused_q4": cuda_counter(recapture, "lm_head_argmax_fused_q4"),
+                    "temp_buffer_evictions": cuda_counter(
+                        recapture, "temp_buffer_evictions"
+                    ),
+                    "temp_buffer_cached_bytes": cuda_counter(
+                        recapture, "temp_buffer_cached_bytes"
+                    ),
+                    "lm_head_argmax_fallbacks": cuda_counter(
+                        recapture, "lm_head_argmax_fallbacks"
+                    ),
+                    "lm_head_argmax_fused_q8": cuda_counter(
+                        recapture, "lm_head_argmax_fused_q8"
+                    ),
+                    "lm_head_argmax_fused_q4": cuda_counter(
+                        recapture, "lm_head_argmax_fused_q4"
+                    ),
                 },
                 "capture_greedy_token": args.capture_greedy_token,
                 "capture_min_alloc_seq": args.capture_min_alloc_seq,

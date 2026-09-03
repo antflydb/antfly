@@ -132,7 +132,10 @@ MCP_QUERY_SHORTHAND_PROPERTIES: dict[str, dict[str, Any]] = {
     # Do not publish a JSON Schema default here: clients that materialize
     # defaults would combine it with queryRequest and violate raw-mode
     # exclusivity. The runtime still defaults shorthand calls to ten.
-    "limit": {"type": "integer", "description": "Maximum results; defaults to 10 in shorthand mode."},
+    "limit": {
+        "type": "integer",
+        "description": "Maximum results; defaults to 10 in shorthand mode.",
+    },
     "orderBy": {"type": "array"},
     "indexes": {"type": "array", "items": {"type": "string"}},
     "filterPrefix": {"type": "string"},
@@ -233,14 +236,19 @@ def constraint_requires_any(value: Any, property_names: set[str]) -> bool:
     return any(constraint_requires_any(item, property_names) for item in value.values())
 
 
-def without_constraints_referencing_properties(value: Any, property_names: set[str]) -> Any:
+def without_constraints_referencing_properties(
+    value: Any, property_names: set[str]
+) -> Any:
     """Drop only combinator branches made stale by removed properties.
 
     Keeping unrelated allOf/anyOf/oneOf branches ensures a future canonical
     validation rule remains visible to MCP clients.
     """
     if isinstance(value, list):
-        return [without_constraints_referencing_properties(item, property_names) for item in value]
+        return [
+            without_constraints_referencing_properties(item, property_names)
+            for item in value
+        ]
     if not isinstance(value, dict):
         return value
 
@@ -255,14 +263,20 @@ def without_constraints_referencing_properties(value: Any, property_names: set[s
             if retained:
                 result[key] = retained
         else:
-            result[key] = without_constraints_referencing_properties(item, property_names)
+            result[key] = without_constraints_referencing_properties(
+                item, property_names
+            )
     return result
 
 
-def tool_input_schema(component: dict[str, Any], aliases: dict[str, str]) -> dict[str, Any]:
+def tool_input_schema(
+    component: dict[str, Any], aliases: dict[str, str]
+) -> dict[str, Any]:
     compact = strip_annotations(component)
     properties = compact.get("properties", {})
-    renamed_properties = {lower_camel(name): schema for name, schema in properties.items()}
+    renamed_properties = {
+        lower_camel(name): schema for name, schema in properties.items()
+    }
     renamed_properties = {"tableName": {"type": "string"}, **renamed_properties}
 
     for alias, source in aliases.items():
@@ -272,7 +286,10 @@ def tool_input_schema(component: dict[str, Any], aliases: dict[str, str]) -> dic
         alias_schema["description"] = f"Compatibility alias for {source_name}."
         renamed_properties[alias] = alias_schema
 
-    required = ["tableName", *(lower_camel(name) for name in compact.get("required", []))]
+    required = [
+        "tableName",
+        *(lower_camel(name) for name in compact.get("required", [])),
+    ]
     result: dict[str, Any] = {
         "type": "object",
         "additionalProperties": False,
@@ -325,7 +342,9 @@ def compact_query_request_schema(schemas: dict[str, Any]) -> dict[str, Any]:
         if name == "order_by":
             properties[name] = {"type": "array"}
             continue
-        value = strip_vendor_extensions(resolve_local_refs(source_properties[name], schemas))
+        value = strip_vendor_extensions(
+            resolve_local_refs(source_properties[name], schemas)
+        )
         if name == "hierarchy":
             removed = deprecated_property_names(value)
             value = without_deprecated_properties(value)
@@ -428,7 +447,12 @@ def custom_generated_contents(schemas: dict[str, Any]) -> tuple[tuple[str, str],
     return (
         (
             "mcp_query_input_schema.json",
-            json.dumps(mcp_query_input_schema(schemas), separators=(",", ":"), ensure_ascii=False) + "\n",
+            json.dumps(
+                mcp_query_input_schema(schemas),
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            + "\n",
         ),
     )
 

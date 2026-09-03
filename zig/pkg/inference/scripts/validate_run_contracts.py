@@ -33,30 +33,58 @@ def validate_run_status(path: Path):
     data = load_json(path)
     require_keys(
         data,
-        ["contract_version", "status", "task", "out_dir", "resume_from", "actions", "derived", "artifacts"],
+        [
+            "contract_version",
+            "status",
+            "task",
+            "out_dir",
+            "resume_from",
+            "actions",
+            "derived",
+            "artifacts",
+        ],
         "run_status.json",
     )
-    require_keys(data["derived"], ["outcome_code", "alerts", "metric_summary"], "run_status.json derived")
-    require_keys(data["artifacts"], ["report", "best", "latest", "final"], "run_status.json artifacts")
+    require_keys(
+        data["derived"],
+        ["outcome_code", "alerts", "metric_summary"],
+        "run_status.json derived",
+    )
+    require_keys(
+        data["artifacts"],
+        ["report", "best", "latest", "final"],
+        "run_status.json artifacts",
+    )
 
 
 def validate_training_config(path: Path):
     data = load_json(path)
-    require_keys(data, ["contract_version", "artifact_family_version", "task"], "training_config.json")
+    require_keys(
+        data,
+        ["contract_version", "artifact_family_version", "task"],
+        "training_config.json",
+    )
     if "inputs" not in data:
         raise SystemExit("training_config.json: missing inputs")
 
 
 def validate_training_report(path: Path):
     data = load_json(path)
-    require_keys(data, ["contract_version", "artifact_family_version", "task"], "training_report.json")
+    require_keys(
+        data,
+        ["contract_version", "artifact_family_version", "task"],
+        "training_report.json",
+    )
     if "report" not in data and "summary" not in data:
         raise SystemExit("training_report.json: missing report/summary payload")
 
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("usage: validate_run_contracts.py <run_dir> [<run_dir> ...]", file=sys.stderr)
+        print(
+            "usage: validate_run_contracts.py <run_dir> [<run_dir> ...]",
+            file=sys.stderr,
+        )
         return 2
 
     for raw in sys.argv[1:]:

@@ -25,7 +25,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.13"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
+        # Pull requests cover the oldest and newest supported runtimes; main
+        # covers every supported minor release.
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11", "3.14"]') || fromJSON('["3.11", "3.12", "3.13", "3.14"]') }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,7 +45,7 @@ jobs:
         run: uv sync
 
       - name: Verify generated client
-        if: matrix.python-version == '3.13'
+        if: matrix.python-version == '3.14'
         working-directory: py/packages/sdk
         run: |
           make generate
@@ -55,9 +57,10 @@ jobs:
 
       - name: Run linting
         working-directory: py/packages/sdk
-        run: |
-          uv run ruff check src tests
-          uv run ruff format --check src tests
+        run: uv run ruff check src tests
+
+      - name: Check Python formatting
+        run: git ls-files -z -- '*.py' | xargs -0 uv run --project py/packages/sdk --locked ruff format --check
 
       - name: Run type checking
         working-directory: py/packages/sdk
@@ -66,3 +69,6 @@ jobs:
       - name: Run tests
         working-directory: py/packages/sdk
         run: uv run pytest tests
+
+      - name: Check CLI wrapper compatibility
+        run: python -m compileall -q py/packages/cli/src/antfly_cli

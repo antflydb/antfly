@@ -454,9 +454,7 @@ class ThreeByThreeBackupCluster:
             ]
             self.data_ports = list(self.port_reservations.reserve_many(3))
             self.data_raft_ports = list(self.port_reservations.reserve_many(3))
-            self.data_urls = [
-                f"http://{self.host}:{port}" for port in self.data_ports
-            ]
+            self.data_urls = [f"http://{self.host}:{port}" for port in self.data_ports]
             self.data_api_urls = [
                 antfly_public_api_url(url, binary=binary) for url in self.data_urls
             ]
@@ -636,11 +634,13 @@ class ThreeByThreeBackupCluster:
             data_command = self._data_command(i)
             proc = self.port_reservations.handoff_to(
                 (self.data_ports[i], self.data_raft_ports[i]),
-                lambda command=data_command, log_file=self.data_log_files[i]: subprocess.Popen(
-                    command,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    cwd=REPO_ROOT,
+                lambda command=data_command, log_file=self.data_log_files[i]: (
+                    subprocess.Popen(
+                        command,
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        cwd=REPO_ROOT,
+                    )
                 ),
             )
             self.data_procs.append(proc)
@@ -659,9 +659,7 @@ class ThreeByThreeBackupCluster:
                 f"{self.debug_logs()}"
             )
 
-    def metadata_snapshot(
-        self, index: int, *, request_timeout_s: float = 1.0
-    ) -> dict:
+    def metadata_snapshot(self, index: int, *, request_timeout_s: float = 1.0) -> dict:
         response = requests.get(
             f"{self.metadata_admin_urls[index]}/metadata/v1/admin/snapshot",
             timeout=request_timeout_s,
@@ -801,8 +799,7 @@ class ThreeByThreeBackupCluster:
         group_ids = {
             int(record.get("group_id", 0))
             for record in snapshot.get("ranges", [])
-            if isinstance(record, dict)
-            and int(record.get("table_id", 0)) == table_id
+            if isinstance(record, dict) and int(record.get("table_id", 0)) == table_id
         }
         return table_id, group_ids
 
@@ -824,8 +821,7 @@ class ThreeByThreeBackupCluster:
             if table_id is None:
                 return False
             if any(
-                isinstance(record, dict)
-                and int(record.get("table_id", 0)) == table_id
+                isinstance(record, dict) and int(record.get("table_id", 0)) == table_id
                 for record in snapshot.get("restore_progresses", [])
             ):
                 return False
@@ -1437,11 +1433,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         lambda: (
             True
             if all(
-                (
-                    doc := _lookup_doc_from_url(
-                        session, data_api_url, table_name, key
-                    )
-                )
+                (doc := _lookup_doc_from_url(session, data_api_url, table_name, key))
                 is not None
                 and doc.get("title") == expected["title"]
                 for key, expected in source_docs.items()
@@ -1492,9 +1484,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         assert len(table_manifests) == 1
         table_manifest = json.loads(table_manifests[0].read_text(encoding="utf-8"))
         assert len(table_manifest["shards"]) == 3
-        assert len(
-            {int(shard["group_id"]) for shard in table_manifest["shards"]}
-        ) == 3
+        assert len({int(shard["group_id"]) for shard in table_manifest["shards"]}) == 3
         routed_source_groups = set()
         for key in source_docs:
             matching_shards = [
@@ -1525,10 +1515,12 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         deleted.raise_for_status()
         assert deleted.status_code == 204
         assert wait_until(
-            lambda: cluster.table_absent_on_all_metadata_nodes(
-                table_name, original_table_id, original_group_ids
-            )
-            or None,
+            lambda: (
+                cluster.table_absent_on_all_metadata_nodes(
+                    table_name, original_table_id, original_group_ids
+                )
+                or None
+            ),
             timeout_s=30.0,
             interval_s=0.5,
         ), f"table remained in metadata after delete\n{cluster.debug_logs()}"
@@ -1593,9 +1585,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
                 )
             return None
 
-        restore_job = wait_until(
-            terminal_restore, timeout_s=120.0, interval_s=0.1
-        )
+        restore_job = wait_until(terminal_restore, timeout_s=120.0, interval_s=0.1)
         assert restore_job is not None, (
             f"restore job {job_id} did not finish\n{cluster.debug_logs()}"
         )
@@ -1634,7 +1624,9 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
             restored_docs_visible_from_every_data_node,
             timeout_s=60.0,
             interval_s=0.5,
-        ), f"restored documents were not readable through every data node\n{cluster.debug_logs()}"
+        ), (
+            f"restored documents were not readable through every data node\n{cluster.debug_logs()}"
+        )
 
         assert wait_until(
             lambda: cluster.restore_progress_cleared(table_name) or None,

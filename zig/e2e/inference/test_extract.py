@@ -28,14 +28,23 @@ def _has_reader_model(api) -> bool:
     if not readers:
         return False
 
-    model = "antflydb/florence-2-base" if "antflydb/florence-2-base" in readers else next(iter(readers))
+    model = (
+        "antflydb/florence-2-base"
+        if "antflydb/florence-2-base" in readers
+        else next(iter(readers))
+    )
     resp = api.post(
         "/read",
         json={"model": model, "images": [{"url": TINY_PNG_URI}]},
     )
-    if resp.status_code == 500 and resp.headers.get("content-type", "").startswith("application/json"):
+    if resp.status_code == 500 and resp.headers.get("content-type", "").startswith(
+        "application/json"
+    ):
         payload = resp.json()
-        if payload.get("error") in {"MODEL_LOAD_FAILED", "INFERENCE_FAILED"} and payload.get("message") in {
+        if payload.get("error") in {
+            "MODEL_LOAD_FAILED",
+            "INFERENCE_FAILED",
+        } and payload.get("message") in {
             "MissingWeight",
             "ShapeMismatch",
             "UnsupportedShape",
@@ -170,7 +179,11 @@ def test_extract_rejects_both_texts_and_images(api):
 def test_extract_rejects_missing_structured_schema(api):
     response = api.post(
         "/extract",
-        json={"model": GLINER_MODEL, "inputs": [{"content": "John Smith"}], "schema": {}},
+        json={
+            "model": GLINER_MODEL,
+            "inputs": [{"content": "John Smith"}],
+            "schema": {},
+        },
     )
     assert response.status_code == 400
     assert "schema" in response.json()["message"]
@@ -181,7 +194,9 @@ def test_extract_rejects_images_for_entity_mode(api):
         "/extract",
         json={
             "model": GLINER_MODEL,
-            "inputs": [{"content": [{"type": "image_url", "image_url": {"url": TINY_PNG_URI}}]}],
+            "inputs": [
+                {"content": [{"type": "image_url", "image_url": {"url": TINY_PNG_URI}}]}
+            ],
             "schema": {"entities": ["person"]},
         },
     )
@@ -192,7 +207,11 @@ def test_extract_rejects_images_for_entity_mode(api):
 def test_extract_rejects_relations_without_labels(api):
     response = api.post(
         "/extract",
-        json={"model": GLINER_MODEL, "inputs": [{"content": "John works at Google"}], "schema": {"relations": []}},
+        json={
+            "model": GLINER_MODEL,
+            "inputs": [{"content": "John works at Google"}],
+            "schema": {"relations": []},
+        },
     )
     assert response.status_code == 400
     assert "schema" in response.json()["message"]

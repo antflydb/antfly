@@ -14,10 +14,23 @@ from benchmark_gemma4_cuda_batching import Server, measure_mode
 def parse_args() -> argparse.Namespace:
     repo = pathlib.Path(__file__).resolve().parents[5]
     parser = argparse.ArgumentParser()
-    parser.add_argument("--antfly-bin", type=pathlib.Path, default=repo / "zig/pkg/inference/zig-out/bin/antfly-inference")
-    parser.add_argument("--model", type=pathlib.Path, default=repo / ".models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf")
+    parser.add_argument(
+        "--antfly-bin",
+        type=pathlib.Path,
+        default=repo / "zig/pkg/inference/zig-out/bin/antfly-inference",
+    )
+    parser.add_argument(
+        "--model",
+        type=pathlib.Path,
+        default=repo
+        / ".models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
+    )
     parser.add_argument("--models-dir", type=pathlib.Path, default=repo / ".models")
-    parser.add_argument("--output-dir", type=pathlib.Path, default=pathlib.Path("/tmp/antfly-gemma4-cuda-server"))
+    parser.add_argument(
+        "--output-dir",
+        type=pathlib.Path,
+        default=pathlib.Path("/tmp/antfly-gemma4-cuda-server"),
+    )
     parser.add_argument("--prompt", default="Write one sentence about ants.")
     parser.add_argument("--tokens", type=int, default=256)
     parser.add_argument("--cache-dtype", default="f32")
@@ -26,7 +39,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--startup-timeout", type=float, default=600.0)
     parser.add_argument(
         "--server-prefix",
-        default=str(repo / "zig/pkg/inference/scripts/gemma4/with_gemma4_qat_cuda_tuning.sh"),
+        default=str(
+            repo / "zig/pkg/inference/scripts/gemma4/with_gemma4_qat_cuda_tuning.sh"
+        ),
     )
     args = parser.parse_args()
     args.max_step_items = 1
@@ -41,7 +56,9 @@ def main() -> None:
     if args.tokens < 1 or args.warmups < 0 or args.repeats < 1:
         raise SystemExit("tokens/repeats must be positive and warmups non-negative")
 
-    capacity = ((len(args.prompt.encode("utf-8")) + 3) // 4 + args.tokens + 64 + 31) // 32 * 32
+    capacity = (
+        ((len(args.prompt.encode("utf-8")) + 3) // 4 + args.tokens + 64 + 31) // 32 * 32
+    )
     os.environ["ANTFLY_CAPTURE_FORCE_KV_CAPACITY"] = str(max(capacity, 544))
     args.output_dir.mkdir(parents=True, exist_ok=True)
     body = {
@@ -55,7 +72,9 @@ def main() -> None:
     }
 
     with Server(args, "off", args.output_dir) as server:
-        result = measure_mode(server, [("default", body)], [1], args.warmups, args.repeats)
+        result = measure_mode(
+            server, [("default", body)], [1], args.warmups, args.repeats
+        )
 
     measurement = result["measurements"]["1"]
     deterministic = len(measurement["fingerprints"]) == 1

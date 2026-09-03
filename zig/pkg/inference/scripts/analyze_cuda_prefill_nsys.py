@@ -63,14 +63,22 @@ def _merged_duration_ns(intervals: Iterable[tuple[int, int]]) -> int:
 
 
 def _require_tables(connection: sqlite3.Connection) -> None:
-    required = {"CUPTI_ACTIVITY_KIND_KERNEL", "CUPTI_ACTIVITY_KIND_RUNTIME", "StringIds"}
+    required = {
+        "CUPTI_ACTIVITY_KIND_KERNEL",
+        "CUPTI_ACTIVITY_KIND_RUNTIME",
+        "StringIds",
+    }
     present = {
         row[0]
-        for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
     }
     missing = sorted(required - present)
     if missing:
-        raise ValueError(f"not an Nsight CUDA SQLite export; missing tables: {', '.join(missing)}")
+        raise ValueError(
+            f"not an Nsight CUDA SQLite export; missing tables: {', '.join(missing)}"
+        )
 
 
 def summarize(path: Path) -> dict[str, object]:

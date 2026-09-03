@@ -39,11 +39,13 @@ def test_stress_chunked_semantic_corruption(backup_api, openai_embedder):
         table_name = f"stress_chunked_{i}_{time.time_ns()}"
         backup_id = f"stress-backup-{i}-{time.time_ns()}"
 
-        created = backup_api.create_table(table_name, num_shards=1, description="stress")
+        created = backup_api.create_table(
+            table_name, num_shards=1, description="stress"
+        )
         assert created["name"] == table_name
 
         assert_created_index(
-        backup_api.create_index(
+            backup_api.create_index(
                 table_name,
                 "semantic_chunked_idx",
                 {
@@ -68,11 +70,13 @@ def test_stress_chunked_semantic_corruption(backup_api, openai_embedder):
                     },
                 },
             ),
-        "semantic_chunked_idx",
-        'embeddings',
-    )
+            "semantic_chunked_idx",
+            "embeddings",
+        )
 
-        backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5)
+        backup_api.wait_index_ready(
+            table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5
+        )
 
         batch = backup_api.batch_write(
             table_name,
@@ -91,21 +95,27 @@ def test_stress_chunked_semantic_corruption(backup_api, openai_embedder):
         assert batch["inserted"] == 2, f"iteration {i}"
 
         before_scan = wait_until(
-            lambda: _chunked_doc(backup_api, table_name, "doc:a", "semantic_chunked_idx_chunks"),
+            lambda: _chunked_doc(
+                backup_api, table_name, "doc:a", "semantic_chunked_idx_chunks"
+            ),
             timeout_s=60.0,
             interval_s=0.5,
         )
         assert before_scan is not None, f"iteration {i}"
 
         assert wait_until(
-            lambda: _semantic_top_hit(backup_api, table_name, "alpha concept", "semantic_chunked_idx", "doc:a"),
+            lambda: _semantic_top_hit(
+                backup_api, table_name, "alpha concept", "semantic_chunked_idx", "doc:a"
+            ),
             timeout_s=60.0,
             interval_s=0.5,
         ), f"iteration {i}"
 
         with tempfile.TemporaryDirectory(prefix="antfly-stress-backup-") as backup_dir:
             location = f"file://{backup_dir}"
-            backup = backup_api.backup_table(table_name, backup_id=backup_id, location=location)
+            backup = backup_api.backup_table(
+                table_name, backup_id=backup_id, location=location
+            )
             assert backup["backup"] == "successful", f"iteration {i}"
 
             deleted = backup_api.delete_table(table_name)

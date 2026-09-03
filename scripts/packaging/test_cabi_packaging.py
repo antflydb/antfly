@@ -431,9 +431,7 @@ class CAbiPackagingTests(unittest.TestCase):
         ).read_text()
         self.assertIn("NPM_VERSION: 11.19.1", sdk_npm_workflow)
         self.assertIn('npm install -g "npm@$NPM_VERSION"', sdk_npm_workflow)
-        ts_ci_workflow = (
-            REPO_ROOT / ".github" / "workflows" / "ts-ci.yml"
-        ).read_text()
+        ts_ci_workflow = (REPO_ROOT / ".github" / "workflows" / "ts-ci.yml").read_text()
         for workflow, expected_jobs in (
             (ts_ci_workflow, 2),
             (sdk_npm_workflow, 1),
@@ -505,6 +503,63 @@ class CAbiPackagingTests(unittest.TestCase):
         )
         self.assertIn("sh -n scripts/release/install_bootstrap.sh", test_script)
 
+    def test_python_support_policy_stays_consistent(self) -> None:
+        supported_versions = ["3.11", "3.12", "3.13", "3.14"]
+        minimum_version = supported_versions[0]
+        latest_version = supported_versions[-1]
+
+        sdk_pyproject = (
+            REPO_ROOT / "py" / "packages" / "sdk" / "pyproject.toml"
+        ).read_text()
+        cli_pyproject = (
+            REPO_ROOT / "py" / "packages" / "cli" / "pyproject.toml"
+        ).read_text()
+        legacy_sdk_pyproject = (
+            REPO_ROOT / "py" / "packages" / "sdk" / "src" / "antfly" / "pyproject.toml"
+        ).read_text()
+
+        expected_requires_python = f'requires-python = ">={minimum_version}"'
+        expected_classifiers = [
+            f"Programming Language :: Python :: {version}"
+            for version in supported_versions
+        ]
+        for project in (sdk_pyproject, cli_pyproject):
+            self.assertIn(expected_requires_python, project)
+            version_classifiers = re.findall(
+                r'"(Programming Language :: Python :: 3\.\d+)"', project
+            )
+            self.assertEqual(version_classifiers, expected_classifiers)
+
+        self.assertIn('target-version = "py311"', sdk_pyproject)
+        self.assertIn(f'pythonVersion = "{minimum_version}"', sdk_pyproject)
+        self.assertIn(f'python = "^{minimum_version}"', legacy_sdk_pyproject)
+        self.assertIn('target-version = "py311"', legacy_sdk_pyproject)
+
+        python_ci = (REPO_ROOT / ".github" / "workflows" / "py-ci.yml").read_text()
+        matrix_line = next(
+            line for line in python_ci.splitlines() if "python-version:" in line
+        )
+        matrices = [
+            json.loads(encoded)
+            for encoded in re.findall(r"fromJSON\('([^']+)'\)", matrix_line)
+        ]
+        self.assertEqual(
+            matrices, [[minimum_version, latest_version], supported_versions]
+        )
+        self.assertIn(f"if: matrix.python-version == '{latest_version}'", python_ci)
+
+        pypi_workflow = (
+            REPO_ROOT / ".github" / "workflows" / "py-pypi-publish.yml"
+        ).read_text()
+        self.assertIn(f'python-version: "{latest_version}"', pypi_workflow)
+
+        installation = (
+            REPO_ROOT / "py" / "packages" / "sdk" / "docs" / "installation.rst"
+        ).read_text()
+        self.assertIn(
+            f"Python {minimum_version} through {latest_version}", installation
+        )
+
     def test_cli_platforms_select_libc_specific_linux_archives(self) -> None:
         names = {
             platform.key: package_cli_release.archive_name("1.2.3", platform)
@@ -546,7 +601,7 @@ class CAbiPackagingTests(unittest.TestCase):
             fake_bin = root / "bin"
             fake_bin.mkdir()
             npm = fake_bin / "npm"
-            npm.write_text("#!/bin/sh\n" 'printf \'%s\\n\' "$*" >> "$FAKE_NPM_LOG"\n')
+            npm.write_text('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$FAKE_NPM_LOG"\n')
             npm.chmod(0o755)
             python = fake_bin / "python3"
             python.write_text(
@@ -646,7 +701,7 @@ class CAbiPackagingTests(unittest.TestCase):
                 repo / "py" / "packages" / "cli" / "src" / "antfly_cli" / "__init__.py"
             ).write_text("def main(): return 0\n")
             (repo / "py" / "packages" / "cli" / "pyproject.toml").write_text(
-                '[project]\nname = "antfly-cli"\nrequires-python = ">=3.10"\n'
+                '[project]\nname = "antfly-cli"\nrequires-python = ">=3.11"\n'
             )
 
             package_cli_release.extract_archive(
@@ -673,7 +728,7 @@ class CAbiPackagingTests(unittest.TestCase):
             self.assertIn("antfly_cli/include/antfly.h", names)
             self.assertIn("antfly_cli/lib/libantfly.so", names)
             self.assertIn("antfly_cli/share/antfly/asset.txt", names)
-            self.assertIn("Requires-Python: >=3.10", metadata)
+            self.assertIn("Requires-Python: >=3.11", metadata)
 
     def test_homebrew_formula_installs_cabi_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

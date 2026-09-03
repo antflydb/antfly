@@ -247,7 +247,7 @@ def _serve_fake_hf(files, owner="acme", repo="stump-model"):
                 self.wfile.write(body)
                 return
             if path.startswith(resolve_prefix):
-                filename = path[len(resolve_prefix):]
+                filename = path[len(resolve_prefix) :]
                 data = payloads.get(filename)
                 if data is not None:
                     self.send_response(200)
@@ -271,7 +271,9 @@ def _serve_fake_hf(files, owner="acme", repo="stump-model"):
 
 def _local_cli_models():
     if os.environ.get("ANTFLY_INFERENCE_URL"):
-        pytest.skip("CLI model pull tests require the local e2e server models directory")
+        pytest.skip(
+            "CLI model pull tests require the local e2e server models directory"
+        )
     try:
         command = inference_command()
     except RuntimeError as exc:
@@ -309,7 +311,10 @@ def _write_onnx_linear_regressor(model_path):
     )
     model = helper.make_model(
         graph,
-        opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("ai.onnx.ml", 3)],
+        opset_imports=[
+            helper.make_opsetid("", 18),
+            helper.make_opsetid("ai.onnx.ml", 3),
+        ],
     )
     onnx.save(model, model_path)
 
@@ -346,7 +351,11 @@ def test_pull_hf_tabular_ir_then_predict(api, tmp_path):
     model = json.loads(json.dumps(STUMP_IR))
     model["metadata"]["name"] = "ignored-source-name"
 
-    with _serve_fake_hf({"tabular_model.json": json.dumps(model)}) as (origin, owner, repo):
+    with _serve_fake_hf({"tabular_model.json": json.dumps(model)}) as (
+        origin,
+        owner,
+        repo,
+    ):
         env = {**os.environ, "ANTFLY_INFERENCE_HF_BASE_URL": origin}
         subprocess.run(
             [
@@ -410,7 +419,11 @@ def test_pull_hf_onnx_ml_then_predict(api, tmp_path):
     model_path = tmp_path / "linear.onnx"
     _write_onnx_linear_regressor(model_path)
 
-    with _serve_fake_hf({"model.onnx": model_path.read_bytes()}, repo=repo) as (origin, owner, repo):
+    with _serve_fake_hf({"model.onnx": model_path.read_bytes()}, repo=repo) as (
+        origin,
+        owner,
+        repo,
+    ):
         env = {**os.environ, "ANTFLY_INFERENCE_HF_BASE_URL": origin}
         subprocess.run(
             [
@@ -438,7 +451,11 @@ def test_pull_hf_pickle_only_rejected(tmp_path):
     command, model_root = _local_cli_models()
     repo = "pickle-only"
 
-    with _serve_fake_hf({"model.pkl": b"\x80\x04not safe"}, repo=repo) as (origin, owner, repo):
+    with _serve_fake_hf({"model.pkl": b"\x80\x04not safe"}, repo=repo) as (
+        origin,
+        owner,
+        repo,
+    ):
         env = {**os.environ, "ANTFLY_INFERENCE_HF_BASE_URL": origin}
         result = subprocess.run(
             [
@@ -635,7 +652,10 @@ def test_convert_rejects_unknown_framework(tmp_path):
         capture_output=True,
         text=True,
     )
-    assert "unknown framework 'sklearn'" in result.stderr or "unknown framework 'sklearn'" in result.stdout
+    assert (
+        "unknown framework 'sklearn'" in result.stderr
+        or "unknown framework 'sklearn'" in result.stdout
+    )
 
 
 def test_convert_malformed_xgboost_does_not_crash_server(base_url, tmp_path):
@@ -726,28 +746,32 @@ def test_hostile_int_does_not_crash_loader(base_url, tmp_path):
         "schema_version": 1,
         "metadata": {"name": "x", "num_features": 1, "task": "regression"},
         "output": {"activation": "identity", "num_outputs": 1},
-        "pipeline": [{
-            "type": "tree_ensemble",
-            "tree_ensemble": {
-                "objective": "x",
-                "num_trees": 2147483648,  # > i32 max
-                "num_features": 1,
-                "max_depth": 1,
-                "nodes": {
-                    "feature_index": [-1],
-                    "threshold": [0],
-                    "left_child": [-1],
-                    "right_child": [-1],
-                    "leaf_value": [1.0],
-                    "default_left": [False],
-                    "tree_starts": [0],
+        "pipeline": [
+            {
+                "type": "tree_ensemble",
+                "tree_ensemble": {
+                    "objective": "x",
+                    "num_trees": 2147483648,  # > i32 max
+                    "num_features": 1,
+                    "max_depth": 1,
+                    "nodes": {
+                        "feature_index": [-1],
+                        "threshold": [0],
+                        "left_child": [-1],
+                        "right_child": [-1],
+                        "leaf_value": [1.0],
+                        "default_left": [False],
+                        "tree_starts": [0],
+                    },
                 },
-            },
-        }],
+            }
+        ],
     }
     hosted_dir = tmp_path / "hostile"
     hosted_dir.mkdir()
-    (hosted_dir / "tabular_model.json").write_text(json.dumps(malicious), encoding="utf-8")
+    (hosted_dir / "tabular_model.json").write_text(
+        json.dumps(malicious), encoding="utf-8"
+    )
     with _serve_directory(hosted_dir) as origin:
         result = subprocess.run(
             [

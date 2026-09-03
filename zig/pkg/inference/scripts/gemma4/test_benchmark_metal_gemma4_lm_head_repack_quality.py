@@ -151,7 +151,9 @@ class ThresholdContractTests(unittest.TestCase):
         quality.validate_campaign_dimensions(2, quality.REVIEWED_VOCAB_SIZE, 120.0)
         for repetitions in (1, 5):
             with self.subTest(repetitions=repetitions):
-                with self.assertRaisesRegex(quality.ContractError, "determinism is observable"):
+                with self.assertRaisesRegex(
+                    quality.ContractError, "determinism is observable"
+                ):
                     quality.validate_campaign_dimensions(
                         repetitions,
                         quality.REVIEWED_VOCAB_SIZE,
@@ -172,14 +174,18 @@ class ThresholdContractTests(unittest.TestCase):
 class EvidenceContractTests(unittest.TestCase):
     def test_output_directory_must_be_new_and_outside_the_repository(self) -> None:
         repo = SCRIPT_DIR.parents[4]
-        with self.assertRaisesRegex(quality.ContractError, "outside the source repository"):
+        with self.assertRaisesRegex(
+            quality.ContractError, "outside the source repository"
+        ):
             quality.validate_output_directory(repo / "new-evidence", repo)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with self.assertRaisesRegex(quality.ContractError, "already exists"):
                 quality.validate_output_directory(root, repo)
             expected = (root / "new-evidence").resolve()
-            self.assertEqual(expected, quality.validate_output_directory(expected, repo))
+            self.assertEqual(
+                expected, quality.validate_output_directory(expected, repo)
+            )
 
     def test_clean_environment_drops_unreviewed_policy_variables(self) -> None:
         with mock.patch.dict(
@@ -191,7 +197,9 @@ class EvidenceContractTests(unittest.TestCase):
             },
             clear=True,
         ):
-            env = quality.clean_environment({"TERMITE_METAL_DUMP_GENERATE_LOGITS_F32": "/tmp/out"})
+            env = quality.clean_environment(
+                {"TERMITE_METAL_DUMP_GENERATE_LOGITS_F32": "/tmp/out"}
+            )
         self.assertEqual("/safe-home", env["HOME"])
         self.assertEqual("/tmp/out", env["TERMITE_METAL_DUMP_GENERATE_LOGITS_F32"])
         self.assertNotIn("TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK", env)
@@ -212,7 +220,9 @@ class EvidenceContractTests(unittest.TestCase):
             root = Path(directory)
             wrong_size = root / "wrong.f32"
             wrong_size.write_bytes(b"short")
-            with self.assertRaisesRegex(quality.ContractError, "invalid logit dump size"):
+            with self.assertRaisesRegex(
+                quality.ContractError, "invalid logit dump size"
+            ):
                 quality.read_logits(wrong_size, 2)
 
             nonfinite = root / "nonfinite.f32"
@@ -258,7 +268,9 @@ class EvidenceContractTests(unittest.TestCase):
             )
             self.assertFalse(metrics["refined_top1_match"])
 
-            with self.assertRaisesRegex(quality.ContractError, "duplicate or out-of-range"):
+            with self.assertRaisesRegex(
+                quality.ContractError, "duplicate or out-of-range"
+            ):
                 quality.compare_logits(
                     baseline_path,
                     candidate_path,

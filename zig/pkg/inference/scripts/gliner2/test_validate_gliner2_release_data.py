@@ -24,18 +24,29 @@ from validate_gliner2_release_data import (
 ALL_TASKS = frozenset({"entities", "classifications", "json_structures", "relations"})
 
 
-def dataset(records: list[str], texts: list[str], tasks: frozenset[str] = ALL_TASKS) -> DatasetContent:
+def dataset(
+    records: list[str], texts: list[str], tasks: frozenset[str] = ALL_TASKS
+) -> DatasetContent:
     hashes = [digest(row) for row in records]
-    return DatasetContent(len(hashes), len(set(hashes)) != len(hashes), frozenset(digest(text) for text in texts), tasks)
+    return DatasetContent(
+        len(hashes),
+        len(set(hashes)) != len(hashes),
+        frozenset(digest(text) for text in texts),
+        tasks,
+    )
 
 
 class ReleaseDataValidationTest(unittest.TestCase):
-    def test_peft_fingerprint_accepts_standard_adapter_without_zig_task_head(self) -> None:
+    def test_peft_fingerprint_accepts_standard_adapter_without_zig_task_head(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             adapter_dir = Path(tmp)
             (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
             (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
-            self.assertRegex(peft_adapter_fingerprint(adapter_dir), r"^sha256:[0-9a-f]{64}$")
+            self.assertRegex(
+                peft_adapter_fingerprint(adapter_dir), r"^sha256:[0-9a-f]{64}$"
+            )
             with self.assertRaisesRegex(ValueError, "task_head.safetensors"):
                 adapter_bundle_fingerprint(adapter_dir)
 
@@ -63,7 +74,12 @@ class ReleaseDataValidationTest(unittest.TestCase):
             (train, dataset(["eval-a", "eval-a"], ["gamma"]), frozenset(), True),
             (train, dataset(["eval-a"], ["alpha"]), frozenset(), True),
             (train, eval_, frozenset({digest("beta")}), True),
-            (dataset(["train-a"], ["alpha"], frozenset({"entities"})), eval_, frozenset(), True),
+            (
+                dataset(["train-a"], ["alpha"], frozenset({"entities"})),
+                eval_,
+                frozenset(),
+                True,
+            ),
         )
         for args in bad_inputs:
             with self.subTest(args=args), self.assertRaises(ValueError):
@@ -78,19 +94,30 @@ class ReleaseDataValidationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_release_data(train, eval_, frozenset(), True, min_eval_records=2)
         with self.assertRaises(ValueError):
-            validate_release_data(train, eval_, frozenset(), True, comparison_train=prefix)
+            validate_release_data(
+                train, eval_, frozenset(), True, comparison_train=prefix
+            )
 
     def test_empty_task_placeholders_do_not_count_as_coverage(self) -> None:
         empty = {
             "input": "fine",
-            "output": {"entities": {}, "classifications": [], "json_structures": [], "relations": []},
+            "output": {
+                "entities": {},
+                "classifications": [],
+                "json_structures": [],
+                "relations": [],
+            },
         }
         self.assertEqual(set(), record_tasks(empty))
         negative_or_incomplete = {
             "input": "fine",
             "output": {
                 "classifications": [
-                    {"task": "priority", "labels": ["normal", "urgent"], "true_label": []}
+                    {
+                        "task": "priority",
+                        "labels": ["normal", "urgent"],
+                        "true_label": [],
+                    }
                 ],
                 "relations": [{"works_for": {"head": "Alice", "tail": ""}}],
             },
@@ -102,10 +129,19 @@ class ReleaseDataValidationTest(unittest.TestCase):
             root = Path(tmp)
             train_path = root / "train.jsonl"
             eval_path = root / "eval.jsonl"
-            train_path.write_text(json.dumps({"input": "  CAFÉ   worker "}) + "\n", encoding="utf-8")
-            eval_path.write_text(json.dumps({"input": "cafe\u0301 worker"}) + "\n", encoding="utf-8")
+            train_path.write_text(
+                json.dumps({"input": "  CAFÉ   worker "}) + "\n", encoding="utf-8"
+            )
+            eval_path.write_text(
+                json.dumps({"input": "cafe\u0301 worker"}) + "\n", encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "overlap"):
-                validate_release_data(load_dataset(train_path), load_dataset(eval_path), frozenset(), False)
+                validate_release_data(
+                    load_dataset(train_path),
+                    load_dataset(eval_path),
+                    frozenset(),
+                    False,
+                )
 
     def test_rejects_recycled_normalized_inputs_with_different_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -114,11 +150,15 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 {"input": "CAFÉ worker", "metadata": 1},
                 {"input": " cafe\u0301   WORKER ", "metadata": 2},
             ]
-            path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "normalized input texts"):
                 validate_release_data(load_dataset(path), None, frozenset(), False)
 
-    def test_release_adapter_provenance_matches_exact_training_data_and_model(self) -> None:
+    def test_release_adapter_provenance_matches_exact_training_data_and_model(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             model_dir = root / "model"
@@ -145,7 +185,9 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 "lora_dropout": 0,
                 "target_modules": ["encoder.layer.0.query_proj"],
             }
-            (adapter_dir / "adapter_config.json").write_text(json.dumps(adapter_config), encoding="utf-8")
+            (adapter_dir / "adapter_config.json").write_text(
+                json.dumps(adapter_config), encoding="utf-8"
+            )
             manifest = {
                 "schema_version": "gliner2_autodiff_training/v3",
                 "backend": "Metal",
@@ -210,7 +252,9 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 "best_checkpoint_sha256": sha256_file(best_checkpoint),
                 "training_state_fingerprint_sha256": "sha256:" + "2" * 64,
                 "base_model_fingerprint_sha256": base_model_fingerprint(model_dir),
-                "adapter_bundle_fingerprint_sha256": adapter_bundle_fingerprint(adapter_dir),
+                "adapter_bundle_fingerprint_sha256": adapter_bundle_fingerprint(
+                    adapter_dir
+                ),
             }
             metal_step = {
                 "event": "step",
@@ -227,23 +271,35 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 "graph_executor_interpreter_fallbacks": 0,
                 "graph_executor_true_host_outputs": 0,
             }
+
             def write_metal_steps(count: int) -> None:
                 (adapter_dir / "training_metrics.jsonl").write_text(
-                    "".join(json.dumps({**metal_step, "step": step}) + "\n" for step in range(1, count + 1)),
+                    "".join(
+                        json.dumps({**metal_step, "step": step}) + "\n"
+                        for step in range(1, count + 1)
+                    ),
                     encoding="utf-8",
                 )
 
             write_metal_steps(1)
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
 
             for key, bad_value in (("backend", "native"), ("compiled_required", False)):
                 with self.subTest(production_manifest_field=key, bad_value=bad_value):
                     original = manifest[key]
                     manifest[key] = bad_value
-                    (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-                    with self.assertRaisesRegex(ValueError, "METAL training with compiled_required"):
-                        validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
+                    (adapter_dir / "training_manifest.json").write_text(
+                        json.dumps(manifest), encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "METAL training with compiled_required"
+                    ):
+                        validate_release_artifact_provenance(
+                            model_dir, train_path, adapter_dir
+                        )
                     manifest[key] = original
 
             bad_training_policy_values = (
@@ -259,9 +315,15 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 with self.subTest(training_policy_field=key, bad_value=bad_value):
                     original = manifest[key]
                     manifest[key] = bad_value
-                    (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-                    with self.assertRaisesRegex(ValueError, "training-policy provenance"):
-                        validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
+                    (adapter_dir / "training_manifest.json").write_text(
+                        json.dumps(manifest), encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "training-policy provenance"
+                    ):
+                        validate_release_artifact_provenance(
+                            model_dir, train_path, adapter_dir
+                        )
                     manifest[key] = original
 
             bad_step_values = (
@@ -280,9 +342,13 @@ class ReleaseDataValidationTest(unittest.TestCase):
                     (adapter_dir / "training_metrics.jsonl").write_text(
                         json.dumps(bad_step) + "\n", encoding="utf-8"
                     )
-                    (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+                    (adapter_dir / "training_manifest.json").write_text(
+                        json.dumps(manifest), encoding="utf-8"
+                    )
                     with self.assertRaisesRegex(ValueError, "release adapter step"):
-                        validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
+                        validate_release_artifact_provenance(
+                            model_dir, train_path, adapter_dir
+                        )
             write_metal_steps(1)
 
             cuda_step = {
@@ -303,9 +369,15 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 "cuda_exact_gelu_backward_calls": 1,
             }
             manifest["backend"] = "CUDA"
-            (adapter_dir / "training_metrics.jsonl").write_text(json.dumps(cuda_step) + "\n", encoding="utf-8")
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-            validate_release_artifact_provenance(model_dir, train_path, adapter_dir, backend="cuda")
+            (adapter_dir / "training_metrics.jsonl").write_text(
+                json.dumps(cuda_step) + "\n", encoding="utf-8"
+            )
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            validate_release_artifact_provenance(
+                model_dir, train_path, adapter_dir, backend="cuda"
+            )
             for key, bad_value in (
                 ("cuda_d2h_bytes", 9),
                 ("cuda_largest_d2h_transfer_bytes", 5),
@@ -318,16 +390,22 @@ class ReleaseDataValidationTest(unittest.TestCase):
                     (adapter_dir / "training_metrics.jsonl").write_text(
                         json.dumps(bad_cuda_step) + "\n", encoding="utf-8"
                     )
-                    with self.assertRaisesRegex(ValueError, "disallowed CUDA transfer or synchronization"):
+                    with self.assertRaisesRegex(
+                        ValueError, "disallowed CUDA transfer or synchronization"
+                    ):
                         validate_release_artifact_provenance(
                             model_dir,
                             train_path,
                             adapter_dir,
                             backend="cuda",
                         )
-            (adapter_dir / "training_metrics.jsonl").write_text(json.dumps(cuda_step) + "\n", encoding="utf-8")
+            (adapter_dir / "training_metrics.jsonl").write_text(
+                json.dumps(cuda_step) + "\n", encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "METAL training"):
-                validate_release_artifact_provenance(model_dir, train_path, adapter_dir, backend="metal")
+                validate_release_artifact_provenance(
+                    model_dir, train_path, adapter_dir, backend="metal"
+                )
             manifest["backend"] = "Metal"
             write_metal_steps(1)
 
@@ -350,37 +428,53 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 with self.subTest(shape_cache_field=key, bad_value=bad_value):
                     original = manifest[key]
                     manifest[key] = bad_value
-                    (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-                    with self.assertRaisesRegex(ValueError, "graph-shape/cache provenance"):
-                        validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
+                    (adapter_dir / "training_manifest.json").write_text(
+                        json.dumps(manifest), encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "graph-shape/cache provenance"
+                    ):
+                        validate_release_artifact_provenance(
+                            model_dir, train_path, adapter_dir
+                        )
                     manifest[key] = original
             missing_shape_policy = manifest.pop("graph_shape_policy")
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "graph-shape/cache provenance"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["graph_shape_policy"] = missing_shape_policy
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
 
             original_eval_digest = manifest["eval_data_sha256"]
             manifest["eval_data_sha256"] = "sha256:" + "0" * 64
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "eval-data fingerprint"):
-                validate_release_artifact_provenance(model_dir, train_path, adapter_dir, eval_data=eval_path)
+                validate_release_artifact_provenance(
+                    model_dir, train_path, adapter_dir, eval_data=eval_path
+                )
             manifest["eval_data_sha256"] = original_eval_digest
 
             original_best_digest = manifest["best_checkpoint_sha256"]
             manifest["best_checkpoint_sha256"] = "sha256:" + "0" * 64
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "best-checkpoint fingerprint"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["best_checkpoint_sha256"] = original_best_digest
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
 
             resume_bytes = b"resume training state"
             resume_digest = "sha256:" + hashlib.sha256(resume_bytes).hexdigest()
-            resume_relative_path = (
-                f"checkpoints/resume-source-{resume_digest.removeprefix('sha256:')}.safetensors"
-            )
+            resume_relative_path = f"checkpoints/resume-source-{resume_digest.removeprefix('sha256:')}.safetensors"
             resume_checkpoint = adapter_dir / resume_relative_path
             resume_checkpoint.write_bytes(resume_bytes)
             manifest.update(
@@ -392,7 +486,9 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 resume_restored_optimizer_steps=1,
                 resume_restored_epochs=1,
             )
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest.update(
                 epochs=2,
@@ -404,7 +500,9 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 eval_count=2,
                 resume_restored_micro_batch_steps=2,
             )
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "resumed-run accounting"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest.update(
@@ -418,17 +516,23 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 resume_restored_micro_batch_steps=1,
             )
             manifest["resume_checkpoint"] = "checkpoints/epoch-1.safetensors"
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "retained resume-checkpoint path"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["resume_checkpoint"] = resume_relative_path
             resume_checkpoint.write_bytes(b"corrupt")
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "resume-checkpoint fingerprint"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             resume_checkpoint.write_bytes(resume_bytes)
             manifest["resume_checkpoint_sha256"] = "not-a-digest"
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "incomplete resume provenance"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             for key in (
@@ -442,13 +546,17 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 manifest.pop(key)
 
             manifest["max_examples"] = False
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "complete dataset"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["max_examples"] = 0
 
             manifest["max_steps"] = manifest["requested_max_steps"] = False
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "uncapped training"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["max_steps"] = manifest["requested_max_steps"] = 0
@@ -456,7 +564,9 @@ class ReleaseDataValidationTest(unittest.TestCase):
             manifest["initial_adapter_checkpoint_used"] = True
             manifest["initial_adapter_checkpoint"] = "/untracked/ancestor.safetensors"
             manifest["initial_adapter_checkpoint_sha256"] = "sha256:" + "0" * 64
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "clean base-model initialization"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["initial_adapter_checkpoint_used"] = False
@@ -464,28 +574,40 @@ class ReleaseDataValidationTest(unittest.TestCase):
             del manifest["initial_adapter_checkpoint_sha256"]
 
             manifest["max_steps"] = manifest["requested_max_steps"] = 1
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "uncapped training"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["max_steps"] = manifest["requested_max_steps"] = 0
             manifest["optimizer_steps"] = 0
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "epoch or optimizer-step accounting"):
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                ValueError, "epoch or optimizer-step accounting"
+            ):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["optimizer_steps"] = 1
 
             manifest["optimizer_steps"] = manifest["effective_steps"] = 2
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "completed-run accounting"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["optimizer_steps"] = manifest["effective_steps"] = 1
             manifest["micro_batch_steps"] = 2
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "completed-run accounting"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["micro_batch_steps"] = 1
             manifest["requested_epochs"] = 2
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "completion or a valid early stop"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["requested_epochs"] = 1
@@ -503,14 +625,20 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 early_stopping_bad_epochs=1,
             )
             write_metal_steps(2)
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["early_stopping_bad_epochs"] = 0
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "early-stopping provenance"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["early_stopping_bad_epochs"] = 2
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "early-stopping provenance"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest.update(
@@ -538,9 +666,15 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 micro_batch_steps=3,
                 total_steps=3,
             )
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "does not consume every training record"):
-                validate_release_artifact_provenance(model_dir, train_path, adapter_dir, 101)
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                ValueError, "does not consume every training record"
+            ):
+                validate_release_artifact_provenance(
+                    model_dir, train_path, adapter_dir, 101
+                )
 
             manifest.update(
                 example_count=3,
@@ -555,7 +689,9 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 total_steps=3,
             )
             write_metal_steps(3)
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             validate_release_artifact_provenance(model_dir, train_path, adapter_dir, 3)
 
             manifest.update(
@@ -571,37 +707,59 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 total_steps=1,
             )
             write_metal_steps(1)
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["grad_accum"] = 1
 
             manifest["effective_batch_size"] = 2
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "inconsistent batch accounting"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["effective_batch_size"] = 1
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
 
             adapter_config["lora_alpha"] = 64
-            (adapter_dir / "adapter_config.json").write_text(json.dumps(adapter_config), encoding="utf-8")
-            manifest["adapter_bundle_fingerprint_sha256"] = adapter_bundle_fingerprint(adapter_dir)
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "adapter_config.json").write_text(
+                json.dumps(adapter_config), encoding="utf-8"
+            )
+            manifest["adapter_bundle_fingerprint_sha256"] = adapter_bundle_fingerprint(
+                adapter_dir
+            )
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "LoRA metadata"):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             adapter_config["lora_alpha"] = 32
-            (adapter_dir / "adapter_config.json").write_text(json.dumps(adapter_config), encoding="utf-8")
-            manifest["adapter_bundle_fingerprint_sha256"] = adapter_bundle_fingerprint(adapter_dir)
-            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (adapter_dir / "adapter_config.json").write_text(
+                json.dumps(adapter_config), encoding="utf-8"
+            )
+            manifest["adapter_bundle_fingerprint_sha256"] = adapter_bundle_fingerprint(
+                adapter_dir
+            )
+            (adapter_dir / "training_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
 
             missing_model_file = model_dir / "tokenizer_config.json"
             missing_model_file.unlink()
-            with self.assertRaisesRegex(ValueError, "required fingerprint file is missing"):
+            with self.assertRaisesRegex(
+                ValueError, "required fingerprint file is missing"
+            ):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             missing_model_file.write_bytes(b"tokenizer_config.json")
 
             missing_adapter_file = adapter_dir / "task_head.safetensors"
             missing_adapter_file.unlink()
-            with self.assertRaisesRegex(ValueError, "required fingerprint file is missing"):
+            with self.assertRaisesRegex(
+                ValueError, "required fingerprint file is missing"
+            ):
                 validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             missing_adapter_file.write_bytes(b"compatibility head")
 

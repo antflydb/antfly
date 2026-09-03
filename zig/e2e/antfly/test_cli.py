@@ -106,7 +106,9 @@ def assert_no_unexpected_semantic_warning(
     result: subprocess.CompletedProcess[str], index_name: str
 ) -> None:
     warning_lines = [
-        line.lower() for line in result.stderr.splitlines() if "warning:" in line.lower()
+        line.lower()
+        for line in result.stderr.splitlines()
+        if "warning:" in line.lower()
     ]
     if not warning_lines:
         return

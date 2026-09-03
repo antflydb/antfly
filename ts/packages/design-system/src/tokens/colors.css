@@ -9,51 +9,51 @@
 
 :root {
   /* honey-amber ramp — the single accent hue */
-  --amber-50:  #fdf6e3;
+  --amber-50: #fdf6e3;
   --amber-100: #f9e9bf;
   --amber-200: #f3d488;
   --amber-300: #ecbc4a;
-  --amber-400: #e3a112;  /* primary fill */
+  --amber-400: #e3a112; /* primary fill */
   --amber-500: #c4850b;
   --amber-600: #9c6907;
   --amber-700: #6f4a05;
 
   /* neutral paper + ink (light) */
-  --background:           #fafafa;
+  --background: #fafafa;
   --background-secondary: #f2f2f1;
-  --foreground:           #1b1b1a;
+  --foreground: #1b1b1a;
 
-  --card:            #ffffff;
+  --card: #ffffff;
   --card-foreground: #1b1b1a;
 
-  --popover:            #ffffff;
+  --popover: #ffffff;
   --popover-foreground: #1b1b1a;
 
   /* amber primary */
-  --primary:            var(--amber-400);
-  --primary-foreground: #221a06;   /* ink ON amber fills */
+  --primary: var(--amber-400);
+  --primary-foreground: #221a06; /* ink ON amber fills */
 
-  --secondary:            #f2f2f1;
+  --secondary: #f2f2f1;
   --secondary-foreground: #1b1b1a;
 
-  --muted:            #f2f2f1;
+  --muted: #f2f2f1;
   --muted-foreground: #54534f;
 
-  --accent:            #f2f2f1;
+  --accent: #f2f2f1;
   --accent-foreground: #1b1b1a;
 
   /* semantic — muted; express via border+icon+text, not loud fills.
      warning is HOT-ORANGE (not brand amber) to avoid colliding with the brand. */
-  --destructive:            #b23c34;
+  --destructive: #b23c34;
   --destructive-foreground: #ffffff;
 
-  --success:            #4d7a45;
+  --success: #4d7a45;
   --success-foreground: #ffffff;
 
-  --warning:            #d3641a;
+  --warning: #d3641a;
   --warning-foreground: #ffffff;
 
-  --info:            #3f6c98;
+  --info: #3f6c98;
   --info-foreground: #ffffff;
 
   /* Compatibility scales for dashboards migrating from local token files.
@@ -132,10 +132,10 @@
   --warning-900: #78350f;
   --warning-fg: #ffffff;
 
-  --border:        #e4e3e0;   /* subtle separator — in-flow chassis, table rows, dividers */
-  --border-strong: #cbcac6;   /* firm edge — floating surfaces (dialog, popover, menus) */
-  --input:         #cbcac6;   /* control edge — firmer than --border so controls pop */
-  --ring:          #1b1b1a;   /* ink focus ring */
+  --border: #e4e3e0; /* subtle separator — in-flow chassis, table rows, dividers */
+  --border-strong: #cbcac6; /* firm edge — floating surfaces (dialog, popover, menus) */
+  --input: #cbcac6; /* control edge — firmer than --border so controls pop */
+  --ring: #1b1b1a; /* ink focus ring */
 
   /* Chart palette — amber leads, ink/neutral pair, then semantic family */
   --chart-1: var(--primary);
@@ -146,23 +146,23 @@
   --chart-6: var(--info);
 
   /* Sidebar */
-  --sidebar:                    var(--background);
-  --sidebar-foreground:         var(--foreground);
-  --sidebar-expanded:           var(--background-secondary);
-  --sidebar-primary:            var(--primary);
+  --sidebar: var(--background);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-expanded: var(--background-secondary);
+  --sidebar-primary: var(--primary);
   --sidebar-primary-foreground: var(--primary-foreground);
-  --sidebar-accent:             var(--accent);
-  --sidebar-accent-foreground:  var(--accent-foreground);
-  --sidebar-border:             var(--border);
-  --sidebar-ring:               var(--ring);
+  --sidebar-accent: var(--accent);
+  --sidebar-accent-foreground: var(--accent-foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
 
   /* Graph paper background — faint hex tessellation */
   --grid-color: rgba(27, 27, 26, 0.05);
-  --grid-size:  24px;
+  --grid-size: 24px;
 
   /* Mono label voice */
   --label-color: var(--muted-foreground);
-  --label-size:  0.75rem;
+  --label-size: 0.75rem;
 
   /* Anty character glow — amber (purple retired). Hotter than ambient
      UI amber so the mascot still reads as "alive" in a warm-monochrome system. */
@@ -172,39 +172,39 @@
 
 .dark {
   /* neutral near-black — modeled on the prototype's protobar palette */
-  --background:           #121212;
+  --background: #121212;
   --background-secondary: #1a1a1a;
-  --foreground:           #ededec;
+  --foreground: #ededec;
 
-  --card:            #1c1c1c;
+  --card: #1c1c1c;
   --card-foreground: #ededec;
 
-  --popover:            #1c1c1c;
+  --popover: #1c1c1c;
   --popover-foreground: #ededec;
 
-  --amber-400: #ecb52e;   /* a touch brighter on dark */
-  --primary:            var(--amber-400);
+  --amber-400: #ecb52e; /* a touch brighter on dark */
+  --primary: var(--amber-400);
   --primary-foreground: #1c1407;
 
-  --secondary:            #1a1a1a;
+  --secondary: #1a1a1a;
   --secondary-foreground: #ededec;
 
-  --muted:            #1a1a1a;
+  --muted: #1a1a1a;
   --muted-foreground: #b2b1ad;
 
-  --accent:            #1a1a1a;
+  --accent: #1a1a1a;
   --accent-foreground: #ededec;
 
-  --destructive:            #d96a61;
+  --destructive: #d96a61;
   --destructive-foreground: #ffffff;
 
-  --success:            #6fa362;
+  --success: #6fa362;
   --success-foreground: #121212;
 
-  --warning:            #e8854a;
+  --warning: #e8854a;
   --warning-foreground: #121212;
 
-  --info:            #6fa0cf;
+  --info: #6fa0cf;
   --info-foreground: #121212;
 
   --searchaf-1: #0a0a0a;
@@ -281,10 +281,10 @@
   --warning-900: #fef3c7;
   --warning-fg: #ffffff;
 
-  --border:        #2c2c2c;   /* subtle separator — in-flow chassis, table rows, dividers */
-  --border-strong: #444443;   /* firm edge — floating surfaces (dialog, popover, menus) */
-  --input:         #444443;   /* control edge — firmer than --border so controls pop */
-  --ring:          #ededec;   /* ink focus ring (light ink on dark) */
+  --border: #2c2c2c; /* subtle separator — in-flow chassis, table rows, dividers */
+  --border-strong: #444443; /* firm edge — floating surfaces (dialog, popover, menus) */
+  --input: #444443; /* control edge — firmer than --border so controls pop */
+  --ring: #ededec; /* ink focus ring (light ink on dark) */
 
   --chart-1: var(--primary);
   --chart-2: var(--muted-foreground);
@@ -293,15 +293,15 @@
   --chart-5: var(--warning);
   --chart-6: var(--info);
 
-  --sidebar:                    var(--background);
-  --sidebar-foreground:         var(--foreground);
-  --sidebar-expanded:           var(--background-secondary);
-  --sidebar-primary:            var(--primary);
+  --sidebar: var(--background);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-expanded: var(--background-secondary);
+  --sidebar-primary: var(--primary);
   --sidebar-primary-foreground: var(--primary-foreground);
-  --sidebar-accent:             var(--accent);
-  --sidebar-accent-foreground:  var(--accent-foreground);
-  --sidebar-border:             var(--border);
-  --sidebar-ring:               var(--ring);
+  --sidebar-accent: var(--accent);
+  --sidebar-accent-foreground: var(--accent-foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
 
   --grid-color: rgba(236, 235, 234, 0.045);
   --label-color: var(--muted-foreground);

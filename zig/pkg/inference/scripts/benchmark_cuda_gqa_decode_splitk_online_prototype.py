@@ -67,12 +67,8 @@ PARITY_SCORE_HD256 = (
 PARITY_SCORE_HD512 = (
     "antfly_gqa_attention_decode_score_parallel_exact_hd512_global_f16_prototype"
 )
-ACCURATE_MERGE_HD256 = (
-    "antfly_gqa_attention_decode_splitk_online_accurate_merge_hd256_swa512_f16_complete_prototype"
-)
-ACCURATE_MERGE_HD512 = (
-    "antfly_gqa_attention_decode_splitk_online_accurate_merge_hd512_global_f16_complete_prototype"
-)
+ACCURATE_MERGE_HD256 = "antfly_gqa_attention_decode_splitk_online_accurate_merge_hd256_swa512_f16_complete_prototype"
+ACCURATE_MERGE_HD512 = "antfly_gqa_attention_decode_splitk_online_accurate_merge_hd512_global_f16_complete_prototype"
 SCORE_HD256 = "antfly_gqa_attention_decode_turboquant_score_prework_hd256_f32_v1"
 TILED_HD256 = (
     "antfly_gqa_attention_decode_turboquant_score_prework_tiled64_hd256_f32_v1"
@@ -122,9 +118,7 @@ class Cuda:
                 f"prototype is qualified only on SM89; found {self.compute_capability}"
             )
         context = ctypes.c_void_p()
-        self.check(
-            self.cuCtxCreate(ctypes.byref(context), 0, device), "cuCtxCreate_v2"
-        )
+        self.check(self.cuCtxCreate(ctypes.byref(context), 0, device), "cuCtxCreate_v2")
         self.context = context
         self.allocations: list[int] = []
         self.modules: list[ctypes.c_void_p] = []
@@ -193,9 +187,7 @@ class Cuda:
         self.cuEventCreate = bind(
             "cuEventCreate", [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
         )
-        self.cuEventRecord = bind(
-            "cuEventRecord", [ctypes.c_void_p, ctypes.c_void_p]
-        )
+        self.cuEventRecord = bind("cuEventRecord", [ctypes.c_void_p, ctypes.c_void_p])
         self.cuEventSynchronize = bind("cuEventSynchronize", [ctypes.c_void_p])
         self.cuEventElapsedTime = bind(
             "cuEventElapsedTime",
@@ -438,7 +430,9 @@ def sha256_file(path: Path) -> str:
 
 
 def guarded_image(payload: bytes | bytearray) -> bytes:
-    return bytes([CANARY]) * GUARD_BYTES + bytes(payload) + bytes([CANARY]) * GUARD_BYTES
+    return (
+        bytes([CANARY]) * GUARD_BYTES + bytes(payload) + bytes([CANARY]) * GUARD_BYTES
+    )
 
 
 def upload_guarded(cuda: Cuda, payload: bytes | bytearray) -> Guarded:
@@ -1141,9 +1135,7 @@ def paired_timing(
         if stable_attempts
         else min(
             attempts,
-            key=lambda attempt: max(
-                attempt["candidate_cv"], attempt["baseline_cv"]
-            ),
+            key=lambda attempt: max(attempt["candidate_cv"], attempt["baseline_cv"]),
         )
     )
     return {
@@ -1202,7 +1194,9 @@ def cpu_sample(
     """
 
     begin, end = case.visible_range
-    dimensions = sorted({0, case.head_dim // 3, (2 * case.head_dim) // 3, case.head_dim - 1})
+    dimensions = sorted(
+        {0, case.head_dim // 3, (2 * case.head_dim) // 3, case.head_dim - 1}
+    )
     heads = (0, HEADS - 1)
     candidate_values = [
         struct.unpack_from("<f", candidate_output, index * 4)[0]
@@ -1235,9 +1229,7 @@ def cpu_sample(
             )
             scored.append((physical, dot / math.sqrt(case.head_dim)))
         maximum = max((score for _, score in scored), default=-math.inf)
-        weighted = [
-            (physical, math.exp(score - maximum)) for physical, score in scored
-        ]
+        weighted = [(physical, math.exp(score - maximum)) for physical, score in scored]
         denominator = math.fsum(weight for _, weight in weighted)
         for dimension in dimensions:
             expected = (
@@ -1256,8 +1248,10 @@ def cpu_sample(
             index = head * case.head_dim + dimension
             candidate = candidate_values[index]
             baseline = None if baseline_values is None else baseline_values[index]
-            if not math.isfinite(expected) or not math.isfinite(candidate) or (
-                baseline is not None and not math.isfinite(baseline)
+            if (
+                not math.isfinite(expected)
+                or not math.isfinite(candidate)
+                or (baseline is not None and not math.isfinite(baseline))
             ):
                 nonfinite += 1
             else:
@@ -1422,9 +1416,7 @@ def run_geometry_sweep(
                 and numeric["cosine_similarity"] >= min_cosine
             )
             integrity_pass = all(
-                value == 0
-                for group in integrity.values()
-                for value in group.values()
+                value == 0 for group in integrity.values() for value in group.values()
             )
             timing = None
             if iterations:
@@ -1439,8 +1431,7 @@ def run_geometry_sweep(
                     max_cv,
                 )
             timing_pass = timing is None or (
-                timing["candidate_cv"] <= max_cv
-                and timing["baseline_cv"] <= max_cv
+                timing["candidate_cv"] <= max_cv and timing["baseline_cv"] <= max_cv
             )
             results.append(
                 {
@@ -1576,9 +1567,7 @@ def run_case(
 
         candidate_payload = payload(candidate_first)
         candidate_repeat = diff_f32(candidate_payload, payload(candidate_second))
-        two_stage_equivalence = diff_f32(
-            payload(two_stage_first), candidate_payload
-        )
+        two_stage_equivalence = diff_f32(payload(two_stage_first), candidate_payload)
         if baseline_first is None:
             zero_reference = bytes(len(candidate_payload))
             numeric = diff_f32(zero_reference, candidate_payload)
@@ -1649,7 +1638,12 @@ def run_case(
                 ),
             },
             "baseline_output": (
-                {"guard_mutations": 0, "used_poison_elements": 0, "used_nonfinite_elements": 0, "unused_mutations": 0}
+                {
+                    "guard_mutations": 0,
+                    "used_poison_elements": 0,
+                    "used_nonfinite_elements": 0,
+                    "unused_mutations": 0,
+                }
                 if baseline_first is None
                 else inspect_guarded(
                     baseline_first,
@@ -1747,9 +1741,7 @@ def run_case(
             and two_stage_equivalence["nonfinite_pairs"] == 0
         )
         integrity_pass = all(
-            value == 0
-            for group in integrity.values()
-            for value in group.values()
+            value == 0 for group in integrity.values() for value in group.values()
         )
         cpu_pass = (
             cpu["nonfinite"] == 0
@@ -1912,7 +1904,9 @@ def abi_rejection_audit(
             head_dim=head_dim + 1,
         )
         cuda.synchronize()
-        output = cuda.download(buffers.candidate.allocation, len(buffers.candidate.image))
+        output = cuda.download(
+            buffers.candidate.allocation, len(buffers.candidate.image)
+        )
         tests["stage2-head-dim-mismatch"] = {
             "output_mutations": sum(
                 left != right for left, right in zip(output, buffers.candidate.image)
@@ -1920,9 +1914,7 @@ def abi_rejection_audit(
         }
         inputs = input_integrity(cuda, buffers)
         passed = all(
-            value == 0
-            for group in tests.values()
-            for value in group.values()
+            value == 0 for group in tests.values() for value in group.values()
         ) and all(value == 0 for value in inputs.values())
         return {
             "head_dim": head_dim,
@@ -2301,9 +2293,7 @@ def run_parity_matrix_case(
                         geometry,
                     )
                 else:
-                    launch_complete(
-                        cuda, functions.complete, case, buffers, geometry
-                    )
+                    launch_complete(cuda, functions.complete, case, buffers, geometry)
 
             reset_parity_candidate(cuda, buffers, exact=exact)
             launch_control()
@@ -2362,9 +2352,7 @@ def run_parity_matrix_case(
                     buffers.score_capacity,
                 )
             integrity_pass = all(
-                value == 0
-                for group in integrity.values()
-                for value in group.values()
+                value == 0 for group in integrity.values() for value in group.values()
             )
             timing = (
                 paired_timing(
@@ -2378,13 +2366,10 @@ def run_parity_matrix_case(
                 if iterations
                 else None
             )
-            exact_bitwise_pass = (
-                not exact
-                or (
-                    output_diff["bitwise_mismatches"] == 0
-                    and score_diff is not None
-                    and score_diff["bitwise_mismatches"] == 0
-                )
+            exact_bitwise_pass = not exact or (
+                output_diff["bitwise_mismatches"] == 0
+                and score_diff is not None
+                and score_diff["bitwise_mismatches"] == 0
             )
             result = {
                 **control,
@@ -2425,7 +2410,8 @@ def run_parity_matrix_case(
             "exact_candidates_pass": all(
                 result["pass"]
                 for result in results
-                if result["algorithm"] in (
+                if result["algorithm"]
+                in (
                     "score-lastcta-exact",
                     "score-parallel-exact+tiled64",
                 )

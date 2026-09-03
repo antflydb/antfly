@@ -59,12 +59,16 @@ class _ExtensionProcess:
         self.host = "127.0.0.1"
         self.package_store = MEMORYAF_PACKAGE_STORE
         if not (self.package_store / "memoryaf" / "extension.json").exists():
-            raise RuntimeError(f"memoryaf extension package not found under {self.package_store}")
+            raise RuntimeError(
+                f"memoryaf extension package not found under {self.package_store}"
+            )
         if mode not in {"standalone", "distributed"}:
             raise ValueError(mode)
 
         with ExitStack() as setup:
-            self.tempdir = tempfile.TemporaryDirectory(prefix=f"antfly-zig-extensions-{mode}-")
+            self.tempdir = tempfile.TemporaryDirectory(
+                prefix=f"antfly-zig-extensions-{mode}-"
+            )
             setup.callback(self.tempdir.cleanup)
             self.root = Path(self.tempdir.name)
             self.port_reservations = LoopbackPortReservations(self.host)
@@ -90,8 +94,12 @@ class _ExtensionProcess:
             self.standalone_log_path = self.root / "standalone.log"
             self.metadata_log_path = self.root / "metadata.log"
             self.data_log_path = self.root / "data.log"
-            self.standalone_log_file = setup.enter_context(self.standalone_log_path.open("w"))
-            self.metadata_log_file = setup.enter_context(self.metadata_log_path.open("w"))
+            self.standalone_log_file = setup.enter_context(
+                self.standalone_log_path.open("w")
+            )
+            self.metadata_log_file = setup.enter_context(
+                self.metadata_log_path.open("w")
+            )
             self.data_log_file = setup.enter_context(self.data_log_path.open("w"))
             self.standalone_proc: subprocess.Popen[str] | None = None
             self.metadata_proc: subprocess.Popen[str] | None = None
@@ -127,7 +135,9 @@ class _ExtensionProcess:
             ),
         )
         if not wait_for_server(self.api_url):
-            raise RuntimeError(f"standalone extension server failed to start\n{self.debug_logs()}")
+            raise RuntimeError(
+                f"standalone extension server failed to start\n{self.debug_logs()}"
+            )
 
     def _start_distributed(self) -> None:
         assert self.metadata_raft_port is not None
@@ -154,7 +164,9 @@ class _ExtensionProcess:
             ),
         )
         if not wait_for_server(self.metadata_admin_url, path="/metadata/v1/status"):
-            raise RuntimeError(f"metadata extension server failed to start\n{self.debug_logs()}")
+            raise RuntimeError(
+                f"metadata extension server failed to start\n{self.debug_logs()}"
+            )
 
         data_command = _data_command(
             self.binary,
@@ -175,7 +187,9 @@ class _ExtensionProcess:
             ),
         )
         if not wait_for_server(self.api_url):
-            raise RuntimeError(f"data extension server failed to start\n{self.debug_logs()}")
+            raise RuntimeError(
+                f"data extension server failed to start\n{self.debug_logs()}"
+            )
 
     def _server_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -183,7 +197,11 @@ class _ExtensionProcess:
         return env
 
     def debug_logs(self) -> str:
-        for handle in (self.standalone_log_file, self.metadata_log_file, self.data_log_file):
+        for handle in (
+            self.standalone_log_file,
+            self.metadata_log_file,
+            self.data_log_file,
+        ):
             handle.flush()
         return (
             f"[standalone]\n{_read_log_tail(self.standalone_log_path)}\n"
@@ -204,7 +222,11 @@ class _ExtensionProcess:
         self.data_proc = None
         self.metadata_proc = None
         self.standalone_proc = None
-        for handle in (self.standalone_log_file, self.metadata_log_file, self.data_log_file):
+        for handle in (
+            self.standalone_log_file,
+            self.metadata_log_file,
+            self.data_log_file,
+        ):
             if not handle.closed:
                 handle.close()
         if not maybe_preserve_tempdir(self.tempdir):
@@ -213,7 +235,11 @@ class _ExtensionProcess:
 
 @pytest.fixture(params=["standalone", "distributed"])
 def extension_server(request) -> _ExtensionProcess:
-    binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).expanduser().resolve()
+    binary = (
+        Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+        .expanduser()
+        .resolve()
+    )
     if binary.name != "antfly":
         pytest.skip("extension e2e requires the unified antfly binary")
     if not binary.exists():
@@ -230,21 +256,31 @@ def _check_response(response: requests.Response) -> Any:
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
-        raise AssertionError(f"{response.request.method} {response.url} failed: {response.text}") from exc
+        raise AssertionError(
+            f"{response.request.method} {response.url} failed: {response.text}"
+        ) from exc
     if not response.content:
         return {}
     return response.json()
 
 
-def test_extension_package_routes_match_standalone_and_distributed(extension_server: _ExtensionProcess) -> None:
+def test_extension_package_routes_match_standalone_and_distributed(
+    extension_server: _ExtensionProcess,
+) -> None:
     _assert_extension_package_routes(extension_server)
 
 
 @pytest.mark.e2e_resource("antfly_process")
 def test_extension_memoryaf_wasm_runtime_required() -> None:
     if not os.environ.get("ANTFLY_WASMTIME_LIB"):
-        pytest.skip("set ANTFLY_WASMTIME_LIB to run the required Wasmtime extension runtime e2e")
-    binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).expanduser().resolve()
+        pytest.skip(
+            "set ANTFLY_WASMTIME_LIB to run the required Wasmtime extension runtime e2e"
+        )
+    binary = (
+        Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+        .expanduser()
+        .resolve()
+    )
     if binary.name != "antfly":
         pytest.skip("extension e2e requires the unified antfly binary")
     if not binary.exists():
@@ -268,21 +304,31 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
     }
 
     def projected_packages() -> list[dict[str, Any]] | None:
-        packages = _check_response(session.get(f"{base_url}/extensions/v1/packages", timeout=10))
+        packages = _check_response(
+            session.get(f"{base_url}/extensions/v1/packages", timeout=10)
+        )
         if any(package.get("name") == "memoryaf" for package in packages):
             return packages
         return None
 
     packages = wait_until(projected_packages, timeout_s=10.0, interval_s=0.25)
-    assert packages is not None, f"memoryaf package was not projected\n{extension_server.debug_logs()}"
-    memoryaf_package = next(package for package in packages if package["name"] == "memoryaf")
+    assert packages is not None, (
+        f"memoryaf package was not projected\n{extension_server.debug_logs()}"
+    )
+    memoryaf_package = next(
+        package for package in packages if package["name"] == "memoryaf"
+    )
     assert memoryaf_package["version"] == MEMORYAF_VERSION
     assert memoryaf_package["artifacts"][0]["kind"] == "wasm"
 
     dry_run = _check_response(
         session.post(
             f"{base_url}/extensions/v1/installed/memoryaf",
-            json={"version": MEMORYAF_VERSION, "scope": {"kind": "cluster"}, "dry_run": True},
+            json={
+                "version": MEMORYAF_VERSION,
+                "scope": {"kind": "cluster"},
+                "dry_run": True,
+            },
             timeout=10,
         )
     )
@@ -290,12 +336,20 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
     assert dry_run["package_version"] == MEMORYAF_VERSION
     assert dry_run["scope"]["kind"] == "cluster"
 
-    installed_after_dry_run = _check_response(session.get(f"{base_url}/extensions/v1/installed", timeout=10))
-    assert all(extension.get("name") != "memoryaf" for extension in installed_after_dry_run)
+    installed_after_dry_run = _check_response(
+        session.get(f"{base_url}/extensions/v1/installed", timeout=10)
+    )
+    assert all(
+        extension.get("name") != "memoryaf" for extension in installed_after_dry_run
+    )
 
     table_name = f"memoryaf_memories_{extension_server.mode}"
     created_table = _check_response(
-        session.post(f"{extension_server.api_url}/tables/{table_name}", json={"num_shards": 1}, timeout=30)
+        session.post(
+            f"{extension_server.api_url}/tables/{table_name}",
+            json={"num_shards": 1},
+            timeout=30,
+        )
     )
     assert created_table["name"] == table_name
 
@@ -316,7 +370,9 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
     assert isinstance(installed["installed_at_epoch_ms"], int)
     assert installed["installed_at_epoch_ms"] > 1_700_000_000_000
 
-    objects = _check_response(session.get(f"{base_url}/extensions/v1/installed/memoryaf/objects", timeout=10))
+    objects = _check_response(
+        session.get(f"{base_url}/extensions/v1/installed/memoryaf/objects", timeout=10)
+    )
     object_kinds = {(obj["object_kind"], obj["object_name"]) for obj in objects}
     assert ("data_shape", "memory_record") in object_kinds
     assert ("generated_artifact", "memory_embedding") in object_kinds
@@ -377,10 +433,17 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
     assert store["result"]["structuredContent"]["ok"] is True
     assert store["result"]["structuredContent"]["tool"] == "store_memory"
     assert store["result"]["structuredContent"]["status"] == "stored"
-    assert "db.write(memory_record)" in store["result"]["structuredContent"]["host_calls"]
+    assert (
+        "db.write(memory_record)" in store["result"]["structuredContent"]["host_calls"]
+    )
     assert "ai.embed(content)" in store["result"]["structuredContent"]["host_calls"]
-    assert store["result"]["structuredContent"]["host_results"]["embedding_dimensions"] == 8
-    assert store["result"]["structuredContent"]["host_results"]["write"]["inserted"] == 1
+    assert (
+        store["result"]["structuredContent"]["host_results"]["embedding_dimensions"]
+        == 8
+    )
+    assert (
+        store["result"]["structuredContent"]["host_results"]["write"]["inserted"] == 1
+    )
 
     search = _check_response(
         session.post(
@@ -390,7 +453,10 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
                 "jsonrpc": "2.0",
                 "id": 4,
                 "method": "tools/call",
-                "params": {"name": "search_memories", "arguments": {"query": "extension runtime", "limit": 5}},
+                "params": {
+                    "name": "search_memories",
+                    "arguments": {"query": "extension runtime", "limit": 5},
+                },
             },
             timeout=10,
         )
@@ -435,4 +501,7 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
         )
     )
     assert missing_query["result"]["isError"] is True
-    assert missing_query["result"]["structuredContent"]["error"]["code"] == "invalid_request"
+    assert (
+        missing_query["result"]["structuredContent"]["error"]["code"]
+        == "invalid_request"
+    )

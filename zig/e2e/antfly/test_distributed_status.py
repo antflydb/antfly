@@ -115,7 +115,9 @@ class SplitStatusCluster:
             self.metadata_log_path = self.root / "metadata.log"
             self.data_log_path = self.root / "data-owner.log"
             self.api_log_path = self.root / "api-node.log"
-            self.metadata_log_file = setup.enter_context(self.metadata_log_path.open("w"))
+            self.metadata_log_file = setup.enter_context(
+                self.metadata_log_path.open("w")
+            )
             self.data_log_file = setup.enter_context(self.data_log_path.open("w"))
             self.api_log_file = setup.enter_context(self.api_log_path.open("w"))
 
@@ -206,7 +208,9 @@ class SplitStatusCluster:
         )
 
     def metadata_snapshot(self) -> dict[str, Any]:
-        response = requests.get(f"{self.metadata_admin_url}/metadata/v1/admin/snapshot", timeout=10)
+        response = requests.get(
+            f"{self.metadata_admin_url}/metadata/v1/admin/snapshot", timeout=10
+        )
         response.raise_for_status()
         payload = response.json()
         return payload if isinstance(payload, dict) else {}
@@ -252,13 +256,17 @@ def _check_response(response: requests.Response) -> dict[str, Any]:
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
-        raise AssertionError(f"{response.request.method} {response.url} failed: {response.text}") from exc
+        raise AssertionError(
+            f"{response.request.method} {response.url} failed: {response.text}"
+        ) from exc
     payload = response.json()
     assert isinstance(payload, dict)
     return payload
 
 
-def _runtime_status_reports(snapshot: dict[str, Any], table_name: str) -> list[dict[str, Any]]:
+def _runtime_status_reports(
+    snapshot: dict[str, Any], table_name: str
+) -> list[dict[str, Any]]:
     reports: list[dict[str, Any]] = []
     for store in snapshot.get("stores", []):
         if not isinstance(store, dict):
@@ -269,7 +277,9 @@ def _runtime_status_reports(snapshot: dict[str, Any], table_name: str) -> list[d
     return reports
 
 
-def _runtime_report_has_index(report: dict[str, Any], index_name: str, *, store_id: int) -> bool:
+def _runtime_report_has_index(
+    report: dict[str, Any], index_name: str, *, store_id: int
+) -> bool:
     if int(report.get("store_id", 0)) != store_id:
         return False
     indexes = report.get("indexes", [])
@@ -317,7 +327,10 @@ def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
         except requests.RequestException:
             return None
         reports = _runtime_status_reports(snapshot, table_name)
-        if any(_runtime_report_has_index(report, index_name, store_id=2) for report in reports):
+        if any(
+            _runtime_report_has_index(report, index_name, store_id=2)
+            for report in reports
+        ):
             return snapshot
         return None
 

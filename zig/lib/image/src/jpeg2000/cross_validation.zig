@@ -489,9 +489,13 @@ test "diagnostic: ours encode high-contrast checkerboard 9/7 -> opj decode (no M
     }
 
     const params: encode.EncodeParams = .{
-        .width = w, .height = h, .components = 1,
-        .bits_per_component = 8, .wavelet_transform = 0,
-        .multiple_component_transform = false, .format = .j2k,
+        .width = w,
+        .height = h,
+        .components = 1,
+        .bits_per_component = 8,
+        .wavelet_transform = 0,
+        .multiple_component_transform = false,
+        .format = .j2k,
         .decomposition_levels = 1,
     };
     const encoded = try encode.encodeU8Bytes(allocator, pixels, &params);
@@ -535,10 +539,15 @@ test "diagnostic: ours encode ramp 9/7 -> opj decode" {
     }
 
     const params: encode.EncodeParams = .{
-        .width = w, .height = h, .components = 3,
-        .bits_per_component = 8, .wavelet_transform = 0,
-        .multiple_component_transform = true, .format = .j2k,
-        .decomposition_levels = 3, .target_bitrate = 1.0,
+        .width = w,
+        .height = h,
+        .components = 3,
+        .bits_per_component = 8,
+        .wavelet_transform = 0,
+        .multiple_component_transform = true,
+        .format = .j2k,
+        .decomposition_levels = 3,
+        .target_bitrate = 1.0,
     };
     const encoded = try encode.encodeU8Bytes(allocator, pixels, &params);
     defer allocator.free(encoded);
@@ -570,10 +579,15 @@ test "diagnostic: ours encode solid-gray 9/7 -> opj decode" {
     @memset(pixels, 128);
 
     const params: encode.EncodeParams = .{
-        .width = w, .height = h, .components = 3,
-        .bits_per_component = 8, .wavelet_transform = 0,
-        .multiple_component_transform = true, .format = .j2k,
-        .decomposition_levels = 3, .target_bitrate = 1.0,
+        .width = w,
+        .height = h,
+        .components = 3,
+        .bits_per_component = 8,
+        .wavelet_transform = 0,
+        .multiple_component_transform = true,
+        .format = .j2k,
+        .decomposition_levels = 3,
+        .target_bitrate = 1.0,
     };
     const encoded = try encode.encodeU8Bytes(allocator, pixels, &params);
     defer allocator.free(encoded);
@@ -618,7 +632,9 @@ test "diagnostic: dump opj's own 9/7 encoded stream for comparison" {
 
     var c1 = try std.process.spawn(io_impl.io(), .{
         .argv = &[_][]const u8{ enc_tool, "-i", in_ppm, "-o", out_j2k, "-r", "24", "-n", "4", "-I" },
-        .stdin = .ignore, .stdout = .ignore, .stderr = .ignore,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
     });
     _ = try c1.wait(io_impl.io());
 
@@ -628,7 +644,9 @@ test "diagnostic: dump opj's own 9/7 encoded stream for comparison" {
 
     var c2 = try std.process.spawn(io_impl.io(), .{
         .argv = &[_][]const u8{ dump_tool, "-i", out_j2k },
-        .stdin = .ignore, .stdout = .inherit, .stderr = .inherit,
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
     });
     _ = try c2.wait(io_impl.io());
 }

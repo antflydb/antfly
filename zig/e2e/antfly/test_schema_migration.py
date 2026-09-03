@@ -53,13 +53,17 @@ def test_schema_migration_full_text_rebuild(stateful_api):
         for i in range(num_docs)
     }
     phase_started = time.monotonic()
-    batch = stateful_api.batch_write(table_name, inserts=inserts, sync_level="full_text")
+    batch = stateful_api.batch_write(
+        table_name, inserts=inserts, sync_level="full_text"
+    )
     timings.record("batch_write_full_text", phase_started)
     assert batch["inserted"] == num_docs
 
     phase_started = time.monotonic()
     initial_index = wait_until(
-        lambda: _ready_index(stateful_api, table_name, "full_text_index_v0", expected_docs=num_docs),
+        lambda: _ready_index(
+            stateful_api, table_name, "full_text_index_v0", expected_docs=num_docs
+        ),
         timeout_s=SCHEMA_MIGRATION_REBUILD_TIMEOUT_S,
     )
     timings.record("initial_index_ready", phase_started)
@@ -113,7 +117,9 @@ def test_schema_migration_full_text_rebuild(stateful_api):
 
     phase_started = time.monotonic()
     rebuilt_index = wait_until(
-        lambda: _ready_index(stateful_api, table_name, "full_text_index_v1", expected_docs=num_docs),
+        lambda: _ready_index(
+            stateful_api, table_name, "full_text_index_v1", expected_docs=num_docs
+        ),
         timeout_s=SCHEMA_MIGRATION_REBUILD_TIMEOUT_S,
     )
     timings.record("target_index_ready", phase_started)
@@ -157,13 +163,19 @@ class _PhaseTimings:
         elapsed = time.monotonic() - started
         self.phases[name] = elapsed
         if self.enabled:
-            print(f"E2E_PHASE table={self.table_name} phase={name} seconds={elapsed:.3f}", flush=True)
+            print(
+                f"E2E_PHASE table={self.table_name} phase={name} seconds={elapsed:.3f}",
+                flush=True,
+            )
 
     def finish(self, stateful_api) -> None:
         total = time.monotonic() - self.started
         if not self.enabled:
             return
-        print(f"E2E_PHASE table={self.table_name} phase=total seconds={total:.3f}", flush=True)
+        print(
+            f"E2E_PHASE table={self.table_name} phase=total seconds={total:.3f}",
+            flush=True,
+        )
         slow_threshold = float(os.getenv("ANTFLY_E2E_SLOW_LOG_THRESHOLD_S", "60"))
         if total < slow_threshold:
             return
@@ -178,7 +190,9 @@ class _PhaseTimings:
             print("E2E_SLOW_LOGS\n" + "\n".join(relevant[-200:]), flush=True)
 
 
-def _ready_index(stateful_api, table_name: str, index_name: str, *, expected_docs: int) -> dict | None:
+def _ready_index(
+    stateful_api, table_name: str, index_name: str, *, expected_docs: int
+) -> dict | None:
     try:
         stats = _index_stats(stateful_api.get_index(table_name, index_name))
     except Exception:
@@ -191,7 +205,9 @@ def _ready_index(stateful_api, table_name: str, index_name: str, *, expected_doc
     return stats
 
 
-def _stable_table(stateful_api, table_name: str, *, expected_version: int) -> dict | None:
+def _stable_table(
+    stateful_api, table_name: str, *, expected_version: int
+) -> dict | None:
     try:
         table = stateful_api.get_table(table_name)
     except Exception:
@@ -203,10 +219,14 @@ def _stable_table(stateful_api, table_name: str, *, expected_version: int) -> di
     return table
 
 
-def _schema_migration_diagnostics(stateful_api, table_name: str, index_name: str) -> str:
+def _schema_migration_diagnostics(
+    stateful_api, table_name: str, index_name: str
+) -> str:
     status = json.dumps(
         {
-            "index": _safe_api_call(lambda: stateful_api.get_index(table_name, index_name)),
+            "index": _safe_api_call(
+                lambda: stateful_api.get_index(table_name, index_name)
+            ),
             "indexes": _safe_api_call(lambda: stateful_api.list_indexes(table_name)),
             "table": _safe_api_call(lambda: stateful_api.get_table(table_name)),
         },

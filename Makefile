@@ -32,6 +32,7 @@ help:
 	@echo "  build-antfarm      Build the antfarm frontend (React admin UI)"
 	@echo "  build-docs         Join OpenAPI specifications"
 	@echo "  generate           Generate Zig OpenAPI modules and client SDKs"
+	@echo "  fmt                Format Zig, Go, Python, and TypeScript sources"
 	@echo "  lint               Run linters across retained Go modules and TypeScript"
 	@echo "  tidy               Run go mod tidy across retained Go modules"
 	@echo "  tidy-check         Verify retained Go modules are tidy"
@@ -69,7 +70,7 @@ help:
 # Build and Generation Commands
 # ====================================================================================
 
-.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-antfarm-main release-scripting-test
+.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check fmt lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-antfarm-main release-scripting-test
 .PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main
@@ -147,6 +148,16 @@ zig-license-check:
 
 zig-tla-check:
 	$(ZIG_MAKE) tla-check
+
+fmt:
+	@echo "==> Formatting Zig"
+	git ls-files -z -- '*.zig' | xargs -0 zig fmt
+	@echo "==> Formatting Go"
+	git ls-files -z -- '*.go' | xargs -0 gofmt -w
+	@echo "==> Formatting Python"
+	git ls-files -z -- '*.py' | xargs -0 uv run --project py/packages/sdk --locked ruff format
+	@echo "==> Formatting TypeScript"
+	cd ts && node scripts/run-pinned-toolchain.mjs pnpm exec biome format --write .
 
 lint:
 	@for mod in $(GO_MODULES); do \

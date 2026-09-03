@@ -479,10 +479,10 @@ test "InfoNCE two docs two chunks each" {
     const dim = 2;
     // Roughly unit vectors: [1,0], [0.9,0.436], [-1,0], [-0.9,-0.436]
     const flat_vecs = [_]f32{
-        1.0,   0.0,
-        0.9,   0.436,
-        -1.0,  0.0,
-        -0.9,  -0.436,
+        1.0,  0.0,
+        0.9,  0.436,
+        -1.0, 0.0,
+        -0.9, -0.436,
     };
     const chunk_mask = [_]f32{ 1, 1, 1, 1 };
     const doc_ids = [_]u32{ 0, 0, 1, 1 };
@@ -539,9 +539,9 @@ test "computeMatryoshkaLossAndGrad basic" {
     const full_dim = 4;
     // Each row: unit-like vector, padded with extra dims.
     const flat_vecs = [_]f32{
-        1.0,  0.0,  0.5, 0.1,
-        0.9,  0.44, 0.3, 0.2,
-        -1.0, 0.0,  0.5, 0.1,
+        1.0,  0.0,   0.5, 0.1,
+        0.9,  0.44,  0.3, 0.2,
+        -1.0, 0.0,   0.5, 0.1,
         -0.9, -0.44, 0.3, 0.2,
     };
     const chunk_mask = [_]f32{ 1, 1, 1, 1 };
@@ -590,8 +590,8 @@ test "computeMatryoshkaLossAndGrad dim exceeds full_dim is clamped" {
     const N = 4;
     const full_dim = 2;
     const flat_vecs = [_]f32{
-        1.0, 0.0,
-        0.9, 0.44,
+        1.0,  0.0,
+        0.9,  0.44,
         -1.0, 0.0,
         -0.9, -0.44,
     };

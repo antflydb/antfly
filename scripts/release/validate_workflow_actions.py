@@ -81,7 +81,9 @@ def main() -> int:
     )
     args = parser.parse_args()
     selected = validate(args.workflow_dir.resolve())
-    print(f"validated permissions and immutable action references in {len(selected)} workflows")
+    print(
+        f"validated permissions and immutable action references in {len(selected)} workflows"
+    )
     return 0
 
 

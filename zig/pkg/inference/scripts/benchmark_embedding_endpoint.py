@@ -38,7 +38,9 @@ def request_embeddings(
     url: str | None = None,
     model: str | None = None,
 ) -> tuple[float, list[list[float]]]:
-    body = json.dumps({"model": model or args.model, "input": [args.text] * batch}).encode()
+    body = json.dumps(
+        {"model": model or args.model, "input": [args.text] * batch}
+    ).encode()
     request = urllib.request.Request(
         url or args.url,
         data=body,
@@ -52,7 +54,9 @@ def request_embeddings(
     payload = json.loads(payload_bytes)
     data = payload.get("data")
     if not isinstance(data, list) or len(data) != batch:
-        raise RuntimeError(f"expected {batch} embeddings, got {len(data) if isinstance(data, list) else 'none'}")
+        raise RuntimeError(
+            f"expected {batch} embeddings, got {len(data) if isinstance(data, list) else 'none'}"
+        )
     embeddings = [item.get("embedding") for item in data]
     if any(not isinstance(embedding, list) for embedding in embeddings):
         raise RuntimeError("response contains no embedding vector")
@@ -76,7 +80,9 @@ def compare_embeddings(
     ]
     cosines = []
     for left, right in zip(actual, reference):
-        dot = sum(left_value * right_value for left_value, right_value in zip(left, right))
+        dot = sum(
+            left_value * right_value for left_value, right_value in zip(left, right)
+        )
         left_norm = math.sqrt(sum(value * value for value in left))
         right_norm = math.sqrt(sum(value * value for value in right))
         cosines.append(dot / (left_norm * right_norm))
@@ -91,7 +97,9 @@ def compare_embeddings(
 def main() -> None:
     args = parse_args()
     parity_rows = []
-    print("batch,avg_ms,p50_ms,p95_ms,min_ms,max_ms,throughput_embeddings_s,dimensions,checksum_first32")
+    print(
+        "batch,avg_ms,p50_ms,p95_ms,min_ms,max_ms,throughput_embeddings_s,dimensions,checksum_first32"
+    )
     for batch in args.batch_sizes:
         embeddings = []
         for _ in range(args.warmups):

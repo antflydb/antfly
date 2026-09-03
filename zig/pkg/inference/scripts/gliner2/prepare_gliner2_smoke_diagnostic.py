@@ -9,9 +9,7 @@ import json
 from pathlib import Path
 
 
-NER_SOURCES = (
-    "ner_smoke.jsonl",
-)
+NER_SOURCES = ("ner_smoke.jsonl",)
 
 FULL_TASK_SOURCES = (
     "ner_smoke.jsonl",
@@ -56,7 +54,11 @@ def main() -> int:
         type=Path,
         default=Path(__file__).resolve().parents[2] / "testdata" / "gliner2",
     )
-    parser.add_argument("--out-dir", type=Path, default=Path("/private/tmp/termite-gliner2-smoke-diagnostic"))
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("/private/tmp/termite-gliner2-smoke-diagnostic"),
+    )
     parser.add_argument(
         "--profile",
         choices=sorted(PROFILES),
@@ -85,7 +87,9 @@ def main() -> int:
     eval_rows = [next(eval_stream) for _ in range(args.eval_count)]
     write_jsonl(args.out_dir / "train.jsonl", train_rows)
     write_jsonl(args.out_dir / "eval.jsonl", eval_rows)
-    print(f"wrote synthetic profile={args.profile} train={len(train_rows)} eval={len(eval_rows)} out_dir={args.out_dir}")
+    print(
+        f"wrote synthetic profile={args.profile} train={len(train_rows)} eval={len(eval_rows)} out_dir={args.out_dir}"
+    )
     return 0
 
 

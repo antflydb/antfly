@@ -38,7 +38,9 @@ def _wait_for_doc(stateful_api, table_name: str, key: str) -> dict | None:
 
 def test_linear_merge_is_idempotent_for_unchanged_docs(stateful_api):
     table_name = f"linear_merge_{time.time_ns()}"
-    created = stateful_api.create_table(table_name, num_shards=1, description="linear merge docs")
+    created = stateful_api.create_table(
+        table_name, num_shards=1, description="linear merge docs"
+    )
     assert created["name"] == table_name
 
     records = {
@@ -69,7 +71,9 @@ def test_linear_merge_is_idempotent_for_unchanged_docs(stateful_api):
     assert first["deleted"] == 0
     assert first["next_cursor"] == "docs/installation.md"
 
-    assert _wait_for_doc(stateful_api, table_name, "docs/getting-started.md") is not None
+    assert (
+        _wait_for_doc(stateful_api, table_name, "docs/getting-started.md") is not None
+    )
     assert _wait_for_doc(stateful_api, table_name, "docs/installation.md") is not None
     assert _wait_for_doc(stateful_api, table_name, "docs/configuration.md") is not None
 

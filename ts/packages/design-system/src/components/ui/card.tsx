@@ -28,9 +28,7 @@ function Card({
   variant,
   ...props
 }: React.ComponentProps<"div"> & VariantProps<typeof cardVariants>) {
-  return (
-    <div data-slot="card" className={cn(cardVariants({ variant }), className)} {...props} />
-  );
+  return <div data-slot="card" className={cn(cardVariants({ variant }), className)} {...props} />;
 }
 
 function CardHeader({ className, ...props }: React.ComponentProps<"div">) {

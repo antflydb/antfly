@@ -22,11 +22,15 @@ class AntflyLoaderTest(unittest.TestCase):
         self.assertEqual(3, output[-1][1])
 
     def test_payload_declares_sync_level(self):
-        payload = loader.batch_payload(loader.encode_entry(b'{"text":"one"}', 0), "full_index")
+        payload = loader.batch_payload(
+            loader.encode_entry(b'{"text":"one"}', 0), "full_index"
+        )
         self.assertEqual("full_index", json.loads(payload)["sync_level"])
 
     def test_batches_resume_at_stable_corpus_ordinal(self):
-        source = io.BytesIO(b'{"text":"zero"}\n{"text":"one"}\n{"text":"two"}\n{"text":"three"}\n')
+        source = io.BytesIO(
+            b'{"text":"zero"}\n{"text":"one"}\n{"text":"two"}\n{"text":"three"}\n'
+        )
         output = list(loader.batches(source, 100, start_document=2))
         documents = {}
         for entries, _ in output:
@@ -62,7 +66,10 @@ class AntflyLoaderTest(unittest.TestCase):
             def close(self):
                 pass
 
-        with mock.patch.object(loader.http.client, "HTTPConnection", Connection), mock.patch.object(loader.time, "sleep"):
+        with (
+            mock.patch.object(loader.http.client, "HTTPConnection", Connection),
+            mock.patch.object(loader.time, "sleep"),
+        ):
             client = loader.AntflyClient("http://127.0.0.1:8080/db/v1", "docs", 1)
             self.assertEqual(1, client.ingest(b'"doc:1":{}', "write"))
             self.assertEqual(2, client.connection.requests)

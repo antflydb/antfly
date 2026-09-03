@@ -29,7 +29,9 @@ def test_classify_native_safetensors_classifier_smoke(api):
     """Explicit safetensors classifier model should return a valid classification batch."""
     resp = api.classify(
         model="cross-encoder/nli-distilroberta-base",
-        text=["The new iPhone has an impressive camera system with advanced AI features."],
+        text=[
+            "The new iPhone has an impressive camera system with advanced AI features."
+        ],
         labels=["technology", "sports", "politics", "entertainment"],
         top_k=4,
     )
@@ -53,7 +55,9 @@ def test_classify_native_safetensors_deberta_smoke(api):
     """Explicit native DeBERTa classifier model should return a valid classification batch."""
     resp = api.classify(
         model="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
-        text=["The new iPhone has an impressive camera system with advanced AI features."],
+        text=[
+            "The new iPhone has an impressive camera system with advanced AI features."
+        ],
         labels=["technology", "sports", "politics", "entertainment"],
         hypothesis_template="This text is about {}.",
         top_k=4,
@@ -76,7 +80,9 @@ def test_classify_gliner2_through_extract(api):
     """The canonical endpoint also dispatches classification-capable extractors."""
     resp = api.classify(
         model=DEFAULT_EXTRACTOR_MODEL,
-        text=["The new iPhone has an impressive camera system with advanced AI features."],
+        text=[
+            "The new iPhone has an impressive camera system with advanced AI features."
+        ],
         labels=["technology", "sports", "politics", "entertainment"],
     )
     assert resp["object"] == "extraction"
@@ -89,7 +95,9 @@ def test_classify_gliner2_through_extract(api):
 def test_classify_single_text(api):
     """iPhone text should classify as technology."""
     resp = api.classify(
-        text=["The new iPhone 15 Pro has an impressive camera system with advanced AI features."],
+        text=[
+            "The new iPhone 15 Pro has an impressive camera system with advanced AI features."
+        ],
         labels=["technology", "sports", "politics", "entertainment"],
     )
     classifications = [item["classifications"] for item in resp["data"]]
@@ -122,7 +130,9 @@ def test_classify_multiple_texts(api):
 def test_classify_multi_label(api):
     """Tech company stock news should score high for both 'technology' and 'business'."""
     resp = api.classify(
-        text=["The tech company's stock surged after announcing record quarterly earnings."],
+        text=[
+            "The tech company's stock surged after announcing record quarterly earnings."
+        ],
         labels=["technology", "business", "sports", "politics"],
         multi_label=True,
         threshold=0.3,

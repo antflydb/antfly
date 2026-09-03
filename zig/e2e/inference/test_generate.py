@@ -66,19 +66,27 @@ def _first_tool_generator_model(api):
         return model
     if os.environ.get("ANTFLY_INFERENCE_TOOL_MODEL"):
         return os.environ["ANTFLY_INFERENCE_TOOL_MODEL"]
-    pytest.skip("No tool-capable generator model available; set ANTFLY_INFERENCE_TOOL_MODEL or place one under models")
+    pytest.skip(
+        "No tool-capable generator model available; set ANTFLY_INFERENCE_TOOL_MODEL or place one under models"
+    )
 
 
 def _skip_unloadable_tool_model_response(response):
     if response_indicates_missing_model(response):
-        pytest.skip("Generator model is listed but not loadable in this build/backend configuration")
+        pytest.skip(
+            "Generator model is listed but not loadable in this build/backend configuration"
+        )
     if response.status_code == 400:
         try:
             payload = response.json()
         except Exception:
             return
-        if payload.get("error") == "INVALID_MODEL" and "tool" in payload.get("message", ""):
-            pytest.skip("Tool-capable model is present in listing, but this runtime does not support tool calling for it")
+        if payload.get("error") == "INVALID_MODEL" and "tool" in payload.get(
+            "message", ""
+        ):
+            pytest.skip(
+                "Tool-capable model is present in listing, but this runtime does not support tool calling for it"
+            )
         return
     if response.status_code != 500:
         return
@@ -86,24 +94,35 @@ def _skip_unloadable_tool_model_response(response):
         payload = response.json()
     except Exception:
         return
-    if payload.get("error") == "MODEL_LOAD_FAILED" and payload.get("message") == "NoModelFileFound":
-        pytest.skip("Tool-capable model is present but not loadable in this build/backend configuration")
+    if (
+        payload.get("error") == "MODEL_LOAD_FAILED"
+        and payload.get("message") == "NoModelFileFound"
+    ):
+        pytest.skip(
+            "Tool-capable model is present but not loadable in this build/backend configuration"
+        )
 
 
 def _skip_missing_generator_response(response):
     if response_indicates_missing_model(response):
-        pytest.skip("Generator model is listed but not loadable in this build/backend configuration")
+        pytest.skip(
+            "Generator model is listed but not loadable in this build/backend configuration"
+        )
 
 
 def _generate_or_skip_unsupported(api, body: dict) -> dict:
     response = api.post("/generate", json=body)
     _skip_missing_generator_response(response)
-    if response.status_code == 500 and response.headers.get("content-type", "").startswith("application/json"):
+    if response.status_code == 500 and response.headers.get(
+        "content-type", ""
+    ).startswith("application/json"):
         payload = response.json()
         if payload.get("error") == "GENERATION_FAILED" and payload.get("message") in {
             "UnsupportedKvHeadDim",
         }:
-            pytest.skip("Generation feature is not supported for this model/backend combination")
+            pytest.skip(
+                "Generation feature is not supported for this model/backend combination"
+            )
     response.raise_for_status()
     return response.json()
 
@@ -136,7 +155,9 @@ def _assert_chat_completion(resp: dict) -> dict:
     assert isinstance(usage.get("prompt_tokens"), int), resp
     assert isinstance(usage.get("completion_tokens"), int), resp
     assert isinstance(usage.get("total_tokens"), int), resp
-    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"], resp
+    assert (
+        usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+    ), resp
     return choice
 
 
@@ -190,7 +211,12 @@ def test_max_tokens_respected(api):
 def test_generate_response_format_json_object(api):
     model = _first_generator_model(api)
     resp = api.generate(
-        [{"role": "user", "content": "Return exactly the JSON object {}, with no other text."}],
+        [
+            {
+                "role": "user",
+                "content": "Return exactly the JSON object {}, with no other text.",
+            }
+        ],
         model=model,
         # This is a grammar-wiring smoke, not an output-quality benchmark.
         # Unconstrained JSON permits trailing whitespace, so a CPU-only Gemma
@@ -242,26 +268,32 @@ def test_generate_response_format_json_schema(api):
 
 def test_generate_invalid_grammar_rejected(api):
     model = _first_generator_model(api)
-    r = api.post("/generate", json={
-        "model": model,
-        "messages": [{"role": "user", "content": "Say hello"}],
-        "max_tokens": 8,
-        "grammar": "this is not valid GBNF syntax %%%",
-    })
+    r = api.post(
+        "/generate",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "Say hello"}],
+            "max_tokens": 8,
+            "grammar": "this is not valid GBNF syntax %%%",
+        },
+    )
     _skip_missing_generator_response(r)
     assert r.status_code == 400, f"Expected 400, got {r.status_code}: {r.text}"
 
 
 def test_generate_with_draft_model_smoke(api):
     model, draft_model = _target_and_draft_generator_models(api)
-    resp = _generate_or_skip_unsupported(api, {
-        "model": model,
-        "messages": [{"role": "user", "content": "Say hello briefly"}],
-        "max_tokens": 8,
-        "chat_template_kwargs": {"enable_thinking": False},
-        "draft_model": draft_model,
-        "speculative_k": 2,
-    })
+    resp = _generate_or_skip_unsupported(
+        api,
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": "Say hello briefly"}],
+            "max_tokens": 8,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "draft_model": draft_model,
+            "speculative_k": 2,
+        },
+    )
 
     content = _message_content(resp)
     assert content, f"No generated content in response: {resp}"
@@ -269,27 +301,35 @@ def test_generate_with_draft_model_smoke(api):
 
 def test_generate_json_schema_with_draft_model(api):
     model, draft_model = _target_and_draft_generator_models(api)
-    resp = _generate_or_skip_unsupported(api, {
-        "model": model,
-        "messages": [{"role": "user", "content": "Return JSON with a string field named answer"}],
-        "max_tokens": 128,
-        "draft_model": draft_model,
-        "speculative_k": 2,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "answer_payload",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "answer": {"type": "string"},
+    resp = _generate_or_skip_unsupported(
+        api,
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Return JSON with a string field named answer",
+                }
+            ],
+            "max_tokens": 128,
+            "draft_model": draft_model,
+            "speculative_k": 2,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer_payload",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "answer": {"type": "string"},
+                        },
+                        "required": ["answer"],
+                        "additionalProperties": False,
                     },
-                    "required": ["answer"],
-                    "additionalProperties": False,
                 },
             },
         },
-    })
+    )
 
     content = _message_content(resp)
     assert content, f"No generated content in response: {resp}"
@@ -343,8 +383,12 @@ def test_stream_emits_finish_chunk_before_done(api):
     body = r.text
     r.close()
 
-    data_lines = [line[len("data: "):] for line in body.splitlines() if line.startswith("data: ")]
-    assert len(data_lines) >= 2, f"Expected at least one JSON event and [DONE], got: {body[:500]}"
+    data_lines = [
+        line[len("data: ") :] for line in body.splitlines() if line.startswith("data: ")
+    ]
+    assert len(data_lines) >= 2, (
+        f"Expected at least one JSON event and [DONE], got: {body[:500]}"
+    )
     assert data_lines[-1] == "[DONE]"
 
     finish_event = json.loads(data_lines[-2])
@@ -368,7 +412,7 @@ def test_stream_delta_structure(api):
     r.close()
 
     data_lines = [
-        line[len("data: "):]
+        line[len("data: ") :]
         for line in body.splitlines()
         if line.startswith("data: ") and "[DONE]" not in line
     ]
@@ -378,19 +422,24 @@ def test_stream_delta_structure(api):
     assert isinstance(role_event.get("id"), str), role_event
     assert role_event.get("object") == "chat.completion.chunk", role_event
     assert isinstance(role_event.get("created"), int), role_event
-    assert role_event.get("choices", [{}])[0].get("delta", {}).get("role") == "assistant", role_event
+    assert (
+        role_event.get("choices", [{}])[0].get("delta", {}).get("role") == "assistant"
+    ), role_event
 
     content_event = next(
         (
             json.loads(line)
             for line in data_lines[1:]
-            if json.loads(line).get("choices", [{}])[0].get("delta", {}).get("content") is not None
+            if json.loads(line).get("choices", [{}])[0].get("delta", {}).get("content")
+            is not None
         ),
         None,
     )
     assert content_event is not None, f"No content delta found in stream: {data_lines}"
     content = content_event.get("choices", [{}])[0].get("delta", {}).get("content")
-    assert content is not None, f"Delta missing choices[0].delta.content: {content_event}"
+    assert content is not None, (
+        f"Delta missing choices[0].delta.content: {content_event}"
+    )
 
 
 # -- Multimodal generation --
@@ -407,16 +456,18 @@ def test_multimodal_generation(api):
         )
     model = _first_multimodal_generator_model(api)
     test_image = make_text_png_uri(["HELLO"], scale=10, padding=20)
-    messages = [{
-        "role": "user",
-        "content": [
-            {
-                "type": "text",
-                "text": "What word is written in this image? Answer with just that word.",
-            },
-            {"type": "image_url", "image_url": {"url": test_image}},
-        ],
-    }]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "What word is written in this image? Answer with just that word.",
+                },
+                {"type": "image_url", "image_url": {"url": test_image}},
+            ],
+        }
+    ]
 
     resp = api.generate(
         messages,
@@ -431,7 +482,9 @@ def test_multimodal_generation(api):
     )
     content = _message_content(resp)
     assert content, f"No multimodal generated content in response: {resp}"
-    assert "hello" in content.casefold(), f"Image-conditioned response missed HELLO: {content!r}"
+    assert "hello" in content.casefold(), (
+        f"Image-conditioned response missed HELLO: {content!r}"
+    )
 
 
 @pytest.mark.multimodal
@@ -444,17 +497,19 @@ def test_multimodal_audio_generation(api):
             "RUN_MULTIMODAL_GENERATOR_TESTS=1 to run it"
         )
     model = _first_multimodal_generator_model(api)
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "Describe this audio in one short sentence."},
-            {
-                "type": "media",
-                "mime_type": "audio/wav",
-                "data": make_wav_b64(0.1, 16000),
-            },
-        ],
-    }]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this audio in one short sentence."},
+                {
+                    "type": "media",
+                    "mime_type": "audio/wav",
+                    "data": make_wav_b64(0.1, 16000),
+                },
+            ],
+        }
+    ]
 
     response = api.generate(
         messages,
@@ -472,11 +527,14 @@ def test_multimodal_audio_generation(api):
 
 def test_generate_rejects_tool_choice_without_tools(api):
     model = _first_generator_model(api)
-    r = api.post("/generate", json={
-        "model": model,
-        "messages": [{"role": "user", "content": "What is the weather?"}],
-        "tool_choice": "required",
-    })
+    r = api.post(
+        "/generate",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "What is the weather?"}],
+            "tool_choice": "required",
+        },
+    )
     _skip_missing_generator_response(r)
     assert r.status_code == 400
     assert "tools are required when tool_choice is set" in r.text
@@ -484,25 +542,30 @@ def test_generate_rejects_tool_choice_without_tools(api):
 
 def test_generate_rejects_invalid_tool_choice(api):
     model = _first_generator_model(api)
-    r = api.post("/generate", json={
-        "model": model,
-        "messages": [{"role": "user", "content": "Call the weather function"}],
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Get the weather for a location",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "location": {"type": "string"},
+    r = api.post(
+        "/generate",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "Call the weather function"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get the weather for a location",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"},
+                            },
+                            "required": ["location"],
+                        },
                     },
-                    "required": ["location"],
-                },
-            },
-        }],
-        "tool_choice": {"type": "function"},
-    })
+                }
+            ],
+            "tool_choice": {"type": "function"},
+        },
+    )
     _skip_missing_generator_response(r)
     assert r.status_code == 400
     assert "invalid tool_choice" in r.text
@@ -510,27 +573,37 @@ def test_generate_rejects_invalid_tool_choice(api):
 
 def test_generate_with_tools_tool_model(api):
     model = _first_tool_generator_model(api)
-    r = api.post("/generate", json={
-        "model": model,
-        "messages": [{"role": "user", "content": "Use the get_weather function for San Francisco."}],
-        "max_tokens": 96,
-        "temperature": 0.1,
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Get the current weather for a location",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "location": {"type": "string"},
+    r = api.post(
+        "/generate",
+        json={
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Use the get_weather function for San Francisco.",
+                }
+            ],
+            "max_tokens": 96,
+            "temperature": 0.1,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get the current weather for a location",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"},
+                            },
+                            "required": ["location"],
+                        },
                     },
-                    "required": ["location"],
-                },
-            },
-        }],
-        "tool_choice": "required",
-    })
+                }
+            ],
+            "tool_choice": "required",
+        },
+    )
     _skip_unloadable_tool_model_response(r)
     r.raise_for_status()
     resp = r.json()
@@ -551,34 +624,44 @@ def test_generate_with_tools_tool_model(api):
 @pytest.mark.streaming
 def test_stream_generate_with_tools_tool_model(api):
     model = _first_tool_generator_model(api)
-    r = api.post("/generate", json={
-        "model": model,
-        "messages": [{"role": "user", "content": "Use the lookup function to find order 42."}],
-        "max_tokens": 96,
-        "temperature": 0.1,
-        "stream": True,
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "lookup",
-                "description": "Look up an order by id",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "integer"},
+    r = api.post(
+        "/generate",
+        json={
+            "model": model,
+            "messages": [
+                {"role": "user", "content": "Use the lookup function to find order 42."}
+            ],
+            "max_tokens": 96,
+            "temperature": 0.1,
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "description": "Look up an order by id",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer"},
+                            },
+                            "required": ["id"],
+                        },
                     },
-                    "required": ["id"],
-                },
-            },
-        }],
-        "tool_choice": "required",
-    }, stream=True)
+                }
+            ],
+            "tool_choice": "required",
+        },
+        stream=True,
+    )
     _skip_unloadable_tool_model_response(r)
     r.raise_for_status()
     body = r.text
     r.close()
 
-    data_lines = [line[len("data: "):] for line in body.splitlines() if line.startswith("data: ")]
+    data_lines = [
+        line[len("data: ") :] for line in body.splitlines() if line.startswith("data: ")
+    ]
     assert data_lines, f"No SSE events returned: {body[:500]}"
     assert data_lines[-1] == "[DONE]"
 
@@ -634,7 +717,9 @@ def test_speculative_decode_matches_greedy(api):
     standard = api.generate(messages, **kwargs)
     standard_content = _message_content(standard) or ""
 
-    speculative = api.generate(messages, draft_model=draft_model, speculative_k=3, **kwargs)
+    speculative = api.generate(
+        messages, draft_model=draft_model, speculative_k=3, **kwargs
+    )
     speculative_content = _message_content(speculative) or ""
 
     assert standard_content, "Standard decode produced no content"
@@ -697,12 +782,14 @@ def test_concurrent_requests_throughput(api):
         results = [f.result() for f in as_completed(futures)]
     conc_elapsed = time.monotonic() - conc_start
 
-    assert len(results) == num_requests, f"Expected {num_requests} results, got {len(results)}"
+    assert len(results) == num_requests, (
+        f"Expected {num_requests} results, got {len(results)}"
+    )
 
     # Log timing for manual inspection (not a hard assertion since
     # throughput depends on hardware and model)
     print(f"\nThroughput test: {num_requests} requests")
-    print(f"  Sequential: {seq_elapsed:.2f}s ({seq_elapsed/num_requests:.2f}s/req)")
-    print(f"  Concurrent: {conc_elapsed:.2f}s ({conc_elapsed/num_requests:.2f}s/req)")
+    print(f"  Sequential: {seq_elapsed:.2f}s ({seq_elapsed / num_requests:.2f}s/req)")
+    print(f"  Concurrent: {conc_elapsed:.2f}s ({conc_elapsed / num_requests:.2f}s/req)")
     if seq_elapsed > 0:
-        print(f"  Speedup: {seq_elapsed/conc_elapsed:.2f}x")
+        print(f"  Speedup: {seq_elapsed / conc_elapsed:.2f}x")

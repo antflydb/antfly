@@ -69,12 +69,7 @@ export function createQuadProgram(canvas: HTMLCanvasElement, fragSrc: string): Q
   gl.vertexAttribPointer(aLoc, 2, gl.FLOAT, false, 0, 0);
 
   gl.enable(gl.BLEND);
-  gl.blendFuncSeparate(
-    gl.SRC_ALPHA,
-    gl.ONE_MINUS_SRC_ALPHA,
-    gl.ONE,
-    gl.ONE_MINUS_SRC_ALPHA
-  );
+  gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   gl.clearColor(0, 0, 0, 0);
 
   const uniforms = new Map<string, WebGLUniformLocation | null>();

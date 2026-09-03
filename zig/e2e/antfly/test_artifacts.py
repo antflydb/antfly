@@ -472,7 +472,9 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
                     >= (
                         4
                         if doc_key in {"pdf-inline", "pdf-url"}
-                        else 2 if doc_key == "pdf-scanned-table" else 1
+                        else 2
+                        if doc_key == "pdf-scanned-table"
+                        else 1
                     )
                 )
                 else None
@@ -810,10 +812,7 @@ def test_artifact_full_text_chunks_remain_with_parents_across_three_shards(
     def distributed_index_status() -> dict | None:
         detail = stateful_api.get_index(table_name, DEFAULT_FULL_TEXT_INDEX)
         shards = detail.get("shard_status", {})
-        counts = [
-            int(status.get("total_indexed", 0))
-            for status in shards.values()
-        ]
+        counts = [int(status.get("total_indexed", 0)) for status in shards.values()]
         if len(counts) != 3 or not all(count > 0 for count in counts):
             return None
         return detail
@@ -881,11 +880,7 @@ def test_artifact_full_text_scale_exceeds_one_million_chunks_on_three_shards(
     while generated_chunks < target_chunks:
         batch_slot = parent_number % 6
         cycle = parent_number // 6
-        prefix = (
-            lane_prefixes[0]
-            if batch_slot < 5
-            else lane_prefixes[1 + cycle % 2]
-        )
+        prefix = lane_prefixes[0] if batch_slot < 5 else lane_prefixes[1 + cycle % 2]
         parent_key = f"{prefix}scale-{parent_number:08d}"
 
         def ready_parent() -> dict | None:
@@ -949,10 +944,7 @@ def test_artifact_full_text_scale_exceeds_one_million_chunks_on_three_shards(
     def million_chunks_visible_on_every_shard() -> dict | None:
         detail = stateful_api.get_index(table_name, DEFAULT_FULL_TEXT_INDEX)
         shards = detail.get("shard_status", {})
-        counts = [
-            int(status.get("total_indexed", 0))
-            for status in shards.values()
-        ]
+        counts = [int(status.get("total_indexed", 0)) for status in shards.values()]
         if len(counts) != 3 or not all(count > 0 for count in counts):
             return None
         if sum(counts) < target_chunks:
@@ -1274,8 +1266,7 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
                 "filename": "canary.txt",
                 "mime_type": "text/plain",
                 "version": "1",
-                "url": "data:text/plain;base64,"
-                + base64.b64encode(source).decode(),
+                "url": "data:text/plain;base64," + base64.b64encode(source).decode(),
             }
         },
         sync_level="full_index",
@@ -1428,7 +1419,10 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
             },
         )
     assert orphan_error.value.response.status_code == 400
-    assert "embedding enrichment producer is not runnable" in orphan_error.value.response.text
+    assert (
+        "embedding enrichment producer is not runnable"
+        in orphan_error.value.response.text
+    )
 
     owner_table = f"embedding_owned_producer_{time.time_ns()}"
     stateful_api.post(
@@ -1498,7 +1492,10 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
             },
         )
     assert mismatch_error.value.response.status_code == 400
-    assert "embedding enrichment producer is not runnable" in mismatch_error.value.response.text
+    assert (
+        "embedding enrichment producer is not runnable"
+        in mismatch_error.value.response.text
+    )
 
     # A matching durable identity may be registered at table scope, but doing
     # so makes the executable index an authoritative owner that cannot be
@@ -1518,7 +1515,10 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
     with pytest.raises(requests.HTTPError) as owner_delete_error:
         stateful_api.delete_index(owner_table, "document_vectors")
     assert owner_delete_error.value.response.status_code == 409
-    assert stateful_api.get_index(owner_table, "document_vectors")["config"]["type"] == "embeddings"
+    assert (
+        stateful_api.get_index(owner_table, "document_vectors")["config"]["type"]
+        == "embeddings"
+    )
 
     # Failed replacement is atomic: the original owner and its artifact remain.
     detail = stateful_api.get_index(owner_table, "document_vectors")
@@ -1556,7 +1556,11 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
         lambda: (
             current
             if (
-                (current := stateful_api.get_index(owner_table, "document_artifact_vectors"))
+                (
+                    current := stateful_api.get_index(
+                        owner_table, "document_artifact_vectors"
+                    )
+                )
                 .get("status", {})
                 .get("total_indexed")
                 == 1

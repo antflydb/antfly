@@ -28,7 +28,9 @@ def sample(engine: str, total: float, ttft: float, digest: str = "stable") -> di
         "Spella Caffe Logo.pdf and Spella Caffe Logo Two Color.pdf are in "
         "/Users/timkaye/Downloads. "
     )
-    content = (prefix + "Verify each filename and preserve the evidence boundary. " * 30)[:900]
+    content = (
+        prefix + "Verify each filename and preserve the evidence boundary. " * 30
+    )[:900]
     result = {
         "engine": engine,
         "total_latency_ms": total,
@@ -62,15 +64,17 @@ def sample(engine: str, total: float, ttft: float, digest: str = "stable") -> di
             "configured_modes": ["serial"],
             "active_consumers": ["serial"],
             "active_count": 2,
-            "active_observations": [{
-                "consumer": "serial",
-                "active_count": 2,
-                "gemma4_head_dims": [256, 512],
-                "routes_by_head_dim": {
-                    "256": "gemma4_f16_local",
-                    "512": "gemma4_f16_global",
-                },
-            }],
+            "active_observations": [
+                {
+                    "consumer": "serial",
+                    "active_count": 2,
+                    "gemma4_head_dims": [256, 512],
+                    "routes_by_head_dim": {
+                        "256": "gemma4_f16_local",
+                        "512": "gemma4_f16_global",
+                    },
+                }
+            ],
             "fallback_count": 0,
             "rejected_count": 0,
             "fallback_reasons": [],
@@ -119,7 +123,9 @@ def frozen_baseline(
     sample_rows: list[dict] | None = None,
 ) -> dict:
     baseline_rows = sample_rows or rows()
-    evaluated = benchmark.evaluate(args(enforce_performance=False), fixture, baseline_rows, None)
+    evaluated = benchmark.evaluate(
+        args(enforce_performance=False), fixture, baseline_rows, None
+    )
     execution_profile = {
         "sha256": "profile-stable",
         "material_environment_sha256": "environment-stable",
@@ -176,12 +182,22 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual({"enable_thinking": False}, fixture.chat_template_kwargs)
         self.assertEqual("public_final", fixture.response_channel)
         self.assertEqual(
-            ("Spella Caffe Logo.pdf", "Spella Caffe Logo Two Color.pdf", "/Users/timkaye/Downloads"),
+            (
+                "Spella Caffe Logo.pdf",
+                "Spella Caffe Logo Two Color.pdf",
+                "/Users/timkaye/Downloads",
+            ),
             fixture.expected_output_substrings,
         )
         self.assertEqual(800, fixture.minimum_visible_utf8_bytes)
-        self.assertEqual("622d1cf25efdaa8717d9a200e6aee381a5f7b3f5f60dae268c66bc04204e251b", fixture.user_sha256)
-        self.assertEqual("0f9791a0344f4e302f60a6ad2cdaee80efe9212f00d49bfccd499c21cf64a6ef", fixture.reference_prompt_sha256)
+        self.assertEqual(
+            "622d1cf25efdaa8717d9a200e6aee381a5f7b3f5f60dae268c66bc04204e251b",
+            fixture.user_sha256,
+        )
+        self.assertEqual(
+            "0f9791a0344f4e302f60a6ad2cdaee80efe9212f00d49bfccd499c21cf64a6ef",
+            fixture.reference_prompt_sha256,
+        )
 
     def test_fixture_hash_drift_is_rejected(self) -> None:
         raw = json.loads(FIXTURE.read_text())
@@ -194,7 +210,9 @@ class FixtureTests(unittest.TestCase):
 
     def test_fixture_rejects_private_thought_channel_contract(self) -> None:
         raw = json.loads(FIXTURE.read_text())
-        raw["reference_chat_suffix"] = "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+        raw["reference_chat_suffix"] = (
+            "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+        )
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "fixture.json"
             path.write_text(json.dumps(raw))
@@ -203,11 +221,15 @@ class FixtureTests(unittest.TestCase):
 
     def test_llama_applied_template_must_match_reference_bytes_and_hash(self) -> None:
         fixture = benchmark.load_fixture(FIXTURE)
-        summary = benchmark.validate_llama_rendered_prompt(fixture.reference_prompt, fixture)
+        summary = benchmark.validate_llama_rendered_prompt(
+            fixture.reference_prompt, fixture
+        )
         self.assertEqual(fixture.reference_prompt_utf8_bytes, summary["utf8_bytes"])
         self.assertEqual(fixture.reference_prompt_sha256, summary["sha256"])
         with self.assertRaisesRegex(RuntimeError, "measured chat template differs"):
-            benchmark.validate_llama_rendered_prompt(fixture.reference_prompt + " ", fixture)
+            benchmark.validate_llama_rendered_prompt(
+                fixture.reference_prompt + " ", fixture
+            )
 
 
 class SchedulingAndParsingTests(unittest.TestCase):
@@ -217,23 +239,34 @@ class SchedulingAndParsingTests(unittest.TestCase):
         self.assertEqual(("antfly", "llama_cpp"), benchmark.paired_order(3))
 
     def test_sse_parser_and_token_delta_preserve_token_boundaries(self) -> None:
-        events = benchmark.parse_sse_lines([
-            b'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n',
-            b'data: {"choices":[{"delta":{"content":"ant"},"finish_reason":null}]}\n',
-            b'data: {"choices":[{"delta":{"content":"s"},"finish_reason":null}]}\n',
-            b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n',
-            b'data: [DONE]\n',
-        ])
+        events = benchmark.parse_sse_lines(
+            [
+                b'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n',
+                b'data: {"choices":[{"delta":{"content":"ant"},"finish_reason":null}]}\n',
+                b'data: {"choices":[{"delta":{"content":"s"},"finish_reason":null}]}\n',
+                b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n',
+                b"data: [DONE]\n",
+            ]
+        )
         deltas = [benchmark.event_delta(event) for event in events]
-        self.assertEqual(["ant", "s"], [content for has_token, content, _ in deltas if has_token])
+        self.assertEqual(
+            ["ant", "s"], [content for has_token, content, _ in deltas if has_token]
+        )
         self.assertEqual("length", deltas[-1][2])
-        self.assertEqual((False, "", None), benchmark.event_delta({
-            "choices": [{"delta": {"content": ""}, "finish_reason": None}],
-        }))
+        self.assertEqual(
+            (False, "", None),
+            benchmark.event_delta(
+                {
+                    "choices": [{"delta": {"content": ""}, "finish_reason": None}],
+                }
+            ),
+        )
 
     def test_stream_timing_requires_an_sse_response_content_type(self) -> None:
         self.assertTrue(benchmark.is_event_stream_content_type("text/event-stream"))
-        self.assertTrue(benchmark.is_event_stream_content_type("Text/Event-Stream; charset=utf-8"))
+        self.assertTrue(
+            benchmark.is_event_stream_content_type("Text/Event-Stream; charset=utf-8")
+        )
         self.assertFalse(benchmark.is_event_stream_content_type("application/json"))
         self.assertFalse(benchmark.is_event_stream_content_type(None))
 
@@ -241,22 +274,59 @@ class SchedulingAndParsingTests(unittest.TestCase):
         # A transport may coalesce several tokens into one content delta or
         # split text without preserving tokenizer boundaries.
         events = [
-            {"choices": [{"delta": {"content": "three token chunk"}, "finish_reason": None}]},
-            {"choices": [{"delta": {"content": " plus two"}, "finish_reason": "length"}]},
-            {"choices": [], "usage": {"prompt_tokens": 2003, "completion_tokens": 5, "total_tokens": 2008}},
+            {
+                "choices": [
+                    {"delta": {"content": "three token chunk"}, "finish_reason": None}
+                ]
+            },
+            {
+                "choices": [
+                    {"delta": {"content": " plus two"}, "finish_reason": "length"}
+                ]
+            },
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 2003,
+                    "completion_tokens": 5,
+                    "total_tokens": 2008,
+                },
+            },
         ]
-        self.assertEqual((5, "final_sse_usage"), benchmark.stream_completion_accounting(events, 2))
-        self.assertEqual((2, "content_events"), benchmark.stream_completion_accounting(events[:-1], 2))
-        self.assertEqual((2003, "final_sse_usage"), benchmark.stream_prompt_accounting(events))
-        self.assertEqual((None, "warmup_usage_fallback"), benchmark.stream_prompt_accounting(events[:-1]))
+        self.assertEqual(
+            (5, "final_sse_usage"), benchmark.stream_completion_accounting(events, 2)
+        )
+        self.assertEqual(
+            (2, "content_events"),
+            benchmark.stream_completion_accounting(events[:-1], 2),
+        )
+        self.assertEqual(
+            (2003, "final_sse_usage"), benchmark.stream_prompt_accounting(events)
+        )
+        self.assertEqual(
+            (None, "warmup_usage_fallback"),
+            benchmark.stream_prompt_accounting(events[:-1]),
+        )
 
     def test_request_bodies_match_work_and_precision(self) -> None:
         fixture = benchmark.load_fixture(FIXTURE)
         antfly = benchmark.request_body(
-            "antfly", pathlib.Path("/model.gguf"), "metal", fixture, 300, "f16", stream=True,
+            "antfly",
+            pathlib.Path("/model.gguf"),
+            "metal",
+            fixture,
+            300,
+            "f16",
+            stream=True,
         )
         llama = benchmark.request_body(
-            "llama_cpp", pathlib.Path("/model.gguf"), "cuda", fixture, 300, "f16", stream=True,
+            "llama_cpp",
+            pathlib.Path("/model.gguf"),
+            "cuda",
+            fixture,
+            300,
+            "f16",
+            stream=True,
         )
         for body in (antfly, llama):
             self.assertEqual(300, body["max_tokens"])
@@ -295,7 +365,9 @@ class SchedulingAndParsingTests(unittest.TestCase):
             model = model_dir / "q4.gguf"
             model.write_bytes(b"model")
             (model_dir / "q8.gguf").write_bytes(b"other-model")
-            with self.assertRaisesRegex(ValueError, "exactly the benchmark decoder GGUF"):
+            with self.assertRaisesRegex(
+                ValueError, "exactly the benchmark decoder GGUF"
+            ):
                 benchmark.antfly_model_identifier(model, models_dir)
 
     def test_antfly_model_identifier_rejects_model_outside_models_dir(self) -> None:
@@ -316,7 +388,9 @@ class SchedulingAndParsingTests(unittest.TestCase):
             model_dir.mkdir()
             model = model_dir / "model.gguf"
             model.write_bytes(b"decoder-tokenizer")
-            (model_dir / "tokenizer.json").write_text('{"conflicting":"sidecar-tokenizer"}')
+            (model_dir / "tokenizer.json").write_text(
+                '{"conflicting":"sidecar-tokenizer"}'
+            )
             antfly = root / "antfly"
             antfly.write_bytes(b"binary")
             namespace = argparse.Namespace(
@@ -336,8 +410,12 @@ class SchedulingAndParsingTests(unittest.TestCase):
                     "prompt_token_ids: 1 2 3\n"
                 ),
             )
-            with mock.patch.object(benchmark.subprocess, "run", return_value=completed) as run:
-                contract = benchmark.collect_antfly_prompt_token_contract(namespace, fixture)
+            with mock.patch.object(
+                benchmark.subprocess, "run", return_value=completed
+            ) as run:
+                contract = benchmark.collect_antfly_prompt_token_contract(
+                    namespace, fixture
+                )
             command = run.call_args.args[0]
             self.assertEqual(str(model_dir.resolve()), command[2])
             self.assertEqual(fixture.user_content, command[3])
@@ -348,10 +426,16 @@ class SchedulingAndParsingTests(unittest.TestCase):
                 command[command.index("--prefill-chunk-size") + 1],
             )
             for name, value in benchmark.CUDA_SERVER_BUDGET_MB.items():
-                self.assertEqual(str(value), command[command.index(f"--{name}-budget-mb") + 1])
+                self.assertEqual(
+                    str(value), command[command.index(f"--{name}-budget-mb") + 1]
+                )
             self.assertEqual(str(model_dir.resolve()), contract["model_directory"])
-            self.assertEqual("antfly_cli_rendered_public_channel_prompt", contract["source"])
-            self.assertEqual(fixture.reference_prompt_sha256, contract["template"]["sha256"])
+            self.assertEqual(
+                "antfly_cli_rendered_public_channel_prompt", contract["source"]
+            )
+            self.assertEqual(
+                fixture.reference_prompt_sha256, contract["template"]["sha256"]
+            )
             self.assertEqual("<bos>", contract["serialized_prompt"]["automatic_prefix"])
 
     def test_model_neutral_cuda_profile_is_explicit_and_overrideable(self) -> None:
@@ -365,17 +449,33 @@ class SchedulingAndParsingTests(unittest.TestCase):
         )
         profile = benchmark.resolve_antfly_execution_profile(base_args, fixture, {})
         self.assertEqual(benchmark.CUDA_PROFILE_NAME, profile["name"])
-        self.assertEqual("required", profile["effective_env"]["ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"])
+        self.assertEqual(
+            "required",
+            profile["effective_env"]["ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"],
+        )
         self.assertEqual(
             "required-fast",
             profile["effective_env"]["ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE"],
         )
-        self.assertEqual("1", profile["effective_env"]["ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN"])
-        self.assertEqual("1", profile["effective_env"]["ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN"])
-        self.assertEqual("0", profile["effective_env"]["ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS"])
+        self.assertEqual(
+            "1", profile["effective_env"]["ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN"]
+        )
+        self.assertEqual(
+            "1", profile["effective_env"]["ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN"]
+        )
+        self.assertEqual(
+            "0",
+            profile["effective_env"][
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS"
+            ],
+        )
         self.assertEqual(
             2400,
-            int(profile["effective_env"]["ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY"]),
+            int(
+                profile["effective_env"][
+                    "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY"
+                ]
+            ),
         )
         self.assertNotIn("ANTFLY_CAPTURE_FORCE_KV_CAPACITY", profile["effective_env"])
 
@@ -391,10 +491,26 @@ class SchedulingAndParsingTests(unittest.TestCase):
             fixture,
             {"ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "auto"},
         )
-        self.assertEqual("auto", overridden["effective_env"]["ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"])
-        self.assertEqual("process_environment", overridden["sources"]["ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"])
-        self.assertEqual("64", overridden["effective_env"]["ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS"])
-        self.assertEqual("command_line", overridden["sources"]["ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS"])
+        self.assertEqual(
+            "auto",
+            overridden["effective_env"]["ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"],
+        )
+        self.assertEqual(
+            "process_environment",
+            overridden["sources"]["ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"],
+        )
+        self.assertEqual(
+            "64",
+            overridden["effective_env"][
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS"
+            ],
+        )
+        self.assertEqual(
+            "command_line",
+            overridden["sources"][
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS"
+            ],
+        )
         self.assertNotEqual(profile["sha256"], overridden["sha256"])
 
     def test_cuda_gqa_prefill_profile_rejects_noncanonical_values(self) -> None:
@@ -428,15 +544,24 @@ class SchedulingAndParsingTests(unittest.TestCase):
                     llama_server_prefix="",
                     enforce_performance=False,
                 )
-                profile = benchmark.resolve_antfly_execution_profile(exploratory, fixture, {})
-                self.assertEqual(value, profile["effective_env"]["ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE"])
+                profile = benchmark.resolve_antfly_execution_profile(
+                    exploratory, fixture, {}
+                )
+                self.assertEqual(
+                    value,
+                    profile["effective_env"][
+                        "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE"
+                    ],
+                )
 
                 enforced = argparse.Namespace(**vars(exploratory))
                 enforced.enforce_performance = True
                 with self.assertRaisesRegex(ValueError, "collect-only"):
                     benchmark.resolve_antfly_execution_profile(enforced, fixture, {})
 
-    def test_versioned_warp_tiled64_profile_is_collect_only_and_fail_closed(self) -> None:
+    def test_versioned_warp_tiled64_profile_is_collect_only_and_fail_closed(
+        self,
+    ) -> None:
         fixture = benchmark.load_fixture(FIXTURE)
         namespace = argparse.Namespace(
             backend="cuda",
@@ -464,7 +589,9 @@ class SchedulingAndParsingTests(unittest.TestCase):
         )
         self.assertEqual("tiled64", profile["route_contract"]["decode"]["consumer"])
         benchmark.validate_headline_execution_profile(
-            argparse.Namespace(profile="headline", enforce_performance=False, output_tokens=300),
+            argparse.Namespace(
+                profile="headline", enforce_performance=False, output_tokens=300
+            ),
             fixture,
             profile,
         )
@@ -478,15 +605,21 @@ class SchedulingAndParsingTests(unittest.TestCase):
         overridden_args.antfly_env = [
             "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER=serial"
         ]
-        overridden = benchmark.resolve_antfly_execution_profile(overridden_args, fixture, {})
+        overridden = benchmark.resolve_antfly_execution_profile(
+            overridden_args, fixture, {}
+        )
         with self.assertRaisesRegex(ValueError, "requires .*required-tiled64"):
             benchmark.validate_headline_execution_profile(
-                argparse.Namespace(profile="headline", enforce_performance=True, output_tokens=300),
+                argparse.Namespace(
+                    profile="headline", enforce_performance=True, output_tokens=300
+                ),
                 fixture,
                 overridden,
             )
 
-    def test_versioned_flash_tiled64_profile_is_collect_only_and_fail_closed(self) -> None:
+    def test_versioned_flash_tiled64_profile_is_collect_only_and_fail_closed(
+        self,
+    ) -> None:
         fixture = benchmark.load_fixture(FIXTURE)
         namespace = argparse.Namespace(
             backend="cuda",
@@ -498,7 +631,9 @@ class SchedulingAndParsingTests(unittest.TestCase):
             cuda_execution_profile="gemma4-e2b-sm89-flash-tiled64-v1",
         )
         profile = benchmark.resolve_antfly_execution_profile(namespace, fixture, {})
-        self.assertEqual("antfly.gemma4_e2b_sm89_flash_tiled64_server.v1", profile["name"])
+        self.assertEqual(
+            "antfly.gemma4_e2b_sm89_flash_tiled64_server.v1", profile["name"]
+        )
         self.assertEqual(
             "required-flash-f16-sm89",
             profile["effective_env"]["ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE"],
@@ -509,10 +644,14 @@ class SchedulingAndParsingTests(unittest.TestCase):
                 "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER"
             ],
         )
-        self.assertEqual([3, 512], profile["route_contract"]["prefill"]["gemma4_query_lengths"])
+        self.assertEqual(
+            [3, 512], profile["route_contract"]["prefill"]["gemma4_query_lengths"]
+        )
         self.assertTrue(profile["route_contract"]["prefill"]["forbid_fallback"])
         benchmark.validate_headline_execution_profile(
-            argparse.Namespace(profile="headline", enforce_performance=False, output_tokens=300),
+            argparse.Namespace(
+                profile="headline", enforce_performance=False, output_tokens=300
+            ),
             fixture,
             profile,
         )
@@ -522,7 +661,9 @@ class SchedulingAndParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "collect-only"):
             benchmark.resolve_antfly_execution_profile(enforced_args, fixture, {})
 
-    def test_versioned_flash_splitk_profile_is_explicit_locked_and_collect_only(self) -> None:
+    def test_versioned_flash_splitk_profile_is_explicit_locked_and_collect_only(
+        self,
+    ) -> None:
         fixture = benchmark.load_fixture(FIXTURE)
         namespace = argparse.Namespace(
             backend="cuda",
@@ -534,7 +675,9 @@ class SchedulingAndParsingTests(unittest.TestCase):
             cuda_execution_profile="gemma4-e2b-sm89-flash-splitk-v1",
         )
         profile = benchmark.resolve_antfly_execution_profile(namespace, fixture, {})
-        self.assertEqual("antfly.gemma4_e2b_sm89_flash_splitk_online_server.v1", profile["name"])
+        self.assertEqual(
+            "antfly.gemma4_e2b_sm89_flash_splitk_online_server.v1", profile["name"]
+        )
         for name, value in benchmark.GEMMA4_E2B_SM89_FLASH_COMMON_ENV.items():
             self.assertEqual(value, profile["effective_env"][name])
             self.assertEqual("reviewed_versioned_profile", profile["sources"][name])
@@ -548,13 +691,24 @@ class SchedulingAndParsingTests(unittest.TestCase):
         )
         self.assertEqual(
             "0",
-            profile["effective_env"]["ANTFLY_INFERENCE_CUDA_DEQUANTIZE_Q4_0_MATRIX_WEIGHTS_BF16"],
+            profile["effective_env"][
+                "ANTFLY_INFERENCE_CUDA_DEQUANTIZE_Q4_0_MATRIX_WEIGHTS_BF16"
+            ],
         )
-        self.assertEqual("0", profile["effective_env"]["ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR"])
-        self.assertEqual("0", profile["effective_env"]["ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16"])
-        self.assertEqual("2400", profile["effective_env"]["ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY"])
+        self.assertEqual(
+            "0", profile["effective_env"]["ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR"]
+        )
+        self.assertEqual(
+            "0", profile["effective_env"]["ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16"]
+        )
+        self.assertEqual(
+            "2400",
+            profile["effective_env"]["ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY"],
+        )
         self.assertEqual(19_000, profile["server_budget_mb"]["backend"])
-        self.assertEqual("decode-splitk-online-sm89", profile["route_contract"]["decode"]["route"])
+        self.assertEqual(
+            "decode-splitk-online-sm89", profile["route_contract"]["decode"]["route"]
+        )
 
         for environment, override in (
             ({"ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL": "0"}, []),
@@ -564,26 +718,38 @@ class SchedulingAndParsingTests(unittest.TestCase):
             with self.subTest(environment=environment, override=override):
                 changed = argparse.Namespace(**vars(namespace))
                 changed.antfly_env = override
-                with self.assertRaisesRegex(ValueError, "locked CUDA execution profile forbids overriding"):
-                    benchmark.resolve_antfly_execution_profile(changed, fixture, environment)
+                with self.assertRaisesRegex(
+                    ValueError, "locked CUDA execution profile forbids overriding"
+                ):
+                    benchmark.resolve_antfly_execution_profile(
+                        changed, fixture, environment
+                    )
 
         for environment, override in (
             ({"ANTFLY_UNREVIEWED_CUDA_TUNING": "1"}, []),
             ({"TERMITE_UNREVIEWED_CUDA_TUNING": "1"}, []),
             ({}, ["ANTFLY_UNREVIEWED_CUDA_TUNING=1"]),
         ):
-            with self.subTest(unreviewed_environment=environment, unreviewed_override=override):
+            with self.subTest(
+                unreviewed_environment=environment, unreviewed_override=override
+            ):
                 changed = argparse.Namespace(**vars(namespace))
                 changed.antfly_env = override
-                with self.assertRaisesRegex(ValueError, "forbids unreviewed environment variable"):
-                    benchmark.resolve_antfly_execution_profile(changed, fixture, environment)
+                with self.assertRaisesRegex(
+                    ValueError, "forbids unreviewed environment variable"
+                ):
+                    benchmark.resolve_antfly_execution_profile(
+                        changed, fixture, environment
+                    )
 
         enforced = argparse.Namespace(**vars(namespace))
         enforced.enforce_performance = True
         with self.assertRaisesRegex(ValueError, "collect-only"):
             benchmark.resolve_antfly_execution_profile(enforced, fixture, {})
 
-    def test_cuda_gqa_prefill_telemetry_parser_requires_exact_active_route(self) -> None:
+    def test_cuda_gqa_prefill_telemetry_parser_requires_exact_active_route(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             log_path = pathlib.Path(temporary) / "server.log"
             log_path.write_text(
@@ -617,9 +783,9 @@ class SchedulingAndParsingTests(unittest.TestCase):
                 encoding="utf-8",
             )
             telemetry = benchmark.parse_cuda_gqa_prefill_telemetry(log_path)
-        contract = benchmark.CUDA_EXECUTION_PROFILES[
-            "gemma4-e2b-sm89-warp-tiled64-v1"
-        ]["route_contract"]["prefill"]
+        contract = benchmark.CUDA_EXECUTION_PROFILES["gemma4-e2b-sm89-warp-tiled64-v1"][
+            "route_contract"
+        ]["prefill"]
         observation = benchmark.cuda_gqa_prefill_route_observation(telemetry, contract)
         self.assertEqual(2, observation["active_count"])
         self.assertEqual([256, 512], observation["gemma4_head_dims"])
@@ -667,18 +833,22 @@ class SchedulingAndParsingTests(unittest.TestCase):
                 encoding="utf-8",
             )
             telemetry = benchmark.parse_cuda_gqa_score_prework_telemetry(log_path)
-        contract = benchmark.CUDA_EXECUTION_PROFILES[
-            "gemma4-e2b-sm89-warp-tiled64-v1"
-        ]["route_contract"]["decode"]
+        contract = benchmark.CUDA_EXECUTION_PROFILES["gemma4-e2b-sm89-warp-tiled64-v1"][
+            "route_contract"
+        ]["decode"]
         observation = benchmark.cuda_gqa_score_prework_observation(telemetry, contract)
         self.assertEqual(["required-tiled64"], telemetry["configured_modes"])
         self.assertEqual("tiled64", observation["consumer"])
         self.assertEqual([256, 512], observation["gemma4_head_dims"])
-        self.assertEqual(contract["routes_by_head_dim"], observation["routes_by_head_dim"])
+        self.assertEqual(
+            contract["routes_by_head_dim"], observation["routes_by_head_dim"]
+        )
         self.assertEqual(0, telemetry["fallback_count"])
         self.assertEqual(0, telemetry["rejected_count"])
 
-    def test_cuda_splitk_decode_telemetry_enforces_required_profile_and_both_head_dims(self) -> None:
+    def test_cuda_splitk_decode_telemetry_enforces_required_profile_and_both_head_dims(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             log_path = pathlib.Path(temporary) / "server.log"
             log_path.write_text(
@@ -693,11 +863,13 @@ class SchedulingAndParsingTests(unittest.TestCase):
                 encoding="utf-8",
             )
             telemetry = benchmark.parse_cuda_gqa_decode_telemetry(log_path)
-        contract = benchmark.CUDA_EXECUTION_PROFILES[
-            "gemma4-e2b-sm89-flash-splitk-v1"
-        ]["route_contract"]["decode"]
+        contract = benchmark.CUDA_EXECUTION_PROFILES["gemma4-e2b-sm89-flash-splitk-v1"][
+            "route_contract"
+        ]["decode"]
         observation = benchmark.cuda_gqa_decode_route_observation(telemetry, contract)
-        self.assertEqual(["required-splitk-online-sm89"], telemetry["configured_profiles"])
+        self.assertEqual(
+            ["required-splitk-online-sm89"], telemetry["configured_profiles"]
+        )
         self.assertEqual("decode-splitk-online-sm89", observation["route"])
         # Server logs are bounded route observations, not CLI launch counters:
         # one active event is retained for each qualified head dimension.
@@ -726,7 +898,9 @@ class SchedulingAndParsingTests(unittest.TestCase):
             "LLAMA_ARG_N_GPU_LAYERS": "99",
             "UNRELATED_BENCHMARK_SETTING": "ignored",
         }
-        profile = benchmark.resolve_antfly_execution_profile(namespace, fixture, material)
+        profile = benchmark.resolve_antfly_execution_profile(
+            namespace, fixture, material
+        )
         for name, value in material.items():
             if name == "UNRELATED_BENCHMARK_SETTING":
                 self.assertNotIn(name, profile["effective_env"])
@@ -741,7 +915,10 @@ class SchedulingAndParsingTests(unittest.TestCase):
             fixture,
             {**material, "TERMITE_CUDA_CUBLASLT_WORKSPACE_MB": "512"},
         )
-        self.assertNotEqual(profile["material_environment_sha256"], changed["material_environment_sha256"])
+        self.assertNotEqual(
+            profile["material_environment_sha256"],
+            changed["material_environment_sha256"],
+        )
         self.assertNotEqual(profile["sha256"], changed["sha256"])
 
     def test_headline_rejects_overridden_required_graph_profile(self) -> None:
@@ -754,7 +931,9 @@ class SchedulingAndParsingTests(unittest.TestCase):
             llama_server_prefix="",
         )
         valid = benchmark.resolve_antfly_execution_profile(resolve_args, fixture, {})
-        gate_args = argparse.Namespace(profile="headline", enforce_performance=True, output_tokens=300)
+        gate_args = argparse.Namespace(
+            profile="headline", enforce_performance=True, output_tokens=300
+        )
         benchmark.validate_headline_execution_profile(gate_args, fixture, valid)
 
         overridden = benchmark.resolve_antfly_execution_profile(
@@ -763,7 +942,9 @@ class SchedulingAndParsingTests(unittest.TestCase):
             {"ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "auto"},
         )
         with self.assertRaisesRegex(ValueError, "DECODE_GRAPH_REPLAY=required"):
-            benchmark.validate_headline_execution_profile(gate_args, fixture, overridden)
+            benchmark.validate_headline_execution_profile(
+                gate_args, fixture, overridden
+            )
 
         legacy = benchmark.resolve_antfly_execution_profile(
             resolve_args,
@@ -778,10 +959,16 @@ class SchedulingAndParsingTests(unittest.TestCase):
             fixture,
             {"ANTFLY_INFERENCE_CUDA_PROFILE_PREFILL_OPS": "1"},
         )
-        with self.assertRaisesRegex(ValueError, "synchronization-heavy timing instrumentation"):
-            benchmark.validate_headline_execution_profile(gate_args, fixture, instrumented)
+        with self.assertRaisesRegex(
+            ValueError, "synchronization-heavy timing instrumentation"
+        ):
+            benchmark.validate_headline_execution_profile(
+                gate_args, fixture, instrumented
+            )
 
-    def test_profile_redacts_sensitive_values_in_provenance_without_weakening_hash(self) -> None:
+    def test_profile_redacts_sensitive_values_in_provenance_without_weakening_hash(
+        self,
+    ) -> None:
         fixture = benchmark.load_fixture(FIXTURE)
         namespace = argparse.Namespace(
             backend="cuda",
@@ -805,7 +992,9 @@ class SchedulingAndParsingTests(unittest.TestCase):
     def test_profile_hash_and_lock_change_with_either_server_prefix(self) -> None:
         fixture = benchmark.load_fixture(FIXTURE)
 
-        def profile(antfly_prefix: str = "", llama_prefix: str = "") -> tuple[argparse.Namespace, dict]:
+        def profile(
+            antfly_prefix: str = "", llama_prefix: str = ""
+        ) -> tuple[argparse.Namespace, dict]:
             namespace = argparse.Namespace(
                 backend="cuda",
                 cache_dtype="f16",
@@ -815,7 +1004,9 @@ class SchedulingAndParsingTests(unittest.TestCase):
                 antfly_server_prefix=antfly_prefix,
                 llama_server_prefix=llama_prefix,
             )
-            resolved = benchmark.resolve_antfly_execution_profile(namespace, fixture, {})
+            resolved = benchmark.resolve_antfly_execution_profile(
+                namespace, fixture, {}
+            )
             namespace.antfly_execution_profile = resolved
             return namespace, resolved
 
@@ -843,7 +1034,9 @@ class SchedulingAndParsingTests(unittest.TestCase):
             llama["server_prefix_sha256"]["llama_cpp"],
             lock["llama_cpp_server_prefix_sha256"],
         )
-        self.assertEqual(llama["material_environment_sha256"], lock["material_environment_sha256"])
+        self.assertEqual(
+            llama["material_environment_sha256"], lock["material_environment_sha256"]
+        )
 
     def test_antfly_server_config_locks_512_row_idle_prefill_chunks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -879,7 +1072,10 @@ class SchedulingAndParsingTests(unittest.TestCase):
             spec = benchmark.make_server_spec(namespace, "llama_cpp", 19001, root)
             template = root / "gemma4-public-final-chat-template.jinja"
             self.assertEqual(benchmark.LLAMA_CHAT_TEMPLATE, template.read_text())
-            self.assertLess(spec.command.index("--jinja"), spec.command.index("--chat-template-file"))
+            self.assertLess(
+                spec.command.index("--jinja"),
+                spec.command.index("--chat-template-file"),
+            )
             self.assertEqual(
                 str(template.resolve()),
                 spec.command[spec.command.index("--chat-template-file") + 1],
@@ -893,31 +1089,43 @@ class StatisticsAndGateTests(unittest.TestCase):
     def test_headline_accepts_statistically_stable_ten_percent_win(self) -> None:
         evidence = benchmark.evaluate(args(), self.fixture, rows(), None)
         self.assertTrue(evidence["passed"])
-        self.assertLess(evidence["comparison"]["paired_bootstrap_95_ci"]["upper_95"], 1.0)
+        self.assertLess(
+            evidence["comparison"]["paired_bootstrap_95_ci"]["upper_95"], 1.0
+        )
         paired_log_ci = evidence["comparison"]["paired_log_ratio_95_ci"]
         self.assertLess(paired_log_ci["total_latency_ms"]["upper_95"], 1.0)
         self.assertEqual(
             "median_paired_log_ratio",
             paired_log_ci["decode_ms"]["estimator"],
         )
-        self.assertLessEqual(evidence["comparison"]["antfly_llama_median_total_ratio"], 0.95)
+        self.assertLessEqual(
+            evidence["comparison"]["antfly_llama_median_total_ratio"], 0.95
+        )
 
     def test_headline_rejects_less_than_five_percent_win(self) -> None:
         evidence = benchmark.evaluate(args(), self.fixture, rows(96.0, 100.0), None)
         self.assertFalse(evidence["passed"])
-        failed = {item["name"] for item in evidence["checks"] if item["enforced"] and not item["passed"]}
+        failed = {
+            item["name"]
+            for item in evidence["checks"]
+            if item["enforced"] and not item["passed"]
+        }
         self.assertIn("headline_median_total_ratio", failed)
 
-    def test_headline_ttft_paired_ci_rejects_tail_regressions_hidden_by_median(self) -> None:
+    def test_headline_ttft_paired_ci_rejects_tail_regressions_hidden_by_median(
+        self,
+    ) -> None:
         measured = []
         for index in range(1, 11):
             antfly_ttft = 19.0 if index <= 6 else 25.0
-            measured.append({
-                "pair": index,
-                "order": list(benchmark.paired_order(index)),
-                "antfly": sample("antfly", 90.0, antfly_ttft),
-                "llama_cpp": sample("llama_cpp", 100.0, 20.0),
-            })
+            measured.append(
+                {
+                    "pair": index,
+                    "order": list(benchmark.paired_order(index)),
+                    "antfly": sample("antfly", 90.0, antfly_ttft),
+                    "llama_cpp": sample("llama_cpp", 100.0, 20.0),
+                }
+            )
         evidence = benchmark.evaluate(args(), self.fixture, measured, None)
         self.assertLessEqual(
             evidence["comparison"]["antfly_llama_median_ttft_ratio"],
@@ -927,19 +1135,27 @@ class StatisticsAndGateTests(unittest.TestCase):
             evidence["comparison"]["paired_log_ratio_95_ci"]["ttft_ms"]["upper_95"],
             1.02,
         )
-        failed = {item["name"] for item in evidence["checks"] if item["enforced"] and not item["passed"]}
+        failed = {
+            item["name"]
+            for item in evidence["checks"]
+            if item["enforced"] and not item["passed"]
+        }
         self.assertIn("headline_ttft_paired_ci", failed)
 
-    def test_headline_decode_paired_ci_rejects_tail_regressions_hidden_by_median(self) -> None:
+    def test_headline_decode_paired_ci_rejects_tail_regressions_hidden_by_median(
+        self,
+    ) -> None:
         measured = []
         for index in range(1, 11):
             antfly_decode = 75.0 if index <= 6 else 85.0
-            measured.append({
-                "pair": index,
-                "order": list(benchmark.paired_order(index)),
-                "antfly": sample("antfly", 90.0, 90.0 - antfly_decode),
-                "llama_cpp": sample("llama_cpp", 100.0, 20.0),
-            })
+            measured.append(
+                {
+                    "pair": index,
+                    "order": list(benchmark.paired_order(index)),
+                    "antfly": sample("antfly", 90.0, 90.0 - antfly_decode),
+                    "llama_cpp": sample("llama_cpp", 100.0, 20.0),
+                }
+            )
         evidence = benchmark.evaluate(args(), self.fixture, measured, None)
         self.assertLessEqual(
             evidence["comparison"]["antfly_llama_median_decode_latency_ratio"],
@@ -949,7 +1165,11 @@ class StatisticsAndGateTests(unittest.TestCase):
             evidence["comparison"]["paired_log_ratio_95_ci"]["decode_ms"]["upper_95"],
             1.02,
         )
-        failed = {item["name"] for item in evidence["checks"] if item["enforced"] and not item["passed"]}
+        failed = {
+            item["name"]
+            for item in evidence["checks"]
+            if item["enforced"] and not item["passed"]
+        }
         self.assertIn("headline_decode_paired_ci", failed)
 
     def test_performance_threshold_contract_is_machine_readable(self) -> None:
@@ -960,9 +1180,7 @@ class StatisticsAndGateTests(unittest.TestCase):
         )
         self.assertEqual(
             1.02,
-            contract["antfly_llama"][
-                "paired_ttft_log_ratio_95_ci_upper_max_inclusive"
-            ],
+            contract["antfly_llama"]["paired_ttft_log_ratio_95_ci_upper_max_inclusive"],
         )
         self.assertEqual(
             1.02,
@@ -976,64 +1194,106 @@ class StatisticsAndGateTests(unittest.TestCase):
         measured[0]["antfly"]["completion_token_accounting_source"] = "content_events"
         evidence = benchmark.evaluate(args(), self.fixture, measured, None)
         self.assertFalse(evidence["passed"])
-        failed = {item["name"] for item in evidence["checks"] if item["enforced"] and not item["passed"]}
+        failed = {
+            item["name"]
+            for item in evidence["checks"]
+            if item["enforced"] and not item["passed"]
+        }
         self.assertIn("pair_1_antfly_authoritative_completion_usage", failed)
 
     def test_headline_requires_required_fast_gqa_prefill_route_evidence(self) -> None:
         measured = rows()
-        measured[0]["antfly"]["cuda_gqa_prefill_telemetry"]["required_fast_gemma4_head_dims"] = [256]
-        measured[0]["antfly"]["cuda_gqa_prefill_telemetry"]["required_fast_route_active"] = False
+        measured[0]["antfly"]["cuda_gqa_prefill_telemetry"][
+            "required_fast_gemma4_head_dims"
+        ] = [256]
+        measured[0]["antfly"]["cuda_gqa_prefill_telemetry"][
+            "required_fast_route_active"
+        ] = False
         evidence = benchmark.evaluate(args(), self.fixture, measured, None)
         self.assertFalse(evidence["passed"])
-        failed = {item["name"] for item in evidence["checks"] if item["enforced"] and not item["passed"]}
+        failed = {
+            item["name"]
+            for item in evidence["checks"]
+            if item["enforced"] and not item["passed"]
+        }
         self.assertIn("pair_1_antfly_required_fast_gqa_prefill", failed)
 
     def test_headline_requires_exact_decode_consumer_route_evidence(self) -> None:
         measured = rows()
         measured[0]["antfly"]["cuda_gqa_score_prework_telemetry"]["fallback_count"] = 1
-        measured[0]["antfly"]["cuda_gqa_score_prework_telemetry"]["fallback_reasons"] = [
-            "consumer_symbol_unavailable"
-        ]
+        measured[0]["antfly"]["cuda_gqa_score_prework_telemetry"][
+            "fallback_reasons"
+        ] = ["consumer_symbol_unavailable"]
         evidence = benchmark.evaluate(args(), self.fixture, measured, None)
         self.assertFalse(evidence["passed"])
-        failed = {item["name"] for item in evidence["checks"] if item["enforced"] and not item["passed"]}
+        failed = {
+            item["name"]
+            for item in evidence["checks"]
+            if item["enforced"] and not item["passed"]
+        }
         self.assertIn("pair_1_antfly_gqa_score_prework_consumer_contract", failed)
 
     def test_correctness_failures_remain_gating_in_collect_only_mode(self) -> None:
         broken = rows()
         broken[0]["antfly"]["completion_tokens"] = 299
-        evidence = benchmark.evaluate(args(enforce_performance=False), self.fixture, broken, None)
+        evidence = benchmark.evaluate(
+            args(enforce_performance=False), self.fixture, broken, None
+        )
         self.assertFalse(evidence["passed"])
-        self.assertTrue(any(item["name"].endswith("completion_tokens") and not item["passed"] for item in evidence["checks"]))
+        self.assertTrue(
+            any(
+                item["name"].endswith("completion_tokens") and not item["passed"]
+                for item in evidence["checks"]
+            )
+        )
 
     def test_empty_or_semantically_wrong_output_is_rejected(self) -> None:
         empty = rows()
         empty[0]["antfly"]["content"] = ""
         empty[0]["antfly"]["content_utf8_bytes"] = 0
-        evidence = benchmark.evaluate(args(enforce_performance=False), self.fixture, empty, None)
+        evidence = benchmark.evaluate(
+            args(enforce_performance=False), self.fixture, empty, None
+        )
         self.assertFalse(evidence["passed"])
-        failed = {item["name"] for item in evidence["checks"] if item["enforced"] and not item["passed"]}
+        failed = {
+            item["name"]
+            for item in evidence["checks"]
+            if item["enforced"] and not item["passed"]
+        }
         self.assertIn("pair_1_antfly_visible_content", failed)
         self.assertIn("pair_1_antfly_semantic_output", failed)
 
         wrong = rows()
         wrong[0]["llama_cpp"]["content"] = "A deterministic but unrelated answer."
-        wrong[0]["llama_cpp"]["content_utf8_bytes"] = len(wrong[0]["llama_cpp"]["content"])
-        evidence = benchmark.evaluate(args(enforce_performance=False), self.fixture, wrong, None)
+        wrong[0]["llama_cpp"]["content_utf8_bytes"] = len(
+            wrong[0]["llama_cpp"]["content"]
+        )
+        evidence = benchmark.evaluate(
+            args(enforce_performance=False), self.fixture, wrong, None
+        )
         self.assertFalse(evidence["passed"])
-        self.assertTrue(any(
-            item["name"] == "pair_1_llama_cpp_semantic_output" and not item["passed"]
-            for item in evidence["checks"]
-        ))
+        self.assertTrue(
+            any(
+                item["name"] == "pair_1_llama_cpp_semantic_output"
+                and not item["passed"]
+                for item in evidence["checks"]
+            )
+        )
 
     def test_e2b_regression_uses_frozen_antfly_baseline(self) -> None:
         baseline = benchmark.evaluate(args(), self.fixture, rows(), None)
         current = rows(92.0, 100.0)
         accepted = benchmark.evaluate(
-            args(profile="e2b-regression", max_baseline_regression=1.03), self.fixture, current, baseline,
+            args(profile="e2b-regression", max_baseline_regression=1.03),
+            self.fixture,
+            current,
+            baseline,
         )
         rejected = benchmark.evaluate(
-            args(profile="e2b-regression", max_baseline_regression=1.02), self.fixture, current, baseline,
+            args(profile="e2b-regression", max_baseline_regression=1.02),
+            self.fixture,
+            current,
+            baseline,
         )
         self.assertTrue(accepted["passed"])
         self.assertFalse(rejected["passed"])
@@ -1049,17 +1309,28 @@ class StatisticsAndGateTests(unittest.TestCase):
             baseline,
         )
         self.assertFalse(evidence["passed"])
-        self.assertTrue(any(
-            item["name"] == "baseline_profile_antfly_latency_cv" and not item["passed"]
-            for item in evidence["checks"]
-        ))
+        self.assertTrue(
+            any(
+                item["name"] == "baseline_profile_antfly_latency_cv"
+                and not item["passed"]
+                for item in evidence["checks"]
+            )
+        )
 
     def test_f32_control_requires_baseline_when_enforced(self) -> None:
         evidence = benchmark.evaluate(
-            args(profile="f32-control", max_baseline_regression=1.05), self.fixture, rows(), None,
+            args(profile="f32-control", max_baseline_regression=1.05),
+            self.fixture,
+            rows(),
+            None,
         )
         self.assertFalse(evidence["passed"])
-        self.assertTrue(any(item["name"] == "frozen_antfly_baseline" and not item["passed"] for item in evidence["checks"]))
+        self.assertTrue(
+            any(
+                item["name"] == "frozen_antfly_baseline" and not item["passed"]
+                for item in evidence["checks"]
+            )
+        )
 
     def test_bootstrap_is_reproducible(self) -> None:
         first = benchmark.paired_bootstrap_ratio_ci(rows(), samples=200, seed=19)
@@ -1105,24 +1376,36 @@ class LockTests(unittest.TestCase):
             hidden.write_bytes(b"ignored-v1")
 
             decoder_provenance = benchmark.path_provenance(decoder)
-            first = benchmark.antfly_model_bundle_provenance(decoder, decoder_provenance)
+            first = benchmark.antfly_model_bundle_provenance(
+                decoder, decoder_provenance
+            )
             self.assertEqual(
                 ["mmproj-model.gguf", "model.gguf", "tokenizer.json"],
                 [item["path"] for item in first["files"]],
             )
             self.assertEqual(
                 decoder_provenance["sha256"],
-                next(item["sha256"] for item in first["files"] if item["path"] == "model.gguf"),
+                next(
+                    item["sha256"]
+                    for item in first["files"]
+                    if item["path"] == "model.gguf"
+                ),
             )
 
             hidden.write_bytes(b"ignored-v2")
-            hidden_only = benchmark.antfly_model_bundle_provenance(decoder, decoder_provenance)
+            hidden_only = benchmark.antfly_model_bundle_provenance(
+                decoder, decoder_provenance
+            )
             self.assertEqual(first["sha256"], hidden_only["sha256"])
-            self.assertTrue(any("hidden" in error for error in hidden_only["layout_errors"]))
+            self.assertTrue(
+                any("hidden" in error for error in hidden_only["layout_errors"])
+            )
 
             projector.write_bytes(b"projector-version-two")
             self.assertTrue(benchmark.model_bundle_stat_errors(decoder, first))
-            changed = benchmark.antfly_model_bundle_provenance(decoder, decoder_provenance)
+            changed = benchmark.antfly_model_bundle_provenance(
+                decoder, decoder_provenance
+            )
             self.assertNotEqual(first["sha256"], changed["sha256"])
 
     def test_enforced_model_bundle_rejects_unresolved_runtime_paths(self) -> None:
@@ -1131,20 +1414,34 @@ class LockTests(unittest.TestCase):
             model_dir.mkdir()
             decoder = model_dir / "model.gguf"
             decoder.write_bytes(b"decoder")
-            (model_dir / "model_manifest.json").write_text('{"model_path":"/external/model.gguf"}')
-            (model_dir / "linked-assets").symlink_to(pathlib.Path(temporary), target_is_directory=True)
+            (model_dir / "model_manifest.json").write_text(
+                '{"model_path":"/external/model.gguf"}'
+            )
+            (model_dir / "linked-assets").symlink_to(
+                pathlib.Path(temporary), target_is_directory=True
+            )
             bundle = benchmark.antfly_model_bundle_provenance(
                 decoder,
                 benchmark.path_provenance(decoder),
             )
-            self.assertTrue(any("runtime-path manifest" in error for error in bundle["layout_errors"]))
-            self.assertTrue(any("symlinked" in error for error in bundle["layout_errors"]))
+            self.assertTrue(
+                any(
+                    "runtime-path manifest" in error
+                    for error in bundle["layout_errors"]
+                )
+            )
+            self.assertTrue(
+                any("symlinked" in error for error in bundle["layout_errors"])
+            )
 
             namespace = argparse.Namespace(enforce_performance=True, backend="cuda")
             provenance = {
                 "antfly_model_bundle": bundle,
                 "runtime_identity": {
-                    "gpu_execution_state": {"error": None, "selected_gpus": [{"uuid": "GPU-test"}]},
+                    "gpu_execution_state": {
+                        "error": None,
+                        "selected_gpus": [{"uuid": "GPU-test"}],
+                    },
                     "cuda_toolchain": "cuda-toolchain",
                 },
                 "gpu_compute_processes_before_benchmark": {
@@ -1167,12 +1464,16 @@ class LockTests(unittest.TestCase):
             self.assertTrue(any("symlinked" in error for error in errors))
 
     def test_gpu_state_is_structured_and_scoped_to_cuda_visible_devices(self) -> None:
-        raw = "\n".join((
-            "0, GPU-first, NVIDIA L4, 580.159.03, 8.9, 23034, Enabled, 72.00, 2040, 6251, 2040, 6251, [N/A]",
-            "1, GPU-second, NVIDIA L4, 580.159.03, 8.9, 23034, Disabled, 72.00, 2040, 6251, 2040, 6251, Disabled",
-        ))
+        raw = "\n".join(
+            (
+                "0, GPU-first, NVIDIA L4, 580.159.03, 8.9, 23034, Enabled, 72.00, 2040, 6251, 2040, 6251, [N/A]",
+                "1, GPU-second, NVIDIA L4, 580.159.03, 8.9, 23034, Disabled, 72.00, 2040, 6251, 2040, 6251, Disabled",
+            )
+        )
         state = benchmark.parse_gpu_execution_state(raw, "1")
-        self.assertEqual(["GPU-second"], [gpu["uuid"] for gpu in state["selected_gpus"]])
+        self.assertEqual(
+            ["GPU-second"], [gpu["uuid"] for gpu in state["selected_gpus"]]
+        )
         self.assertEqual(72.0, state["selected_gpus"][0]["power.limit"])
 
         with self.assertRaisesRegex(ValueError, "power.limit is unavailable"):
@@ -1182,19 +1483,25 @@ class LockTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected 13"):
             benchmark.parse_gpu_execution_state("0, GPU-broken", "0")
 
-    def test_gpu_process_checks_ignore_unselected_gpus_and_catch_midrun_jobs(self) -> None:
+    def test_gpu_process_checks_ignore_unselected_gpus_and_catch_midrun_jobs(
+        self,
+    ) -> None:
         gpu_state = {
             "error": None,
             "cuda_visible_devices": "0",
             "selected_gpus": [{"uuid": "GPU-selected"}],
         }
-        process_rows = "\n".join((
-            "GPU-other, 100, unrelated-job",
-            "GPU-selected, 200, interfering-job",
-        ))
+        process_rows = "\n".join(
+            (
+                "GPU-other, 100, unrelated-job",
+                "GPU-selected, 200, interfering-job",
+            )
+        )
         with mock.patch.object(benchmark, "command_output", return_value=process_rows):
             processes = benchmark.capture_selected_gpu_compute_processes(gpu_state)
-        self.assertEqual([200], [process["pid"] for process in processes["selected_gpu_processes"]])
+        self.assertEqual(
+            [200], [process["pid"] for process in processes["selected_gpu_processes"]]
+        )
 
         with tempfile.TemporaryDirectory() as temporary:
             model_dir = pathlib.Path(temporary) / "model"
@@ -1214,25 +1521,43 @@ class LockTests(unittest.TestCase):
                 model=model,
             )
             with (
-                mock.patch.object(benchmark, "capture_gpu_execution_state", return_value=gpu_state),
+                mock.patch.object(
+                    benchmark, "capture_gpu_execution_state", return_value=gpu_state
+                ),
                 mock.patch.object(
                     benchmark,
                     "capture_selected_gpu_compute_processes",
                     return_value={
                         "error": None,
                         "selected_gpu_processes": [
-                            {"gpu_uuid": "GPU-selected", "pid": 200, "process_name": "interfering-job"}
+                            {
+                                "gpu_uuid": "GPU-selected",
+                                "pid": 200,
+                                "process_name": "interfering-job",
+                            }
                         ],
                     },
                 ),
             ):
-                guard = benchmark.capture_runtime_guard(namespace, provenance, "mid-run")
-            self.assertTrue(any("not idle" in error for error in benchmark.runtime_guard_errors(namespace, guard)))
+                guard = benchmark.capture_runtime_guard(
+                    namespace, provenance, "mid-run"
+                )
+            self.assertTrue(
+                any(
+                    "not idle" in error
+                    for error in benchmark.runtime_guard_errors(namespace, guard)
+                )
+            )
 
-    def test_enforced_provenance_requires_idle_gpu_and_stable_execution_state(self) -> None:
+    def test_enforced_provenance_requires_idle_gpu_and_stable_execution_state(
+        self,
+    ) -> None:
         namespace = argparse.Namespace(enforce_performance=True, backend="cuda")
         provenance = {
-            "antfly_model_bundle": {"sha256": "bundle", "files": [{"path": "model.gguf"}]},
+            "antfly_model_bundle": {
+                "sha256": "bundle",
+                "files": [{"path": "model.gguf"}],
+            },
             "runtime_identity": {
                 "gpu_execution_state": {
                     "error": None,
@@ -1255,13 +1580,17 @@ class LockTests(unittest.TestCase):
                 "build_metadata": "llama-build",
             },
         }
-        self.assertEqual([], benchmark.provenance_validation_errors(namespace, provenance))
+        self.assertEqual(
+            [], benchmark.provenance_validation_errors(namespace, provenance)
+        )
 
         busy = {
             **provenance,
             "gpu_compute_processes_before_benchmark": {
                 "error": None,
-                "selected_gpu_processes": [{"gpu_uuid": "GPU-uuid", "pid": 123, "name": "other-job"}],
+                "selected_gpu_processes": [
+                    {"gpu_uuid": "GPU-uuid", "pid": 123, "name": "other-job"}
+                ],
             },
         }
         errors = benchmark.provenance_validation_errors(namespace, busy)
@@ -1274,7 +1603,9 @@ class LockTests(unittest.TestCase):
         errors = benchmark.provenance_validation_errors(namespace, missing_state)
         self.assertTrue(any("power/clock/MIG" in error for error in errors))
 
-    def test_llama_build_metadata_excludes_nondeterministic_startup_log_prefix(self) -> None:
+    def test_llama_build_metadata_excludes_nondeterministic_startup_log_prefix(
+        self,
+    ) -> None:
         first = benchmark.stable_executable_build_metadata(
             "0.00.019 E CUDA init diagnostic\nversion: 1 (abc123)\nbuilt with GNU 12 for Linux"
         )
@@ -1296,12 +1627,17 @@ class LockTests(unittest.TestCase):
                 "libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x2)\n"
             )
             inspection = {"returncode": 0, "output": ldd_output, "error": None}
-            with mock.patch.object(benchmark, "command_capture", return_value=inspection):
+            with mock.patch.object(
+                benchmark, "command_capture", return_value=inspection
+            ):
                 first = benchmark.dynamic_dependency_provenance(binary)
                 library.write_bytes(b"second-build")
                 second = benchmark.dynamic_dependency_provenance(binary)
             self.assertEqual("resolved", first["status"])
-            self.assertEqual(["libggml-cuda.so.0"], [item["name"] for item in first["material_dependency_files"]])
+            self.assertEqual(
+                ["libggml-cuda.so.0"],
+                [item["name"] for item in first["material_dependency_files"]],
+            )
             self.assertNotEqual(first["sha256"], second["sha256"])
 
     def test_ldd_parser_reports_unresolved_dependencies(self) -> None:
@@ -1356,7 +1692,9 @@ class LockTests(unittest.TestCase):
         }
         errors = benchmark.baseline_compatibility_errors(baseline, current)
         self.assertTrue(any("runtime_identity_sha256" in error for error in errors))
-        self.assertTrue(any("llama_cpp_runtime_bundle_sha256" in error for error in errors))
+        self.assertTrue(
+            any("llama_cpp_runtime_bundle_sha256" in error for error in errors)
+        )
 
     def test_frozen_baseline_quality_fails_closed(self) -> None:
         fixture = benchmark.load_fixture(FIXTURE)
@@ -1382,10 +1720,14 @@ class LockTests(unittest.TestCase):
         profile = tampered["provenance"]["antfly_execution_profile"]
         profile["sha256"] = "tampered-profile"
         profile["server_budget_mb"]["backend"] += 1
-        tampered["provenance_sha256"] = benchmark.canonical_sha256(tampered["provenance"])
+        tampered["provenance_sha256"] = benchmark.canonical_sha256(
+            tampered["provenance"]
+        )
 
         errors = benchmark.baseline_quality_errors(tampered, "e2b-regression")
-        self.assertTrue(any("antfly_execution_profile_sha256" in error for error in errors))
+        self.assertTrue(
+            any("antfly_execution_profile_sha256" in error for error in errors)
+        )
         self.assertTrue(any("antfly_server_budget_mb" in error for error in errors))
 
     def test_regression_enforcement_requires_pinned_baseline_sha256(self) -> None:
@@ -1400,16 +1742,25 @@ class LockTests(unittest.TestCase):
             model.parent.mkdir()
             for path in (antfly, llama, model, baseline, lock):
                 path.write_bytes(b"fixture")
-            namespace = benchmark.parse_args([
-                "--antfly-bin", str(antfly),
-                "--llama-server-bin", str(llama),
-                "--model", str(model),
-                "--models-dir", str(root),
-                "--profile", "e2b-regression",
-                "--baseline-evidence", str(baseline),
-                "--lockfile", str(lock),
-                "--require-lock",
-            ])
+            namespace = benchmark.parse_args(
+                [
+                    "--antfly-bin",
+                    str(antfly),
+                    "--llama-server-bin",
+                    str(llama),
+                    "--model",
+                    str(model),
+                    "--models-dir",
+                    str(root),
+                    "--profile",
+                    "e2b-regression",
+                    "--baseline-evidence",
+                    str(baseline),
+                    "--lockfile",
+                    str(lock),
+                    "--require-lock",
+                ]
+            )
             with self.assertRaisesRegex(ValueError, "requires --baseline-sha256"):
                 benchmark.validate_args(namespace, fixture)
 
@@ -1431,19 +1782,31 @@ class LockTests(unittest.TestCase):
             model.write_bytes(b"model")
             baseline.write_text("{}")
             with self.assertRaisesRegex(SystemExit, "frozen baseline SHA-256 mismatch"):
-                benchmark.main([
-                    "--antfly-bin", str(antfly),
-                    "--llama-server-bin", str(llama),
-                    "--model", str(model),
-                    "--models-dir", str(root),
-                    "--output-dir", str(output),
-                    "--collect-only",
-                    "--warmups", "1",
-                    "--repeats", "1",
-                    "--bootstrap-samples", "1",
-                    "--baseline-evidence", str(baseline),
-                    "--baseline-sha256", "0" * 64,
-                ])
+                benchmark.main(
+                    [
+                        "--antfly-bin",
+                        str(antfly),
+                        "--llama-server-bin",
+                        str(llama),
+                        "--model",
+                        str(model),
+                        "--models-dir",
+                        str(root),
+                        "--output-dir",
+                        str(output),
+                        "--collect-only",
+                        "--warmups",
+                        "1",
+                        "--repeats",
+                        "1",
+                        "--bootstrap-samples",
+                        "1",
+                        "--baseline-evidence",
+                        str(baseline),
+                        "--baseline-sha256",
+                        "0" * 64,
+                    ]
+                )
 
     def test_reviewed_lock_bytes_must_match_pinned_sha256(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1458,20 +1821,34 @@ class LockTests(unittest.TestCase):
                 path.write_bytes(b"not-an-elf")
             model.write_bytes(b"model")
             lock.write_text("{}")
-            with self.assertRaisesRegex(SystemExit, "reviewed lockfile SHA-256 mismatch"):
-                benchmark.main([
-                    "--antfly-bin", str(antfly),
-                    "--llama-server-bin", str(llama),
-                    "--model", str(model),
-                    "--models-dir", str(root),
-                    "--output-dir", str(output),
-                    "--collect-only",
-                    "--warmups", "1",
-                    "--repeats", "1",
-                    "--bootstrap-samples", "1",
-                    "--lockfile", str(lock),
-                    "--lockfile-sha256", "0" * 64,
-                ])
+            with self.assertRaisesRegex(
+                SystemExit, "reviewed lockfile SHA-256 mismatch"
+            ):
+                benchmark.main(
+                    [
+                        "--antfly-bin",
+                        str(antfly),
+                        "--llama-server-bin",
+                        str(llama),
+                        "--model",
+                        str(model),
+                        "--models-dir",
+                        str(root),
+                        "--output-dir",
+                        str(output),
+                        "--collect-only",
+                        "--warmups",
+                        "1",
+                        "--repeats",
+                        "1",
+                        "--bootstrap-samples",
+                        "1",
+                        "--lockfile",
+                        str(lock),
+                        "--lockfile-sha256",
+                        "0" * 64,
+                    ]
+                )
 
     def test_baseline_profile_threshold_cannot_be_loosened(self) -> None:
         fixture = benchmark.load_fixture(FIXTURE)
@@ -1484,23 +1861,36 @@ class LockTests(unittest.TestCase):
             model.parent.mkdir()
             for path in (antfly, llama, model, baseline):
                 path.write_bytes(b"fixture")
-            namespace = benchmark.parse_args([
-                "--antfly-bin", str(antfly),
-                "--llama-server-bin", str(llama),
-                "--model", str(model),
-                "--models-dir", str(root),
-                "--profile", "e2b-regression",
-                "--baseline-evidence", str(baseline),
-                "--max-baseline-regression", "1.04",
-            ])
+            namespace = benchmark.parse_args(
+                [
+                    "--antfly-bin",
+                    str(antfly),
+                    "--llama-server-bin",
+                    str(llama),
+                    "--model",
+                    str(model),
+                    "--models-dir",
+                    str(root),
+                    "--profile",
+                    "e2b-regression",
+                    "--baseline-evidence",
+                    str(baseline),
+                    "--max-baseline-regression",
+                    "1.04",
+                ]
+            )
             with self.assertRaisesRegex(ValueError, "cannot be looser than 1.03"):
                 benchmark.validate_args(namespace, fixture)
 
     def test_e4b_regression_profile_uses_f16_and_three_percent_ceiling(self) -> None:
-        namespace = benchmark.parse_args([
-            "--model", "/tmp/e4b.gguf",
-            "--profile", "e4b-regression",
-        ])
+        namespace = benchmark.parse_args(
+            [
+                "--model",
+                "/tmp/e4b.gguf",
+                "--profile",
+                "e4b-regression",
+            ]
+        )
         self.assertEqual("f16", namespace.cache_dtype)
         self.assertEqual(1.03, namespace.max_baseline_regression)
 
@@ -1515,55 +1905,91 @@ class LockTests(unittest.TestCase):
             model.parent.mkdir()
             for path in (antfly, llama, model, lock):
                 path.write_bytes(b"fixture")
-            namespace = benchmark.parse_args([
-                "--antfly-bin", str(antfly),
-                "--llama-server-bin", str(llama),
-                "--model", str(model),
-                "--models-dir", str(root),
-                "--lockfile", str(lock),
-                "--lockfile-sha256", "0" * 64,
-                "--require-lock",
-                "--antfly-server-prefix", "",
-                "--llama-server-prefix", "",
-            ])
+            namespace = benchmark.parse_args(
+                [
+                    "--antfly-bin",
+                    str(antfly),
+                    "--llama-server-bin",
+                    str(llama),
+                    "--model",
+                    str(model),
+                    "--models-dir",
+                    str(root),
+                    "--lockfile",
+                    str(lock),
+                    "--lockfile-sha256",
+                    "0" * 64,
+                    "--require-lock",
+                    "--antfly-server-prefix",
+                    "",
+                    "--llama-server-prefix",
+                    "",
+                ]
+            )
             for field, value, message in (
                 ("antfly_server_prefix", "numactl --membind=0", "Antfly server prefix"),
                 ("llama_server_prefix", "taskset -c 0-3", "llama.cpp server prefix"),
             ):
                 setattr(namespace, field, value)
-                with self.subTest(field=field), self.assertRaisesRegex(ValueError, message):
+                with (
+                    self.subTest(field=field),
+                    self.assertRaisesRegex(ValueError, message),
+                ):
                     benchmark.validate_args(namespace, fixture)
                 setattr(namespace, field, "")
 
             for field in ("max_ttft_ci_upper", "max_decode_ci_upper"):
                 setattr(namespace, field, 1.03)
-                with self.subTest(field=field), self.assertRaisesRegex(
-                    ValueError,
-                    field.replace("_", "-") + " cannot be looser than 1.02",
+                with (
+                    self.subTest(field=field),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        field.replace("_", "-") + " cannot be looser than 1.02",
+                    ),
                 ):
                     benchmark.validate_args(namespace, fixture)
                 setattr(namespace, field, 1.02)
 
     def test_l4_e2e_requires_locked_long_e2e_for_release(self) -> None:
-        runner = (SCRIPTS.parents[4] / "zig/e2e/inference/run_cuda_gemma4_l4_e2e.sh").read_text()
+        runner = (
+            SCRIPTS.parents[4] / "zig/e2e/inference/run_cuda_gemma4_l4_e2e.sh"
+        ).read_text()
         lane = runner[
-            runner.index('if [[ "$long_e2e_configured" -eq 3 ]]', runner.index('"${release_args[@]}"')):
-            runner.index('if [[ -n "$e4b_qat_model" ]]', runner.index('"${release_args[@]}"'))
+            runner.index(
+                'if [[ "$long_e2e_configured" -eq 3 ]]',
+                runner.index('"${release_args[@]}"'),
+            ) : runner.index(
+                'if [[ -n "$e4b_qat_model" ]]', runner.index('"${release_args[@]}"')
+            )
         ]
         e4b_lane = runner[
-            runner.index('if [[ -n "$e4b_qat_model" ]]', runner.index('"${release_args[@]}"')):
-            runner.index("# Nightly-mode MTP is collection-only")
+            runner.index(
+                'if [[ -n "$e4b_qat_model" ]]', runner.index('"${release_args[@]}"')
+            ) : runner.index("# Nightly-mode MTP is collection-only")
         ]
         self.assertIn("long_e2e_configured", runner)
         self.assertIn('elif [[ "$mode" == "release" ]]', runner)
         self.assertIn("release mode requires LLAMA_SERVER_BIN", runner)
-        self.assertIn("release mode requires E4B_QAT_MODEL and reviewed frozen E4B regression evidence", runner)
+        self.assertIn(
+            "release mode requires E4B_QAT_MODEL and reviewed frozen E4B regression evidence",
+            runner,
+        )
         self.assertIn("e4b_regression_configured", runner)
-        self.assertIn("E4B_BASELINE_EVIDENCE, E4B_BASELINE_SHA256, E4B_REGRESSION_LOCK, and E4B_REGRESSION_LOCK_SHA256", runner)
-        self.assertIn('require_sha256 "E4B_BASELINE_SHA256" "$e4b_baseline_sha256"', runner)
-        self.assertIn('require_sha256 "E4B_REGRESSION_LOCK_SHA256" "$e4b_regression_lock_sha256"', runner)
+        self.assertIn(
+            "E4B_BASELINE_EVIDENCE, E4B_BASELINE_SHA256, E4B_REGRESSION_LOCK, and E4B_REGRESSION_LOCK_SHA256",
+            runner,
+        )
+        self.assertIn(
+            'require_sha256 "E4B_BASELINE_SHA256" "$e4b_baseline_sha256"', runner
+        )
+        self.assertIn(
+            'require_sha256 "E4B_REGRESSION_LOCK_SHA256" "$e4b_regression_lock_sha256"',
+            runner,
+        )
         self.assertIn('e2b_models_dir="$(dirname "$(dirname "$e2b_model")")"', runner)
-        self.assertIn('e4b_models_dir="$(dirname "$(dirname "$e4b_qat_model")")"', runner)
+        self.assertIn(
+            'e4b_models_dir="$(dirname "$(dirname "$e4b_qat_model")")"', runner
+        )
         self.assertIn("$long_e2e_lock_sha256", runner)
         self.assertIn(
             "LLAMA_SERVER_BIN, LONG_E2E_LOCK, and LONG_E2E_LOCK_SHA256 must be configured together",
@@ -1575,8 +2001,8 @@ class LockTests(unittest.TestCase):
         self.assertIn('--lockfile-sha256 "$long_e2e_lock_sha256"', lane)
         self.assertIn('--model "$e2b_model"', lane)
         self.assertIn('--models-dir "$e2b_models_dir"', lane)
-        self.assertIn('benchmark_rc=0', lane)
-        self.assertIn('|| benchmark_rc=$?', lane)
+        self.assertIn("benchmark_rc=0", lane)
+        self.assertIn("|| benchmark_rc=$?", lane)
         self.assertIn("merge_gemma4_long_e2e_release_summary.py", lane)
         self.assertIn('"$benchmark_rc"', lane)
         self.assertIn("--require-lock", lane)
@@ -1598,7 +2024,7 @@ class LockTests(unittest.TestCase):
 
 class HarnessIntegrationTests(unittest.TestCase):
     def test_collect_only_runs_both_warm_servers_and_writes_evidence(self) -> None:
-        fake_source = r'''
+        fake_source = r"""
             #!/usr/bin/env python3
             import http.server
             import json
@@ -1743,7 +2169,7 @@ class HarnessIntegrationTests(unittest.TestCase):
                     self.wfile.flush()
 
             http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
-        '''
+        """
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             fake = root / "fake-engine.py"
@@ -1754,17 +2180,27 @@ class HarnessIntegrationTests(unittest.TestCase):
             model.write_bytes(b"fake-model")
             output = root / "evidence"
             argv = [
-                "--antfly-bin", str(fake),
-                "--llama-server-bin", str(fake),
-                "--model", str(model),
-                "--models-dir", str(root),
-                "--output-dir", str(output),
+                "--antfly-bin",
+                str(fake),
+                "--llama-server-bin",
+                str(fake),
+                "--model",
+                str(model),
+                "--models-dir",
+                str(root),
+                "--output-dir",
+                str(output),
                 "--collect-only",
-                "--warmups", "1",
-                "--repeats", "1",
-                "--bootstrap-samples", "20",
-                "--startup-timeout", "5",
-                "--request-timeout", "5",
+                "--warmups",
+                "1",
+                "--repeats",
+                "1",
+                "--bootstrap-samples",
+                "20",
+                "--startup-timeout",
+                "5",
+                "--request-timeout",
+                "5",
             ]
             with mock.patch("builtins.print"):
                 benchmark.main(argv)
@@ -1787,8 +2223,14 @@ class HarnessIntegrationTests(unittest.TestCase):
             self.assertEqual(["antfly", "llama_cpp"], evidence["rows"][0]["order"])
             self.assertEqual(300, evidence["rows"][0]["antfly"]["completion_tokens"])
             self.assertEqual(2051, evidence["rows"][0]["llama_cpp"]["prompt_tokens"])
-            self.assertEqual("final_sse_usage", evidence["rows"][0]["antfly"]["completion_token_accounting_source"])
-            self.assertEqual("final_sse_usage", evidence["rows"][0]["llama_cpp"]["completion_token_accounting_source"])
+            self.assertEqual(
+                "final_sse_usage",
+                evidence["rows"][0]["antfly"]["completion_token_accounting_source"],
+            )
+            self.assertEqual(
+                "final_sse_usage",
+                evidence["rows"][0]["llama_cpp"]["completion_token_accounting_source"],
+            )
             self.assertEqual(
                 "llama_cpp_apply_template",
                 evidence["rows"][0]["llama_cpp"]["prompt_template"]["source"],
@@ -1805,7 +2247,9 @@ class HarnessIntegrationTests(unittest.TestCase):
                 evidence["rows"][0]["antfly"]["decode_ms"],
                 evidence["rows"][0]["antfly"]["visible_content_ms"],
             )
-            self.assertGreaterEqual(evidence["rows"][0]["antfly"]["stream_tail_ms"], 0.0)
+            self.assertGreaterEqual(
+                evidence["rows"][0]["antfly"]["stream_tail_ms"], 0.0
+            )
             self.assertAlmostEqual(
                 evidence["rows"][0]["antfly"]["total_latency_ms"],
                 evidence["rows"][0]["antfly"]["ttft_ms"]
@@ -1816,9 +2260,17 @@ class HarnessIntegrationTests(unittest.TestCase):
             self.assertTrue(evidence["rows"][0]["antfly"]["connection_reused"])
             profile = evidence["provenance"]["antfly_execution_profile"]
             self.assertEqual(benchmark.CUDA_PROFILE_NAME, profile["name"])
-            self.assertEqual("required", profile["effective_env"]["ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"])
-            self.assertEqual(profile["sha256"], evidence["lock"]["antfly_execution_profile_sha256"])
-            self.assertEqual(profile["material_environment_sha256"], evidence["lock"]["material_environment_sha256"])
+            self.assertEqual(
+                "required",
+                profile["effective_env"]["ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"],
+            )
+            self.assertEqual(
+                profile["sha256"], evidence["lock"]["antfly_execution_profile_sha256"]
+            )
+            self.assertEqual(
+                profile["material_environment_sha256"],
+                evidence["lock"]["material_environment_sha256"],
+            )
             self.assertEqual(
                 profile["server_prefix_sha256"]["llama_cpp"],
                 evidence["lock"]["llama_cpp_server_prefix_sha256"],
@@ -1831,16 +2283,26 @@ class HarnessIntegrationTests(unittest.TestCase):
                 evidence["provenance"]["runtime_identity"]["sha256"],
                 evidence["lock"]["runtime_identity_sha256"],
             )
-            prompt_contract = json.loads((output / "prompt_token_contract.json").read_text())
-            self.assertEqual(str(model.parent.resolve()), prompt_contract["model_directory"])
+            prompt_contract = json.loads(
+                (output / "prompt_token_contract.json").read_text()
+            )
+            self.assertEqual(
+                str(model.parent.resolve()), prompt_contract["model_directory"]
+            )
             self.assertEqual(4, len(evidence["provenance"]["runtime_guards"]))
             self.assertEqual(
                 evidence["provenance"]["antfly_model_bundle"]["sha256"],
                 evidence["provenance"]["antfly_model_bundle_post_benchmark"]["sha256"],
             )
-            self.assertTrue((output / "raw/pair-01-antfly/stream_events.json").is_file())
-            self.assertTrue((output / "raw/pair-01-llama_cpp/stream_events.json").is_file())
-            self.assertTrue((output / "raw/pair-01-llama_cpp/llama_prompt_template.json").is_file())
+            self.assertTrue(
+                (output / "raw/pair-01-antfly/stream_events.json").is_file()
+            )
+            self.assertTrue(
+                (output / "raw/pair-01-llama_cpp/stream_events.json").is_file()
+            )
+            self.assertTrue(
+                (output / "raw/pair-01-llama_cpp/llama_prompt_template.json").is_file()
+            )
             manifest = json.loads((output / "evidence_manifest.json").read_text())
             paths = {item["path"] for item in manifest["files"]}
             self.assertIn("evidence.json", paths)

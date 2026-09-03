@@ -47,8 +47,12 @@ class ReproducibleTarTests(unittest.TestCase):
             (source / "share" / "antfly").mkdir(parents=True)
             (source / "include").mkdir()
             (source / "README.md").write_text("Antfly\n", encoding="utf-8")
-            (source / "share" / "antfly" / "asset.txt").write_text("asset\n", encoding="utf-8")
-            (source / "include" / "antfly.h").write_text("/* Antfly */\n", encoding="utf-8")
+            (source / "share" / "antfly" / "asset.txt").write_text(
+                "asset\n", encoding="utf-8"
+            )
+            (source / "include" / "antfly.h").write_text(
+                "/* Antfly */\n", encoding="utf-8"
+            )
             binary = source / "antfly"
             binary.write_bytes(b"#!/bin/sh\nexit 0\n")
             binary.chmod(0o700)
@@ -68,24 +72,33 @@ class ReproducibleTarTests(unittest.TestCase):
 
             gzip_header = first.read_bytes()[:10]
             self.assertEqual(gzip_header[:3], b"\x1f\x8b\x08")
-            self.assertEqual(gzip_header[3] & 0x08, 0, "gzip header must not contain a filename")
+            self.assertEqual(
+                gzip_header[3] & 0x08, 0, "gzip header must not contain a filename"
+            )
             self.assertEqual(gzip_header[4:8], b"\0\0\0\0")
 
-            listing = subprocess.check_output(["tar", "-tzf", str(first)], text=True).splitlines()
+            listing = subprocess.check_output(
+                ["tar", "-tzf", str(first)], text=True
+            ).splitlines()
             self.assertIn("./include/antfly.h", listing)
 
             with tarfile.open(first, "r:gz") as archive:
                 members = archive.getmembers()
             expected_names: List[str] = ["."] + [
                 f"./{path.relative_to(source).as_posix()}"
-                for path in sorted(source.rglob("*"), key=lambda item: item.relative_to(source).as_posix())
+                for path in sorted(
+                    source.rglob("*"),
+                    key=lambda item: item.relative_to(source).as_posix(),
+                )
             ]
             self.assertEqual([member.name for member in members], expected_names)
             for member in members:
                 self.assertEqual((member.uid, member.gid), (0, 0))
                 self.assertEqual((member.uname, member.gname), ("", ""))
                 self.assertEqual(member.mtime, 1_700_000_000)
-                expected_mode = 0o755 if member.isdir() or member.name == "./antfly" else 0o644
+                expected_mode = (
+                    0o755 if member.isdir() or member.name == "./antfly" else 0o644
+                )
                 self.assertEqual(stat.S_IMODE(member.mode), expected_mode)
 
     def test_rejects_links_and_special_files(self) -> None:

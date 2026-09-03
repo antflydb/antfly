@@ -99,7 +99,13 @@ def test_standalone_drop_drains_pending_enrichment_work(
     try:
         rate_limited_openai_embedder.allow_all_requests()
         for table_name in table_names:
-            created = _json_request(session, server, "POST", f"/tables/{table_name}", payload={"num_shards": 1})
+            created = _json_request(
+                session,
+                server,
+                "POST",
+                f"/tables/{table_name}",
+                payload={"num_shards": 1},
+            )
             assert isinstance(created, dict)
             assert created["name"] == table_name
             created_tables.add(table_name)
@@ -137,7 +143,9 @@ def test_standalone_drop_drains_pending_enrichment_work(
                     interval_s=0.1,
                 )
                 is not None
-            ), f"index did not become ready for {table_name}\nserver logs:\n{server.debug_logs()}"
+            ), (
+                f"index did not become ready for {table_name}\nserver logs:\n{server.debug_logs()}"
+            )
 
         rate_limited_openai_embedder.deny_requests()
         documents = {
@@ -174,7 +182,9 @@ def test_standalone_drop_drains_pending_enrichment_work(
                 latest_statuses[table_name] = detail
                 status = detail.get("status", {})
                 coverage = status.get("coverage", {})
-                provider_limited = rate_limited_openai_embedder.stats()["rate_limited_requests"] > 0
+                provider_limited = (
+                    rate_limited_openai_embedder.stats()["rate_limited_requests"] > 0
+                )
                 work_pending = (
                     int(coverage.get("pending", 0)) > 0
                     or int(status.get("replay_applied_sequence", 0))
@@ -212,7 +222,9 @@ def test_standalone_drop_drains_pending_enrichment_work(
             "POST",
             f"/tables/{survivor}/batch",
             payload={
-                "inserts": {"doc:survivor": {"body": "the unrelated owner remains writable"}},
+                "inserts": {
+                    "doc:survivor": {"body": "the unrelated owner remains writable"}
+                },
                 "sync_level": "write",
             },
         )

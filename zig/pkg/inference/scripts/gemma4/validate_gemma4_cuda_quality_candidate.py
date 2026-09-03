@@ -36,11 +36,17 @@ from paired_benchmark import balanced_pair_order
 SUITE_SCHEMA = "antfly.gemma4_cuda_quality_suite.v1"
 EVIDENCE_SCHEMA = "antfly.gemma4_cuda_quality_evidence.v1"
 SAMPLE_SCHEMA = "antfly.gemma4_cuda_quality_sample.v1"
-PROMPT_TOKEN_IDS_RE = re.compile(r"^prompt_token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$", re.MULTILINE)
+PROMPT_TOKEN_IDS_RE = re.compile(
+    r"^prompt_token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$", re.MULTILINE
+)
 TOKEN_IDS_RE = re.compile(r"^token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$", re.MULTILINE)
-TOKENS_RE = re.compile(r"^(?:finish_reason=(?P<finish>\S+)\s+)?tokens=(?P<count>\d+)\s*$", re.MULTILINE)
+TOKENS_RE = re.compile(
+    r"^(?:finish_reason=(?P<finish>\S+)\s+)?tokens=(?P<count>\d+)\s*$", re.MULTILINE
+)
 HEX_SHA256_RE = re.compile(r"[0-9a-f]{64}")
-REVIEWED_SUITE_SHA256 = "f68f1910dae34f8c7a7827ea12d6b4a82c58ff85e6b4ae2f8ac6cb9138805898"
+REVIEWED_SUITE_SHA256 = (
+    "f68f1910dae34f8c7a7827ea12d6b4a82c58ff85e6b4ae2f8ac6cb9138805898"
+)
 SAFE_PARENT_ENVIRONMENT_KEYS = (
     "HOME",
     "LANG",
@@ -117,11 +123,16 @@ def inference_root_from_script() -> pathlib.Path:
 
 
 def reviewed_suite_path() -> pathlib.Path:
-    return inference_root_from_script() / "scripts/gemma4/fixtures/gemma4_cuda_quality_suite_v1.json"
+    return (
+        inference_root_from_script()
+        / "scripts/gemma4/fixtures/gemma4_cuda_quality_suite_v1.json"
+    )
 
 
 def canonical_json_bytes(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
 
 
 def canonical_sha256(value: Any) -> str:
@@ -176,7 +187,9 @@ def _prompt_fixture_text(path: pathlib.Path) -> tuple[str, str, dict[str, Any]]:
     repeat = raw.get("repeat")
     prefix = raw.get("reference_chat_prefix")
     chat_suffix = raw.get("reference_chat_suffix")
-    if not all(isinstance(value, str) for value in (segment, suffix, prefix, chat_suffix)):
+    if not all(
+        isinstance(value, str) for value in (segment, suffix, prefix, chat_suffix)
+    ):
         raise ValueError(f"prompt fixture strings are incomplete in {path}")
     if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:
         raise ValueError(f"prompt fixture repeat is invalid in {path}")
@@ -186,14 +199,22 @@ def _prompt_fixture_text(path: pathlib.Path) -> tuple[str, str, dict[str, Any]]:
 
 
 def _inline_prompt_text(contract: dict[str, Any], case_id: str) -> tuple[str, str]:
-    fields = ("reference_chat_prefix", "segment", "padding", "suffix", "reference_chat_suffix")
+    fields = (
+        "reference_chat_prefix",
+        "segment",
+        "padding",
+        "suffix",
+        "reference_chat_suffix",
+    )
     if not all(isinstance(contract.get(name), str) for name in fields):
         raise ValueError(f"{case_id} inline prompt strings are incomplete")
     repeat = contract.get("repeat")
     if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:
         raise ValueError(f"{case_id} prompt repeat must be a positive integer")
     user = contract["segment"] * repeat + contract["padding"] + contract["suffix"]
-    return user, contract["reference_chat_prefix"] + user + contract["reference_chat_suffix"]
+    return user, contract["reference_chat_prefix"] + user + contract[
+        "reference_chat_suffix"
+    ]
 
 
 def _verify_prompt_contract(
@@ -233,13 +254,20 @@ def _verify_prompt_contract(
         expected_user_sha = _required_digest(
             contract.get("expected_user_sha256"), f"{case_id} expected user prompt"
         )
-        if len(user_bytes) != expected_user_bytes or sha256_bytes(user_bytes) != expected_user_sha:
+        if (
+            len(user_bytes) != expected_user_bytes
+            or sha256_bytes(user_bytes) != expected_user_sha
+        ):
             raise ValueError(f"{case_id} user prompt contract mismatch")
 
 
 def _float_field(profile: dict[str, Any], name: str) -> float:
     value = profile.get(name)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
         raise ValueError(f"threshold {name} must be finite")
     return float(value)
 
@@ -257,38 +285,63 @@ def validate_threshold_profile(name: str, profile: dict[str, Any]) -> None:
         "min_normalized_text_similarity",
     }
     if set(profile) != required:
-        raise ValueError(f"threshold profile {name!r} fields must be exactly {sorted(required)}")
+        raise ValueError(
+            f"threshold profile {name!r} fields must be exactly {sorted(required)}"
+        )
     allow = profile.get("allow_token_divergence")
     if not isinstance(allow, bool):
-        raise ValueError(f"threshold profile {name!r} allow_token_divergence must be boolean")
+        raise ValueError(
+            f"threshold profile {name!r} allow_token_divergence must be boolean"
+        )
     max_fraction = _float_field(profile, "max_divergent_case_fraction")
     max_rate = _float_field(profile, "max_token_divergence_rate")
     min_fraction = _float_field(profile, "min_first_divergence_fraction")
     min_similarity = _float_field(profile, "min_normalized_text_similarity")
     max_delta = profile.get("max_output_length_delta_tokens")
     min_index = profile.get("min_first_divergence_index")
-    if any(value < 0.0 or value > 1.0 for value in (max_fraction, max_rate, min_fraction, min_similarity)):
-        raise ValueError(f"threshold profile {name!r} rate fields must be within [0, 1]")
+    if any(
+        value < 0.0 or value > 1.0
+        for value in (max_fraction, max_rate, min_fraction, min_similarity)
+    ):
+        raise ValueError(
+            f"threshold profile {name!r} rate fields must be within [0, 1]"
+        )
     if isinstance(max_delta, bool) or not isinstance(max_delta, int) or max_delta < 0:
-        raise ValueError(f"threshold profile {name!r} max output length delta is invalid")
+        raise ValueError(
+            f"threshold profile {name!r} max output length delta is invalid"
+        )
     if isinstance(min_index, bool) or not isinstance(min_index, int) or min_index < 0:
-        raise ValueError(f"threshold profile {name!r} minimum divergence index is invalid")
+        raise ValueError(
+            f"threshold profile {name!r} minimum divergence index is invalid"
+        )
     if not allow:
         if max_fraction != 0.0 or max_rate != 0.0 or max_delta != 0:
             raise ValueError(f"exact threshold profile {name!r} permits divergence")
         return
     if max_fraction > HARD_BOUNDED_POLICY["max_divergent_case_fraction"]:
-        raise ValueError(f"threshold profile {name!r} divergent-case fraction is too permissive")
+        raise ValueError(
+            f"threshold profile {name!r} divergent-case fraction is too permissive"
+        )
     if max_rate > HARD_BOUNDED_POLICY["max_token_divergence_rate"]:
-        raise ValueError(f"threshold profile {name!r} token divergence rate is too permissive")
+        raise ValueError(
+            f"threshold profile {name!r} token divergence rate is too permissive"
+        )
     if max_delta > HARD_BOUNDED_POLICY["max_output_length_delta_tokens"]:
-        raise ValueError(f"threshold profile {name!r} output length delta is too permissive")
+        raise ValueError(
+            f"threshold profile {name!r} output length delta is too permissive"
+        )
     if min_index < HARD_BOUNDED_POLICY["min_first_divergence_index"]:
-        raise ValueError(f"threshold profile {name!r} first divergence index is too permissive")
+        raise ValueError(
+            f"threshold profile {name!r} first divergence index is too permissive"
+        )
     if min_fraction < HARD_BOUNDED_POLICY["min_first_divergence_fraction"]:
-        raise ValueError(f"threshold profile {name!r} first divergence fraction is too permissive")
+        raise ValueError(
+            f"threshold profile {name!r} first divergence fraction is too permissive"
+        )
     if min_similarity < HARD_BOUNDED_POLICY["min_normalized_text_similarity"]:
-        raise ValueError(f"threshold profile {name!r} text similarity is too permissive")
+        raise ValueError(
+            f"threshold profile {name!r} text similarity is too permissive"
+        )
 
 
 def _validate_generation_contract(contract: dict[str, Any]) -> None:
@@ -307,7 +360,9 @@ def _validate_generation_contract(contract: dict[str, Any]) -> None:
         "scratch_budget_mb": 2048,
     }
     if contract != locked:
-        raise ValueError("quality suite generation contract is not the reviewed deterministic CUDA contract")
+        raise ValueError(
+            "quality suite generation contract is not the reviewed deterministic CUDA contract"
+        )
 
 
 def _validate_output_contract(contract: dict[str, Any], case_id: str) -> None:
@@ -315,25 +370,40 @@ def _validate_output_contract(contract: dict[str, Any], case_id: str) -> None:
         raise ValueError(f"{case_id} output contract must be an object")
     for name in ("min_utf8_bytes", "max_utf8_bytes", "min_words", "max_words"):
         if name in contract and (
-            isinstance(contract[name], bool) or not isinstance(contract[name], int) or contract[name] < 0
+            isinstance(contract[name], bool)
+            or not isinstance(contract[name], int)
+            or contract[name] < 0
         ):
             raise ValueError(f"{case_id} output contract {name} is invalid")
     if contract.get("min_utf8_bytes", 1) < 1:
         raise ValueError(f"{case_id} output contract must require non-empty output")
-    for name in ("required_substrings", "forbidden_substrings", "required_fullmatch_regexes"):
+    for name in (
+        "required_substrings",
+        "forbidden_substrings",
+        "required_fullmatch_regexes",
+    ):
         values = contract.get(name, [])
-        if not isinstance(values, list) or not all(isinstance(item, str) and item for item in values):
+        if not isinstance(values, list) or not all(
+            isinstance(item, str) and item for item in values
+        ):
             raise ValueError(f"{case_id} output contract {name} is invalid")
     if json_contract := contract.get("json"):
-        if not isinstance(json_contract, dict) or json_contract.get("type") not in {"object", "array"}:
+        if not isinstance(json_contract, dict) or json_contract.get("type") not in {
+            "object",
+            "array",
+        }:
             raise ValueError(f"{case_id} JSON output contract is invalid")
         if json_contract.get("type") == "object":
             keys = json_contract.get("exact_keys")
             values = json_contract.get("expected_values")
-            if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
+            if not isinstance(keys, list) or not all(
+                isinstance(key, str) for key in keys
+            ):
                 raise ValueError(f"{case_id} JSON exact keys are invalid")
             if not isinstance(values, dict) or set(values) != set(keys):
-                raise ValueError(f"{case_id} JSON expected values must cover the exact keys")
+                raise ValueError(
+                    f"{case_id} JSON expected values must cover the exact keys"
+                )
 
 
 def load_suite(path: pathlib.Path, profile_name: str | None = None) -> QualitySuite:
@@ -343,7 +413,9 @@ def load_suite(path: pathlib.Path, profile_name: str | None = None) -> QualitySu
         resolved == reviewed_suite_path().resolve()
         and sha256_bytes(suite_bytes) != REVIEWED_SUITE_SHA256
     ):
-        raise ValueError("reviewed CUDA quality suite bytes do not match the pinned v1 SHA-256")
+        raise ValueError(
+            "reviewed CUDA quality suite bytes do not match the pinned v1 SHA-256"
+        )
     raw = json.loads(suite_bytes.decode("utf-8"))
     if raw.get("schema") != SUITE_SCHEMA or not isinstance(raw.get("id"), str):
         raise ValueError(f"unsupported CUDA quality suite: {resolved}")
@@ -372,7 +444,9 @@ def load_suite(path: pathlib.Path, profile_name: str | None = None) -> QualitySu
         "parse_special": True,
         "token_ids_sha256_encoding": "SHA-256 of the UTF-8 compact JSON integer array",
     }:
-        raise ValueError("quality suite prompt-token hash contract is not the reviewed contract")
+        raise ValueError(
+            "quality suite prompt-token hash contract is not the reviewed contract"
+        )
     generation = raw.get("generation_contract")
     if not isinstance(generation, dict):
         raise ValueError("quality suite generation contract is missing")
@@ -386,7 +460,9 @@ def load_suite(path: pathlib.Path, profile_name: str | None = None) -> QualitySu
         if not isinstance(item, dict):
             raise ValueError("quality suite case must be an object")
         case_id = item.get("id")
-        if not isinstance(case_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", case_id):
+        if not isinstance(case_id, str) or not re.fullmatch(
+            r"[a-z0-9][a-z0-9-]*", case_id
+        ):
             raise ValueError("quality suite case ID is invalid")
         if case_id in seen_ids:
             raise ValueError(f"duplicate quality suite case ID {case_id}")
@@ -397,8 +473,13 @@ def load_suite(path: pathlib.Path, profile_name: str | None = None) -> QualitySu
         source_provenance: list[dict[str, Any]] = []
         fixture_name = prompt_contract.get("fixture_path")
         if fixture_name is not None:
-            if not isinstance(fixture_name, str) or pathlib.PurePosixPath(fixture_name).name != fixture_name:
-                raise ValueError(f"{case_id} prompt fixture path must be a sibling filename")
+            if (
+                not isinstance(fixture_name, str)
+                or pathlib.PurePosixPath(fixture_name).name != fixture_name
+            ):
+                raise ValueError(
+                    f"{case_id} prompt fixture path must be a sibling filename"
+                )
             fixture_path = resolved.parent / fixture_name
             user, prompt, fixture_raw = _prompt_fixture_text(fixture_path)
             source_provenance.append(stable_file_provenance(fixture_path))
@@ -408,30 +489,44 @@ def load_suite(path: pathlib.Path, profile_name: str | None = None) -> QualitySu
                 ("expected_prompt_tokens", "expected_reference_prompt_tokens"),
             ):
                 if prompt_contract.get(contract_name) != fixture_raw.get(fixture_field):
-                    raise ValueError(f"{case_id} suite and referenced fixture contracts disagree")
+                    raise ValueError(
+                        f"{case_id} suite and referenced fixture contracts disagree"
+                    )
         else:
             user, prompt = _inline_prompt_text(prompt_contract, case_id)
-        _verify_prompt_contract(case_id=case_id, contract=prompt_contract, user=user, prompt=prompt)
-        max_tokens = _required_positive_int(item.get("max_tokens"), f"{case_id} max tokens")
-        if len(prompt.encode("utf-8")) < 2000 or prompt_contract["expected_prompt_tokens"] < 2000:
+        _verify_prompt_contract(
+            case_id=case_id, contract=prompt_contract, user=user, prompt=prompt
+        )
+        max_tokens = _required_positive_int(
+            item.get("max_tokens"), f"{case_id} max tokens"
+        )
+        if (
+            len(prompt.encode("utf-8")) < 2000
+            or prompt_contract["expected_prompt_tokens"] < 2000
+        ):
             raise ValueError(f"{case_id} must remain a long-context prompt")
-        if prompt_contract["expected_prompt_tokens"] + max_tokens > generation["capture_kv_capacity"]:
+        if (
+            prompt_contract["expected_prompt_tokens"] + max_tokens
+            > generation["capture_kv_capacity"]
+        ):
             raise ValueError(f"{case_id} exceeds the locked capture KV capacity")
         allow_divergence = item.get("allow_candidate_divergence")
         if not isinstance(allow_divergence, bool):
             raise ValueError(f"{case_id} allow_candidate_divergence must be boolean")
         output_contract = item.get("output_contract")
         _validate_output_contract(output_contract, case_id)
-        cases.append(QualityCase(
-            id=case_id,
-            description=str(item.get("description") or ""),
-            prompt=prompt,
-            prompt_contract=prompt_contract,
-            prompt_source_provenance=tuple(source_provenance),
-            max_tokens=max_tokens,
-            allow_candidate_divergence=allow_divergence,
-            output_contract=output_contract,
-        ))
+        cases.append(
+            QualityCase(
+                id=case_id,
+                description=str(item.get("description") or ""),
+                prompt=prompt,
+                prompt_contract=prompt_contract,
+                prompt_source_provenance=tuple(source_provenance),
+                max_tokens=max_tokens,
+                allow_candidate_divergence=allow_divergence,
+                output_contract=output_contract,
+            )
+        )
     allowed_cases = sum(case.allow_candidate_divergence for case in cases)
     if allowed_cases / len(cases) > HARD_BOUNDED_POLICY["max_divergent_case_fraction"]:
         raise ValueError("too many suite cases permit bounded candidate divergence")
@@ -451,7 +546,9 @@ def validate_output(text: str, contract: dict[str, Any]) -> list[str]:
         errors.append("output contains the Unicode replacement character")
     if "\x00" in text:
         errors.append("output contains NUL")
-    invalid_controls = sorted({ord(ch) for ch in text if ord(ch) < 32 and ch not in "\n\r\t"})
+    invalid_controls = sorted(
+        {ord(ch) for ch in text if ord(ch) < 32 and ch not in "\n\r\t"}
+    )
     if invalid_controls:
         errors.append(f"output contains control characters {invalid_controls}")
     minimum = int(contract.get("min_utf8_bytes", 1))
@@ -518,7 +615,9 @@ def parse_generate_stdout(stdout: bytes) -> tuple[dict[str, Any], list[str]]:
     prompt_matches = list(PROMPT_TOKEN_IDS_RE.finditer(text))
     token_matches = list(TOKEN_IDS_RE.finditer(text))
     if len(prompt_matches) != 1:
-        errors.append(f"expected one prompt_token_ids record, found {len(prompt_matches)}")
+        errors.append(
+            f"expected one prompt_token_ids record, found {len(prompt_matches)}"
+        )
     if len(token_matches) != 1:
         errors.append(f"expected one token_ids record, found {len(token_matches)}")
     prompt_ids = (
@@ -546,12 +645,16 @@ def parse_generate_stdout(stdout: bytes) -> tuple[dict[str, Any], list[str]]:
     token_count: int | None = None
     finish_reason: str | None = None
     if len(token_records) != 1:
-        errors.append(f"expected one generated token-count record, found {len(token_records)}")
+        errors.append(
+            f"expected one generated token-count record, found {len(token_records)}"
+        )
     else:
         token_count = int(token_records[0].group("count"))
         finish_reason = token_records[0].group("finish")
         if token_count != len(token_ids):
-            errors.append(f"token-count record {token_count} differs from {len(token_ids)} token IDs")
+            errors.append(
+                f"token-count record {token_count} differs from {len(token_ids)} token IDs"
+            )
     return {
         "stdout_utf8": text,
         "prompt_token_ids": prompt_ids,
@@ -566,12 +669,16 @@ def normalized_text_similarity(baseline: str, candidate: str) -> float:
     def normalize(value: str) -> str:
         return " ".join(value.casefold().split())
 
-    return difflib.SequenceMatcher(None, normalize(baseline), normalize(candidate), autojunk=False).ratio()
+    return difflib.SequenceMatcher(
+        None, normalize(baseline), normalize(candidate), autojunk=False
+    ).ratio()
 
 
 def token_divergence(baseline: list[int], candidate: list[int]) -> dict[str, Any]:
     common = min(len(baseline), len(candidate))
-    mismatch_indexes = [index for index in range(common) if baseline[index] != candidate[index]]
+    mismatch_indexes = [
+        index for index in range(common) if baseline[index] != candidate[index]
+    ]
     exact = baseline == candidate
     first = None if exact else (mismatch_indexes[0] if mismatch_indexes else common)
     mismatch_count = len(mismatch_indexes) + abs(len(baseline) - len(candidate))
@@ -606,12 +713,16 @@ def divergence_errors(
     if not quality_case.allow_candidate_divergence:
         errors.append("this structured/exact canary forbids generated-token divergence")
         return errors
-    if metrics["positional_divergence_rate"] > float(profile["max_token_divergence_rate"]):
+    if metrics["positional_divergence_rate"] > float(
+        profile["max_token_divergence_rate"]
+    ):
         errors.append(
             f"token divergence rate {metrics['positional_divergence_rate']:.6f} exceeds "
             f"{profile['max_token_divergence_rate']:.6f}"
         )
-    if metrics["output_length_delta_tokens"] > int(profile["max_output_length_delta_tokens"]):
+    if metrics["output_length_delta_tokens"] > int(
+        profile["max_output_length_delta_tokens"]
+    ):
         errors.append(
             f"output length delta {metrics['output_length_delta_tokens']} exceeds "
             f"{profile['max_output_length_delta_tokens']}"
@@ -658,15 +769,21 @@ def route_evidence(
     }
     timing_metadata = candidate_validator.DEFAULT_TIMING_METADATA
     if spec.require_persistent_replay:
-        names.update((
-            timing_metadata.persistent_replay_counter,
-            timing_metadata.graph_discard_counter,
-            timing_metadata.graph_capacity_skip_counter,
-        ))
+        names.update(
+            (
+                timing_metadata.persistent_replay_counter,
+                timing_metadata.graph_discard_counter,
+                timing_metadata.graph_capacity_skip_counter,
+            )
+        )
     values: dict[str, int | None] = {}
     for name in sorted(names):
         raw = counters.get(name)
-        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(float(raw)):
+        if (
+            isinstance(raw, bool)
+            or not isinstance(raw, (int, float))
+            or not math.isfinite(float(raw))
+        ):
             values[name] = None
             errors.append(f"route counter {name} is absent or non-numeric")
         elif float(raw) < 0 or not float(raw).is_integer():
@@ -679,7 +796,9 @@ def route_evidence(
         if enabled and observed is not None and observed < 1:
             errors.append(f"candidate did not use required route {route.name}")
         if not enabled and observed is not None and observed != 0:
-            errors.append(f"baseline unexpectedly used candidate route {route.name}: {observed}")
+            errors.append(
+                f"baseline unexpectedly used candidate route {route.name}: {observed}"
+            )
     for route in spec.required_baseline_route_counters:
         observed = values.get(route.name)
         if not enabled and observed is not None and observed < 1:
@@ -688,7 +807,9 @@ def route_evidence(
         for route in spec.forbidden_route_counters:
             observed = values.get(route.name)
             if observed is not None and observed != 0:
-                errors.append(f"candidate reported forbidden route/fallback {route.name}: {observed}")
+                errors.append(
+                    f"candidate reported forbidden route/fallback {route.name}: {observed}"
+                )
         if enforce_exact_qualification_counts:
             for expectation in spec.qualification_route_counts:
                 observed = values.get(expectation.name)
@@ -702,7 +823,10 @@ def route_evidence(
         minimum_persistent_replays = max(1, (generated_token_count or 0) - 8)
         arm = "candidate" if enabled else "baseline"
         observed_replays = values.get(timing_metadata.persistent_replay_counter)
-        if observed_replays is not None and observed_replays < minimum_persistent_replays:
+        if (
+            observed_replays is not None
+            and observed_replays < minimum_persistent_replays
+        ):
             errors.append(
                 f"{arm} persistent replays {observed_replays} below "
                 f"{minimum_persistent_replays}"
@@ -717,12 +841,20 @@ def route_evidence(
     return {
         "enabled": enabled,
         "candidate_gate": spec.environment_variable,
-        "candidate_gate_value": spec.candidate_gate_value if enabled else spec.baseline_gate_value,
+        "candidate_gate_value": spec.candidate_gate_value
+        if enabled
+        else spec.baseline_gate_value,
         "counter_group": "cuda",
         "counters": values,
-        "required_candidate_routes": [counter.name for counter in spec.required_route_counters],
-        "required_baseline_routes": [counter.name for counter in spec.required_baseline_route_counters],
-        "forbidden_candidate_routes": [counter.name for counter in spec.forbidden_route_counters],
+        "required_candidate_routes": [
+            counter.name for counter in spec.required_route_counters
+        ],
+        "required_baseline_routes": [
+            counter.name for counter in spec.required_baseline_route_counters
+        ],
+        "forbidden_candidate_routes": [
+            counter.name for counter in spec.forbidden_route_counters
+        ],
         "exact_qualification_counts_enforced": enforce_exact_qualification_counts,
         "persistent_graph_replay": {
             "required": spec.require_persistent_replay,
@@ -758,16 +890,22 @@ def candidate_spec_identity(spec: candidate_validator.CandidateSpec) -> dict[str
         "baseline_gate_value": spec.baseline_gate_value,
         "candidate_gate_value": spec.candidate_gate_value,
         "route_phase": spec.route_phase,
-        "required_route_counters": [counter.name for counter in spec.required_route_counters],
+        "required_route_counters": [
+            counter.name for counter in spec.required_route_counters
+        ],
         "required_baseline_route_counters": [
             counter.name for counter in spec.required_baseline_route_counters
         ],
-        "forbidden_route_counters": [counter.name for counter in spec.forbidden_route_counters],
+        "forbidden_route_counters": [
+            counter.name for counter in spec.forbidden_route_counters
+        ],
         "fixed_comparison_environment": dict(spec.fixed_comparison_environment),
         "qualification_route_counts": {
             item.name: item.exact_count for item in spec.qualification_route_counts
         },
-        "qualification_workload": qualification_workload_identity(spec.qualification_workload),
+        "qualification_workload": qualification_workload_identity(
+            spec.qualification_workload
+        ),
         "require_persistent_replay": spec.require_persistent_replay,
     }
 
@@ -825,7 +963,9 @@ def build_runtime_environment(
     enabled: bool,
     capture_kv_capacity: int,
 ) -> dict[str, str]:
-    env = {name: parent[name] for name in SAFE_PARENT_ENVIRONMENT_KEYS if name in parent}
+    env = {
+        name: parent[name] for name in SAFE_PARENT_ENVIRONMENT_KEYS if name in parent
+    }
     env.update(spec.fixed_comparison_environment)
     env[spec.environment_variable] = (
         spec.candidate_gate_value if enabled else spec.baseline_gate_value
@@ -846,7 +986,9 @@ def runtime_environment_identity(env: dict[str, str]) -> dict[str, Any]:
 
 
 def _timing_latency(timing: dict[str, Any]) -> dict[str, Any]:
-    timing_ms = timing.get("timing_ms") if isinstance(timing.get("timing_ms"), dict) else {}
+    timing_ms = (
+        timing.get("timing_ms") if isinstance(timing.get("timing_ms"), dict) else {}
+    )
 
     def finite(name: str) -> float | None:
         value = timing_ms.get(name)
@@ -886,15 +1028,24 @@ def build_generate_command(
         "generate",
         str(model),
         prompt,
-        "--backend", "cuda",
-        "--combined-budget-mb", str(generation["combined_budget_mb"]),
-        "--backend-budget-mb", str(generation["backend_budget_mb"]),
-        "--kv-budget-mb", str(generation["kv_budget_mb"]),
-        "--scratch-budget-mb", str(generation["scratch_budget_mb"]),
-        "--prefill-chunk-size", str(generation["prefill_chunk_size"]),
-        "--cache-dtype", generation["cache_dtype"],
-        "--max-tokens", str(max_tokens),
-        "--temperature", "0",
+        "--backend",
+        "cuda",
+        "--combined-budget-mb",
+        str(generation["combined_budget_mb"]),
+        "--backend-budget-mb",
+        str(generation["backend_budget_mb"]),
+        "--kv-budget-mb",
+        str(generation["kv_budget_mb"]),
+        "--scratch-budget-mb",
+        str(generation["scratch_budget_mb"]),
+        "--prefill-chunk-size",
+        str(generation["prefill_chunk_size"]),
+        "--cache-dtype",
+        generation["cache_dtype"],
+        "--max-tokens",
+        str(max_tokens),
+        "--temperature",
+        "0",
         "--raw-prompt",
         "--no-chat-template",
         "--print-finish-reason",
@@ -902,7 +1053,8 @@ def build_generate_command(
         "--print-prompt-token-ids",
         "--print-token-ids",
         "--print-timing",
-        "--json-timing", str(timing_path),
+        "--json-timing",
+        str(timing_path),
     ]
 
 
@@ -952,7 +1104,9 @@ def run_sample(
     except subprocess.TimeoutExpired as exc:
         returncode = 124
         stdout = exc.stdout or b""
-        stderr = (exc.stderr or b"") + f"\ncommand timed out after {args.timeout_sec}s\n".encode()
+        stderr = (
+            exc.stderr or b""
+        ) + f"\ncommand timed out after {args.timeout_sec}s\n".encode()
     finished = dt.datetime.now(dt.timezone.utc)
     stdout_path.write_bytes(stdout)
     stderr_path.write_bytes(stderr)
@@ -962,7 +1116,9 @@ def run_sample(
     errors.extend(parse_errors)
     prompt_ids = parsed["prompt_token_ids"]
     expected_prompt_tokens = quality_case.prompt_contract["expected_prompt_tokens"]
-    expected_prompt_ids_sha = quality_case.prompt_contract["expected_prompt_token_ids_sha256"]
+    expected_prompt_ids_sha = quality_case.prompt_contract[
+        "expected_prompt_token_ids_sha256"
+    ]
     observed_prompt_ids_sha = canonical_sha256(prompt_ids)
     if len(prompt_ids) != expected_prompt_tokens:
         errors.append(
@@ -1004,7 +1160,9 @@ def run_sample(
         generated_token_count=len(token_ids),
     )
     errors.extend(route_errors)
-    timing_provenance = stable_file_provenance(timing_path) if timing_path.is_file() else None
+    timing_provenance = (
+        stable_file_provenance(timing_path) if timing_path.is_file() else None
+    )
     return {
         "schema": SAMPLE_SCHEMA,
         "case_id": quality_case.id,
@@ -1055,14 +1213,21 @@ def evaluate_case(
     errors: list[str] = []
     baseline_samples = [item["baseline"] for item in repetitions]
     candidate_samples = [item["candidate"] for item in repetitions]
-    for label, samples in (("baseline", baseline_samples), ("candidate", candidate_samples)):
+    for label, samples in (
+        ("baseline", baseline_samples),
+        ("candidate", candidate_samples),
+    ):
         reference_tokens = samples[0]["generated"]["token_ids"]
         reference_text = samples[0]["generated"]["text"]
         for sample in samples[1:]:
             if sample["generated"]["token_ids"] != reference_tokens:
-                errors.append(f"{label} greedy token IDs are not deterministic across repetitions")
+                errors.append(
+                    f"{label} greedy token IDs are not deterministic across repetitions"
+                )
             if sample["generated"]["text"] != reference_text:
-                errors.append(f"{label} decoded text is not deterministic across repetitions")
+                errors.append(
+                    f"{label} decoded text is not deterministic across repetitions"
+                )
     pairs: list[dict[str, Any]] = []
     for item in repetitions:
         baseline = item["baseline"]
@@ -1082,21 +1247,27 @@ def evaluate_case(
             divergence["exact_token_ids"]
             and baseline["generated"]["text"] != candidate["generated"]["text"]
         ):
-            pair_errors.append("identical token IDs decoded to different baseline/candidate text")
+            pair_errors.append(
+                "identical token IDs decoded to different baseline/candidate text"
+            )
         if baseline["prompt_token_ids"] != candidate["prompt_token_ids"]:
-            pair_errors.append("baseline and candidate prompt-token attestations differ")
+            pair_errors.append(
+                "baseline and candidate prompt-token attestations differ"
+            )
         errors.extend(f"repeat {item['repetition']}: {error}" for error in pair_errors)
-        pairs.append({
-            "repetition": item["repetition"],
-            "execution_order": item["execution_order"],
-            "baseline": baseline,
-            "candidate": candidate,
-            "token_divergence": divergence,
-            "normalized_text_similarity": similarity,
-            "latency_excluded_from_quality_verdict": True,
-            "errors": pair_errors,
-            "passed": not pair_errors,
-        })
+        pairs.append(
+            {
+                "repetition": item["repetition"],
+                "execution_order": item["execution_order"],
+                "baseline": baseline,
+                "candidate": candidate,
+                "token_divergence": divergence,
+                "normalized_text_similarity": similarity,
+                "latency_excluded_from_quality_verdict": True,
+                "errors": pair_errors,
+                "passed": not pair_errors,
+            }
+        )
     exact = all(pair["token_divergence"]["exact_token_ids"] for pair in pairs)
     return {
         "case_id": quality_case.id,
@@ -1112,8 +1283,12 @@ def evaluate_case(
         "allow_candidate_divergence": quality_case.allow_candidate_divergence,
         "output_contract": quality_case.output_contract,
         "greedy_determinism": {
-            "baseline": not any(error.startswith("baseline greedy") for error in errors),
-            "candidate": not any(error.startswith("candidate greedy") for error in errors),
+            "baseline": not any(
+                error.startswith("baseline greedy") for error in errors
+            ),
+            "candidate": not any(
+                error.startswith("candidate greedy") for error in errors
+            ),
         },
         "exact_token_ids": exact,
         "pairs": pairs,
@@ -1132,7 +1307,9 @@ def evaluate_suite_cases(
     ]
     divergent_cases = [case["case_id"] for case in cases if not case["exact_token_ids"]]
     divergent_fraction = len(divergent_cases) / len(cases)
-    errors = [f"{case['case_id']}: {error}" for case in cases for error in case["errors"]]
+    errors = [
+        f"{case['case_id']}: {error}" for case in cases for error in case["errors"]
+    ]
     if divergent_fraction > float(suite.profile["max_divergent_case_fraction"]):
         errors.append(
             f"divergent case fraction {divergent_fraction:.6f} exceeds "
@@ -1141,8 +1318,7 @@ def evaluate_suite_cases(
     diagnostic_passed = not errors
     exact_observed = not divergent_cases
     exact_policy = (
-        suite.profile_name == "exact-v1"
-        and not suite.profile["allow_token_divergence"]
+        suite.profile_name == "exact-v1" and not suite.profile["allow_token_divergence"]
     )
     reviewed_policy = exact_policy and suite.path == reviewed_suite_path().resolve()
     quality_qualified = diagnostic_passed and reviewed_policy and exact_observed
@@ -1205,7 +1381,9 @@ def embedded_artifact_identity(
         errors.append(f"artifact identity command exited {completed.returncode}")
     for name, value in expected.items():
         if fields.get(name) != value:
-            errors.append(f"artifact identity {name}={fields.get(name)!r}, expected {value!r}")
+            errors.append(
+                f"artifact identity {name}={fields.get(name)!r}, expected {value!r}"
+            )
     return {
         "command": command,
         "log": stable_file_provenance(log_path),
@@ -1250,7 +1428,9 @@ def collect_input_provenance(
     for case in suite.cases:
         for item in case.prompt_source_provenance:
             referenced[item["path"]] = item
-    files["referenced_prompt_fixtures"] = [referenced[name] for name in sorted(referenced)]
+    files["referenced_prompt_fixtures"] = [
+        referenced[name] for name in sorted(referenced)
+    ]
     git = release_provenance.git_provenance(repo_root_from_script())
     git_errors = release_provenance.git_content_provenance_errors(git)
     gpu = release_provenance.gpu_provenance()
@@ -1277,19 +1457,29 @@ def collect_input_provenance(
     }
 
 
-def provenance_stability_errors(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+def provenance_stability_errors(
+    before: dict[str, Any], after: dict[str, Any]
+) -> list[str]:
     errors: list[str] = []
     before_files = before["files"]
     after_files = after["files"]
     if before_files != after_files:
-        changed = sorted(name for name in before_files if before_files.get(name) != after_files.get(name))
+        changed = sorted(
+            name
+            for name in before_files
+            if before_files.get(name) != after_files.get(name)
+        )
         errors.append("hashed inputs changed during the run: " + ", ".join(changed))
     if before["git_content_identity"] != after["git_content_identity"]:
         errors.append("Git tracked/untracked content changed during the run")
     if before["gpu"] != after["gpu"]:
         errors.append("visible GPU identity changed during the run")
-    errors.extend(f"pre-run provenance: {error}" for error in before["git_content_errors"])
-    errors.extend(f"post-run provenance: {error}" for error in after["git_content_errors"])
+    errors.extend(
+        f"pre-run provenance: {error}" for error in before["git_content_errors"]
+    )
+    errors.extend(
+        f"post-run provenance: {error}" for error in after["git_content_errors"]
+    )
     errors.extend(f"pre-run hardware: {error}" for error in before["gpu_errors"])
     errors.extend(f"post-run hardware: {error}" for error in after["gpu_errors"])
     return errors
@@ -1299,10 +1489,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     repo = repo_root_from_script()
     inference = inference_root_from_script()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--kernel-id", required=True, help="cataloged CUDA candidate kernel ID")
+    parser.add_argument(
+        "--kernel-id", required=True, help="cataloged CUDA candidate kernel ID"
+    )
     parser.add_argument("--model", type=pathlib.Path, required=True)
     parser.add_argument(
-        "--binary", type=pathlib.Path, default=inference / "zig-out/bin/antfly-inference"
+        "--binary",
+        type=pathlib.Path,
+        default=inference / "zig-out/bin/antfly-inference",
     )
     parser.add_argument(
         "--wrapper",
@@ -1349,7 +1543,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     except ValueError:
         pass
     else:
-        parser.error("--output-dir must be outside the repository so evidence cannot change source provenance")
+        parser.error(
+            "--output-dir must be outside the repository so evidence cannot change source provenance"
+        )
     if args.output_dir.exists():
         parser.error("--output-dir must not already exist")
     return args
@@ -1377,7 +1573,10 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("; ".join(preflight_errors))
     args.output_dir.mkdir(parents=True, exist_ok=False)
     baseline_env = build_runtime_environment(
-        dict(os.environ), spec, False, suite.raw["generation_contract"]["capture_kv_capacity"]
+        dict(os.environ),
+        spec,
+        False,
+        suite.raw["generation_contract"]["capture_kv_capacity"],
     )
     artifact_identity = embedded_artifact_identity(
         args.binary,
@@ -1405,12 +1604,14 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
                     repetition=repetition,
                     order_index=order_index,
                 )
-            repetitions.append({
-                "repetition": repetition + 1,
-                "execution_order": list(labels),
-                "baseline": samples["baseline"],
-                "candidate": samples["candidate"],
-            })
+            repetitions.append(
+                {
+                    "repetition": repetition + 1,
+                    "execution_order": list(labels),
+                    "baseline": samples["baseline"],
+                    "candidate": samples["candidate"],
+                }
+            )
             global_pair += 1
         repetitions_by_case[quality_case.id] = repetitions
     evaluation = evaluate_suite_cases(suite, repetitions_by_case)
@@ -1459,7 +1660,9 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             "quality_qualified": quality_qualified,
             "collect_only": not exact_policy,
             "exact_policy_selected": exact_policy,
-            "all_generated_token_ids_exact": evaluation["all_generated_token_ids_exact"],
+            "all_generated_token_ids_exact": evaluation[
+                "all_generated_token_ids_exact"
+            ],
             "performance_metrics_used": False,
             "latency_recorded_separately": True,
             "promotion_authority": "none",
@@ -1470,7 +1673,9 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     }
     evidence["content_sha256"] = canonical_sha256(evidence)
     output_path = args.output_dir / "quality_evidence.json"
-    output_path.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output_path.write_text(
+        json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return evidence
 
 
@@ -1483,15 +1688,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     verdict = evidence["verdict"]
     print(
-        json.dumps({
-            "schema": EVIDENCE_SCHEMA,
-            "evidence": str(args.output_dir / "quality_evidence.json"),
-            "content_sha256": evidence["content_sha256"],
-            "diagnostic_thresholds_passed": verdict["diagnostic_thresholds_passed"],
-            "quality_qualified": verdict["quality_qualified"],
-            "collect_only": verdict["collect_only"],
-            "errors": verdict["errors"],
-        }, sort_keys=True)
+        json.dumps(
+            {
+                "schema": EVIDENCE_SCHEMA,
+                "evidence": str(args.output_dir / "quality_evidence.json"),
+                "content_sha256": evidence["content_sha256"],
+                "diagnostic_thresholds_passed": verdict["diagnostic_thresholds_passed"],
+                "quality_qualified": verdict["quality_qualified"],
+                "collect_only": verdict["collect_only"],
+                "errors": verdict["errors"],
+            },
+            sort_keys=True,
+        )
     )
     return 0 if verdict["quality_qualified"] else 1
 

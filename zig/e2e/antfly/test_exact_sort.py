@@ -265,7 +265,4 @@ def test_public_exact_sort_declares_native_coverage_and_shorthand_fields_are_act
         warmed_capabilities = _capabilities_by_field(
             stateful_api.get_table(sortable_table)
         )
-        assert (
-            warmed_capabilities["modified_at"]["sort_lifecycle_state"]
-            == "queryable"
-        )
+        assert warmed_capabilities["modified_at"]["sort_lifecycle_state"] == "queryable"

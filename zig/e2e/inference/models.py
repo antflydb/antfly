@@ -438,10 +438,10 @@ def _validated_managed_artifacts(path: Path) -> tuple[str, ...] | None:
         artifacts = completion["artifacts"]
     except (OSError, KeyError, TypeError, UnicodeError, json.JSONDecodeError):
         return ()
-    if (
-        type(completion.get("version")) is not int
-        or completion["version"] not in {1, 2}
-    ):
+    if type(completion.get("version")) is not int or completion["version"] not in {
+        1,
+        2,
+    }:
         return ()
     if (
         not isinstance(artifacts, list)
@@ -606,7 +606,9 @@ def _find_local_model(name: str, task_hint: str | None = None) -> LocalModel | N
     # selecting a completed variant deterministically when no legacy install
     # exists; callers that know the variant use `_model_path` instead.
     try:
-        candidates.extend(sorted(legacy_path.parent.glob(f"{legacy_path.name}--antfly-*")))
+        candidates.extend(
+            sorted(legacy_path.parent.glob(f"{legacy_path.name}--antfly-*"))
+        )
     except OSError:
         pass
 
@@ -704,13 +706,15 @@ def ensure_model_by_name(name: str, task_hint: str | None = None) -> Path | None
     return ensure_model(spec)
 
 
-def listed_model_name(
-    available_models: set[str], request_name: str
-) -> str | None:
+def listed_model_name(available_models: set[str], request_name: str) -> str | None:
     """Resolve a bare request name to the exact identifier advertised by /models."""
 
     exact = next(
-        (name for name in available_models if name.casefold() == request_name.casefold()),
+        (
+            name
+            for name in available_models
+            if name.casefold() == request_name.casefold()
+        ),
         None,
     )
     if exact is not None:

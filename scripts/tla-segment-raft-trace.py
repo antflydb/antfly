@@ -20,6 +20,7 @@ creates a fresh cluster whose nodes all emit InitState. This script splits
 the concatenated trace at cluster initialization boundaries so each segment
 can be validated independently against Traceetcdraft.tla.
 """
+
 import json, sys, os
 
 BOOTSTRAP_EVENTS = {"InitState", "BecomeFollower", "ApplyConfChange"}
@@ -86,8 +87,7 @@ def segment_trace(lines):
 
         if new_run:
             current_has_activity = any(
-                json.loads(l)["event"]["name"] not in BOOTSTRAP_EVENTS
-                for l in current
+                json.loads(l)["event"]["name"] not in BOOTSTRAP_EVENTS for l in current
             )
             # Pull back trailing bootstrap events that belong to the new run.
             overflow = []
@@ -174,7 +174,9 @@ def main():
                 f"{transition}/{count}-change"
                 for transition, count in unsupported_conf_changes
             )
-            print(f"  SKIP nseg-{i} ({len(seg)} events, unsupported joint config: {details})")
+            print(
+                f"  SKIP nseg-{i} ({len(seg)} events, unsupported joint config: {details})"
+            )
             continue
         # Skip segments where the bootstrap config references nodes not in
         # the trace. The TLA+ spec (BootstrappedConfig) uses the LAST
@@ -185,7 +187,9 @@ def main():
             o = json.loads(l)
             nids.add(o["event"]["nid"])
             if o["event"]["name"] in BOOTSTRAP_EVENTS:
-                last_bootstrap_conf[o["event"]["nid"]] = o["event"].get("conf", [[], []])
+                last_bootstrap_conf[o["event"]["nid"]] = o["event"].get(
+                    "conf", [[], []]
+                )
         # Derive the bootstrapped config for the first node (matches TLA+ TraceInitServer)
         first_nid = json.loads(seg[0])["event"]["nid"]
         if first_nid in last_bootstrap_conf:
@@ -207,7 +211,9 @@ def main():
         message_nids.discard(None)
         if not message_nids.issubset(nids):
             missing = message_nids - nids
-            print(f"  SKIP nseg-{i} ({len(seg)} events, messages reference missing nodes {missing})")
+            print(
+                f"  SKIP nseg-{i} ({len(seg)} events, messages reference missing nodes {missing})"
+            )
             continue
         # Every node's first bootstrap event must come before its first
         # non-bootstrap event. TLA+ BootstrapLogIndicesForServer(i) requires
@@ -226,10 +232,15 @@ def main():
         for nid in nids:
             if nid not in first_bootstrap:
                 bad_nodes.add(nid)
-            elif nid in first_non_bootstrap and first_bootstrap[nid] > first_non_bootstrap[nid]:
+            elif (
+                nid in first_non_bootstrap
+                and first_bootstrap[nid] > first_non_bootstrap[nid]
+            ):
                 bad_nodes.add(nid)
         if bad_nodes:
-            print(f"  SKIP nseg-{i} ({len(seg)} events, nodes {bad_nodes} lack bootstrap prefix)")
+            print(
+                f"  SKIP nseg-{i} ({len(seg)} events, nodes {bad_nodes} lack bootstrap prefix)"
+            )
             continue
         # Skip segments with ReceiveSnapshot but no BecomeLeader — the
         # snapshot came from a leader in another segment, so QuorumLogInv

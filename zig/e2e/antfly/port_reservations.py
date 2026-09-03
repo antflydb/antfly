@@ -64,7 +64,9 @@ class LoopbackPortReservations:
             sock.bind((self.host, port))
             reserved_port = int(sock.getsockname()[1])
             if reserved_port in self._sockets:
-                raise RuntimeError(f"kernel returned duplicate reserved port {reserved_port}")
+                raise RuntimeError(
+                    f"kernel returned duplicate reserved port {reserved_port}"
+                )
             self._sockets[reserved_port] = sock
             return reserved_port
         except BaseException:
@@ -92,7 +94,9 @@ class LoopbackPortReservations:
                 raise
             return self.reserve()
 
-    def reserve_excluding(self, excluded: Collection[int], *, attempts: int = 64) -> int:
+    def reserve_excluding(
+        self, excluded: Collection[int], *, attempts: int = 64
+    ) -> int:
         """Reserve a kernel-selected port outside a fixture's advertised set."""
         if attempts <= 0:
             raise ValueError("port reservation attempts must be positive")
