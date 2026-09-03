@@ -25,6 +25,7 @@ const runtime_http_bridge = @import("../runtime_http_bridge.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
+const api_routes = @import("http_routes.zig").Routes;
 const http_server_mod = @import("http_server.zig");
 const operation_contract = @import("operation.zig");
 const probe_operations = @import("probe_operations.zig");
@@ -465,6 +466,13 @@ pub const AntflyApiHandler = struct {
         {
             return null;
         }
+
+        // This route owns a richer public error contract. Let its handler
+        // authenticate and derive the stable transaction ID before returning
+        // the same typed IdempotentBatchError used for other availability
+        // failures.
+        if (ctx.request.method == .POST and api_routes.matchTableIdempotentBatch(path) != null)
+            return null;
 
         _ = ctx.status(503);
         return try ctx.json(.{
@@ -4849,12 +4857,15 @@ pub const AntflyApiHandler = struct {
         if (idempotency_key.len == 0 or idempotency_key.len > 256) {
             return respondJsonErrorBody(ctx, 400, "{\"error\":\"invalid idempotency key\",\"code\":\"invalid_idempotency_key\",\"message\":\"Idempotency-Key must contain 1 to 256 bytes\",\"retryable\":false}");
         }
+        const principal = http_server_mod.transactionPrincipal(authenticated_identity);
+        const txn_id = transactions_api.idempotentTransactionId(principal, decoded_table_name, idempotency_key);
+        const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
+        if (self.api_server.haMutationPolicy().failover_safe_mutations_only) {
+            return try idempotentBatchError(ctx, 503, "unknown", "idempotency_unavailable", "durable idempotency receipts are not continuously replicated while HA is active", true, &txn_hex);
+        }
         if (!self.api_server.tryAcquireWrite()) {
             try ctx.setHeader("Retry-After", "1");
             if (ctx.h1_sock != null) try ctx.setHeader("Connection", "close");
-            const principal = http_server_mod.transactionPrincipal(authenticated_identity);
-            const txn_id = transactions_api.idempotentTransactionId(principal, decoded_table_name, idempotency_key);
-            const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
             return try idempotentBatchError(ctx, 429, "not_applied", "write_capacity_exhausted", "write capacity is exhausted", true, &txn_hex);
         }
         defer self.api_server.releaseWrite();
@@ -8839,6 +8850,36 @@ test "httpx idempotent batch admission returns its documented JSON receipt error
     try std.testing.expectEqualStrings("write_capacity_exhausted", parsed.value.object.get("code").?.string);
     try std.testing.expect(parsed.value.object.get("transaction_id") != null);
     try std.testing.expect(parsed.value.object.get("reconcile") != null);
+}
+
+test "httpx HA rejection preserves the idempotent batch error contract" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{ .ha_failover_safe_mutations_only = true }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/idempotent-batch");
+    defer request.deinit();
+    request.body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}}}";
+    try request.headers.append("idempotency-key", "ha-contract-test");
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+
+    // The universal HA middleware intentionally delegates this one route so
+    // its generated response schema is not replaced by the generic envelope.
+    try std.testing.expect((try handler.haMutationRejection(&ctx)) == null);
+    var rejected = try handler.idempotentBatchWrite(&ctx, "docs");
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 503), rejected.status.code);
+    try std.testing.expectEqualStrings("application/json", rejected.headers.get("content-type").?);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rejected.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("unknown", parsed.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("idempotency_unavailable", parsed.value.object.get("code").?.string);
+    try std.testing.expect(parsed.value.object.get("transaction_id") != null);
+    try std.testing.expect(parsed.value.object.get("reconcile") != null);
+    try std.testing.expect(parsed.value.object.get("retryable").?.bool);
 }
 
 test "httpx idempotent batch parse failures use JSON error envelopes" {

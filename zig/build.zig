@@ -5915,6 +5915,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_session_maintenance_test_mod,
         .filters = &.{
             "durable session mutations publish only after persistence succeeds",
+            "cluster shared session capacity is enforced by the durable create transaction",
             "durable transaction sessions retain terminal commit coordinator handoff",
             "repair-required transaction sessions replay propagation once then release coordination",
             "committed repair session without coordinator replays a write handoff",
@@ -5934,6 +5935,10 @@ pub fn build(b: *std.Build) void {
             "api http server keeps session maintenance off public request paths",
             "api http server can renew owned session leases via explicit maintenance hook",
             "api http server keeps session maintenance off internal request paths",
+            "stable transaction recovery only terminalizes durable abort evidence",
+            "stable transaction recovery heartbeat interval stays inside the lease",
+            "stable transaction recovery retains ambiguity and heartbeats its lease",
+            "httpx HA rejection preserves the idempotent batch error contract",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

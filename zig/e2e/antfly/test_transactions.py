@@ -303,6 +303,9 @@ def test_multi_shard_batch_timeout_converges_to_one_terminal_state(stateful_api)
 
 def test_idempotent_batch_survives_lost_response_and_restart(stateful_api):
     """A keyed non-idempotent transform is applied exactly once across replay."""
+    if not stateful_api.supports_restart:
+        pytest.skip("durable receipt replay requires a real server restart")
+
     table_name = _create_table(stateful_api, "idempotent_batch_replay")
     stateful_api.batch_write(
         table_name,
@@ -358,8 +361,7 @@ def test_idempotent_batch_survives_lost_response_and_restart(stateful_api):
     )
     assert visible["value"] == 1
 
-    if stateful_api.supports_restart:
-        stateful_api.restart_server()
+    stateful_api.restart_server()
 
     replay = stateful_api.s.post(
         f"{stateful_api.url}{path}",
@@ -367,7 +369,10 @@ def test_idempotent_batch_survives_lost_response_and_restart(stateful_api):
         headers={"Idempotency-Key": key},
         timeout=30,
     )
-    assert replay.status_code in (200, 201, 202), replay.text
+    # A recreated receipt would return 201 and could still leave the counter at
+    # one because the storage transaction ID is independently deduplicated.
+    # Require proof that the original durable receipt survived the restart.
+    assert replay.status_code in (200, 202), replay.text
     assert replay.json()["transaction_id"] == transaction_id
     assert stateful_api.lookup_key(table_name, "counter")["value"] == 1
 

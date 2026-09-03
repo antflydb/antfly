@@ -3650,145 +3650,240 @@ pub const ApiHttpServer = struct {
         }) orelse return;
     }
 
+    /// Once phase-two execution has started, only storage evidence of a
+    /// durable abort may terminalize an idempotency receipt as aborted. Input,
+    /// topology, and availability errors are ambiguous on replay and must
+    /// remain recoverable.
+    fn durableRecoveryAbortOutcome(err: anyerror) ?transactions_api.IdempotentReceiptOutcome {
+        return switch (err) {
+            error.DecisionConflict => .aborted,
+            else => null,
+        };
+    }
+
+    const SessionRecoveryLeaseHeartbeat = struct {
+        server: *ApiHttpServer,
+        io: std.Io,
+        txn_id: db_mod.types.TxnId,
+        owner_node_id: u64,
+        interval_ns: u64,
+        stop_event: std.Io.Event = .unset,
+        lost: std.atomic.Value(bool) = .init(false),
+        expires_at_ns: std.atomic.Value(u64),
+
+        fn renew(self: *@This()) !void {
+            const now_ns = platform_time.realtimeNs();
+            try self.server.txn_sessions.renewOwnedLease(self.txn_id, self.owner_node_id, now_ns);
+            self.expires_at_ns.store(self.server.sessionRecoveryLeaseExpirationNs(now_ns).?, .release);
+        }
+
+        fn run(self: *@This()) void {
+            while (!self.stop_event.isSet()) {
+                self.stop_event.waitTimeout(self.io, .{
+                    .duration = .{
+                        .raw = std.Io.Duration.fromNanoseconds(self.interval_ns),
+                        .clock = .awake,
+                    },
+                }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => {
+                        if (self.stop_event.isSet()) return;
+                        self.lost.store(true, .release);
+                        return;
+                    },
+                };
+                if (self.stop_event.isSet()) return;
+                self.renew() catch |err| {
+                    if (err == error.SessionLeaseLost or
+                        platform_time.realtimeNs() >= self.expires_at_ns.load(.acquire))
+                    {
+                        self.lost.store(true, .release);
+                        return;
+                    }
+                    std.log.warn("stable transaction recovery lease renewal deferred txn_id={x} err={s}", .{ self.txn_id, @errorName(err) });
+                };
+            }
+        }
+    };
+
+    fn sessionRecoveryLeaseRenewInterval(self: *const ApiHttpServer) ?u64 {
+        const ttl_ns = self.sessionRecoveryLeaseDurationNs() orelse return null;
+        const configured = self.cfg.session_owner_lease_renew_interval_ns orelse @max(@as(u64, 1), ttl_ns / 3);
+        return @max(@as(u64, 1), @min(configured, @max(@as(u64, 1), ttl_ns / 2)));
+    }
+
+    fn sessionRecoveryLeaseDurationNs(self: *const ApiHttpServer) ?u64 {
+        const configured_ns = self.cfg.session_owner_lease_ttl_ns orelse return null;
+        const ttl_ms = @max(@as(u64, 1), configured_ns / std.time.ns_per_ms);
+        return ttl_ms *| std.time.ns_per_ms;
+    }
+
+    fn sessionRecoveryLeaseExpirationNs(self: *const ApiHttpServer, now_ns: u64) ?u64 {
+        const duration_ns = self.sessionRecoveryLeaseDurationNs() orelse return null;
+        // Durable lease timestamps have millisecond resolution. Mirror the
+        // stored floor exactly instead of tracking an optimistic local expiry.
+        return (now_ns / std.time.ns_per_ms) *| std.time.ns_per_ms +| duration_ns;
+    }
+
     fn retryPendingTransactionRecovery(self: *ApiHttpServer, limit: usize) !void {
         const source = self.table_writes orelse return;
         const pending = try self.txn_sessions.listPendingRecoveryIds(self.alloc, limit);
         defer self.alloc.free(pending);
+        if (pending.len == 0) return;
         const local_node_id = self.localSessionNodeId();
-        const now_ns = platform_time.realtimeNs();
+        var fallback_io: ?std.Io.Threaded = if (self.sessionRecoveryLeaseRenewInterval() != null and self.sharedApiIo() == null)
+            std.Io.Threaded.init(std.heap.page_allocator, .{})
+        else
+            null;
+        defer if (fallback_io) |*owned| owned.deinit();
+        const recovery_io = self.sharedApiIo() orelse if (fallback_io) |*owned| owned.io() else null;
         for (pending) |txn_id| {
-            var recovery = (self.txn_sessions.claimPendingRecovery(self.alloc, txn_id, local_node_id, now_ns) catch |err| {
+            // Each claim receives a lease based on the instant it begins. A
+            // slow preceding recovery must not consume a later item's lease.
+            const claim_now_ns = platform_time.realtimeNs();
+            var recovery = (self.txn_sessions.claimPendingRecovery(self.alloc, txn_id, local_node_id, claim_now_ns) catch |err| {
                 std.log.warn("stable transaction recovery claim deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                 continue;
             }) orelse continue;
             defer recovery.deinit(self.alloc);
-            switch (recovery) {
-                .acknowledge => |acknowledgement| {
-                    const acknowledged = source.acknowledgeTransactionCommit(
-                        self.alloc,
-                        acknowledgement.txn_id,
-                        acknowledgement.coordinator_group_id,
-                        acknowledgement.coordinator_table_name,
-                    ) catch |err| {
-                        std.log.warn("stable transaction coordinator acknowledgement maintenance deferred txn_id={x} err={s}", .{ acknowledgement.txn_id, @errorName(err) });
-                        continue;
-                    };
-                    if (acknowledged == null) continue;
-                    _ = (self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, acknowledgement.txn_id) catch |err| {
-                        std.log.warn("stable transaction acknowledgement receipt persistence deferred txn_id={x} err={s}", .{ acknowledgement.txn_id, @errorName(err) });
-                        continue;
-                    }) orelse continue;
-                },
-                .commit => |*commit| {
-                    const distributed_tables = commit.request.distributedTables(self.alloc) catch |err| {
-                        std.log.err("invalid sealed stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        continue;
-                    };
-                    defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
-                    const outcome = (source.commitTransactionWithId(
-                        self.alloc,
-                        txn_id,
-                        commit.begin_timestamp,
-                        distributed_tables,
-                        // Proposal-only delivery is insufficient for recovery:
-                        // a new leader may discard it before apply. Upgrade
-                        // only the weakest level, preserving stronger caller
-                        // visibility contracts without extra hot-path work.
-                        if (commit.repair_handoff_needs_coordinator or commit.sync_level == .propose)
-                            .write
-                        else
-                            commit.sync_level,
-                    ) catch |err| switch (err) {
-                        error.EnrichmentWorkerFailed => {
-                            // Older records and third-party sources may expose a
-                            // committed terminal repair only as an error. Persist
-                            // that fact now; the next claim uses write durability
-                            // to recover coordinator metadata without calling the
-                            // failed provider again.
-                            _ = (self.txn_sessions.recordTerminalCommitWithRepair(
-                                self.alloc,
-                                txn_id,
-                                .committed,
-                                true,
-                                null,
-                                null,
-                            ) catch |persist_err| {
-                                std.log.warn("stable transaction repair handoff persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
-                                continue;
-                            }) orelse continue;
-                            continue;
-                        },
-                        error.InvalidBatchRequest,
-                        error.InvalidArgument,
-                        error.InvalidGraphEdges,
-                        error.UnsupportedTransformOperation,
-                        error.TopologyChanged,
-                        error.UnsupportedOperation,
-                        error.TableNotFound,
-                        error.UnknownGroup,
-                        => {
-                            self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt, .not_applied);
-                            continue;
-                        },
-                        error.DecisionConflict,
-                        error.DocIdentityNamespaceMismatch,
-                        => {
-                            self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt, .aborted);
-                            continue;
-                        },
-                        else => {
-                            std.log.warn("stable transaction commit recovery deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                            continue;
-                        },
-                    }) orelse continue;
-                    switch (outcome) {
-                        .conflict => {
-                            // A replayed transaction ID can only conflict when
-                            // the coordinator durably chose abort.
-                            self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt, .aborted);
-                        },
-                        .committed => |committed| {
-                            const repair_required = commit.repair_required or committed.visibility_repair_required;
-                            const status = transactions_api.terminalCommitStatusForOutcome(
-                                committed.propagation_pending,
-                                committed.visibility_pending,
-                                committed.visibility_retry_pending,
-                                committed.visibility_repair_required,
-                            );
-                            _ = (self.txn_sessions.recordTerminalCommitWithRepair(
-                                self.alloc,
-                                txn_id,
-                                status,
-                                repair_required,
-                                committed.coordinator_group_id,
-                                committed.coordinator_table_name,
-                            ) catch |err| {
-                                std.log.warn("stable transaction terminal handoff persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                continue;
-                            }) orelse continue;
-                            // Pending is a durable decision, not a completed
-                            // API/storage handoff. Retain the coordinator's
-                            // self-participant so topology stays fenced while
-                            // maintenance replays phase two under this ID.
-                            if (status == .committed) {
-                                if (committed.coordinator_group_id) |group_id| {
-                                    const table_name = committed.coordinator_table_name orelse continue;
-                                    const acknowledged = source.acknowledgeTransactionCommit(self.alloc, txn_id, group_id, table_name) catch |err| {
-                                        std.log.warn("stable transaction recovered coordinator acknowledgement deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                        continue;
-                                    };
-                                    if (acknowledged == null) continue;
-                                    _ = (self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, txn_id) catch |err| {
-                                        std.log.warn("stable transaction recovered acknowledgement receipt persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                        continue;
-                                    }) orelse continue;
-                                }
+            if (self.sessionRecoveryLeaseRenewInterval()) |interval_ns| if (recovery_io) |io| {
+                var heartbeat: SessionRecoveryLeaseHeartbeat = .{
+                    .server = self,
+                    .io = io,
+                    .txn_id = txn_id,
+                    .owner_node_id = local_node_id,
+                    .interval_ns = interval_ns,
+                    .expires_at_ns = .init(self.sessionRecoveryLeaseExpirationNs(claim_now_ns).?),
+                };
+                var heartbeat_future = std.Io.async(io, SessionRecoveryLeaseHeartbeat.run, .{&heartbeat});
+                defer {
+                    heartbeat.stop_event.set(io);
+                    heartbeat_future.await(io);
+                }
+                self.advanceClaimedTransactionRecovery(source, txn_id, &recovery);
+                continue;
+            };
+            self.advanceClaimedTransactionRecovery(source, txn_id, &recovery);
+        }
+    }
+
+    fn advanceClaimedTransactionRecovery(
+        self: *ApiHttpServer,
+        source: table_writes.TableWriteSource,
+        txn_id: db_mod.types.TxnId,
+        recovery: *transactions_api.PendingSessionRecovery,
+    ) void {
+        switch (recovery.*) {
+            .acknowledge => |acknowledgement| {
+                const acknowledged = source.acknowledgeTransactionCommit(
+                    self.alloc,
+                    acknowledgement.txn_id,
+                    acknowledgement.coordinator_group_id,
+                    acknowledgement.coordinator_table_name,
+                ) catch |err| {
+                    std.log.warn("stable transaction coordinator acknowledgement maintenance deferred txn_id={x} err={s}", .{ acknowledgement.txn_id, @errorName(err) });
+                    return;
+                };
+                if (acknowledged == null) return;
+                _ = (self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, acknowledgement.txn_id) catch |err| {
+                    std.log.warn("stable transaction acknowledgement receipt persistence deferred txn_id={x} err={s}", .{ acknowledgement.txn_id, @errorName(err) });
+                    return;
+                }) orelse return;
+            },
+            .commit => |*commit| {
+                const distributed_tables = commit.request.distributedTables(self.alloc) catch |err| {
+                    std.log.err("invalid sealed stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                    return;
+                };
+                defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
+                const outcome = (source.commitTransactionWithId(
+                    self.alloc,
+                    txn_id,
+                    commit.begin_timestamp,
+                    distributed_tables,
+                    // Proposal-only delivery is insufficient for recovery:
+                    // a new leader may discard it before apply. Upgrade
+                    // only the weakest level, preserving stronger caller
+                    // visibility contracts without extra hot-path work.
+                    if (commit.repair_handoff_needs_coordinator or commit.sync_level == .propose)
+                        .write
+                    else
+                        commit.sync_level,
+                ) catch |err| switch (err) {
+                    error.EnrichmentWorkerFailed => {
+                        // Older records and third-party sources may expose a
+                        // committed terminal repair only as an error. Persist
+                        // that fact now; the next claim uses write durability
+                        // to recover coordinator metadata without calling the
+                        // failed provider again.
+                        _ = (self.txn_sessions.recordTerminalCommitWithRepair(
+                            self.alloc,
+                            txn_id,
+                            .committed,
+                            true,
+                            null,
+                            null,
+                        ) catch |persist_err| {
+                            std.log.warn("stable transaction repair handoff persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
+                            return;
+                        }) orelse return;
+                        return;
+                    },
+                    else => {
+                        if (durableRecoveryAbortOutcome(err)) |abort_outcome| {
+                            self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt, abort_outcome);
+                            return;
+                        }
+                        std.log.warn("stable transaction commit recovery deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                        return;
+                    },
+                }) orelse return;
+                switch (outcome) {
+                    .conflict => {
+                        // A replayed transaction ID can only conflict when
+                        // the coordinator durably chose abort.
+                        self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt, .aborted);
+                    },
+                    .committed => |committed| {
+                        const repair_required = commit.repair_required or committed.visibility_repair_required;
+                        const status = transactions_api.terminalCommitStatusForOutcome(
+                            committed.propagation_pending,
+                            committed.visibility_pending,
+                            committed.visibility_retry_pending,
+                            committed.visibility_repair_required,
+                        );
+                        _ = (self.txn_sessions.recordTerminalCommitWithRepair(
+                            self.alloc,
+                            txn_id,
+                            status,
+                            repair_required,
+                            committed.coordinator_group_id,
+                            committed.coordinator_table_name,
+                        ) catch |err| {
+                            std.log.warn("stable transaction terminal handoff persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                            return;
+                        }) orelse return;
+                        // Pending is a durable decision, not a completed
+                        // API/storage handoff. Retain the coordinator's
+                        // self-participant so topology stays fenced while
+                        // maintenance replays phase two under this ID.
+                        if (status == .committed) {
+                            if (committed.coordinator_group_id) |group_id| {
+                                const table_name = committed.coordinator_table_name orelse return;
+                                const acknowledged = source.acknowledgeTransactionCommit(self.alloc, txn_id, group_id, table_name) catch |err| {
+                                    std.log.warn("stable transaction recovered coordinator acknowledgement deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                                    return;
+                                };
+                                if (acknowledged == null) return;
+                                _ = (self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, txn_id) catch |err| {
+                                    std.log.warn("stable transaction recovered acknowledgement receipt persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                                    return;
+                                }) orelse return;
                             }
-                        },
-                    }
-                },
-            }
+                        }
+                    },
+                }
+            },
         }
     }
 
@@ -26380,6 +26475,110 @@ test "continuous HA freezes pre-existing restore workers and resumption" {
     try std.testing.expect(!server.restore_jobs_resumed.load(.acquire));
 }
 
+test "stable transaction recovery only terminalizes durable abort evidence" {
+    try std.testing.expectEqual(
+        transactions_api.IdempotentReceiptOutcome.aborted,
+        ApiHttpServer.durableRecoveryAbortOutcome(error.DecisionConflict).?,
+    );
+    try std.testing.expect(ApiHttpServer.durableRecoveryAbortOutcome(error.DocIdentityNamespaceMismatch) == null);
+    try std.testing.expect(ApiHttpServer.durableRecoveryAbortOutcome(error.InvalidBatchRequest) == null);
+    try std.testing.expect(ApiHttpServer.durableRecoveryAbortOutcome(error.TopologyChanged) == null);
+    try std.testing.expect(ApiHttpServer.durableRecoveryAbortOutcome(error.TableNotFound) == null);
+    try std.testing.expect(ApiHttpServer.durableRecoveryAbortOutcome(error.UnknownGroup) == null);
+}
+
+test "stable transaction recovery heartbeat interval stays inside the lease" {
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .session_owner_lease_ttl_ns = 10 * std.time.ns_per_ms,
+        .session_owner_lease_renew_interval_ns = std.time.ns_per_s,
+    }, source.iface(), null, null);
+    defer server.deinit();
+    try std.testing.expectEqual(@as(?u64, 5 * std.time.ns_per_ms), server.sessionRecoveryLeaseRenewInterval());
+}
+
+test "stable transaction recovery retains ambiguity and heartbeats its lease" {
+    const alloc = std.testing.allocator;
+    const session_path = "/tmp/antfly-api-recovery-ambiguity-heartbeat";
+    var cleanup_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer cleanup_io.deinit();
+    std.Io.Dir.cwd().deleteTree(cleanup_io.io(), session_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(cleanup_io.io(), session_path) catch {};
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const FakeWrites = struct {
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .commit_transaction_with_id = commitTransactionWithId,
+            } };
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TestUnexpectedResult;
+        }
+        fn commitTransactionWithId(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            sleepNs(80 * std.time.ns_per_ms);
+            return error.InvalidBatchRequest;
+        }
+    };
+
+    var source = FakeSource{};
+    var writes = FakeWrites{};
+    var server = try ApiHttpServer.initWithConfig(alloc, .{
+        .session_store_path = session_path,
+        .session_owner_lease_ttl_ns = 20 * std.time.ns_per_ms,
+        .session_owner_lease_renew_interval_ns = 2 * std.time.ns_per_ms,
+    }, source.iface(), null, writes.source());
+    defer server.deinit();
+
+    const txn_id = transactions_api.idempotentTransactionId("alice", "docs", "ambiguous-recovery");
+    _ = try server.txn_sessions.beginIdempotentForPrincipal(
+        alloc,
+        txn_id,
+        .{ .sync_level = .write },
+        server.localSessionNodeId(),
+        "alice",
+    );
+    var request = try transactions_api.parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}},"sync_level":"write"}
+    );
+    defer request.deinit(alloc);
+    var sealed = (try server.txn_sessions.cloneCommitRequest(alloc, txn_id, &request)) orelse return error.TestExpectedEqual;
+    sealed.deinit(alloc);
+    _ = (try server.txn_sessions.markCommitExecutionStarted(alloc, txn_id)) orelse return error.TestExpectedEqual;
+
+    try server.runSessionMaintenanceOnce();
+    try std.testing.expect((try server.txn_sessions.getIdempotentOutcome(alloc, txn_id)) == null);
+    const status = (try server.txn_sessions.getStatus(alloc, txn_id)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(status.lease_expires_at > platform_time.realtimeNs());
+    const pending = try server.txn_sessions.listPendingRecoveryIds(alloc, 8);
+    defer alloc.free(pending);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqualSlices(u8, &txn_id, &pending[0]);
+}
+
 test "continuous HA allows a configured RemoteApply batch write" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -33085,7 +33284,10 @@ test "api http server keeps session maintenance off internal request paths" {
         .body = "",
     });
     defer internal_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 404), internal_resp.status);
+    // Internal service routes fail closed before dispatch when no service
+    // credential is configured; either way, request dispatch must not drive
+    // session maintenance.
+    try std.testing.expectEqual(@as(u16, 503), internal_resp.status);
     try std.testing.expectEqual(@as(u64, 0), owner.last_session_lease_renew_ns.load(.acquire));
 }
 

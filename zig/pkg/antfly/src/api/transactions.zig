@@ -797,13 +797,14 @@ pub const DurableSessionStore = struct {
         ttl_ms: u64,
         require_expired: bool,
         max_record_bytes: ?usize,
+        max_sessions: ?usize,
     ) !bool {
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
         return switch (self.backend) {
             .docstore => |store| blk: {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
-                const changed = try saveSessionWithLeaseTxn(self, &txn, session, expected_owner, expected_incarnation, now_ms, ttl_ms, require_expired, max_record_bytes);
+                const changed = try saveSessionWithLeaseTxn(self, &txn, session, expected_owner, expected_incarnation, now_ms, ttl_ms, require_expired, max_record_bytes, max_sessions);
                 if (!changed) {
                     txn.abort();
                     break :blk false;
@@ -814,7 +815,7 @@ pub const DurableSessionStore = struct {
             .runtime => |store| blk: {
                 var txn = try store.beginWrite();
                 errdefer txn.abort();
-                const changed = try saveSessionWithLeaseTxn(self, &txn, session, expected_owner, expected_incarnation, now_ms, ttl_ms, require_expired, max_record_bytes);
+                const changed = try saveSessionWithLeaseTxn(self, &txn, session, expected_owner, expected_incarnation, now_ms, ttl_ms, require_expired, max_record_bytes, max_sessions);
                 if (!changed) {
                     txn.abort();
                     break :blk false;
@@ -835,6 +836,7 @@ pub const DurableSessionStore = struct {
         ttl_ms: u64,
         require_expired: bool,
         max_record_bytes: ?usize,
+        max_sessions: ?usize,
     ) !bool {
         const session_key = try makeSessionKey(self.alloc, session.txn_id);
         defer self.alloc.free(session_key);
@@ -852,6 +854,14 @@ pub const DurableSessionStore = struct {
             if (current.owner_node_id != owner or
                 current.owner_incarnation != (expected_incarnation orelse return false)) return false;
         } else if (current_raw != null) return false;
+
+        // Cluster-shared admission cannot use a process-local cached count.
+        // Count and create under the backend write transaction so every API
+        // process observes one serial capacity boundary. This scan is also
+        // compatible with rolling binaries that do not maintain a counter.
+        if (expected_owner == null) if (max_sessions) |limit| {
+            if (try countSessionsTxn(txn, limit) >= limit) return error.SessionLimitExceeded;
+        };
 
         const owner_id = try ownerLeaseId(self.alloc, session.owner_node_id, session.owner_incarnation);
         defer self.alloc.free(owner_id);
@@ -897,6 +907,20 @@ pub const DurableSessionStore = struct {
         if (self.fail_lease_transition_after_session_write_for_test) return error.InjectedLeaseTransitionFailure;
         try txn.put(lease_key, lease_value);
         return true;
+    }
+
+    fn countSessionsTxn(txn: anytype, limit: usize) !usize {
+        if (limit == 0) return 0;
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var count: usize = 0;
+        var entry = try cursor.seekAtOrAfter(session_prefix);
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, session_prefix)) break;
+            count += 1;
+            if (count >= limit) break;
+        }
+        return count;
     }
 
     pub fn load(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !?Session {
@@ -1627,7 +1651,7 @@ pub const SessionRegistry = struct {
         };
         if (self.durable != null and self.lease_store != null and self.owner_lease_ttl_ns != null) {
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-            if (!(try self.durable.?.saveWithLease(session, null, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return error.SessionLeaseLost;
+            if (!(try self.durable.?.saveWithLease(session, null, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes, self.max_sessions))) return error.SessionLeaseLost;
         } else {
             try self.persistLocked(session);
         }
@@ -1701,7 +1725,7 @@ pub const SessionRegistry = struct {
 
         if (self.durable != null and self.lease_store != null and self.owner_lease_ttl_ns != null) {
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-            if (!(try self.durable.?.saveWithLease(session, null, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) {
+            if (!(try self.durable.?.saveWithLease(session, null, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes, self.max_sessions))) {
                 // Another API node won the create race. Load the immutable
                 // binding and return it only when it is the same operation.
                 var existing = (try self.durable.?.load(txn_id)) orelse return error.SessionLeaseLost;
@@ -2187,7 +2211,7 @@ pub const SessionRegistry = struct {
             adopted.owner_incarnation = self.owner_incarnation;
             touchSession(&adopted);
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-            if (!(try durable.saveWithLease(adopted, expected_owner, expected_incarnation, now_ns / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return null;
+            if (!(try durable.saveWithLease(adopted, expected_owner, expected_incarnation, now_ns / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes, null))) return null;
             candidate.deinit(durable.alloc);
             candidate = try adopted.clone(durable.alloc);
             try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &adopted);
@@ -2472,7 +2496,7 @@ pub const SessionRegistry = struct {
         if (self.lease_store != null and self.owner_lease_ttl_ns != null) {
             const now_ns = nextTxnTimestamp();
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-            if (!(try durable.saveWithLease(candidate, expected_owner, expected_incarnation, now_ns / std.time.ns_per_ms, ttl_ms, false, self.max_record_bytes))) return false;
+            if (!(try durable.saveWithLease(candidate, expected_owner, expected_incarnation, now_ns / std.time.ns_per_ms, ttl_ms, false, self.max_record_bytes, null))) return false;
         } else try self.persistLocked(candidate);
         try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &candidate);
         return true;
@@ -2512,7 +2536,7 @@ pub const SessionRegistry = struct {
         candidate.owner_incarnation = self.owner_incarnation;
         touchSession(&candidate);
         const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-        if (!(try durable.saveWithLease(candidate, expected_owner, expected_incarnation, effective_now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return false;
+        if (!(try durable.saveWithLease(candidate, expected_owner, expected_incarnation, effective_now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes, null))) return false;
         try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &candidate);
         return true;
     }
@@ -2651,6 +2675,7 @@ pub const SessionRegistry = struct {
             ttl_ms,
             true,
             self.max_record_bytes,
+            null,
         ))) return error.SessionLeaseLost;
     }
 
@@ -2711,12 +2736,17 @@ pub const SessionRegistry = struct {
 
     fn ensureSessionCapacityLocked(self: *SessionRegistry) !void {
         const limit = self.max_sessions orelse return;
+        // Cluster-shared stores enforce capacity in the same backend write
+        // transaction that creates the durable session. A cached process-local
+        // count cannot safely admit work across API nodes.
+        if (self.durable != null and self.durable_scope == .cluster_shared) return;
         const count = if (self.durable != null) self.known_durable_session_count orelse return error.SessionCapacityUnavailable else self.sessions.count();
         if (count + self.reserved_session_count >= limit) return error.SessionLimitExceeded;
     }
 
     fn initializeDurableSessionCount(self: *SessionRegistry) !void {
         const durable = self.durable orelse return;
+        if (self.durable_scope == .cluster_shared) return;
         self.mutex.lock();
         if (self.known_durable_session_count != null) {
             self.mutex.unlock();
@@ -2818,6 +2848,21 @@ pub const SessionRegistry = struct {
             renewed += 1;
         }
         return renewed;
+    }
+
+    /// Renews one claimed session using the exact process incarnation. Long
+    /// recovery operations use this independently of the periodic registry
+    /// scan so their ownership cannot expire while storage work is in flight.
+    pub fn renewOwnedLease(
+        self: *SessionRegistry,
+        txn_id: db_mod.types.TxnId,
+        owner_node_id: u64,
+        now_ns: u64,
+    ) !void {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        try self.renewLeaseLockedAt(txn_id, owner_node_id, self.owner_incarnation, now_ns);
     }
 
     fn renewLeaseLockedAt(self: *SessionRegistry, txn_id: db_mod.types.TxnId, owner_node_id: u64, owner_incarnation: u64, now_ns: u64) !void {
@@ -5204,6 +5249,39 @@ test "durable session limits bound count and encoded record size" {
     try std.testing.expectEqual(@as(usize, 0), small_registry.sessions.count());
 }
 
+test "cluster shared session capacity is enforced by the durable create transaction" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-shared-capacity", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    const leases = SessionLeaseStore.init(alloc, &store);
+    var first = SessionRegistry.initWithOptions(&durable, leases, std.time.ns_per_s, null, 1, null);
+    defer first.deinit(alloc);
+    first.durable_scope = .cluster_shared;
+    var second = SessionRegistry.initWithOptions(&durable, leases, std.time.ns_per_s, null, 1, null);
+    defer second.deinit(alloc);
+    second.durable_scope = .cluster_shared;
+
+    // Model two API processes that both observed zero sessions before either
+    // create. The backend write transaction, not these stale caches, owns the
+    // cluster-wide capacity invariant.
+    first.known_durable_session_count = 0;
+    second.known_durable_session_count = 0;
+    _ = try first.begin(alloc, .{ .sync_level = .write }, 1);
+    try std.testing.expectError(
+        error.SessionLimitExceeded,
+        second.begin(alloc, .{ .sync_level = .write }, 2),
+    );
+    try std.testing.expectEqual(@as(usize, 1), try durable.sessionCount());
+}
+
 test "transaction session registry adopts durable session ownership" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5405,7 +5483,7 @@ test "durable recovery index tracks only validated commit execution and terminal
     defer alloc.free(terminal_pending);
     try std.testing.expectEqual(@as(usize, 1), terminal_pending.len);
 
-    var pending_terminal_work = (try terminal_registry.claimPendingRecovery(
+    var pending_terminal_work = (try registry.claimPendingRecovery(
         alloc,
         session.txn_id,
         9,
@@ -5414,8 +5492,8 @@ test "durable recovery index tracks only validated commit execution and terminal
     defer pending_terminal_work.deinit(alloc);
     try std.testing.expect(pending_terminal_work == .commit);
 
-    _ = (try terminal_registry.recordTerminalCommit(alloc, session.txn_id, .committed, 7001, "docs")) orelse return error.TestExpectedEqual;
-    var acknowledgement_work = (try terminal_registry.claimPendingRecovery(
+    _ = (try registry.recordTerminalCommit(alloc, session.txn_id, .committed, 7001, "docs")) orelse return error.TestExpectedEqual;
+    var acknowledgement_work = (try registry.claimPendingRecovery(
         alloc,
         session.txn_id,
         9,
@@ -5423,7 +5501,7 @@ test "durable recovery index tracks only validated commit execution and terminal
     )) orelse return error.TestExpectedEqual;
     defer acknowledgement_work.deinit(alloc);
     try std.testing.expect(acknowledgement_work == .acknowledge);
-    _ = (try terminal_registry.markTerminalCoordinatorAcknowledged(alloc, session.txn_id)) orelse return error.TestExpectedEqual;
+    _ = (try registry.markTerminalCoordinatorAcknowledged(alloc, session.txn_id)) orelse return error.TestExpectedEqual;
 
     var completed_registry = SessionRegistry.init(&durable);
     defer completed_registry.deinit(alloc);

@@ -34,6 +34,7 @@ pub const Disposition = enum {
 
 pub const Surface = enum {
     document_batch,
+    idempotent_document_batch,
     document_merge,
     auth_user,
     auth_password,
@@ -88,6 +89,7 @@ const post_put_delete = &[_]http_common.Method{ .POST, .PUT, .DELETE };
 
 pub const entries = [_]Entry{
     .{ .surface = .document_batch, .disposition = .remote_apply, .path_pattern = "/tables/{table}/batch", .methods = post, .reason = "logical batch records enter the synchronous HA mutation mirror before local acknowledgement" },
+    .{ .surface = .idempotent_document_batch, .disposition = .reject, .path_pattern = "/tables/{table}/idempotent-batch", .methods = post, .reason = "durable idempotency receipts and recovery leases are not continuously replicated by standalone HA" },
     .{ .surface = .document_merge, .disposition = .remote_apply, .path_pattern = "/tables/{table}/merge", .methods = post, .reason = "merge writes use the same synchronous HA mutation mirror as batch writes" },
     .{ .surface = .auth_user, .disposition = .reject, .path_pattern = "/auth/v1/users/{user}", .methods = post_delete, .reason = "the live user store is not part of continuous replication" },
     .{ .surface = .auth_password, .disposition = .reject, .path_pattern = "/auth/v1/users/{user}/password", .methods = &.{.PUT}, .reason = "password hashes are seed state but password rotation is not continuously replicated" },
@@ -160,6 +162,8 @@ pub fn classify(method: http_common.Method, path: []const u8) ?Classification {
 
     if (method == .POST and routes.Routes.matchTableBatch(path) != null)
         return classified(.document_batch, .remote_apply);
+    if (method == .POST and routes.Routes.matchTableIdempotentBatch(path) != null)
+        return rejected(.idempotent_document_batch);
     if (method == .POST and routes.Routes.matchTableMerge(path) != null)
         return classified(.document_merge, .remote_apply);
 
@@ -341,6 +345,7 @@ test "HA public non-GET route matrix has an explicit durability disposition" {
         .{ .method = .POST, .path = "/backup", .surface = .backup, .disposition = .reject },
         .{ .method = .POST, .path = "/tables/docs/backup", .surface = .backup, .disposition = .reject },
         .{ .method = .POST, .path = "/tables/docs/batch", .surface = .document_batch, .disposition = .remote_apply },
+        .{ .method = .POST, .path = "/tables/docs/idempotent-batch", .surface = .idempotent_document_batch, .disposition = .reject },
         .{ .method = .POST, .path = "/tables/docs/merge", .surface = .document_merge, .disposition = .remote_apply },
 
         // Authentication and authorization state.

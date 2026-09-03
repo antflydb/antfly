@@ -1,5 +1,6 @@
 [
   {"surface":"document_batch","disposition":"remote_apply","path_pattern":"/tables/{table}/batch","methods":["POST"],"reason":"logical batch records enter the synchronous HA mutation mirror before local acknowledgement"},
+  {"surface":"idempotent_document_batch","disposition":"reject","path_pattern":"/tables/{table}/idempotent-batch","methods":["POST"],"reason":"durable idempotency receipts and recovery leases are not continuously replicated by standalone HA"},
   {"surface":"document_merge","disposition":"remote_apply","path_pattern":"/tables/{table}/merge","methods":["POST"],"reason":"merge writes use the same synchronous HA mutation mirror as batch writes"},
   {"surface":"auth_user","disposition":"reject","path_pattern":"/auth/v1/users/{user}","methods":["POST","DELETE"],"reason":"the live user store is not part of continuous replication"},
   {"surface":"auth_password","disposition":"reject","path_pattern":"/auth/v1/users/{user}/password","methods":["PUT"],"reason":"password hashes are seed state but password rotation is not continuously replicated"},
