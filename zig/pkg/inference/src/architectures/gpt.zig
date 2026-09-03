@@ -2960,7 +2960,11 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             trace_sink,
         );
         var new_hidden = block_hidden;
-        if (try applyQwen3VlDeepstack(cb, allocator, config, block_hidden, total, layer, decode_context)) |injected| {
+        const deepstack_hidden = applyQwen3VlDeepstack(cb, allocator, config, block_hidden, total, layer, decode_context) catch |err| {
+            if (block_hidden != hidden) cb.free(block_hidden);
+            return err;
+        };
+        if (deepstack_hidden) |injected| {
             if (injected != block_hidden and block_hidden != hidden) cb.free(block_hidden);
             new_hidden = injected;
         }
@@ -3587,7 +3591,11 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
             null,
         );
         var new_hidden = block_hidden;
-        if (try applyQwen3VlDeepstack(cb, allocator, config, block_hidden, total, layer, decode_context)) |injected| {
+        const deepstack_hidden = applyQwen3VlDeepstack(cb, allocator, config, block_hidden, total, layer, decode_context) catch |err| {
+            if (block_hidden != hidden) cb.free(block_hidden);
+            return err;
+        };
+        if (deepstack_hidden) |injected| {
             if (injected != block_hidden and block_hidden != hidden) cb.free(block_hidden);
             new_hidden = injected;
         }

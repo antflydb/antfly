@@ -533,6 +533,17 @@ pub fn compatibilitySummaryForBackend(
 ) !?CompatibilitySummary {
     const candidate = artifactCandidateForBackend(man.*, backend) orelse return null;
 
+    // Exact Qwen3-VL promotions are Metal-only. Reject other routes before
+    // inspectAlloc re-hashes the multi-gigabyte promoted bundle; hashing is
+    // still mandatory once for the only backend that can consume it.
+    if (man.isQwen3VlBundle() and backend != .metal) {
+        return .{
+            .level = .incompatible,
+            .code = .unsupported_backend,
+            .message = "production-qualified Qwen3-VL bundles require the Metal backend",
+        };
+    }
+
     // GGUF metadata is authoritative only when this route will consume GGUF.
     // ONNX/safetensors routes use the manifest architecture rather than
     // accidentally inheriting an unrelated optional GGUF's classification.

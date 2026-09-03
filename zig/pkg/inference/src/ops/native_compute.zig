@@ -6681,7 +6681,7 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
     if (effective_seq_len == 0 and effective_batch > 0 and num_heads > 0 and q_rows > 0 and q_rows % (effective_batch * num_heads) == 0) {
         effective_seq_len = q_rows / (effective_batch * num_heads);
     }
-    if (effective_batch == 0 or effective_seq_len == 0 or (effective_batch > 0 and effective_seq_len > 0 and mask.len < effective_batch * effective_seq_len)) {
+    if (effective_batch == 0 or effective_seq_len == 0 or (mask.len != 0 and effective_batch > 0 and effective_seq_len > 0 and mask.len < effective_batch * effective_seq_len)) {
         std.log.warn("sdpa runtime dims batch={d} seq_len={d} mask_len={d} q_rows={d} q_len={d} num_heads={d} head_dim={d} attrs_batch={d} attrs_seq_len={d}", .{
             effective_batch,
             effective_seq_len,
@@ -6831,7 +6831,10 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
 
         for (0..effective_seq_len) |qi| {
             for (0..effective_seq_len) |ki| {
-                if (mask[b * effective_seq_len + ki] == 0) {
+                // An empty mask is the portable contract for unmasked
+                // attention (notably Qwen3-VL vision attention). Backends
+                // without a specialized route deliberately arrive here.
+                if (mask.len != 0 and mask[b * effective_seq_len + ki] == 0) {
                     scores[qi * effective_seq_len + ki] = -std.math.inf(f32);
                 }
             }
@@ -47924,6 +47927,27 @@ test "ComputeBackend scaledDotProductAttention call site exercises flash layout"
     const ref = try referenceBidirectionalHeadMajorAttention(allocator, q_data, k_data, v_data, bias_data, &mask, batch, seq_len, num_heads, head_dim);
     defer allocator.free(ref);
     try expectApproxEqSlice(ref, getData(out_ct), 1e-4);
+}
+
+test "Qwen3-VL vision attention portable fallback treats an empty mask as unmasked" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
+
+    var q_data = [_]f32{ 0.0, 0.0 };
+    var k_data = [_]f32{ 0.0, 0.0 };
+    var v_data = [_]f32{ 2.0, 4.0 };
+    const q = try compute.makeBuf(&q_data, false);
+    defer freeTensor(&compute, q);
+    const k = try compute.makeBuf(&k_data, false);
+    defer freeTensor(&compute, k);
+    const v = try compute.makeBuf(&v_data, false);
+    defer freeTensor(&compute, v);
+
+    const output = try cb.scaledDotProductAttentionQwen3VlVision(q, k, v, 1, 2, 1, 1);
+    defer freeTensor(&compute, output);
+    try std.testing.expectEqualSlices(f32, &.{ 3.0, 3.0 }, getData(output));
 }
 
 test "ComputeBackend causalSelfAttention call site matches naive reference" {

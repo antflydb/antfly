@@ -483,7 +483,10 @@ fn assessWithRuntimeFacts(
                 // Qwen3-Embedding checkpoints resolve to the qwen3 decoder
                 // arch (unknown to the encoder list below) but serve through
                 // the qualified resident last-token embedding runtime.
-                if (man.embedding_style == .qwen3_embedding and man.isLastTokenDecoderEmbedder()) {
+                if (std.mem.eql(u8, architecture, "qwen3") and
+                    man.embedding_style == .qwen3_embedding and
+                    man.isLastTokenDecoderEmbedder())
+                {
                     return makeCompatible(
                         architecture,
                         "qualified Qwen3-Embedding last-token decoder embedder",
@@ -696,6 +699,14 @@ test "qwen3-embedding style embedder is compatible despite decoder arch" {
     man.embedding_style = .qwen3_embedding;
     const result = assess(&man, "qwen3");
     try std.testing.expectEqual(Level.compatible, result.level);
+
+    // The manifest style is metadata, not authority to bypass architecture
+    // safety policy for an unrelated decoder or encoder family.
+    inline for (.{ "nomic-bert", "bart" }) |architecture| {
+        const spoofed_result = assess(&man, architecture);
+        try std.testing.expectEqual(Level.incompatible, spoofed_result.level);
+        try std.testing.expect(!spoofed_result.allowed(true));
+    }
 
     // A bare qwen3 embedder without the resolved style stays unknown.
     var bare = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };

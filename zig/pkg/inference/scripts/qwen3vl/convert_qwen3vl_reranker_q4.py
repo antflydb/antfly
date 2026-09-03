@@ -13,7 +13,11 @@ import sys
 from convert_qwen3vl_reranker import main
 
 
+def has_option(args: list[str], name: str) -> bool:
+    return any(arg == name or arg.startswith(f"{name}=") for arg in args)
+
+
 if __name__ == "__main__":
-    if "--decoder-quantization" not in sys.argv[1:]:
+    if not has_option(sys.argv[1:], "--decoder-quantization"):
         sys.argv[1:1] = ["--decoder-quantization", "Q4_K_M"]
     raise SystemExit(main())

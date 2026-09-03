@@ -348,15 +348,24 @@ const WeightCache = struct {
             if (tensor_ref.quantized) {
                 if (try self.store.tensorStore().loadQuantizedStorageRef(&tensor_ref)) |storage_value| {
                     var storage = storage_value;
-                    if (storage.shape.len == 2 and
+                    const shape_matches = storage.shape.len == 2 and
                         storage.shape[0] == @as(i64, @intCast(out_dim)) and
-                        storage.shape[1] == @as(i64, @intCast(in_dim)))
-                    {
-                        const tensor = try metal_compute_mod.MetalCompute.takeQuantizedStorage(self.cb, storage);
-                        errdefer self.cb.free(tensor);
-                        return self.insert(key, tensor);
+                        storage.shape[1] == @as(i64, @intCast(in_dim));
+                    if (shape_matches) {
+                        // takeQuantizedStorage consumes storage on every
+                        // outcome. Unsupported IQ-family formats still have a
+                        // valid host-dequantized path below, so only propagate
+                        // genuine upload/allocation failures.
+                        const maybe_tensor: ?CT = metal_compute_mod.MetalCompute.takeQuantizedStorage(self.cb, storage) catch |err| switch (err) {
+                            error.UnsupportedTensorType => null,
+                            else => return err,
+                        };
+                        if (maybe_tensor) |tensor| {
+                            errdefer self.cb.free(tensor);
+                            return self.insert(key, tensor);
+                        }
                     }
-                    storage.deinit();
+                    if (!shape_matches) storage.deinit();
                 }
             }
         }
@@ -665,7 +674,7 @@ fn encodeSingleImage(
         cfg.image_mean,
         cfg.image_std,
         1.0 / 255.0,
-        .bicubic,
+        .pillow_bicubic,
     );
     defer allocator.free(pixels);
     const preprocess_ns = profileLap(profile, &stage_started_at);

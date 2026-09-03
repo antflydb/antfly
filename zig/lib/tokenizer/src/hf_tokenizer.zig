@@ -64,7 +64,11 @@ pub const HfTokenizer = struct {
     /// next-occurrence lookups. Built lazily after `parseAddedTokens`.
     added_trie: AddedTokenTrie,
     special: SpecialTokens,
+    cls_token_seen: bool,
+    sep_token_seen: bool,
     pad_token_seen: bool,
+    unk_token_seen: bool,
+    mask_token_seen: bool,
     /// TemplateProcessing post-processor wrap: token IDs emitted before and
     /// after the encoded sequence (e.g. Qwen3-Embedding appends a single
     /// <|endoftext|>). Owned by `allocator`; freed on deinit.
@@ -760,17 +764,22 @@ pub const HfTokenizer = struct {
     ) void {
         if (bos_id) |id| {
             self.special.cls_id = id;
+            self.cls_token_seen = true;
             self.wrap_specials_explicit = true;
         }
         if (eos_id) |id| {
             self.special.sep_id = id;
+            self.sep_token_seen = true;
             self.wrap_specials_explicit = true;
         }
         if (pad_id) |id| {
             self.special.pad_id = id;
             self.pad_token_seen = true;
         }
-        if (unk_id) |id| self.special.unk_id = id;
+        if (unk_id) |id| {
+            self.special.unk_id = id;
+            self.unk_token_seen = true;
+        }
     }
 
     /// Install an explicit encodeForModel wrap template, overriding both the
@@ -836,7 +845,11 @@ pub const HfTokenizer = struct {
             .special_token_ids = .{},
             .added_trie = .{},
             .special = .{},
+            .cls_token_seen = false,
+            .sep_token_seen = false,
             .pad_token_seen = false,
+            .unk_token_seen = false,
+            .mask_token_seen = false,
             .template_prepend_ids = &.{},
             .template_append_ids = &.{},
             .has_template_processing = false,
@@ -1264,6 +1277,7 @@ pub const HfTokenizer = struct {
 
         // Set unk special token
         self.special.unk_id = self.unigram_unk_id;
+        self.unk_token_seen = true;
     }
 
     // =====================================================================
@@ -1333,6 +1347,7 @@ pub const HfTokenizer = struct {
                 } else v.string;
                 if (self.vocab.get(lookup)) |id| {
                     self.special.unk_id = id;
+                    self.unk_token_seen = true;
                 }
             }
         }
@@ -1421,41 +1436,59 @@ pub const HfTokenizer = struct {
             // Detect common special tokens by content
             if (std.mem.eql(u8, content.string, "[CLS]")) {
                 self.special.cls_id = id;
+                self.cls_token_seen = true;
                 self.wrap_specials_explicit = true;
             }
             if (std.mem.eql(u8, content.string, "[SEP]")) {
                 self.special.sep_id = id;
+                self.sep_token_seen = true;
                 self.wrap_specials_explicit = true;
             }
             if (std.mem.eql(u8, content.string, "[PAD]")) {
                 self.special.pad_id = id;
                 self.pad_token_seen = true;
             }
-            if (std.mem.eql(u8, content.string, "[UNK]")) self.special.unk_id = id;
-            if (std.mem.eql(u8, content.string, "[MASK]")) self.special.mask_id = id;
+            if (std.mem.eql(u8, content.string, "[UNK]")) {
+                self.special.unk_id = id;
+                self.unk_token_seen = true;
+            }
+            if (std.mem.eql(u8, content.string, "[MASK]")) {
+                self.special.mask_id = id;
+                self.mask_token_seen = true;
+            }
             // RoBERTa/GPT-style special tokens
             if (std.mem.eql(u8, content.string, "<s>")) {
                 self.special.cls_id = id;
+                self.cls_token_seen = true;
                 self.wrap_specials_explicit = true;
             }
             if (std.mem.eql(u8, content.string, "<bos>")) {
                 self.special.cls_id = id;
+                self.cls_token_seen = true;
                 self.wrap_specials_explicit = true;
             }
             if (std.mem.eql(u8, content.string, "</s>")) {
                 self.special.sep_id = id;
+                self.sep_token_seen = true;
                 self.wrap_specials_explicit = true;
             }
             if (std.mem.eql(u8, content.string, "<eos>")) {
                 self.special.sep_id = id;
+                self.sep_token_seen = true;
                 self.wrap_specials_explicit = true;
             }
             if (std.mem.eql(u8, content.string, "<pad>")) {
                 self.special.pad_id = id;
                 self.pad_token_seen = true;
             }
-            if (std.mem.eql(u8, content.string, "<unk>")) self.special.unk_id = id;
-            if (std.mem.eql(u8, content.string, "<mask>")) self.special.mask_id = id;
+            if (std.mem.eql(u8, content.string, "<unk>")) {
+                self.special.unk_id = id;
+                self.unk_token_seen = true;
+            }
+            if (std.mem.eql(u8, content.string, "<mask>")) {
+                self.special.mask_id = id;
+                self.mask_token_seen = true;
+            }
         }
     }
 
@@ -1487,6 +1520,7 @@ pub const HfTokenizer = struct {
             if (cls == .array and cls.array.items.len >= 2) {
                 if (cls.array.items[1] == .integer) {
                     self.special.cls_id = @intCast(cls.array.items[1].integer);
+                    self.cls_token_seen = true;
                     self.wrap_specials_explicit = true;
                 }
             }
@@ -1495,6 +1529,7 @@ pub const HfTokenizer = struct {
             if (sep == .array and sep.array.items.len >= 2) {
                 if (sep.array.items[1] == .integer) {
                     self.special.sep_id = @intCast(sep.array.items[1].integer);
+                    self.sep_token_seen = true;
                     self.wrap_specials_explicit = true;
                 }
             }
@@ -1515,28 +1550,34 @@ pub const HfTokenizer = struct {
         if (obj.get("special_tokens")) |st| {
             if (st == .object) {
                 if (st.object.get("[CLS]")) |cls| {
-                    self.resolveSpecialToken(cls, &self.special.cls_id);
-                    self.wrap_specials_explicit = true;
+                    if (self.resolveSpecialToken(cls, &self.special.cls_id)) {
+                        self.cls_token_seen = true;
+                        self.wrap_specials_explicit = true;
+                    }
                 }
                 if (st.object.get("[SEP]")) |sep| {
-                    self.resolveSpecialToken(sep, &self.special.sep_id);
-                    self.wrap_specials_explicit = true;
+                    if (self.resolveSpecialToken(sep, &self.special.sep_id)) {
+                        self.sep_token_seen = true;
+                        self.wrap_specials_explicit = true;
+                    }
                 }
                 if (st.object.get("[PAD]")) |pad| {
-                    self.resolveSpecialToken(pad, &self.special.pad_id);
-                    self.pad_token_seen = true;
+                    if (self.resolveSpecialToken(pad, &self.special.pad_id)) self.pad_token_seen = true;
                 }
                 if (st.object.get("<bos>")) |bos| {
-                    self.resolveSpecialToken(bos, &self.special.cls_id);
-                    self.wrap_specials_explicit = true;
+                    if (self.resolveSpecialToken(bos, &self.special.cls_id)) {
+                        self.cls_token_seen = true;
+                        self.wrap_specials_explicit = true;
+                    }
                 }
                 if (st.object.get("<eos>")) |eos| {
-                    self.resolveSpecialToken(eos, &self.special.sep_id);
-                    self.wrap_specials_explicit = true;
+                    if (self.resolveSpecialToken(eos, &self.special.sep_id)) {
+                        self.sep_token_seen = true;
+                        self.wrap_specials_explicit = true;
+                    }
                 }
                 if (st.object.get("<pad>")) |pad| {
-                    self.resolveSpecialToken(pad, &self.special.pad_id);
-                    self.pad_token_seen = true;
+                    if (self.resolveSpecialToken(pad, &self.special.pad_id)) self.pad_token_seen = true;
                 }
             }
         }
@@ -1577,7 +1618,7 @@ pub const HfTokenizer = struct {
             var resolved: i32 = -1;
             if (st_map) |map| {
                 if (map.get(name_val.string)) |st_entry| {
-                    self.resolveSpecialToken(st_entry, &resolved);
+                    _ = self.resolveSpecialToken(st_entry, &resolved);
                 }
             }
             if (resolved < 0) {
@@ -1610,23 +1651,27 @@ pub const HfTokenizer = struct {
         // template's tokens rather than the BERT-flavored defaults.
         if (owned_prepend.len > 0) {
             self.special.cls_id = owned_prepend[0];
+            self.cls_token_seen = true;
             self.wrap_specials_explicit = true;
         }
         if (owned_append.len > 0) {
             self.special.sep_id = owned_append[owned_append.len - 1];
+            self.sep_token_seen = true;
             self.wrap_specials_explicit = true;
         }
     }
 
-    fn resolveSpecialToken(_: *HfTokenizer, val: std.json.Value, target: *i32) void {
-        if (val != .object) return;
+    fn resolveSpecialToken(_: *HfTokenizer, val: std.json.Value, target: *i32) bool {
+        if (val != .object) return false;
         if (val.object.get("ids")) |ids| {
             if (ids == .array and ids.array.items.len > 0) {
                 if (ids.array.items[0] == .integer) {
                     target.* = @intCast(ids.array.items[0].integer);
+                    return true;
                 }
             }
         }
+        return false;
     }
 
     // =====================================================================
@@ -7412,14 +7457,22 @@ pub const HfTokenizer = struct {
         while (declared.next()) |id| {
             if (id.* >= 0) try unique.put(allocator, @intCast(id.*), {});
         }
-        for ([_]i32{
-            self.special.cls_id,
-            self.special.sep_id,
-            self.special.pad_id,
-            self.special.unk_id,
-            self.special.mask_id,
-        }) |id| {
-            if (id >= 0 and self.id_to_token.contains(id)) try unique.put(allocator, @intCast(id), {});
+        const role_tokens = [_]struct { id: i32, explicit: bool }{
+            .{ .id = self.special.cls_id, .explicit = self.cls_token_seen },
+            .{ .id = self.special.sep_id, .explicit = self.sep_token_seen },
+            .{ .id = self.special.pad_id, .explicit = self.pad_token_seen },
+            .{ .id = self.special.unk_id, .explicit = self.unk_token_seen },
+            .{ .id = self.special.mask_id, .explicit = self.mask_token_seen },
+        };
+        for (role_tokens) |role| {
+            // WordPiece owns the historical BERT defaults. Other vocabulary
+            // families must declare a role before an ordinary token at a
+            // coincidentally matching ID is protected as special.
+            if ((role.explicit or self.model_type == .word_piece) and
+                role.id >= 0 and self.id_to_token.contains(role.id))
+            {
+                try unique.put(allocator, @intCast(role.id), {});
+            }
         }
         const result = try allocator.alloc(u32, unique.count());
         errdefer allocator.free(result);
@@ -11541,6 +11594,31 @@ test "bpe without post-processor gets no bert-default wrap tokens" {
             try std.testing.expect(id != 102);
         }
     }
+}
+
+test "bpe special-token inventory excludes undeclared bert default ids" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"ordinary-zero": 0, "ordinary-unk": 100, "ordinary-cls": 101, "ordinary-sep": 102, "ordinary-mask": 103, "<eos>": 200},
+        \\    "merges": []
+        \\  }
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+
+    const undeclared = try tok.getAllSpecialTokenIds(allocator);
+    defer allocator.free(undeclared);
+    try std.testing.expectEqual(@as(usize, 0), undeclared.len);
+
+    tok.applySpecialTokenIds(null, 200, null, null);
+    const declared = try tok.getAllSpecialTokenIds(allocator);
+    defer allocator.free(declared);
+    try std.testing.expectEqualSlices(u32, &.{200}, declared);
 }
 
 test "bert-style TemplateProcessing keeps cls and sep wrap" {

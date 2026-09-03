@@ -22142,9 +22142,9 @@ fn runtimeZeroBiasElisionEnabled() bool {
     // Skipping an all-zero bias add is numerically an identity, and models
     // without native biases (e.g. qwen3 GGUF) get zero-filled bias buffers
     // synthesized at slot prepare, so default the elision on.
-    if (getenvBool("TERMITE_METAL_DISABLE_ZERO_BIAS_ELISION")) return false;
-    return !getenvBool("TERMITE_METAL_DISABLE_A4B_ZERO_BIAS_ELISION") and
-        !getenvBool("TERMITE_METAL_DISABLE_QWEN3VL_ZERO_BIAS_ELISION");
+    if (getenvFlagEnabled("TERMITE_METAL_DISABLE_ZERO_BIAS_ELISION")) return false;
+    return !getenvFlagEnabled("TERMITE_METAL_DISABLE_A4B_ZERO_BIAS_ELISION") and
+        !getenvFlagEnabled("TERMITE_METAL_DISABLE_QWEN3VL_ZERO_BIAS_ELISION");
 }
 
 fn applyRuntimeLinearBiasHost(self: anytype, slot: usize, output: []f32, rows: usize, out_dim: usize) bool {

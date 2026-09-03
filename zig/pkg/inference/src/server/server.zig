@@ -5304,17 +5304,6 @@ pub const Node = struct {
                 }
             } else |_| {}
 
-            // Discovery publishes validated managed-receipt identities instead
-            // of cache leaf names. Pre-provisioned production volumes are not
-            // required to reproduce Antfly's private install-directory hash,
-            // so resolve the same identity that /models advertises before
-            // falling back to legacy variant stripping. Multiple matching
-            // receipts are an operator error and fail closed.
-            if (std.mem.indexOfScalar(u8, n, ':') != null) {
-                if (try self.resolveDiscoveredRequestName(io, n)) |managed_path|
-                    return managed_path;
-            }
-
             // Strip ":variant" suffix for path resolution (variant is for pulling, not path lookup)
             const name_without_variant = if (std.mem.indexOfScalar(u8, n, ':')) |colon| n[0..colon] else n;
 
@@ -5337,18 +5326,23 @@ pub const Node = struct {
                 } else {
                     self.allocator.free(task_path);
                 }
+            }
 
+            // Discovery publishes validated managed-receipt identities instead
+            // of cache leaf names. Only scan after cheap legacy exact matches:
+            // those paths do not depend on receipt metadata and must not become
+            // O(models x artifacts) or fail because an unrelated receipt is
+            // unreadable/ambiguous.
+            if (try self.resolveDiscoveredRequestName(io, n)) |managed_path|
+                return managed_path;
+
+            if (task_type) |tt| {
                 // Variant resolution within task-type dir
                 const task_dir = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.config.models_dir, tt });
                 defer self.allocator.free(task_dir);
                 if (try registry_mod.resolveVariant(self.allocator, io, task_dir, name_without_variant)) |variant_path| {
                     return variant_path;
                 }
-            }
-
-            if (std.mem.indexOfScalar(u8, n, ':') == null) {
-                if (try self.resolveDiscoveredRequestName(io, n)) |managed_path|
-                    return managed_path;
             }
 
             // Variant resolution: look for "name-{suffix}" with shortest suffix wins
@@ -17019,6 +17013,40 @@ test "HTTP model resolution is canonical and contained while trusted resolution 
         try tmp.dir.symLink(std.testing.io, "../outside", "models/link", .{});
         try std.testing.expectError(error.ModelOutsideModelsDir, node.resolveRequestModelPath(request_allocator, std.testing.io, "link", "generators"));
     }
+}
+
+test "trusted model resolution prefers an exact legacy path before receipt discovery" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/owner/model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
+    inline for (.{ "duplicate-a", "duplicate-b" }) |leaf| {
+        try tmp.dir.createDirPath(io, "models/" ++ leaf);
+        try tmp.dir.writeFile(io, .{ .sub_path = "models/" ++ leaf ++ "/config.json", .data = "{}" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "models/" ++ leaf ++ "/model.gguf", .data = "decoder" });
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "models/" ++ leaf ++ "/.antfly-download-complete.json",
+            .data =
+            \\{"version":2,"source":{"owner":"owner","name":"model","variant":"q4_0"},"artifacts":[{"path":"config.json","size":2},{"path":"model.gguf","size":7}]}
+            ,
+        });
+    }
+
+    const models_root = try tmp.dir.realPathFileAlloc(io, "models", allocator);
+    defer allocator.free(models_root);
+    const model_root = try tmp.dir.realPathFileAlloc(io, "models/owner/model", allocator);
+    defer allocator.free(model_root);
+
+    var node: Node = undefined;
+    node.config = .{ .models_dir = models_root };
+    node.allocator = allocator;
+
+    const resolved = try node.resolveModelPath(io, "owner/model:q4_0", "generators");
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(model_root, resolved);
 }
 
 test "HTTP model resolution accepts the managed identity advertised by discovery" {

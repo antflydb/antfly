@@ -11211,17 +11211,17 @@ test "serving chat templates preserve ChatML Llama and Gemma prompt bytes" {
         .{
             .source = "{%- for message in messages %}\n{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}\n{%- endfor %}\n{%- if add_generation_prompt %}\n{{ '<|im_start|>assistant\\n' }}\n{%- endif %}",
             .bos = "",
-            .expected = "<|im_start|>user\nHello<|im_end|>\n\n<|im_start|>assistant\nHi<|im_end|>\n<|im_start|>assistant\n",
+            .expected = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHi<|im_end|>\n<|im_start|>assistant\n",
         },
         .{
             .source = "{{ bos_token }}{%- for message in messages %}\n{{ '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n' + message['content'] + '<|eot_id|>' }}\n{%- endfor %}\n{%- if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}{%- endif %}",
             .bos = "<|begin_of_text|>",
-            .expected = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|>\n<|start_header_id|>assistant<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+            .expected = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
         },
         .{
             .source = "{{ bos_token }}{%- for message in messages %}\n{{ '<start_of_turn>' + message['role'] + '\\n' + message['content'] + '<end_of_turn>\\n' }}\n{%- endfor %}\n{%- if add_generation_prompt %}{{ '<start_of_turn>assistant\\n' }}{%- endif %}",
             .bos = "<bos>",
-            .expected = "<bos><start_of_turn>user\nHello<end_of_turn>\n\n<start_of_turn>assistant\nHi<end_of_turn>\n<start_of_turn>assistant\n",
+            .expected = "<bos><start_of_turn>user\nHello<end_of_turn>\n<start_of_turn>assistant\nHi<end_of_turn>\n<start_of_turn>assistant\n",
         },
     };
     for (cases) |case| {
