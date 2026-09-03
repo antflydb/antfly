@@ -155,6 +155,24 @@ fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlob
     };
 }
 
+fn parseSchemaEtag(raw: []const u8) !u32 {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.startsWith(u8, value, "W/")) return error.WeakSchemaEtag;
+    if (value.len < 10 or value[0] != '"' or value[value.len - 1] != '"')
+        return error.InvalidSchemaEtag;
+    const tag = value[1 .. value.len - 1];
+    const prefix = "schema-";
+    if (!std.mem.startsWith(u8, tag, prefix) or tag.len == prefix.len)
+        return error.InvalidSchemaEtag;
+    return try std.fmt.parseUnsigned(u32, tag[prefix.len..], 10);
+}
+
+fn setSchemaEtag(ctx: *httpx.Context, version: u32) !void {
+    var buf: [32]u8 = undefined;
+    const value = try std.fmt.bufPrint(&buf, "\"schema-{d}\"", .{version});
+    try ctx.setHeader("ETag", value);
+}
+
 fn isNdjsonContentType(content_type: ?[]const u8) bool {
     const value = content_type orelse return false;
     const media_type = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, value, ';')) |idx| value[0..idx] else value, " \t");
@@ -4377,6 +4395,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text("invalid retrieval agent request");
             },
+            error.MissingGenerationConfig => {
+                _ = ctx.status(422);
+                return ctx.text("steps.generation requires a step-level or top-level generator or chain");
+            },
             error.TableNotFound => {
                 _ = ctx.status(404);
                 return ctx.text("not found");
@@ -5005,6 +5027,19 @@ pub const AntflyApiHandler = struct {
     }
 
     pub fn updateSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.mutateSchema(ctx, table_name, .replace);
+    }
+
+    pub fn patchSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.mutateSchema(ctx, table_name, .merge_patch);
+    }
+
+    fn mutateSchema(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        table_name: []const u8,
+        mode: tables_api.SchemaMutationMode,
+    ) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -5015,54 +5050,18 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid schema update request");
         };
-        var invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, body_data);
-        const schema_json = table_contract.parseSchemaUpdateRequest(alloc, body_data) catch |err| {
-            invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, body_data);
-            _ = ctx.status(400);
-            return ctx.text(invalid_schema_message);
-        };
-        defer alloc.free(schema_json);
-
-        const table_before = try self.api_server.loadOwnedTableRecord(alloc, decoded_table_name);
-        if (table_before == null) {
-            _ = self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
-                error.InvalidSchemaUpdateRequest => {
-                    _ = ctx.status(400);
-                    return ctx.text(invalid_schema_message);
-                },
-                error.TableNotFound => {
-                    _ = ctx.status(404);
-                    return ctx.text("not found");
-                },
-                error.UnsupportedOperation => blk: {
-                    const table_writes_source = self.api_server.table_writes orelse {
-                        _ = ctx.status(404);
-                        return ctx.text("not found");
-                    };
-                    _ = table_writes_source.updateSchema(alloc, decoded_table_name, schema_json) catch |write_err| switch (write_err) {
-                        error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
-                            _ = ctx.status(400);
-                            return ctx.text(invalid_schema_message);
-                        },
-                        else => return write_err,
-                    } orelse {
-                        _ = ctx.status(404);
-                        return ctx.text("not found");
-                    };
-                    break :blk null;
-                },
-                else => return err,
+        var expected_version: ?u32 = null;
+        if (ctx.header("if-match")) |raw_etag| {
+            expected_version = parseSchemaEtag(raw_etag) catch {
+                _ = ctx.status(400);
+                return ctx.text("If-Match must be a strong schema ETag such as \"schema-0\"");
             };
-            var arena_impl = std.heap.ArenaAllocator.init(alloc);
-            defer arena_impl.deinit();
-            const value = try http_server_mod.buildLocalSchemaUpdateStatus(arena_impl.allocator(), decoded_table_name, schema_json);
-            return ctx.openApiJson(value);
         }
-        defer metadata_table_manager.freeTable(alloc, table_before.?);
-
+        var invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, body_data);
         var local_schema_applied = false;
-        const committed_version = self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
-            error.InvalidSchemaUpdateRequest => {
+        var mutation = self.api_server.source.mutateSchema(alloc, decoded_table_name, mode, body_data, expected_version) catch |err| switch (err) {
+            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest, error.SchemaVersionManagedByBackend => {
+                invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, body_data);
                 _ = ctx.status(400);
                 return ctx.text(invalid_schema_message);
             },
@@ -5070,7 +5069,28 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(404);
                 return ctx.text("not found");
             },
+            error.SchemaVersionChanged, error.TableGenerationChanged => {
+                _ = ctx.status(409);
+                return ctx.text("schema version changed; refresh and retry");
+            },
+            error.MetadataMutationOutcomeUnknown => {
+                return metadataMutationOutcomeUnknownResponse(ctx);
+            },
+            error.UnsupportedConditionalSchemaUpdate => {
+                _ = ctx.status(409);
+                return ctx.text("conditional schema update is unavailable; refresh and retry");
+            },
             error.UnsupportedOperation => blk: {
+                if (mode == .merge_patch) {
+                    _ = ctx.status(405);
+                    return ctx.text("schema patch is unavailable on this deployment");
+                }
+                const schema_json = table_contract.parseSchemaUpdateRequest(alloc, body_data) catch |parse_err| {
+                    invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(parse_err, body_data);
+                    _ = ctx.status(400);
+                    return ctx.text(invalid_schema_message);
+                };
+                defer alloc.free(schema_json);
                 const table_writes_source = self.api_server.table_writes orelse {
                     _ = ctx.status(405);
                     return ctx.text("method not allowed");
@@ -5083,11 +5103,18 @@ pub const AntflyApiHandler = struct {
                     else => return write_err,
                 };
                 local_schema_applied = true;
-                break :blk null;
+                break :blk tables_api.SchemaMutationResult{
+                    .version = 0,
+                    .schema_json = try alloc.dupe(u8, schema_json),
+                };
             },
             else => return err,
         };
-        var expectation = try self.api_server.schemaProjectionExpectationAlloc(alloc, &table_before.?, schema_json, committed_version);
+        defer mutation.deinit(alloc);
+        const committed_version: ?u32 = if (local_schema_applied) null else mutation.version;
+        var expectation = http_server_mod.ApiHttpServer.SchemaProjectionExpectation{
+            .schema_json = try alloc.dupe(u8, mutation.schema_json),
+        };
         defer expectation.deinit(alloc);
         self.api_server.waitForSchemaUpdateProjection(decoded_table_name, expectation, committed_version) catch |err| switch (err) {
             error.TableVisibilityTimeout => {
@@ -5100,7 +5127,7 @@ pub const AntflyApiHandler = struct {
             },
             else => return err,
         };
-        self.api_server.reconcileProjectedSchemaUpdate(alloc, decoded_table_name, schema_json, local_schema_applied) catch |write_err| switch (write_err) {
+        self.api_server.reconcileProjectedSchemaUpdate(alloc, decoded_table_name, mutation.schema_json, local_schema_applied) catch |write_err| switch (write_err) {
             error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
                 _ = ctx.status(400);
                 return ctx.text(invalid_schema_message);
@@ -5108,8 +5135,9 @@ pub const AntflyApiHandler = struct {
             else => return write_err,
         };
 
-        const body = try self.api_server.encodeSchemaUpdateResponse(decoded_table_name, schema_json);
+        const body = try self.api_server.encodeSchemaUpdateResponse(decoded_table_name, mutation.schema_json);
         defer self.api_server.alloc.free(body);
+        if (!local_schema_applied) try setSchemaEtag(ctx, mutation.version);
         return jsonResponse(ctx, 200, body);
     }
 
@@ -6200,6 +6228,10 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
             try self.inner.put(prefix ++ path, handler_fn);
         }
 
+        pub fn patch(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
+            try self.inner.patch(prefix ++ path, handler_fn);
+        }
+
         pub fn delete(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
             try self.inner.delete(prefix ++ path, handler_fn);
         }
@@ -6423,6 +6455,7 @@ const SchemaUpdateStatusSource = struct {
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
                 .update_schema = updateSchema,
+                .mutate_schema = mutateSchema,
                 .wait_table_projection = waitTableProjection,
             },
         };
@@ -6478,6 +6511,36 @@ const SchemaUpdateStatusSource = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try std.testing.expectEqualStrings("docs", table_name);
         try self.replaceSchemaJson(alloc, schema_json);
+    }
+
+    fn mutateSchema(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        mode: tables_api.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !tables_api.SchemaMutationResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try std.testing.expectEqualStrings("docs", table_name);
+        const current = metadata_table_manager.TableRecord{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = tables_api.effectiveSchemaJson(self.schema_json),
+            .indexes_json = tables_api.default_indexes_json,
+            .placement_role = "data",
+        };
+        if (expected_version) |expected| {
+            if (try tables_api.schemaVersion(current.schema_json) != expected)
+                return error.SchemaVersionChanged;
+        }
+        const updated = try tables_api.applySchemaMutationRecord(alloc, &current, mode, body);
+        defer metadata_table_manager.freeTable(alloc, updated);
+        try self.replaceSchemaJson(alloc, updated.schema_json);
+        return .{
+            .version = try tables_api.schemaVersion(updated.schema_json),
+            .schema_json = try alloc.dupe(u8, updated.schema_json),
+        };
     }
 
     fn waitTableProjection(ptr: *anyopaque, table_name: []const u8, schema_json: ?[]const u8, indexes_json: ?[]const u8) !void {
@@ -8970,6 +9033,7 @@ test "httpx antfly schema update returns full table status after projection" {
     defer resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), resp.status.code);
     try std.testing.expectEqualStrings("application/json", resp.contentType().?);
+    try std.testing.expectEqualStrings("\"schema-1\"", resp.headers.get("etag").?);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.TableStatus, alloc, resp.body.?, .{});
     defer parsed.deinit();
@@ -8978,6 +9042,42 @@ test "httpx antfly schema update returns full table status after projection" {
     try std.testing.expectEqual(@as(u32, 1), source.projection_wait_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), writes.reconcile_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 0), writes.synchronous_update_calls.load(.monotonic));
+}
+
+test "httpx schema patch merges at the authority and accepts version zero ETag" {
+    const alloc = std.testing.allocator;
+    var source = SchemaUpdateStatusSource{};
+    defer source.deinit(alloc);
+    var writes = SchemaReconcileWriteSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
+
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const schema_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/schema", .{base_url});
+    defer alloc.free(schema_url);
+    const headers = [_][2][]const u8{
+        .{ "content-type", "application/merge-patch+json" },
+        .{ "if-match", "\"schema-0\"" },
+    };
+    var resp = try requestWithRetry(&client, client_io.io(), .PATCH, schema_url, "{\"description\":\"patched\"}", &headers, 20);
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+    try std.testing.expectEqualStrings("\"schema-1\"", resp.headers.get("etag").?);
+    try std.testing.expect(std.mem.indexOf(u8, source.schema_json.?, "\"description\":\"patched\"") != null);
+}
+
+test "schema ETags are strong and preserve version zero" {
+    try std.testing.expectEqual(@as(u32, 0), try parseSchemaEtag("\"schema-0\""));
+    try std.testing.expectEqual(@as(u32, 42), try parseSchemaEtag(" \"schema-42\" "));
+    try std.testing.expectError(error.WeakSchemaEtag, parseSchemaEtag("W/\"schema-1\""));
+    try std.testing.expectError(error.InvalidSchemaEtag, parseSchemaEtag("0"));
 }
 
 test "httpx global query table name comes from request body" {

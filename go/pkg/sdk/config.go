@@ -26,21 +26,46 @@ import (
 )
 
 func NewEmbedderConfig(config any) (*EmbedderConfig, error) {
+	var provider EmbedderProvider
 	modelConfig := &EmbedderConfig{}
 	switch v := config.(type) {
 	case OllamaEmbedderConfig:
+		provider = EmbedderProviderOllama
 		if err := modelConfig.FromOllamaEmbedderConfig(v); err != nil {
 			return nil, fmt.Errorf("from ollama embedder config: %w", err)
 		}
 	case OpenAIEmbedderConfig:
+		provider = EmbedderProviderOpenai
 		if err := modelConfig.FromOpenAIEmbedderConfig(v); err != nil {
 			return nil, fmt.Errorf("from openai embedder config: %w", err)
 		}
+	case OpenRouterEmbedderConfig:
+		provider = EmbedderProviderOpenrouter
+		if err := modelConfig.FromOpenRouterEmbedderConfig(v); err != nil {
+			return nil, fmt.Errorf("from openrouter embedder config: %w", err)
+		}
 	case BedrockEmbedderConfig:
+		provider = EmbedderProviderBedrock
 		if err := modelConfig.FromBedrockEmbedderConfig(v); err != nil {
 			return nil, fmt.Errorf("from bedrock embedder config: %w", err)
 		}
+	case CohereEmbedderConfig:
+		provider = EmbedderProviderCohere
+		if err := modelConfig.FromCohereEmbedderConfig(v); err != nil {
+			return nil, fmt.Errorf("from cohere embedder config: %w", err)
+		}
+	case GoogleEmbedderConfig:
+		provider = EmbedderProviderGemini
+		if err := modelConfig.FromGoogleEmbedderConfig(v); err != nil {
+			return nil, fmt.Errorf("from Google embedder config: %w", err)
+		}
+	case VertexEmbedderConfig:
+		provider = EmbedderProviderVertex
+		if err := modelConfig.FromVertexEmbedderConfig(v); err != nil {
+			return nil, fmt.Errorf("from Vertex embedder config: %w", err)
+		}
 	case AntflyEmbedderConfig:
+		provider = EmbedderProviderAntfly
 		if err := modelConfig.FromAntflyEmbedderConfig(v); err != nil {
 			return nil, fmt.Errorf("from antfly embedder config: %w", err)
 		}
@@ -48,7 +73,68 @@ func NewEmbedderConfig(config any) (*EmbedderConfig, error) {
 		return nil, fmt.Errorf("unknown model config type: %T", v)
 	}
 
+	modelConfig.Provider = provider
 	return modelConfig, nil
+}
+
+// NewIndexEmbedderConfig constructs the purpose-specific embedder union accepted
+// by embeddings-index creation. Use NewEmbedderConfig for general inference APIs.
+func NewIndexEmbedderConfig(config any) (*IndexEmbedderConfig, error) {
+	modelConfig := &IndexEmbedderConfig{}
+	switch v := config.(type) {
+	case OllamaEmbedderConfig:
+		if err := modelConfig.FromOllamaEmbedderConfig(v); err != nil {
+			return nil, fmt.Errorf("from ollama index embedder config: %w", err)
+		}
+	case OpenAIEmbedderConfig:
+		if err := modelConfig.FromOpenAIEmbedderConfig(v); err != nil {
+			return nil, fmt.Errorf("from openai index embedder config: %w", err)
+		}
+	case BedrockEmbedderConfig:
+		if err := modelConfig.FromBedrockEmbedderConfig(v); err != nil {
+			return nil, fmt.Errorf("from bedrock index embedder config: %w", err)
+		}
+	case AntflyEmbedderConfig:
+		if err := modelConfig.FromAntflyEmbedderConfig(v); err != nil {
+			return nil, fmt.Errorf("from antfly index embedder config: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("embedder config type %T is not supported for indexes", v)
+	}
+
+	return modelConfig, nil
+}
+
+func indexEmbedderConfig(config EmbedderConfig) (IndexEmbedderConfig, error) {
+	var indexConfig IndexEmbedderConfig
+	switch config.Provider {
+	case EmbedderProviderOllama:
+		value, err := config.AsOllamaEmbedderConfig()
+		if err != nil {
+			return indexConfig, fmt.Errorf("decode ollama embedder config: %w", err)
+		}
+		return indexConfig, indexConfig.FromOllamaEmbedderConfig(value)
+	case EmbedderProviderOpenai:
+		value, err := config.AsOpenAIEmbedderConfig()
+		if err != nil {
+			return indexConfig, fmt.Errorf("decode openai embedder config: %w", err)
+		}
+		return indexConfig, indexConfig.FromOpenAIEmbedderConfig(value)
+	case EmbedderProviderBedrock:
+		value, err := config.AsBedrockEmbedderConfig()
+		if err != nil {
+			return indexConfig, fmt.Errorf("decode bedrock embedder config: %w", err)
+		}
+		return indexConfig, indexConfig.FromBedrockEmbedderConfig(value)
+	case EmbedderProviderAntfly:
+		value, err := config.AsAntflyEmbedderConfig()
+		if err != nil {
+			return indexConfig, fmt.Errorf("decode antfly embedder config: %w", err)
+		}
+		return indexConfig, indexConfig.FromAntflyEmbedderConfig(value)
+	default:
+		return indexConfig, fmt.Errorf("embedder provider %q is not supported for indexes", config.Provider)
+	}
 }
 
 func NewGeneratorConfig(config any) (*GeneratorConfig, error) {
@@ -585,9 +671,12 @@ func NewArtifactEmbeddingIndexConfig(name string, config ArtifactEmbeddingIndexC
 	if name == "" {
 		return nil, fmt.Errorf("index name is required")
 	}
-	provider, err := config.Embedder.Discriminator()
-	if err != nil || provider == "" {
+	if config.Embedder.Provider == "" {
 		return nil, fmt.Errorf("embedder provider is required")
+	}
+	indexEmbedder, err := indexEmbedderConfig(config.Embedder)
+	if err != nil {
+		return nil, err
 	}
 	if len(config.Sources) == 0 {
 		return nil, fmt.Errorf("at least one artifact embedding source is required")
@@ -638,7 +727,7 @@ func NewArtifactEmbeddingIndexConfig(name string, config ArtifactEmbeddingIndexC
 		Sources:        sources,
 		Dimension:      config.ExpectedDims,
 		Sparse:         config.Sparse,
-		Embedder:       config.Embedder,
+		Embedder:       indexEmbedder,
 		DistanceMetric: config.DistanceMetric,
 	})
 	if err != nil {

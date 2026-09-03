@@ -52,6 +52,7 @@ import type {
   RetrievalAgentResult,
   RetrievalAgentStreamCallbacks,
   ScanKeysRequest,
+  Table,
   TableArtifactEnrichmentList,
   TableQueryRequest,
   TableSchema,
@@ -864,18 +865,45 @@ export class AntflyClient {
   }
 
   /**
-   * Retrieval Agent - Unified retrieval pipeline with optional classification, generation, and eval
-   * Supports pipeline mode (structured queries) and agentic mode (tool-calling with LLM)
-   * Configure steps.classification, steps.answer, steps.eval to enable additional pipeline stages
-   * @param request - Retrieval agent request with query, mode, and optional step configs
-   * @param callbacks - Optional callbacks for SSE events (classification, reasoning, hit, answer, citation, confidence, followup_question, eval, done, error)
-   * @returns Promise with RetrievalAgentResult (JSON) or AbortController (when streaming)
+   * Run the retrieval agent and return one complete JSON result.
+   *
+   * Use streamRetrievalAgent when incremental events are required. Keeping the
+   * two response modes separate avoids runtime shape checks on the result.
    */
+  async retrievalAgent(request: RetrievalAgentRequest): Promise<RetrievalAgentResult>;
+  /**
+   * @deprecated Use streamRetrievalAgent(request, callbacks). This overload is
+   * retained for source compatibility and will be removed in a future major release.
+   */
+  async retrievalAgent(
+    request: RetrievalAgentRequest,
+    callbacks: RetrievalAgentStreamCallbacks
+  ): Promise<AbortController>;
   async retrievalAgent(
     request: RetrievalAgentRequest,
     callbacks?: RetrievalAgentStreamCallbacks
   ): Promise<RetrievalAgentResult | AbortController> {
-    return this.performRetrievalAgent(request, callbacks);
+    if (callbacks) return this.streamRetrievalAgent(request, callbacks);
+    const result = await this.performRetrievalAgent({ ...request, stream: false });
+    if (result instanceof AbortController) {
+      result.abort();
+      throw new Error("Retrieval agent returned a stream for a JSON request");
+    }
+    return result;
+  }
+
+  /** Run the retrieval agent as an SSE stream. */
+  async streamRetrievalAgent(
+    request: RetrievalAgentRequest,
+    callbacks: RetrievalAgentStreamCallbacks
+  ): Promise<AbortController> {
+    const result = await this.performRetrievalAgent({ ...request, stream: true }, callbacks);
+    if (result instanceof AbortController) return result;
+
+    // A proxy or older server may still answer with JSON. Preserve the complete
+    // result rather than dropping it, while keeping the streaming return shape.
+    callbacks.onDone?.(result);
+    return new AbortController();
   }
 
   /**
@@ -946,16 +974,13 @@ export class AntflyClient {
         },
       };
 
-      const abortController = (await this.performRetrievalAgent(
-        request,
-        wrappedCallbacks
-      )) as AbortController;
+      const abortController = await this.streamRetrievalAgent(request, wrappedCallbacks);
 
       return { abortController, messages: messagesPromise };
     }
 
     // Non-streaming mode
-    const result = (await this.performRetrievalAgent(request)) as RetrievalAgentResult;
+    const result = await this.retrievalAgent(request);
 
     // Use server-provided messages or build from response
     const updatedMessages: ChatMessage[] = result.messages?.length
@@ -1095,15 +1120,57 @@ export class AntflyClient {
       return true;
     },
 
-    /**
-     * Update schema for a table
-     */
-    updateSchema: async (tableName: string, config: TableSchema) => {
+    /** Replace the complete schema for a table. */
+    replaceSchema: async (
+      tableName: string,
+      config: TableSchema,
+      options?: { expectedVersion?: number }
+    ): Promise<Table | undefined> => {
       const { data, error } = await this.client.PUT("/db/v1/tables/{tableName}/schema", {
         params: { path: { tableName } },
         body: config,
+        headers:
+          options?.expectedVersion === undefined
+            ? undefined
+            : { "If-Match": `"schema-${options.expectedVersion}"` },
       });
-      if (error) throw new Error(`Failed to update table schema: ${error.error}`);
+      if (error) throw new Error(`Failed to replace table schema: ${error.error}`);
+      return data;
+    },
+
+    /** Apply an RFC 7396 JSON Merge Patch without replacing unrelated fields. */
+    patchSchema: async (
+      tableName: string,
+      patch: Record<string, unknown>,
+      options?: { expectedVersion?: number }
+    ): Promise<Table | undefined> => {
+      const { data, error } = await this.client.PATCH("/db/v1/tables/{tableName}/schema", {
+        params: { path: { tableName } },
+        body: patch,
+        headers:
+          options?.expectedVersion === undefined
+            ? undefined
+            : { "If-Match": `"schema-${options.expectedVersion}"` },
+      });
+      if (error) throw new Error(`Failed to patch table schema: ${error.error}`);
+      return data;
+    },
+
+    /** @deprecated Use replaceSchema for explicit full-replacement semantics. */
+    updateSchema: async (
+      tableName: string,
+      config: TableSchema,
+      options?: { expectedVersion?: number }
+    ): Promise<Table | undefined> => {
+      const { data, error } = await this.client.PUT("/db/v1/tables/{tableName}/schema", {
+        params: { path: { tableName } },
+        body: config,
+        headers:
+          options?.expectedVersion === undefined
+            ? undefined
+            : { "If-Match": `"schema-${options.expectedVersion}"` },
+      });
+      if (error) throw new Error(`Failed to replace table schema: ${error.error}`);
       return data;
     },
 

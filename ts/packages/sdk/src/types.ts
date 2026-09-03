@@ -333,25 +333,36 @@ export type ExternalIoConnection = components["schemas"]["ExternalIoConnection"]
 export type CdcConnection = components["schemas"]["CdcConnection"];
 
 // Model and reranker types
-export type EmbedderConfig = components["schemas"]["ManagedEmbedderConfig"];
-export type ManagedEmbedderConfig = components["schemas"]["ManagedEmbedderConfig"];
+export type EmbedderConfig = components["schemas"]["EmbedderConfig"];
+export type IndexEmbedderConfig = components["schemas"]["IndexEmbedderConfig"];
 export type RerankerConfig = components["schemas"]["RerankerConfig"];
 export type GeneratorConfig = components["schemas"]["GeneratorConfig"];
 export type EmbedderProvider = components["schemas"]["EmbedderProvider"];
-export const embedderProviders = [
-  "antfly",
-  "ollama",
-  "openai",
-  "bedrock",
-] as const satisfies readonly EmbedderProvider[];
+export type IndexEmbedderProvider = NonNullable<IndexEmbedderConfig["provider"]>;
+export const embedderProviderCapabilities = {
+  antfly: { index: true },
+  bedrock: { index: true },
+  cohere: { index: false },
+  gemini: { index: false },
+  mock: { index: false },
+  ollama: { index: true },
+  openai: { index: true },
+  openrouter: { index: false },
+  vertex: { index: false },
+} as const satisfies Record<EmbedderProvider, { index: boolean }>;
+export const embedderProviders = Object.keys(embedderProviderCapabilities) as EmbedderProvider[];
+export const indexEmbedderProviders = embedderProviders.filter(
+  (provider): provider is IndexEmbedderProvider => embedderProviderCapabilities[provider].index
+);
 export type GeneratorProvider = components["schemas"]["GeneratorProvider"];
-export const generatorProviders: components["schemas"]["GeneratorProvider"][] = [
-  "antfly",
-  "ollama",
-  "gemini",
-  "openai",
-  "vertex",
-];
+export const generatorProviderCapabilities = {
+  antfly: {},
+  gemini: {},
+  ollama: {},
+  openai: {},
+  vertex: {},
+} as const satisfies Record<GeneratorProvider, object>;
+export const generatorProviders = Object.keys(generatorProviderCapabilities) as GeneratorProvider[];
 
 // AI response types
 export type ClassificationTransformationResult =

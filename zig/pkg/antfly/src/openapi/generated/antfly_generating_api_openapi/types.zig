@@ -166,7 +166,7 @@ pub const ClarificationRequest = struct {
 
 /// Configuration for the classification step. This step analyzes the query, selects the optimal retrieval strategy, and generates semantic transformations.
 pub const ClassificationStepConfig = struct {
-    /// Enable query classification and strategy selection
+    /// Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
     enabled: ?bool = null,
     /// Include pre-retrieval reasoning explaining query analysis and strategy selection
     with_reasoning: ?bool = null,
@@ -291,7 +291,7 @@ pub const ClassificationTransformationResult = struct {
 
 /// Configuration for confidence assessment. Evaluates answer quality and resource relevance. Can use a model calibrated for scoring tasks.
 pub const ConfidenceStepConfig = struct {
-    /// Enable confidence scoring
+    /// Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
     enabled: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -329,7 +329,7 @@ pub const FilterSpec = struct {
 
 /// Configuration for deterministic follow-up suggestions derived from the original query and the standard Antfly follow-up templates.
 pub const FollowupStepConfig = struct {
-    /// Enable follow-up question generation
+    /// Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
     enabled: ?bool = null,
     /// Number of follow-up questions to generate
     count: ?i64 = null,
@@ -425,9 +425,9 @@ pub const GenerationResult = struct {
 
 /// Configuration for the generation step. This step generates the final response from retrieved documents using the reasoning as context.
 pub const GenerationStepConfig = struct {
-    /// Enable generation from retrieved documents
+    /// Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
     enabled: ?bool = null,
-    /// Generator to use for generation. If not specified, uses the default summarizer.
+    /// Canonical generator configuration for this step. When omitted, the top-level request generator is used.
     generator: ?antfly_generating_openapi.GeneratorConfig = null,
     /// Chain of generators to try in order. Mutually exclusive with 'generator'.
     chain: ?[]const ChainLink = null,

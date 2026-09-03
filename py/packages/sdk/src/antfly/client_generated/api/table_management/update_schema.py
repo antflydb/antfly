@@ -9,15 +9,18 @@ from ...client import AuthenticatedClient, Client
 from ...models.error import Error
 from ...models.table import Table
 from ...models.table_schema import TableSchema
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     table_name: str,
     *,
     body: TableSchema,
+    if_match: str | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
+    if not isinstance(if_match, Unset):
+        headers["If-Match"] = if_match
 
     _kwargs: dict[str, Any] = {
         "method": "put",
@@ -50,6 +53,11 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
 
         return response_404
 
+    if response.status_code == 409:
+        response_409 = Error.from_dict(response.json())
+
+        return response_409
+
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -75,11 +83,16 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: TableSchema,
+    if_match: str | Unset = UNSET,
 ) -> Response[Error | Table]:
-    """Update a table's schema
+    """Replace a table's schema
+
+     Replaces the complete table schema. Properties omitted from the request
+    are removed. Use PATCH on this path for a partial JSON Merge Patch update.
 
     Args:
         table_name (str):
+        if_match (str | Unset):  Example: "schema-0".
         body (TableSchema): Schema definition for a table with multiple document types
 
     Raises:
@@ -93,6 +106,7 @@ def sync_detailed(
     kwargs = _get_kwargs(
         table_name=table_name,
         body=body,
+        if_match=if_match,
     )
 
     response = client.get_httpx_client().request(
@@ -107,11 +121,16 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: TableSchema,
+    if_match: str | Unset = UNSET,
 ) -> Error | Table | None:
-    """Update a table's schema
+    """Replace a table's schema
+
+     Replaces the complete table schema. Properties omitted from the request
+    are removed. Use PATCH on this path for a partial JSON Merge Patch update.
 
     Args:
         table_name (str):
+        if_match (str | Unset):  Example: "schema-0".
         body (TableSchema): Schema definition for a table with multiple document types
 
     Raises:
@@ -126,6 +145,7 @@ def sync(
         table_name=table_name,
         client=client,
         body=body,
+        if_match=if_match,
     ).parsed
 
 
@@ -134,11 +154,16 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: TableSchema,
+    if_match: str | Unset = UNSET,
 ) -> Response[Error | Table]:
-    """Update a table's schema
+    """Replace a table's schema
+
+     Replaces the complete table schema. Properties omitted from the request
+    are removed. Use PATCH on this path for a partial JSON Merge Patch update.
 
     Args:
         table_name (str):
+        if_match (str | Unset):  Example: "schema-0".
         body (TableSchema): Schema definition for a table with multiple document types
 
     Raises:
@@ -152,6 +177,7 @@ async def asyncio_detailed(
     kwargs = _get_kwargs(
         table_name=table_name,
         body=body,
+        if_match=if_match,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -164,11 +190,16 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: TableSchema,
+    if_match: str | Unset = UNSET,
 ) -> Error | Table | None:
-    """Update a table's schema
+    """Replace a table's schema
+
+     Replaces the complete table schema. Properties omitted from the request
+    are removed. Use PATCH on this path for a partial JSON Merge Patch update.
 
     Args:
         table_name (str):
+        if_match (str | Unset):  Example: "schema-0".
         body (TableSchema): Schema definition for a table with multiple document types
 
     Raises:
@@ -184,5 +215,6 @@ async def asyncio(
             table_name=table_name,
             client=client,
             body=body,
+            if_match=if_match,
         )
     ).parsed

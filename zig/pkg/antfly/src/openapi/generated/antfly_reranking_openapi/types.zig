@@ -96,7 +96,7 @@ pub const RerankerConfig = struct {
     api_key: ?[]const u8 = null,
     /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
-    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain.
     credentials_path: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -201,7 +201,7 @@ pub const VertexRerankerConfig = struct {
     model: []const u8,
     /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
-    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain.
     credentials_path: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

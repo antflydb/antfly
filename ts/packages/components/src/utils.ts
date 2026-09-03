@@ -239,28 +239,13 @@ export async function streamAnswer(
       : undefined;
 
     // Call the retrieval agent endpoint
-    const result = await client.retrievalAgent(retrievalRequest, sdkCallbacks);
-
-    // Handle non-streaming response (RetrievalAgentResult)
-    if (result && typeof result === "object" && "generation" in result) {
-      if (callbacks.onRetrievalAgentResult) {
-        callbacks.onRetrievalAgentResult(result as RetrievalAgentResult);
-      }
-      if (callbacks.onComplete) {
-        callbacks.onComplete();
-      }
-      return new AbortController(); // Return a dummy controller for consistency
+    if (sdkCallbacks) {
+      return await client.streamRetrievalAgent(retrievalRequest, sdkCallbacks);
     }
 
-    // Handle streaming response (AbortController)
-    if (result && typeof result === "object" && "abort" in result) {
-      return result as AbortController;
-    }
-
-    // Fallback
-    if (callbacks.onComplete) {
-      callbacks.onComplete();
-    }
+    const result: RetrievalAgentResult = await client.retrievalAgent(retrievalRequest);
+    callbacks.onRetrievalAgentResult?.(result);
+    callbacks.onComplete?.();
     return new AbortController();
   } catch (error) {
     if (error instanceof Error) {

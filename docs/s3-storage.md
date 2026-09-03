@@ -96,7 +96,11 @@ protected secret-store file:
 ```
 
 For Google Cloud Storage, select `gcs` and use Application Default
-Credentials, an explicit bearer token, or a service-account document:
+Credentials, an explicit bearer token, or a service-account document. The
+default chain checks `GOOGLE_APPLICATION_CREDENTIALS`, the local gcloud ADC
+file, and then the GCE/GKE metadata server. Service-account, authorized-user,
+and file- or URL-based external-account (workload identity) documents are
+supported and access tokens are cached until refresh is needed:
 
 ```json
 {

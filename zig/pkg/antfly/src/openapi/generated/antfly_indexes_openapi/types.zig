@@ -662,7 +662,7 @@ pub const CreateEmbeddingsIndexRequest = struct {
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?antfly_embeddings_openapi.ManagedEmbedderConfig = null,
+    embedder: ?antfly_embeddings_openapi.IndexEmbedderConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
     chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
     /// Default number of results to return from search (sparse only)
@@ -2614,7 +2614,7 @@ pub const EmbeddingsIndexConfig = struct {
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?antfly_embeddings_openapi.ManagedEmbedderConfig = null,
+    embedder: ?antfly_embeddings_openapi.IndexEmbedderConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
     chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
     /// Default number of results to return from search (sparse only)
@@ -6706,7 +6706,7 @@ pub const IndexConfig = struct {
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?antfly_embeddings_openapi.ManagedEmbedderConfig = null,
+    embedder: ?antfly_embeddings_openapi.IndexEmbedderConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
     chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
     /// Default number of results to return from search (sparse only)

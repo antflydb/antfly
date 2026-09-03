@@ -2908,6 +2908,7 @@ fn registerLinkedInferenceManifest(
             .post => .POST,
             .put => .PUT,
             .delete => .DELETE,
+            .patch => .PATCH,
         }, entry.path.slice(), linkedInferenceHttpHandler, route);
     }
 }
@@ -2938,6 +2939,7 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
             .POST => .post,
             .PUT => .put,
             .DELETE => .delete,
+            .PATCH => .patch,
             else => return error.MethodNotAllowed,
         },
         .path = runtime_http_abi.Bytes.init(context.request.uri.path),

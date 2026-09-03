@@ -601,6 +601,7 @@ const ManifestServer = struct {
             .post => .POST,
             .put => .PUT,
             .delete => .DELETE,
+            .patch => .PATCH,
         }, path, handler) catch |err| {
             std.log.err("linked inference route manifest rejected method={s} path={s} err={}", .{
                 @tagName(method),
@@ -638,6 +639,10 @@ const ManifestServer = struct {
     pub fn delete(self: *const ManifestServer, comptime path: []const u8, handler: httpx.Handler) !void {
         try self.register(.delete, path, handler);
     }
+
+    pub fn patch(self: *const ManifestServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.patch, path, handler);
+    }
 };
 
 const RouteMetadata = struct {
@@ -651,6 +656,7 @@ fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
         .post => "POST",
         .put => "PUT",
         .delete => "DELETE",
+        .patch => "PATCH",
     };
     const relative_path = if (std.mem.startsWith(u8, path, inference.server.public_api_prefix))
         path[inference.server.public_api_prefix.len..]
@@ -690,6 +696,7 @@ const DirectServer = struct {
             .post => .POST,
             .put => .PUT,
             .delete => .DELETE,
+            .patch => .PATCH,
         }, path, localInferenceHttpHandler, route);
     }
 
@@ -707,6 +714,10 @@ const DirectServer = struct {
 
     pub fn delete(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
         try self.register(.delete, path, handler);
+    }
+
+    pub fn patch(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.patch, path, handler);
     }
 };
 
@@ -732,6 +743,7 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
         .post => .POST,
         .put => .PUT,
         .delete => .DELETE,
+        .patch => .PATCH,
     }, target);
     defer http_request.deinit();
     const input_headers = if (request.headers_ptr) |ptr| ptr[0..request.headers_len] else &.{};

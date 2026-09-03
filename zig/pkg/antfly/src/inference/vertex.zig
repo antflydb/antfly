@@ -105,6 +105,7 @@ pub const Options = struct {
     location: []const u8 = "us-central1",
     credentials_path: ?[]const u8 = null,
     bearer_token: ?[]const u8 = null,
+    token_source: ?*google_auth.CachedTokenSource = null,
 };
 
 pub const Provider = struct {
@@ -115,6 +116,7 @@ pub const Provider = struct {
     location: []const u8,
     auth_header: ?[2][]const u8 = null,
     token_source: ?*google_auth.CachedTokenSource = null,
+    owns_token_source: bool = false,
     max_tokens: ?i64 = null,
     temperature: ?f32 = null,
     top_p: ?f32 = null,
@@ -139,8 +141,11 @@ pub const Provider = struct {
 
         if (options.bearer_token) |token| {
             try provider.setBearer(token);
+        } else if (options.token_source) |source| {
+            provider.token_source = source;
         } else {
             provider.token_source = try initVertexTokenSource(allocator, options.credentials_path);
+            provider.owns_token_source = true;
         }
 
         return provider;
@@ -151,9 +156,11 @@ pub const Provider = struct {
         self.allocator.free(self.project_id);
         self.allocator.free(self.location);
         if (self.auth_header) |header| self.allocator.free(header[1]);
-        if (self.token_source) |source| {
-            source.deinit();
-            self.allocator.destroy(source);
+        if (self.owns_token_source) {
+            if (self.token_source) |source| {
+                source.deinit();
+                self.allocator.destroy(source);
+            }
         }
         self.* = undefined;
     }
@@ -527,9 +534,7 @@ pub fn mintAuthorizationValueAlloc(alloc: Allocator, credentials_path: ?[]const 
 
 fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*google_auth.CachedTokenSource {
     var cfg = if (credentials_path) |path| blk: {
-        var service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return error.MissingVertexCredentials;
-        errdefer service_account.deinit(alloc);
-        break :blk google_auth.configFromServiceAccountAlloc(alloc, service_account, vertex_auth_scope) catch return error.MissingVertexCredentials;
+        break :blk google_auth.configFromFileAlloc(alloc, path, vertex_auth_scope) catch return error.MissingVertexCredentials;
     } else google_auth.configFromEnvAlloc(alloc, vertex_auth_scope) catch return error.MissingVertexCredentials;
     errdefer cfg.deinit(alloc);
 
@@ -541,11 +546,9 @@ fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*goog
 
 pub fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]const u8) !?[]u8 {
     if (credentials_path) |path| {
-        var service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return null;
-        defer service_account.deinit(alloc);
-        return if (service_account.project_id) |value| try alloc.dupe(u8, value) else null;
+        return google_auth.projectIdFromFileAlloc(alloc, path) catch null;
     }
-    return try google_auth.serviceAccountEnvProjectIdAlloc(alloc);
+    return try google_auth.projectIdFromDefaultCredentialsAlloc(alloc);
 }
 
 fn appendJsonString(

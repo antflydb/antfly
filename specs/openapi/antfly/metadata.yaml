@@ -1463,6 +1463,13 @@ components:
       schema:
         type: string
   schemas:
+    TableSchemaPatch:
+      type: object
+      additionalProperties: true
+      description: |
+        RFC 7396 JSON Merge Patch for a table schema. Object members are merged
+        recursively; null removes a member. The resulting document must be a
+        valid TableSchema and `version` remains server-managed.
     Error:
       $ref: "../auth/api.yaml#/components/schemas/Error"
     UnsupportedIndexCapabilityError:
@@ -2162,6 +2169,10 @@ components:
       $ref: "sort.yaml#/components/schemas/SortField"
     EmbedderProvider:
       $ref: "embeddings.yaml#/components/schemas/EmbedderProvider"
+    EmbedderConfig:
+      $ref: "embeddings.yaml#/components/schemas/EmbedderConfig"
+    IndexEmbedderConfig:
+      $ref: "embeddings.yaml#/components/schemas/IndexEmbedderConfig"
     ClusterHealth:
       type: string
       enum:
@@ -11023,10 +11034,22 @@ paths:
         schema:
           type: string
     put:
-      summary: Update a table's schema
+      summary: Replace a table's schema
+      description: |
+        Replaces the complete table schema. Properties omitted from the request
+        are removed. Use PATCH on this path for a partial JSON Merge Patch update.
       tags:
         - table_management
       operationId: updateSchema
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          description: Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update.
+          schema:
+            type: string
+            pattern: '^"schema-[0-9]+"$'
+            example: '"schema-0"'
       requestBody:
         required: true
         content:
@@ -11036,6 +11059,12 @@ paths:
       responses:
         "200":
           description: Schema updated successfully
+          headers:
+            ETag:
+              description: Strong ETag for the committed schema version.
+              schema:
+                type: string
+                example: '"schema-1"'
           content:
             application/json:
               schema:
@@ -11044,6 +11073,56 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    patch:
+      summary: Patch a table's schema
+      description: |
+        Applies an RFC 7396 JSON Merge Patch to the current table schema. Object
+        members are merged recursively and a null value removes that member.
+        Antfly validates and versions the resulting complete schema atomically.
+      tags:
+        - table_management
+      operationId: patchSchema
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          description: Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update.
+          schema:
+            type: string
+            pattern: '^"schema-[0-9]+"$'
+            example: '"schema-0"'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: "#/components/schemas/TableSchemaPatch"
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TableSchemaPatch"
+      responses:
+        "200":
+          description: Schema patched successfully
+          headers:
+            ETag:
+              description: Strong ETag for the committed schema version.
+              schema:
+                type: string
+                example: '"schema-1"'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Table"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/documents:

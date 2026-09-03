@@ -18,7 +18,8 @@ import { resolveTable, streamAnswer } from "./utils";
 export interface AnswerResultsProps {
   id: string;
   searchBoxId: string; // Links to the QueryBox that provides the search value
-  generator?: GeneratorConfig;
+  /** Generator used by the answer step. Required so invalid empty generation requests fail at compile time. */
+  generator: GeneratorConfig;
   agentKnowledge?: string; // Additional context for the answer agent
   table?: string; // Optional table override - auto-inherits from QueryBox if not specified
   filterQuery?: Record<string, unknown>; // Filter query to constrain search results
@@ -179,7 +180,7 @@ export default function AnswerResults({
     // QueryBox only provides the text value, AnswerResults owns the query configuration
     const retrievalRequest: RetrievalAgentRequest = {
       query: currentQuery,
-      ...(generator ? { generator } : {}),
+      generator,
       agent_knowledge: agentKnowledge,
       stream: true,
       queries: [
@@ -195,22 +196,17 @@ export default function AnswerResults({
       ],
       steps: {
         generation: {
-          enabled: true,
           ...(systemPrompt ? { system_prompt: systemPrompt } : {}),
           ...(generationContext ? { generation_context: generationContext } : {}),
         },
-        classification: {
-          enabled: true,
-          with_reasoning: showReasoning,
-        },
-        followup: {
-          enabled: showFollowUpQuestions,
-          ...(followUpCount ? { count: followUpCount } : {}),
-        },
-        confidence: {
-          enabled: showConfidence,
-        },
-        eval: evalConfig,
+        ...(showClassification || showReasoning
+          ? { classification: { with_reasoning: showReasoning } }
+          : {}),
+        ...(showFollowUpQuestions
+          ? { followup: { ...(followUpCount ? { count: followUpCount } : {}) } }
+          : {}),
+        ...(showConfidence ? { confidence: {} } : {}),
+        ...(evalConfig ? { eval: evalConfig } : {}),
       },
     };
 
@@ -348,6 +344,7 @@ export default function AnswerResults({
     onGenerationChunkCallback,
     onConfidenceCallback,
     onFollowupCallback,
+    showClassification,
   ]);
 
   // Register this component as a widget (for consistency with other components)

@@ -94,7 +94,7 @@ components:
         credentials_path:
           type: string
           writeOnly: true
-          description: "Path to service account JSON key file. Alternative to ADC for non-GCP environments."
+          description: "Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Alternative to the default ADC chain."
         dimension:
           type: integer
           description: "The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding)."
@@ -369,8 +369,12 @@ components:
         model: "bge-base-en-v1.5"
         api_url: "http://localhost:8082"
 
-    ManagedEmbedderConfig:
-      description: "Embedding provider configuration accepted by managed index creation."
+    IndexEmbedderConfig:
+      description: |-
+        Embedding provider configuration accepted when Antfly creates and
+        maintains an embeddings index. This purpose-specific subset reuses the
+        canonical provider configurations; it does not define a second provider
+        namespace.
       oneOf:
         - $ref: "#/components/schemas/OllamaEmbedderConfig"
         - $ref: "#/components/schemas/OpenAIEmbedderConfig"

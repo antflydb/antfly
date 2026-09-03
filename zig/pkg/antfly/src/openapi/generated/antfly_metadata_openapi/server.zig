@@ -441,7 +441,7 @@ pub fn parseRestoreTableBody(allocator: std.mem.Allocator, body: []const u8) !st
     return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Update a table's schema
+/// Replace a table's schema
 pub const UpdateSchemaPathParams = struct {
     /// Name of the table
     table_name: []const u8,
@@ -450,6 +450,17 @@ pub const UpdateSchemaPathParams = struct {
 /// Parse the JSON request body for updateSchema.
 pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_schema_openapi.TableSchema) {
     return std.json.parseFromSlice(antfly_schema_openapi.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Patch a table's schema
+pub const PatchSchemaPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for patchSchema.
+pub fn parsePatchSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TableSchemaPatch) {
+    return std.json.parseFromSlice(types.TableSchemaPatch, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for beginTransaction.
@@ -601,6 +612,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "PATCH", .path = "/tables/{tableName}/schema", .operation_id = "patchSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/begin", .operation_id = "beginTransaction", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions", .request_body = .none, .streaming_response = false },
@@ -679,6 +691,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "runTableRepair")) @compileError("ServerRouter: Impl missing required method 'runTableRepair'");
         if (!@hasDecl(Impl, "restoreTable")) @compileError("ServerRouter: Impl missing required method 'restoreTable'");
         if (!@hasDecl(Impl, "updateSchema")) @compileError("ServerRouter: Impl missing required method 'updateSchema'");
+        if (!@hasDecl(Impl, "patchSchema")) @compileError("ServerRouter: Impl missing required method 'patchSchema'");
         if (!@hasDecl(Impl, "listTransactionSessions")) @compileError("ServerRouter: Impl missing required method 'listTransactionSessions'");
         if (!@hasDecl(Impl, "beginTransaction")) @compileError("ServerRouter: Impl missing required method 'beginTransaction'");
         if (!@hasDecl(Impl, "cleanupTransactionSessions")) @compileError("ServerRouter: Impl missing required method 'cleanupTransactionSessions'");
@@ -755,6 +768,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/repair/run", httpx.Handler.bind(self.impl, runTableRepair));
             try server.post("/tables/:tableName/restore", httpx.Handler.bind(self.impl, restoreTable));
             try server.put("/tables/:tableName/schema", httpx.Handler.bind(self.impl, updateSchema));
+            try server.patch("/tables/:tableName/schema", httpx.Handler.bind(self.impl, patchSchema));
             try server.get("/transactions", httpx.Handler.bind(self.impl, listTransactionSessions));
             try server.post("/transactions/begin", httpx.Handler.bind(self.impl, beginTransaction));
             try server.post("/transactions/cleanup", httpx.Handler.bind(self.impl, cleanupTransactionSessions));
@@ -1167,11 +1181,18 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.restoreTable(ctx, table_name);
         }
 
-        /// Update a table's schema
+        /// Replace a table's schema
         /// PUT /tables/{tableName}/schema
         fn updateSchema(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.updateSchema(ctx, table_name);
+        }
+
+        /// Patch a table's schema
+        /// PATCH /tables/{tableName}/schema
+        fn patchSchema(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.patchSchema(ctx, table_name);
         }
 
         /// List transaction sessions
@@ -1321,6 +1342,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn patchSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn beginTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response

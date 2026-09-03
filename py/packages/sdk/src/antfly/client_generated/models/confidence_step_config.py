@@ -17,10 +17,11 @@ class ConfidenceStepConfig:
     resource relevance. Can use a model calibrated for scoring tasks.
 
         Attributes:
-            enabled (bool | Unset): Enable confidence scoring Default: False.
+            enabled (bool | Unset): Compatibility switch. The step is enabled when this object is present; omit the step to
+                disable it.
     """
 
-    enabled: bool | Unset = False
+    enabled: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

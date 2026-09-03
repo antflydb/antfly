@@ -164,8 +164,8 @@ components:
       properties:
         enabled:
           type: boolean
-          default: false
-          description: "Enable query classification and strategy selection"
+          deprecated: true
+          description: "Compatibility switch. The step is enabled when this object is present; omit the step to disable it."
         with_reasoning:
           type: boolean
           default: false
@@ -185,11 +185,11 @@ components:
       properties:
         enabled:
           type: boolean
-          default: false
-          description: "Enable generation from retrieved documents"
+          deprecated: true
+          description: "Compatibility switch. The step is enabled when this object is present; omit the step to disable it."
         generator:
           $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
-          description: "Generator to use for generation. If not specified, uses the default summarizer."
+          description: "Canonical generator configuration for this step. When omitted, the top-level request generator is used."
         chain:
           type: array
           items:
@@ -211,8 +211,8 @@ components:
       properties:
         enabled:
           type: boolean
-          default: false
-          description: "Enable follow-up question generation"
+          deprecated: true
+          description: "Compatibility switch. The step is enabled when this object is present; omit the step to disable it."
         count:
           type: integer
           default: 3
@@ -228,8 +228,8 @@ components:
       properties:
         enabled:
           type: boolean
-          default: false
-          description: "Enable confidence scoring"
+          deprecated: true
+          description: "Compatibility switch. The step is enabled when this object is present; omit the step to disable it."
 
     # Shared retrieval-agent message and tool types.
 

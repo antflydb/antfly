@@ -89,6 +89,10 @@ Models are stored in `~/.antfly/inference/models/` by default, organized by type
 
 Antfly inference auto-discovers and loads models from these directories when Antfly starts in standalone mode. Use `--models-dir` to override the default location.
 
+Traditional ML predictors use the parallel `~/.antfly/inference/ml/` directory.
+Use `--ml-dir` to override it. Neither inference asset directory follows the
+database `--data-dir` implicitly.
+
 For text generation, only a specific set of model architectures is supported. See
 [Supported models](/docs/guides/supported-models) before pulling a generator.
 
@@ -97,6 +101,12 @@ For text generation, only a specific set of model architectures is supported. Se
 Antfly inference models can be used in index and query configurations:
 
 ### Embedder Configuration
+
+The API uses one `EmbedderProvider` and one canonical `EmbedderConfig` across
+inference features. Index creation accepts the purpose-specific
+`IndexEmbedderConfig` subset (`antfly`, `ollama`, `openai`, or `bedrock`), so
+generated clients cannot advertise providers that the indexing runtime cannot
+execute.
 
 ```json
 {
@@ -119,6 +129,9 @@ Antfly inference models can be used in index and query configurations:
 ```
 
 ### Reranker Configuration
+
+Reranking supports `antfly`, `cohere`, and `vertex`. Ollama reranking is not
+advertised because Antfly does not implement a compatible Ollama rerank API.
 
 ```json
 {

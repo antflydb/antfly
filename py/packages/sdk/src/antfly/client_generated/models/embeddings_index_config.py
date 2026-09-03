@@ -62,7 +62,10 @@ class EmbeddingsIndexConfig:
                 product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
             mem_only (bool | Unset): Whether to use in-memory only storage (dense only)
             embedder (AntflyEmbedderConfig | BedrockEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig | Unset):
-                Embedding provider configuration accepted by managed index creation.
+                Embedding provider configuration accepted when Antfly creates and
+                maintains an embeddings index. This purpose-specific subset reuses the
+                canonical provider configurations; it does not define a second provider
+                namespace.
             chunker (ChunkerConfig | Unset): A unified configuration for a chunking provider. Example: {'provider':
                 'antfly', 'model': 'fixed', 'text': {'target_tokens': 500, 'overlap_tokens': 50}}.
             top_k (int | Unset): Default number of results to return from search (sparse only) Default: 10.
@@ -265,32 +268,32 @@ class EmbeddingsIndexConfig:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_managed_embedder_config_type_0 = OllamaEmbedderConfig.from_dict(data)
+                componentsschemas_index_embedder_config_type_0 = OllamaEmbedderConfig.from_dict(data)
 
-                return componentsschemas_managed_embedder_config_type_0
+                return componentsschemas_index_embedder_config_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_managed_embedder_config_type_1 = OpenAIEmbedderConfig.from_dict(data)
+                componentsschemas_index_embedder_config_type_1 = OpenAIEmbedderConfig.from_dict(data)
 
-                return componentsschemas_managed_embedder_config_type_1
+                return componentsschemas_index_embedder_config_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_managed_embedder_config_type_2 = BedrockEmbedderConfig.from_dict(data)
+                componentsschemas_index_embedder_config_type_2 = BedrockEmbedderConfig.from_dict(data)
 
-                return componentsschemas_managed_embedder_config_type_2
+                return componentsschemas_index_embedder_config_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_managed_embedder_config_type_3 = AntflyEmbedderConfig.from_dict(data)
+            componentsschemas_index_embedder_config_type_3 = AntflyEmbedderConfig.from_dict(data)
 
-            return componentsschemas_managed_embedder_config_type_3
+            return componentsschemas_index_embedder_config_type_3
 
         embedder = _parse_embedder(d.pop("embedder", UNSET))
 

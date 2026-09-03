@@ -24,8 +24,6 @@ interface SearchWidgetConfig {
 interface FacetWidgetConfig {
   fields: string[];
   size: number;
-  filterValue?: string;
-  filterValueModifier?: (value: string) => string;
   useCustomQuery?: boolean;
 }
 
@@ -70,19 +68,6 @@ function isSearchWidgetConfig(config: unknown): config is SearchWidgetConfig {
     typeof (config as SearchWidgetConfig).itemsPerPage === "number" &&
     typeof (config as SearchWidgetConfig).page === "number"
   );
-}
-
-export function facetFilterMatches(
-  key: string,
-  filterValue: string,
-  modifier?: (value: string) => string
-): boolean {
-  if (!modifier) return key.toLowerCase().includes(filterValue.toLowerCase());
-  try {
-    return new RegExp(modifier(filterValue), "i").test(key);
-  } catch {
-    return false;
-  }
 }
 
 export default function Listener({ children, onChange }: ListenerProps) {
@@ -331,8 +316,6 @@ export default function Listener({ children, onChange }: ListenerProps) {
                 const config = f.configuration as FacetWidgetConfig;
                 const fields = config.fields;
                 const size = config.size;
-                const filterValue = config.filterValue;
-                const filterValueModifier = config.filterValueModifier;
                 const useCustomQuery = config.useCustomQuery;
 
                 // Get the aggs (antfly queries) from fields
@@ -420,12 +403,6 @@ export default function Listener({ children, onChange }: ListenerProps) {
                       .map((f: string) => {
                         if (!result.aggregations?.[f]?.buckets) {
                           return [];
-                        }
-                        // Only use filterValue for legacy mode (non-custom queries)
-                        if (filterValue && !useCustomQuery) {
-                          return result.aggregations[f].buckets?.filter((i: AggregationBucket) =>
-                            facetFilterMatches(i.key, filterValue, filterValueModifier)
-                          );
                         }
                         return result.aggregations[f].buckets;
                       })

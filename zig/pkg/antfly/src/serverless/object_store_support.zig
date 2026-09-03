@@ -63,7 +63,7 @@ pub fn s3ConfigAlloc(alloc: Allocator, options: ?S3Options) !object_storage.S3.C
 pub fn gcsConfigAlloc(alloc: Allocator, maybe_options: ?GcsOptions) !object_storage.Gcs.JsonApiConfig {
     const options = maybe_options orelse GcsOptions{};
     var cfg = switch (options.credential_source) {
-        .default => try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc),
+        .default => try object_storage.Gcs.jsonApiClientConfigFromEnvWithScopeAlloc(alloc, options.scope),
         .bearer_token => try object_storage.Gcs.jsonApiClientConfigWithBearerTokenAlloc(
             alloc,
             options.bearer_token orelse return error.MissingGcsBearerToken,

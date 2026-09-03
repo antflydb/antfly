@@ -18,15 +18,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@antfly/design-system";
-import { embedderProviders } from "@antfly/sdk";
+import { type IndexEmbedderProvider, indexEmbedderProviders } from "@antfly/sdk";
 import type React from "react";
 import { useMemo } from "react";
 import { useFieldArray, useFormContext } from "react-hook-form";
 import { liveModelSuggestions, useConnectedModels } from "@/hooks/use-connections";
 import ChunkingForm from "./ChunkingForm";
 import { Combobox } from "./Combobox";
-
-type IndexEmbedderProvider = (typeof embedderProviders)[number];
 
 const staticModelSuggestions: Record<IndexEmbedderProvider, string[]> = {
   antfly: ["all-MiniLM-L6-v2"],
@@ -103,7 +101,7 @@ const IndexForm: React.FC<IndexFormProps> = ({
                 </SelectTrigger>
               </FormControl>
               <SelectContent>
-                {embedderProviders.map((p: string) => (
+                {indexEmbedderProviders.map((p) => (
                   <SelectItem key={p} value={p}>
                     {p}
                   </SelectItem>

@@ -360,6 +360,7 @@ pub const ProvisionedGroupStorage = struct {
         self.read_cache.backend_runtime = self.backend_runtime;
         self.read_cache.antfly_provider = read_source.antfly_provider;
         self.read_cache.secret_store = read_source.secret_store;
+        read_source.reranker_runtime = try self.read_cache.ensureRerankerRuntime();
         // Resident writer DBs also serve freshness-sensitive reads. Leaving
         // their cache unset makes the LSM backend retain a private decoded
         // index for every run, bypassing both the shared cache bound and the

@@ -327,7 +327,7 @@ fn default_embedding_source_field() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactEmbeddingIndexOptions {
     pub sources: Vec<ArtifactEmbeddingSourceSpec>,
-    pub embedder: types::ManagedEmbedderConfig,
+    pub embedder: types::IndexEmbedderConfig,
     pub dimension: Option<u32>,
     #[serde(default)]
     pub sparse: bool,
@@ -374,7 +374,7 @@ pub struct ArtifactEmbeddingIndexConfigSpec {
     pub kind: ArtifactEmbeddingIndexKind,
     pub sources: Vec<ArtifactIndexSourceSpec>,
     pub enrichments: Vec<ArtifactEmbeddingEnrichmentSpec>,
-    pub embedder: types::ManagedEmbedderConfig,
+    pub embedder: types::IndexEmbedderConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dimension: Option<u32>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -598,8 +598,8 @@ pub fn validate_create_table_request_relationships(
 include!(concat!(env!("OUT_DIR"), "/client.rs"));
 
 /// Build an Antfly inference embedder without exposing generated union variant names.
-pub fn antfly_embedder(model: impl Into<String>) -> types::ManagedEmbedderConfig {
-    types::ManagedEmbedderConfig::AntflyEmbedderConfig(types::AntflyEmbedderConfig {
+pub fn antfly_embedder(model: impl Into<String>) -> types::IndexEmbedderConfig {
+    types::IndexEmbedderConfig::AntflyEmbedderConfig(types::AntflyEmbedderConfig {
         api_url: None,
         model: model.into(),
         provider: types::AntflyEmbedderConfigProvider::Antfly,

@@ -53,7 +53,7 @@ export interface ChatTurn {
 export interface ChatConfig {
   url: string;
   headers?: Record<string, string>;
-  generator?: GeneratorConfig;
+  generator: GeneratorConfig;
   table: string;
   semanticIndexes?: string[];
   agentKnowledge?: string;
@@ -131,7 +131,7 @@ export function useChatStream() {
     // Build retrieval agent request
     const request: RetrievalAgentRequest = {
       query: text,
-      ...(config.generator ? { generator: config.generator } : {}),
+      generator: config.generator,
       agent_knowledge: config.agentKnowledge,
       stream: true,
       messages,
@@ -148,15 +148,13 @@ export function useChatStream() {
       ],
       steps: config.steps ?? {
         generation: {
-          enabled: true,
           ...(config.systemPrompt ? { system_prompt: config.systemPrompt } : {}),
         },
-        classification: { enabled: true },
+        classification: {},
         followup: {
-          enabled: true,
           ...(config.followUpCount ? { count: config.followUpCount } : {}),
         },
-        confidence: { enabled: true },
+        confidence: {},
         ...(config.tools ? { tools: config.tools } : {}),
       },
       ...(config.maxInternalIterations

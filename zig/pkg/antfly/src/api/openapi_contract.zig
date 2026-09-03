@@ -1062,6 +1062,7 @@ test "client openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@hasDecl(client_generated.Client, "backupTable"));
     try std.testing.expect(@hasDecl(client_generated.Client, "restoreTable"));
     try std.testing.expect(@hasDecl(client_generated.Client, "updateSchema"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "patchSchema"));
     try std.testing.expect(@hasDecl(client_generated.Client, "listIndexes"));
     try std.testing.expect(@hasDecl(client_generated.Client, "createIndex"));
     try std.testing.expect(@hasDecl(client_generated.Client, "dropIndex"));

@@ -90,6 +90,7 @@ pub const Routes = struct {
     pub const internal_table_restore_suffix = "/restore";
     pub const internal_table_definition_suffix = "/definition";
     pub const internal_table_schema_suffix = "/schema";
+    pub const internal_table_schema_mutation_suffix = "/schema:mutate";
     pub const internal_table_indexes_infix = "/indexes/";
     pub const internal_table_enrichments_infix = "/enrichments/";
     pub const internal_table_replication_sources_infix = "/replication-sources/";

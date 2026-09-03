@@ -4,7 +4,8 @@ import type React from "react";
 import { describe, expect, it, vi } from "vitest";
 import Antfly from "./Antfly";
 import Autosuggest from "./Autosuggest";
-import Listener, { facetFilterMatches } from "./Listener";
+import { facetFilterMatches } from "./Facet";
+import Listener from "./Listener";
 import QueryBox from "./QueryBox";
 import Results from "./Results";
 

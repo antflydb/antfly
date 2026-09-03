@@ -106,6 +106,10 @@ from .cluster_status import ClusterStatus
 from .cluster_status_deployment_mode import ClusterStatusDeploymentMode
 from .cluster_topology import ClusterTopology
 from .cluster_topology_deployment_mode import ClusterTopologyDeploymentMode
+from .cohere_embedder_config import CohereEmbedderConfig
+from .cohere_embedder_config_input_type import CohereEmbedderConfigInputType
+from .cohere_embedder_config_provider import CohereEmbedderConfigProvider
+from .cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
 from .cohere_reranker_config import CohereRerankerConfig
 from .cohere_reranker_config_provider import CohereRerankerConfigProvider
 from .confidence_step_config import ConfidenceStepConfig
@@ -201,6 +205,7 @@ from .edge_metadata import EdgeMetadata
 from .edge_type_config import EdgeTypeConfig
 from .edge_type_config_topology import EdgeTypeConfigTopology
 from .edges_response import EdgesResponse
+from .embedder_config import EmbedderConfig
 from .embedder_provider import EmbedderProvider
 from .embedding_type_1 import EmbeddingType1
 from .embedding_type_3 import EmbeddingType3
@@ -306,6 +311,8 @@ from .get_current_user_response_200 import GetCurrentUserResponse200
 from .get_current_user_response_200_metadata_type_0 import GetCurrentUserResponse200MetadataType0
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
 from .global_stateful_query_request import GlobalStatefulQueryRequest
+from .google_embedder_config import GoogleEmbedderConfig
+from .google_embedder_config_provider import GoogleEmbedderConfigProvider
 from .google_generator_config import GoogleGeneratorConfig
 from .google_generator_config_provider import GoogleGeneratorConfigProvider
 from .graph_aggregate_value import GraphAggregateValue
@@ -721,6 +728,8 @@ from .open_ai_embedder_config import OpenAIEmbedderConfig
 from .open_ai_embedder_config_provider import OpenAIEmbedderConfigProvider
 from .open_ai_generator_config import OpenAIGeneratorConfig
 from .open_ai_generator_config_provider import OpenAIGeneratorConfigProvider
+from .open_router_embedder_config import OpenRouterEmbedderConfig
+from .open_router_embedder_config_provider import OpenRouterEmbedderConfigProvider
 from .package_artifact import PackageArtifact
 from .package_artifact_kind import PackageArtifactKind
 from .package_dependency import PackageDependency
@@ -889,6 +898,7 @@ from .table_restore_status import TableRestoreStatus
 from .table_restore_status_status import TableRestoreStatusStatus
 from .table_schema import TableSchema
 from .table_schema_document_schemas import TableSchemaDocumentSchemas
+from .table_schema_patch import TableSchemaPatch
 from .table_shards import TableShards
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
@@ -966,6 +976,8 @@ from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
 from .vad_options import VADOptions
+from .vertex_embedder_config import VertexEmbedderConfig
+from .vertex_embedder_config_provider import VertexEmbedderConfigProvider
 from .vertex_generator_config import VertexGeneratorConfig
 from .vertex_generator_config_provider import VertexGeneratorConfigProvider
 from .vertex_reranker_config import VertexRerankerConfig
@@ -1085,6 +1097,10 @@ __all__ = (
     "ClusterStatusDeploymentMode",
     "ClusterTopology",
     "ClusterTopologyDeploymentMode",
+    "CohereEmbedderConfig",
+    "CohereEmbedderConfigInputType",
+    "CohereEmbedderConfigProvider",
+    "CohereEmbedderConfigTruncate",
     "CohereRerankerConfig",
     "CohereRerankerConfigProvider",
     "ConfidenceStepConfig",
@@ -1178,6 +1194,7 @@ __all__ = (
     "EdgesResponse",
     "EdgeTypeConfig",
     "EdgeTypeConfigTopology",
+    "EmbedderConfig",
     "EmbedderProvider",
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
@@ -1283,6 +1300,8 @@ __all__ = (
     "GetCurrentUserResponse200MetadataType0",
     "GetDocumentArtifactManifestDetail",
     "GlobalStatefulQueryRequest",
+    "GoogleEmbedderConfig",
+    "GoogleEmbedderConfigProvider",
     "GoogleGeneratorConfig",
     "GoogleGeneratorConfigProvider",
     "GraphAggregatesResult",
@@ -1694,6 +1713,8 @@ __all__ = (
     "OpenAIEmbedderConfigProvider",
     "OpenAIGeneratorConfig",
     "OpenAIGeneratorConfigProvider",
+    "OpenRouterEmbedderConfig",
+    "OpenRouterEmbedderConfigProvider",
     "PackageArtifact",
     "PackageArtifactKind",
     "PackageDependency",
@@ -1862,6 +1883,7 @@ __all__ = (
     "TableRestoreStatusStatus",
     "TableSchema",
     "TableSchemaDocumentSchemas",
+    "TableSchemaPatch",
     "TableShards",
     "TableStatistics",
     "TableStatisticsFieldStats",
@@ -1939,6 +1961,8 @@ __all__ = (
     "User",
     "UserMetadataType0",
     "VADOptions",
+    "VertexEmbedderConfig",
+    "VertexEmbedderConfigProvider",
     "VertexGeneratorConfig",
     "VertexGeneratorConfigProvider",
     "VertexRerankerConfig",

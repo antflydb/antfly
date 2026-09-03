@@ -201,15 +201,34 @@ Metrics tracked:
 
 ### Adding TTL to Existing Table
 
-TTL can be added to an existing table through schema updates:
+TTL can be added to an existing table with a JSON Merge Patch:
+
+```http
+PATCH /db/v1/tables/my_table/schema
+Content-Type: application/merge-patch+json
+If-Match: "schema-3"
+
+{"ttl":{"duration":"7d"}}
+```
+
+Successful schema mutations return the committed schema ETag (for example,
+`ETag: "schema-4"`). Reuse that value in `If-Match` when concurrent editors
+must not overwrite each other. Omitting `If-Match` applies the merge patch to
+the newest authoritative schema and retries an internal metadata race.
+
 - Applies retroactively to all existing documents
 - Documents already expired based on the new TTL are marked for immediate deletion
 
 ### Removing TTL
 
-TTL can be removed explicitly by setting `ttl` to `null` in the table schema:
+TTL can be removed explicitly with a JSON Merge Patch. Other schema fields are
+preserved:
 
-```json
+```http
+PATCH /db/v1/tables/my_table/schema
+Content-Type: application/merge-patch+json
+If-Match: "schema-4"
+
 {"ttl": null}
 ```
 
@@ -220,7 +239,8 @@ After removal:
 
 ### Changing TTL Duration
 
-TTL duration can be changed through schema updates:
+TTL duration can be changed with the same PATCH endpoint. `PUT` replaces the
+complete schema and should only be used when the caller intends replacement:
 - New duration applies immediately to all documents
 - All documents recalculate expiration using existing timestamps with new duration
 

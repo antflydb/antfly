@@ -235,6 +235,7 @@ export type {
   // Model and reranker types
   EmbedderConfig,
   EmbedderProvider,
+  IndexEmbedderProvider,
   // Embedding types
   Embedding,
   // Eval types
@@ -320,7 +321,7 @@ export type {
   LegacyGraphSearchResult,
   LinearMergeRequest,
   LinearMergeResult,
-  ManagedEmbedderConfig,
+  IndexEmbedderConfig,
   MergeProfile,
   MultiBatchRequest,
   MultiBatchResult,
@@ -380,8 +381,11 @@ export type {
   WriteOptions,
 } from "./types.js";
 export {
+  embedderProviderCapabilities,
   embedderProviders,
+  indexEmbedderProviders,
   formatQueryHitsTotal,
+  generatorProviderCapabilities,
   generatorProviders,
   queryHitsTotalIsExact,
   queryHitsTotalValue,

@@ -346,7 +346,7 @@ const EvalsPlaygroundPage: React.FC = () => {
         try {
           // Call retrievalAgent with generation + inline eval config
           // Note: queries must include semantic_search (not auto-populated from query)
-          // Note: steps.generation must have enabled: true (defaults to false)
+          // A generation step is enabled by its presence.
           const answerResult = await apiClient.retrievalAgent(
             {
               query: item.question,
@@ -369,7 +369,7 @@ const EvalsPlaygroundPage: React.FC = () => {
                   }
                 : {}),
               steps: {
-                generation: { enabled: true },
+                generation: {},
                 eval: {
                   evaluators: ["correctness"],
                   judge: {

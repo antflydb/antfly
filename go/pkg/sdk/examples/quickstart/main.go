@@ -20,7 +20,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
+	embedder, err := antfly.NewIndexEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model: "antflydb/clipclap",
 	})
 	if err != nil {

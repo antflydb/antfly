@@ -133,6 +133,10 @@ antfly query --table wikipedia \
 
 The `field` parameter tells the reranker which document field to score against the query. `candidate_count` controls the expensive scoring window, while `top_n` controls the number returned. The built-in `antfly` reranker uses a cross-encoder model bundled in the binary. For larger or custom models, use `"provider": "antfly"` with a model like `cross-encoder/ms-marco-MiniLM-L-6-v2`.
 
+The executable reranker providers are `antfly`, `cohere`, and `vertex`.
+Antfly validates `top_n <= candidate_count` before retrieval and only sends the
+bounded candidate window to a remote reranker.
+
 <Callout type="tip">
 Retrieve more results than you need (50-100), then use `candidate_count` to bound reranking cost and `top_n` for the final response size. A larger candidate set can improve recall but increases latency.
 </Callout>

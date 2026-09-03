@@ -37,9 +37,9 @@ class VertexRerankerConfig:
                 default@latest.
             project_id (str | Unset): Google Cloud project ID. Shared Vertex credential field; see
                 vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
-            credentials_path (str | Unset): Path to service account JSON file. Shared Vertex credential field; see
-                vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment
-                variable.
+            credentials_path (str | Unset): Path to an ADC credential JSON file (service-account, authorized-user, or
+                external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls
+                back to the default ADC chain.
     """
 
     provider: VertexRerankerConfigProvider

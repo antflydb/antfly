@@ -941,6 +941,10 @@ pub fn jsonApiClientConfigWithBearerTokenAlloc(
 }
 
 pub fn jsonApiClientConfigFromEnvAlloc(alloc: Allocator) !JsonApiConfig {
+    return try jsonApiClientConfigFromEnvWithScopeAlloc(alloc, null);
+}
+
+pub fn jsonApiClientConfigFromEnvWithScopeAlloc(alloc: Allocator, configured_scope: ?[]const u8) !JsonApiConfig {
     var cfg = try jsonApiClientConfigAlloc(alloc);
     errdefer cfg.deinit(alloc);
 
@@ -948,7 +952,10 @@ pub fn jsonApiClientConfigFromEnvAlloc(alloc: Allocator) !JsonApiConfig {
         defer alloc.free(token);
         cfg.auth = .{ .bearer_token = try alloc.dupe(u8, token) };
     } else {
-        const scope = (try envOwned(alloc, "GCS_OAUTH_SCOPE")) orelse try alloc.dupe(u8, google_auth.default_scope);
+        const scope = if (configured_scope) |value|
+            try alloc.dupe(u8, value)
+        else
+            (try envOwned(alloc, "GCS_OAUTH_SCOPE")) orelse try alloc.dupe(u8, google_auth.default_scope);
         defer alloc.free(scope);
         cfg.auth = .{ .google_token_source = try google_auth.tokenSourceFromEnvAlloc(alloc, scope) };
     }
@@ -958,7 +965,7 @@ pub fn jsonApiClientConfigFromEnvAlloc(alloc: Allocator) !JsonApiConfig {
     if (explicit_project_id) |value| {
         cfg.project_id = try alloc.dupe(u8, value);
     } else if (switch (cfg.auth) {
-        .google_token_source => |source| source.cfg.service_account.project_id,
+        .google_token_source => |source| source.cfg.projectId(),
         else => null,
     }) |value| {
         cfg.project_id = try alloc.dupe(u8, value);

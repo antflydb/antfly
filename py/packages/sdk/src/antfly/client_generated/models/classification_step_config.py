@@ -19,7 +19,8 @@ class ClassificationStepConfig:
     selects the optimal retrieval strategy, and generates semantic transformations.
 
         Attributes:
-            enabled (bool | Unset): Enable query classification and strategy selection Default: False.
+            enabled (bool | Unset): Compatibility switch. The step is enabled when this object is present; omit the step to
+                disable it.
             with_reasoning (bool | Unset): Include pre-retrieval reasoning explaining query analysis and strategy selection
                 Default: False.
             force_strategy (QueryStrategy | Unset): Strategy for query transformation and retrieval:
@@ -33,7 +34,7 @@ class ClassificationStepConfig:
                 optimization)
     """
 
-    enabled: bool | Unset = False
+    enabled: bool | Unset = UNSET
     with_reasoning: bool | Unset = False
     force_strategy: QueryStrategy | Unset = UNSET
     force_semantic_mode: SemanticQueryMode | Unset = UNSET

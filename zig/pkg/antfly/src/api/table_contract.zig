@@ -262,6 +262,31 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     return try tables_api.parseSchemaUpdateRequest(alloc, body);
 }
 
+/// Apply an RFC 7396 JSON Merge Patch to a stored table schema and return the
+/// validated canonical replacement document. Both parsed trees live in one
+/// arena so values can be moved between them without per-node allocation or
+/// ownership bookkeeping.
+pub fn mergeSchemaPatchRequest(
+    alloc: std.mem.Allocator,
+    current_schema_json: []const u8,
+    patch_json: []const u8,
+) ![]u8 {
+    return try tables_api.mergeSchemaPatchRequest(alloc, current_schema_json, patch_json);
+}
+
+test "schema merge patch preserves unrelated fields and removes ttl" {
+    const alloc = std.testing.allocator;
+    const merged = try mergeSchemaPatchRequest(
+        alloc,
+        "{\"version\":4,\"ttl\":{\"duration\":\"1h\"},\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\"}}}}",
+        "{\"ttl\":null}",
+    );
+    defer alloc.free(merged);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "\"ttl\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "\"document_schemas\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "\"version\"") == null);
+}
+
 pub fn schemaUpdateRequestErrorMessage(err: anyerror, body: []const u8) []const u8 {
     if (err == error.SchemaVersionManagedByBackend) {
         return "schema.version is managed by Antfly; omit it";

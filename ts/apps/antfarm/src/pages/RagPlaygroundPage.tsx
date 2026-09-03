@@ -411,138 +411,144 @@ const RagPlaygroundPage: React.FC = () => {
         )}
 
         {/* Streaming answer via AnswerResults */}
-        <AnswerResults
-          id="rag-answer"
-          searchBoxId="rag-query"
-          table={selectedTable}
-          {...(effectiveGenerator ? { generator: effectiveGenerator } : {})}
-          systemPrompt={steps.generation.system_prompt || undefined}
-          generationContext={steps.generation.generation_context || undefined}
-          limit={limit}
-          followUpCount={steps.followup.enabled ? steps.followup.count : undefined}
-          semanticIndexes={selectedIndex ? [selectedIndex] : undefined}
-          showClassification={steps.classification.enabled}
-          showReasoning={steps.classification.with_reasoning}
-          showFollowUpQuestions={steps.followup.enabled}
-          showConfidence={steps.confidence.enabled}
-          showHits
-          renderLoading={() => (
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <ReloadIcon className="h-4 w-4 animate-spin" />
-              Searching and generating answer...
-            </div>
-          )}
-          renderEmpty={() => (
-            <div className="text-sm text-muted-foreground">
-              Submit a question to get an AI-powered answer.
-            </div>
-          )}
-          renderClassification={(data) => (
-            <div className="p-3 rounded-none bg-muted/50 space-y-2">
-              <div className="flex items-center gap-2 text-sm font-medium">
-                <Sparkles className="h-4 w-4" />
-                Classification
+        {effectiveGenerator ? (
+          <AnswerResults
+            id="rag-answer"
+            searchBoxId="rag-query"
+            table={selectedTable}
+            generator={effectiveGenerator}
+            systemPrompt={steps.generation.system_prompt || undefined}
+            generationContext={steps.generation.generation_context || undefined}
+            limit={limit}
+            followUpCount={steps.followup.enabled ? steps.followup.count : undefined}
+            semanticIndexes={selectedIndex ? [selectedIndex] : undefined}
+            showClassification={steps.classification.enabled}
+            showReasoning={steps.classification.with_reasoning}
+            showFollowUpQuestions={steps.followup.enabled}
+            showConfidence={steps.confidence.enabled}
+            showHits
+            renderLoading={() => (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <ReloadIcon className="h-4 w-4 animate-spin" />
+                Searching and generating answer...
               </div>
-              <div className="grid grid-cols-2 gap-2 text-xs">
-                <div>
-                  <span className="text-muted-foreground">Strategy:</span>{" "}
-                  <span className="font-medium">{data.strategy}</span>
-                </div>
-                <div>
-                  <span className="text-muted-foreground">Mode:</span>{" "}
-                  <span className="font-medium">{data.semantic_mode}</span>
-                </div>
+            )}
+            renderEmpty={() => (
+              <div className="text-sm text-muted-foreground">
+                Submit a question to get an AI-powered answer.
               </div>
-              {data.semantic_query && (
-                <div className="text-xs">
-                  <span className="text-muted-foreground">Semantic Query:</span>{" "}
-                  <span className="italic">{data.semantic_query}</span>
+            )}
+            renderClassification={(data) => (
+              <div className="p-3 rounded-none bg-muted/50 space-y-2">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <Sparkles className="h-4 w-4" />
+                  Classification
                 </div>
-              )}
-              {data.reasoning && (
-                <div className="text-xs text-muted-foreground mt-2 p-2 bg-background rounded-none">
-                  {data.reasoning}
-                </div>
-              )}
-            </div>
-          )}
-          renderAnswer={(answer, streaming) => (
-            <div className="text-sm">
-              {answer ? (
-                formatAnswer(answer)
-              ) : (
-                <span className="text-muted-foreground italic">Generating...</span>
-              )}
-              {streaming && (
-                <span className="inline-block w-2 h-4 bg-foreground/50 animate-pulse ml-0.5" />
-              )}
-            </div>
-          )}
-          renderFollowUpQuestions={(questions) => (
-            <div className="space-y-2">
-              <Separator />
-              <div className="text-sm font-medium flex items-center gap-2">
-                <HelpCircle className="h-4 w-4" />
-                Follow-up Questions
-              </div>
-              <div className="space-y-1">
-                {questions.map((q) => (
-                  <Button
-                    key={q}
-                    variant="ghost"
-                    size="sm"
-                    className="w-full justify-start text-left h-auto py-2 text-sm"
-                    onClick={() => setQuery(q)}
-                  >
-                    {q}
-                  </Button>
-                ))}
-              </div>
-            </div>
-          )}
-          renderHits={(hits) => (
-            <Collapsible open={contextOpen} onOpenChange={setContextOpen}>
-              <Separator />
-              <CollapsibleTrigger asChild>
-                <Button variant="ghost" size="sm" className="w-full justify-between mt-2">
-                  <span className="flex items-center gap-2">
-                    <BookOpen className="h-4 w-4" />
-                    Retrieved Context ({hits.length} documents)
-                  </span>
-                  {contextOpen ? (
-                    <ChevronDown className="h-4 w-4" />
-                  ) : (
-                    <ChevronRight className="h-4 w-4" />
-                  )}
-                </Button>
-              </CollapsibleTrigger>
-              <CollapsibleContent className="space-y-2 mt-2">
-                {hits.map((hit, i) => (
-                  <div key={hit._id || i} className="p-3 rounded-none border text-xs space-y-1">
-                    <div className="flex items-center justify-between">
-                      <span className="font-medium">{hit._id}</span>
-                      <Badge className="text-xs">{hit._score?.toFixed(3)}</Badge>
-                    </div>
-                    {hit._source && (
-                      <pre className="text-muted-foreground overflow-x-auto whitespace-pre-wrap">
-                        {JSON.stringify(hit._source, null, 2).slice(0, 500)}
-                        {JSON.stringify(hit._source).length > 500 && "..."}
-                      </pre>
-                    )}
+                <div className="grid grid-cols-2 gap-2 text-xs">
+                  <div>
+                    <span className="text-muted-foreground">Strategy:</span>{" "}
+                    <span className="font-medium">{data.strategy}</span>
                   </div>
-                ))}
-              </CollapsibleContent>
-            </Collapsible>
-          )}
-          onStreamStart={handleStreamStart}
-          onStreamEnd={handleStreamEnd}
-          onError={handleError}
-          onClassification={handleClassification}
-          onHit={handleHit}
-          onGenerationChunk={handleAnswerChunk}
-          onConfidence={handleConfidence}
-          onFollowup={handleFollowUpQuestion}
-        />
+                  <div>
+                    <span className="text-muted-foreground">Mode:</span>{" "}
+                    <span className="font-medium">{data.semantic_mode}</span>
+                  </div>
+                </div>
+                {data.semantic_query && (
+                  <div className="text-xs">
+                    <span className="text-muted-foreground">Semantic Query:</span>{" "}
+                    <span className="italic">{data.semantic_query}</span>
+                  </div>
+                )}
+                {data.reasoning && (
+                  <div className="text-xs text-muted-foreground mt-2 p-2 bg-background rounded-none">
+                    {data.reasoning}
+                  </div>
+                )}
+              </div>
+            )}
+            renderAnswer={(answer, streaming) => (
+              <div className="text-sm">
+                {answer ? (
+                  formatAnswer(answer)
+                ) : (
+                  <span className="text-muted-foreground italic">Generating...</span>
+                )}
+                {streaming && (
+                  <span className="inline-block w-2 h-4 bg-foreground/50 animate-pulse ml-0.5" />
+                )}
+              </div>
+            )}
+            renderFollowUpQuestions={(questions) => (
+              <div className="space-y-2">
+                <Separator />
+                <div className="text-sm font-medium flex items-center gap-2">
+                  <HelpCircle className="h-4 w-4" />
+                  Follow-up Questions
+                </div>
+                <div className="space-y-1">
+                  {questions.map((q) => (
+                    <Button
+                      key={q}
+                      variant="ghost"
+                      size="sm"
+                      className="w-full justify-start text-left h-auto py-2 text-sm"
+                      onClick={() => setQuery(q)}
+                    >
+                      {q}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            )}
+            renderHits={(hits) => (
+              <Collapsible open={contextOpen} onOpenChange={setContextOpen}>
+                <Separator />
+                <CollapsibleTrigger asChild>
+                  <Button variant="ghost" size="sm" className="w-full justify-between mt-2">
+                    <span className="flex items-center gap-2">
+                      <BookOpen className="h-4 w-4" />
+                      Retrieved Context ({hits.length} documents)
+                    </span>
+                    {contextOpen ? (
+                      <ChevronDown className="h-4 w-4" />
+                    ) : (
+                      <ChevronRight className="h-4 w-4" />
+                    )}
+                  </Button>
+                </CollapsibleTrigger>
+                <CollapsibleContent className="space-y-2 mt-2">
+                  {hits.map((hit, i) => (
+                    <div key={hit._id || i} className="p-3 rounded-none border text-xs space-y-1">
+                      <div className="flex items-center justify-between">
+                        <span className="font-medium">{hit._id}</span>
+                        <Badge className="text-xs">{hit._score?.toFixed(3)}</Badge>
+                      </div>
+                      {hit._source && (
+                        <pre className="text-muted-foreground overflow-x-auto whitespace-pre-wrap">
+                          {JSON.stringify(hit._source, null, 2).slice(0, 500)}
+                          {JSON.stringify(hit._source).length > 500 && "..."}
+                        </pre>
+                      )}
+                    </div>
+                  ))}
+                </CollapsibleContent>
+              </Collapsible>
+            )}
+            onStreamStart={handleStreamStart}
+            onStreamEnd={handleStreamEnd}
+            onError={handleError}
+            onClassification={handleClassification}
+            onHit={handleHit}
+            onGenerationChunk={handleAnswerChunk}
+            onConfidence={handleConfidence}
+            onFollowup={handleFollowUpQuestion}
+          />
+        ) : (
+          <div className="p-6 text-center text-sm text-muted-foreground">
+            Configure a generator to run the answer pipeline.
+          </div>
+        )}
       </div>
     ),
     [

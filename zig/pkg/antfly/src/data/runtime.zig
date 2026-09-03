@@ -17137,6 +17137,7 @@ const RemoteMetadataSource = struct {
                 .drop_table = remoteDropTable,
                 .drop_table_exact = remoteDropTableExact,
                 .update_schema = remoteUpdateSchema,
+                .mutate_schema = remoteMutateSchema,
                 .create_index = remoteCreateIndex,
                 .drop_index = remoteDropIndex,
                 .put_artifact_enrichment = remotePutArtifactEnrichment,
@@ -18113,6 +18114,46 @@ const RemoteMetadataSource = struct {
             }
         }.call, .{ .table_name = table_name, .schema_json = schema_json });
         self.invalidateCache();
+    }
+
+    fn remoteMutateSchema(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        mode: antfly.public_api.tables.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !antfly.public_api.tables.SchemaMutationResult {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const Context = struct {
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            mode: antfly.public_api.tables.SchemaMutationMode,
+            body: []const u8,
+            expected_version: ?u32,
+        };
+        const result = try self.withMetadataApiClient(
+            antfly.public_api.tables.SchemaMutationResult,
+            struct {
+                fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: Context) !antfly.public_api.tables.SchemaMutationResult {
+                    var remote = try client.mutateSchema(base_uri, ctx.table_name, ctx.mode, ctx.body, ctx.expected_version);
+                    defer remote.deinit(client.alloc);
+                    return .{
+                        .version = remote.version,
+                        .schema_json = try ctx.alloc.dupe(u8, remote.schema_json),
+                    };
+                }
+            }.call,
+            Context{
+                .alloc = alloc,
+                .table_name = table_name,
+                .mode = mode,
+                .body = body,
+                .expected_version = expected_version,
+            },
+        );
+        self.invalidateCache();
+        return result;
     }
 
     fn remoteCreateIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {

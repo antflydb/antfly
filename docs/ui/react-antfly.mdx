@@ -799,9 +799,9 @@ function MyComponent() {
           model: 'qwen2.5:7b'
         },
         steps: {
-          generation: { enabled: true },
-          classification: { enabled: true, with_reasoning: true },
-          followup: { enabled: true }
+          generation: {},
+          classification: { with_reasoning: true },
+          followup: {}
         }
       },
       headers: { 'X-API-Key': 'key' }

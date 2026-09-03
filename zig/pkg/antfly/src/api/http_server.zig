@@ -1290,6 +1290,8 @@ pub const StatusSource = struct {
         drop_table_exact: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!metadata_table_topology_mutations.DropResult = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         update_schema_versioned: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 = null,
+        update_schema_versioned_expected: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8, expected_version: ?u32) anyerror!u32 = null,
+        mutate_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) anyerror!tables_api.SchemaMutationResult = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
         put_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) anyerror!void = null,
@@ -1426,6 +1428,40 @@ pub const StatusSource = struct {
         const fn_ptr = self.vtable.update_schema orelse return error.UnsupportedOperation;
         try BoundaryAbi.call("update_schema", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, schema_json });
         return null;
+    }
+
+    /// Atomically updates a schema when the authoritative current schema has
+    /// the expected version. Sources without the conditional capability may
+    /// only service unconditional updates.
+    pub fn updateSchemaExpected(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8, expected_version: ?u32) !?u32 {
+        if (self.vtable.update_schema_versioned_expected) |fn_ptr| {
+            return try BoundaryAbi.call("update_schema_versioned_expected", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, schema_json, expected_version });
+        }
+        if (expected_version != null) return error.UnsupportedConditionalSchemaUpdate;
+        return try self.updateSchema(alloc, table_name, schema_json);
+    }
+
+    /// Runs replace or merge-patch at the metadata authority and returns the
+    /// exact committed schema. Production sources implement this capability;
+    /// the replace fallback exists only for embedded legacy adapters.
+    pub fn mutateSchema(
+        self: StatusSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        mode: tables_api.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !tables_api.SchemaMutationResult {
+        if (self.vtable.mutate_schema) |fn_ptr| {
+            return try BoundaryAbi.call("mutate_schema", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, mode, body, expected_version });
+        }
+        if (mode != .replace) return error.UnsupportedOperation;
+        const version = (try self.updateSchemaExpected(alloc, table_name, body, expected_version)) orelse
+            return error.UnsupportedOperation;
+        return .{
+            .version = version,
+            .schema_json = try tables_api.normalizeSchemaVersion(alloc, body, version),
+        };
     }
 
     pub fn createIndex(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -1594,11 +1630,19 @@ pub const StatusSource = struct {
             }
 
             fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
-                _ = try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json);
+                _ = try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json, null);
             }
 
             fn updateSchemaVersioned(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 {
-                return try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json);
+                return try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json, null);
+            }
+
+            fn updateSchemaVersionedExpected(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8, expected_version: ?u32) anyerror!u32 {
+                return try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json, expected_version);
+            }
+
+            fn mutateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) anyerror!tables_api.SchemaMutationResult {
+                return try mutateSchemaOnService(cast(ptr), alloc, table_name, mode, body, expected_version);
             }
 
             fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void {
@@ -1698,6 +1742,8 @@ pub const StatusSource = struct {
             .drop_table_exact = Gen.dropTableExact,
             .update_schema = Gen.updateSchema,
             .update_schema_versioned = Gen.updateSchemaVersioned,
+            .update_schema_versioned_expected = Gen.updateSchemaVersionedExpected,
+            .mutate_schema = Gen.mutateSchema,
             .create_index = Gen.createIndex,
             .drop_index = Gen.dropIndex,
             .put_artifact_enrichment = Gen.putArtifactEnrichment,
@@ -2184,18 +2230,40 @@ fn dropTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     try runPostMutationRound(svc);
 }
 
-fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !u32 {
+fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8, expected_version: ?u32) !u32 {
+    var result = try mutateSchemaOnService(svc, alloc, table_name, .replace, schema_json, expected_version);
+    defer result.deinit(alloc);
+    return result.version;
+}
+
+fn mutateSchemaOnService(
+    svc: anytype,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    mode: tables_api.SchemaMutationMode,
+    body: []const u8,
+    expected_version: ?u32,
+) !tables_api.SchemaMutationResult {
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
+    if (expected_version) |expected| {
+        if (try tables_api.schemaVersion(table.schema_json) != expected) return error.SchemaVersionChanged;
+    }
 
-    const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
+    const updated = try tables_api.applySchemaMutationRecord(alloc, table, mode, body);
     defer metadata_table_manager.freeTable(alloc, updated);
     const version = try tables_api.schemaVersion(updated.schema_json);
-    try svc.replaceTableDefinition(table.*, updated);
+    svc.replaceTableDefinition(table.*, updated) catch |err| {
+        if (expected_version != null and err == error.TableGenerationChanged) return error.SchemaVersionChanged;
+        return err;
+    };
     try runPostMutationRound(svc);
-    return version;
+    return .{
+        .version = version,
+        .schema_json = try alloc.dupe(u8, updated.schema_json),
+    };
 }
 
 fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -6444,6 +6512,10 @@ pub const ApiHttpServer = struct {
             },
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
                 try queue.status(alloc, task_id, context_id, "failed", "invalid retrieval agent request");
+                return;
+            },
+            error.MissingGenerationConfig => {
+                try queue.status(alloc, task_id, context_id, "failed", "steps.generation requires a generator or chain");
                 return;
             },
             error.TableNotFound => {
@@ -16989,12 +17061,22 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
 
         fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
             const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-            _ = try updateSchemaOnService(service, alloc, table_name, schema_json);
+            _ = try updateSchemaOnService(service, alloc, table_name, schema_json, null);
         }
 
         fn updateSchemaVersioned(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 {
             const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-            return try updateSchemaOnService(service, alloc, table_name, schema_json);
+            return try updateSchemaOnService(service, alloc, table_name, schema_json, null);
+        }
+
+        fn updateSchemaVersionedExpected(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8, expected_version: ?u32) anyerror!u32 {
+            const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+            return try updateSchemaOnService(service, alloc, table_name, schema_json, expected_version);
+        }
+
+        fn mutateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) anyerror!tables_api.SchemaMutationResult {
+            const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+            return try mutateSchemaOnService(service, alloc, table_name, mode, body, expected_version);
         }
 
         fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void {
@@ -17020,6 +17102,8 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
             .drop_table_exact = V.dropTableExact,
             .update_schema = V.updateSchema,
             .update_schema_versioned = V.updateSchemaVersioned,
+            .update_schema_versioned_expected = V.updateSchemaVersionedExpected,
+            .mutate_schema = V.mutateSchema,
             .create_index = V.createIndex,
             .drop_index = V.dropIndex,
         },
@@ -24198,7 +24282,7 @@ test "direct schema update rejects extension-owned data shapes" {
     var service = FakeService{};
     try std.testing.expectError(
         error.ExtensionOwnedObject,
-        updateSchemaOnService(&service, std.testing.allocator, "memories", "{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"string\"},\"tags\":{\"type\":\"array\"}}}"),
+        updateSchemaOnService(&service, std.testing.allocator, "memories", "{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"string\"},\"tags\":{\"type\":\"array\"}}}", null),
     );
 }
 
@@ -36520,6 +36604,7 @@ test "status source prefers authoritative schema generation result" {
     const FakeSource = struct {
         legacy_calls: usize = 0,
         versioned_calls: usize = 0,
+        conditional_calls: usize = 0,
 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
@@ -36535,6 +36620,13 @@ test "status source prefers authoritative schema generation result" {
             self.versioned_calls += 1;
             return 7;
         }
+
+        fn conditional(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, expected_version: ?u32) !u32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.conditional_calls += 1;
+            try std.testing.expectEqual(@as(?u32, 6), expected_version);
+            return 7;
+        }
     };
 
     var fake = FakeSource{};
@@ -36544,11 +36636,14 @@ test "status source prefers authoritative schema generation result" {
             .status = FakeSource.status,
             .update_schema = FakeSource.legacy,
             .update_schema_versioned = FakeSource.versioned,
+            .update_schema_versioned_expected = FakeSource.conditional,
         },
     };
     try std.testing.expectEqual(@as(?u32, 7), try source.updateSchema(std.testing.allocator, "docs", "{}"));
+    try std.testing.expectEqual(@as(?u32, 7), try source.updateSchemaExpected(std.testing.allocator, "docs", "{}", 6));
     try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
     try std.testing.expectEqual(@as(usize, 1), fake.versioned_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.conditional_calls);
 }
 
 test "schema projection detects a superseding backend generation" {

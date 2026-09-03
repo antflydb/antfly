@@ -8,6 +8,7 @@ import type {
   GlobalQueryRequest,
   QueryRequest,
   TableQueryRequest,
+  TableSchema,
   TableStatus,
 } from "../src/types.js";
 
@@ -15,6 +16,7 @@ import type {
 const mockGet = vi.fn();
 const mockPost = vi.fn();
 const mockPut = vi.fn();
+const mockPatch = vi.fn();
 const mockDelete = vi.fn();
 
 vi.mock("openapi-fetch", () => ({
@@ -25,7 +27,7 @@ vi.mock("openapi-fetch", () => ({
     DELETE: mockDelete,
     OPTIONS: vi.fn(),
     HEAD: vi.fn(),
-    PATCH: vi.fn(),
+    PATCH: mockPatch,
     TRACE: vi.fn(),
     request: vi.fn(),
     use: vi.fn(),
@@ -325,6 +327,26 @@ describe("AntflyClient", () => {
         'Invalid index "semantic": Embedding source_artifact_name requires a non-empty embedding_name.'
       );
       expect(mockPost).not.toHaveBeenCalled();
+    });
+
+    it("separates full schema replacement from merge patch updates", async () => {
+      mockPut.mockResolvedValueOnce({ data: { name: "products" }, error: undefined });
+      mockPatch.mockResolvedValueOnce({ data: { name: "products" }, error: undefined });
+      const replacement = { default_type: "product" } as TableSchema;
+
+      await client.tables.replaceSchema("products", replacement, { expectedVersion: 4 });
+      expect(mockPut).toHaveBeenCalledWith("/db/v1/tables/{tableName}/schema", {
+        params: { path: { tableName: "products" } },
+        body: replacement,
+        headers: { "If-Match": '"schema-4"' },
+      });
+
+      await client.tables.patchSchema("products", { ttl: null }, { expectedVersion: 5 });
+      expect(mockPatch).toHaveBeenCalledWith("/db/v1/tables/{tableName}/schema", {
+        params: { path: { tableName: "products" } },
+        body: { ttl: null },
+        headers: { "If-Match": '"schema-5"' },
+      });
     });
 
     it("should query a specific table", async () => {
@@ -1175,6 +1197,29 @@ describe("AntflyClient", () => {
     }
 
     describe("Retrieval Agent SSE parsing", () => {
+      it("keeps JSON and streaming retrieval modes explicit on the wire", async () => {
+        const jsonFetch = vi
+          .spyOn(globalThis, "fetch")
+          .mockResolvedValueOnce(Response.json({ query: "test query", hits: [] }, { status: 200 }));
+
+        await client.retrievalAgent({ table: "test", query: "test query", stream: true });
+        expect(JSON.parse(String(jsonFetch.mock.calls[0][1]?.body))).toMatchObject({
+          stream: false,
+        });
+
+        jsonFetch.mockResolvedValueOnce(
+          createSSEResponse([{ event: "done", data: JSON.stringify({ query: "test query" }) }])
+        );
+        await client.streamRetrievalAgent(
+          { table: "test", query: "test query", stream: false },
+          {}
+        );
+        expect(JSON.parse(String(jsonFetch.mock.calls[1][1]?.body))).toMatchObject({
+          stream: true,
+        });
+        jsonFetch.mockRestore();
+      });
+
       it("should JSON-parse reasoning events to preserve newlines", async () => {
         const reasoningWithNewlines =
           "Step 1: First thing\nStep 2: Second thing\nStep 3: Third thing";
@@ -1189,7 +1234,7 @@ describe("AntflyClient", () => {
 
         const receivedReasoning: string[] = [];
         let doneReceived = false;
-        await client.retrievalAgent(
+        await client.streamRetrievalAgent(
           { table: "test", query: "test query" },
           {
             onReasoning: (text) => receivedReasoning.push(text),

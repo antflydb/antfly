@@ -2499,7 +2499,7 @@ fn buildGenerationChain(
     } else if (request.generator) |generator_cfg| {
         try links.append(alloc, .{ .generator = try generatorConfigFromPublic(alloc, generator_cfg) });
     } else {
-        return error.UnsupportedRetrievalAgentRequest;
+        return error.MissingGenerationConfig;
     }
 
     return try links.toOwnedSlice(alloc);
@@ -9698,6 +9698,19 @@ test "retrieval agent generation preserves canonical chain order and retry polic
     try std.testing.expectEqual(generating.ChainCondition.on_timeout, config.chain[0].condition.?);
     try std.testing.expectEqual(@as(u32, 2), config.chain[0].retry.?.max_attempts);
     try std.testing.expectEqual(generating.Provider.antfly, config.chain[1].generator.provider);
+}
+
+test "retrieval agent generation requires a canonical generator when the step is present" {
+    const body =
+        \\{"query":"answer","queries":[],"steps":{"generation":{}}}
+    ;
+    var parsed = try parseJsonBody(RetrievalAgentRequest, std.testing.allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expectError(
+        error.MissingGenerationConfig,
+        parseGenerationConfig(std.testing.allocator, parsed.value),
+    );
 }
 
 fn unreachableRunQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!query_api.QueryResponse {

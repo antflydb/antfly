@@ -3538,6 +3538,8 @@ pub const EdgesResponse = struct {
     }
 };
 
+pub const EmbedderConfig = antfly_embeddings_openapi.EmbedderConfig;
+
 pub const EmbedderProvider = antfly_embeddings_openapi.EmbedderProvider;
 
 pub const Embedding = std.json.Value;
@@ -4932,6 +4934,8 @@ pub const IncompleteDetails = struct {
     /// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue
     reason: []const u8,
 };
+
+pub const IndexEmbedderConfig = antfly_embeddings_openapi.IndexEmbedderConfig;
 
 /// A retryable index mutation failure, including a distributed artifact-source protocol fence or a temporarily unavailable model probe.
 pub const IndexMutationServiceUnavailableError = struct {
@@ -11260,6 +11264,9 @@ pub const TableRestoreStatus = struct {
         try jw.endObject();
     }
 };
+
+/// RFC 7396 JSON Merge Patch for a table schema. Object members are merged recursively; null removes a member. The resulting document must be a valid TableSchema and `version` remains server-managed.
+pub const TableSchemaPatch = std.json.ArrayHashMap(std.json.Value);
 
 /// Statistics about a table used for query planning.
 pub const TableStatistics = struct {

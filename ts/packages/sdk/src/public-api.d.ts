@@ -1051,13 +1051,23 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** Update a table's schema */
+        /**
+         * Replace a table's schema
+         * @description Replaces the complete table schema. Properties omitted from the request
+         *     are removed. Use PATCH on this path for a partial JSON Merge Patch update.
+         */
         put: operations["updateSchema"];
         post?: never;
         delete?: never;
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Patch a table's schema
+         * @description Applies an RFC 7396 JSON Merge Patch to the current table schema. Object
+         *     members are merged recursively and a null value removes that member.
+         *     Antfly validates and versions the resulting complete schema atomically.
+         */
+        patch: operations["patchSchema"];
         trace?: never;
     };
     "/db/v1/tables/{tableName}/documents": {
@@ -2685,6 +2695,14 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * @description RFC 7396 JSON Merge Patch for a table schema. Object members are merged
+         *     recursively; null removes a member. The resulting document must be a
+         *     valid TableSchema and `version` remains server-managed.
+         */
+        TableSchemaPatch: {
+            [key: string]: unknown;
+        };
         Error: {
             /** @description Optional stable machine-readable error code for programmatic handling. */
             code?: string;
@@ -3238,6 +3256,217 @@ export interface components {
          * @enum {string}
          */
         EmbedderProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "mock" | "antfly";
+        /**
+         * @description A unified configuration for an embedding provider.
+         *
+         *     Embedders can be configured with templates to customize how documents are
+         *     converted to text before embedding. Templates use Handlebars syntax and
+         *     support various built-in helpers.
+         *
+         *     **Template System:**
+         *     - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
+         *     - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
+         *     - **Context**: Templates receive the full document as context
+         *
+         *     **Built-in Helpers:**
+         *
+         *     1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
+         *        ```handlebars
+         *        {{scrubHtml html_content}}
+         *        ```
+         *        - Removes `<script>` and `<style>` tags
+         *        - Adds newlines after block elements (p, div, h1-h6, li, etc.)
+         *        - Returns plain text with preserved readability
+         *
+         *     2. **eq** - Equality comparison for conditionals
+         *        ```handlebars
+         *        {{#if (eq status "active")}}Active user{{/if}}
+         *        {{#if (eq @key "special")}}Special field{{/if}}
+         *        ```
+         *
+         *     3. **media** - GenKit dotprompt media directive for multimodal content
+         *        ```handlebars
+         *        {{media url=imageDataURI}}
+         *        {{media url=this.image_url}}
+         *        {{media url="https://example.com/image.jpg"}}
+         *        {{media url="s3://endpoint/bucket/image.png"}}
+         *        {{media url="file:///path/to/image.jpg"}}
+         *        ```
+         *
+         *        **Supported URL Schemes:**
+         *        - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
+         *        - `http://` / `https://` - Web URLs with automatic content type detection
+         *        - `file://` - Local filesystem paths
+         *        - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
+         *
+         *        **Automatic Content Processing:**
+         *        - **Images**: Downloaded, resized (if needed), converted to data URIs
+         *        - **PDFs**: Text extracted or first page rendered as image
+         *        - **HTML**: Readable text extracted using Mozilla Readability
+         *
+         *        **Security Controls:**
+         *        Downloads are protected by content security settings (see Configuration Reference):
+         *        - Allowed host whitelist
+         *        - Private IP blocking (prevents SSRF attacks)
+         *        - Download size limits (default: 100MB)
+         *        - HTTP downloads time out after 30 seconds by default; zero disables the deadline
+         *        - Image dimension limits (default: 2048px, auto-resized)
+         *
+         *        See: https://antfly.io/docs/configuration#security--cors
+         *
+         *     4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
+         *        ```handlebars
+         *        {{encodeToon this.fields}}
+         *        {{encodeToon this.fields lengthMarker=false indent=4}}
+         *        {{encodeToon this.fields delimiter="\t"}}
+         *        ```
+         *
+         *        **What is TOON?**
+         *        TOON is a compact, human-readable format designed for passing structured data to LLMs.
+         *        It provides **30-60% token reduction** compared to JSON while maintaining high LLM
+         *        comprehension accuracy.
+         *
+         *        **Key Features:**
+         *        - Compact syntax using `:` for key-value pairs
+         *        - Array length markers: `tags[#3]: ai,search,ml`
+         *        - Tabular format for uniform data structures
+         *        - Optimized for LLM parsing and understanding
+         *        - Maintains human readability
+         *
+         *        **Benefits:**
+         *        - **Lower API costs** - Reduced token usage means lower LLM API costs
+         *        - **Faster responses** - Less tokens to process
+         *        - **More context** - Fit more documents within token limits
+         *
+         *        **Options:**
+         *        - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
+         *        - `indent` (int): Indentation spacing for nested objects (default: 2)
+         *        - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
+         *
+         *        **Example output:**
+         *        ```
+         *        title: Introduction to Vector Search
+         *        author: Jane Doe
+         *        tags[#3]: ai,search,ml
+         *        metadata:
+         *          edition: 2
+         *          pages: 450
+         *        ```
+         *
+         *        **Default in RAG:** TOON is the default format for document rendering in RAG queries.
+         *
+         *        **References:**
+         *        - TOON Specification: https://github.com/toon-format/toon
+         *        - Go Implementation: https://github.com/alpkeskin/gotoon
+         *
+         *     **Template Examples:**
+         *
+         *     Document with metadata:
+         *     ```handlebars
+         *     Title: {{metadata.title}}
+         *     Date: {{metadata.date}}
+         *     Tags: {{#each metadata.tags}}{{this}}, {{/each}}
+         *
+         *     {{content}}
+         *     ```
+         *
+         *     HTML content extraction:
+         *     ```handlebars
+         *     Product: {{name}}
+         *     Description: {{scrubHtml description_html}}
+         *     Price: ${{price}}
+         *     ```
+         *
+         *     Multimodal with image:
+         *     ```handlebars
+         *     Product: {{title}}
+         *     {{media url=image}}
+         *     Description: {{description}}
+         *     ```
+         *
+         *     Conditional formatting:
+         *     ```handlebars
+         *     {{title}}
+         *     {{#if author}}By: {{author}}{{/if}}
+         *     {{#if (eq category "premium")}}⭐ Premium Content{{/if}}
+         *     {{body}}
+         *     ```
+         *
+         *     **Environment Variables:**
+         *     - `GEMINI_API_KEY` - API key for Google AI
+         *     - `OPENAI_API_KEY` - API key for OpenAI
+         *     - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs
+         *     - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434)
+         *
+         *     **Importing Pre-computed Embeddings:**
+         *
+         *     You can import existing embeddings (from OpenAI, Cohere, or any provider), but only
+         *     for indexes configured with `external: true`. External indexes accept vectors written
+         *     directly through the document `_embeddings` field and do not generate prompts from
+         *     `field` or `template`.
+         *
+         *     **Steps:**
+         *     1. Create an embeddings index with `external: true`
+         *     2. For dense indexes, set the index `dimension`
+         *     3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
+         *
+         *     **Example:**
+         *     ```json
+         *     {
+         *       "title": "My Document",
+         *       "content": "Document text...",
+         *       "_embeddings": {
+         *         "my_vector_index": [0.1, 0.2, 0.3, ...]
+         *       }
+         *     }
+         *     ```
+         *
+         *     **Delete Behavior:**
+         *     - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector
+         *     - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged
+         *
+         *     **Use Cases:**
+         *     - Migrating from another vector database with existing embeddings
+         *     - Using embeddings generated by external systems
+         *     - Importing pre-computed OpenAI, Cohere, or other provider embeddings
+         *     - Batch processing embeddings offline before ingestion
+         * @example {
+         *       "provider": "openai",
+         *       "model": "text-embedding-3-small"
+         *     }
+         */
+        EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
+            provider: components["schemas"]["EmbedderProvider"];
+            /**
+             * @description Declare that this model supports non-text content (images, audio, video, PDFs),
+             *     even if the model isn't in Antfly's built-in model registry yet.
+             *
+             *     When `true`, Antfly treats the model as multimodal and will send binary content
+             *     (images, audio, etc.) to the provider instead of extracting text. The provider's
+             *     API is still responsible for accepting the content — this flag just tells Antfly
+             *     not to strip it.
+             *
+             *     Not needed for models already in the registry (e.g., `multimodalembedding`,
+             *     `gemini-embedding-2-preview`, `clip-*`, `clipclap`).
+             *
+             *     **Example:**
+             *     ```json
+             *     {
+             *       "provider": "vertex",
+             *       "model": "some-future-multimodal-model",
+             *       "multimodal": true
+             *     }
+             *     ```
+             */
+            multimodal?: boolean;
+        };
+        /**
+         * @description Embedding provider configuration accepted when Antfly creates and
+         *     maintains an embeddings index. This purpose-specific subset reuses the
+         *     canonical provider configurations; it does not define a second provider
+         *     namespace.
+         */
+        IndexEmbedderConfig: components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
         /**
          * @description Overall health status of the cluster
          * @enum {string}
@@ -8582,6 +8811,325 @@ export interface components {
          */
         GraphPathObjective: "min_hops" | "min_weight_sum" | "max_weight_product";
         /**
+         * @description Configuration for the Google AI (Gemini) embedding provider.
+         *
+         *     API key via `api_key` field or `GEMINI_API_KEY` environment variable.
+         *
+         *     **Example Models:** gemini-embedding-001 (default, 3072 dims)
+         *
+         *     **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
+         * @example {
+         *       "provider": "gemini",
+         *       "model": "gemini-embedding-001",
+         *       "dimension": 3072,
+         *       "api_key": "your-api-key"
+         *     }
+         */
+        GoogleEmbedderConfig: {
+            /** @enum {string} */
+            provider: "gemini";
+            /** @description The Google Cloud project ID (optional for Gemini API, required for Vertex AI). */
+            project_id?: string;
+            /** @description The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API. */
+            location?: string;
+            /**
+             * @description The name of the embedding model to use.
+             * @default gemini-embedding-001
+             * @example gemini-embedding-001
+             */
+            model: string;
+            /**
+             * @description The dimension of the embedding vector (768, 1536, or 3072 recommended).
+             * @default 3072
+             */
+            dimension?: number;
+            /** @description The Google API key. Can also be set via GEMINI_API_KEY environment variable. */
+            api_key?: string;
+            /**
+             * Format: uri
+             * @description The URL of the Google API endpoint (optional, uses default if not specified).
+             */
+            url?: string;
+        };
+        /**
+         * @description Configuration for Google Cloud Vertex AI embedding models (enterprise-grade).
+         *
+         *     Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
+         *
+         *     **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video)
+         *
+         *     **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
+         * @example {
+         *       "provider": "vertex",
+         *       "model": "gemini-embedding-001",
+         *       "project_id": "my-gcp-project",
+         *       "location": "us-central1",
+         *       "dimension": 3072
+         *     }
+         */
+        VertexEmbedderConfig: {
+            /** @enum {string} */
+            provider: "vertex";
+            /**
+             * @description The name of the Vertex AI embedding model to use.
+             * @default gemini-embedding-001
+             * @example gemini-embedding-001
+             */
+            model: string;
+            /** @description Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable. */
+            project_id?: string;
+            /**
+             * @description Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
+             * @default us-central1
+             */
+            location?: string;
+            /** @description Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Alternative to the default ADC chain. */
+            credentials_path?: string;
+            /**
+             * @description The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding).
+             * @default 3072
+             */
+            dimension?: number;
+        };
+        /**
+         * @description Configuration for the Ollama embedding provider.
+         *
+         *     Local embeddings for privacy and offline use. URL via `url` field or `OLLAMA_HOST` env var.
+         *
+         *     **Example Models:** nomic-embed-text (768 dims), mxbai-embed-large (1024 dims), all-minilm (384 dims)
+         *
+         *     **Docs:** https://ollama.com/search?c=embedding
+         * @example {
+         *       "provider": "ollama",
+         *       "model": "nomic-embed-text",
+         *       "url": "http://localhost:11434"
+         *     }
+         */
+        OllamaEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "ollama";
+            /**
+             * @description The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large').
+             * @example nomic-embed-text
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the Ollama API endpoint. Can also be set via OLLAMA_HOST environment variable.
+             * @default http://localhost:11434
+             * @example http://localhost:11434
+             */
+            url?: string;
+        };
+        /**
+         * @description Configuration for the OpenAI embedding provider.
+         *
+         *     API key via `api_key` field or `OPENAI_API_KEY` environment variable.
+         *     Supports OpenAI-compatible APIs via `url` field.
+         *
+         *     **Example Models:** text-embedding-3-small (default, 1536 dims), text-embedding-3-large (3072 dims)
+         *
+         *     **Docs:** https://platform.openai.com/docs/guides/embeddings
+         * @example {
+         *       "provider": "openai",
+         *       "model": "text-embedding-3-small",
+         *       "api_key": "sk-..."
+         *     }
+         */
+        OpenAIEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "openai";
+            /**
+             * @description The name of the OpenAI model to use.
+             * @default text-embedding-3-small
+             * @example text-embedding-3-small
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the OpenAI API endpoint. Defaults to OpenAI's API. Can be set via OPENAI_BASE_URL environment variable.
+             * @default https://api.openai.com
+             * @example https://api.openai.com
+             */
+            url?: string;
+            /** @description The OpenAI API key. Can also be set via OPENAI_API_KEY environment variable. */
+            api_key?: string;
+            /** @description Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072. */
+            dimensions?: number;
+        };
+        /**
+         * @description Configuration for the OpenRouter embedding provider.
+         *
+         *     OpenRouter provides a unified API for multiple embedding models from different providers.
+         *     API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
+         *
+         *     **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
+         *     google/gemini-embedding-001, qwen/qwen3-embedding-8b
+         *
+         *     **Docs:** https://openrouter.ai/docs/api/reference/embeddings
+         * @example {
+         *       "provider": "openrouter",
+         *       "model": "openai/text-embedding-3-small",
+         *       "api_key": "sk-or-..."
+         *     }
+         */
+        OpenRouterEmbedderConfig: {
+            /** @enum {string} */
+            provider: "openrouter";
+            /**
+             * @description The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
+             * @default openai/text-embedding-3-small
+             * @example openai/text-embedding-3-small
+             */
+            model: string;
+            /** @description The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable. */
+            api_key?: string;
+            /** @description Output dimension for the embedding (if supported by the model). */
+            dimensions?: number;
+        };
+        /**
+         * @description Configuration for the AWS Bedrock embedding provider.
+         *
+         *     Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles.
+         *
+         *     **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0
+         *
+         *     **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
+         * @example {
+         *       "provider": "bedrock",
+         *       "model": "cohere.embed-v4",
+         *       "request_format": "cohere_v4",
+         *       "region": "us-east-1"
+         *     }
+         */
+        BedrockEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "bedrock";
+            /**
+             * @description The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
+             * @example cohere.embed-v4
+             */
+            model: string;
+            /**
+             * @description Bedrock provider request schema. `auto` recognizes direct foundation-model IDs,
+             *     foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly
+             *     for application inference profiles, provisioned throughput, custom models, and
+             *     other aliases whose invocation target does not identify the underlying model.
+             * @default auto
+             * @enum {string}
+             */
+            request_format?: "auto" | "titan_text" | "titan_multimodal" | "cohere_v3" | "cohere_v4";
+            /**
+             * @description The AWS region for the Bedrock service (e.g., 'us-east-1').
+             * @example us-east-1
+             */
+            region?: string;
+            /** @description Output dimension for Bedrock embedding models that support configurable dimensions. */
+            dimension?: number;
+            /** @description Alias for output dimension when using OpenAI-compatible configuration fields. */
+            dimensions?: number;
+            /** @description Cohere Bedrock input type, such as search_document, search_query, classification, or clustering. */
+            input_type?: string;
+            /** @description Cohere Bedrock truncate behavior. */
+            truncate?: string;
+            /**
+             * @description Whether to strip new lines from the input text before embedding.
+             * @default false
+             */
+            strip_new_lines?: boolean;
+            /**
+             * @description The batch size for embedding requests to optimize throughput.
+             * @default 1
+             */
+            batch_size?: number;
+        };
+        /**
+         * @description Configuration for the Cohere embedding provider.
+         *
+         *     API key via `api_key` field or `COHERE_API_KEY` environment variable.
+         *
+         *     **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0
+         *
+         *     **Docs:** https://docs.cohere.com/reference/embed
+         * @example {
+         *       "provider": "cohere",
+         *       "model": "embed-english-v3.0",
+         *       "input_type": "search_document"
+         *     }
+         */
+        CohereEmbedderConfig: {
+            /** @enum {string} */
+            provider: "cohere";
+            /**
+             * @description The name of the Cohere embedding model to use.
+             * @default embed-english-v3.0
+             * @example embed-english-v3.0
+             */
+            model: string;
+            /** @description The Cohere API key. Can also be set via COHERE_API_KEY environment variable. */
+            api_key?: string;
+            /**
+             * @description Specifies the type of input for optimized embeddings.
+             * @default search_document
+             * @enum {string}
+             */
+            input_type?: "search_document" | "search_query" | "classification" | "clustering";
+            /**
+             * @description How to handle inputs longer than the max token length.
+             * @default END
+             * @enum {string}
+             */
+            truncate?: "NONE" | "START" | "END";
+        };
+        /**
+         * @description Configuration for the Antfly inference embedding provider.
+         *
+         *     Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
+         *     It provides embedding generation with multi-tier caching (memory + persistent).
+         *
+         *     **Features:**
+         *     - Local ONNX-based embedding generation
+         *     - L1 memory cache with configurable TTL
+         *     - L2 persistent Pebble database cache
+         *     - Singleflight deduplication for concurrent identical requests
+         *
+         *     **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)
+         *
+         *     Models are loaded from the `models/embedders/{name}/` directory.
+         * @example {
+         *       "provider": "antfly",
+         *       "model": "bge-base-en-v1.5",
+         *       "api_url": "http://localhost:8082"
+         *     }
+         */
+        AntflyEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "antfly";
+            /**
+             * @description The embedding model name (maps to models/embedders/{name}/ directory).
+             * @example bge-base-en-v1.5
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+             * @example http://localhost:8082
+             */
+            api_url?: string;
+        };
+        /**
          * @description Managed generated artifact kind.
          * @enum {string}
          */
@@ -8669,178 +9217,6 @@ export interface components {
          * @enum {string}
          */
         DistanceMetric: "l2_squared" | "inner_product" | "cosine";
-        /**
-         * @description Configuration for the Ollama embedding provider.
-         *
-         *     Local embeddings for privacy and offline use. URL via `url` field or `OLLAMA_HOST` env var.
-         *
-         *     **Example Models:** nomic-embed-text (768 dims), mxbai-embed-large (1024 dims), all-minilm (384 dims)
-         *
-         *     **Docs:** https://ollama.com/search?c=embedding
-         * @example {
-         *       "provider": "ollama",
-         *       "model": "nomic-embed-text",
-         *       "url": "http://localhost:11434"
-         *     }
-         */
-        OllamaEmbedderConfig: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            provider: "ollama";
-            /**
-             * @description The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large').
-             * @example nomic-embed-text
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the Ollama API endpoint. Can also be set via OLLAMA_HOST environment variable.
-             * @default http://localhost:11434
-             * @example http://localhost:11434
-             */
-            url?: string;
-        };
-        /**
-         * @description Configuration for the OpenAI embedding provider.
-         *
-         *     API key via `api_key` field or `OPENAI_API_KEY` environment variable.
-         *     Supports OpenAI-compatible APIs via `url` field.
-         *
-         *     **Example Models:** text-embedding-3-small (default, 1536 dims), text-embedding-3-large (3072 dims)
-         *
-         *     **Docs:** https://platform.openai.com/docs/guides/embeddings
-         * @example {
-         *       "provider": "openai",
-         *       "model": "text-embedding-3-small",
-         *       "api_key": "sk-..."
-         *     }
-         */
-        OpenAIEmbedderConfig: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            provider: "openai";
-            /**
-             * @description The name of the OpenAI model to use.
-             * @default text-embedding-3-small
-             * @example text-embedding-3-small
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the OpenAI API endpoint. Defaults to OpenAI's API. Can be set via OPENAI_BASE_URL environment variable.
-             * @default https://api.openai.com
-             * @example https://api.openai.com
-             */
-            url?: string;
-            /** @description The OpenAI API key. Can also be set via OPENAI_API_KEY environment variable. */
-            api_key?: string;
-            /** @description Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072. */
-            dimensions?: number;
-        };
-        /**
-         * @description Configuration for the AWS Bedrock embedding provider.
-         *
-         *     Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles.
-         *
-         *     **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0
-         *
-         *     **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
-         * @example {
-         *       "provider": "bedrock",
-         *       "model": "cohere.embed-v4",
-         *       "request_format": "cohere_v4",
-         *       "region": "us-east-1"
-         *     }
-         */
-        BedrockEmbedderConfig: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            provider: "bedrock";
-            /**
-             * @description The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
-             * @example cohere.embed-v4
-             */
-            model: string;
-            /**
-             * @description Bedrock provider request schema. `auto` recognizes direct foundation-model IDs,
-             *     foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly
-             *     for application inference profiles, provisioned throughput, custom models, and
-             *     other aliases whose invocation target does not identify the underlying model.
-             * @default auto
-             * @enum {string}
-             */
-            request_format?: "auto" | "titan_text" | "titan_multimodal" | "cohere_v3" | "cohere_v4";
-            /**
-             * @description The AWS region for the Bedrock service (e.g., 'us-east-1').
-             * @example us-east-1
-             */
-            region?: string;
-            /** @description Output dimension for Bedrock embedding models that support configurable dimensions. */
-            dimension?: number;
-            /** @description Alias for output dimension when using OpenAI-compatible configuration fields. */
-            dimensions?: number;
-            /** @description Cohere Bedrock input type, such as search_document, search_query, classification, or clustering. */
-            input_type?: string;
-            /** @description Cohere Bedrock truncate behavior. */
-            truncate?: string;
-            /**
-             * @description Whether to strip new lines from the input text before embedding.
-             * @default false
-             */
-            strip_new_lines?: boolean;
-            /**
-             * @description The batch size for embedding requests to optimize throughput.
-             * @default 1
-             */
-            batch_size?: number;
-        };
-        /**
-         * @description Configuration for the Antfly inference embedding provider.
-         *
-         *     Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
-         *     It provides embedding generation with multi-tier caching (memory + persistent).
-         *
-         *     **Features:**
-         *     - Local ONNX-based embedding generation
-         *     - L1 memory cache with configurable TTL
-         *     - L2 persistent Pebble database cache
-         *     - Singleflight deduplication for concurrent identical requests
-         *
-         *     **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)
-         *
-         *     Models are loaded from the `models/embedders/{name}/` directory.
-         * @example {
-         *       "provider": "antfly",
-         *       "model": "bge-base-en-v1.5",
-         *       "api_url": "http://localhost:8082"
-         *     }
-         */
-        AntflyEmbedderConfig: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            provider: "antfly";
-            /**
-             * @description The embedding model name (maps to models/embedders/{name}/ directory).
-             * @example bge-base-en-v1.5
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-             * @example http://localhost:8082
-             */
-            api_url?: string;
-        };
-        /** @description Embedding provider configuration accepted by managed index creation. */
-        ManagedEmbedderConfig: components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
         /** @description Options specific to text chunking. */
         TextChunkOptions: {
             /** @description Target number of tokens per chunk. */
@@ -9002,7 +9378,7 @@ export interface components {
             /** @description Whether to use in-memory only storage (dense only) */
             mem_only?: boolean;
             /** @description Configuration for the embeddings plugin (managed indexes only; not allowed when external=true) */
-            embedder?: components["schemas"]["ManagedEmbedderConfig"];
+            embedder?: components["schemas"]["IndexEmbedderConfig"];
             /** @description Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing. */
             chunker?: components["schemas"]["ChunkerConfig"];
             /**
@@ -11177,8 +11553,8 @@ export interface components {
          */
         ClassificationStepConfig: {
             /**
-             * @description Enable query classification and strategy selection
-             * @default false
+             * @deprecated
+             * @description Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
              */
             enabled?: boolean;
             /**
@@ -11239,11 +11615,11 @@ export interface components {
          */
         GenerationStepConfig: {
             /**
-             * @description Enable generation from retrieved documents
-             * @default false
+             * @deprecated
+             * @description Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
              */
             enabled?: boolean;
-            /** @description Generator to use for generation. If not specified, uses the default summarizer. */
+            /** @description Canonical generator configuration for this step. When omitted, the top-level request generator is used. */
             generator?: components["schemas"]["GeneratorConfig"];
             /** @description Chain of generators to try in order. Mutually exclusive with 'generator'. */
             chain?: components["schemas"]["ChainLink"][];
@@ -11261,8 +11637,8 @@ export interface components {
          */
         FollowupStepConfig: {
             /**
-             * @description Enable follow-up question generation
-             * @default false
+             * @deprecated
+             * @description Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
              */
             enabled?: boolean;
             /**
@@ -11277,8 +11653,8 @@ export interface components {
          */
         ConfidenceStepConfig: {
             /**
-             * @description Enable confidence scoring
-             * @default false
+             * @deprecated
+             * @description Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
              */
             enabled?: boolean;
         };
@@ -11838,7 +12214,7 @@ export interface components {
             model: string;
             /** @description Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable. */
             project_id?: string;
-            /** @description Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable. */
+            /** @description Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain. */
             credentials_path?: string;
         };
         /**
@@ -16149,7 +16525,10 @@ export interface operations {
     updateSchema: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
+                "If-Match"?: string;
+            };
             path: {
                 /** @description Name of the table */
                 tableName: string;
@@ -16165,6 +16544,8 @@ export interface operations {
             /** @description Schema updated successfully */
             200: {
                 headers: {
+                    /** @description Strong ETag for the committed schema version. */
+                    ETag?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16173,6 +16554,44 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    patchSchema: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
+                "If-Match"?: string;
+            };
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/merge-patch+json": components["schemas"]["TableSchemaPatch"];
+                "application/json": components["schemas"]["TableSchemaPatch"];
+            };
+        };
+        responses: {
+            /** @description Schema patched successfully */
+            200: {
+                headers: {
+                    /** @description Strong ETag for the committed schema version. */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Table"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
         };
     };

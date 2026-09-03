@@ -17,11 +17,12 @@ class FollowupStepConfig:
     original query and the standard Antfly follow-up templates.
 
         Attributes:
-            enabled (bool | Unset): Enable follow-up question generation Default: False.
+            enabled (bool | Unset): Compatibility switch. The step is enabled when this object is present; omit the step to
+                disable it.
             count (int | Unset): Number of follow-up questions to generate Default: 3.
     """
 
-    enabled: bool | Unset = False
+    enabled: bool | Unset = UNSET
     count: int | Unset = 3
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

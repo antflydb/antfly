@@ -192,7 +192,7 @@ pub const EmbedderConfig = struct {
     api_key: ?[]const u8 = null,
     /// The URL of the Google API endpoint (optional, uses default if not specified).
     url: ?[]const u8 = null,
-    /// Path to service account JSON key file. Alternative to ADC for non-GCP environments.
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Alternative to the default ADC chain.
     credentials_path: ?[]const u8 = null,
     /// Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072.
     dimensions: ?i64 = null,
@@ -428,8 +428,8 @@ pub const GoogleEmbedderConfig = struct {
     }
 };
 
-/// Embedding provider configuration accepted by managed index creation.
-pub const ManagedEmbedderConfig = union(enum) {
+/// Embedding provider configuration accepted when Antfly creates and maintains an embeddings index. This purpose-specific subset reuses the canonical provider configurations; it does not define a second provider namespace.
+pub const IndexEmbedderConfig = union(enum) {
     ollama_embedder_config: OllamaEmbedderConfig,
     open_ai_embedder_config: OpenAIEmbedderConfig,
     bedrock_embedder_config: BedrockEmbedderConfig,
@@ -648,7 +648,7 @@ pub const VertexEmbedderConfig = struct {
     project_id: ?[]const u8 = null,
     /// Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
     location: ?[]const u8 = null,
-    /// Path to service account JSON key file. Alternative to ADC for non-GCP environments.
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Alternative to the default ADC chain.
     credentials_path: ?[]const u8 = null,
     /// The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding).
     dimension: ?i64 = null,
