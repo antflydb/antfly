@@ -341,14 +341,18 @@ func TestProxyRequestRetryPreservesCapabilityStaleResponse(t *testing.T) {
 		RetryOnStatuses:    map[int]bool{http.StatusInternalServerError: true},
 		RetryOnRequestErrs: true,
 	}
-	p.Router().RouteManager().UpsertRoute(route)
+	routeManager := p.Router().RouteManager()
+	if changed, err := routeManager.UpsertRoute(route); err != nil || !changed {
+		t.Fatalf("install route: changed=%v err=%v", changed, err)
+	}
+	routeGeneration := routeManager.Generation()
 	revision := "revision-a"
 	endpoints := p.router.ResolveEndpointCandidates("model-a", "primary", nil, "embed")
 	token, err := p.issueCapabilityLease(
 		"model-a",
 		"embed",
 		"embed",
-		p.router.RouteManager().Generation(),
+		routeGeneration,
 		revision,
 		"",
 		capabilityEndpointSet(p.registry, endpoints),
@@ -358,18 +362,16 @@ func TestProxyRequestRetryPreservesCapabilityStaleResponse(t *testing.T) {
 	}
 
 	var attempts int32
+	var updateChanged bool
+	var updateErr error
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		atomic.AddInt32(&attempts, 1)
 		// Simulate a policy update after the first attempt has already been
-		// admitted. The retry must tell the client to discard the old plan.
-		p.Router().RouteManager().UpsertRoute(&Route{
-			Name:            route.Name,
-			Priority:        1,
-			Operations:      route.Operations,
-			Destinations:    route.Destinations,
-			RetryAttempts:   route.RetryAttempts,
-			RetryOnStatuses: route.RetryOnStatuses,
-		})
+		// admitted. Clone the complete identity and policy so adding future
+		// identity fields cannot accidentally turn this into a second route.
+		updatedRoute := cloneRoute(route, false)
+		updatedRoute.Priority = 1
+		updateChanged, updateErr = routeManager.UpsertRoute(updatedRoute)
 		return &http.Response{
 			StatusCode: http.StatusInternalServerError,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -392,6 +394,18 @@ func TestProxyRequestRetryPreservesCapabilityStaleResponse(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&attempts); got != 1 {
 		t.Fatalf("backend attempts = %d, want retry rejected before second forwarding", got)
+	}
+	if updateErr != nil || !updateChanged {
+		t.Fatalf("update route: changed=%v err=%v", updateChanged, updateErr)
+	}
+	if got := routeManager.Generation(); got != routeGeneration+1 {
+		t.Fatalf("route generation = %d, want %d", got, routeGeneration+1)
+	}
+	routeManager.mu.RLock()
+	installedRoutes := append([]*Route(nil), routeManager.routes...)
+	routeManager.mu.RUnlock()
+	if len(installedRoutes) != 1 || installedRoutes[0].Namespace != route.Namespace || installedRoutes[0].Name != route.Name {
+		t.Fatalf("installed routes after update = %#v, want exactly %s/%s", installedRoutes, route.Namespace, route.Name)
 	}
 }
 
