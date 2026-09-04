@@ -85,6 +85,32 @@ pub fn printBackendTimingDetails(
         },
     );
     std.debug.print(
+        "{s}_nomic_bert: layer_attempts={d} layer_successes={d} layer_fallbacks={d} layer_host_us={d}\n",
+        .{
+            prefix,
+            provider_stats.metal_runtime_nomic_bert_encoder_layer_attempts,
+            provider_stats.metal_runtime_nomic_bert_encoder_layer_successes,
+            provider_stats.metal_runtime_nomic_bert_encoder_layer_fallbacks,
+            @divTrunc(provider_stats.metal_runtime_nomic_bert_encoder_layer_nanos, std.time.ns_per_us),
+        },
+    );
+    std.debug.print(
+        "{s}_nomic_bert_ops: qkv_rope={d} rope_pair={d} rope_pair_fallback={d} attention={d} attention_post={d} ffn_pair={d} ffn_activation={d} ffn_output_norm={d} ffn_fused={d} ffn_fused_fail={d}\n",
+        .{
+            prefix,
+            provider_stats.metal_runtime_nomic_bert_qkv_rope_calls,
+            provider_stats.metal_runtime_nomic_bert_rope_pair_calls,
+            provider_stats.metal_runtime_nomic_bert_rope_pair_fallbacks,
+            provider_stats.metal_runtime_nomic_bert_attention_calls,
+            provider_stats.metal_runtime_nomic_bert_attention_post_calls,
+            provider_stats.metal_runtime_nomic_bert_ffn_pair_calls,
+            provider_stats.metal_runtime_nomic_bert_ffn_activation_calls,
+            provider_stats.metal_runtime_nomic_bert_ffn_output_norm_calls,
+            provider_stats.metal_runtime_nomic_bert_ffn_fused_calls,
+            provider_stats.metal_runtime_nomic_bert_ffn_fused_failures,
+        },
+    );
+    std.debug.print(
         "{s}_quant_linear_nulls: prepare_provider=0x{x} apply_provider=0x{x} apply_not_prepared={d} first_apply_slot={d} apply_dim={d} apply_shape={d} apply_quant_storage={d} apply_quant_weight={d} apply_dense_cache={d} pair_not_prepared={d} first_pair_slots={d}/{d} pair_dim={d} pair_shape={d} pair_dense_direct_ok={d} pair_dense_direct_fail={d} pair_delegate={d}\n",
         .{
             prefix,
