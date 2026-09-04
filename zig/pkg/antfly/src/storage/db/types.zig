@@ -3067,6 +3067,12 @@ pub const DBIndexStats = struct {
     // continuity, this proof can retain authority across table-level opening
     // metadata and applies to every index kind. It is never persisted.
     runtime_observation_targeted_sibling: bool = false,
+    // Cache-local convergence authority for this exact index incarnation.
+    // Ordinary target advances clear only the affected identities; an
+    // unknown-scope advance is represented by the enclosing table metadata.
+    // This is deliberately independent of serving authority and is never
+    // persisted or exposed as a separate public field.
+    runtime_target_observation_complete: bool = true,
     // Error name recorded when the index's persisted artifacts failed to
     // load (e.g. "UnsupportedVersion"); null for healthy indexes.
     load_error: ?[]const u8 = null,
@@ -3740,55 +3746,57 @@ pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiag
     if (stats.resolvers.len > 0) alloc.free(stats.resolvers);
 }
 
+pub fn freeDBIndexStatsItem(alloc: Allocator, item: DBIndexStats) void {
+    alloc.free(item.name);
+    for (item.source_replay) |source| alloc.free(source.artifact_name);
+    if (item.source_replay.len > 0) alloc.free(item.source_replay);
+    if (item.load_error) |value| alloc.free(value);
+    if (item.index_repair_last_error) |value| alloc.free(value);
+    if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
+    if (item.algebraic_last_error_reason) |value| alloc.free(value);
+    if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
+    if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
+    if (item.algebraic_planner_last_decision) |value| alloc.free(value);
+    if (item.algebraic_planner_last_fallback_reason) |value| alloc.free(value);
+    if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
+    if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
+    if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
+    if (item.algebraic_top_candidate) |candidate| {
+        alloc.free(candidate.recommendation);
+        alloc.free(candidate.materialization_id);
+        alloc.free(candidate.lifecycle);
+        alloc.free(candidate.decision);
+    }
+    if (item.algebraic_active_progress) |progress| {
+        alloc.free(progress.recommendation);
+        alloc.free(progress.materialization_id);
+        alloc.free(progress.lifecycle);
+    }
+    for (item.algebraic_candidates) |candidate| {
+        alloc.free(candidate.recommendation);
+        alloc.free(candidate.materialization_id);
+        alloc.free(candidate.lifecycle);
+        alloc.free(candidate.decision);
+    }
+    if (item.algebraic_candidates.len > 0) alloc.free(item.algebraic_candidates);
+    for (item.algebraic_candidate_decision_history) |entry| {
+        alloc.free(entry.recommendation);
+        alloc.free(entry.materialization_id);
+        alloc.free(entry.lifecycle);
+        alloc.free(entry.previous_decision);
+        alloc.free(entry.decision);
+    }
+    if (item.algebraic_candidate_decision_history.len > 0) alloc.free(item.algebraic_candidate_decision_history);
+    for (item.algebraic_progress) |progress| {
+        alloc.free(progress.recommendation);
+        alloc.free(progress.materialization_id);
+        alloc.free(progress.lifecycle);
+    }
+    if (item.algebraic_progress.len > 0) alloc.free(item.algebraic_progress);
+}
+
 pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
     freeResolverReplayDiagnostics(alloc, stats.resolver_replay);
-    for (stats.indexes) |item| {
-        alloc.free(item.name);
-        for (item.source_replay) |source| alloc.free(source.artifact_name);
-        if (item.source_replay.len > 0) alloc.free(item.source_replay);
-        if (item.load_error) |value| alloc.free(value);
-        if (item.index_repair_last_error) |value| alloc.free(value);
-        if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
-        if (item.algebraic_last_error_reason) |value| alloc.free(value);
-        if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
-        if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
-        if (item.algebraic_planner_last_decision) |value| alloc.free(value);
-        if (item.algebraic_planner_last_fallback_reason) |value| alloc.free(value);
-        if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
-        if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
-        if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
-        if (item.algebraic_top_candidate) |candidate| {
-            alloc.free(candidate.recommendation);
-            alloc.free(candidate.materialization_id);
-            alloc.free(candidate.lifecycle);
-            alloc.free(candidate.decision);
-        }
-        if (item.algebraic_active_progress) |progress| {
-            alloc.free(progress.recommendation);
-            alloc.free(progress.materialization_id);
-            alloc.free(progress.lifecycle);
-        }
-        for (item.algebraic_candidates) |candidate| {
-            alloc.free(candidate.recommendation);
-            alloc.free(candidate.materialization_id);
-            alloc.free(candidate.lifecycle);
-            alloc.free(candidate.decision);
-        }
-        if (item.algebraic_candidates.len > 0) alloc.free(item.algebraic_candidates);
-        for (item.algebraic_candidate_decision_history) |entry| {
-            alloc.free(entry.recommendation);
-            alloc.free(entry.materialization_id);
-            alloc.free(entry.lifecycle);
-            alloc.free(entry.previous_decision);
-            alloc.free(entry.decision);
-        }
-        if (item.algebraic_candidate_decision_history.len > 0) alloc.free(item.algebraic_candidate_decision_history);
-        for (item.algebraic_progress) |progress| {
-            alloc.free(progress.recommendation);
-            alloc.free(progress.materialization_id);
-            alloc.free(progress.lifecycle);
-        }
-        if (item.algebraic_progress.len > 0) alloc.free(item.algebraic_progress);
-    }
+    for (stats.indexes) |item| freeDBIndexStatsItem(alloc, item);
     if (stats.indexes.len > 0) alloc.free(stats.indexes);
 }

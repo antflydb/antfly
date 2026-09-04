@@ -12652,11 +12652,21 @@ pub const ProvisionedTableWriteSource = struct {
         switch (event.change) {
             .target_advanced => {
                 if (self.runtime_status_cache) |cache| {
-                    cache.markGroupTargetObservationPending(
-                        table_name,
-                        group_id,
-                        event.target_sequence,
-                    );
+                    if (event.target_scope_known) {
+                        const sequence = event.target_sequence orelse 0;
+                        cache.markIndexTargetsObservationPending(
+                            table_name,
+                            group_id,
+                            event.target_indexes,
+                            sequence,
+                        );
+                    } else {
+                        cache.markGroupTargetObservationPending(
+                            table_name,
+                            group_id,
+                            event.target_sequence,
+                        );
+                    }
                 }
                 self.markWriteCacheRefreshPending(table_name);
                 self.notifyLocalChange(table_name, .runtime_status);
