@@ -1,132 +1,32 @@
 name: Release request
 
-# This main-owned workflow is the only supported release-tag creator. It
-# resolves the version line from controller policy, snapshots the protected
-# source branch tip, uploads that immutable request, and creates the tag last.
+# Tag code has read-only access and emits only an untrusted identity request.
+# The release-build controller validates it from the default branch.
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Canonical release tag, for example v0.2.1-rc.4"
-        required: true
-        type: string
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: read
 
-concurrency:
-  group: release-cut-${{ inputs.tag }}
-  cancel-in-progress: false
-
 jobs:
   request:
-    name: Cut protected release tag
-    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: ubuntu-latest
-    environment: release-cut
-    permissions:
-      actions: read
-      contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 0
-      - name: Verify the protected release-cut environment contract
+      - name: Write untrusted tag request
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python scripts/release/github_environment.py check \
-            --repository "$GITHUB_REPOSITORY" \
-            --environment release-cut
-          python scripts/release/github_rulesets.py check \
-            --repository "$GITHUB_REPOSITORY"
-      - name: Resolve trusted release source
-        id: source
-        env:
-          RELEASE_TAG: ${{ inputs.tag }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -euo pipefail
-          test "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH"
-          git fetch --no-tags origin "refs/heads/$DEFAULT_BRANCH"
-          test "$GITHUB_SHA" = "$(git rev-parse FETCH_HEAD)"
-          python scripts/release/release_channels.py resolve \
-            --tag "$RELEASE_TAG" --channel auto >/dev/null
-          resolved="$(python scripts/release/release_lines.py resolve \
-            --tag "$RELEASE_TAG" --github-output "$GITHUB_OUTPUT")"
-          source_ref="$(jq -r .source_ref <<<"$resolved")"
-          git fetch --no-tags origin "$source_ref"
-          source_ref_head="$(git rev-parse FETCH_HEAD)"
-          if test -n "$(git ls-remote --refs origin "refs/tags/$RELEASE_TAG")"; then
-            git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-            test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = tag
-            test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$source_ref_head"
-            tag_exists=true
-          else
-            tag_exists=false
-          fi
-          {
-            echo "source_ref_head=$source_ref_head"
-            echo "source_commit=$source_ref_head"
-            echo "tag_exists=$tag_exists"
-          } >> "$GITHUB_OUTPUT"
-      - name: Write immutable release request
-        env:
-          RELEASE_TAG: ${{ inputs.tag }}
-          RELEASE_LINE: ${{ steps.source.outputs.release_line }}
-          SOURCE_REF: ${{ steps.source.outputs.source_ref }}
-          SOURCE_REF_HEAD: ${{ steps.source.outputs.source_ref_head }}
-          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ github.sha }}
         run: |
           mkdir -p dist/build-request
           jq -n \
             --arg tag "$RELEASE_TAG" \
-            --arg release_line "$RELEASE_LINE" \
-            --arg source_ref "$SOURCE_REF" \
-            --arg source_ref_head "$SOURCE_REF_HEAD" \
             --arg source_commit "$SOURCE_COMMIT" \
-            '{schema_version: 2, request_kind: "tag", tag: $tag,
-              release_line: $release_line, source_ref: $source_ref,
-              source_ref_head: $source_ref_head, source_commit: $source_commit,
-              channel: "auto"}' \
+            '{schema_version: 1, request_kind: "tag", tag: $tag, source_commit: $source_commit, channel: "auto"}' \
             > dist/build-request/build-request.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: antfly-build-request
           path: dist/build-request/build-request.json
           if-no-files-found: error
-      - name: Create immutable annotated release tag
-        env:
-          RELEASE_TAG: ${{ inputs.tag }}
-          SOURCE_REF: ${{ steps.source.outputs.source_ref }}
-          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
-          TAG_EXISTS: ${{ steps.source.outputs.tag_exists }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -euo pipefail
-          # Abort a dispatch that became stale after approval or while its
-          # request artifact was being written. For a new tag, include the
-          # observed protected branch tips in one atomic push so a newer remote
-          # tip seen during push negotiation also rejects the tag creation.
-          git fetch --no-tags origin "refs/heads/$DEFAULT_BRANCH"
-          test "$GITHUB_SHA" = "$(git rev-parse FETCH_HEAD)"
-          git fetch --no-tags origin "$SOURCE_REF"
-          test "$SOURCE_COMMIT" = "$(git rev-parse FETCH_HEAD)"
-          if [ "$TAG_EXISTS" = true ]; then
-            echo "annotated tag already records the selected branch tip"
-            exit 0
-          fi
-          test "$TAG_EXISTS" = false
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git tag -a "$RELEASE_TAG" -m "$RELEASE_TAG" "$SOURCE_COMMIT"
-          protected_refs=(
-            "$GITHUB_SHA:refs/heads/$DEFAULT_BRANCH"
-          )
-          if [ "$SOURCE_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
-            protected_refs+=("$SOURCE_COMMIT:$SOURCE_REF")
-          fi
-          git push --atomic origin \
-            "${protected_refs[@]}" \
-            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"

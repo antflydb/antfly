@@ -135,31 +135,9 @@ def verify_release_spec(path: Path, tag: str, commit: str) -> dict[str, object]:
     channel = document.get("channel")
     if not isinstance(build_controller_commit, str) or not isinstance(channel, str):
         raise SystemExit("release spec does not match the release identity")
-    schema_version = document.get("schema_version")
-    if schema_version == 4:
-        expected = build_release_spec(
-            tag, channel, commit, build_controller_commit
-        ).document()
-    elif schema_version == 5:
-        release_line = document.get("release_line")
-        source_ref = document.get("source_ref")
-        source_ref_head = document.get("source_ref_head")
-        if not all(
-            isinstance(value, str)
-            for value in (release_line, source_ref, source_ref_head)
-        ):
-            raise SystemExit("release spec does not match the release identity")
-        expected = build_release_spec(
-            tag,
-            channel,
-            commit,
-            build_controller_commit,
-            release_line=release_line,
-            source_ref=source_ref,
-            source_ref_head=source_ref_head,
-        ).document()
-    else:
-        raise SystemExit("release spec uses an unsupported schema")
+    expected = build_release_spec(
+        tag, channel, commit, build_controller_commit
+    ).document()
     if document != expected:
         raise SystemExit("release spec does not match the release identity")
     return document
@@ -288,14 +266,6 @@ def main() -> int:
         "registry_versions": registry_versions,
         "artifacts": artifacts,
     }
-    if release_spec["schema_version"] == 5:
-        metadata.update(
-            {
-                "release_line": release_spec["release_line"],
-                "source_ref": release_spec["source_ref"],
-                "source_ref_head": release_spec["source_ref_head"],
-            }
-        )
 
     metadata_path = out_dir / "metadata.json"
     artifacts_path = out_dir / "artifacts.json"
@@ -312,27 +282,22 @@ def main() -> int:
             "sha256": sha256(metadata_path),
         },
     ]
-    ledger = {
-        "tag": tag,
-        "version": version,
-        "commit": args.commit,
-        "build_controller_commit": release_spec["build_controller_commit"],
-        "promotion_controller_commit": args.promotion_controller_commit,
-        "schema_version": release_spec["schema_version"],
-        "generated_at": release_generated_at,
-        "registry_versions": registry_versions,
-        "artifacts": ledger_artifacts,
-    }
-    if release_spec["schema_version"] == 5:
-        ledger.update(
-            {
-                "release_line": release_spec["release_line"],
-                "source_ref": release_spec["source_ref"],
-                "source_ref_head": release_spec["source_ref_head"],
-            }
-        )
     artifacts_path.write_text(
-        json.dumps(ledger, indent=2) + "\n",
+        json.dumps(
+            {
+                "tag": tag,
+                "version": version,
+                "commit": args.commit,
+                "build_controller_commit": release_spec["build_controller_commit"],
+                "promotion_controller_commit": args.promotion_controller_commit,
+                "schema_version": 4,
+                "generated_at": release_generated_at,
+                "registry_versions": registry_versions,
+                "artifacts": ledger_artifacts,
+            },
+            indent=2,
+        )
+        + "\n",
         encoding="utf-8",
     )
 

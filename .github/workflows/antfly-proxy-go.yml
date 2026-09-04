@@ -11,7 +11,7 @@ on:
       - ".github/actions/load-toolchain-policy/action.yml"
       - ".github/workflows/antfly-proxy-go.yml"
   pull_request:
-    branches: ["main", "v*.x"]
+    branches: ["main"]
     paths:
       - "go/pkg/proxy/**"
       - "scripts/ci/toolchain-policy.json"

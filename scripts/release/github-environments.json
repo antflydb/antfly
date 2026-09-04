@@ -1,18 +1,6 @@
 {
   "schema_version": 1,
   "environments": {
-    "release-cut": {
-      "reviewers_from": "npm",
-      "prevent_self_review": true,
-      "wait_timer": 0,
-      "deployment_branch_policy": {
-        "protected_branches": false,
-        "custom_branch_policies": true
-      },
-      "branch_policies": [
-        {"name": "main", "type": "branch"}
-      ]
-    },
     "container-publish": {
       "reviewers_from": "npm",
       "prevent_self_review": true,

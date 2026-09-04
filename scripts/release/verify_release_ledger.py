@@ -9,9 +9,6 @@ import json
 import re
 from pathlib import Path
 
-from release_channels import NIGHTLY_PATTERN
-from release_lines import nightly_line, validate_provenance
-
 
 def inferred_scope(entry: dict[str, object]) -> str:
     scope = entry.get("scope")
@@ -40,7 +37,6 @@ def verify_payload(
     commit: str,
     ledger_sha256: str,
     scope: str | None = None,
-    release_line_policy: dict[str, object] | None = None,
 ) -> str:
     expected_ledger_digest = ledger_sha256.lower()
     if not re.fullmatch(r"[0-9a-f]{64}", expected_ledger_digest):
@@ -54,38 +50,14 @@ def verify_payload(
 
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     schema_version = ledger.get("schema_version")
-    if schema_version not in {1, 2, 3, 4, 5}:
+    if schema_version not in {1, 2, 3, 4}:
         raise SystemExit("unsupported release ledger schema")
     if ledger.get("tag") != tag or ledger.get("commit") != commit:
         raise SystemExit("release ledger does not match the requested tag and commit")
-    if schema_version in {4, 5}:
+    if schema_version == 4:
         for field in ("build_controller_commit", "promotion_controller_commit"):
             if not re.fullmatch(r"[0-9a-f]{40}", str(ledger.get(field, ""))):
                 raise SystemExit(f"release ledger has an invalid {field}")
-    if schema_version == 5:
-        release_line = ledger.get("release_line")
-        source_ref = ledger.get("source_ref")
-        source_ref_head = ledger.get("source_ref_head")
-        if not isinstance(release_line, str) or not isinstance(source_ref, str):
-            raise SystemExit("release ledger has invalid source provenance")
-        if not re.fullmatch(r"[0-9a-f]{40}", str(source_ref_head)):
-            raise SystemExit("release ledger has invalid source provenance")
-        if NIGHTLY_PATTERN.fullmatch(tag):
-            expected = nightly_line()
-            if release_line != expected.name or source_ref != expected.source_ref:
-                raise SystemExit("release ledger has invalid nightly source provenance")
-        else:
-            validate_provenance(
-                tag,
-                release_line,
-                source_ref,
-                release_line_policy,
-                allow_closed=True,
-            )
-            if source_ref_head != commit:
-                raise SystemExit(
-                    "release ledger source head differs from release commit"
-                )
 
     entries: dict[str, dict[str, object]] = {}
     ledger_artifacts = ledger.get("artifacts")
@@ -102,7 +74,7 @@ def verify_payload(
             or name in entries
         ):
             raise SystemExit("release ledger contains an invalid or duplicate artifact")
-        if schema_version in {2, 3, 4, 5} and entry.get("scope") not in {
+        if schema_version in {2, 3, 4} and entry.get("scope") not in {
             "runtime",
             "cli",
             "support",
