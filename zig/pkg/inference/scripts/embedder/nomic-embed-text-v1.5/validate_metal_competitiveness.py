@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Any
 
 
-EXPECTED_CELLS = {(batch, sequence_length) for batch in (1, 2, 4) for sequence_length in (16, 128)}
+EXPECTED_CELLS = {
+    (batch, sequence_length) for batch in (1, 2, 4) for sequence_length in (16, 128)
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,7 +28,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pytorch-direct", required=True)
     parser.add_argument("--native-http", required=True)
     parser.add_argument("--pytorch-http", required=True)
-    parser.add_argument("--parity", help="compact six-cell output from bench_pytorch_mps.py parity")
+    parser.add_argument(
+        "--parity", help="compact six-cell output from bench_pytorch_mps.py parity"
+    )
     parser.add_argument("--ffn-fusion-disabled")
     parser.add_argument("--pool-normalize-disabled")
     parser.add_argument("--q8-sdpa-disabled")
@@ -69,18 +73,26 @@ def cells(
             raise ValueError(f"{kind}: duplicate evidence for cell {key}")
         result[key] = row
     if set(result) != expected:
-        raise ValueError(f"{kind}: expected cells {sorted(expected)}, got {sorted(result)}")
+        raise ValueError(
+            f"{kind}: expected cells {sorted(expected)}, got {sorted(result)}"
+        )
     return result
 
 
-def embedding_cells(rows: list[dict[str, Any]], kind: str) -> dict[tuple[int, int], list[list[float]]]:
+def embedding_cells(
+    rows: list[dict[str, Any]], kind: str
+) -> dict[tuple[int, int], list[list[float]]]:
     result: dict[tuple[int, int], list[list[float]]] = {}
     for row in rows:
         if row.get("kind") != kind:
             continue
         key = (int(row["batch"]), int(row["sequence_length"]))
         embeddings = row.get("embeddings")
-        if not isinstance(embeddings, list) or not embeddings or any(not isinstance(item, list) for item in embeddings):
+        if (
+            not isinstance(embeddings, list)
+            or not embeddings
+            or any(not isinstance(item, list) for item in embeddings)
+        ):
             raise ValueError(f"{kind}: malformed embedding evidence for {key}")
         result[key] = embeddings
     return result
@@ -89,15 +101,28 @@ def embedding_cells(rows: list[dict[str, Any]], kind: str) -> dict[tuple[int, in
 def ratio(candidate: dict[str, Any], reference: dict[str, Any]) -> float:
     candidate_ms = float(candidate["mean_ms"])
     reference_ms = float(reference["mean_ms"])
-    if not math.isfinite(candidate_ms) or not math.isfinite(reference_ms) or candidate_ms <= 0 or reference_ms <= 0:
+    if (
+        not math.isfinite(candidate_ms)
+        or not math.isfinite(reference_ms)
+        or candidate_ms <= 0
+        or reference_ms <= 0
+    ):
         raise ValueError("non-positive or non-finite mean_ms")
     return candidate_ms / reference_ms
 
 
-def compare_embeddings(actual: list[list[float]], reference: list[list[float]]) -> dict[str, float]:
-    if len(actual) != len(reference) or any(len(left) != len(right) for left, right in zip(actual, reference)):
+def compare_embeddings(
+    actual: list[list[float]], reference: list[list[float]]
+) -> dict[str, float]:
+    if len(actual) != len(reference) or any(
+        len(left) != len(right) for left, right in zip(actual, reference)
+    ):
         raise ValueError("embedding shapes differ")
-    values = [(left_value, right_value) for left, right in zip(actual, reference) for left_value, right_value in zip(left, right)]
+    values = [
+        (left_value, right_value)
+        for left, right in zip(actual, reference)
+        for left_value, right_value in zip(left, right)
+    ]
     errors = [abs(left - right) for left, right in values]
     cosines = []
     for left, right in zip(actual, reference):
@@ -105,7 +130,11 @@ def compare_embeddings(actual: list[list[float]], reference: list[list[float]]) 
         left_norm = math.sqrt(sum(a * a for a in left))
         right_norm = math.sqrt(sum(b * b for b in right))
         cosines.append(dot / (left_norm * right_norm))
-    return {"max_abs_error": max(errors), "mean_abs_error": sum(errors) / len(errors), "min_cosine": min(cosines)}
+    return {
+        "max_abs_error": max(errors),
+        "mean_abs_error": sum(errors) / len(errors),
+        "min_cosine": min(cosines),
+    }
 
 
 def validate_optimization(
@@ -117,7 +146,9 @@ def validate_optimization(
     failures: list[str],
 ) -> dict[str, float]:
     ratios = {
-        f"b{batch}_s{sequence_length}": ratio(optimized[(batch, sequence_length)], disabled[(batch, sequence_length)])
+        f"b{batch}_s{sequence_length}": ratio(
+            optimized[(batch, sequence_length)], disabled[(batch, sequence_length)]
+        )
         for batch, sequence_length in affected
     }
     for batch, sequence_length in improvement_cells:
@@ -129,7 +160,9 @@ def validate_optimization(
             )
     for key, value in ratios.items():
         if value > 1.02:
-            failures.append(f"{name}: {key} regresses {(value - 1) * 100:.2f}%, above 2%")
+            failures.append(
+                f"{name}: {key} regresses {(value - 1) * 100:.2f}%, above 2%"
+            )
     return ratios
 
 
@@ -151,7 +184,9 @@ def main() -> int:
         native = native_direct[key]
         reference = pytorch_direct[key]
         if native.get("warmups") != 3 or native.get("repeats") != 10:
-            failures.append(f"direct {key}: benchmark contract requires 3 warmups and 10 repeats")
+            failures.append(
+                f"direct {key}: benchmark contract requires 3 warmups and 10 repeats"
+            )
         if native.get("model_sha") != reference.get("model_sha"):
             failures.append(f"direct {key}: model SHA differs")
         direct_ratio = ratio(native, reference)
@@ -159,27 +194,54 @@ def main() -> int:
         if direct_ratio > 1.20:
             failures.append(f"direct {key}: ratio {direct_ratio:.4f} exceeds 1.20")
         layers = native.get("nomic_layers")
-        if not isinstance(layers, dict) or layers.get("fallbacks") != 0 or int(layers.get("successes", 0)) < 12:
-            failures.append(f"direct {key}: Nomic layer executor did not complete without fallback")
+        if (
+            not isinstance(layers, dict)
+            or layers.get("fallbacks") != 0
+            or int(layers.get("successes", 0)) < 12
+        ):
+            failures.append(
+                f"direct {key}: Nomic layer executor did not complete without fallback"
+            )
         expected_rope_pairs = 0
         if int(layers.get("rope_pairs", 0)) != expected_rope_pairs:
-            failures.append(f"direct {key}: expected {expected_rope_pairs} paired-RoPE layers")
+            failures.append(
+                f"direct {key}: expected {expected_rope_pairs} paired-RoPE layers"
+            )
         # The fused FFN remains an opt-in experiment because its clean A/B did
         # not meet the 5% anchor / 2% no-regression retention contract.
         expected_ffn_fused = 0
         if int(layers.get("ffn_fused", 0)) != expected_ffn_fused:
-            failures.append(f"direct {key}: expected {expected_ffn_fused} fused-FFN layers")
-        if int(layers.get("pool_normalize_successes", 0)) < 1 or int(layers.get("pool_normalize_failures", 0)) != 0:
+            failures.append(
+                f"direct {key}: expected {expected_ffn_fused} fused-FFN layers"
+            )
+        if (
+            int(layers.get("pool_normalize_successes", 0)) < 1
+            or int(layers.get("pool_normalize_failures", 0)) != 0
+        ):
             failures.append(f"direct {key}: fused pooling/normalization was not active")
         expected_q8 = 12 if key[1] == 128 or key == (4, 16) else 0
         if int(layers.get("sdpa_q8", 0)) != expected_q8:
-            failures.append(f"direct {key}: expected {expected_q8} Nomic tiled-SDPA layers")
+            failures.append(
+                f"direct {key}: expected {expected_q8} Nomic tiled-SDPA layers"
+            )
         residency = native.get("residency")
-        expected_output_materializations = int(native.get("warmups", 0)) + int(native.get("repeats", 0))
-        if not isinstance(residency, dict) or int(residency.get("to_host_device_calls", -1)) != expected_output_materializations:
-            failures.append(f"direct {key}: unexpected device-to-host materialization inside the measured pipeline")
+        expected_output_materializations = int(native.get("warmups", 0)) + int(
+            native.get("repeats", 0)
+        )
+        if (
+            not isinstance(residency, dict)
+            or int(residency.get("to_host_device_calls", -1))
+            != expected_output_materializations
+        ):
+            failures.append(
+                f"direct {key}: unexpected device-to-host materialization inside the measured pipeline"
+            )
         swap = native.get("swap_bytes")
-        if isinstance(swap, dict) and swap.get("available") and int(swap.get("after", 0)) > int(swap.get("before", 0)):
+        if (
+            isinstance(swap, dict)
+            and swap.get("available")
+            and int(swap.get("after", 0)) > int(swap.get("before", 0))
+        ):
             failures.append(f"direct {key}: swap grew during the measured cell")
         native_endpoint = native_http[key]
         pytorch_endpoint = pytorch_http[key]
@@ -192,7 +254,9 @@ def main() -> int:
 
     parity: dict[str, dict[str, float]] = {}
     native_embeddings = embedding_cells(native_direct_rows, "nomic_direct_embeddings")
-    pytorch_embeddings = embedding_cells(pytorch_direct_rows, "nomic_direct_reference_embeddings")
+    pytorch_embeddings = embedding_cells(
+        pytorch_direct_rows, "nomic_direct_reference_embeddings"
+    )
     if args.parity:
         compact_parity = cells(load_jsonl(args.parity), "nomic_direct_parity")
         for key, row in compact_parity.items():
@@ -202,16 +266,31 @@ def main() -> int:
                 "min_cosine": float(row["min_cosine"]),
             }
             parity[f"b{key[0]}_s{key[1]}"] = result
-            if result["max_abs_error"] > 2e-6 or result["mean_abs_error"] > 3e-7 or result["min_cosine"] < 0.9999999:
+            if (
+                result["max_abs_error"] > 2e-6
+                or result["mean_abs_error"] > 3e-7
+                or result["min_cosine"] < 0.9999999
+            ):
                 failures.append(f"parity {key}: {result}")
     elif native_embeddings or pytorch_embeddings:
-        if set(native_embeddings) != EXPECTED_CELLS or set(pytorch_embeddings) != EXPECTED_CELLS:
-            failures.append("parity: expected embedded vectors for all six direct cells")
+        if (
+            set(native_embeddings) != EXPECTED_CELLS
+            or set(pytorch_embeddings) != EXPECTED_CELLS
+        ):
+            failures.append(
+                "parity: expected embedded vectors for all six direct cells"
+            )
         else:
             for key in sorted(EXPECTED_CELLS):
-                result = compare_embeddings(native_embeddings[key], pytorch_embeddings[key])
+                result = compare_embeddings(
+                    native_embeddings[key], pytorch_embeddings[key]
+                )
                 parity[f"b{key[0]}_s{key[1]}"] = result
-                if result["max_abs_error"] > 2e-6 or result["mean_abs_error"] > 3e-7 or result["min_cosine"] < 0.9999999:
+                if (
+                    result["max_abs_error"] > 2e-6
+                    or result["mean_abs_error"] > 3e-7
+                    or result["min_cosine"] < 0.9999999
+                ):
                     failures.append(f"parity {key}: {result}")
     else:
         failures.append("parity: no embedded vector evidence was supplied")

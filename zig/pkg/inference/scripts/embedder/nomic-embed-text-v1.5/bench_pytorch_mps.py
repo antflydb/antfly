@@ -13,7 +13,6 @@ import argparse
 import hashlib
 import json
 import math
-import os
 import re
 import resource
 import statistics
@@ -52,24 +51,34 @@ def parse_args() -> argparse.Namespace:
     direct.add_argument("--repeats", type=int, default=10)
     direct.add_argument("--print-embeddings", action="store_true")
 
-    serve = subparsers.add_parser("serve", help="serve /ai/v1/embeddings over local HTTP")
+    serve = subparsers.add_parser(
+        "serve", help="serve /ai/v1/embeddings over local HTTP"
+    )
     add_common(serve)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=18100)
 
-    endpoint = subparsers.add_parser("endpoint", help="benchmark an OpenAI-compatible endpoint")
+    endpoint = subparsers.add_parser(
+        "endpoint", help="benchmark an OpenAI-compatible endpoint"
+    )
     endpoint.add_argument("--url", required=True)
     endpoint.add_argument("--model-name", default="nomic-ai/nomic-embed-text-v1.5")
     endpoint.add_argument("--model-sha", required=True)
-    endpoint.add_argument("--backend", required=True, help="evidence label, e.g. antfly or pytorch")
-    endpoint.add_argument("--device", required=True, help="evidence label, e.g. metal or mps")
+    endpoint.add_argument(
+        "--backend", required=True, help="evidence label, e.g. antfly or pytorch"
+    )
+    endpoint.add_argument(
+        "--device", required=True, help="evidence label, e.g. metal or mps"
+    )
     endpoint.add_argument("--batches", default="1,2,4")
     endpoint.add_argument("--sequence-lengths", default="16,128")
     endpoint.add_argument("--warmups", type=int, default=3)
     endpoint.add_argument("--repeats", type=int, default=10)
     endpoint.add_argument("--timeout", type=float, default=60.0)
 
-    parity = subparsers.add_parser("parity", help="compare native Metal embeddings with PyTorch MPS")
+    parity = subparsers.add_parser(
+        "parity", help="compare native Metal embeddings with PyTorch MPS"
+    )
     add_common(parity)
     parity.add_argument("--native-binary", required=True)
     parity.add_argument("--batches", default="1,2,4")
@@ -78,16 +87,24 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.mode in {"direct", "endpoint", "parity"}:
         args.batches = parse_int_set(args.batches, {1, 2, 4}, "batches")
-        args.sequence_lengths = parse_int_set(args.sequence_lengths, {16, 128}, "sequence lengths")
-        if args.mode in {"direct", "endpoint"} and (args.warmups != 3 or args.repeats != 10):
-            parser.error("the benchmark contract requires exactly 3 warmups and 10 repeats")
+        args.sequence_lengths = parse_int_set(
+            args.sequence_lengths, {16, 128}, "sequence lengths"
+        )
+        if args.mode in {"direct", "endpoint"} and (
+            args.warmups != 3 or args.repeats != 10
+        ):
+            parser.error(
+                "the benchmark contract requires exactly 3 warmups and 10 repeats"
+            )
     return args
 
 
 def parse_int_set(value: str, allowed: set[int], label: str) -> list[int]:
     result = [int(item) for item in value.split(",")]
     if not result or any(item not in allowed for item in result):
-        raise argparse.ArgumentTypeError(f"{label} must be drawn from {sorted(allowed)}")
+        raise argparse.ArgumentTypeError(
+            f"{label} must be drawn from {sorted(allowed)}"
+        )
     return result
 
 
@@ -102,17 +119,25 @@ def import_torch_and_transformers(extra_python_paths: list[str]):
 
 class NomicMpsEmbedder:
     def __init__(self, args: argparse.Namespace):
-        torch, auto_model, auto_tokenizer = import_torch_and_transformers(args.python_path)
+        torch, auto_model, auto_tokenizer = import_torch_and_transformers(
+            args.python_path
+        )
         if not torch.backends.mps.is_available():
             raise RuntimeError("PyTorch MPS is unavailable")
         self.torch = torch
         self.device = torch.device("mps")
-        self.model = auto_model.from_pretrained(
-            args.model_dir,
-            trust_remote_code=True,
-            torch_dtype=torch.float32,
-        ).to(self.device).eval()
-        self.tokenizer = auto_tokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
+        self.model = (
+            auto_model.from_pretrained(
+                args.model_dir,
+                trust_remote_code=True,
+                torch_dtype=torch.float32,
+            )
+            .to(self.device)
+            .eval()
+        )
+        self.tokenizer = auto_tokenizer.from_pretrained(
+            args.model_dir, trust_remote_code=True
+        )
         self.model_name = args.model_name
         self.model_sha = sha256_file(Path(args.model_dir) / "model.safetensors")
 
@@ -127,7 +152,9 @@ class NomicMpsEmbedder:
             return embeddings.cpu().tolist()
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        encoded = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+        encoded = self.tokenizer(
+            texts, padding=True, truncation=True, return_tensors="pt"
+        )
         return self.embed_ids(
             encoded["input_ids"].to(self.device),
             encoded["attention_mask"].to(self.device),
@@ -144,7 +171,14 @@ def load_fixture(path: str) -> dict[str, Any]:
         raise RuntimeError("unexpected Nomic benchmark fixture identity")
     for length in (16, 128):
         ids = fixture.get(f"input_ids_{length}")
-        if not isinstance(ids, list) or len(ids) != length or any(not isinstance(value, int) or value < 0 or value >= 30528 for value in ids):
+        if (
+            not isinstance(ids, list)
+            or len(ids) != length
+            or any(
+                not isinstance(value, int) or value < 0 or value >= 30528
+                for value in ids
+            )
+        ):
             raise RuntimeError(f"invalid input_ids_{length} fixture")
     return fixture
 
@@ -156,8 +190,12 @@ def direct(args: argparse.Namespace) -> None:
     for sequence_length in args.sequence_lengths:
         row = fixture[f"input_ids_{sequence_length}"]
         for batch in args.batches:
-            input_ids = torch.tensor([row] * batch, dtype=torch.long, device=embedder.device)
-            attention_mask = torch.ones((batch, sequence_length), dtype=torch.long, device=embedder.device)
+            input_ids = torch.tensor(
+                [row] * batch, dtype=torch.long, device=embedder.device
+            )
+            attention_mask = torch.ones(
+                (batch, sequence_length), dtype=torch.long, device=embedder.device
+            )
             for _ in range(args.warmups):
                 embedder.embed_ids(input_ids, attention_mask)
             rss_before = rss_bytes()
@@ -211,7 +249,9 @@ def serve(args: argparse.Namespace) -> None:
 
         def do_POST(self) -> None:  # noqa: N802
             if self.path != "/ai/v1/embeddings":
-                self.send_error(HTTPStatus.NOT_FOUND, "only /ai/v1/embeddings is available")
+                self.send_error(
+                    HTTPStatus.NOT_FOUND, "only /ai/v1/embeddings is available"
+                )
                 return
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
@@ -219,8 +259,14 @@ def serve(args: argparse.Namespace) -> None:
                 inputs = body.get("input")
                 if isinstance(inputs, str):
                     inputs = [inputs]
-                if not isinstance(inputs, list) or not inputs or any(not isinstance(item, str) for item in inputs):
-                    raise ValueError("input must be a non-empty string or list of strings")
+                if (
+                    not isinstance(inputs, list)
+                    or not inputs
+                    or any(not isinstance(item, str) for item in inputs)
+                ):
+                    raise ValueError(
+                        "input must be a non-empty string or list of strings"
+                    )
                 embeddings = embedder.embed_texts(inputs)
                 response = {
                     "object": "list",
@@ -238,7 +284,9 @@ def serve(args: argparse.Namespace) -> None:
                 self.end_headers()
                 self.wfile.write(payload)
             except Exception as exc:  # report a valid API response for client evidence
-                payload = json.dumps({"error": {"message": str(exc), "type": "invalid_request_error"}}).encode()
+                payload = json.dumps(
+                    {"error": {"message": str(exc), "type": "invalid_request_error"}}
+                ).encode()
                 self.send_response(HTTPStatus.BAD_REQUEST)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
@@ -246,7 +294,16 @@ def serve(args: argparse.Namespace) -> None:
                 self.wfile.write(payload)
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(json.dumps({"kind": "nomic_pytorch_mps_endpoint", "url": f"http://{args.host}:{args.port}/ai/v1/embeddings", "model_sha": embedder.model_sha}), flush=True)
+    print(
+        json.dumps(
+            {
+                "kind": "nomic_pytorch_mps_endpoint",
+                "url": f"http://{args.host}:{args.port}/ai/v1/embeddings",
+                "model_sha": embedder.model_sha,
+            }
+        ),
+        flush=True,
+    )
     server.serve_forever()
 
 
@@ -256,7 +313,9 @@ def endpoint(args: argparse.Namespace) -> None:
         # adding CLS/SEP makes these payloads pad exactly to 16 and 128.
         text = " ".join(["the"] * (sequence_length - 2))
         for batch in args.batches:
-            body = json.dumps({"model": args.model_name, "input": [text] * batch}).encode()
+            body = json.dumps(
+                {"model": args.model_name, "input": [text] * batch}
+            ).encode()
             for _ in range(args.warmups):
                 request_endpoint(args.url, body, args.timeout)
             rss_before = rss_bytes()
@@ -297,8 +356,12 @@ def parity(args: argparse.Namespace) -> int:
     for sequence_length in args.sequence_lengths:
         row = fixture[f"input_ids_{sequence_length}"]
         for batch in args.batches:
-            input_ids = torch.tensor([row] * batch, dtype=torch.long, device=embedder.device)
-            attention_mask = torch.ones((batch, sequence_length), dtype=torch.long, device=embedder.device)
+            input_ids = torch.tensor(
+                [row] * batch, dtype=torch.long, device=embedder.device
+            )
+            attention_mask = torch.ones(
+                (batch, sequence_length), dtype=torch.long, device=embedder.device
+            )
             reference = embedder.embed_ids(input_ids, attention_mask)
             command = [
                 str(native_binary),
@@ -320,7 +383,9 @@ def parity(args: argparse.Namespace) -> int:
                 "10",
                 "--print-embeddings",
             ]
-            completed = subprocess.run(command, text=True, capture_output=True, check=True)
+            completed = subprocess.run(
+                command, text=True, capture_output=True, check=True
+            )
             records = []
             for line in (completed.stdout + "\n" + completed.stderr).splitlines():
                 if not line.startswith("{"):
@@ -329,10 +394,14 @@ def parity(args: argparse.Namespace) -> int:
                 if value.get("kind") == "nomic_direct_embeddings":
                     records.append(value)
             if len(records) != 1:
-                raise RuntimeError(f"native parity cell b{batch}/s{sequence_length} emitted {len(records)} embedding records")
+                raise RuntimeError(
+                    f"native parity cell b{batch}/s{sequence_length} emitted {len(records)} embedding records"
+                )
             actual = records[0].get("embeddings")
             if not isinstance(actual, list):
-                raise RuntimeError(f"native parity cell b{batch}/s{sequence_length} has malformed embeddings")
+                raise RuntimeError(
+                    f"native parity cell b{batch}/s{sequence_length} has malformed embeddings"
+                )
             metrics = compare_embeddings(actual, reference)
             cell_passed = (
                 metrics["max_abs_error"] <= 2e-6
@@ -354,10 +423,18 @@ def parity(args: argparse.Namespace) -> int:
     return 0 if passed else 1
 
 
-def compare_embeddings(actual: list[list[float]], reference: list[list[float]]) -> dict[str, float]:
-    if len(actual) != len(reference) or any(len(left) != len(right) for left, right in zip(actual, reference)):
+def compare_embeddings(
+    actual: list[list[float]], reference: list[list[float]]
+) -> dict[str, float]:
+    if len(actual) != len(reference) or any(
+        len(left) != len(right) for left, right in zip(actual, reference)
+    ):
         raise RuntimeError("native and PyTorch embedding shapes differ")
-    errors = [abs(left_value - right_value) for left, right in zip(actual, reference) for left_value, right_value in zip(left, right)]
+    errors = [
+        abs(left_value - right_value)
+        for left, right in zip(actual, reference)
+        for left_value, right_value in zip(left, right)
+    ]
     cosines = []
     for left, right in zip(actual, reference):
         dot = sum(a * b for a, b in zip(left, right))
@@ -371,8 +448,12 @@ def compare_embeddings(actual: list[list[float]], reference: list[list[float]]) 
     }
 
 
-def request_endpoint(url: str, body: bytes, timeout: float) -> tuple[float, list[list[float]]]:
-    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+def request_endpoint(
+    url: str, body: bytes, timeout: float
+) -> tuple[float, list[list[float]]]:
+    request = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
     start = time.perf_counter_ns()
     with urllib.request.urlopen(request, timeout=timeout) as response:
         payload = json.loads(response.read())
@@ -381,7 +462,9 @@ def request_endpoint(url: str, body: bytes, timeout: float) -> tuple[float, list
     if not isinstance(data, list) or not data:
         raise RuntimeError("endpoint response lacks embeddings")
     embeddings = [item.get("embedding") for item in data]
-    if any(not isinstance(embedding, list) or not embedding for embedding in embeddings):
+    if any(
+        not isinstance(embedding, list) or not embedding for embedding in embeddings
+    ):
         raise RuntimeError("endpoint response has an invalid embedding")
     return elapsed, embeddings
 

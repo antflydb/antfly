@@ -56,7 +56,9 @@ def parse_args() -> argparse.Namespace:
     parity_parser = subparsers.add_parser("parity")
     add_common(parity_parser)
     parity_parser.add_argument("--native-binary", required=True)
-    parity_parser.add_argument("--native-backend", choices=("native", "metal"), default="metal")
+    parity_parser.add_argument(
+        "--native-backend", choices=("native", "metal"), default="metal"
+    )
     parity_parser.add_argument("--native-warmups", type=int, default=1)
     parity_parser.add_argument("--native-repeats", type=int, default=1)
 
@@ -73,7 +75,9 @@ def parse_args() -> argparse.Namespace:
 def parse_int_set(value: str, allowed: set[int], label: str) -> list[int]:
     result = [int(item) for item in value.split(",")]
     if not result or any(item not in allowed for item in result):
-        raise argparse.ArgumentTypeError(f"{label} must be drawn from {sorted(allowed)}")
+        raise argparse.ArgumentTypeError(
+            f"{label} must be drawn from {sorted(allowed)}"
+        )
     return result
 
 
@@ -87,11 +91,15 @@ class BgeM3Embedder:
         self.torch = torch
         self.device_name = device_name
         self.device = torch.device(device_name)
-        self.model = AutoModel.from_pretrained(
-            model_dir,
-            local_files_only=True,
-            torch_dtype=torch.float32,
-        ).to(self.device).eval()
+        self.model = (
+            AutoModel.from_pretrained(
+                model_dir,
+                local_files_only=True,
+                torch_dtype=torch.float32,
+            )
+            .to(self.device)
+            .eval()
+        )
         self.model_name = model_name
         self.model_sha = sha256_file(Path(model_dir) / "model.safetensors")
 
@@ -128,7 +136,10 @@ def load_fixture(path: str) -> dict[str, Any]:
         if (
             not isinstance(ids, list)
             or len(ids) != length
-            or any(not isinstance(value, int) or value < 0 or value >= VOCAB_SIZE for value in ids)
+            or any(
+                not isinstance(value, int) or value < 0 or value >= VOCAB_SIZE
+                for value in ids
+            )
             or not isinstance(mask, list)
             or len(mask) != length
             or any(value not in (0, 1) for value in mask)
@@ -137,7 +148,9 @@ def load_fixture(path: str) -> dict[str, Any]:
     return fixture
 
 
-def fixture_tensors(embedder: BgeM3Embedder, fixture: dict[str, Any], batch: int, length: int):
+def fixture_tensors(
+    embedder: BgeM3Embedder, fixture: dict[str, Any], batch: int, length: int
+):
     torch = embedder.torch
     ids = [fixture[f"input_ids_{length}"]] * batch
     masks = [fixture[f"attention_mask_{length}"]] * batch
@@ -153,7 +166,9 @@ def direct(args: argparse.Namespace) -> int:
     try:
         for length in args.sequence_lengths:
             for batch in args.batches:
-                input_ids, attention_mask = fixture_tensors(embedder, fixture, batch, length)
+                input_ids, attention_mask = fixture_tensors(
+                    embedder, fixture, batch, length
+                )
                 for _ in range(args.warmups):
                     embedder.embed_ids(input_ids, attention_mask)
                 rss_before = rss_bytes()
@@ -227,17 +242,27 @@ def parity(args: argparse.Namespace) -> int:
         for batch in args.batches:
             command = [
                 str(native_binary),
-                "--model-dir", str(Path(args.model_dir).resolve()),
-                "--model-sha", model_sha,
-                "--fixture", str(fixture_path),
-                "--backend", args.native_backend,
-                "--batch", str(batch),
-                "--seq-len", str(length),
-                "--warmup-iters", str(args.native_warmups),
-                "--measure-iters", str(args.native_repeats),
+                "--model-dir",
+                str(Path(args.model_dir).resolve()),
+                "--model-sha",
+                model_sha,
+                "--fixture",
+                str(fixture_path),
+                "--backend",
+                args.native_backend,
+                "--batch",
+                str(batch),
+                "--seq-len",
+                str(length),
+                "--warmup-iters",
+                str(args.native_warmups),
+                "--measure-iters",
+                str(args.native_repeats),
                 "--print-embeddings",
             ]
-            completed = subprocess.run(command, text=True, capture_output=True, check=True)
+            completed = subprocess.run(
+                command, text=True, capture_output=True, check=True
+            )
             records = [
                 json.loads(line)
                 for line in (completed.stdout + "\n" + completed.stderr).splitlines()
@@ -273,7 +298,9 @@ def parity(args: argparse.Namespace) -> int:
     return 0 if passed else 1
 
 
-def compare_embeddings(actual: list[list[float]], reference: list[list[float]]) -> dict[str, float]:
+def compare_embeddings(
+    actual: list[list[float]], reference: list[list[float]]
+) -> dict[str, float]:
     if len(actual) != len(reference) or any(
         len(left) != len(right) for left, right in zip(actual, reference)
     ):
