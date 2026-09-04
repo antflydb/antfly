@@ -178,11 +178,16 @@ pub const ColdSequentialReader = struct {
 
     pub const VTable = struct {
         read_range_alloc: *const fn (*anyopaque, Allocator, u64, usize) anyerror![]u8,
+        read_range_into: *const fn (*anyopaque, u64, []u8) anyerror!void,
         deinit: *const fn (*anyopaque) void,
     };
 
     pub fn readRangeAlloc(self: *ColdSequentialReader, allocator: Allocator, offset: u64, len: usize) ![]u8 {
         return try self.vtable.read_range_alloc(self.ptr, allocator, offset, len);
+    }
+
+    pub fn readRangeInto(self: *ColdSequentialReader, offset: u64, out: []u8) !void {
+        return try self.vtable.read_range_into(self.ptr, offset, out);
     }
 
     pub fn deinit(self: *ColdSequentialReader) void {
@@ -502,6 +507,7 @@ pub const Storage = struct {
         append_file_absolute: ?*const fn (*anyopaque, []const u8, []const u8, bool) anyerror!void = null,
         begin_atomic_write: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!AtomicWriteSink = null,
         begin_cold_sequential_read: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!ColdSequentialReader = null,
+        begin_cold_random_read: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!ColdSequentialReader = null,
         cold_sequential_reader_capacity: ?*const fn (*anyopaque) usize = null,
         /// Persists file contents without implying namespace durability.
         sync_contents_absolute: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
@@ -643,6 +649,16 @@ pub const Storage = struct {
         return try GenericColdSequentialReader.create(allocator, self, path);
     }
 
+    /// Opens a maintenance-private descriptor for sparse immutable reads.
+    /// Native implementations bypass completed pages without leaking their
+    /// cache policy into the foreground descriptor cache.
+    pub fn beginColdRandomRead(self: Storage, allocator: Allocator, path: []const u8) !ColdSequentialReader {
+        if (self.vtable.begin_cold_random_read) |begin_cold_random_read| {
+            return try begin_cold_random_read(self.ptr, allocator, path);
+        }
+        return try GenericColdSequentialReader.create(allocator, self, path);
+    }
+
     /// Acquires a descriptor/handle bound to the currently opened file, not a
     /// path which may later be atomically replaced. Generation capture uses
     /// this stronger contract so materialization can safely outlive mutation
@@ -736,6 +752,7 @@ const GenericColdSequentialReader = struct {
 
     const vtable: ColdSequentialReader.VTable = .{
         .read_range_alloc = readRangeAlloc,
+        .read_range_into = readRangeInto,
         .deinit = deinitErased,
     };
 
@@ -753,6 +770,14 @@ const GenericColdSequentialReader = struct {
     fn readRangeAlloc(ptr: *anyopaque, allocator: Allocator, offset: u64, len: usize) ![]u8 {
         const self: *GenericColdSequentialReader = @ptrCast(@alignCast(ptr));
         return try self.storage.readFileRangeAlloc(allocator, self.path, offset, len);
+    }
+
+    fn readRangeInto(ptr: *anyopaque, offset: u64, out: []u8) !void {
+        const self: *GenericColdSequentialReader = @ptrCast(@alignCast(ptr));
+        const bytes = try self.storage.readFileRangeAlloc(self.allocator, self.path, offset, out.len);
+        defer self.allocator.free(bytes);
+        if (bytes.len != out.len) return error.EndOfStream;
+        @memcpy(out, bytes);
     }
 
     fn deinitErased(ptr: *anyopaque) void {
@@ -1916,6 +1941,7 @@ else blk: {
                 .append_file_absolute = appendFileAbsolute,
                 .begin_atomic_write = beginAtomicWrite,
                 .begin_cold_sequential_read = beginColdSequentialRead,
+                .begin_cold_random_read = beginColdRandomRead,
                 .cold_sequential_reader_capacity = coldSequentialReaderCapacity,
                 .sync_contents_absolute = syncFileContentsAbsolute,
                 .sync_parent_absolute = syncParentAbsolute,
@@ -2094,7 +2120,12 @@ else blk: {
 
             fn beginColdSequentialRead(ptr: *anyopaque, allocator: Allocator, path: []const u8) !ColdSequentialReader {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                return try NativeColdSequentialReader.create(allocator, path, self.state);
+                return try NativeColdSequentialReader.create(allocator, path, self.state, .sequential);
+            }
+
+            fn beginColdRandomRead(ptr: *anyopaque, allocator: Allocator, path: []const u8) !ColdSequentialReader {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                return try NativeColdSequentialReader.create(allocator, path, self.state, .random);
             }
 
             fn coldSequentialReaderCapacity(ptr: *anyopaque) usize {
@@ -2209,6 +2240,7 @@ else blk: {
             .append_file_absolute = appendFileAbsolute,
             .begin_atomic_write = beginAtomicWrite,
             .begin_cold_sequential_read = beginColdSequentialRead,
+            .begin_cold_random_read = beginColdRandomRead,
             .cold_sequential_reader_capacity = coldSequentialReaderCapacity,
             .sync_contents_absolute = syncFileContentsAbsolute,
             .sync_parent_absolute = syncParentAbsolute,
@@ -2379,7 +2411,12 @@ else blk: {
 
         fn beginColdSequentialRead(ptr: *anyopaque, allocator: Allocator, path: []const u8) !ColdSequentialReader {
             const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            return try NativeColdSequentialReader.create(allocator, path, state);
+            return try NativeColdSequentialReader.create(allocator, path, state, .sequential);
+        }
+
+        fn beginColdRandomRead(ptr: *anyopaque, allocator: Allocator, path: []const u8) !ColdSequentialReader {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            return try NativeColdSequentialReader.create(allocator, path, state, .random);
         }
 
         fn coldSequentialReaderCapacity(ptr: *anyopaque) usize {
@@ -3036,10 +3073,13 @@ const NativeColdSequentialReader = struct {
 
     const vtable: ColdSequentialReader.VTable = .{
         .read_range_alloc = readRangeAlloc,
+        .read_range_into = readRangeInto,
         .deinit = deinitErased,
     };
 
-    fn create(allocator: Allocator, path: []const u8, state: *NativeStorageState) !ColdSequentialReader {
+    const Intent = enum { sequential, random };
+
+    fn create(allocator: Allocator, path: []const u8, state: *NativeStorageState, intent: Intent) !ColdSequentialReader {
         if (comptime !supports_posix_fd_cache) return error.UnsupportedNativeStorageRuntime;
 
         var permit = try state.acquireFdPermit();
@@ -3055,7 +3095,10 @@ const NativeColdSequentialReader = struct {
             // This descriptor is maintenance-private, so F_NOCACHE cannot
             // alter foreground query reads through the shared descriptor cache.
             _ = std.posix.system.fcntl(fd, std.posix.F.NOCACHE, @as(usize, 1)),
-            .linux => _ = std.os.linux.fadvise(fd, 0, 0, std.os.linux.POSIX_FADV.SEQUENTIAL),
+            .linux => _ = std.os.linux.fadvise(fd, 0, 0, switch (intent) {
+                .sequential => std.os.linux.POSIX_FADV.SEQUENTIAL,
+                .random => std.os.linux.POSIX_FADV.RANDOM,
+            }),
             else => {},
         }
 
@@ -3072,11 +3115,20 @@ const NativeColdSequentialReader = struct {
         const self: *NativeColdSequentialReader = @ptrCast(@alignCast(ptr));
         const out = try allocator.alloc(u8, len);
         errdefer allocator.free(out);
+        try self.readInto(offset, out);
+        return out;
+    }
+
+    fn readRangeInto(ptr: *anyopaque, offset: u64, out: []u8) !void {
+        const self: *NativeColdSequentialReader = @ptrCast(@alignCast(ptr));
+        return try self.readInto(offset, out);
+    }
+
+    fn readInto(self: *NativeColdSequentialReader, offset: u64, out: []u8) !void {
         try readAllAtOffset(self.fd, out, offset);
         if (builtin.os.tag == .linux) {
-            _ = std.os.linux.fadvise(self.fd, @intCast(offset), @intCast(len), std.os.linux.POSIX_FADV.DONTNEED);
+            _ = std.os.linux.fadvise(self.fd, @intCast(offset), @intCast(out.len), std.os.linux.POSIX_FADV.DONTNEED);
         }
-        return out;
     }
 
     fn deinitErased(ptr: *anyopaque) void {
@@ -3812,6 +3864,14 @@ test "cold sequential reader is isolated from foreground descriptor cache" {
     try std.testing.expectEqualStrings("ab", foreground);
 
     reader.deinit();
+    try std.testing.expectEqual(before, native.snapshotStats().fd_admitted_descriptors);
+
+    var random_reader = try native.storage().beginColdRandomRead(std.testing.allocator, path);
+    try std.testing.expectEqual(before + 1, native.snapshotStats().fd_admitted_descriptors);
+    var random_buf: [3]u8 = undefined;
+    try random_reader.readRangeInto(4, &random_buf);
+    try std.testing.expectEqualStrings("efg", &random_buf);
+    random_reader.deinit();
     try std.testing.expectEqual(before, native.snapshotStats().fd_admitted_descriptors);
 }
 

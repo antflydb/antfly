@@ -1416,6 +1416,88 @@ pub const Opened = struct {
     wal: vector_wal.Replay,
     wal_order: std.ArrayListUnmanaged(usize),
 
+    /// Maintenance-only view of one immutable generation. Every block uses a
+    /// private cold-random descriptor, so sparse projection copying neither
+    /// faults the query mmap nor changes its FD cache policy. The existing FD
+    /// governor bounds the complete set and preserves its reserved headroom.
+    pub const ColdProjectionSession = struct {
+        opened: *const Opened,
+        readers: []lsm_backend.storage_io.ColdSequentialReader,
+        opened_readers: usize = 0,
+
+        fn init(opened: *const Opened) !ColdProjectionSession {
+            if (opened.blocks.len > opened.store.storage.coldSequentialReaderCapacity())
+                return error.DescriptorAdmissionCapacityTooSmall;
+            const readers = try opened.store.alloc.alloc(lsm_backend.storage_io.ColdSequentialReader, opened.blocks.len);
+            var session: ColdProjectionSession = .{ .opened = opened, .readers = readers };
+            errdefer session.deinit();
+            for (opened.readers) |reader| {
+                const path = try opened.store.blockPathAlloc(reader.generation, reader.shard_id);
+                defer opened.store.alloc.free(path);
+                session.readers[session.opened_readers] = try opened.store.storage.beginColdRandomRead(opened.store.alloc, path);
+                session.opened_readers += 1;
+            }
+            return session;
+        }
+
+        pub fn deinit(self: *ColdProjectionSession) void {
+            for (self.readers[0..self.opened_readers]) |*reader| reader.deinit();
+            self.opened.store.alloc.free(self.readers);
+            self.* = undefined;
+        }
+
+        fn readProjectionInto(
+            self: *const ColdProjectionSession,
+            located: LocatedValue,
+            scratch: []u8,
+        ) !vector_block.Value {
+            return switch (located) {
+                .wal => |value| value,
+                .block => |block| blk: {
+                    _ = try self.opened.readerForLocated(block.reader_index, block.reader_generation, block.reader_shard_id);
+                    if (scratch.len < block.location.vector_len) return error.BufferTooSmall;
+                    const vector_bytes = scratch[0..block.location.vector_len];
+                    try self.readers[block.reader_index].readRangeInto(@intCast(block.location.vector_offset), vector_bytes);
+                    break :blk try block.location.projectionValueFromPayload(vector_bytes);
+                },
+            };
+        }
+
+        fn runProjectionRead(self: *const ColdProjectionSession, request: *ProjectionReadRequest) std.Io.Cancelable!void {
+            request.value = self.readProjectionInto(request.located, request.scratch) catch |err| {
+                request.err = err;
+                return;
+            };
+        }
+
+        pub fn readProjectionsIntoBatch(
+            self: *const ColdProjectionSession,
+            io: ?std.Io,
+            requests: []ProjectionReadRequest,
+        ) !ReadBatchStats {
+            try runPositionalReadBatch(
+                ProjectionReadRequest,
+                self,
+                io,
+                requests,
+                ColdProjectionSession.runProjectionRead,
+            );
+            var stats: ReadBatchStats = .{};
+            for (requests) |request| switch (request.located) {
+                .wal => {},
+                .block => |block| {
+                    stats.physical_reads += 1;
+                    stats.physical_bytes +|= block.location.vector_len;
+                },
+            };
+            return stats;
+        }
+    };
+
+    pub fn beginColdProjectionSession(self: *const Opened) !ColdProjectionSession {
+        return try ColdProjectionSession.init(self);
+    }
+
     pub fn deinit(self: *Opened) void {
         const alloc = self.store.alloc;
         self.store.deinit();
@@ -2549,17 +2631,17 @@ pub const Opened = struct {
 
 fn runPositionalReadBatch(
     comptime Request: type,
-    opened: *const Opened,
+    context: anytype,
     maybe_io: ?std.Io,
     requests: []Request,
-    comptime run: fn (*const Opened, *Request) std.Io.Cancelable!void,
+    comptime run: anytype,
 ) !void {
     const io = maybe_io orelse {
-        for (requests) |*request| try run(opened, request);
+        for (requests) |*request| try run(context, request);
         return;
     };
     if (requests.len < 2) {
-        for (requests) |*request| try run(opened, request);
+        for (requests) |*request| try run(context, request);
         return;
     }
 
@@ -2567,7 +2649,7 @@ fn runPositionalReadBatch(
     var concurrency_available = true;
     while (start < requests.len) {
         if (!concurrency_available) {
-            for (requests[start..]) |*request| try run(opened, request);
+            for (requests[start..]) |*request| try run(context, request);
             return;
         }
 
@@ -2575,7 +2657,7 @@ fn runPositionalReadBatch(
         var group = std.Io.Group.init;
         var scheduled_end = start;
         while (scheduled_end < end) : (scheduled_end += 1) {
-            group.concurrent(io, run, .{ opened, &requests[scheduled_end] }) catch {
+            group.concurrent(io, run, .{ context, &requests[scheduled_end] }) catch {
                 concurrency_available = false;
                 break;
             };
@@ -2583,7 +2665,7 @@ fn runPositionalReadBatch(
         // Await is a cancellation propagation boundary and guarantees all
         // issued reads have stopped touching request memory before returning.
         try group.await(io);
-        for (requests[scheduled_end..end]) |*request| try run(opened, request);
+        for (requests[scheduled_end..end]) |*request| try run(context, request);
         start = end;
     }
 }
@@ -3294,6 +3376,23 @@ test "vector block positional lookup reads mmap payload through retained descrip
     var expected_projection_bytes: u64 = 0;
     for (projection_requests) |request| expected_projection_bytes += @intCast(request.located.block.location.vector_len);
     try std.testing.expectEqual(expected_projection_bytes, projection_read_stats.physical_bytes);
+
+    var cold_session = try opened.beginColdProjectionSession();
+    defer cold_session.deinit();
+    var cold_scratch: [keys.len][256]u8 = undefined;
+    var cold_requests: [keys.len]ProjectionReadRequest = undefined;
+    for (projection_requests, 0..) |request, i| {
+        cold_requests[i] = .{ .located = request.located, .scratch = &cold_scratch[i] };
+    }
+    const cold_stats = try cold_session.readProjectionsIntoBatch(io_impl.io(), &cold_requests);
+    try std.testing.expectEqual(projection_read_stats.physical_reads, cold_stats.physical_reads);
+    try std.testing.expectEqual(projection_read_stats.physical_bytes, cold_stats.physical_bytes);
+    for (cold_requests, projection_requests) |cold, ordinary| {
+        try std.testing.expect(cold.err == null);
+        try std.testing.expectEqualSlices(u8, ordinary.value.?.bytes, cold.value.?.bytes);
+        try std.testing.expectEqual(ordinary.value.?.scale, cold.value.?.scale);
+        try std.testing.expectEqual(ordinary.value.?.quantization_error_norm, cold.value.?.quantization_error_norm);
+    }
     var exact_scratch: [keys.len][256]u8 = undefined;
     var exact_requests: [keys.len]ExactReadRequest = undefined;
     for (projection_requests, 0..) |request, i| {

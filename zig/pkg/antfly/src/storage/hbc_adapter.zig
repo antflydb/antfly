@@ -3939,6 +3939,8 @@ pub const HBCIndex = struct {
     external_vector_batch_located_distance_loader: ?ExternalVectorBatchLocatedDistanceLoader = null,
     external_vector_bounded_distance_available: ?ExternalVectorBoundedDistanceAvailable = null,
     external_vector_projection_build_loader: ?vectorindex_hbc_runtime.NativeProjectionBuildLoader = null,
+    external_vector_projection_build_begin: ?vectorindex_hbc_runtime.NativeProjectionBuildBegin = null,
+    external_vector_projection_build_end: ?vectorindex_hbc_runtime.NativeProjectionBuildEnd = null,
 
     const EnvOwner = hbc_backend.OpenedBackend;
     pub const ExternalVectorLoader = *const fn (ctx: *anyopaque, alloc: Allocator, vector_id: u64, metadata: []const u8) anyerror![]f32;
@@ -6371,6 +6373,17 @@ pub const HBCIndex = struct {
         self.external_vector_projection_build_loader = loader;
     }
 
+    pub fn setExternalVectorProjectionBuildLifecycle(
+        self: *HBCIndex,
+        ctx: *anyopaque,
+        begin: vectorindex_hbc_runtime.NativeProjectionBuildBegin,
+        end: vectorindex_hbc_runtime.NativeProjectionBuildEnd,
+    ) void {
+        self.external_vector_ctx = ctx;
+        self.external_vector_projection_build_begin = begin;
+        self.external_vector_projection_build_end = end;
+    }
+
     pub fn hasExternalVectorLoader(self: *const HBCIndex) bool {
         return self.external_vector_ctx != null and
             (self.external_vector_loader != null or self.external_vector_scratch_loader != null or self.external_vector_batch_scratch_loader != null or self.external_vector_batch_transformed_matrix_loader != null or self.external_vector_batch_distance_loader != null or self.external_vector_batch_bounded_distance_loader != null);
@@ -7572,6 +7585,8 @@ pub const HBCIndex = struct {
                 .{
                     .ctx = self.external_vector_ctx.?,
                     .loader = self.external_vector_projection_build_loader.?,
+                    .begin = self.external_vector_projection_build_begin,
+                    .end = self.external_vector_projection_build_end,
                 }
             else
                 null,
@@ -8667,6 +8682,18 @@ pub const HBCIndex = struct {
         var projection_payload = std.ArrayListUnmanaged(u8).empty;
         defer projection_payload.deinit(alloc);
 
+        var projection_build_started = false;
+        if (projection_source) |source| {
+            if (source.begin) |begin| {
+                try begin(source.ctx, covered_source_sequence);
+                projection_build_started = true;
+            }
+        }
+        defer if (projection_build_started) {
+            const source = projection_source.?;
+            if (source.end) |end| end(source.ctx);
+        };
+
         var posting_count: u64 = 0;
         var node_id: u64 = 1;
         while (node_id <= metadata.node_count) : (node_id = std.math.add(u64, node_id, 1) catch break) {
@@ -8963,6 +8990,18 @@ pub const HBCIndex = struct {
         defer projection_values.deinit(alloc);
         var projection_payload = std.ArrayListUnmanaged(u8).empty;
         defer projection_payload.deinit(alloc);
+
+        var projection_build_started = false;
+        if (projection_source) |source| {
+            if (source.begin) |begin| {
+                try begin(source.ctx, covered_source_sequence);
+                projection_build_started = true;
+            }
+        }
+        defer if (projection_build_started) {
+            const source = projection_source.?;
+            if (source.end) |end| end(source.ctx);
+        };
 
         node_id = 1;
         while (node_id <= metadata.node_count) : (node_id = std.math.add(u64, node_id, 1) catch break) {
@@ -9358,6 +9397,8 @@ pub const HBCIndex = struct {
                     .{
                         .ctx = self.external_vector_ctx.?,
                         .loader = self.external_vector_projection_build_loader.?,
+                        .begin = self.external_vector_projection_build_begin,
+                        .end = self.external_vector_projection_build_end,
                     }
                 else
                     null,
@@ -14737,6 +14778,52 @@ pub const HBCIndex = struct {
         return try vectorindex_hbc_index.search(self, query, k, nowNs, elapsedSince);
     }
 
+    pub fn acquireSearchAdmission(
+        self: *HBCIndex,
+        active_count: u64,
+        node_count: u64,
+        req: SearchRequest,
+    ) !resource_manager_mod.DenseSearchAdmissionLease {
+        const manager = self.resource_manager orelse return .{};
+        const search_width: u64 = @intCast(req.search_width orelse self.config.search_width);
+        const branching_factor: u64 = @intCast(@max(self.config.branching_factor, 2));
+        // A bulk-built high-fanout tree has approximately one internal node
+        // per branching_factor nodes. Derive its leaf occupancy from the
+        // immutable published shape instead of charging every selected leaf
+        // as completely full. The latter overcharged this 1M tree by 43% and
+        // moved admission below the measured memory-bandwidth knee.
+        const estimated_internal_nodes = if (node_count <= 1)
+            0
+        else
+            std.math.divCeil(u64, node_count - 1, branching_factor) catch unreachable;
+        const estimated_leaf_count = @max(node_count -| estimated_internal_nodes, 1);
+        const mean_leaf_occupancy = std.math.divCeil(u64, active_count, estimated_leaf_count) catch unreachable;
+        const candidate_count = @min(active_count, search_width *| mean_leaf_occupancy);
+        const dimensions: u64 = @intCast(@max(self.config.dims, 1));
+        // RaBitQ scans one bit per transformed dimension. Non-quantized
+        // indexes scan their resident f32 plane. Directory and heap metadata
+        // are deliberately excluded: this permit models the shared bandwidth
+        // plane, while their owned bytes remain normal ResourceManager usage.
+        const bytes_per_candidate = if (self.config.use_quantization)
+            std.math.divCeil(u64, dimensions, 8) catch unreachable
+        else
+            dimensions *| @sizeOf(f32);
+        const estimated_scan_bytes = @max(candidate_count *| bytes_per_candidate, 1);
+        const cancellation: ?resource_manager_mod.DenseSearchCancellation = if (req.cancellation) |token|
+            .{ .ptr = token.ptr, .is_cancelled = token.is_cancelled_fn }
+        else
+            null;
+        return try manager.acquireDenseSearchBandwidth(estimated_scan_bytes, cancellation, self.runtimeIo());
+    }
+
+    pub fn releaseSearchAdmission(
+        self: *HBCIndex,
+        lease: *resource_manager_mod.DenseSearchAdmissionLease,
+    ) void {
+        _ = self;
+        lease.release();
+    }
+
     pub fn searchWithRequest(self: *HBCIndex, req: SearchRequest) !SearchResults {
         return try vectorindex_hbc_index.searchWithRequest(self, req, nowNs, elapsedSince);
     }
@@ -19079,6 +19166,38 @@ test "hbc retains a bounded pool of concurrent search scratch" {
         primary_bytes,
         resource_manager.sliceStats(.dense_search_working_set).used_bytes,
     );
+}
+
+test "hbc search charges estimated quantized scan bytes to node admission" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+        .dense_search_bandwidth_capacity_bytes = 64,
+    });
+    defer resource_manager.deinit(alloc);
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 64,
+        .leaf_size = 2,
+        .branching_factor = 2,
+        .search_width = 4,
+    });
+    defer idx.close();
+    idx.attachResourceManager(&resource_manager);
+    var first: [64]f32 = @splat(0);
+    var second: [64]f32 = @splat(1);
+    try idx.insert(1, &first);
+    try idx.insert(2, &second);
+    var results = try idx.searchWithRequest(.{ .query = &first, .k = 1 });
+    defer results.deinit();
+
+    const stats = resource_manager.denseSearchAdmissionStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.admissions);
+    try std.testing.expectEqual(@as(u64, 16), stats.peak_active_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.peak_active_queries);
+    try std.testing.expectEqual(@as(u64, 0), stats.active_queries);
 }
 
 test "hbc resource manager reattachment is idempotent and transfers local cache usage" {

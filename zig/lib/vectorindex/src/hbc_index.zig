@@ -2543,6 +2543,15 @@ fn searchProfiledRequestAttempt(
     // retain an MVCC snapshot or request workspace while waiting, and honor a
     // disconnect before acquiring either resource.
     try search_types.checkCancelled(req);
+    var search_admission = if (comptime @hasDecl(Index, "acquireSearchAdmission"))
+        try self.acquireSearchAdmission(published_snapshot.active_count, published_snapshot.node_count, req)
+    else {};
+    defer if (comptime @hasDecl(Index, "releaseSearchAdmission")) {
+        self.releaseSearchAdmission(&search_admission);
+    };
+    // Admission can wait behind other bandwidth-heavy scans. It deliberately
+    // happens before the MVCC transaction and request workspace are acquired.
+    try search_types.checkCancelled(req);
     const setup_start = total_start;
     const txn_start = now_fn_u64();
     var txn = if (comptime @hasDecl(Index, "beginRuntimeSearchTxnForCoverage"))

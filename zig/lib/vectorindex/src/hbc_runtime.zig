@@ -117,9 +117,14 @@ pub const NativeProjectionBuildLoader = *const fn (
     source_sequence: u64,
 ) anyerror!void;
 
+pub const NativeProjectionBuildBegin = *const fn (ctx: *anyopaque, source_sequence: u64) anyerror!void;
+pub const NativeProjectionBuildEnd = *const fn (ctx: *anyopaque) void;
+
 pub const NativeProjectionBuildSource = struct {
     ctx: *anyopaque,
     loader: NativeProjectionBuildLoader,
+    begin: ?NativeProjectionBuildBegin = null,
+    end: ?NativeProjectionBuildEnd = null,
 };
 
 pub const WriteProfile = struct {

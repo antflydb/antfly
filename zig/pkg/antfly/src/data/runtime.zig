@@ -2822,6 +2822,17 @@ fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.R
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_hard_limit_rejections_total", "counter", "Aggregate managed host-memory hard-limit rejections", snapshot.memory.hard_limit_rejections);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_accounting_errors_total", "counter", "Fail-closed host-memory release accounting errors", snapshot.memory.accounting_errors);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_pressure", "gauge", "Aggregate managed host-memory pressure state, 0 normal, 1 soft, 2 hard", pressureValue(snapshot.memory.pressure));
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_capacity_bytes", "gauge", "Node-wide candidate-scan bandwidth capacity", snapshot.dense_search_admission.capacity_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_active_bytes", "gauge", "Estimated candidate bytes held by active dense scans", snapshot.dense_search_admission.active_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_peak_active_bytes", "gauge", "Peak estimated candidate bytes held by active dense scans", snapshot.dense_search_admission.peak_active_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_active_queries", "gauge", "Dense queries currently holding candidate-scan permits", snapshot.dense_search_admission.active_queries);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_peak_active_queries", "gauge", "Peak dense queries concurrently holding candidate-scan permits", snapshot.dense_search_admission.peak_active_queries);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_queued_queries", "gauge", "Dense queries waiting for candidate-scan permits", snapshot.dense_search_admission.queued_queries);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_peak_queued_queries", "gauge", "Peak dense queries waiting for candidate-scan permits", snapshot.dense_search_admission.peak_queued_queries);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_grants_total", "counter", "Dense candidate-scan permits granted", snapshot.dense_search_admission.admissions);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_waits_total", "counter", "Dense queries queued for candidate-scan permits", snapshot.dense_search_admission.waits);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_cancellations_total", "counter", "Queued dense searches cancelled before admission", snapshot.dense_search_admission.cancellations);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_wait_ns_total", "counter", "Cumulative nanoseconds dense queries spent queued for candidate-scan permits", snapshot.dense_search_admission.wait_ns);
     try writeResourceMetricFamily(writer, snapshot, .used_bytes, "antfly_resource_used_bytes", "gauge", "Resource slice bytes currently accounted");
     try writeResourceMetricFamily(writer, snapshot, .peak_bytes, "antfly_resource_peak_bytes", "gauge", "Resource slice peak bytes accounted");
     try writeResourceMetricFamily(writer, snapshot, .soft_limit_bytes, "antfly_resource_soft_limit_bytes", "gauge", "Resource slice soft limit in bytes");

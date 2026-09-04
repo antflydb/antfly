@@ -4399,6 +4399,78 @@ correct monotonically advancing counts, and query/durable state never regressed;
 status UX should distinguish `temporarily_unavailable` from a literal empty
 index in a separate change.
 
+#### Node-wide scan admission and cold publication experiment
+
+The concurrency-30 regression was a real memory-bandwidth knee rather than a
+row-directory regression. On the existing 1M generation, fixed active-scan
+caps of 24/20/16/12 produced 723.6/701.8/730.3/667.8 QPS and p95 latency of
+90.8/89.5/85.7/92.0 ms respectively. The cap-16 prototype was the best sample,
+but a process-wide constant would encode this machine and corpus into product
+behavior. It was removed after establishing the knee.
+
+The production-shaped replacement is a FIFO, work-weighted node admission
+queue owned by `ResourceManager`. Each query is charged for its estimated
+candidate scan bytes using the published active-vector/node shape, search
+width, dimensions, and quantization encoding. It waits before acquiring an
+MVCC transaction, generation fence, or query scratch; waits are cooperative
+with the runtime and preserve request cancellation. Oversized queries consume
+the complete budget and retain progress. The default capacity derives from the
+dense-search working-set budget, can be explicitly configured or disabled,
+and exports capacity, active/queued query and byte high waters, grants, waits,
+cancellations, and cumulative wait time.
+
+The same experiment isolates full-checkpoint projection reads from query
+residency. One projection-build lifecycle pins a single exact vector generation
+at the requested source sequence for the whole posting generation. Native
+storage opens maintenance-private, FD-governed random-read descriptors; on
+macOS they use `F_NOCACHE`, and on Linux they use random advice plus per-read
+`DONTNEED`. Query mmap/descriptor policy is never changed. If a generation has
+more blocks than the private-descriptor capacity, publication retains the
+pinned-generation correctness boundary and falls back to ordinary positional
+reads. Focused tests prove descriptor accounting, byte-equivalent batched
+projection reads, FIFO/work-weighted admission, and cancelled-waiter removal.
+
+A fresh public-API 50K qualification used batch 100, four load workers, native
+HBC, float16 vector blocks, boundary rerank, and 30-second concurrency phases.
+It completed in 30.49 seconds (20.44 insert + 10.05 catch-up), retained 0.9862
+recall, delivered 274/1,109/1,198/1,229 QPS at concurrency 1/10/20/30, and had
+p95 latency of 4.19/14.76/34.46/59.56 ms. Live/restart peak RSS was 1.88 GB /
+345 MB. Its 30 active scans totaled only 110 MB against the 384-MiB budget, so
+there were no waits: the governor stays out of the way below the bandwidth
+knee.
+
+The fresh public-API 1M qualification also completed without capture,
+publication, restart, or query failures:
+
+| 1M row V2 | Before admission/cold reads | Admission + cold reads | Change |
+| --- | ---: | ---: | ---: |
+| Insert | 636.06 s | 634.62 s | -0.2% |
+| Finalize | 74.18 s | 89.63 s | +20.8% |
+| Total ready | 710.24 s | 724.25 s | +2.0% |
+| Recall | 0.9929 | 0.9924 | -0.05 pp |
+| QPS, concurrency 1 / 10 / 20 / 30 | 70.6 / 636.1 / 642.3 / 533.9 | 70.7 / 626.8 / 701.6 / 649.6 | +0.2% / -1.5% / +9.2% / +21.7% |
+| p95 ms, concurrency 1 / 10 / 20 / 30 | 13.95 / 23.82 / 75.17 / 111.86 | 13.85 / 24.68 / 66.73 / 87.48 | -0.7% / +3.6% / -11.2% / -21.8% |
+| Cache-inclusive live peak RSS | 6.72 GB | 6.26 GB | -6.9% |
+| Restart peak RSS | 2.12 GB | 2.37 GB | +11.8% |
+
+The governor admitted at most 17 simultaneous 1M scans, charged 381 MB of its
+402.7-MB capacity, queued at most 13 requests, and observed no cancellations.
+A restarted reverse-order 30/20/10/1 curve delivered
+666.0/699.6/624.7/97.6 QPS with p95 82.72/56.56/24.85/11.60 ms. Concurrency 30
+is therefore 9.5 percent faster with 16.9 percent lower p95 than the uncapped
+reverse-order control (608.3 QPS / 99.54 ms). It is within 1.2 percent of
+r126's 673.7 QPS while improving on r126's 92.88-ms p95.
+
+Candidate work and exact completion stayed unchanged at 239,918 approximate
+and 146.6 exact vectors/query. The admission gain is not a recall, routing, or
+rerank shortcut. The cold-reader result is useful but not free: it removed
+about 462 MB from the live RSS high water while adding 15.45 seconds to final
+publication, and its 6.26-GB peak remains 9.2 percent above r126's 5.73 GB.
+The durable end state remains chunked posting generations which reuse clean
+projection chunks instead of rereading and rewriting the complete 1.83-GB
+generation. Until then, private cold descriptors bound cache overlap at a
+modest two-percent total-load cost without affecting foreground query layout.
+
 ## Next checks
 
 1. Narrow broad persisted L0 source ranges with adaptive, workload-independent

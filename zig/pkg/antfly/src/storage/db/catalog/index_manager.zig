@@ -2536,6 +2536,23 @@ pub const IndexManager = struct {
     };
 
     threadlocal var active_dense_vector_load_session: ?*DenseVectorLoadSession = null;
+    const DenseProjectionBuildSession = struct {
+        context: *DenseVectorLoadContext,
+        source_sequence: u64,
+        generation: *SharedVectorBlockGeneration,
+        cold_reader: ?vector_block_store_mod.Opened.ColdProjectionSession,
+
+        fn deinit(self: *@This()) void {
+            if (self.cold_reader) |*reader| reader.deinit();
+            self.generation.release();
+            self.* = undefined;
+        }
+    };
+    /// Posting publication is synchronous on one runtime thread. Pin both the
+    /// immutable vector generation and its maintenance-private descriptors for
+    /// the complete projection pass so every leaf observes one source boundary
+    /// without warming the query-serving mappings.
+    threadlocal var active_dense_projection_build_session: ?DenseProjectionBuildSession = null;
     // A full native posting checkpoint copies the vector projection plane one
     // leaf at a time. Positional pread still populates the unified file cache,
     // so periodically release the already-copied immutable block pages instead
@@ -4661,6 +4678,11 @@ pub const IndexManager = struct {
         entry.index.setExternalVectorBatchLocatedDistanceLoader(vector_loader_context, scoreDenseVectorsFromNativeLocations);
         entry.index.setExternalVectorBoundedDistanceAvailable(vector_loader_context, denseVectorBoundedProjectionAvailable);
         entry.index.setExternalVectorProjectionBuildLoader(vector_loader_context, loadDenseVectorProjectionsForPostingBuild);
+        entry.index.setExternalVectorProjectionBuildLifecycle(
+            vector_loader_context,
+            beginDenseVectorProjectionBuild,
+            endDenseVectorProjectionBuild,
+        );
         self.attachVectorBlockResidencyPolicy(entry.index);
 
         // Repair/rebuild reopens must restore the same physical-format
@@ -16459,6 +16481,11 @@ pub const IndexManager = struct {
                 index.setExternalVectorBatchLocatedDistanceLoader(vector_loader_context, scoreDenseVectorsFromNativeLocations);
                 index.setExternalVectorBoundedDistanceAvailable(vector_loader_context, denseVectorBoundedProjectionAvailable);
                 index.setExternalVectorProjectionBuildLoader(vector_loader_context, loadDenseVectorProjectionsForPostingBuild);
+                index.setExternalVectorProjectionBuildLifecycle(
+                    vector_loader_context,
+                    beginDenseVectorProjectionBuild,
+                    endDenseVectorProjectionBuild,
+                );
                 self.attachVectorBlockResidencyPolicy(index);
                 if (index.experimentalPostingWalAuthoritative() or
                     (densePostingSidecarEnabled() and
@@ -22482,6 +22509,49 @@ pub const IndexManager = struct {
                 generation.opened.scorePrecision() == .authoritative_float32_with_bounded_float16);
     }
 
+    fn beginDenseVectorProjectionBuild(ctx: *anyopaque, source_sequence: u64) !void {
+        if (active_dense_projection_build_session != null)
+            return error.DenseProjectionBuildAlreadyActive;
+        const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
+        const generation = loader.manager.acquireVectorBlockGeneration() orelse return error.Unsupported;
+        errdefer generation.release();
+        if (!vectorBlockGenerationExactAtSequence(generation, source_sequence) or
+            generation.opened.scorePrecision() != .authoritative_float32_with_bounded_float16)
+            return error.Unsupported;
+
+        // Descriptor admission is an optimization boundary, not a correctness
+        // boundary. If this generation has more physical blocks than the
+        // process can privately open, retain the pinned generation and use its
+        // ordinary positional reader. Other open/read failures remain visible
+        // so publication never papers over a corrupt or missing block.
+        const cold_reader = generation.opened.beginColdProjectionSession() catch |err| switch (err) {
+            error.DescriptorAdmissionCapacityTooSmall => null,
+            else => return err,
+        };
+        active_dense_projection_build_session = .{
+            .context = loader,
+            .source_sequence = source_sequence,
+            .generation = generation,
+            .cold_reader = cold_reader,
+        };
+    }
+
+    fn endDenseVectorProjectionBuild(ctx: *anyopaque) void {
+        const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
+        const session = if (active_dense_projection_build_session) |*value| value else {
+            std.log.err("dense projection build ended without an active session index={s}", .{loader.index_name});
+            return;
+        };
+        if (session.context != loader) {
+            std.log.err("dense projection build session owner mismatch expected={s} actual={s}", .{
+                session.context.index_name,
+                loader.index_name,
+            });
+        }
+        session.deinit();
+        active_dense_projection_build_session = null;
+    }
+
     fn loadDenseVectorProjectionsForPostingBuild(
         ctx: *anyopaque,
         vector_ids: []const u64,
@@ -22499,8 +22569,21 @@ pub const IndexManager = struct {
         const required_bytes = std.math.mul(usize, row_bytes, vector_ids.len) catch return error.BufferTooSmall;
         if (payload_scratch.len < required_bytes) return error.BufferTooSmall;
 
-        const generation = manager.acquireVectorBlockGeneration() orelse return error.Unsupported;
-        defer generation.release();
+        var build_session: ?*DenseProjectionBuildSession = null;
+        if (active_dense_projection_build_session) |*session| {
+            if (session.context != loader or session.source_sequence != source_sequence)
+                return error.DenseProjectionBuildSessionMismatch;
+            build_session = session;
+        }
+        var release_generation = false;
+        const generation = if (build_session) |session|
+            session.generation
+        else blk: {
+            const acquired = manager.acquireVectorBlockGeneration() orelse return error.Unsupported;
+            release_generation = true;
+            break :blk acquired;
+        };
+        defer if (release_generation) generation.release();
         if (!vectorBlockGenerationExactAtSequence(generation, source_sequence) or
             generation.opened.scorePrecision() != .authoritative_float32_with_bounded_float16)
             return error.Unsupported;
@@ -22530,13 +22613,24 @@ pub const IndexManager = struct {
             const destination = payload_scratch[read.position * row_bytes ..][0..row_bytes];
             requests[i] = .{ .located = located, .scratch = destination };
         }
-        _ = try generation.opened.readProjectionsIntoBatch(manager.io, requests);
-        defer {
-            if (dense_projection_build_batches_until_reclaim <= 1) {
-                generation.opened.discardResidentPagesAfterMaintenanceScan();
-                dense_projection_build_batches_until_reclaim = 32;
+        const used_cold_reader = if (build_session) |session| session.cold_reader != null else false;
+        if (build_session) |session| {
+            if (session.cold_reader) |*reader| {
+                _ = try reader.readProjectionsIntoBatch(manager.io, requests);
             } else {
-                dense_projection_build_batches_until_reclaim -= 1;
+                _ = try generation.opened.readProjectionsIntoBatch(manager.io, requests);
+            }
+        } else {
+            _ = try generation.opened.readProjectionsIntoBatch(manager.io, requests);
+        }
+        defer {
+            if (!used_cold_reader) {
+                if (dense_projection_build_batches_until_reclaim <= 1) {
+                    generation.opened.discardResidentPagesAfterMaintenanceScan();
+                    dense_projection_build_batches_until_reclaim = 32;
+                } else {
+                    dense_projection_build_batches_until_reclaim -= 1;
+                }
             }
         }
         for (reads, requests) |read, request| {
