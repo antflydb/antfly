@@ -42,7 +42,12 @@ check_typescript() {
     check_generated_status \
       packages/sdk/src/public-api.d.ts \
       packages/sdk/src/query.d.ts
-    node scripts/run-pinned-toolchain.mjs pnpm exec turbo run lint typecheck build test
+    # Keep CPU-heavy builds separate from tests. The shared SDK runner is sized
+    # for cost rather than maximum parallelism; letting Turbo run every phase at
+    # once can starve browser-style user-event tests and leave timed-out input
+    # work running into the next test.
+    node scripts/run-pinned-toolchain.mjs pnpm exec turbo run lint typecheck build --concurrency=2
+    node scripts/run-pinned-toolchain.mjs pnpm exec turbo run test --concurrency=1
     diff -qr apps/antfarm/dist ../zig/pkg/antfly/antfarm
   )
 }
