@@ -652,7 +652,12 @@ pub const Runtime = struct {
                 if (parsed.generator.provider == .antfly and parsed.generator.url.len == 0) {
                     const local = self.antfly_provider orelse break :blk null;
                     const resolve = local.model_capabilities orelse break :blk null;
-                    break :blk try resolve(local.ptr, alloc, parsed.generator.model, .generate);
+                    break :blk try managed_embedder.AntflyProviderBoundary.call(
+                        "model_capabilities",
+                        local.boundary_dispatch,
+                        resolve,
+                        .{ local.ptr, alloc, parsed.generator.model, inference_work.Task.generate },
+                    );
                 }
                 if (parsed.generator.provider == .antfly and parsed.generator.url.len > 0) {
                     var secret = try common_secrets.SecretValue.initConfigOrEnv(
@@ -835,7 +840,12 @@ pub const Runtime = struct {
         }
         const local = self.antfly_provider orelse return null;
         const resolve = local.model_capabilities orelse return null;
-        const capabilities = try resolve(local.ptr, alloc, cfg.model orelse "", .read);
+        const capabilities = try managed_embedder.AntflyProviderBoundary.call(
+            "model_capabilities",
+            local.boundary_dispatch,
+            resolve,
+            .{ local.ptr, alloc, cfg.model orelse "", inference_work.Task.read },
+        );
         try capabilities.validate();
         if (capabilities.task != .read) return error.InvalidInferenceCapabilities;
         return capabilities;
@@ -896,7 +906,12 @@ pub const Runtime = struct {
             const local = self.antfly_provider orelse return null;
             if (local.extract == null) return null;
             const resolve = local.model_capabilities orelse return null;
-            const capabilities = try resolve(local.ptr, alloc, cfg.model, .extract);
+            const capabilities = try managed_embedder.AntflyProviderBoundary.call(
+                "model_capabilities",
+                local.boundary_dispatch,
+                resolve,
+                .{ local.ptr, alloc, cfg.model, inference_work.Task.extract },
+            );
             try capabilities.validate();
             if (capabilities.task != .extract) return error.InvalidInferenceCapabilities;
             return capabilities;
@@ -1212,7 +1227,12 @@ pub const Runtime = struct {
         var response = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) blk: {
             const local = self.antfly_provider orelse return error.BatchIncompatible;
             const extract_fn = local.extract orelse return error.BatchIncompatible;
-            break :blk try extract_fn(local.ptr, alloc, cfg.model, extract_request);
+            break :blk try managed_embedder.AntflyProviderBoundary.call(
+                "extract",
+                local.boundary_dispatch,
+                extract_fn,
+                .{ local.ptr, alloc, cfg.model, extract_request },
+            );
         } else extracting.extractWithConfigAndOptions(alloc, self.http, cfg, extract_request, .{
             .source_table = self.execution.routing.source_table,
         }) catch |err| {
@@ -1464,10 +1484,15 @@ pub const Runtime = struct {
         }
         for (out) |*item| item.* = "";
         for (requests, 0..) |request, i| {
-            var result = try transcribe_audio(local.ptr, alloc, model, .{
-                .url = request.source_text,
-                .language = cfg_parsed.value.language_code,
-            });
+            var result = try managed_embedder.AntflyProviderBoundary.call(
+                "transcribe_audio",
+                local.boundary_dispatch,
+                transcribe_audio,
+                .{ local.ptr, alloc, model, transcribing.Request{
+                    .url = request.source_text,
+                    .language = cfg_parsed.value.language_code,
+                } },
+            );
             defer transcribing.deinitResponse(alloc, &result);
 
             out[i] = if (isJsonContentType(request.content_type))
@@ -1695,7 +1720,12 @@ pub const Runtime = struct {
         if (local_attachments) {
             const local = self.antfly_provider.?;
             const resolve_capabilities = local.model_capabilities orelse return error.InvalidInferenceCapabilities;
-            const capabilities = try resolve_capabilities(local.ptr, alloc, cfg.model, .generate);
+            const capabilities = try managed_embedder.AntflyProviderBoundary.call(
+                "model_capabilities",
+                local.boundary_dispatch,
+                resolve_capabilities,
+                .{ local.ptr, alloc, cfg.model, inference_work.Task.generate },
+            );
             var encoded_bytes: usize = 0;
             var modalities = inference_work.Modalities{ .text = true };
             for (request.media) |media| {
@@ -1721,12 +1751,11 @@ pub const Runtime = struct {
                     .page_number = request.page_number,
                 },
             };
-            const result = try self.antfly_provider.?.generate_messages_with_attachments.?(
-                self.antfly_provider.?.ptr,
-                alloc,
-                cfg.model,
-                &messages,
-                attachments,
+            const result = try managed_embedder.AntflyProviderBoundary.call(
+                "generate_messages_with_attachments",
+                local.boundary_dispatch,
+                local.generate_messages_with_attachments.?,
+                .{ local.ptr, alloc, cfg.model, &messages, attachments },
             );
             return result;
         }
@@ -1860,7 +1889,12 @@ pub const Runtime = struct {
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             const read_images = local.read_images orelse return error.UnsupportedReaderProvider;
-            const items = try read_images(local.ptr, alloc, execution_cfg.model orelse "", request);
+            const items = try managed_embedder.AntflyProviderBoundary.call(
+                "read_images",
+                local.boundary_dispatch,
+                read_images,
+                .{ local.ptr, alloc, execution_cfg.model orelse "", request },
+            );
             return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
         }
 
@@ -1950,9 +1984,19 @@ pub const Runtime = struct {
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             if (local.read_encoded_images_reported) |read_reported|
-                return try read_reported(local.ptr, alloc, execution_cfg.model orelse "", request);
+                return try managed_embedder.AntflyProviderBoundary.call(
+                    "read_encoded_images_reported",
+                    local.boundary_dispatch,
+                    read_reported,
+                    .{ local.ptr, alloc, execution_cfg.model orelse "", request },
+                );
             if (local.read_encoded_images) |read_encoded_images| {
-                const items = try read_encoded_images(local.ptr, alloc, execution_cfg.model orelse "", request);
+                const items = try managed_embedder.AntflyProviderBoundary.call(
+                    "read_encoded_images",
+                    local.boundary_dispatch,
+                    read_encoded_images,
+                    .{ local.ptr, alloc, execution_cfg.model orelse "", request },
+                );
                 errdefer {
                     for (items) |*item| readers.deinitResult(alloc, item);
                     alloc.free(items);
@@ -2028,10 +2072,15 @@ pub const Runtime = struct {
         if (isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) {
             const local = self.antfly_provider orelse return error.UnsupportedTranscriberProvider;
             const transcribe_audio = local.transcribe_audio orelse return error.UnsupportedTranscriberProvider;
-            var result = try transcribe_audio(local.ptr, alloc, antfly_model.?, .{
-                .url = request.source_text,
-                .language = cfg_parsed.value.language_code,
-            });
+            var result = try managed_embedder.AntflyProviderBoundary.call(
+                "transcribe_audio",
+                local.boundary_dispatch,
+                transcribe_audio,
+                .{ local.ptr, alloc, antfly_model.?, transcribing.Request{
+                    .url = request.source_text,
+                    .language = cfg_parsed.value.language_code,
+                } },
+            );
             defer transcribing.deinitResponse(alloc, &result);
 
             if (isJsonContentType(request.content_type)) {
@@ -2140,7 +2189,12 @@ pub const Runtime = struct {
         var response = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) blk: {
             const local = self.antfly_provider orelse return error.UnsupportedExtractionProvider;
             const extract_fn = local.extract orelse return error.UnsupportedExtractionProvider;
-            break :blk try extract_fn(local.ptr, alloc, cfg.model, extract_request);
+            break :blk try managed_embedder.AntflyProviderBoundary.call(
+                "extract",
+                local.boundary_dispatch,
+                extract_fn,
+                .{ local.ptr, alloc, cfg.model, extract_request },
+            );
         } else extracting.extractWithConfigAndOptions(alloc, self.http, cfg, extract_request, .{
             .source_table = self.execution.routing.source_table,
         }) catch |err| {

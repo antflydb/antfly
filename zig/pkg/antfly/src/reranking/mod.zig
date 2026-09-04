@@ -22,6 +22,8 @@ const antfly_provider = @import("../inference/local.zig");
 const remote_capabilities = @import("../inference/remote_capabilities.zig");
 const common_secrets = @import("../common/secrets.zig");
 const execution_context = @import("../inference/execution_context.zig");
+const runtime_error_abi = @import("../runtime_error_abi.zig");
+const runtime_native_abi = @import("../runtime_native_abi.zig");
 
 pub const Config = lib.Config;
 pub const Provider = lib.Provider;
@@ -88,9 +90,19 @@ pub fn rerankDocumentsWithOptions(
                 const request_context = options.execution.requestContext(io);
                 try request_context.check();
                 const scores = if (linked_context_reranker) |rerank|
-                    try rerank(local.ptr, alloc, cfg.model, query, documents, request_context)
+                    try managed_embedder.AntflyProviderBoundary.call(
+                        "rerank_texts_with_context",
+                        local.boundary_dispatch,
+                        rerank,
+                        .{ local.ptr, alloc, cfg.model, query, documents, request_context },
+                    )
                 else
-                    try linked_reranker.?(local.ptr, alloc, cfg.model, query, documents);
+                    try managed_embedder.AntflyProviderBoundary.call(
+                        "rerank_texts",
+                        local.boundary_dispatch,
+                        linked_reranker.?,
+                        .{ local.ptr, alloc, cfg.model, query, documents },
+                    );
                 errdefer alloc.free(scores);
                 try request_context.check();
                 return scores;
@@ -309,6 +321,31 @@ test "reranking runtime routes antfly provider to local antfly" {
     try std.testing.expectEqual(@as(usize, 1), state.context_calls);
     try std.testing.expect(!state.legacy_called);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), scores[1], 0.0001);
+
+    const RejectingBoundary = struct {
+        fn dispatch(
+            _: *const runtime_native_abi.CallContract,
+            _: *const anyopaque,
+            _: *const anyopaque,
+            _: ?*anyopaque,
+        ) callconv(.c) runtime_error_abi.Status {
+            return runtime_error_abi.statusFromError(error.UnsupportedVersion);
+        }
+    };
+    var rejected = local;
+    rejected.boundary_dispatch = RejectingBoundary.dispatch;
+    try std.testing.expectError(error.UnsupportedVersion, rerankDocumentsWithOptions(
+        alloc,
+        &client,
+        cfg,
+        .{
+            .antfly_provider = rejected,
+            .execution = .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
+        },
+        "query",
+        &.{ "doc1", "doc2" },
+    ));
+    try std.testing.expectEqual(@as(usize, 1), state.context_calls);
 
     var canceled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, rerankDocumentsWithOptions(alloc, &client, cfg, .{

@@ -258,7 +258,14 @@ pub fn deinitClassificationScores(alloc: std.mem.Allocator, results: []const []c
     alloc.free(results);
 }
 
-const AntflyProviderBoundary = runtime_callback_abi.Boundary(AntflyProvider);
+/// The checked native boundary for every callback carried by AntflyProvider.
+///
+/// AntflyProvider crosses hidden static runtime units in the standalone build.
+/// Consumers must invoke callbacks through this boundary so the owning unit can
+/// validate method/signature/layout contracts and translate errors through the
+/// stable status ABI. Keep this public and shared instead of defining
+/// task-family-specific trampolines with independently drifting contracts.
+pub const AntflyProviderBoundary = runtime_callback_abi.Boundary(AntflyProvider);
 
 pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
@@ -1375,7 +1382,12 @@ pub const ManagedEmbedder = struct {
         if (entry.sparse) return error.UnsupportedEmbeddingProvider;
         if (entry.antfly_provider) |local| {
             if (local.model_capabilities) |resolve| {
-                const result = try resolve(local.ptr, alloc, entry.model, .embed);
+                const result = try AntflyProviderBoundary.call(
+                    "model_capabilities",
+                    local.boundary_dispatch,
+                    resolve,
+                    .{ local.ptr, alloc, entry.model, inference_work.Task.embed },
+                );
                 try result.validate();
                 if (result.task != .embed) return error.InvalidInferenceCapabilities;
                 return result;
@@ -1592,6 +1604,7 @@ fn applyAntflyEmbeddingRequestControls(
     );
     provider.setRequestCancellation(entry.cancellation);
     provider.setRequestTimeoutMs(timeout_ms);
+    provider.setMaxResponseBytes(remote_embedding_max_response_bytes);
 }
 
 fn entryForegroundBounded(entry: *const ManagedEmbeddingEntry, sparse: bool) bool {
@@ -3900,6 +3913,11 @@ fn isOperationalEmbeddingProbeError(err: anyerror) bool {
         error.UnexpectedReadFailure,
         error.SendFailed,
         error.RecvFailed,
+        // Capability discovery intentionally normalizes transport and retryable
+        // HTTP failures so callers do not depend on backend-specific socket
+        // errors. Dimension probing must preserve that operational class when
+        // `validation: defer_probe` is selected.
+        error.RemoteCapabilityDiscoveryTransient,
         // Executor admission is transport capacity, not a malformed index
         // definition. Surface it through the retryable probe-unavailable
         // contract so clients do not turn transient saturation into a
@@ -3908,6 +3926,11 @@ fn isOperationalEmbeddingProbeError(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+test "managed embedder treats normalized capability discovery failure as operational" {
+    try std.testing.expect(isOperationalEmbeddingProbeError(error.RemoteCapabilityDiscoveryTransient));
+    try std.testing.expect(!isOperationalEmbeddingProbeError(error.RemoteCapabilityDiscoveryRejected));
 }
 
 fn inferEmbeddingDimensionsFromEntry(

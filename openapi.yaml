@@ -6835,11 +6835,13 @@ paths:
         batching will use the same request item shape with `mode: async`.
 
 
-        Batch generation is text-only. Image or other multimodal content parts are
+        Batch generation accepts bounded image and audio content parts. Media is
 
-        rejected per item as `UNSUPPORTED_MULTIMODAL` before media fetch or model loading;
+        validated and admitted before model dispatch; models without compatible
 
-        other item failures remain independently reported.
+        multimodal capabilities return an independent per-item error without
+
+        failing sibling requests.
       operationId: generateBatchContent
       requestBody:
         required: true

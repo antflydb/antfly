@@ -289,6 +289,27 @@ pub const Provider = struct {
         self.request_timeout_ms = timeout_ms;
     }
 
+    /// Build the task-neutral controls for every request sent to a distributed
+    /// Antfly inference node. Keeping this in one helper prevents a newly added
+    /// model family or wire encoding from silently dropping deadline,
+    /// cancellation, or response-memory enforcement.
+    fn controlledJsonRequest(
+        self: *Provider,
+        json_body: []const u8,
+        fallback_timeout_ms: ?u64,
+    ) httpx.RequestOptions {
+        return .{
+            .json = json_body,
+            .headers = self.requestHeaders(),
+            .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
+            .max_response_size = self.max_response_bytes,
+            .cancellation = if (self.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
+        };
+    }
+
     pub fn setSamplingOptions(
         self: *Provider,
         temperature: ?f32,
@@ -357,14 +378,7 @@ pub const Provider = struct {
             .input = .{ .array = input_array },
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{
-            .json = json_body,
-            .headers = self.requestHeaders(),
-            .cancellation = if (self.cancellation) |token|
-                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
-            else
-                null,
-        });
+        var resp = try self.http.post(url, self.controlledJsonRequest(json_body, null));
         defer resp.deinit();
 
         if (!resp.ok()) {
@@ -452,14 +466,7 @@ pub const Provider = struct {
     fn embedJsonBody(self: *Provider, alloc: std.mem.Allocator, json_body: []const u8) !inference.EmbedResult {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/embed", .{self.base_url});
         defer self.allocator.free(url);
-        var resp = try self.http.post(url, .{
-            .json = json_body,
-            .headers = self.requestHeaders(),
-            .cancellation = if (self.cancellation) |token|
-                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
-            else
-                null,
-        });
+        var resp = try self.http.post(url, self.controlledJsonRequest(json_body, null));
         defer resp.deinit();
 
         if (!resp.ok()) {
@@ -517,16 +524,7 @@ pub const Provider = struct {
             .presence_penalty = self.presence_penalty,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{
-            .json = json_body,
-            .headers = self.requestHeaders(),
-            .timeout_ms = self.request_timeout_ms orelse 300_000,
-            .max_response_size = self.max_response_bytes,
-            .cancellation = if (self.cancellation) |token|
-                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
-            else
-                null,
-        });
+        var resp = try self.http.post(url, self.controlledJsonRequest(json_body, 300_000));
         defer resp.deinit();
         if (!resp.ok()) return if (isCapabilityStaleResponse(resp))
             error.InferenceCapabilitiesStale
@@ -592,16 +590,7 @@ pub const Provider = struct {
             .prompts = documents,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{
-            .json = json_body,
-            .headers = self.requestHeaders(),
-            .timeout_ms = self.request_timeout_ms,
-            .max_response_size = self.max_response_bytes,
-            .cancellation = if (self.cancellation) |token|
-                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
-            else
-                null,
-        });
+        var resp = try self.http.post(url, self.controlledJsonRequest(json_body, null));
         defer resp.deinit();
         if (!resp.ok()) return if (isCapabilityStaleResponse(resp))
             error.InferenceCapabilitiesStale
@@ -656,6 +645,33 @@ fn logEmbedFailure(kind: []const u8, url: []const u8, status: u16, body: ?[]cons
 
 test "antfly provider compiles" {
     _ = Provider;
+}
+
+pub fn testAntflyProviderRequestControls() !void {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var http = httpx.Client.init(std.testing.allocator, io_impl.io());
+    defer http.deinit();
+    var provider = Provider.init(std.testing.allocator, &http, "http://inference");
+    defer provider.deinit();
+
+    provider.setRequestTimeoutMs(17);
+    provider.setMaxResponseBytes(23);
+    try provider.setSourceTable("docs");
+    const options = provider.controlledJsonRequest("{}", 31);
+    try std.testing.expectEqualStrings("{}", options.json orelse return error.TestExpectedJson);
+    try std.testing.expectEqual(@as(?u64, 17), options.timeout_ms);
+    try std.testing.expectEqual(@as(?usize, 23), options.max_response_size);
+    try std.testing.expect(options.headers != null);
+    try std.testing.expect(options.cancellation == null);
+
+    provider.setRequestTimeoutMs(null);
+    const fallback = provider.controlledJsonRequest("{}", 31);
+    try std.testing.expectEqual(@as(?u64, 31), fallback.timeout_ms);
+}
+
+test "antfly provider applies task-neutral request controls to every wire request" {
+    try testAntflyProviderRequestControls();
 }
 
 test "antfly provider composes authorization and capability lease headers" {

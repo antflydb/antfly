@@ -240,7 +240,12 @@ const BackendState = struct {
             },
             .embedded_antfly => |local| blk: {
                 if (local.generate_messages) |generate_messages| {
-                    const content = try generate_messages(local.ptr, alloc, model, messages);
+                    const content = try managed_embedder.AntflyProviderBoundary.call(
+                        "generate_messages",
+                        local.boundary_dispatch,
+                        generate_messages,
+                        .{ local.ptr, alloc, model, messages },
+                    );
                     break :blk inference.GenerateResult{
                         .content = content,
                         .allocator = alloc,
@@ -255,7 +260,12 @@ const BackendState = struct {
                     roles[i] = message.role.toSlice();
                     contents[i] = textContent(message) orelse return error.UnsupportedGeneratorProvider;
                 }
-                const content = try generate_text(local.ptr, alloc, model, roles, contents);
+                const content = try managed_embedder.AntflyProviderBoundary.call(
+                    "generate_text",
+                    local.boundary_dispatch,
+                    generate_text,
+                    .{ local.ptr, alloc, model, roles, contents },
+                );
                 break :blk inference.GenerateResult{
                     .content = content,
                     .allocator = alloc,

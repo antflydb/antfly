@@ -97,6 +97,7 @@ test "managed embedder configured inference api url precedence" {
 
 test "managed embedder deadlines bound provider pacing and transport" {
     try managed_embedder.testEmbeddingProviderDeadlines();
+    try local.testAntflyProviderRequestControls();
 }
 
 test "managed embedder cancels an in-flight remote embedding request" {

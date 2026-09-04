@@ -2153,9 +2153,10 @@ export interface paths {
          *     This endpoint implements the synchronous form only. Future async durable
          *     batching will use the same request item shape with `mode: async`.
          *
-         *     Batch generation is text-only. Image or other multimodal content parts are
-         *     rejected per item as `UNSUPPORTED_MULTIMODAL` before media fetch or model loading;
-         *     other item failures remain independently reported.
+         *     Batch generation accepts bounded image and audio content parts. Media is
+         *     validated and admitted before model dispatch; models without compatible
+         *     multimodal capabilities return an independent per-item error without
+         *     failing sibling requests.
          */
         post: operations["generateBatchContent"];
         delete?: never;

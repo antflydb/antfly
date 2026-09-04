@@ -1566,6 +1566,39 @@ document. They are architectural requirements, not Florence-specific cleanup:
     and destroys it only after entries and pacers drain. Remote request code
     fails closed when no owner-bound HTTP executor exists, preventing a future
     fallback from silently restoring thread-pool amplification.
+173. **Only embedding honored the checked linked-provider callback ABI.**
+    `AntflyProviderBoundary` is now the single public, versioned invocation
+    boundary for every callback carried by `AntflyProvider`. Capability
+    discovery, generation, reranking, reading, extraction, transcription, and
+    model listing invoke through the provider's owning dispatch just like dense
+    and sparse embedding. Hidden static runtime units therefore validate the
+    method, callback signature, argument layout, and result layout before
+    interpreting native pointers, and private Zig errors cross the boundary
+    only through the stable status ABI. New model-family callbacks must be
+    appended to the same provider vtable and may not introduce an unchecked
+    direct-call path.
+174. **Residual embedding deadlines were calculated but not applied to the
+    `/embed` request.** The Antfly wire provider now constructs every JSON POST
+    through one task-neutral request-control helper carrying the residual
+    timeout, semantic cancellation, bounded response size, and routing headers.
+    Dense text, sparse text, multimodal embedding, generation, and reranking
+    cannot independently omit those controls when their wire encodings evolve.
+175. **The generation batch OpenAPI description contradicted executable
+    multimodal behavior.** The inference specification is the authoritative
+    contract and now describes bounded image/audio admission plus per-item
+    capability failures. Generated clients and joined public specifications are
+    regenerated from that source; security-contract tests assert the same
+    behavior instead of preserving a stale text-only promise.
+176. **A merge-resolved content-security assertion was not repository-formatted.**
+    The test is formatted by the pinned Python formatter and remains covered by
+    the normal SDK formatting gate.
+177. **Capability discovery normalized transient transport failures without
+    preserving dimension-probe policy.** Managed embedding probes now classify
+    `RemoteCapabilityDiscoveryTransient` as operational. An explicitly
+    dimensioned index using `validation: defer_probe` can therefore persist its
+    stable producer identity while a distributed inference catalog is briefly
+    unavailable; authoritative rejection and malformed capability contracts
+    still fail closed.
 
 ### Post-review implementation contract
 

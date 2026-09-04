@@ -1085,7 +1085,12 @@ fn resolveModels(
         {
             if (sources.antfly_provider) |provider| {
                 if (provider.list_models_json) |list_fn| {
-                    if (list_fn(provider.ptr, arena)) |body| {
+                    if (managed_embedder.AntflyProviderBoundary.call(
+                        "list_models_json",
+                        provider.boundary_dispatch,
+                        list_fn,
+                        .{ provider.ptr, arena },
+                    )) |body| {
                         const result = try list_models.parseAntflyModels(arena, body);
                         outcomes[i] = .{ .ok = true, .models = result.models };
                     } else |err| {
