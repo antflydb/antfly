@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphMetricOrderDirection(str, Enum):
+class GraphMetricOrderDirection(StrEnum):
     ASC = "asc"
     DESC = "desc"
 

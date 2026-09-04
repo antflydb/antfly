@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphMetricEventKind(str, Enum):
+class GraphMetricEventKind(StrEnum):
     DELETE = "delete"
     FAILED = "failed"
     PAUSE = "pause"

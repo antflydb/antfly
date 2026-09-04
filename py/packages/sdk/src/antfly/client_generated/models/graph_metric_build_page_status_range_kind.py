@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphMetricBuildPageStatusRangeKind(str, Enum):
+class GraphMetricBuildPageStatusRangeKind(StrEnum):
     CONTRIBUTIONS = "contributions"
     FULL = "full"
     JOB_CONTROL = "job_control"

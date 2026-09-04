@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphMetricStatusPhase(str, Enum):
+class GraphMetricStatusPhase(StrEnum):
     CHECK_CONVERGENCE = "check_convergence"
     CLEANUP_OLD_GENERATIONS = "cleanup_old_generations"
     COMPLETE = "complete"

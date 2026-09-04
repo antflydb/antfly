@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphTraversalMetricFreshness(str, Enum):
+class GraphTraversalMetricFreshness(StrEnum):
     FRESH = "fresh"
     PUBLISHED = "published"
 

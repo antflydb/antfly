@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphMetricFilterOp(str, Enum):
+class GraphMetricFilterOp(StrEnum):
     EQ = "eq"
     GT = "gt"
     GTE = "gte"

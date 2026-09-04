@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphMetricEdgeFilterStatusMode(str, Enum):
+class GraphMetricEdgeFilterStatusMode(StrEnum):
     ALL = "all"
     TYPES = "types"
 

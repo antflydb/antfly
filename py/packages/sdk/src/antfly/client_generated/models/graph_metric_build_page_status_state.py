@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphMetricBuildPageStatusState(str, Enum):
+class GraphMetricBuildPageStatusState(StrEnum):
     COMPLETE = "complete"
     FAILED = "failed"
     LEASED = "leased"

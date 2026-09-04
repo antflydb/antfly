@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ExecuteGraphMetricActionAction(str, Enum):
+class ExecuteGraphMetricActionAction(StrEnum):
     DELETE = "delete"
     PAUSE = "pause"
     REBUILD = "rebuild"

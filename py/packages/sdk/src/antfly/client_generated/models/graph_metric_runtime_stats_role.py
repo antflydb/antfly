@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphMetricRuntimeStatsRole(str, Enum):
+class GraphMetricRuntimeStatsRole(StrEnum):
     COMBINED = "combined"
     COORDINATOR = "coordinator"
     WORKER = "worker"

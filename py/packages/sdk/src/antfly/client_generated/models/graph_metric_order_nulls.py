@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphMetricOrderNulls(str, Enum):
+class GraphMetricOrderNulls(StrEnum):
     FIRST = "first"
     LAST = "last"
     NULLS_FIRST = "nulls_first"

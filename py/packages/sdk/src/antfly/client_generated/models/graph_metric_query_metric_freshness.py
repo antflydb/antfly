@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphMetricQueryMetricFreshness(str, Enum):
+class GraphMetricQueryMetricFreshness(StrEnum):
     FRESH = "fresh"
     PUBLISHED = "published"
 

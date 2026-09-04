@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class LegacyGraphQueryMetricFreshness(str, Enum):
+class LegacyGraphQueryMetricFreshness(StrEnum):
     FRESH = "fresh"
     PUBLISHED = "published"
 
