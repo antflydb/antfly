@@ -335,7 +335,7 @@ fn fillPageRankNext(
     next: []f64,
     base: f64,
     options: Options,
-) !void {
+) !f64 {
     const Worker = struct {
         fn run(
             graph: Topology,
@@ -343,48 +343,60 @@ fn fillPageRankNext(
             scale: []const f64,
             output: []f64,
             base_score: f64,
-            start: usize,
-            end: usize,
+            parts: usize,
+            worker: usize,
+            width: usize,
+            partials: *[reduction_partitions]f64,
             cancellation: CancellationToken,
             failure: *?anyerror,
         ) void {
-            for (start..end) |target| {
-                if ((target - start) % 4096 == 0) cancellation.check() catch |err| {
-                    failure.* = err;
-                    return;
-                };
-                var value = base_score;
-                const edge_start: usize = graph.incoming_offsets[target];
-                const edge_end: usize = graph.incoming_offsets[target + 1];
-                for (graph.incoming_sources[edge_start..edge_end], 0..) |source, edge_index| {
-                    if (edge_index % 4096 == 0) cancellation.check() catch |err| {
+            var part = worker;
+            while (part < parts) : (part += width) {
+                var delta: f64 = 0;
+                const start = weightedBoundary(graph.incoming_offsets, part, parts);
+                const end = weightedBoundary(graph.incoming_offsets, part + 1, parts);
+                for (start..end) |target| {
+                    if ((target - start) % 4096 == 0) cancellation.check() catch |err| {
                         failure.* = err;
                         return;
                     };
-                    value += current[source] * scale[source];
+                    var value = base_score;
+                    const edge_start: usize = graph.incoming_offsets[target];
+                    const edge_end: usize = graph.incoming_offsets[target + 1];
+                    for (graph.incoming_sources[edge_start..edge_end], 0..) |source, edge_index| {
+                        if (edge_index % 4096 == 0) cancellation.check() catch |err| {
+                            failure.* = err;
+                            return;
+                        };
+                        value += current[source] * scale[source];
+                    }
+                    output[target] = value;
+                    delta += @abs(value - current[target]);
                 }
-                output[target] = value;
+                partials[part] = delta;
             }
         }
     };
-    const width = parallelWidth(topology, options);
+    const parts = logicalReductionParts(topology.nodeCount());
+    var partials: [reduction_partitions]f64 = @splat(0);
+    const width = @min(parallelWidth(topology, options), parts);
     if (width == 1) {
         var failure: ?anyerror = null;
-        Worker.run(topology, scores, source_scale, next, base, 0, topology.nodeCount(), options.cancellation, &failure);
+        Worker.run(topology, scores, source_scale, next, base, parts, 0, 1, &partials, options.cancellation, &failure);
         if (failure) |err| return err;
-        return;
+    } else {
+        const io = options.io.?;
+        var failures: [max_kernel_parallelism]?anyerror = @splat(null);
+        var group: std.Io.Group = .init;
+        for (0..width) |worker| group.async(io, Worker.run, .{
+            topology, scores, source_scale, next, base, parts, worker, width, &partials, options.cancellation, &failures[worker],
+        });
+        try group.await(io);
+        for (failures[0..width]) |failure| if (failure) |err| return err;
     }
-    const io = options.io.?;
-    var failures: [max_kernel_parallelism]?anyerror = @splat(null);
-    var group: std.Io.Group = .init;
-    for (0..width) |part| {
-        const start = weightedBoundary(topology.incoming_offsets, part, width);
-        const end = weightedBoundary(topology.incoming_offsets, part + 1, width);
-        if (start == end) continue;
-        group.async(io, Worker.run, .{ topology, scores, source_scale, next, base, start, end, options.cancellation, &failures[part] });
-    }
-    try group.await(io);
-    for (failures[0..width]) |failure| if (failure) |err| return err;
+    var delta: f64 = 0;
+    for (partials[0..parts]) |partial| delta += partial;
+    return delta;
 }
 
 fn fillAdjacencySums(
@@ -392,6 +404,7 @@ fn fillAdjacencySums(
     input: []const f64,
     output: []f64,
     incoming: bool,
+    input_divisor: f64,
     options: Options,
 ) !void {
     const Worker = struct {
@@ -400,6 +413,7 @@ fn fillAdjacencySums(
             values: []const f64,
             result: []f64,
             use_incoming: bool,
+            input_scale: f64,
             start: usize,
             end: usize,
             cancellation: CancellationToken,
@@ -419,7 +433,7 @@ fn fillAdjacencySums(
                             failure.* = err;
                             return;
                         };
-                        sum += values[source];
+                        sum += values[source] * input_scale;
                     }
                 } else {
                     const edge_start: usize = graph.outgoing_offsets[ordinal];
@@ -429,7 +443,7 @@ fn fillAdjacencySums(
                             failure.* = err;
                             return;
                         };
-                        sum += values[target];
+                        sum += values[target] * input_scale;
                     }
                 }
                 result[ordinal] = sum;
@@ -437,10 +451,11 @@ fn fillAdjacencySums(
         }
     };
     const offsets = if (incoming) topology.incoming_offsets else topology.outgoing_offsets;
+    const input_scale = if (input_divisor > 0) 1.0 / input_divisor else 1.0;
     const width = parallelWidth(topology, options);
     if (width == 1) {
         var failure: ?anyerror = null;
-        Worker.run(topology, input, output, incoming, 0, topology.nodeCount(), options.cancellation, &failure);
+        Worker.run(topology, input, output, incoming, input_scale, 0, topology.nodeCount(), options.cancellation, &failure);
         if (failure) |err| return err;
         return;
     }
@@ -451,7 +466,7 @@ fn fillAdjacencySums(
         const start = weightedBoundary(offsets, part, width);
         const end = weightedBoundary(offsets, part + 1, width);
         if (start == end) continue;
-        group.async(io, Worker.run, .{ topology, input, output, incoming, start, end, options.cancellation, &failures[part] });
+        group.async(io, Worker.run, .{ topology, input, output, incoming, input_scale, start, end, options.cancellation, &failures[part] });
     }
     try group.await(io);
     for (failures[0..width]) |failure| if (failure) |err| return err;
@@ -494,8 +509,10 @@ pub fn pageRankTopologyAlloc(alloc: Allocator, topology: Topology, options: Opti
         iteration += 1;
         const sink_mass = try pageRankSinkMass(scores, source_scale, options);
         const base = (1.0 - options.damping + options.damping * sink_mass) / count;
-        try fillPageRankNext(topology, scores, source_scale, next, base, options);
-        delta = try swapAndDelta(&scores, &next, options);
+        delta = try fillPageRankNext(topology, scores, source_scale, next, base, options);
+        const previous = scores;
+        scores = next;
+        next = previous;
         if (!std.math.isFinite(delta)) return error.InvalidGraphMetricScore;
         if (delta <= options.tolerance) return .{ .scores = scores, .iterations_completed = iteration, .converged = true, .delta = delta };
     }
@@ -525,9 +542,8 @@ pub fn eigenvectorTopologyAlloc(alloc: Allocator, topology: Topology, options: O
     while (iteration < options.max_iterations) {
         try options.cancellation.check();
         iteration += 1;
-        try fillAdjacencySums(topology, scores, next, true, options);
-        try normalize(next, options);
-        delta = try swapAndDelta(&scores, &next, options);
+        try fillAdjacencySums(topology, scores, next, true, 1, options);
+        delta = try normalizeSwapAndDelta(&scores, &next, options);
         if (!std.math.isFinite(delta)) return error.InvalidGraphMetricScore;
         if (delta <= options.tolerance) return .{ .scores = scores, .iterations_completed = iteration, .converged = true, .delta = delta };
     }
@@ -563,11 +579,11 @@ pub fn hitsTopologyAlloc(alloc: Allocator, topology: Topology, options: Options)
     while (iteration < options.max_iterations) {
         try options.cancellation.check();
         iteration += 1;
-        try fillAdjacencySums(topology, hubs, next_authorities, true, options);
-        try normalize(next_authorities, options);
-        try fillAdjacencySums(topology, next_authorities, next_hubs, false, options);
-        try normalize(next_hubs, options);
-        delta = try replaceHitsAndDelta(authorities, hubs, next_authorities, next_hubs, options);
+        try fillAdjacencySums(topology, hubs, next_authorities, true, 1, options);
+        const authority_norm = @sqrt(try normSquared(next_authorities, options));
+        try fillAdjacencySums(topology, next_authorities, next_hubs, false, authority_norm, options);
+        const hub_norm = @sqrt(try normSquared(next_hubs, options));
+        delta = try replaceHitsAndDelta(authorities, hubs, next_authorities, next_hubs, authority_norm, hub_norm, options);
         if (!std.math.isFinite(delta)) return error.InvalidGraphMetricScore;
         if (delta <= options.tolerance) return .{ .authorities = authorities, .hubs = hubs, .iterations_completed = iteration, .converged = true, .delta = delta };
     }
@@ -721,6 +737,66 @@ fn normalize(values: []f64, options: Options) !void {
     if (norm > 0) try scaleValues(values, norm, options);
 }
 
+/// Normalize the newly computed vector and calculate convergence in the same
+/// cache pass. Iterative eigenvector builds previously streamed the full
+/// vector once to normalize and again to compare it with the prior vector.
+fn normalizeSwapAndDelta(current: *[]f64, next: *[]f64, options: Options) !f64 {
+    if (current.*.len != next.*.len) return error.InvalidGraphMetricScore;
+    const norm = @sqrt(try normSquared(next.*, options));
+    const Worker = struct {
+        fn run(
+            old_values: []const f64,
+            new_values: []f64,
+            divisor: f64,
+            parts: usize,
+            worker: usize,
+            width: usize,
+            partials: *[reduction_partitions]f64,
+            cancellation: CancellationToken,
+            failure: *?anyerror,
+        ) void {
+            var part = worker;
+            while (part < parts) : (part += width) {
+                var sum: f64 = 0;
+                const start = vectorBoundary(old_values.len, part, parts);
+                const end = vectorBoundary(old_values.len, part + 1, parts);
+                for (start..end) |i| {
+                    if ((i - start) % 4096 == 0) cancellation.check() catch |err| {
+                        failure.* = err;
+                        return;
+                    };
+                    if (divisor > 0) new_values[i] /= divisor;
+                    sum += @abs(new_values[i] - old_values[i]);
+                }
+                partials[part] = sum;
+            }
+        }
+    };
+    const parts = logicalReductionParts(current.*.len);
+    var partials: [reduction_partitions]f64 = @splat(0);
+    const width = @min(vectorParallelWidth(current.*.len, options), parts);
+    if (width == 1) {
+        var failure: ?anyerror = null;
+        Worker.run(current.*, next.*, norm, parts, 0, 1, &partials, options.cancellation, &failure);
+        if (failure) |err| return err;
+    } else {
+        const io = options.io.?;
+        var failures: [max_kernel_parallelism]?anyerror = @splat(null);
+        var group: std.Io.Group = .init;
+        for (0..width) |worker| group.async(io, Worker.run, .{
+            current.*, next.*, norm, parts, worker, width, &partials, options.cancellation, &failures[worker],
+        });
+        try group.await(io);
+        for (failures[0..width]) |failure| if (failure) |err| return err;
+    }
+    var delta: f64 = 0;
+    for (partials[0..parts]) |partial| delta += partial;
+    const previous = current.*;
+    current.* = next.*;
+    next.* = previous;
+    return delta;
+}
+
 fn swapAndDelta(current: *[]f64, next: *[]f64, options: Options) !f64 {
     const Worker = struct {
         fn run(
@@ -780,6 +856,8 @@ fn replaceHitsAndDelta(
     hubs: []f64,
     next_authorities: []const f64,
     next_hubs: []const f64,
+    authority_norm: f64,
+    hub_norm: f64,
     options: Options,
 ) !f64 {
     const Worker = struct {
@@ -788,6 +866,8 @@ fn replaceHitsAndDelta(
             hub_values: []f64,
             new_authorities: []const f64,
             new_hubs: []const f64,
+            authority_divisor: f64,
+            hub_divisor: f64,
             parts: usize,
             worker: usize,
             width: usize,
@@ -805,10 +885,12 @@ fn replaceHitsAndDelta(
                         failure.* = err;
                         return;
                     };
-                    sum += @abs(new_authorities[i] - authority_values[i]);
-                    sum += @abs(new_hubs[i] - hub_values[i]);
-                    authority_values[i] = new_authorities[i];
-                    hub_values[i] = new_hubs[i];
+                    const new_authority = if (authority_divisor > 0) new_authorities[i] / authority_divisor else new_authorities[i];
+                    const new_hub = if (hub_divisor > 0) new_hubs[i] / hub_divisor else new_hubs[i];
+                    sum += @abs(new_authority - authority_values[i]);
+                    sum += @abs(new_hub - hub_values[i]);
+                    authority_values[i] = new_authority;
+                    hub_values[i] = new_hub;
                 }
                 partials[part] = sum;
             }
@@ -821,14 +903,14 @@ fn replaceHitsAndDelta(
     const width = @min(vectorParallelWidth(authorities.len, options), parts);
     if (width == 1) {
         var failure: ?anyerror = null;
-        Worker.run(authorities, hubs, next_authorities, next_hubs, parts, 0, 1, &partials, options.cancellation, &failure);
+        Worker.run(authorities, hubs, next_authorities, next_hubs, authority_norm, hub_norm, parts, 0, 1, &partials, options.cancellation, &failure);
         if (failure) |err| return err;
     } else {
         const io = options.io.?;
         var failures: [max_kernel_parallelism]?anyerror = @splat(null);
         var group: std.Io.Group = .init;
         for (0..width) |worker| group.async(io, Worker.run, .{
-            authorities, hubs, next_authorities, next_hubs, parts, worker, width, &partials, options.cancellation, &failures[worker],
+            authorities, hubs, next_authorities, next_hubs, authority_norm, hub_norm, parts, worker, width, &partials, options.cancellation, &failures[worker],
         });
         try group.await(io);
         for (failures[0..width]) |failure| if (failure) |err| return err;
@@ -915,11 +997,11 @@ test "serverless graph metric runtime fanout preserves deterministic target-owne
     const parallel_outgoing = try alloc.alloc(f64, node_count);
     defer alloc.free(parallel_outgoing);
     for (values, 0..) |*value, i| value.* = @floatFromInt(i % 31);
-    try fillAdjacencySums(topology, values, serial_incoming, true, options);
-    try fillAdjacencySums(topology, values, parallel_incoming, true, parallel_options);
+    try fillAdjacencySums(topology, values, serial_incoming, true, 1, options);
+    try fillAdjacencySums(topology, values, parallel_incoming, true, 1, parallel_options);
     try std.testing.expectEqualSlices(f64, serial_incoming, parallel_incoming);
-    try fillAdjacencySums(topology, values, serial_outgoing, false, options);
-    try fillAdjacencySums(topology, values, parallel_outgoing, false, parallel_options);
+    try fillAdjacencySums(topology, values, serial_outgoing, false, 1, options);
+    try fillAdjacencySums(topology, values, parallel_outgoing, false, 1, parallel_options);
     try std.testing.expectEqualSlices(f64, serial_outgoing, parallel_outgoing);
 
     try std.testing.expectEqual(

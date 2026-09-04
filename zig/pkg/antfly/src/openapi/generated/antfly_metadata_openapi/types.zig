@@ -4088,6 +4088,10 @@ pub const GlobalStatefulQueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
+    /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied.
+    graph_metric: ?antfly_indexes_openapi.GraphMetricQuery = null,
+    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes.
+    graph_metric_rerank: ?antfly_indexes_openapi.GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?antfly_indexes_openapi.GraphQueries = null,
@@ -4133,6 +4137,8 @@ pub const GlobalStatefulQueryRequest = struct {
         .{ "count", "count", true },
         .{ "profile", "profile", true },
         .{ "reranker", "reranker", false },
+        .{ "graph_metric", "graph_metric", false },
+        .{ "graph_metric_rerank", "graph_metric_rerank", false },
         .{ "analyses", "analyses", true },
         .{ "graph_queries", "graph_queries", false },
         .{ "document_renderer", "document_renderer", true },
@@ -4263,6 +4269,20 @@ pub const GlobalStatefulQueryRequest = struct {
             try jw.write(value);
         } else if (jw.options.emit_null_optional_fields) {
             try jw.objectField("reranker");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.graph_metric) |value| {
+            try jw.objectField("graph_metric");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("graph_metric");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.graph_metric_rerank) |value| {
+            try jw.objectField("graph_metric_rerank");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("graph_metric_rerank");
             try jw.write(@as(?u8, null));
         }
         if (self.analyses) |value| {

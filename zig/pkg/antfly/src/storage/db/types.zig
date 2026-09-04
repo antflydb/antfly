@@ -1749,10 +1749,30 @@ pub const GraphMetricRerank = struct {
     index_name: []const u8,
     metric_name: []const u8,
     freshness: GraphMetricFreshness = .published,
+    candidate_count: ?u32 = null,
     base_weight: f64 = 1.0,
     weight: f64 = 1.0,
     missing_score: f64 = 0.0,
 };
+
+pub const graph_metric_rerank_max_candidates: u32 = 10_000;
+pub const graph_metric_rerank_default_oversample: u32 = 4;
+
+pub fn graphMetricRerankCandidateCount(rerank: GraphMetricRerank, offset: u32, limit: u32) u32 {
+    if (rerank.candidate_count) |count| return count;
+    const page_boundary = offset +| limit;
+    const adaptive = offset +| (limit *| graph_metric_rerank_default_oversample);
+    return @min(graph_metric_rerank_max_candidates, @max(page_boundary, adaptive));
+}
+
+pub fn validateGraphMetricRerankWindow(rerank: GraphMetricRerank, offset: u32, limit: u32) !void {
+    const page_boundary = offset +| limit;
+    if (page_boundary > graph_metric_rerank_max_candidates) return error.QueryCandidateBudgetExceeded;
+    if (rerank.candidate_count) |count| {
+        if (count == 0 or count > graph_metric_rerank_max_candidates or count < page_boundary)
+            return error.InvalidQueryRequest;
+    }
+}
 
 pub const NamedFullTextQuery = struct {
     name: []const u8,
@@ -2194,6 +2214,8 @@ pub const GraphMetricResult = struct {
 pub const GraphSearchResult = struct {
     name: []u8,
     nodes: []graph_query_mod.GraphResultNode = &.{},
+    metric_values_slab: []graph_query_mod.GraphMetricValue = &.{},
+    metric_value_names: [][]u8 = &.{},
     paths: []GraphPath = &.{},
     matches: []GraphPatternMatch = &.{},
     aggregates: []GraphAggregateResult = &.{},
@@ -2213,6 +2235,9 @@ pub const GraphSearchResult = struct {
         alloc.free(self.name);
         for (self.nodes) |*node| node.deinit(alloc);
         if (self.nodes.len > 0) alloc.free(self.nodes);
+        if (self.metric_values_slab.len > 0) alloc.free(self.metric_values_slab);
+        for (self.metric_value_names) |name| alloc.free(name);
+        if (self.metric_value_names.len > 0) alloc.free(self.metric_value_names);
         for (self.paths) |path| paths_mod.freePath(alloc, path);
         if (self.paths.len > 0) alloc.free(self.paths);
         for (self.matches) |*match| match.deinit(alloc);

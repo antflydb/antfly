@@ -5749,6 +5749,22 @@ pub const GraphIndex = struct {
         }
     };
 
+    /// Multiple published metric columns pinned to one reverse-store snapshot.
+    /// This is the query boundary used by metric filtering and ordering so a
+    /// concurrent publication can never mix generations across dependencies.
+    pub const GraphMetricColumnsSnapshot = struct {
+        statuses: []GraphMetricStatus,
+        score_columns: [][]?f64,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            for (self.statuses) |*status| status.deinit(alloc);
+            if (self.statuses.len > 0) alloc.free(self.statuses);
+            for (self.score_columns) |column| alloc.free(column);
+            if (self.score_columns.len > 0) alloc.free(self.score_columns);
+            self.* = undefined;
+        }
+    };
+
     pub const GraphMetricPlannedDrainOptions = struct {
         worker_ids: []const []const u8,
         max_steps: usize = 100000,
@@ -7685,8 +7701,8 @@ pub const GraphIndex = struct {
         var prior_completed_units: u64 = 0;
         var page_attempt = page.attempt;
         var reached_page_end = true;
-        var last_scanned_key: []u8 = "";
-        defer if (last_scanned_key.len > 0) self.alloc.free(last_scanned_key);
+        var last_scanned_key: std.ArrayListUnmanaged(u8) = .empty;
+        defer last_scanned_key.deinit(self.alloc);
         {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
@@ -7712,8 +7728,8 @@ pub const GraphIndex = struct {
                     }
                 }
                 scanned_units += 1;
-                if (last_scanned_key.len > 0) self.alloc.free(last_scanned_key);
-                last_scanned_key = try self.alloc.dupe(u8, entry.key);
+                last_scanned_key.clearRetainingCapacity();
+                try last_scanned_key.appendSlice(self.alloc, entry.key);
                 if (!graphMetricEdgeAllowed(cfg.edge_filter, parsed.edge_type.bytes)) continue;
                 try self.putPageRankScanNode(&nodes, parsed.source.bytes);
                 try self.putPageRankScanNode(&nodes, parsed.target.bytes);
@@ -7738,7 +7754,7 @@ pub const GraphIndex = struct {
         var adoption_cursor: []u8 = "";
         defer if (adoption_cursor.len > 0) self.alloc.free(adoption_cursor);
         if (reached_page_end) adoption_cursor = try self.graphMetricBuildAdoptionCursorAlloc(fingerprint);
-        const progress_cursor = if (reached_page_end) adoption_cursor else last_scanned_key;
+        const progress_cursor = if (reached_page_end) adoption_cursor else last_scanned_key.items;
         var write_page = page;
         write_page.attempt = page_attempt;
         try self.writePageRankScanPartialsForAttempt(
@@ -7968,8 +7984,8 @@ pub const GraphIndex = struct {
         var page_attempt = page.attempt;
         var total_units = page.total_units;
         var reached_page_end = true;
-        var last_scanned_key: []u8 = "";
-        defer if (last_scanned_key.len > 0) self.alloc.free(last_scanned_key);
+        var last_scanned_key: std.ArrayListUnmanaged(u8) = .empty;
+        defer last_scanned_key.deinit(self.alloc);
         var contribution_sum: f64 = 0.0;
         {
             var txn = try self.beginReadReverseTxn();
@@ -7997,8 +8013,8 @@ pub const GraphIndex = struct {
                     }
                 }
                 scanned_units += 1;
-                if (last_scanned_key.len > 0) self.alloc.free(last_scanned_key);
-                last_scanned_key = try self.alloc.dupe(u8, entry.key);
+                last_scanned_key.clearRetainingCapacity();
+                try last_scanned_key.appendSlice(self.alloc, entry.key);
                 if (!graphMetricEdgeAllowed(cfg.edge_filter, parsed.edge_type.bytes)) continue;
 
                 const source_factor = source_factors.get(parsed.source.bytes) orelse blk: {
@@ -8038,7 +8054,7 @@ pub const GraphIndex = struct {
         var adoption_cursor: []u8 = "";
         defer if (adoption_cursor.len > 0) self.alloc.free(adoption_cursor);
         if (reached_page_end) adoption_cursor = try self.graphMetricBuildAdoptionCursorAlloc(fingerprint);
-        const progress_cursor = if (reached_page_end) adoption_cursor else last_scanned_key;
+        const progress_cursor = if (reached_page_end) adoption_cursor else last_scanned_key.items;
         var write_page = page;
         write_page.attempt = page_attempt;
         try self.writePageRankContributionAttemptPartialsForAttempt(
@@ -8468,8 +8484,8 @@ pub const GraphIndex = struct {
         var total_units = page.total_units;
         var contribution_sum: f64 = 0.0;
         var reached_page_end = true;
-        var last_scanned_key: []u8 = "";
-        defer if (last_scanned_key.len > 0) self.alloc.free(last_scanned_key);
+        var last_scanned_key: std.ArrayListUnmanaged(u8) = .empty;
+        defer last_scanned_key.deinit(self.alloc);
         {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
@@ -8517,8 +8533,8 @@ pub const GraphIndex = struct {
                     result.value_ptr.* = source_rank;
                 }
                 contribution_sum += source_rank;
-                if (last_scanned_key.len > 0) self.alloc.free(last_scanned_key);
-                last_scanned_key = try self.alloc.dupe(u8, entry.key);
+                last_scanned_key.clearRetainingCapacity();
+                try last_scanned_key.appendSlice(self.alloc, entry.key);
             }
         }
 
@@ -8529,7 +8545,7 @@ pub const GraphIndex = struct {
         var adoption_cursor: []u8 = "";
         defer if (adoption_cursor.len > 0) self.alloc.free(adoption_cursor);
         if (reached_page_end) adoption_cursor = try self.graphMetricBuildAdoptionCursorAlloc(fingerprint);
-        const progress_cursor = if (reached_page_end) adoption_cursor else last_scanned_key;
+        const progress_cursor = if (reached_page_end) adoption_cursor else last_scanned_key.items;
         var write_page = page;
         write_page.attempt = page_attempt;
         try self.writePageRankContributionAttemptPartialsForAttempt(
@@ -8818,8 +8834,8 @@ pub const GraphIndex = struct {
         var total_units = page.total_units;
         var contribution_sum: f64 = 0.0;
         var reached_page_end = true;
-        var last_scanned_key: []u8 = "";
-        defer if (last_scanned_key.len > 0) self.alloc.free(last_scanned_key);
+        var last_scanned_key: std.ArrayListUnmanaged(u8) = .empty;
+        defer last_scanned_key.deinit(self.alloc);
         {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
@@ -8867,8 +8883,8 @@ pub const GraphIndex = struct {
                     result.value_ptr.* = source_hub;
                 }
                 contribution_sum += source_hub;
-                if (last_scanned_key.len > 0) self.alloc.free(last_scanned_key);
-                last_scanned_key = try self.alloc.dupe(u8, entry.key);
+                last_scanned_key.clearRetainingCapacity();
+                try last_scanned_key.appendSlice(self.alloc, entry.key);
             }
         }
 
@@ -8879,7 +8895,7 @@ pub const GraphIndex = struct {
         var adoption_cursor: []u8 = "";
         defer if (adoption_cursor.len > 0) self.alloc.free(adoption_cursor);
         if (reached_page_end) adoption_cursor = try self.graphMetricBuildAdoptionCursorAlloc(fingerprint);
-        const progress_cursor = if (reached_page_end) adoption_cursor else last_scanned_key;
+        const progress_cursor = if (reached_page_end) adoption_cursor else last_scanned_key.items;
         var write_page = page;
         write_page.attempt = page_attempt;
         try self.writePageRankContributionAttemptPartialsForAttempt(
@@ -9219,8 +9235,8 @@ pub const GraphIndex = struct {
         var total_units = page.total_units;
         var raw_sum: f64 = 0.0;
         var reached_page_end = true;
-        var last_scanned_key: []u8 = "";
-        defer if (last_scanned_key.len > 0) self.alloc.free(last_scanned_key);
+        var last_scanned_key: std.ArrayListUnmanaged(u8) = .empty;
+        defer last_scanned_key.deinit(self.alloc);
         {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
@@ -9268,8 +9284,8 @@ pub const GraphIndex = struct {
                     result.value_ptr.* = target_authority;
                 }
                 raw_sum += target_authority;
-                if (last_scanned_key.len > 0) self.alloc.free(last_scanned_key);
-                last_scanned_key = try self.alloc.dupe(u8, entry.key);
+                last_scanned_key.clearRetainingCapacity();
+                try last_scanned_key.appendSlice(self.alloc, entry.key);
             }
         }
 
@@ -9280,7 +9296,7 @@ pub const GraphIndex = struct {
         var adoption_cursor: []u8 = "";
         defer if (adoption_cursor.len > 0) self.alloc.free(adoption_cursor);
         if (reached_page_end) adoption_cursor = try self.graphMetricBuildAdoptionCursorAlloc(fingerprint);
-        const progress_cursor = if (reached_page_end) adoption_cursor else last_scanned_key;
+        const progress_cursor = if (reached_page_end) adoption_cursor else last_scanned_key.items;
         var write_page = page;
         write_page.attempt = page_attempt;
         try self.writeHitsHubRawAttemptPartialsForAttempt(
@@ -9812,8 +9828,8 @@ pub const GraphIndex = struct {
         var prior_completed_units: u64 = 0;
         var page_attempt = page.attempt;
         var reached_page_end = true;
-        var last_scanned_key: []u8 = "";
-        defer if (last_scanned_key.len > 0) self.alloc.free(last_scanned_key);
+        var last_scanned_key: std.ArrayListUnmanaged(u8) = .empty;
+        defer last_scanned_key.deinit(self.alloc);
         {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
@@ -9839,8 +9855,8 @@ pub const GraphIndex = struct {
                     }
                 }
                 scanned_units += 1;
-                if (last_scanned_key.len > 0) self.alloc.free(last_scanned_key);
-                last_scanned_key = try self.alloc.dupe(u8, entry.key);
+                last_scanned_key.clearRetainingCapacity();
+                try last_scanned_key.appendSlice(self.alloc, entry.key);
                 if (!graphMetricEdgeAllowed(cfg.edge_filter, parsed.edge_type.bytes)) continue;
                 const source_idx = try self.getOrPutDegreeNode(&map, &nodes, parsed.source.bytes);
                 const target_idx = try self.getOrPutDegreeNode(&map, &nodes, parsed.target.bytes);
@@ -9864,7 +9880,7 @@ pub const GraphIndex = struct {
         var adoption_cursor: []u8 = "";
         defer if (adoption_cursor.len > 0) self.alloc.free(adoption_cursor);
         if (reached_page_end) adoption_cursor = try self.graphMetricBuildAdoptionCursorAlloc(score_fingerprint);
-        const progress_cursor = if (reached_page_end) adoption_cursor else last_scanned_key;
+        const progress_cursor = if (reached_page_end) adoption_cursor else last_scanned_key.items;
         const progress_units = if (reached_page_end and page.total_units != 0) page.total_units else completed_units;
         {
             var score_batch = try self.beginWriteReverseBatch();
@@ -13102,6 +13118,40 @@ pub const GraphIndex = struct {
         errdefer status.deinit(self.alloc);
         const scores = try self.graphMetricScoresInTxnAlloc(&txn, metric_name, status.published_generation, nodes);
         return .{ .status = status, .scores = scores };
+    }
+
+    pub fn graphMetricColumnsSnapshotAlloc(
+        self: *GraphIndex,
+        metric_names: []const []const u8,
+        nodes: []const []const u8,
+    ) !GraphMetricColumnsSnapshot {
+        const statuses = try self.alloc.alloc(GraphMetricStatus, metric_names.len);
+        var initialized_statuses: usize = 0;
+        errdefer {
+            for (statuses[0..initialized_statuses]) |*status| status.deinit(self.alloc);
+            if (statuses.len > 0) self.alloc.free(statuses);
+        }
+        const score_columns = try self.alloc.alloc([]?f64, metric_names.len);
+        var initialized_columns: usize = 0;
+        errdefer {
+            for (score_columns[0..initialized_columns]) |column| self.alloc.free(column);
+            if (score_columns.len > 0) self.alloc.free(score_columns);
+        }
+
+        var txn = try self.beginReadReverseTxn();
+        defer txn.abort();
+        for (metric_names, 0..) |metric_name, i| {
+            statuses[i] = try self.graphMetricStatusInTxn(metric_name, &txn);
+            initialized_statuses += 1;
+            score_columns[i] = try self.graphMetricScoresInTxnAlloc(
+                &txn,
+                metric_name,
+                statuses[i].published_generation,
+                nodes,
+            );
+            initialized_columns += 1;
+        }
+        return .{ .statuses = statuses, .score_columns = score_columns };
     }
 
     fn graphMetricScoresInTxnAlloc(

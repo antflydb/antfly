@@ -490,13 +490,20 @@ point reads, but their score-ordered secondary index retains only the best
 10,000 entries, matching the public `top_k` ceiling. Each publication page
 merges its local top prefix with that bounded durable prefix, so top-k remains
 `O(K)` to read without doubling persistent score storage. Native reranking and
-graph projections resolve candidate columns through stable read snapshots and
-reuse a key buffer across candidates. Graph filtering, ordering, and limiting
+graph projections resolve every dependency column through one stable read
+snapshot and reuse retained cursor storage across maintenance pages. Graph filtering, ordering, and limiting
 then stay columnar: clause names are resolved once, bounded result pages use
-`O(N log K)` selection, and per-node metric objects are allocated only for
-surviving projected rows. Native and serverless execution call the same
+`O(N log K)` selection, and surviving rows are views into one contiguous
+metric-value slab with one owned copy of each metric name. Native and serverless execution call the same
 storage-independent selector, so ordering, null placement, filtering, limits,
 and deterministic tie-breaking cannot drift between deployments.
+
+Search reranking is a bounded two-stage retrieval operation. `candidate_count`
+controls the first-stage window (default `offset + 4 * limit`, maximum 10,000),
+the graph metric scores and sorts that window, and only then are `offset` and
+`limit` applied. An explicit window must cover the requested page. This avoids
+the misleading UX of reranking only an already-truncated page while keeping
+score reads and latency predictable for operators.
 
 Serverless point, projection, rerank, and direct top-k reads share one budget
 ledger on the pinned request session. The ledger composes authenticated range
@@ -506,8 +513,17 @@ per-metric-limit loophole where a valid request could multiply the allowed I/O
 by its dependency count. Exhaustion fails before the next backend range read
 and is returned as an actionable, non-retryable HTTP 422. Current v5/v6
 artifacts continue to use authenticated routed blocks and the persisted bounded
-top tier; v1-v3 compatibility reads are charged for their full artifact before
-materialization.
+top tier. Independent immutable score ranges use bounded eight-way `std.Io`
+fanout, while every child view shares the same synchronized request ledger and
+pinned manifest. v1-v3 compatibility reads are charged for their full artifact
+before materialization.
+
+Planned native maintenance pins the index catalog with a shared lifetime guard
+for each bounded scheduler unit. It does not hold the database-wide apply fence:
+graph storage transactions, page leases, attempt identities, and publication
+generation fences are the concurrency boundary. A short cooperative pause after
+durable progress protects foreground storage latency without serializing graph
+writes behind a complete maintenance page.
 
 External serverless reconciliation accepts the same caller-owned compute
 runtime as ordinary lake builds, keeping CPU fanout under one operator-visible

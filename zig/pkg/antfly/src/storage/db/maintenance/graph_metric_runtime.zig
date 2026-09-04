@@ -54,6 +54,10 @@ pub const Config = struct {
     owner_id: []const u8 = "local",
     lease_ttl_ms: u64 = 30_000,
     coordinator_start_background_builds: bool = true,
+    /// A short cooperative pause after durable progress prevents a busy graph
+    /// build from monopolizing storage bandwidth while still sustaining high
+    /// maintenance throughput.
+    active_interval_ms: u64 = 2,
     idle_interval_ms: u64 = 50,
     error_interval_ms: u64 = 250,
     // One bounded unit of durable work per runtime tick keeps foreground
@@ -347,7 +351,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     alloc: Allocator,
     io_impl: ?*Io.Threaded,
     maintenance_boundary: MaintenanceBoundary,
-    apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     config: Config,
     lease_key: []u8,
     ownership: ownership_mod.State,
@@ -367,6 +370,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         config: Config,
     ) !GraphMetricRuntime {
         const io_impl = backend_runtime.io_impl;
+        _ = apply_mutex;
         if (config.enabled and io_impl == null) return error.MissingBackendRuntimeIo;
         try validateConfig(config);
         const lease_key = try runtimeLeaseKeyAlloc(alloc, config);
@@ -375,7 +379,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
             .alloc = alloc,
             .io_impl = io_impl,
             .maintenance_boundary = MaintenanceBoundary.direct(index_manager),
-            .apply_mutex = apply_mutex,
             .config = config,
             .lease_key = lease_key,
             .ownership = try ownership_mod.State.init(alloc, store, lease_key, .{
@@ -454,15 +457,10 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn runOnceDetailed(self: *GraphMetricRuntime) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
         if (!self.config.enabled) return .{};
         self.recordTickStarted();
-        // Reject non-owners before contending on the database-wide apply
-        // fence. The post-lock renewal below remains authoritative because a
-        // lease can be lost while this runtime waits for the fence.
         if (!self.ensureRuntimeLease(self.config.clock.nowRealtimeMs())) {
             self.recordTickSuccess(.{});
             return .{};
         }
-        if (!lockApplyExclusiveBackoff(self)) return .{};
-        defer self.apply_mutex.unlockExclusive();
         const now_ms = self.config.clock.nowRealtimeMs();
         if (!self.ensureRuntimeLease(now_ms)) {
             self.recordTickSuccess(.{});
@@ -492,8 +490,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
             self.recordTickSuccess(.{});
             return .{};
         }
-        if (!lockApplyExclusiveBackoff(self)) return .{};
-        defer self.apply_mutex.unlockExclusive();
         const now_ms = self.config.clock.nowRealtimeMs();
         if (!self.ensureRuntimeLease(now_ms)) {
             self.recordTickSuccess(.{});
@@ -527,8 +523,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
             self.recordTickSuccess(.{});
             return .{};
         }
-        if (!lockApplyExclusiveBackoff(self)) return .{};
-        defer self.apply_mutex.unlockExclusive();
         const now_ms = self.config.clock.nowRealtimeMs();
         if (!self.ensureRuntimeLease(now_ms)) {
             self.recordTickSuccess(.{});
@@ -564,8 +558,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
             self.recordTickSuccess(.{});
             return .{};
         }
-        if (!lockApplyExclusiveBackoff(self)) return .{};
-        defer self.apply_mutex.unlockExclusive();
         const now_ms = self.config.clock.nowRealtimeMs();
         if (!self.ensureRuntimeLease(now_ms)) {
             self.recordTickSuccess(.{});
@@ -1153,7 +1145,10 @@ fn workerMain(runtime: *GraphMetricRuntime) void {
             sleepMs(runtime, runtime.config.error_interval_ms);
             continue;
         };
-        if (ran) continue;
+        if (ran) {
+            sleepMs(runtime, runtime.config.active_interval_ms);
+            continue;
+        }
         waitForWork(runtime);
     }
 }
@@ -1231,14 +1226,6 @@ fn isShutdown(runtime: *GraphMetricRuntime) bool {
     runtime.mutex.lockUncancelable(io);
     defer runtime.mutex.unlock(io);
     return runtime.shutdown;
-}
-
-fn lockApplyExclusiveBackoff(runtime: *GraphMetricRuntime) bool {
-    while (!runtime.apply_mutex.tryLockExclusive()) {
-        if (isShutdown(runtime)) return false;
-        sleepMs(runtime, 1);
-    }
-    return true;
 }
 
 test "db graph metric runtime lease ownership blocks duplicate owners and allows takeover" {

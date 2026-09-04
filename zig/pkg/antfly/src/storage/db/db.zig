@@ -24096,15 +24096,13 @@ pub const DB = struct {
 
     pub fn runGraphMetricPlannedCoordinatorSweep(self: *DB, options: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepOptions) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        lockApply(self);
-        defer self.core.unlockApply();
+        // Planned graph work is generation-fenced and storage-transactional.
+        // IndexManager pins catalog lifetime without blocking foreground apply.
         return try self.core.index_manager.runGraphMetricPlannedCoordinatorSweep(options);
     }
 
     pub fn runGraphMetricPlannedWorkerSweep(self: *DB, options: index_manager_mod.IndexManager.GraphMetricPlannedWorkerSweepOptions) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        lockApply(self);
-        defer self.core.unlockApply();
         return try self.core.index_manager.runGraphMetricPlannedWorkerSweep(options);
     }
 
@@ -29239,7 +29237,12 @@ pub const DB = struct {
             if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &children);
             return children;
         }
-        const selection_req = types.canonicalGroupedMatchSelectionRequest(execution_req);
+        var selection_req = types.canonicalGroupedMatchSelectionRequest(execution_req);
+        if (execution_req.graph_metric_rerank) |rerank| {
+            try types.validateGraphMetricRerankWindow(rerank, execution_req.offset, execution_req.limit);
+            selection_req.offset = 0;
+            selection_req.limit = types.graphMetricRerankCandidateCount(rerank, execution_req.offset, execution_req.limit);
+        }
         if (searchRequestRequiresComposedSearch(selection_req)) {
             var composed = try self.searchComposed(alloc, selection_req, exec_ctx, dense_profile_sink);
             errdefer composed.deinit();
@@ -29367,8 +29370,28 @@ pub const DB = struct {
                 return a_score > b_score;
             }
         }.lessThan);
+        try pageGraphMetricRerankedHits(result, req.offset, req.limit);
         if (result.graph_metric_rerank_status) |*old| old.deinit(result.alloc);
         result.graph_metric_rerank_status = result_status;
+    }
+
+    fn pageGraphMetricRerankedHits(result: *types.SearchResult, offset: u32, limit: u32) !void {
+        const old_hits = result.hits;
+        const start = @min(@as(usize, offset), old_hits.len);
+        const keep_len = @min(@as(usize, limit), old_hits.len - start);
+        if (start == 0 and keep_len == old_hits.len) return;
+
+        const kept = try result.alloc.alloc(types.SearchHit, keep_len);
+        for (old_hits, 0..) |*hit, i| {
+            if (i >= start and i < start + keep_len) {
+                kept[i - start] = hit.*;
+                hit.* = undefined;
+            } else {
+                hit.deinit(result.alloc);
+            }
+        }
+        if (old_hits.len > 0) result.alloc.free(old_hits);
+        result.hits = kept;
     }
 
     fn clampF64ToF32(value: f64) f32 {

@@ -1725,8 +1725,8 @@ test "serverless lake graph metrics share one bounded HITS execution for a compa
         .{ .name = "authority", .kind = .hits_authority },
         .{ .name = "hub", .kind = .hits_hub },
     };
-    // 804 HITS kernel work items plus the fifteen-item indexed projection.
-    const limits = Limits{ .max_work_items = 819, .max_total_work_items = 819 };
+    // 604 HITS kernel work items plus the fifteen-item indexed projection.
+    const limits = Limits{ .max_work_items = 619, .max_total_work_items = 619 };
     const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, limits, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
     defer {
         for (published) |ref| freeArtifactRef(alloc, ref);
@@ -1798,9 +1798,9 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         .{ .name = "rank_a", .kind = .pagerank },
         .{ .name = "rank_b", .kind = .pagerank },
     };
-    // One PageRank consumes 354 kernel work items plus fifteen projection
+    // One PageRank consumes 254 kernel work items plus fifteen projection
     // items; the table-wide budget admits the first and rejects the second.
-    const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, .{ .max_work_items = 369, .max_total_work_items = 369 }, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
+    const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, .{ .max_work_items = 269, .max_total_work_items = 269 }, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
     defer {
         for (published) |ref| freeArtifactRef(alloc, ref);
         alloc.free(published);
@@ -1813,7 +1813,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         try std.testing.expectEqual(if (i == 0) metric_segment.MaterializationState.ready else .rejected, decoded.materialization_state);
     }
 
-    var shared_budget = graph_metric_policy.Budget{ .limits = .{ .max_work_items = 369, .max_total_work_items = 369 } };
+    var shared_budget = graph_metric_policy.Budget{ .limits = .{ .max_work_items = 269, .max_total_work_items = 269 } };
     const one_config = [_]graph_mod.GraphMetricConfig{.{ .name = "shared_rank", .kind = .pagerank }};
     var prepared = try prepareGraphArtifactAlloc(alloc, &artifacts, source, .none, shared_budget.limits);
     defer prepared.deinit(alloc);

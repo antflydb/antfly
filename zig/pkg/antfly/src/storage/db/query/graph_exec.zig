@@ -1629,12 +1629,6 @@ pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
 
     const name = try alloc.dupe(u8, named.name);
     errdefer alloc.free(name);
-    // Metric names may be interned in the execution status payload. Nodes
-    // outlive that payload, so give projected names independent ownership at
-    // this boundary.
-    for (graph_result.nodes) |*node| {
-        for (node.metrics) |*metric| try metric.ensureNameOwned(alloc);
-    }
     const metric_status = if (named.query.include_metric_status)
         try cloneGraphMetricStatusesFromGraph(alloc, graph_result.metric_status)
     else
@@ -1642,10 +1636,16 @@ pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
     errdefer types.freeGraphMetricStatuses(alloc, metric_status);
     const nodes = graph_result.nodes;
     graph_result.nodes = &.{};
+    const metric_values_slab = graph_result.metric_values_slab;
+    graph_result.metric_values_slab = &.{};
+    const metric_value_names = graph_result.metric_value_names;
+    graph_result.metric_value_names = &.{};
 
     return .{
         .name = name,
         .nodes = nodes,
+        .metric_values_slab = metric_values_slab,
+        .metric_value_names = metric_value_names,
         .paths = &.{},
         .matches = &.{},
         .hits = hits,

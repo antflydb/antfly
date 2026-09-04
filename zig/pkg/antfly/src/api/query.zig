@@ -8261,7 +8261,7 @@ test "query parser accepts direct graph metric reads" {
 
 test "query parser accepts graph metric rerank" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"match_all":{}},"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank","base_weight":0.5,"weight":2.5,"missing_score":-0.25,"metric_freshness":"fresh"},"limit":10}
+        \\{"full_text_search":{"match_all":{}},"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank","candidate_count":80,"base_weight":0.5,"weight":2.5,"missing_score":-0.25,"metric_freshness":"fresh"},"offset":5,"limit":10}
     );
     defer owned.deinit(std.testing.allocator);
 
@@ -8269,9 +8269,17 @@ test "query parser accepts graph metric rerank" {
     try std.testing.expectEqualStrings("graph_idx", owned.req.graph_metric_rerank.?.index_name);
     try std.testing.expectEqualStrings("pagerank", owned.req.graph_metric_rerank.?.metric_name);
     try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, owned.req.graph_metric_rerank.?.freshness);
+    try std.testing.expectEqual(@as(?u32, 80), owned.req.graph_metric_rerank.?.candidate_count);
+    try std.testing.expectEqual(@as(u32, 80), db_mod.types.graphMetricRerankCandidateCount(owned.req.graph_metric_rerank.?, owned.req.offset, owned.req.limit));
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), owned.req.graph_metric_rerank.?.base_weight, 0.000001);
     try std.testing.expectApproxEqAbs(@as(f64, 2.5), owned.req.graph_metric_rerank.?.weight, 0.000001);
     try std.testing.expectApproxEqAbs(@as(f64, -0.25), owned.req.graph_metric_rerank.?.missing_score, 0.000001);
+    const adaptive = db_mod.types.GraphMetricRerank{ .index_name = "graph_idx", .metric_name = "pagerank" };
+    try std.testing.expectEqual(@as(u32, 45), db_mod.types.graphMetricRerankCandidateCount(adaptive, 5, 10));
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, db_mod.types.validateGraphMetricRerankWindow(adaptive, 9_999, 2));
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"full_text_search":{"match_all":{}},"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank","candidate_count":10},"offset":5,"limit":10}
+    ));
 }
 
 test "query encoder emits graph metric results" {

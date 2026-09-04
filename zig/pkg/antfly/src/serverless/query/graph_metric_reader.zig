@@ -134,6 +134,7 @@ const OwnedTopQueue = std.PriorityQueue(Score, void, compareOwnedWorstFirst);
 const ScoreFetchRange = struct { first_block: usize, last_block: usize, offset: u64, len: usize };
 const max_score_range_requests: usize = 32;
 const max_top_score_range_requests: usize = 64;
+const max_parallel_score_range_requests: usize = 8;
 const coalesced_score_window_bytes: u64 = 8 * 1024 * 1024;
 const ranked_fetch_window_bytes: usize = 8 * 1024 * 1024;
 
@@ -265,11 +266,18 @@ pub fn scoresAlloc(
 
     const fetch_ranges = try planScoreFetchRangesAlloc(alloc, routing.entries, block_counts, control.score_data_offset);
     defer alloc.free(fetch_ranges);
+    var fetched_ranges = try fetchScoreRangesAlloc(
+        alloc,
+        session,
+        metric_index,
+        control.header.version,
+        routing.entries,
+        fetch_ranges,
+    );
+    defer fetched_ranges.deinit(alloc);
 
-    for (fetch_ranges) |range| {
+    for (fetch_ranges, fetched_ranges.payloads) |range, payload| {
         try session.checkCancellation();
-        const payload = try fetchScoreRangeAlloc(alloc, session, metric_index, control.header.version, routing.entries, range);
-        defer alloc.free(payload);
         for (range.first_block..range.last_block + 1) |block_index| {
             if (block_counts[block_index] == 0) continue;
             const entry = routing.entries[block_index];
@@ -454,6 +462,92 @@ fn fetchScoreRangeAlloc(
         error.ArtifactIntegrityMismatch => error.InvalidGraphMetricSegment,
         else => |other| other,
     };
+}
+
+const FetchedScoreRanges = struct {
+    payloads: [][]u8,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.payloads) |payload| if (payload.len > 0) std.heap.smp_allocator.free(payload);
+        alloc.free(self.payloads);
+    }
+};
+
+fn fetchScoreRangeWorker(
+    child: *runtime_mod.QuerySession,
+    metric_index: usize,
+    segment_version: u16,
+    entries: []const metric_segment.codec.RoutingEntry,
+    range: ScoreFetchRange,
+    output: *[]u8,
+    failure: *?anyerror,
+) void {
+    output.* = fetchScoreRangeAlloc(
+        std.heap.smp_allocator,
+        child,
+        metric_index,
+        segment_version,
+        entries,
+        range,
+    ) catch |err| {
+        failure.* = err;
+        return;
+    };
+}
+
+/// Fetch independent immutable score ranges concurrently with bounded fanout.
+/// Every child borrows the pinned manifest and charges the same synchronized
+/// request budget, so parallelism changes latency without weakening admission.
+fn fetchScoreRangesAlloc(
+    alloc: Allocator,
+    session: *runtime_mod.QuerySession,
+    metric_index: usize,
+    segment_version: u16,
+    entries: []const metric_segment.codec.RoutingEntry,
+    ranges: []const ScoreFetchRange,
+) !FetchedScoreRanges {
+    const payloads = try alloc.alloc([]u8, ranges.len);
+    @memset(payloads, @constCast((&[_]u8{})[0..]));
+    errdefer {
+        for (payloads) |payload| if (payload.len > 0) std.heap.smp_allocator.free(payload);
+        alloc.free(payloads);
+    }
+
+    var batch_start: usize = 0;
+    while (batch_start < ranges.len) {
+        const batch_len = @min(max_parallel_score_range_requests, ranges.len - batch_start);
+        var children: [max_parallel_score_range_requests]runtime_mod.QuerySession = undefined;
+        var failures: [max_parallel_score_range_requests]?anyerror = @splat(null);
+        if (session.io) |io| {
+            var group: std.Io.Group = .init;
+            for (0..batch_len) |batch_index| {
+                const index = batch_start + batch_index;
+                children[batch_index] = session.forkGraphMetricRead(std.heap.smp_allocator);
+                group.async(io, fetchScoreRangeWorker, .{
+                    &children[batch_index], metric_index, segment_version, entries, ranges[index], &payloads[index], &failures[batch_index],
+                });
+            }
+            try group.await(io);
+        } else {
+            for (0..batch_len) |batch_index| {
+                const index = batch_start + batch_index;
+                children[batch_index] = session.forkGraphMetricRead(std.heap.smp_allocator);
+                fetchScoreRangeWorker(
+                    &children[batch_index],
+                    metric_index,
+                    segment_version,
+                    entries,
+                    ranges[index],
+                    &payloads[index],
+                    &failures[batch_index],
+                );
+            }
+        }
+        for (children[0..batch_len]) |*child| child.deinit();
+        for (failures[0..batch_len]) |failure| if (failure) |err| return err;
+        batch_start += batch_len;
+    }
+    return .{ .payloads = payloads };
 }
 
 fn fetchRankedScoreBlocksAlloc(
@@ -666,10 +760,17 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
     var selected_bytes: usize = 0;
     const fetch_ranges = try planAllScoreFetchRangesAlloc(alloc, routing.entries);
     defer alloc.free(fetch_ranges);
-    for (fetch_ranges) |range| {
+    var fetched_ranges = try fetchScoreRangesAlloc(
+        alloc,
+        session,
+        metric_index,
+        control.header.version,
+        routing.entries,
+        fetch_ranges,
+    );
+    defer fetched_ranges.deinit(alloc);
+    for (fetch_ranges, fetched_ranges.payloads) |range, payload| {
         try session.checkCancellation();
-        const payload = try fetchScoreRangeAlloc(alloc, session, metric_index, control.header.version, routing.entries, range);
-        defer alloc.free(payload);
         for (range.first_block..range.last_block + 1) |block_index| {
             const entry = routing.entries[block_index];
             if (entry.offset < range.offset) return error.InvalidGraphMetricSegment;

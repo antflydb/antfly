@@ -12769,6 +12769,10 @@ pub const GlobalStatefulQueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
+    /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied.
+    graph_metric: ?GraphMetricQuery = null,
+    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes.
+    graph_metric_rerank: ?GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?GraphQueries = null,
@@ -12814,6 +12818,8 @@ pub const GlobalStatefulQueryRequest = struct {
         .{ "count", "count", true },
         .{ "profile", "profile", true },
         .{ "reranker", "reranker", true },
+        .{ "graph_metric", "graph_metric", true },
+        .{ "graph_metric_rerank", "graph_metric_rerank", true },
         .{ "analyses", "analyses", true },
         .{ "graph_queries", "graph_queries", true },
         .{ "document_renderer", "document_renderer", true },
@@ -12938,6 +12944,14 @@ pub const GlobalStatefulQueryRequest = struct {
         }
         if (self.reranker) |value| {
             try jw.objectField("reranker");
+            try jw.write(value);
+        }
+        if (self.graph_metric) |value| {
+            try jw.objectField("graph_metric");
+            try jw.write(value);
+        }
+        if (self.graph_metric_rerank) |value| {
+            try jw.objectField("graph_metric_rerank");
             try jw.write(value);
         }
         if (self.analyses) |value| {
@@ -15110,6 +15124,8 @@ pub const GraphMetricRerank = struct {
     index: []const u8,
     /// Graph metric name to blend into the search hit score.
     metric: []const u8,
+    /// Bounded retrieval window scored by the graph metric before offset and limit are applied. When omitted, Antfly uses an adaptive four-times page window, capped at 10,000 candidates. An explicit value must cover offset plus limit. Larger windows improve promotion recall at predictable linear score-read cost.
+    candidate_count: ?i32 = null,
     /// Multiplier applied to the existing hit score before adding the graph metric feature.
     base_weight: ?f64 = null,
     /// Multiplier applied to the graph metric score before it is added to the existing hit score.
@@ -15123,6 +15139,7 @@ pub const GraphMetricRerank = struct {
     pub const openApiFieldMetadata = .{
         .{ "index", "index", false },
         .{ "metric", "metric", false },
+        .{ "candidate_count", "candidate_count", true },
         .{ "base_weight", "base_weight", true },
         .{ "weight", "weight", true },
         .{ "missing_score", "missing_score", true },
@@ -15143,6 +15160,10 @@ pub const GraphMetricRerank = struct {
         try jw.write(self.index);
         try jw.objectField("metric");
         try jw.write(self.metric);
+        if (self.candidate_count) |value| {
+            try jw.objectField("candidate_count");
+            try jw.write(value);
+        }
         if (self.base_weight) |value| {
             try jw.objectField("base_weight");
             try jw.write(value);

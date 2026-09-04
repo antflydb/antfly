@@ -2784,6 +2784,9 @@ pub fn parseQueryRequestWithDeadline(
     req.graph_queries = try buildGraphQueries(alloc, request);
     req.graph_metric_queries = try parseGraphMetricQueriesAlloc(alloc, effective_body);
     req.graph_metric_rerank = try parseGraphMetricRerankAlloc(alloc, request.graph_metric_rerank);
+    if (req.graph_metric_rerank) |rerank| {
+        try db_mod.types.validateGraphMetricRerankWindow(rerank, req.offset, req.limit);
+    }
     if (req.graph_queries.len > 0) {
         req.graph_query_transport = try captureGraphQueryTransportAlloc(alloc, effective_body, req.graph_queries);
     }
@@ -10503,6 +10506,10 @@ fn parseGraphMetricRerankAlloc(
         .index_name = index_name,
         .metric_name = metric_name,
         .freshness = freshness,
+        .candidate_count = if (rerank.candidate_count) |count|
+            std.math.cast(u32, count) orelse return error.InvalidQueryRequest
+        else
+            null,
         .base_weight = base_weight,
         .weight = weight,
         .missing_score = missing_score,

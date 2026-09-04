@@ -45,9 +45,9 @@ pub fn kernelWorkItems(kind: Kind, node_count: usize, edge_count: usize, iterati
     };
     const iteration_node_passes: u64 = switch (kind) {
         .degree => 1,
-        .pagerank => 3, // sink mass, adjacency fill, delta
-        .eigenvector => 4, // adjacency fill, norm, scale, delta
-        .hits => 7, // two fills, two norm/scale pairs, paired delta/copy
+        .pagerank => 2, // sink mass, fused adjacency fill + delta
+        .eigenvector => 3, // adjacency fill, norm, fused scale + delta
+        .hits => 5, // two fills, two norms, fused paired scale/delta/copy
     };
     const iteration_edge_passes: u64 = switch (kind) {
         .degree => 0,
@@ -65,9 +65,9 @@ pub fn kernelWorkItems(kind: Kind, node_count: usize, edge_count: usize, iterati
 
 test "kernel work model accounts for algorithm-specific vector and edge passes" {
     try std.testing.expectEqual(@as(u64, 10), try kernelWorkItems(.degree, 10, 20, 50));
-    try std.testing.expectEqual(@as(u64, 120), try kernelWorkItems(.pagerank, 10, 20, 2));
-    try std.testing.expectEqual(@as(u64, 130), try kernelWorkItems(.eigenvector, 10, 20, 2));
-    try std.testing.expectEqual(@as(u64, 240), try kernelWorkItems(.hits, 10, 20, 2));
+    try std.testing.expectEqual(@as(u64, 100), try kernelWorkItems(.pagerank, 10, 20, 2));
+    try std.testing.expectEqual(@as(u64, 110), try kernelWorkItems(.eigenvector, 10, 20, 2));
+    try std.testing.expectEqual(@as(u64, 200), try kernelWorkItems(.hits, 10, 20, 2));
 }
 
 test "kernel work model rejects overflow" {

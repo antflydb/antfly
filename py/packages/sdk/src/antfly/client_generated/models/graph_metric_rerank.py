@@ -20,6 +20,10 @@ class GraphMetricRerank:
         Attributes:
             index (str): Graph index that owns the published metric.
             metric (str): Graph metric name to blend into the search hit score.
+            candidate_count (int | Unset): Bounded retrieval window scored by the graph metric before offset and limit are
+                applied. When omitted, Antfly uses an adaptive four-times page window, capped at 10,000 candidates. An explicit
+                value must cover offset plus limit. Larger windows improve promotion recall at predictable linear score-read
+                cost.
             base_weight (float | Unset): Multiplier applied to the existing hit score before adding the graph metric
                 feature. Default: 1.0.
             weight (float | Unset): Multiplier applied to the graph metric score before it is added to the existing hit
@@ -32,6 +36,7 @@ class GraphMetricRerank:
 
     index: str
     metric: str
+    candidate_count: int | Unset = UNSET
     base_weight: float | Unset = 1.0
     weight: float | Unset = 1.0
     missing_score: float | Unset = 0.0
@@ -42,6 +47,8 @@ class GraphMetricRerank:
         index = self.index
 
         metric = self.metric
+
+        candidate_count = self.candidate_count
 
         base_weight = self.base_weight
 
@@ -61,6 +68,8 @@ class GraphMetricRerank:
                 "metric": metric,
             }
         )
+        if candidate_count is not UNSET:
+            field_dict["candidate_count"] = candidate_count
         if base_weight is not UNSET:
             field_dict["base_weight"] = base_weight
         if weight is not UNSET:
@@ -79,6 +88,8 @@ class GraphMetricRerank:
 
         metric = d.pop("metric")
 
+        candidate_count = d.pop("candidate_count", UNSET)
+
         base_weight = d.pop("base_weight", UNSET)
 
         weight = d.pop("weight", UNSET)
@@ -95,6 +106,7 @@ class GraphMetricRerank:
         graph_metric_rerank = cls(
             index=index,
             metric=metric,
+            candidate_count=candidate_count,
             base_weight=base_weight,
             weight=weight,
             missing_score=missing_score,

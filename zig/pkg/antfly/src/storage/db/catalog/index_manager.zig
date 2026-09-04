@@ -6128,6 +6128,15 @@ pub const IndexManager = struct {
         self: *IndexManager,
         options: GraphMetricPlannedSchedulerSweepOptions,
     ) !GraphMetricPlannedSchedulerSweepResult {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return try self.runGraphMetricPlannedCoordinatorSweepUnlocked(options);
+    }
+
+    fn runGraphMetricPlannedCoordinatorSweepUnlocked(
+        self: *IndexManager,
+        options: GraphMetricPlannedSchedulerSweepOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
         var result = GraphMetricPlannedSchedulerSweepResult{};
         if (options.max_metrics == 0) return result;
         const active_builds_before_start: usize = if (options.auto_idle_options != null)
@@ -6227,6 +6236,15 @@ pub const IndexManager = struct {
         self: *IndexManager,
         options: GraphMetricPlannedWorkerSweepOptions,
     ) !GraphMetricPlannedSchedulerSweepResult {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return try self.runGraphMetricPlannedWorkerSweepUnlocked(options);
+    }
+
+    fn runGraphMetricPlannedWorkerSweepUnlocked(
+        self: *IndexManager,
+        options: GraphMetricPlannedWorkerSweepOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
         if (options.worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
         var result = GraphMetricPlannedSchedulerSweepResult{};
         if (options.max_pages == 0) return result;
@@ -6301,6 +6319,8 @@ pub const IndexManager = struct {
         self: *IndexManager,
         options: GraphMetricPlannedMaintenanceOptions,
     ) !GraphMetricPlannedSchedulerSweepResult {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
         return try self.runGraphMetricPlannedMaintenanceWithAuto(options, null);
     }
 
@@ -6309,6 +6329,8 @@ pub const IndexManager = struct {
         options: GraphMetricPlannedMaintenanceOptions,
         auto_options: GraphMetricPlannedAutoIdleOptions,
     ) !GraphMetricPlannedSchedulerSweepResult {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
         return try self.runGraphMetricPlannedMaintenanceWithAuto(options, auto_options);
     }
 
@@ -6327,7 +6349,7 @@ pub const IndexManager = struct {
         var rounds: usize = 0;
         while (rounds < options.max_rounds) : (rounds += 1) {
             var round = GraphMetricPlannedSchedulerSweepResult{};
-            const coordinator_before = try self.runGraphMetricPlannedCoordinatorSweep(.{
+            const coordinator_before = try self.runGraphMetricPlannedCoordinatorSweepUnlocked(.{
                 .max_metrics = options.max_metrics_per_round,
                 .start_background_builds = true,
                 .now_ms = options.now_ms,
@@ -6336,7 +6358,7 @@ pub const IndexManager = struct {
             round.add(coordinator_before);
 
             if (options.worker_ids.len == 0) {
-                const worker = try self.runGraphMetricPlannedWorkerSweep(.{
+                const worker = try self.runGraphMetricPlannedWorkerSweepUnlocked(.{
                     .worker_id = options.worker_id,
                     .max_pages = options.max_pages_per_round,
                     .now_ms = options.now_ms,
@@ -6348,7 +6370,7 @@ pub const IndexManager = struct {
                     var worker_progressed = false;
                     for (options.worker_ids) |worker_id| {
                         if (pages_remaining == 0) break;
-                        const worker = try self.runGraphMetricPlannedWorkerSweep(.{
+                        const worker = try self.runGraphMetricPlannedWorkerSweepUnlocked(.{
                             .worker_id = worker_id,
                             .max_pages = 1,
                             .now_ms = options.now_ms,
@@ -6361,7 +6383,7 @@ pub const IndexManager = struct {
                 }
             }
 
-            const coordinator_after = try self.runGraphMetricPlannedCoordinatorSweep(.{
+            const coordinator_after = try self.runGraphMetricPlannedCoordinatorSweepUnlocked(.{
                 .max_metrics = options.max_metrics_per_round,
                 .start_background_builds = true,
                 .now_ms = options.now_ms,

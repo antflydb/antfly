@@ -6054,6 +6054,8 @@ pub const GraphMetricRerank = struct {
     index: []const u8,
     /// Graph metric name to blend into the search hit score.
     metric: []const u8,
+    /// Bounded retrieval window scored by the graph metric before offset and limit are applied. When omitted, Antfly uses an adaptive four-times page window, capped at 10,000 candidates. An explicit value must cover offset plus limit. Larger windows improve promotion recall at predictable linear score-read cost.
+    candidate_count: ?i32 = null,
     /// Multiplier applied to the existing hit score before adding the graph metric feature.
     base_weight: ?f64 = null,
     /// Multiplier applied to the graph metric score before it is added to the existing hit score.
@@ -6067,6 +6069,7 @@ pub const GraphMetricRerank = struct {
     pub const openApiFieldMetadata = .{
         .{ "index", "index", false },
         .{ "metric", "metric", false },
+        .{ "candidate_count", "candidate_count", true },
         .{ "base_weight", "base_weight", true },
         .{ "weight", "weight", true },
         .{ "missing_score", "missing_score", true },
@@ -6087,6 +6090,10 @@ pub const GraphMetricRerank = struct {
         try jw.write(self.index);
         try jw.objectField("metric");
         try jw.write(self.metric);
+        if (self.candidate_count) |value| {
+            try jw.objectField("candidate_count");
+            try jw.write(value);
+        }
         if (self.base_weight) |value| {
             try jw.objectField("base_weight");
             try jw.write(value);

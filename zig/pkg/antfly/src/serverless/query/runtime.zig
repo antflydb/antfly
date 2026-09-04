@@ -62,6 +62,7 @@ pub const GraphMetricReadLimits = struct {
 };
 
 pub const GraphMetricReadBudget = struct {
+    mutex: std.atomic.Mutex = .unlocked,
     limits: GraphMetricReadLimits = .{},
     range_requests: u64 = 0,
     range_bytes: u64 = 0,
@@ -76,6 +77,8 @@ pub const GraphMetricReadBudget = struct {
     }
 
     pub fn chargeRange(self: *@This(), bytes: usize) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
         const next_requests = try checkedCharge(self.range_requests, 1, self.limits.max_range_requests);
         const next_bytes = try checkedCharge(self.range_bytes, @intCast(bytes), self.limits.max_range_bytes);
         self.range_requests = next_requests;
@@ -83,6 +86,8 @@ pub const GraphMetricReadBudget = struct {
     }
 
     pub fn chargeDecode(self: *@This(), blocks: usize, work_items: usize) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
         const next_blocks = try checkedCharge(self.decoded_blocks, @intCast(blocks), self.limits.max_decoded_blocks);
         const next_items = try checkedCharge(self.work_items, @intCast(work_items), self.limits.max_work_items);
         self.decoded_blocks = next_blocks;
@@ -90,6 +95,8 @@ pub const GraphMetricReadBudget = struct {
     }
 
     pub fn chargeRetained(self: *@This(), bytes: usize) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
         self.retained_bytes = try checkedCharge(self.retained_bytes, @intCast(bytes), self.limits.max_retained_bytes);
     }
 };
@@ -239,14 +246,18 @@ pub const QuerySession = struct {
     artifacts: *artifacts_mod.ArtifactStore,
     cache: ?*cache_mod.QueryCache = null,
     manifest: manifest_mod.Manifest,
+    owns_manifest: bool = true,
+    io: ?std.Io = null,
     cancellation: CancellationToken = .none,
     diagnostics: ?*operation.RequestDiagnostics = null,
     graph_metric_specs: ?[]graph_metric_config.IndexSpec = null,
+    owns_graph_metric_specs: bool = true,
     graph_metric_read_budget: GraphMetricReadBudget = .{},
+    graph_metric_read_budget_shared: ?*GraphMetricReadBudget = null,
 
     pub fn deinit(self: *QuerySession) void {
-        self.clearGraphMetricSpecs();
-        self.manifest.deinit(self.alloc);
+        if (self.owns_graph_metric_specs) self.clearGraphMetricSpecs();
+        if (self.owns_manifest) self.manifest.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -264,6 +275,10 @@ pub const QuerySession = struct {
     }
 
     pub fn clearGraphMetricSpecs(self: *QuerySession) void {
+        if (!self.owns_graph_metric_specs) {
+            self.graph_metric_specs = null;
+            return;
+        }
         if (self.graph_metric_specs) |specs| graph_metric_config.freeIndexSpecs(self.alloc, specs);
         self.graph_metric_specs = null;
     }
@@ -293,6 +308,33 @@ pub const QuerySession = struct {
         self.diagnostics = diagnostics;
     }
 
+    pub fn setIo(self: *QuerySession, io: ?std.Io) void {
+        self.io = io;
+    }
+
+    /// Create a non-owning view of the pinned request for a concurrent range
+    /// fetch. Callers provide a thread-safe allocator; the manifest, cache,
+    /// cancellation token, and aggregate graph budget remain shared.
+    pub fn forkGraphMetricRead(self: *QuerySession, alloc: Allocator) QuerySession {
+        return .{
+            .alloc = alloc,
+            .artifacts = self.artifacts,
+            .cache = self.cache,
+            .manifest = self.manifest,
+            .owns_manifest = false,
+            .io = self.io,
+            .cancellation = self.cancellation,
+            .diagnostics = null,
+            .graph_metric_specs = self.graph_metric_specs,
+            .owns_graph_metric_specs = false,
+            .graph_metric_read_budget_shared = self.effectiveGraphMetricReadBudget(),
+        };
+    }
+
+    fn effectiveGraphMetricReadBudget(self: *QuerySession) *GraphMetricReadBudget {
+        return self.graph_metric_read_budget_shared orelse &self.graph_metric_read_budget;
+    }
+
     pub fn recordGraphMetricRejection(
         self: *QuerySession,
         graph_index_name: []const u8,
@@ -308,15 +350,15 @@ pub const QuerySession = struct {
     }
 
     pub fn chargeGraphMetricRange(self: *QuerySession, bytes: usize) !void {
-        return self.graph_metric_read_budget.chargeRange(bytes);
+        return self.effectiveGraphMetricReadBudget().chargeRange(bytes);
     }
 
     pub fn chargeGraphMetricDecode(self: *QuerySession, blocks: usize, work_items: usize) !void {
-        return self.graph_metric_read_budget.chargeDecode(blocks, work_items);
+        return self.effectiveGraphMetricReadBudget().chargeDecode(blocks, work_items);
     }
 
     pub fn chargeGraphMetricRetained(self: *QuerySession, bytes: usize) !void {
-        return self.graph_metric_read_budget.chargeRetained(bytes);
+        return self.effectiveGraphMetricReadBudget().chargeRetained(bytes);
     }
 
     pub fn findArtifactIndex(self: *const QuerySession, kind: manifest_mod.ArtifactKind) ?usize {

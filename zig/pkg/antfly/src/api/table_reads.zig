@@ -5334,6 +5334,9 @@ fn queryHostedAcrossGroupsParallel(
 }
 
 fn distributedSearchShardLimit(req: db_mod.types.SearchRequest) u32 {
+    if (req.graph_metric_rerank) |rerank| {
+        return db_mod.types.graphMetricRerankCandidateCount(rerank, req.offset, req.limit);
+    }
     if (req.reranker) |reranker| {
         if (reranker.candidate_count) |candidate_count| return candidate_count;
         const output_limit = reranker.top_n orelse req.limit;
@@ -5349,9 +5352,9 @@ const DistributedCoordinatorPaging = struct {
     limit: u32,
 };
 
-/// Reranking and distributed pruning are coordinator transforms. Retain the
-/// global retrieval window here and apply the caller's offset/final limit only
-/// after final-score processing.
+/// Provider reranking and distributed pruning are coordinator transforms.
+/// Graph-metric reranking is computed against shard-local published vectors,
+/// then merged by final score using the caller's page at the coordinator.
 fn distributedCoordinatorPaging(req: db_mod.types.SearchRequest) DistributedCoordinatorPaging {
     if (req.reranker != null or req.pruner != null) return .{
         .offset = 0,
@@ -5382,6 +5385,20 @@ test "distributed reranking widens retrieval and stays coordinator owned" {
     const coordinator = distributedCoordinatorPaging(req);
     try std.testing.expectEqual(@as(u32, 0), coordinator.offset);
     try std.testing.expectEqual(@as(u32, 50), coordinator.limit);
+
+    const graph_req = db_mod.types.SearchRequest{
+        .limit = 10,
+        .offset = 5,
+        .graph_metric_rerank = .{ .index_name = "graph", .metric_name = "pagerank" },
+    };
+    const graph_shard = distributedSearchShardRequest(graph_req, &.{}, false);
+    try std.testing.expectEqual(@as(u32, 45), graph_shard.limit);
+    try std.testing.expectEqual(@as(u32, 0), graph_shard.offset);
+    try std.testing.expectEqual(@as(?u32, 45), graph_shard.graph_metric_rerank.?.candidate_count);
+
+    const graph_coordinator = distributedCoordinatorPaging(graph_req);
+    try std.testing.expectEqual(@as(u32, 5), graph_coordinator.offset);
+    try std.testing.expectEqual(@as(u32, 10), graph_coordinator.limit);
 }
 
 const complete_match_anchor_order = [_]db_mod.types.SortField{.{ .field = "_id" }};
@@ -5657,6 +5674,11 @@ fn distributedSearchShardRequest(
     // the global merge.
     copy.reranker = null;
     copy.reranker_query_text = "";
+    // Graph-metric scoring remains shard-local because its published vector is
+    // shard-local. Pin the already-expanded global candidate window explicitly
+    // so each shard neither applies the caller offset nor expands it a second
+    // time; the coordinator merges final scores and applies the public page.
+    if (copy.graph_metric_rerank) |*rerank| rerank.candidate_count = copy.limit;
     // Pruning is score-domain-sensitive. Applying it independently on shards
     // would produce topology-dependent results and, with a reranker, would use
     // retrieval scores instead of the provider's final scores.
@@ -17728,6 +17750,9 @@ fn appendGraphMetricRerankField(
     var rerank_first = true;
     try appendJsonFieldString(alloc, out, &rerank_first, "index", rerank.index_name);
     try appendJsonFieldString(alloc, out, &rerank_first, "metric", rerank.metric_name);
+    if (rerank.candidate_count) |candidate_count| {
+        try appendJsonFieldU32(alloc, out, &rerank_first, "candidate_count", candidate_count);
+    }
     try appendJsonFieldF64(alloc, out, &rerank_first, "base_weight", rerank.base_weight);
     try appendJsonFieldF64(alloc, out, &rerank_first, "weight", rerank.weight);
     try appendJsonFieldF64(alloc, out, &rerank_first, "missing_score", rerank.missing_score);

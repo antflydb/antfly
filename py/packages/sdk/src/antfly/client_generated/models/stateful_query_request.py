@@ -62,7 +62,7 @@ class StatefulQueryRequest:
     the stateful public transport boundary for the v0.2 transition window.
 
         Attributes:
-            table (str | Unset): Name of the table to query. Optional for global queries. Example: wikipedia.
+            table (str | Unset): Name of the table to query. Required for global-query requests. Example: wikipedia.
             query (QueryRequestQuery | Unset): Canonical public query AST. Prefer this field for new clients.
 
                 Boolean clauses are normalized before planning:
@@ -227,8 +227,10 @@ class StatefulQueryRequest:
                 and a groups-times-matches execution budget of 1,000.
                  Example: 20.
             offset (int | Unset): Number of results to skip for pagination. Supported for text-backed,
-                match_all, and filter-only requests. Not supported for semantic_search
-                due to vector index limitations.
+                match_all, and filter-only requests. Approximate semantic requests do
+                not support offset on their own. Semantic and hybrid requests support
+                it when a reranker is configured: Antfly retrieves a bounded candidate
+                window and applies offset after coordinator-owned reranking.
             timeout_ms (int | Unset): Optional query execution deadline in milliseconds. The server applies this as a
                 cooperative deadline across query planning, search execution, aggregation reruns,
                 sorting, and response post-processing. If the deadline expires before the query
@@ -298,7 +300,7 @@ class StatefulQueryRequest:
                 join metadata, reranker stats, and merge details.
                 Has minor performance overhead — not recommended for production traffic.
             reranker (RerankerConfig | Unset): A unified configuration for a reranking provider. Example: {'provider':
-                'ollama', 'model': 'dengcao/Qwen3-Reranker-0.6B:F16', 'field': 'content'}.
+                'cohere', 'model': 'rerank-v4.0-pro', 'field': 'content'}.
             graph_metric (GraphMetricQuery | Unset): Reads a published graph metric. Score-bearing graph metric queries on
                 multi-shard tables require a globally coordinated metric snapshot and otherwise return
                 graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores.
@@ -347,7 +349,9 @@ class StatefulQueryRequest:
                  Example: {{encodeToon this.fields}}.
             pruner (Pruner | Unset): Configuration for pruning search results based on score quality.
                 Helps filter out low-relevance results in RAG pipelines by detecting
-                score gaps or deviations from top results.
+                score gaps or deviations from top results. Pruning runs once on the
+                globally merged score domain, after reranking when a reranker is
+                configured and before offset/limit paging.
             join (JoinClause | Unset): Configuration for joining data from another table.
                 Supports inner, left, and right joins with automatic strategy selection.
             foreign_sources (QueryRequestForeignSources | Unset): Map of table name to foreign data source configuration for

@@ -2988,9 +2988,16 @@ pub const HttpHandler = struct {
         var session: query_mod.QuerySession = undefined;
         var session_initialized = false;
         defer if (session_initialized) session.deinit();
+        var graph_metric_rerank_status: ?db_types.GraphMetricStatus = null;
+        defer if (graph_metric_rerank_status) |*status| status.deinit(self.alloc);
 
         if (requestHasSearchInputs(request)) {
-            const search_request = requestWithoutGraphControls(request);
+            var search_request = requestWithoutGraphControls(request);
+            if (metric_requests.rerank) |rerank| {
+                try db_types.validateGraphMetricRerankWindow(rerank, req.offset, req.limit);
+                search_request.offset = 0;
+                search_request.limit = @intCast(db_types.graphMetricRerankCandidateCount(rerank, req.offset, req.limit));
+            }
             const search_body = try std.json.Stringify.valueAlloc(self.alloc, search_request, .{});
             defer self.alloc.free(search_body);
 
@@ -3014,6 +3021,14 @@ pub const HttpHandler = struct {
             req.profile = execution.profile_requested;
             search_hits = try allocDbSearchHitsAlloc(self.alloc, execution.hits);
             search_total_hits = publicGraphSeedTotalHits(execution.hits.len, req.limit);
+
+            session = execution.takeSession();
+            session_initialized = true;
+            if (metric_requests.rerank) |rerank| {
+                if (req.count_only) return error.UnsupportedQueryRequest;
+                graph_metric_rerank_status = try self.applyPublicGraphMetricRerank(&session, search_hits, rerank);
+                search_hits = try pagePublicGraphMetricRerankedHits(self.alloc, search_hits, req.offset, req.limit);
+            }
             try initial_sets.append(self.alloc, .{
                 .name = "$query_results",
                 .hits = search_hits,
@@ -3045,9 +3060,6 @@ pub const HttpHandler = struct {
                     .total_hits = search_total_hits,
                 });
             }
-
-            session = execution.takeSession();
-            session_initialized = true;
         } else {
             session = self.query.openHeadSession(namespace) catch |err| switch (err) {
                 error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -3057,11 +3069,10 @@ pub const HttpHandler = struct {
             session.setCancellation(cancellation);
             session.setDiagnostics(diagnostics);
         }
-        var graph_metric_rerank_status: ?db_types.GraphMetricStatus = null;
-        defer if (graph_metric_rerank_status) |*status| status.deinit(self.alloc);
+        session.setIo(self.io);
         if (metric_requests.rerank) |rerank| {
-            if (!requestHasSearchInputs(request) or req.count_only) return error.UnsupportedQueryRequest;
-            graph_metric_rerank_status = try self.applyPublicGraphMetricRerank(&session, search_hits, rerank);
+            _ = rerank;
+            if (!requestHasSearchInputs(request)) return error.UnsupportedQueryRequest;
         }
 
         const results = self.executePublicGraphQueriesAlloc(&session, table_name, graph_queries, initial_sets.items) catch |err| {
@@ -3196,17 +3207,31 @@ pub const HttpHandler = struct {
             initialized_columns += 1;
         }
 
-        var metric_value_names: [graph_query_mod.graph_metric_dependency_limit][]const u8 = undefined;
-        for (statuses[0..dependency_count], 0..) |status, i| metric_value_names[i] = status.name;
-        try graph_query_mod.GraphQueryEngine.applyLoadedMetricColumns(
+        const metric_value_names = try self.alloc.alloc([]u8, dependency_count);
+        var initialized_metric_names: usize = 0;
+        var metric_names_owned = true;
+        errdefer if (metric_names_owned) {
+            for (metric_value_names[0..initialized_metric_names]) |name| self.alloc.free(name);
+            self.alloc.free(metric_value_names);
+        };
+        for (statuses[0..dependency_count], 0..) |status, i| {
+            metric_value_names[i] = try self.alloc.dupe(u8, status.name);
+            initialized_metric_names += 1;
+        }
+        if (result.metric_values_slab.len > 0) self.alloc.free(result.metric_values_slab);
+        result.metric_values_slab = try graph_query_mod.GraphQueryEngine.applyLoadedMetricColumns(
             self.alloc,
             dependency_names[0..dependency_count],
-            metric_value_names[0..dependency_count],
+            metric_value_names,
             score_columns,
             query,
             graphMetricPostProcessingNeeded(query),
             &result.nodes,
         );
+        for (result.metric_value_names) |name| self.alloc.free(name);
+        if (result.metric_value_names.len > 0) self.alloc.free(result.metric_value_names);
+        result.metric_value_names = metric_value_names;
+        metric_names_owned = false;
         for (result.metric_status) |*status| status.deinit(self.alloc);
         if (result.metric_status.len > 0) self.alloc.free(result.metric_status);
         result.metric_status = statuses;
@@ -8775,6 +8800,29 @@ fn allocDbSearchHitsAlloc(
 fn freeDbSearchHits(alloc: Allocator, hits: []db_types.SearchHit) void {
     for (hits) |*hit| hit.deinit(alloc);
     alloc.free(hits);
+}
+
+fn pagePublicGraphMetricRerankedHits(
+    alloc: Allocator,
+    hits: []db_types.SearchHit,
+    offset: u32,
+    limit: u32,
+) ![]db_types.SearchHit {
+    const start = @min(@as(usize, offset), hits.len);
+    const keep_len = @min(@as(usize, limit), hits.len - start);
+    if (start == 0 and keep_len == hits.len) return hits;
+
+    const kept = try alloc.alloc(db_types.SearchHit, keep_len);
+    for (hits, 0..) |*hit, i| {
+        if (i >= start and i < start + keep_len) {
+            kept[i - start] = hit.*;
+            hit.* = undefined;
+        } else {
+            hit.deinit(alloc);
+        }
+    }
+    alloc.free(hits);
+    return kept;
 }
 
 fn allocQueryHitsAlloc(
