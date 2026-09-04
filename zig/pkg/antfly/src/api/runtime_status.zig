@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform_time = @import("antfly_platform").time;
 const db_mod = struct {
     pub const types = @import("../storage/db/types.zig");
@@ -279,19 +280,30 @@ const TargetedIndexAuthority = struct {
 const IndexObservationLookup = struct {
     by_name: std.StringHashMapUnmanaged(usize) = .empty,
 
+    fn initCapacity(alloc: std.mem.Allocator, count: usize) !@This() {
+        var out: @This() = .{};
+        errdefer out.deinit(alloc);
+        try out.by_name.ensureTotalCapacity(alloc, @intCast(count));
+        return out;
+    }
+
     fn init(
         alloc: std.mem.Allocator,
         indexes: []const db_mod.types.DBIndexStats,
     ) !@This() {
-        var out: @This() = .{};
+        var out = try initCapacity(alloc, indexes.len);
         errdefer out.deinit(alloc);
-        try out.by_name.ensureTotalCapacity(alloc, @intCast(indexes.len));
+        try out.populate(indexes);
+        return out;
+    }
+
+    fn populate(self: *@This(), indexes: []const db_mod.types.DBIndexStats) !void {
+        std.debug.assert(self.by_name.count() == 0);
         for (indexes, 0..) |item, index| {
-            const result = out.by_name.getOrPutAssumeCapacity(item.name);
+            const result = self.by_name.getOrPutAssumeCapacity(item.name);
             if (result.found_existing) return error.DuplicateRuntimeStatusIndex;
             result.value_ptr.* = index;
         }
-        return out;
     }
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -300,12 +312,102 @@ const IndexObservationLookup = struct {
     }
 };
 
+/// Allocation-owned scratch for one optimistic multi-group publication.
+/// Cached and incoming index rows are moved—not cloned—into `merged_indexes`
+/// only after every group has been validated under the cache mutex. Retired
+/// deep state is destroyed after unlocking, keeping the shared critical path
+/// allocation-free and linear in the two index sets.
+const IndexDeltaMergeWorkspace = struct {
+    expected_previous_generation: u64,
+    expected_previous_index_count: usize,
+    merged_indexes: []db_mod.types.DBIndexStats = &.{},
+    retired_indexes: []db_mod.types.DBIndexStats = &.{},
+    retired_count: usize = 0,
+    cached_selected: []bool = &.{},
+    incoming_selected: []bool = &.{},
+    previous_lookup: IndexObservationLookup = .{},
+    retired_status: ?LocalTableRuntimeStatus = null,
+    old_cached_backing: []db_mod.types.DBIndexStats = &.{},
+    old_incoming_backing: []db_mod.types.DBIndexStats = &.{},
+    installed: bool = false,
+
+    fn init(
+        alloc: std.mem.Allocator,
+        previous_generation: u64,
+        previous_index_count: usize,
+        incoming_index_count: usize,
+        merged_index_count: usize,
+    ) !@This() {
+        var out: @This() = .{
+            .expected_previous_generation = previous_generation,
+            .expected_previous_index_count = previous_index_count,
+        };
+        errdefer out.deinit(alloc);
+        if (merged_index_count > 0) out.merged_indexes = try alloc.alloc(db_mod.types.DBIndexStats, merged_index_count);
+        if (previous_index_count + incoming_index_count > 0)
+            out.retired_indexes = try alloc.alloc(db_mod.types.DBIndexStats, previous_index_count + incoming_index_count);
+        if (previous_index_count > 0) {
+            out.cached_selected = try alloc.alloc(bool, previous_index_count);
+            @memset(out.cached_selected, false);
+        }
+        if (incoming_index_count > 0) {
+            out.incoming_selected = try alloc.alloc(bool, incoming_index_count);
+            @memset(out.incoming_selected, false);
+        }
+        out.previous_lookup = try IndexObservationLookup.initCapacity(alloc, previous_index_count);
+        return out;
+    }
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.previous_lookup.deinit(alloc);
+        if (self.installed) {
+            for (self.retired_indexes[0..self.retired_count]) |item|
+                db_mod.types.freeDBIndexStatsItem(alloc, item);
+            if (self.old_cached_backing.len > 0) alloc.free(self.old_cached_backing);
+            if (self.old_incoming_backing.len > 0) alloc.free(self.old_incoming_backing);
+            if (self.retired_status) |*status| status.deinit(alloc);
+        } else if (self.merged_indexes.len > 0) {
+            alloc.free(self.merged_indexes);
+        }
+        if (self.retired_indexes.len > 0) alloc.free(self.retired_indexes);
+        if (self.cached_selected.len > 0) alloc.free(self.cached_selected);
+        if (self.incoming_selected.len > 0) alloc.free(self.incoming_selected);
+        self.* = undefined;
+    }
+};
+
+const IndexDeltaMergeSpec = struct {
+    previous_generation: u64,
+    previous_index_count: usize,
+    merged_index_count: usize,
+};
+
+const TestStructuralPublishPreparationHook = struct {
+    ptr: *anyopaque,
+    run: *const fn (*anyopaque) void,
+};
+
+var test_after_structural_publish_preparation_hook: ?TestStructuralPublishPreparationHook = null;
+
+fn runTestAfterStructuralPublishPreparationHook() void {
+    if (comptime builtin.is_test) {
+        if (test_after_structural_publish_preparation_hook) |hook| hook.run(hook.ptr);
+    }
+}
+
 pub const TableRuntimeSnapshotCache = struct {
     pub const IndexIdentity = struct {
         index_name: []const u8,
         kind: db_mod.types.IndexKind,
         incarnation: u64,
         config_hash: u64,
+    };
+
+    /// Desired catalog authority for one targeted structural transition.
+    /// Runtime observations validate this value; they never define it.
+    pub const TargetedIndexExpectation = union(enum) {
+        absent,
+        exact: IndexIdentity,
     };
 
     pub const TableEpoch = struct {
@@ -622,6 +724,47 @@ pub const TableRuntimeSnapshotCache = struct {
         return true;
     }
 
+    /// Binds a targeted transition to the identity accepted by the durable
+    /// catalog. This is deliberately separate from runtime publication: the
+    /// first shard observation may be stale, incomplete, or the wrong kind and
+    /// therefore cannot be allowed to choose serving authority.
+    pub fn bindTargetedIndexExpectation(
+        self: *@This(),
+        table_name: []const u8,
+        index_name: []const u8,
+        token: TargetedIndexTransitionToken,
+        expected: TargetedIndexExpectation,
+    ) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.tables.getPtr(table_name) orelse return false;
+        const authority = currentTargetedIndexAuthority(state, index_name, token) orelse return false;
+        if (!authority.owner_active) return false;
+        const normalized: TargetedIndexAuthority.Expectation = switch (expected) {
+            .absent => .absent,
+            .exact => |identity| blk: {
+                if (!std.mem.eql(u8, identity.index_name, index_name) or
+                    identity.incarnation == 0 or identity.config_hash == 0) return false;
+                break :blk .{ .exact = .{
+                    .kind = identity.kind,
+                    .incarnation = identity.incarnation,
+                    .config_hash = identity.config_hash,
+                } };
+            },
+        };
+        if (targetExpectationsEqual(authority.expectation, normalized)) return true;
+        // One coalesced activation owner may replan after the catalog changes
+        // while it is queued. The latest successfully fenced catalog snapshot
+        // supersedes the earlier expectation under the same operation token;
+        // observations still cannot perform this transition themselves.
+        authority.expectation = normalized;
+        authority.expectation_observation_generation = self.next_observation_generation;
+        authority.target_authority_handed_off = false;
+        authority.convergence_requirements.clearRetainingCapacity();
+        markTargetObservationStaleLocked(state, index_name);
+        return true;
+    }
+
     /// Requests release after the named mutation's last synchronous/queued
     /// owner finishes. The fence remains active until a subsequent fresh
     /// table publication performs the authority handoff; structural work can
@@ -641,6 +784,23 @@ pub const TableRuntimeSnapshotCache = struct {
         fence.release_after_observation_generation = self.next_observation_generation;
         self.advanceTargetedIndexAuthorityLocked(state);
         self.settleReleasedIndexAuthoritiesLocked(state);
+    }
+
+    /// Returns true only when the exact transition has already installed its
+    /// catalog identity across every observed group. Callers may treat a stale
+    /// publication as benign only after this proof; a merely newer generic
+    /// observation is not an activation acknowledgement.
+    pub fn targetedIndexAuthorityHandedOff(
+        self: *@This(),
+        table_name: []const u8,
+        index_name: []const u8,
+        token: TargetedIndexTransitionToken,
+    ) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.tables.getPtr(table_name) orelse return false;
+        const authority = currentTargetedIndexAuthority(state, index_name, token) orelse return false;
+        return authority.target_authority_handed_off;
     }
 
     /// Records an authoritative structural acknowledgement that the named
@@ -788,9 +948,10 @@ pub const TableRuntimeSnapshotCache = struct {
     }
 
     /// Publishes a bounded set of owned observations under one table-epoch
-    /// decision and one cache lock. Statuses are cloned before locking so
-    /// allocation and DBStats ownership do not lengthen the critical section.
-    /// A newer observation for one group is preserved without rejecting valid
+    /// decision. Status payloads are cloned outside the cache mutex; a short
+    /// optimistic preflight reserves any missing group slots, and the final
+    /// all-group commit performs no allocation or deep destruction. A newer
+    /// observation for one group is preserved without rejecting valid
     /// observations for the other groups.
     pub fn publishGroups(
         self: *@This(),
@@ -850,13 +1011,17 @@ pub const TableRuntimeSnapshotCache = struct {
             }
         }
 
+        const transferred = try self.alloc.alloc(bool, statuses.len);
+        defer if (transferred.len > 0) self.alloc.free(transferred);
+        @memset(transferred, false);
+        const publishable = try self.alloc.alloc(bool, statuses.len);
+        defer if (publishable.len > 0) self.alloc.free(publishable);
+        @memset(publishable, false);
         const owned = try self.alloc.alloc(LocalTableRuntimeStatus, statuses.len);
         var initialized: usize = 0;
-        var clean_all = true;
         defer {
-            if (clean_all) {
-                for (owned[0..initialized]) |*status| status.deinit(self.alloc);
-            }
+            for (owned[0..initialized], transferred[0..initialized]) |*status, was_transferred|
+                if (!was_transferred) status.deinit(self.alloc);
             self.alloc.free(owned);
         }
         for (statuses, 0..) |status, index| {
@@ -874,6 +1039,63 @@ pub const TableRuntimeSnapshotCache = struct {
             initialized_lookups += 1;
         }
 
+        // Size the ownership-transfer merge under a brief read of the exact
+        // cached generations, then allocate every workspace after unlocking.
+        // The final publication lock validates these generation/count pairs
+        // before it mutates any group.
+        const merge_specs = try self.alloc.alloc(?IndexDeltaMergeSpec, statuses.len);
+        defer if (merge_specs.len > 0) self.alloc.free(merge_specs);
+        @memset(merge_specs, null);
+        lockAtomic(&self.mutex);
+        {
+            defer self.mutex.unlock();
+            const state = self.tables.getPtr(table_name) orelse return .stale_table;
+            if (!std.meta.eql(state.epoch, token.table_epoch)) return .stale_table;
+            var missing_group_count: usize = 0;
+            for (statuses) |status| {
+                if (!state.groups.contains(status.group_id)) missing_group_count += 1;
+            }
+            // Reserve only the currently missing group slots before any index
+            // payload is moved. A concurrent publisher may consume this spare
+            // capacity after we unlock; the final preflight below detects that
+            // case and asks the durable owner to retry instead of allocating
+            // or rehashing in the commit section.
+            try state.groups.ensureUnusedCapacity(self.alloc, @intCast(missing_group_count));
+            for (statuses, incoming_lookups, 0..) |status, incoming_lookup, index| {
+                const previous = state.groups.getPtr(status.group_id) orelse continue;
+                if (previous.cache_observation_generation > token.observation_generation) continue;
+                merge_specs[index] = .{
+                    .previous_generation = previous.cache_observation_generation,
+                    .previous_index_count = previous.stats.indexes.len,
+                    .merged_index_count = mergedIndexObservationCount(
+                        previous.*,
+                        incoming_lookup,
+                        target_index_name,
+                    ),
+                };
+            }
+        }
+        const merge_workspaces = try self.alloc.alloc(?IndexDeltaMergeWorkspace, statuses.len);
+        var initialized_workspaces: usize = 0;
+        defer {
+            for (merge_workspaces[0..initialized_workspaces]) |*workspace| {
+                if (workspace.*) |*value| value.deinit(self.alloc);
+            }
+            if (merge_workspaces.len > 0) self.alloc.free(merge_workspaces);
+        }
+        for (merge_specs, statuses, 0..) |spec, status, index| {
+            merge_workspaces[index] = if (spec) |value| try IndexDeltaMergeWorkspace.init(
+                self.alloc,
+                value.previous_generation,
+                value.previous_index_count,
+                status.stats.indexes.len,
+                value.merged_index_count,
+            ) else null;
+            initialized_workspaces += 1;
+        }
+
+        runTestAfterStructuralPublishPreparationHook();
+
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const state = self.tables.getPtr(table_name) orelse return .stale_table;
@@ -883,11 +1105,31 @@ pub const TableRuntimeSnapshotCache = struct {
             _ = currentTargetedIndexAuthority(state, name, transition) orelse return .stale_observation;
         }
 
+        // Optimistic preflight is valid only for the exact cached generation.
+        // A newer observation makes this token stale; any other replacement is
+        // transient contention and is retried by the durable publisher rather
+        // than merging against an allocation plan for a different snapshot.
+        for (statuses, merge_specs) |status, spec| {
+            const previous = state.groups.getPtr(status.group_id);
+            if (spec) |expected| {
+                const current = previous orelse return error.RuntimeStatusPublicationContended;
+                if (current.cache_observation_generation > token.observation_generation) continue;
+                if (current.cache_observation_generation != expected.previous_generation or
+                    current.stats.indexes.len != expected.previous_index_count)
+                    return error.RuntimeStatusPublicationContended;
+            } else if (previous) |current| {
+                if (current.cache_observation_generation <= token.observation_generation)
+                    return error.RuntimeStatusPublicationContended;
+            }
+        }
+
         var new_groups: usize = 0;
         for (statuses) |status| {
             if (!state.groups.contains(status.group_id)) new_groups += 1;
         }
-        try state.groups.ensureUnusedCapacity(self.alloc, @intCast(new_groups));
+        const maximum_group_count = (state.groups.capacity() * std.hash_map.default_max_load_percentage) / 100;
+        if (maximum_group_count - state.groups.count() < new_groups)
+            return error.RuntimeStatusPublicationContended;
 
         const now_ns = platform_time.monotonicNs();
         if (target_index_name) |name| {
@@ -900,6 +1142,12 @@ pub const TableRuntimeSnapshotCache = struct {
                     token.observation_generation >= authority.accept_target_after_observation_generation and
                     token.observation_generation >= authority.expectation_observation_generation)
                 {
+                    // Production publishers carry an operation token and must
+                    // have bound the durable catalog identity before sampling
+                    // runtime state. Only the token-free test convenience path
+                    // may infer an expectation from its synthetic observation.
+                    if (transition_token != null and authority.expectation == .unknown)
+                        return error.MissingTargetedIndexExpectation;
                     // Decide publication eligibility before mutating the
                     // authority registry. A delayed structural observation
                     // whose every group has already been superseded cannot
@@ -930,9 +1178,10 @@ pub const TableRuntimeSnapshotCache = struct {
                 }
             }
         }
-        var published = false;
-        clean_all = false;
-        for (owned, statuses, incoming_lookups) |*next, status, incoming_lookup| {
+        // Every allocation and generation validation is complete. Build each
+        // per-index delta by transferring ownership into its preallocated
+        // workspace; the cache remains unchanged until all groups are ready.
+        for (owned, statuses, incoming_lookups, merge_workspaces, 0..) |*next, status, incoming_lookup, *workspace, owned_index| {
             next.cache_observation_generation = token.observation_generation;
             next.withMetadataDefaults(.live_writer_publish, now_ns);
             self.applyTargetObservationAuthorityLocked(
@@ -943,32 +1192,42 @@ pub const TableRuntimeSnapshotCache = struct {
             );
             if (state.groups.getPtr(status.group_id)) |previous| {
                 if (previous.cache_observation_generation > token.observation_generation) {
-                    next.deinit(self.alloc);
                     continue;
                 }
-                try mergeIndexObservationDelta(
-                    self.alloc,
-                    previous.*,
+                const merge_workspace = &(workspace.* orelse unreachable);
+                moveIndexObservationDeltaLocked(
+                    previous,
                     next,
                     incoming_lookup,
                     &state.index_authorities,
                     target_index_name,
+                    merge_workspace,
                 );
-                try preserveArtifactVisibilityOnReplayRegression(
+                try preserveArtifactVisibilityUsingLookup(
                     self.alloc,
-                    previous.*,
+                    previous,
                     next,
                     &state.index_authorities,
                     state.active_index_transition_count != 0,
                     target_index_name,
+                    merge_workspace.previous_lookup,
+                    true,
                 );
-                previous.deinit(self.alloc);
-                previous.* = next.*;
+            }
+            publishable[owned_index] = true;
+        }
+
+        var published = false;
+        for (owned, statuses, publishable, merge_workspaces, 0..) |*next, status, should_publish, *workspace, owned_index| {
+            if (!should_publish) continue;
+            if (state.groups.getPtr(status.group_id)) |previous| {
+                finishMovedIndexObservationDeltaLocked(previous, next, &(workspace.* orelse unreachable));
             } else {
                 state.groups.putAssumeCapacity(status.group_id, next.*);
+                next.* = undefined;
             }
             self.enforceIndexAuthoritiesInStatusLocked(state, state.groups.getPtr(status.group_id).?);
-            next.* = undefined;
+            transferred[owned_index] = true;
             published = true;
         }
         self.advanceTargetedIndexAuthorityLocked(state);
@@ -1290,7 +1549,10 @@ pub const TableRuntimeSnapshotCache = struct {
                 const current_index = lookup.by_name.get(index_name) orelse return;
                 if (!indexMatchesTargetIdentity(status.stats.indexes[current_index], identity)) return;
             }
-            const owned_name = self.alloc.dupe(u8, index_name) catch return;
+            const owned_name = self.alloc.dupe(u8, index_name) catch {
+                self.markGroupTargetObservationPendingLocked(state, group_id, source_target_sequence);
+                return;
+            };
             state.index_authorities.put(self.alloc, owned_name, .{
                 .transition_revision = 0,
                 .transition_active = false,
@@ -1305,6 +1567,7 @@ pub const TableRuntimeSnapshotCache = struct {
                 .target_authority_handed_off = true,
             }) catch {
                 self.alloc.free(owned_name);
+                self.markGroupTargetObservationPendingLocked(state, group_id, source_target_sequence);
                 return;
             };
             authority = state.index_authorities.getPtr(owned_name).?;
@@ -1785,11 +2048,31 @@ fn preserveArtifactVisibilityOnReplayRegression(
     has_active_index_transition: bool,
     structural_target_index_name: ?[]const u8,
 ) !void {
-    // Serving continuity is keyed by exact index identity. Build the lookup
-    // once so a large multi-index publication remains linear while holding
-    // the cache mutex.
     var previous_lookup = try IndexObservationLookup.init(alloc, previous.stats.indexes);
     defer previous_lookup.deinit(alloc);
+    var mutable_previous = previous;
+    try preserveArtifactVisibilityUsingLookup(
+        alloc,
+        &mutable_previous,
+        incoming,
+        index_authorities,
+        has_active_index_transition,
+        structural_target_index_name,
+        previous_lookup,
+        false,
+    );
+}
+
+fn preserveArtifactVisibilityUsingLookup(
+    alloc: std.mem.Allocator,
+    previous: *LocalTableRuntimeStatus,
+    incoming: *LocalTableRuntimeStatus,
+    index_authorities: ?*const std.StringHashMapUnmanaged(TargetedIndexAuthority),
+    has_active_index_transition: bool,
+    structural_target_index_name: ?[]const u8,
+    previous_lookup: IndexObservationLookup,
+    transfer_retained_state: bool,
+) !void {
     var preserved_visibility = false;
     for (incoming.stats.indexes) |*dst| {
         // Serviceability is a cache-local continuity proof. Re-derive it for
@@ -1797,12 +2080,12 @@ fn preserveArtifactVisibilityOnReplayRegression(
         dst.runtime_observation_serviceable = false;
         dst.runtime_observation_targeted_sibling = false;
         const cached_index = previous_lookup.by_name.get(dst.name) orelse continue;
-        const cached = previous.stats.indexes[cached_index];
+        const cached = &previous.stats.indexes[cached_index];
         if (cached.kind != dst.kind) continue;
         const accepted_authority_continuity = if (index_authorities) |authorities|
             if (authorities.get(dst.name)) |authority|
                 (!authority.transition_active or authority.target_authority_handed_off) and
-                    targetAuthorityAcceptsIdentity(authority, cached)
+                    targetAuthorityAcceptsIdentity(authority, cached.*)
             else
                 false
         else
@@ -1896,7 +2179,7 @@ fn preserveArtifactVisibilityOnReplayRegression(
             previous_observation_serviceable and
             (!cached.runtime_observation_stale or target_fence_accepts_same_incarnation) and
             cached.coverage_summary_ready and
-            indexHasPublishedGenerationVisibility(cached);
+            indexHasPublishedGenerationVisibility(cached.*);
         const serviceable_continuity = serviceable_catch_up_continuity or
             targeted_sibling_continuity or
             accepted_authority_continuity;
@@ -1916,12 +2199,12 @@ fn preserveArtifactVisibilityOnReplayRegression(
             !projection_regressed and
             !visibility_regressed_without_newer_replay) continue;
 
-        preserveIndexArtifactVisibility(dst, cached);
+        preserveIndexArtifactVisibility(dst, cached.*);
         if (targeted_sibling_continuity or
             projection_regressed or
             visibility_regressed_without_newer_replay or
             (same_accepted_source_target and serving_cardinality_regressed))
-            try preserveIndexProjectionLifecycle(alloc, dst, cached);
+            try preserveIndexProjectionLifecycle(alloc, dst, cached, transfer_retained_state);
         dst.replay_applied_sequence = @max(dst.replay_applied_sequence, cached.replay_applied_sequence);
         dst.replay_target_sequence = @max(dst.replay_target_sequence, cached.replay_target_sequence);
         dst.catch_up_applied_sequence = @max(dst.catch_up_applied_sequence, cached.catch_up_applied_sequence);
@@ -1954,7 +2237,8 @@ fn preserveArtifactVisibilityOnReplayRegression(
 fn preserveIndexProjectionLifecycle(
     alloc: std.mem.Allocator,
     dst: *db_mod.types.DBIndexStats,
-    cached: db_mod.types.DBIndexStats,
+    cached: *db_mod.types.DBIndexStats,
+    transfer_retained_state: bool,
 ) !void {
     dst.coverage_produced_count = cached.coverage_produced_count;
     dst.coverage_skipped_count = cached.coverage_skipped_count;
@@ -1974,11 +2258,17 @@ fn preserveIndexProjectionLifecycle(
     // incoming repair state (or vice versa) can turn normal backfill into a
     // synthetic repair, or hide genuine recovery. Preserve the whole durable
     // lifecycle bundle whenever the corresponding projection is retained.
-    const retained_last_error = if (cached.index_repair_last_error) |value|
+    const retained_last_error = if (transfer_retained_state) blk: {
+        const value = cached.index_repair_last_error;
+        cached.index_repair_last_error = dst.index_repair_last_error;
+        break :blk value;
+    } else if (cached.index_repair_last_error) |value|
         try alloc.dupe(u8, value)
     else
         null;
-    if (dst.index_repair_last_error) |value| alloc.free(value);
+    if (!transfer_retained_state) {
+        if (dst.index_repair_last_error) |value| alloc.free(value);
+    }
     dst.index_repair_id = cached.index_repair_id;
     dst.index_lifecycle_work_class = cached.index_lifecycle_work_class;
     dst.index_repair_trigger = cached.index_repair_trigger;
@@ -2231,6 +2521,98 @@ fn mergeIndexObservationDelta(
     if (original.len > 0) alloc.free(original);
     status.stats.indexes = merged;
     status.stats.index_count = @intCast(merged.len);
+}
+
+fn mergedIndexObservationCount(
+    previous: LocalTableRuntimeStatus,
+    incoming: IndexObservationLookup,
+    removable_structural_target: ?[]const u8,
+) usize {
+    var count = incoming.by_name.count();
+    for (previous.stats.indexes) |cached| {
+        if (incoming.by_name.contains(cached.name)) continue;
+        if (removable_structural_target) |target| {
+            if (std.mem.eql(u8, cached.name, target)) continue;
+        }
+        count += 1;
+    }
+    return count;
+}
+
+/// Allocation-free ownership merge used by atomic multi-group publication.
+/// The caller must have sized the workspace from the same cached generation
+/// and must retire both detached backing arrays after releasing the mutex.
+fn moveIndexObservationDeltaLocked(
+    previous: *LocalTableRuntimeStatus,
+    status: *LocalTableRuntimeStatus,
+    incoming: IndexObservationLookup,
+    index_authorities: *const std.StringHashMapUnmanaged(TargetedIndexAuthority),
+    removable_structural_target: ?[]const u8,
+    workspace: *IndexDeltaMergeWorkspace,
+) void {
+    std.debug.assert(previous.cache_observation_generation == workspace.expected_previous_generation);
+    std.debug.assert(previous.stats.indexes.len == workspace.expected_previous_index_count);
+    std.debug.assert(workspace.merged_indexes.len == mergedIndexObservationCount(previous.*, incoming, removable_structural_target));
+    workspace.previous_lookup.populate(previous.stats.indexes) catch unreachable;
+
+    var merged_count: usize = 0;
+    for (status.stats.indexes, 0..) |candidate, candidate_index| {
+        if (workspace.previous_lookup.by_name.get(candidate.name)) |cached_index| {
+            const cached = previous.stats.indexes[cached_index];
+            if (index_authorities.get(cached.name)) |authority| {
+                if (targetAuthorityAcceptsIdentity(authority, cached) and
+                    !targetAuthorityAcceptsIdentity(authority, candidate))
+                {
+                    workspace.merged_indexes[merged_count] = cached;
+                    workspace.cached_selected[cached_index] = true;
+                    merged_count += 1;
+                    continue;
+                }
+            }
+        }
+        workspace.merged_indexes[merged_count] = candidate;
+        workspace.incoming_selected[candidate_index] = true;
+        merged_count += 1;
+    }
+    for (previous.stats.indexes, 0..) |cached, cached_index| {
+        if (incoming.by_name.contains(cached.name)) continue;
+        if (removable_structural_target) |target| {
+            if (std.mem.eql(u8, cached.name, target)) continue;
+        }
+        workspace.merged_indexes[merged_count] = cached;
+        workspace.cached_selected[cached_index] = true;
+        merged_count += 1;
+    }
+    std.debug.assert(merged_count == workspace.merged_indexes.len);
+
+    workspace.old_incoming_backing = status.stats.indexes;
+    status.stats.indexes = workspace.merged_indexes;
+    status.stats.index_count = @intCast(merged_count);
+}
+
+fn finishMovedIndexObservationDeltaLocked(
+    previous: *LocalTableRuntimeStatus,
+    status: *LocalTableRuntimeStatus,
+    workspace: *IndexDeltaMergeWorkspace,
+) void {
+    for (workspace.old_incoming_backing, workspace.incoming_selected) |item, selected| {
+        if (selected) continue;
+        workspace.retired_indexes[workspace.retired_count] = item;
+        workspace.retired_count += 1;
+    }
+    workspace.old_cached_backing = previous.stats.indexes;
+    for (workspace.old_cached_backing, workspace.cached_selected) |item, selected| {
+        if (selected) continue;
+        workspace.retired_indexes[workspace.retired_count] = item;
+        workspace.retired_count += 1;
+    }
+
+    workspace.retired_status = previous.*;
+    workspace.retired_status.?.stats.indexes = &.{};
+    workspace.retired_status.?.stats.index_count = 0;
+    previous.* = status.*;
+    status.* = undefined;
+    workspace.installed = true;
 }
 
 fn cloneDBIndexStats(
@@ -4140,6 +4522,12 @@ test "new targeted transition supersedes delayed controls from an older owner" {
         .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{ .index_count = 1, .indexes = current_indexes[0..] },
     };
+    try std.testing.expect(cache.bindTargetedIndexExpectation("docs", "thumbnail", newer, .{ .exact = .{
+        .index_name = "thumbnail",
+        .kind = .dense_vector,
+        .incarnation = 13,
+        .config_hash = 44,
+    } }));
     try std.testing.expectEqual(
         TableRuntimeSnapshotCache.PublishResult.stale_observation,
         try cache.publishTargetedGroupsForTransition(publication, older, "docs", "thumbnail", &.{current_status}),
@@ -4676,6 +5064,51 @@ test "accepted group identity survives late predecessor before global handoff" {
     try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic").?.target_authority_handed_off);
 }
 
+test "catalog identity rejects a wrong first structural observation" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const transition = cache.fenceTargetedIndexPublications("docs", "semantic").?;
+    try std.testing.expect(cache.armTargetedIndexPublications("docs", "semantic", transition));
+    try std.testing.expect(cache.bindTargetedIndexExpectation("docs", "semantic", transition, .{ .exact = .{
+        .index_name = "semantic",
+        .kind = .dense_vector,
+        .incarnation = 22,
+        .config_hash = 91,
+    } }));
+
+    var wrong_kind = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic"),
+        .kind = .sparse_vector,
+        .coverage_generation = 22,
+        .coverage_config_hash = 91,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const wrong = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.stale_observation,
+        try cache.publishTargetedGroupsForTransition(wrong, transition, "docs", "semantic", &.{.{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .index_count = 1, .indexes = wrong_kind[0..] },
+        }}),
+    );
+    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic").?.target_authority_handed_off);
+
+    const absent = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.stale_observation,
+        try cache.publishTargetedGroupsForTransition(absent, transition, "docs", "semantic", &.{.{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{},
+        }}),
+    );
+    try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic").?.expectation == .exact);
+}
+
 test "exact target advances fence only their index incarnation" {
     const alloc = std.testing.allocator;
     var cache = TableRuntimeSnapshotCache.init(alloc);
@@ -4805,6 +5238,56 @@ test "exact target advance before first status remains index scoped" {
     try std.testing.expect(findIndexStatusByName(complete.stats.indexes, "thumbnail").?.runtime_target_observation_complete);
 }
 
+test "exact target advance allocation failure remains fail closed" {
+    for (0..2) |successful_target_allocations| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const alloc = failing.allocator();
+        var cache = TableRuntimeSnapshotCache.init(alloc);
+        defer cache.deinit();
+
+        var indexes = [_]db_mod.types.DBIndexStats{.{
+            .name = @constCast("semantic"),
+            .kind = .dense_vector,
+            .coverage_generation = 7,
+            .coverage_config_hash = 17,
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+            .runtime_target_observation_complete = true,
+        }};
+        const initial = try cache.capturePublicationToken("docs");
+        try std.testing.expectEqual(
+            TableRuntimeSnapshotCache.PublishResult.published,
+            try cache.publishGroup(initial, "docs", .{
+                .group_id = 3,
+                .metadata = .{
+                    .source = .live_writer_publish,
+                    .freshness = .fresh,
+                    .target_observation_complete = true,
+                },
+                .stats = .{ .index_count = 1, .indexes = indexes[0..] },
+            }),
+        );
+
+        // Fail either the owned authority name or its map insertion. The
+        // conservative group fallback may encounter the same exhausted
+        // allocator and retire the snapshot; both outcomes are fail closed.
+        failing.fail_index = failing.alloc_index + successful_target_allocations;
+        cache.markIndexTargetObservationPending("docs", 3, .{
+            .index_name = "semantic",
+            .kind = .dense_vector,
+            .incarnation = 7,
+            .config_hash = 17,
+        }, 9);
+        try std.testing.expect(failing.has_induced_failure);
+
+        const state = cache.tables.getPtr("docs") orelse continue;
+        const observed = state.groups.getPtr(3) orelse continue;
+        const item = findIndexStatusByName(observed.stats.indexes, "semantic").?;
+        try std.testing.expect(!observed.metadata.target_observation_complete or
+            !item.runtime_target_observation_complete);
+    }
+}
+
 test "per-index delta merge stays bounded across many accepted authorities" {
     const alloc = std.testing.allocator;
     const index_count = 512;
@@ -4861,6 +5344,160 @@ test "per-index delta merge stays bounded across many accepted authorities" {
     var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
     defer observed.deinit(alloc);
     try std.testing.expectEqual(index_count, observed.stats.indexes.len);
+}
+
+test "multi-group delta allocation failure is atomic and leak free" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var cache = TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+
+            var accepted = [_]db_mod.types.DBIndexStats{.{
+                .name = @constCast("semantic"),
+                .kind = .dense_vector,
+                .coverage_generation = 5,
+                .coverage_config_hash = 15,
+                .coverage_identity_ready = true,
+                .coverage_summary_ready = true,
+                .doc_count = 3,
+            }};
+            const initial = try cache.capturePublicationToken("docs");
+            try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroups(initial, "docs", &.{
+                .{ .group_id = 7, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .doc_count = 10, .index_count = 1, .indexes = accepted[0..] } },
+                .{ .group_id = 8, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .doc_count = 10, .index_count = 1, .indexes = accepted[0..] } },
+            }));
+            const update = try cache.capturePublicationToken("docs");
+            _ = cache.publishGroups(update, "docs", &.{
+                .{ .group_id = 7, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .doc_count = 20 } },
+                .{ .group_id = 8, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .doc_count = 20 } },
+            }) catch |err| switch (err) {
+                error.OutOfMemory => {},
+                else => return err,
+            };
+
+            var observed = (try cache.snapshot(alloc, "docs")).?;
+            defer observed.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), observed.items.len);
+            try std.testing.expect(observed.items[0].stats.doc_count == observed.items[1].stats.doc_count);
+            try std.testing.expect(observed.items[0].stats.doc_count == 10 or observed.items[0].stats.doc_count == 20);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "multi-group commit uses preflight group capacity without allocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    _ = try cache.capturePublicationToken("docs");
+    const state = cache.tables.getPtr("docs").?;
+    try state.groups.ensureTotalCapacity(alloc, 512);
+    const initial_capacity = state.groups.capacity();
+    const initial_maximum_count = (initial_capacity * std.hash_map.default_max_load_percentage) / 100;
+    for (0..initial_maximum_count) |index| {
+        const group_id: u64 = @intCast(index + 1);
+        state.groups.putAssumeCapacityNoClobber(group_id, .{
+            .group_id = group_id,
+            .cache_observation_generation = 1,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{},
+        });
+    }
+    try std.testing.expectEqual(initial_maximum_count, state.groups.count());
+
+    const FailAfterPreparation = struct {
+        allocator: *std.testing.FailingAllocator,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.allocator.fail_index = self.allocator.alloc_index;
+        }
+    };
+    var hook = FailAfterPreparation{ .allocator = &failing };
+    test_after_structural_publish_preparation_hook = .{ .ptr = &hook, .run = FailAfterPreparation.run };
+    defer test_after_structural_publish_preparation_hook = null;
+
+    const new_group_id: u64 = @intCast(initial_maximum_count + 1);
+    const update = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroups(update, "docs", &.{.{
+        .group_id = new_group_id,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{},
+    }}));
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expect(state.groups.contains(new_group_id));
+}
+
+test "prepared index delta commit performs no allocation" {
+    const alloc = std.testing.allocator;
+    var cached_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic"),
+        .kind = .dense_vector,
+        .coverage_generation = 5,
+        .coverage_config_hash = 15,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .serving_snapshot_ready = true,
+        .doc_count = 3,
+        .index_repair_last_error = "cached failure",
+    }};
+    var previous = try (LocalTableRuntimeStatus{
+        .group_id = 7,
+        .cache_observation_generation = 11,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .runtime_owner_id = 1, .index_count = 1, .indexes = cached_indexes[0..] },
+    }).clone(alloc);
+    var incoming_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic"),
+        .kind = .dense_vector,
+        .coverage_generation = 5,
+        .coverage_config_hash = 15,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .serving_snapshot_ready = false,
+        .index_repair_last_error = "incoming failure",
+    }};
+    var incoming = try (LocalTableRuntimeStatus{
+        .group_id = 7,
+        .cache_observation_generation = 12,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .catching_up },
+        .stats = .{ .runtime_owner_id = 1, .index_count = 1, .indexes = incoming_indexes[0..] },
+    }).clone(alloc);
+    var incoming_lookup = try IndexObservationLookup.init(alloc, incoming.stats.indexes);
+    defer incoming_lookup.deinit(alloc);
+    var authorities = std.StringHashMapUnmanaged(TargetedIndexAuthority).empty;
+    defer authorities.deinit(alloc);
+    var workspace = try IndexDeltaMergeWorkspace.init(alloc, 11, 1, 1, 1);
+
+    moveIndexObservationDeltaLocked(
+        &previous,
+        &incoming,
+        incoming_lookup,
+        &authorities,
+        null,
+        &workspace,
+    );
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try preserveArtifactVisibilityUsingLookup(
+        failing.allocator(),
+        &previous,
+        &incoming,
+        &authorities,
+        false,
+        null,
+        workspace.previous_lookup,
+        true,
+    );
+    finishMovedIndexObservationDeltaLocked(&previous, &incoming, &workspace);
+    workspace.deinit(alloc);
+    defer previous.deinit(alloc);
+
+    try std.testing.expect(previous.stats.indexes[0].serving_snapshot_ready);
+    try std.testing.expectEqual(@as(u64, 3), previous.stats.indexes[0].doc_count);
+    try std.testing.expectEqualStrings("cached failure", previous.stats.indexes[0].index_repair_last_error.?);
 }
 
 test "targeted authority binding is monotonic under reversed publication order" {
