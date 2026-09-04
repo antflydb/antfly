@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import hashlib
 import json
+from pathlib import Path
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -14,6 +15,24 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import benchmark_qwen3_embedding_endpoint as benchmark
+
+
+def fixture_payload(model_sha256: str | None = None) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema": benchmark.FIXTURE_SCHEMA,
+        "recipe": {
+            "token_counts": [2, 3],
+            "fill": {"text": "token", "token_id": 7},
+            "eos_token_id": 99,
+            "prefixes": [
+                {"id": "a", "text": "alpha", "token_id": 1},
+                {"id": "b", "text": "beta", "token_id": 2},
+            ],
+        },
+    }
+    if model_sha256 is not None:
+        payload["model_sha256"] = model_sha256
+    return payload
 
 
 class CorpusTests(unittest.TestCase):
@@ -206,20 +225,14 @@ class RunCellTests(unittest.TestCase):
 
 class FixtureTests(unittest.TestCase):
     def test_exact_token_fixture_round_trip(self) -> None:
-        payload = {
-            "schema": benchmark.FIXTURE_SCHEMA,
-            "cases": [
-                {"id": "a", "text": "alpha", "token_ids": [1, 2]},
-                {"id": "b", "text": "beta", "token_ids": [3, 4, 5]},
-            ],
-        }
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "fixture.json"
-            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.write_text(json.dumps(fixture_payload()), encoding="utf-8")
             cases = benchmark.load_fixture(path)
         texts, counts = benchmark.fixture_batch(cases, 3)
-        self.assertEqual(["alpha", "beta", "alpha"], texts)
-        self.assertEqual([2, 3, 2], counts)
+        self.assertEqual(["alpha", "beta", "alpha token"], texts)
+        self.assertEqual([2, 2, 3], counts)
+        self.assertEqual([1, 7, 99], cases[2]["token_ids"])
 
     def test_fixture_rejects_wrong_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -229,14 +242,9 @@ class FixtureTests(unittest.TestCase):
                 benchmark.load_fixture(path)
 
     def test_fixture_rejects_model_sha_mismatch(self) -> None:
-        payload = {
-            "schema": benchmark.FIXTURE_SCHEMA,
-            "model_sha256": "a" * 64,
-            "cases": [{"id": "a", "text": "alpha", "token_ids": [1]}],
-        }
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "fixture.json"
-            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.write_text(json.dumps(fixture_payload("a" * 64)), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "does not match"):
                 benchmark.load_fixture(path, "b" * 64)
 
@@ -306,6 +314,11 @@ class FixtureTests(unittest.TestCase):
     def test_checked_in_fixture_has_cache_neutral_exact_lengths_and_eos(self) -> None:
         path = Path(__file__).resolve().parent / "fixtures/qwen3_embedding_0_6b_exact_tokens.json"
         cases = benchmark.load_fixture(path)
+        expanded = json.dumps(cases, sort_keys=True, separators=(",", ":")).encode()
+        self.assertEqual(
+            "9e0b463d9ecb82826c3809fffb43b8000bf798b457ef34e0271321d0977a898e",
+            hashlib.sha256(expanded).hexdigest(),
+        )
         by_length = {
             length: benchmark.select_fixture_token_count(cases, length)
             for length in (511, 2551)
@@ -406,4 +419,3 @@ class ArgTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

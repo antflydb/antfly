@@ -27,7 +27,7 @@ import urllib.request
 
 DEFAULT_SEED = 20260901
 COSINE_WARN_THRESHOLD = 0.98
-FIXTURE_SCHEMA = "antfly.qwen3_embedding.benchmark_fixture.v1"
+FIXTURE_SCHEMA = "antfly.qwen3_embedding.benchmark_fixture.v2"
 REPORT_SCHEMA = "antfly.qwen3_embedding.endpoint_benchmark.v2"
 
 VOCABULARY = [
@@ -175,26 +175,75 @@ def load_fixture(
                 f"fixture model SHA-256 {fixture_sha256!r} does not match "
                 f"benchmark model {expected_model_sha256}"
             )
-    cases = payload.get("cases")
-    if not isinstance(cases, list) or not cases:
-        raise ValueError("fixture has no cases")
-    validated = []
-    seen = set()
-    for raw in cases:
-        if not isinstance(raw, dict):
-            raise ValueError("fixture case is not an object")
-        case_id, text, token_ids = raw.get("id"), raw.get("text"), raw.get("token_ids")
-        if not isinstance(case_id, str) or not case_id or case_id in seen:
-            raise ValueError(f"invalid or duplicate fixture id: {case_id!r}")
-        if not isinstance(text, str) or not text:
-            raise ValueError(f"fixture case {case_id}: text is empty")
-        if not isinstance(token_ids, list) or not token_ids or not all(
-            isinstance(token, int) and not isinstance(token, bool) for token in token_ids
+    recipe = payload.get("recipe")
+    if not isinstance(recipe, dict):
+        raise ValueError("fixture has no recipe")
+    token_counts = recipe.get("token_counts")
+    fill = recipe.get("fill")
+    eos_token_id = recipe.get("eos_token_id")
+    prefixes = recipe.get("prefixes")
+
+    def is_int(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    if (
+        not isinstance(token_counts, list)
+        or not token_counts
+        or not all(is_int(value) and value >= 2 for value in token_counts)
+        or len(set(token_counts)) != len(token_counts)
+    ):
+        raise ValueError("fixture recipe token_counts are invalid")
+    if (
+        not isinstance(fill, dict)
+        or not isinstance(fill.get("text"), str)
+        or not fill["text"]
+        or not is_int(fill.get("token_id"))
+    ):
+        raise ValueError("fixture recipe fill is invalid")
+    if not is_int(eos_token_id):
+        raise ValueError("fixture recipe eos_token_id is invalid")
+    if not isinstance(prefixes, list) or not prefixes:
+        raise ValueError("fixture recipe has no prefixes")
+
+    normalized_prefixes = []
+    seen_prefix_ids = set()
+    seen_prefix_token_ids = set()
+    for prefix in prefixes:
+        if not isinstance(prefix, dict):
+            raise ValueError("fixture recipe prefix is not an object")
+        prefix_id, text, token_id = (
+            prefix.get("id"), prefix.get("text"), prefix.get("token_id")
+        )
+        if (
+            not isinstance(prefix_id, str)
+            or not prefix_id
+            or prefix_id in seen_prefix_ids
+            or not isinstance(text, str)
+            or not text
+            or not is_int(token_id)
+            or token_id in seen_prefix_token_ids
         ):
-            raise ValueError(f"fixture case {case_id}: token_ids are invalid")
-        seen.add(case_id)
-        validated.append({"id": case_id, "text": text, "token_ids": token_ids})
-    return validated
+            raise ValueError(f"invalid or duplicate fixture prefix: {prefix!r}")
+        seen_prefix_ids.add(prefix_id)
+        seen_prefix_token_ids.add(token_id)
+        normalized_prefixes.append((prefix_id, text, token_id))
+
+    cases = []
+    for token_count in token_counts:
+        fill_count = token_count - 2
+        for prefix_id, prefix_text, prefix_token_id in normalized_prefixes:
+            cases.append(
+                {
+                    "id": f"tokens_{token_count}_{prefix_id}",
+                    "text": prefix_text + (" " + fill["text"]) * fill_count,
+                    "token_ids": (
+                        [prefix_token_id]
+                        + [fill["token_id"]] * fill_count
+                        + [eos_token_id]
+                    ),
+                }
+            )
+    return cases
 
 
 def fixture_batch(
@@ -703,4 +752,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
