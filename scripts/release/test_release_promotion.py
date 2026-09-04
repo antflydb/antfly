@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import io
@@ -98,6 +99,136 @@ class ReleasePromotionTests(unittest.TestCase):
             )
             self.assertEqual(
                 (output / "install.sh").read_bytes(), objects["scripts/install.sh"]
+            )
+
+    def test_release_spec_records_trusted_release_line_provenance(self) -> None:
+        channels = load_module(
+            "release_channels_provenance_test", "release_channels.py"
+        )
+        document = channels.build_release_spec(
+            "v0.2.1-rc.4",
+            "auto",
+            COMMIT,
+            "f" * 40,
+            release_line="0.2",
+            source_ref="refs/heads/v0.2.x",
+            source_ref_head=COMMIT,
+        ).document()
+
+        self.assertEqual(document["schema_version"], 5)
+        self.assertEqual(document["release_line"], "0.2")
+        self.assertEqual(document["source_ref"], "refs/heads/v0.2.x")
+        self.assertEqual(document["source_ref_head"], COMMIT)
+
+    def test_schema_five_ledger_enforces_controller_release_line(self) -> None:
+        verifier = load_module(
+            "verify_release_ledger_provenance_test", "verify_release_ledger.py"
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            artifact = root / "antfly.tar.gz"
+            artifact.write_bytes(b"release")
+            ledger_path = root / "artifacts.json"
+            ledger = {
+                "schema_version": 5,
+                "tag": "v0.2.1-rc.4",
+                "commit": COMMIT,
+                "release_line": "0.2",
+                "source_ref": "refs/heads/v0.2.x",
+                "source_ref_head": COMMIT,
+                "build_controller_commit": "e" * 40,
+                "promotion_controller_commit": "f" * 40,
+                "artifacts": [
+                    {
+                        "name": artifact.name,
+                        "size": artifact.stat().st_size,
+                        "sha256": verifier.sha256(artifact),
+                        "scope": "runtime",
+                    }
+                ],
+            }
+            ledger_path.write_text(json.dumps(ledger))
+            verifier.verify_payload(
+                ledger_path,
+                root,
+                "v0.2.1-rc.4",
+                COMMIT,
+                verifier.sha256(ledger_path),
+                None,
+            )
+
+            ledger["source_ref"] = "refs/heads/main"
+            ledger_path.write_text(json.dumps(ledger))
+            with self.assertRaisesRegex(SystemExit, "release-line provenance"):
+                verifier.verify_payload(
+                    ledger_path,
+                    root,
+                    "v0.2.1-rc.4",
+                    COMMIT,
+                    verifier.sha256(ledger_path),
+                    None,
+                )
+
+    def test_schema_five_ledger_survives_release_line_handoff(self) -> None:
+        verifier = load_module(
+            "verify_release_ledger_handoff_test", "verify_release_ledger.py"
+        )
+        release_lines = load_module("release_lines_handoff_test", "release_lines.py")
+        policy = copy.deepcopy(release_lines.load_policy())
+        policy["lines"]["0.3"]["source_ref"] = "refs/heads/v0.3.x"
+        policy["lines"]["0.3"]["trusted_source_refs"].append("refs/heads/v0.3.x")
+        release_lines.validate_policy(policy)
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            artifact = root / "antfly.tar.gz"
+            artifact.write_bytes(b"release")
+            ledger_path = root / "artifacts.json"
+            ledger = {
+                "schema_version": 5,
+                "tag": "v0.3.0",
+                "commit": COMMIT,
+                "release_line": "0.3",
+                "source_ref": "refs/heads/main",
+                "source_ref_head": COMMIT,
+                "build_controller_commit": "e" * 40,
+                "promotion_controller_commit": "f" * 40,
+                "artifacts": [
+                    {
+                        "name": artifact.name,
+                        "size": artifact.stat().st_size,
+                        "sha256": verifier.sha256(artifact),
+                        "scope": "runtime",
+                    }
+                ],
+            }
+            ledger_path.write_text(json.dumps(ledger))
+
+            verifier.verify_payload(
+                ledger_path,
+                root,
+                "v0.3.0",
+                COMMIT,
+                verifier.sha256(ledger_path),
+                None,
+                policy,
+            )
+
+    def test_schema_four_release_spec_remains_compatible(self) -> None:
+        channels = load_module("release_channels_v4_compat_test", "release_channels.py")
+        payload = load_module(
+            "build_release_payload_v4_compat_test", "build_release_payload.py"
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            path = Path(raw_tmp) / "release-request.json"
+            document = channels.build_release_spec(
+                "v1.2.3", "stable", COMMIT, "f" * 40
+            ).document()
+            path.write_text(json.dumps(document))
+
+            self.assertEqual(document["schema_version"], 4)
+            self.assertEqual(
+                payload.verify_release_spec(path, "v1.2.3", COMMIT), document
             )
 
     def test_release_channel_policy_resolves_all_supported_channels(self) -> None:
@@ -1216,16 +1347,16 @@ class ReleasePromotionTests(unittest.TestCase):
             archives.mkdir()
             extras.mkdir()
             source.mkdir()
-            (archives / "antfly_1.2.3_Linux_x86_64_gnu.tar.gz").write_bytes(b"native")
-            (extras / "antfly-cli-1.2.3.tgz").write_bytes(b"npm")
+            (archives / "antfly_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(b"native")
+            (extras / "antfly-cli-0.2.1.tgz").write_bytes(b"npm")
             (extras / "cli-snapshot.json").write_text(
                 json.dumps(
                     {
-                        "version": "1.2.3",
+                        "version": "0.2.1",
                         "commit": COMMIT,
                         "registry_versions": {
-                            "npm": "1.2.3",
-                            "python": "1.2.3",
+                            "npm": "0.2.1",
+                            "python": "0.2.1",
                         },
                     }
                 )
@@ -1259,17 +1390,20 @@ class ReleasePromotionTests(unittest.TestCase):
             release_spec.write_text(
                 json.dumps(
                     {
-                        "schema_version": 4,
-                        "tag": "v1.2.3",
-                        "version": "1.2.3",
+                        "schema_version": 5,
+                        "tag": "v0.2.1",
+                        "version": "0.2.1",
                         "channel": "stable",
                         "source_commit": COMMIT,
+                        "release_line": "0.2",
+                        "source_ref": "refs/heads/v0.2.x",
+                        "source_ref_head": COMMIT,
                         "build_controller_commit": "f" * 40,
                         "build_contract_schema": 1,
                         "registry_versions": {
-                            "npm": "1.2.3",
-                            "python": "1.2.3",
-                            "container": "v1.2.3",
+                            "npm": "0.2.1",
+                            "python": "0.2.1",
+                            "container": "v0.2.1",
                         },
                     }
                 )
@@ -1277,7 +1411,7 @@ class ReleasePromotionTests(unittest.TestCase):
             argv = [
                 "build_release_payload.py",
                 "--tag",
-                "v1.2.3",
+                "v0.2.1",
                 "--commit",
                 COMMIT,
                 "--archive-dir",
@@ -1299,13 +1433,16 @@ class ReleasePromotionTests(unittest.TestCase):
             ):
                 self.assertEqual(payload.main(), 0)
             ledger = json.loads((output / "artifacts.json").read_text())
-            self.assertEqual(ledger["schema_version"], 4)
+            self.assertEqual(ledger["schema_version"], 5)
+            self.assertEqual(ledger["release_line"], "0.2")
+            self.assertEqual(ledger["source_ref"], "refs/heads/v0.2.x")
+            self.assertEqual(ledger["source_ref_head"], COMMIT)
             self.assertEqual(ledger["build_controller_commit"], "f" * 40)
             self.assertEqual(ledger["promotion_controller_commit"], "e" * 40)
             self.assertEqual(ledger["generated_at"], "1970-01-01T00:00:00Z")
             self.assertEqual(
                 ledger["registry_versions"],
-                {"npm": "1.2.3", "python": "1.2.3", "container": "v1.2.3"},
+                {"npm": "0.2.1", "python": "0.2.1", "container": "v0.2.1"},
             )
             kinds = {artifact["kind"] for artifact in ledger["artifacts"]}
             self.assertIn("runtime-archive", kinds)
@@ -1321,7 +1458,7 @@ class ReleasePromotionTests(unittest.TestCase):
             )
             promotion = root / "promotion"
             promotion.mkdir()
-            promoted_package = promotion / "antfly-cli-1.2.3.tgz"
+            promoted_package = promotion / "antfly-cli-0.2.1.tgz"
             promoted_package.write_bytes((output / promoted_package.name).read_bytes())
             promoted_manifest = promotion / "cli-snapshot.json"
             promoted_manifest.write_bytes(
@@ -1336,7 +1473,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 "--scope",
                 "cli",
                 "--tag",
-                "v1.2.3",
+                "v0.2.1",
                 "--commit",
                 COMMIT,
                 "--ledger-sha256",

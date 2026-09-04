@@ -49,17 +49,23 @@ SDK and enables Metal and Accelerate.
 
 ## Pipeline Ownership
 
-Release is split into an untrusted request plane, a default-branch artifact
-plane, and a default-branch promotion plane. Code loaded from a tag or manually
-selected workflow ref never controls a builder or receives publication
-credentials.
+Release is split into an approved request plane, a default-branch artifact
+plane, and a default-branch promotion plane. Code loaded from a tag or a
+maintenance branch never controls a workflow or receives publication
+credentials; those refs provide only versioned source objects.
 
 1. `.github/workflows/antfly-release-build.yml` and
-   `.github/workflows/antfly-nightly.yml` emit only an untrusted JSON request.
-   They never call a builder. `.github/workflows/antfly-release-build-controller.yml`
-   is loaded through `workflow_run` from the default branch. It requires tag
-   requests to match the pushed tag and commit, and nightly requests to have
-   been dispatched on the default branch.
+   `.github/workflows/antfly-nightly.yml` are dispatched on `main` and emit an
+   immutable JSON request. A version release passes the protected `release-cut`
+   environment, derives its source branch from the tag and
+   `scripts/release/release-lines.json`, snapshots that branch's exact tip,
+   uploads the request, and creates the annotated tag last. It never accepts a
+   caller-supplied source branch. `.github/workflows/antfly-release-build-controller.yml`
+   is loaded through `workflow_run` from the default branch. It re-derives the
+   source branch from current controller policy and requires the tag, source
+   commit, and recorded branch head to agree. Direct tag pushes do not trigger
+   a release. If `main` or the selected source branch moves after approval, the
+   request fails before tag creation and must be dispatched again.
 2. The build controller pins its exact commit and calls
    `.github/workflows/antfly-artifact-build.yml`, the sole reusable artifact
    builder, from that same commit. The requested source commit supplies only
@@ -70,22 +76,25 @@ credentials.
    calls `.github/workflows/cli-package.yml`, extracts `install.sh` and
    `openapi.yaml` directly from the selected Git commit, and uploads the native
    archives, CLI snapshot, commit-bound source snapshot, and
-   canonical `ReleaseSpec` (source commit, build-controller commit, channel,
-   build contract, and all registry versions) as an Actions artifact. The
+   canonical schema-v5 `ReleaseSpec` (release line, source ref, validated source
+   head, source commit, build-controller commit, channel, build contract, and
+   all registry versions) as an Actions artifact. The
    workflow graph, nested reusable workflows, and controller-owned scripts all
    share that recorded build-controller identity.
 3. Completion of the build controller triggers
    `.github/workflows/antfly-release.yml` through `workflow_run`. GitHub loads
    this privileged promotion workflow from the default branch. It checks the
-   channel identity and source commit, combines the build outputs into one
-   schema-versioned artifact ledger, verifies it, attests
+   channel identity and recorded release-line provenance, combines the build
+   outputs into one schema-versioned artifact ledger, verifies it, attests
    every payload file, and stores the exact bytes under immutable,
    content-addressed object-storage keys. Stable and next additionally stage
    those bytes on a draft GitHub Release; nightly deliberately does not create
    a GitHub Release.
-4. The promotion controller separates the complete payload into
-   ledger, runtime, and CLI scopes, and verifies source ancestry, attestations,
-   exact scope membership, and every digest.
+4. The promotion controller separates the complete payload into ledger,
+   runtime, and CLI scopes, and verifies controller ancestry, the recorded
+   source branch and head, attestations, exact scope membership, and every
+   digest. Schema-v4 payloads remain recoverable with their historical
+   default-branch ancestry rule; new builds always emit schema v5.
 5. Policy-selected package registries, the Homebrew formula, and the single
    multi-architecture container image consume those verified scopes. Stable
    and RC releases publish npm and PyPI packages; nightly builds verify the same
@@ -200,10 +209,11 @@ verified bytes and removes unledgered assets before publishing the release.
 Nightly uses R2 as its only policy-selected source.
 
 The deployment environments follow the versioned contract in
-`scripts/release/github-environments.json`. `release-promotion` accepts only the
-default `main` branch and protects release preflight plus retention approval;
+`scripts/release/github-environments.json`. `release-cut` and
+`release-promotion` accept only `main`; the former protects tag creation and the
+latter protects release preflight plus retention approval.
 `container-publish` accepts only the legacy release and operator tag patterns.
-Both copy the required-reviewer set from the `npm` environment and prevent
+All three copy the required-reviewer set from the `npm` environment and prevent
 self-review. Release preflight and retention planning audit the live GitHub
 configuration before any mutable or destructive operation. An administrator
 applies intentional contract changes with:
@@ -212,6 +222,22 @@ applies intentional contract changes with:
 python3 scripts/release/github_environment.py apply \
   --repository antflydb/antfly
 ```
+
+Repository ref protections follow
+`scripts/release/github-rulesets.json`. The branch ruleset covers `main` and
+`v*.x`, requires a reviewed PR and GitHub Actions-owned `sdks-ci`, `zig-base`,
+and `e2e-base` checks, and prohibits branch deletion and force-pushes. The tag
+ruleset prohibits updating or deleting `v*` tags. Apply and verify it with:
+
+```bash
+python3 scripts/release/github_rulesets.py apply \
+  --repository antflydb/antfly
+```
+
+The apply commands require repository-administration permission and must run
+after the contract change has merged. Maintenance PRs are included in the CI
+workflow branch filters so protected `v*.x` branches receive the same required
+checks.
 
 `.github/workflows/antfly-container.yml` has only a `workflow_call` entry point.
 It accepts only the default-branch promotion controller's normal `workflow_run`
@@ -327,6 +353,47 @@ represented by every publication target (notably container tags). Historical
 spellings such as `rc2`, `pre.2`, and `preview2` can be read from existing
 journals during recovery, but cannot create a new release candidate.
 
+Cut a stable or prerelease tag through the protected default-branch workflow;
+do not create or move it with `git tag`:
+
+```bash
+gh workflow run antfly-release-build.yml --ref main -f tag=v0.2.1-rc.4
+```
+
+The tag's major/minor version selects its source through
+`scripts/release/release-lines.json`. The initial policy maps `0.2` to
+`refs/heads/v0.2.x` and `0.3` to `refs/heads/main`. Unknown and closed lines
+cannot cut new releases. Recovery may continue to resolve a closed line so an
+already sealed ledger does not become unusable.
+
+Each line records one current `source_ref` for new cuts and an append-only
+`trusted_source_refs` provenance list. When ownership moves from `main` to a
+maintenance branch, change `source_ref` and add the maintenance ref without
+removing `main`; retained ledgers and already approved requests remain valid
+against the branch that originally supplied their source.
+
+## Maintenance Release Lines
+
+Before `main` advances to the next minor line, synchronize the maintenance
+branch one final time and merge the release-policy support into it. After
+`main` becomes `0.3`, `v0.2.x` owns all `0.2` source releases:
+
+1. Land the fix on `main` unless it is intentionally maintenance-only.
+2. Open a backport PR containing only the applicable commits against
+   `v0.2.x`; never merge the `0.3`-era `main` history into it.
+3. Wait for the protected maintenance-branch checks and review.
+4. Dispatch the release workflow from `main` with the next canonical
+   `v0.2.1-rc.N` tag. The controller tags the exact `v0.2.x` tip recorded in
+   provenance.
+
+Adding a future line is a reviewed controller-policy change. When a line is no
+longer supported, retain its mapping but change its status to `closed`; deleting
+the mapping would also disable provenance validation for retained releases. A
+line's trusted source refs are append-only after its first schema-v5 release.
+Before `main` advances beyond a supported line, create and synchronize the
+matching `v<major>.<minor>.x` branch, change that line's current `source_ref`,
+and retain both refs in `trusted_source_refs`.
+
 Run a snapshot for the current default-branch head with
 `gh workflow run antfly-nightly.yml`. To reproduce a snapshot from a specific
 default-branch commit, add `-f source_commit=<40-character-commit>`.
@@ -387,9 +454,9 @@ new plan and approval. Fresh journal and alias ETags protect the actual sweep.
 Registry cleanup removes only container digests with no retained or channel
 references. Per-ledger container identity records have an independent
 lifecycle: every expired record is removed after registry validation even when
-its image digest is shared with a retained release. Conversely, a schema-v4
-release missing its immutable container record is retained for repair rather
-than partially collected. R2 payloads and identity records are deleted only
+its image digest is shared with a retained release. Conversely, a schema-v4 or
+schema-v5 release missing its immutable container record is retained for repair
+rather than partially collected. R2 payloads and identity records are deleted only
 after registry cleanup succeeds. The GC never deletes stable releases, shared
 content-addressed objects, or npm/PyPI versions. Immutable completion receipts
 remain as compact audit history after payload deletion. Existing `termite/`
