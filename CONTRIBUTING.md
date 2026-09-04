@@ -33,7 +33,12 @@ docs/                Hand-written documentation (synced to docs site at build ti
 
 - **Zig 0.16** — required for the server runtime
 - **Go 1.26+** — required for retained Go SDKs and tools
+- **Python 3.11+ and uv** — required for Python SDK and repository tooling
+- **Rust** — required for the Rust SDK and extensions; CI pins the exact version
 - **Node.js and pnpm versions pinned in `ts/package.json`** — for reproducible TypeScript SDK and Antfarm artifacts; `make generate` uses Volta automatically when available
+
+Exact CI toolchains and supported Python minors are recorded in
+`scripts/ci/sdk-policy.json`.
 
 ## Makefile Targets
 
@@ -43,6 +48,9 @@ Run `make help` for the full list. Key targets:
 |--------|-------------|
 | `make build` | Build the `antfly` binary (includes Antfarm frontend and code generation) |
 | `make generate` | Regenerate OpenAPI types, Go/TS/Python SDKs, and the embedded Antfarm dashboard |
+| `make fmt` | Format Zig, Go, Python, TypeScript, and Rust sources |
+| `make fmt-check` | Verify repository formatting without changing files |
+| `make repository-check` | Run formatting, SDK, memoryaf, and release-tooling checks serially |
 | `make lint` | Run linters across retained Go modules and TypeScript |
 | `make tidy` | Run `go mod tidy` across retained Go modules |
 | `make tidy-check` | Verify retained Go modules are tidy |

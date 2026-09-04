@@ -1,21 +1,19 @@
-name: TypeScript CI
+name: TypeScript Application CI
 
 on:
   push:
     branches: [main]
     paths:
       - "ts/**"
+      - "!ts/packages/sdk/**"
       - "zig/pkg/antfly/antfarm/**"
-      - "openapi.yaml"
-      - "specs/openapi/**"
       - ".github/workflows/ts-ci.yml"
   pull_request:
     branches: [main]
     paths:
       - "ts/**"
+      - "!ts/packages/sdk/**"
       - "zig/pkg/antfly/antfarm/**"
-      - "openapi.yaml"
-      - "specs/openapi/**"
       - ".github/workflows/ts-ci.yml"
 
 permissions:
@@ -64,15 +62,6 @@ jobs:
 
       - name: Lint and type check
         run: pnpm lint
-
-      - name: Verify generated SDKs
-        run: |
-          pnpm --filter @antfly/sdk generate
-          status="$(git status --porcelain -- packages/sdk/src/public-api.d.ts packages/sdk/src/query.d.ts)"
-          if [ -n "$status" ]; then
-            echo "$status"
-            exit 1
-          fi
 
       - name: Build
         run: pnpm build

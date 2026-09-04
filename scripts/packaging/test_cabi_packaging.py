@@ -479,18 +479,17 @@ class CAbiPackagingTests(unittest.TestCase):
     def test_release_scripting_target_discovers_the_complete_suite(self) -> None:
         makefile = (REPO_ROOT / "Makefile").read_text()
         test_script = (REPO_ROOT / "scripts" / "release" / "test.sh").read_text()
-        workflow = (REPO_ROOT / ".github" / "workflows" / "zig-tests.yml").read_text()
-        release_job = workflow.split("  release-tooling:", 1)[1].split(
-            "\n  backup-s3-integration:", 1
-        )[0]
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "repository-validation.yml"
+        ).read_text()
+        check_script = (REPO_ROOT / "scripts" / "ci" / "check.sh").read_text()
 
-        self.assertIn("run: scripts/release/test.sh", release_job)
-        self.assertNotIn("run: make ", release_job)
-        self.assertNotIn("scripts/release/test_", release_job)
-        self.assertIn('python-version: "3.13"', release_job)
-        self.assertIn("sudo apt-get install -y xz-utils", release_job)
-        self.assertIn("uses: mlugg/setup-zig@", release_job)
-        self.assertIn("version: 0.16.0", release_job)
+        self.assertIn("run: scripts/ci/check.sh release", workflow)
+        self.assertNotIn("run: make ", workflow)
+        self.assertIn("uses: mlugg/setup-zig@", workflow)
+        self.assertIn("steps.policy.outputs.zig_version", workflow)
+        self.assertIn("xz-utils", workflow)
+        self.assertIn('"$repo_root/scripts/release/test.sh"', check_script)
         self.assertIn("release-scripting-test:", makefile)
         self.assertIn("scripts/release/test.sh", makefile)
         self.assertIn(
@@ -502,81 +501,6 @@ class CAbiPackagingTests(unittest.TestCase):
             test_script,
         )
         self.assertIn("sh -n scripts/release/install_bootstrap.sh", test_script)
-
-    def test_python_support_policy_stays_consistent(self) -> None:
-        supported_versions = ["3.11", "3.12", "3.13", "3.14"]
-        minimum_version = supported_versions[0]
-        latest_version = supported_versions[-1]
-
-        sdk_pyproject = (
-            REPO_ROOT / "py" / "packages" / "sdk" / "pyproject.toml"
-        ).read_text()
-        cli_pyproject = (
-            REPO_ROOT / "py" / "packages" / "cli" / "pyproject.toml"
-        ).read_text()
-        legacy_sdk_pyproject = (
-            REPO_ROOT / "py" / "packages" / "sdk" / "src" / "antfly" / "pyproject.toml"
-        ).read_text()
-        generated_poetry_template = (
-            REPO_ROOT
-            / "py"
-            / "packages"
-            / "sdk"
-            / "templates"
-            / "pyproject_poetry.toml.jinja"
-        ).read_text()
-        generated_ruff_template = (
-            REPO_ROOT
-            / "py"
-            / "packages"
-            / "sdk"
-            / "templates"
-            / "pyproject_ruff.toml.jinja"
-        ).read_text()
-
-        expected_requires_python = f'requires-python = ">={minimum_version}"'
-        expected_classifiers = [
-            f"Programming Language :: Python :: {version}"
-            for version in supported_versions
-        ]
-        for project in (sdk_pyproject, cli_pyproject):
-            self.assertIn(expected_requires_python, project)
-            version_classifiers = re.findall(
-                r'"(Programming Language :: Python :: 3\.\d+)"', project
-            )
-            self.assertEqual(version_classifiers, expected_classifiers)
-
-        self.assertIn('target-version = "py311"', sdk_pyproject)
-        self.assertIn(f'pythonVersion = "{minimum_version}"', sdk_pyproject)
-        self.assertIn(f'python = "^{minimum_version}"', legacy_sdk_pyproject)
-        self.assertIn('target-version = "py311"', legacy_sdk_pyproject)
-        self.assertIn(f'python = "^{minimum_version}"', generated_poetry_template)
-        self.assertIn('target-version = "py311"', generated_ruff_template)
-
-        python_ci = (REPO_ROOT / ".github" / "workflows" / "py-ci.yml").read_text()
-        matrix_line = next(
-            line for line in python_ci.splitlines() if "python-version:" in line
-        )
-        matrices = [
-            json.loads(encoded)
-            for encoded in re.findall(r"fromJSON\('([^']+)'\)", matrix_line)
-        ]
-        self.assertEqual(
-            matrices, [[minimum_version, latest_version], supported_versions]
-        )
-        self.assertIn(f"if: matrix.python-version == '{latest_version}'", python_ci)
-
-        pypi_workflow = (
-            REPO_ROOT / ".github" / "workflows" / "py-pypi-publish.yml"
-        ).read_text()
-        self.assertIn(f'python-version: "{latest_version}"', pypi_workflow)
-
-        installation = (
-            REPO_ROOT / "py" / "packages" / "sdk" / "docs" / "installation.rst"
-        ).read_text()
-        self.assertIn(
-            f"Python {minimum_version} through {latest_version}", installation
-        )
 
     def test_cli_platforms_select_libc_specific_linux_archives(self) -> None:
         names = {
