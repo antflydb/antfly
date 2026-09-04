@@ -26,6 +26,7 @@ const gguf_format = @import("../gguf/format.zig");
 const gguf_writer = @import("../gguf/writer.zig");
 const managed_receipt = @import("../registry/managed_receipt.zig");
 const qwen3vl_catalog = @import("../registry/qwen3vl_catalog.zig");
+const qwen3_embedding_catalog = @import("../registry/qwen3_embedding_catalog.zig");
 
 pub const Level = enum {
     compatible,
@@ -70,11 +71,18 @@ pub const Qwen3VlPromotion = enum {
     reranker_2b_q8_0,
 };
 
+pub const Qwen3EmbeddingPromotion = enum {
+    none,
+    q8_0,
+    f16,
+};
+
 pub const Inspection = struct {
     architecture: []u8,
     expert_count: u32 = 0,
     qualified_gemma4_a4b: bool = false,
     qwen3vl_promotion: Qwen3VlPromotion = .none,
+    qwen3_embedding_promotion: Qwen3EmbeddingPromotion = .none,
     artifact_inspected: bool = true,
 
     pub fn deinit(self: *Inspection, allocator: std.mem.Allocator) void {
@@ -107,6 +115,14 @@ pub fn inspectAlloc(
     const metadata = gguf_format.readSupportMetadata(region.data) catch return result;
     result.artifact_inspected = true;
     result.qwen3vl_promotion = inspectQwen3VlPromotion(
+        allocator,
+        man,
+        metadata,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => .none,
+    };
+    result.qwen3_embedding_promotion = inspectQwen3EmbeddingPromotion(
         allocator,
         man,
         metadata,
@@ -303,6 +319,95 @@ fn inspectQwen3VlPromotion(
     return promotion;
 }
 
+fn qwen3EmbeddingGeometryIsQualified(metadata: gguf_format.SupportMetadata) bool {
+    const architecture = metadata.architecture orelse return false;
+    return std.mem.eql(u8, architecture, "qwen3") and
+        metadata.block_count == 28 and
+        metadata.embedding_length == 1024 and
+        metadata.expert_count == 0;
+}
+
+fn qwen3EmbeddingPromotionFromReceipt(
+    man: *const manifest_mod.ModelManifest,
+    metadata: gguf_format.SupportMetadata,
+    receipt: managed_receipt.DownloadReceipt,
+) Qwen3EmbeddingPromotion {
+    if (!qwen3EmbeddingGeometryIsQualified(metadata) or
+        man.model_type != .embedder or
+        man.embedding_style != .qwen3_embedding or
+        !man.isLastTokenDecoderEmbedder() or
+        receipt.version != 2)
+    {
+        return .none;
+    }
+    const source = receipt.source orelse return .none;
+    const bundle = qwen3_embedding_catalog.findBundleForHubRef(
+        source.owner,
+        source.name,
+        source.variant,
+    ) orelse return .none;
+    if (bundle.generated_model_manifest == null or
+        receipt.artifacts.len != bundle.artifacts().len + 1)
+    {
+        return .none;
+    }
+    const gguf_path = man.gguf_path orelse return .none;
+    if (!std.mem.eql(u8, std.fs.path.basename(gguf_path), bundle.artifacts()[0].path))
+        return .none;
+    for (bundle.artifacts()) |artifact| {
+        if (!receiptArtifactMatches(receipt, artifact.path, artifact.size, artifact.sha256))
+            return .none;
+    }
+    if (!receiptArtifactMatches(
+        receipt,
+        "model_manifest.json",
+        qwen3_embedding_catalog.gguf_bundle_model_manifest.len,
+        qwen3_embedding_catalog.gguf_bundle_model_manifest_sha256,
+    )) return .none;
+    if (std.mem.eql(u8, bundle.variant, qwen3_embedding_catalog.q8_0_bundle_variant)) return .q8_0;
+    if (std.mem.eql(u8, bundle.variant, qwen3_embedding_catalog.f16_bundle_variant)) return .f16;
+    return .none;
+}
+
+fn qwen3EmbeddingPromotionContentMatches(
+    receipt: *const managed_receipt.ValidatedReceipt,
+    promotion: Qwen3EmbeddingPromotion,
+) bool {
+    const bundle = switch (promotion) {
+        .none => return false,
+        .q8_0 => &qwen3_embedding_catalog.bundles[0],
+        .f16 => &qwen3_embedding_catalog.bundles[1],
+    };
+    for (bundle.artifacts()) |artifact| {
+        if (!validatedArtifactContentMatches(receipt, artifact.path, artifact.sha256))
+            return false;
+    }
+    return validatedArtifactContentMatches(
+        receipt,
+        "model_manifest.json",
+        qwen3_embedding_catalog.gguf_bundle_model_manifest_sha256,
+    );
+}
+
+fn inspectQwen3EmbeddingPromotion(
+    allocator: std.mem.Allocator,
+    man: *const manifest_mod.ModelManifest,
+    metadata: gguf_format.SupportMetadata,
+) !Qwen3EmbeddingPromotion {
+    if (man.embedding_style != .qwen3_embedding or !man.usesGgufWeights()) return .none;
+    const gguf_path = man.gguf_path orelse return .none;
+    const model_dir = std.fs.path.dirname(gguf_path) orelse return .none;
+    var receipt = (try managed_receipt.loadValidated(
+        allocator,
+        std.Options.debug_io,
+        model_dir,
+    )) orelse return .none;
+    defer receipt.deinit();
+    const promotion = qwen3EmbeddingPromotionFromReceipt(man, metadata, receipt.parsed.value);
+    if (!qwen3EmbeddingPromotionContentMatches(&receipt, promotion)) return .none;
+    return promotion;
+}
+
 test "compatibility inspection ignores an unselected colocated GGUF" {
     const allocator = std.testing.allocator;
     var manifest = manifest_mod.ModelManifest{
@@ -360,6 +465,7 @@ pub fn assessInspection(
         inspection.expert_count,
         inspection.qualified_gemma4_a4b,
         inspection.qwen3vl_promotion,
+        inspection.qwen3_embedding_promotion,
     );
 }
 
@@ -368,7 +474,7 @@ fn assessWithFacts(
     architecture: []const u8,
     expert_count: u32,
 ) Assessment {
-    return assessWithRuntimeFacts(man, architecture, expert_count, false, .none);
+    return assessWithRuntimeFacts(man, architecture, expert_count, false, .none, .none);
 }
 
 fn assessWithRuntimeFacts(
@@ -377,6 +483,7 @@ fn assessWithRuntimeFacts(
     expert_count: u32,
     qualified_gemma4_a4b: bool,
     qwen3vl_promotion: Qwen3VlPromotion,
+    qwen3_embedding_promotion: Qwen3EmbeddingPromotion,
 ) Assessment {
     if (man.hasIncompleteGlinerBundle() or
         man.hasIncompleteColqwenBundle() or
@@ -487,10 +594,15 @@ fn assessWithRuntimeFacts(
                     man.embedding_style == .qwen3_embedding and
                     man.isLastTokenDecoderEmbedder())
                 {
-                    return makeCompatible(
-                        architecture,
-                        "qualified Qwen3-Embedding last-token decoder embedder",
-                    );
+                    return switch (qwen3_embedding_promotion) {
+                        .q8_0 => makeCompatible(architecture, "qualified Qwen3-Embedding 0.6B Q8_0 managed bundle"),
+                        .f16 => makeCompatible(architecture, "qualified Qwen3-Embedding 0.6B F16 managed bundle"),
+                        .none => makeIncompatible(
+                            architecture,
+                            .unsupported_backend,
+                            "Qwen3-Embedding requires an exact production-qualified managed receipt and live artifact hashes",
+                        ),
+                    };
                 }
             },
         },
@@ -687,13 +799,20 @@ pub fn makeIncompatible(architecture: []const u8, code: Code, message: []const u
     return .{ .level = .incompatible, .code = code, .message = message, .architecture = architecture };
 }
 
-test "qwen3-embedding style embedder is compatible despite decoder arch" {
+test "qwen3-embedding style requires an exact managed promotion" {
     var man = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     man.model_type = .embedder;
     man.pooling = .last;
     man.embedding_style = .qwen3_embedding;
     const result = assess(&man, "qwen3");
-    try std.testing.expectEqual(Level.compatible, result.level);
+    try std.testing.expectEqual(Level.incompatible, result.level);
+
+    var promoted = Inspection{
+        .architecture = try std.testing.allocator.dupe(u8, "qwen3"),
+        .qwen3_embedding_promotion = .q8_0,
+    };
+    defer promoted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Level.compatible, assessInspection(&man, promoted).level);
 
     // The manifest style is metadata, not authority to bypass architecture
     // safety policy for an unrelated unsafe family. NomicBERT is now a
@@ -707,6 +826,49 @@ test "qwen3-embedding style embedder is compatible despite decoder arch" {
     bare.model_type = .embedder;
     const bare_result = assess(&bare, "qwen3");
     try std.testing.expectEqual(Level.unknown, bare_result.level);
+}
+
+test "qwen3-embedding promotion receipt pins source variant and every artifact" {
+    const bundle = &qwen3_embedding_catalog.bundles[0];
+    var artifacts: [bundle.artifact_list.len + 1]managed_receipt.ArtifactReceipt = undefined;
+    for (bundle.artifacts(), 0..) |artifact, i| artifacts[i] = .{
+        .path = artifact.path,
+        .size = artifact.size,
+        .sha256 = artifact.sha256,
+    };
+    artifacts[bundle.artifact_list.len] = .{
+        .path = "model_manifest.json",
+        .size = qwen3_embedding_catalog.gguf_bundle_model_manifest.len,
+        .sha256 = qwen3_embedding_catalog.gguf_bundle_model_manifest_sha256,
+    };
+    const slash = std.mem.indexOfScalar(u8, bundle.source_repo, '/').?;
+    var receipt = managed_receipt.DownloadReceipt{
+        .version = 2,
+        .source = .{
+            .owner = bundle.source_repo[0..slash],
+            .name = bundle.source_repo[slash + 1 ..],
+            .variant = bundle.variant,
+        },
+        .artifacts = &artifacts,
+    };
+    var man = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .embedder,
+        .pooling = .last,
+        .embedding_style = .qwen3_embedding,
+        .gguf_path = bundle.artifacts()[0].path,
+    };
+    const metadata = gguf_format.SupportMetadata{
+        .architecture = "qwen3",
+        .block_count = 28,
+        .embedding_length = 1024,
+    };
+    try std.testing.expectEqual(.q8_0, qwen3EmbeddingPromotionFromReceipt(&man, metadata, receipt));
+    artifacts[0].sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expectEqual(.none, qwen3EmbeddingPromotionFromReceipt(&man, metadata, receipt));
+    artifacts[0].sha256 = bundle.artifacts()[0].sha256;
+    receipt.source.?.variant = qwen3_embedding_catalog.f16_bundle_variant;
+    try std.testing.expectEqual(.none, qwen3EmbeddingPromotionFromReceipt(&man, metadata, receipt));
 }
 
 test "unknown generators are unknown and require opt in" {

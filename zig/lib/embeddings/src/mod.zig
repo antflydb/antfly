@@ -85,7 +85,7 @@ pub const Config = struct {
 
     pub fn validate(self: Config) !void {
         switch (self.provider) {
-            .antfly, .mock => {},
+            .antfly => {},
             else => if (self.model.len == 0) return error.InvalidEmbedderConfig,
         }
         if (self.request_format.len > 0) {
@@ -100,6 +100,23 @@ pub const Config = struct {
         }
         if (self.batch_size) |batch_size| {
             if (batch_size == 0) return error.InvalidEmbedderConfig;
+        }
+        const has_role_overrides = self.query_input_type.len > 0 or self.document_input_type.len > 0;
+        const has_instruction = self.query_instruction.len > 0;
+        switch (self.provider) {
+            .cohere, .gemini, .vertex => if (has_instruction) return error.UnsupportedEmbeddingRetrievalConfig,
+            .bedrock => {
+                if (has_instruction) return error.UnsupportedEmbeddingRetrievalConfig;
+                const cohere_format = std.mem.eql(u8, self.request_format, "cohere_v3") or
+                    std.mem.eql(u8, self.request_format, "cohere_v4") or
+                    (self.request_format.len == 0 or std.mem.eql(u8, self.request_format, "auto")) and
+                        (std.mem.indexOf(u8, self.model, "cohere.embed-") != null);
+                if ((has_role_overrides or self.input_type.len > 0) and !cohere_format)
+                    return error.UnsupportedEmbeddingRetrievalConfig;
+            },
+            .antfly => if (has_role_overrides) return error.UnsupportedEmbeddingRetrievalConfig,
+            .openai, .openrouter, .ollama => if (has_role_overrides or has_instruction)
+                return error.UnsupportedEmbeddingRetrievalConfig,
         }
     }
 
@@ -132,6 +149,7 @@ pub fn stringifyAlloc(alloc: Allocator, cfg: Config) ![]u8 {
 }
 
 pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !Config {
+    const provider_name = generated.provider orelse return error.InvalidEmbedderConfig;
     const retrieval = generated.retrieval;
     const query_input_type = try resolveRetrievalField(
         if (retrieval) |value| value.query_input_type else null,
@@ -146,7 +164,7 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
         generated.query_instruction,
     );
     var cfg = Config{
-        .provider = generated.provider,
+        .provider = std.meta.stringToEnum(Provider, provider_name) orelse return error.InvalidEmbedderConfig,
         .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
         .request_format = if (generated.request_format) |request_format| try alloc.dupe(u8, request_format) else "",
         .url = if (generated.url) |url|
@@ -187,7 +205,7 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
 
 pub fn openApiFromConfig(cfg: Config) openapi.EmbedderConfig {
     return .{
-        .provider = cfg.provider,
+        .provider = @tagName(cfg.provider),
         .model = if (cfg.model.len > 0) cfg.model else null,
         .request_format = if (cfg.request_format.len > 0) cfg.request_format else null,
         .url = switch (cfg.provider) {
@@ -252,28 +270,27 @@ fn validBedrockRequestFormat(value: []const u8) bool {
 test "embedder config round trip" {
     const alloc = std.testing.allocator;
     const raw =
-        \\{"provider":"openai","model":"text-embedding-3-small","url":"https://api.openai.com","api_key":"sk-test","dimensions":1536,"retrieval":{"query_input_type":"search_query","document_input_type":"search_document","query_instruction":"retrieve relevant passages"}}
+        \\{"provider":"cohere","model":"embed-english-v3.0","api_key":"test-key","dimensions":1024,"retrieval":{"query_input_type":"search_query","document_input_type":"search_document"}}
     ;
     var cfg = try parseConfigFromSlice(alloc, raw);
     defer cfg.deinit(alloc);
 
-    try std.testing.expectEqual(.openai, cfg.provider);
-    try std.testing.expectEqualStrings("text-embedding-3-small", cfg.model);
-    try std.testing.expectEqualStrings("https://api.openai.com", cfg.url);
-    try std.testing.expectEqual(@as(?u32, 1536), cfg.dimensions);
+    try std.testing.expectEqual(.cohere, cfg.provider);
+    try std.testing.expectEqualStrings("embed-english-v3.0", cfg.model);
+    try std.testing.expectEqual(@as(?u32, 1024), cfg.dimensions);
     try std.testing.expectEqualStrings("search_query", cfg.query_input_type);
     try std.testing.expectEqualStrings("search_document", cfg.document_input_type);
-    try std.testing.expectEqualStrings("retrieve relevant passages", cfg.query_instruction);
+    try std.testing.expectEqualStrings("", cfg.query_instruction);
 
     const encoded = try stringifyAlloc(alloc, cfg);
     defer alloc.free(encoded);
     var reparsed = try parseConfigFromSlice(alloc, encoded);
     defer reparsed.deinit(alloc);
-    try std.testing.expectEqual(.openai, reparsed.provider);
-    try std.testing.expectEqualStrings("text-embedding-3-small", reparsed.model);
+    try std.testing.expectEqual(.cohere, reparsed.provider);
+    try std.testing.expectEqualStrings("embed-english-v3.0", reparsed.model);
     try std.testing.expectEqualStrings("search_query", reparsed.query_input_type);
     try std.testing.expectEqualStrings("search_document", reparsed.document_input_type);
-    try std.testing.expectEqualStrings("retrieve relevant passages", reparsed.query_instruction);
+    try std.testing.expectEqualStrings("", reparsed.query_instruction);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"retrieval\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_input_type\":\"search_query\"") != null);
 }
@@ -281,16 +298,32 @@ test "embedder config round trip" {
 test "embedder config accepts matching legacy retrieval fields and rejects conflicts" {
     const alloc = std.testing.allocator;
     const compatible =
-        \\{"provider":"openai","model":"text-embedding-3-small","query_input_type":"search_query","retrieval":{"query_input_type":"search_query"}}
+        \\{"provider":"cohere","model":"embed-english-v3.0","query_input_type":"search_query","retrieval":{"query_input_type":"search_query"}}
     ;
     var cfg = try parseConfigFromSlice(alloc, compatible);
     defer cfg.deinit(alloc);
     try std.testing.expectEqualStrings("search_query", cfg.query_input_type);
 
     const conflicting =
-        \\{"provider":"openai","model":"text-embedding-3-small","query_input_type":"classification","retrieval":{"query_input_type":"search_query"}}
+        \\{"provider":"cohere","model":"embed-english-v3.0","query_input_type":"classification","retrieval":{"query_input_type":"search_query"}}
     ;
     try std.testing.expectError(error.InvalidEmbedderConfig, parseConfigFromSlice(alloc, conflicting));
+}
+
+test "embedder config rejects retrieval controls a provider would ignore" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.UnsupportedEmbeddingRetrievalConfig,
+        parseConfigFromSlice(alloc,
+            \\{"provider":"openai","model":"text-embedding-3-small","retrieval":{"query_input_type":"search_query"}}
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedEmbeddingRetrievalConfig,
+        parseConfigFromSlice(alloc,
+            \\{"provider":"bedrock","model":"amazon.titan-embed-text-v2:0","retrieval":{"query_input_type":"search_query"}}
+        ),
+    );
 }
 
 test "embedder config supports antfly api_url normalization" {

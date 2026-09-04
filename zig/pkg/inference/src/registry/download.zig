@@ -1400,6 +1400,9 @@ pub fn writeManagedArtifactAndUpdatePlan(
 
     var artifacts = std.ArrayListUnmanaged(ManagedArtifactReceipt).empty;
     defer artifacts.deinit(allocator);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
     try artifacts.ensureTotalCapacity(allocator, validated.artifacts.len + 1);
     var replaced = false;
     for (validated.artifacts) |artifact| {
@@ -1407,6 +1410,7 @@ pub fn writeManagedArtifactAndUpdatePlan(
             try artifacts.append(allocator, .{
                 .path = relative_path,
                 .size = data.len,
+                .sha256 = &digest_hex,
             });
             replaced = true;
         } else {
@@ -1424,6 +1428,7 @@ pub fn writeManagedArtifactAndUpdatePlan(
         try artifacts.append(allocator, .{
             .path = relative_path,
             .size = data.len,
+            .sha256 = &digest_hex,
         });
     }
 

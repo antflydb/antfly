@@ -1233,6 +1233,11 @@ class InferenceRerankerServer:
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
+            # Production reranker clients are process-scoped and keep
+            # connections alive. Match the inference server's HTTP/1.1
+            # framing so this fixture exercises that connection-reuse path.
+            protocol_version = "HTTP/1.1"
+
             def do_POST(self) -> None:  # noqa: N802
                 if self.path != "/rerank":
                     self.send_error(404)

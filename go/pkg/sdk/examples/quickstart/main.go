@@ -20,7 +20,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
+	embedder, err := antfly.NewIndexEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model: "Qwen/Qwen3-Embedding-0.6B-GGUF",
 	})
 	if err != nil {

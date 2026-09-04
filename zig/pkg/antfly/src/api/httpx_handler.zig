@@ -54,6 +54,7 @@ const backups_api = @import("backups.zig");
 const batch_api = @import("batch.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const public_table_http = @import("public_table_http.zig");
+const query_request_diagnostics = @import("query_request_diagnostics.zig");
 const stored_destination_authorization = @import("stored_destination_authorization.zig");
 const tables_api = @import("tables.zig");
 const table_contract = @import("table_contract.zig");
@@ -94,7 +95,7 @@ const admin_routes = @import("../admin/routes.zig");
 const internal_routes = @import("../internal/routes.zig");
 
 const ParsedGlobalQueryTable = struct {
-    parsed: std.json.Parsed(metadata_openapi.StatefulQueryRequest),
+    parsed: std.json.Parsed(metadata_openapi.GlobalStatefulQueryRequest),
     table_name: []const u8,
 
     fn deinit(self: *@This()) void {
@@ -147,16 +148,162 @@ fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlob
     try query_contract.validatePublicQuerySortTupleContract(alloc, body);
     var parsed = metadata_openapi.server.parseGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
     errdefer parsed.deinit();
+    const table_name = parsed.value.table orelse return error.InvalidQueryRequest;
+    if (table_name.len == 0) return error.InvalidQueryRequest;
     return .{
         .parsed = parsed,
-        .table_name = parsed.value.table orelse "",
+        .table_name = table_name,
     };
+}
+
+fn parseSchemaEtag(raw: []const u8) !u32 {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.startsWith(u8, value, "W/")) return error.WeakSchemaEtag;
+    if (value.len < 10 or value[0] != '"' or value[value.len - 1] != '"')
+        return error.InvalidSchemaEtag;
+    const tag = value[1 .. value.len - 1];
+    const prefix = "schema-";
+    if (!std.mem.startsWith(u8, tag, prefix) or tag.len == prefix.len)
+        return error.InvalidSchemaEtag;
+    return try std.fmt.parseUnsigned(u32, tag[prefix.len..], 10);
+}
+
+fn setSchemaEtag(ctx: *httpx.Context, version: u32) !void {
+    var buf: [32]u8 = undefined;
+    const value = try std.fmt.bufPrint(&buf, "\"schema-{d}\"", .{version});
+    try ctx.setHeader("ETag", value);
 }
 
 fn isNdjsonContentType(content_type: ?[]const u8) bool {
     const value = content_type orelse return false;
     const media_type = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, value, ';')) |idx| value[0..idx] else value, " \t");
     return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
+}
+
+const DecodedRequestBody = struct {
+    body: []u8,
+    allocation: []u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.allocation);
+        self.* = undefined;
+    }
+};
+
+fn gunzipRequestBodyAlloc(ctx: ?*httpx.Context, alloc: std.mem.Allocator, encoded: []const u8, max_size: usize) !DecodedRequestBody {
+    var encoded_reader: std.Io.Reader = .fixed(encoded);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompressor = std.compress.flate.Decompress.init(&encoded_reader, .gzip, &window);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer {
+        if (ctx) |request_ctx| request_ctx.releaseRequestBodyBuffer(out.capacity);
+        out.deinit(alloc);
+    }
+    var buf: [16 * 1024]u8 = undefined;
+    while (true) {
+        const count = decompressor.reader.readSliceShort(&buf) catch |err| {
+            if (err == error.EndOfStream) break;
+            return error.InvalidCompressedBody;
+        };
+        if (count == 0) break;
+        if (count > max_size -| out.items.len) return error.RequestBodyTooLarge;
+        const required = out.items.len + count;
+        if (required > out.capacity) {
+            const geometric = out.capacity +| @max(out.capacity / 2, @as(usize, 16 * 1024));
+            const new_capacity = @min(max_size, @max(required, geometric));
+            const growth = new_capacity - out.capacity;
+            if (ctx) |request_ctx| {
+                if (!request_ctx.tryReserveRequestBodyBuffer(growth)) return error.BodyCapacityExceeded;
+            }
+            out.ensureTotalCapacityPrecise(alloc, new_capacity) catch |err| {
+                if (ctx) |request_ctx| request_ctx.releaseRequestBodyBuffer(growth);
+                return err;
+            };
+        }
+        out.appendSliceAssumeCapacity(buf[0..count]);
+    }
+    const body = out.items;
+    const allocation = out.allocatedSlice();
+    out = .empty;
+    return .{ .body = body, .allocation = allocation };
+}
+
+test "gzip request bodies are decoded with an expanded-size limit" {
+    const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0 };
+    var decoded = try gunzipRequestBodyAlloc(null, std.testing.allocator, &encoded, 2);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{}", decoded.body);
+    try std.testing.expectError(error.RequestBodyTooLarge, gunzipRequestBodyAlloc(null, std.testing.allocator, &encoded, 1));
+    try std.testing.expectError(error.InvalidCompressedBody, gunzipRequestBodyAlloc(null, std.testing.allocator, "not gzip", 1024));
+}
+
+test "gzip request bodies reserve expanded capacity from the shared server budget" {
+    const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0 };
+    var budget = httpx.SharedBodyBudget.init(1);
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/");
+    defer request.deinit();
+    request.body_budget = &budget;
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    try std.testing.expectError(
+        error.BodyCapacityExceeded,
+        gunzipRequestBodyAlloc(&ctx, std.testing.allocator, &encoded, 2),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+    try std.testing.expectEqual(@as(u64, 1), budget.stats().rejected_total);
+}
+
+test "invalid gzip releases partially expanded body capacity" {
+    const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0 };
+    var budget = httpx.SharedBodyBudget.init(32 * 1024);
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/");
+    defer request.deinit();
+    request.body_budget = &budget;
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    try std.testing.expectError(
+        error.InvalidCompressedBody,
+        gunzipRequestBodyAlloc(&ctx, std.testing.allocator, encoded[0 .. encoded.len - 4], 1024),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+}
+
+test "gzip request body reservation follows the owned decoded buffer lifetime" {
+    const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0 };
+    var budget = httpx.SharedBodyBudget.init(32 * 1024);
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/");
+    request.body_budget = &budget;
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+
+    const decoded = try gunzipRequestBodyAlloc(&ctx, std.testing.allocator, &encoded, 2);
+    try request.replaceOwnedBodyAllocation(decoded.body, decoded.allocation);
+    try std.testing.expectEqual(@as(usize, 2), budget.stats().in_use);
+
+    ctx.deinit();
+    request.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+}
+
+test "gzip request completes with combined encoded and decoded budget" {
+    const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0 };
+    var budget = httpx.SharedBodyBudget.init(encoded.len + 2);
+    try std.testing.expect(budget.tryReserve(encoded.len));
+
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/");
+    request.body_budget = &budget;
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+
+    const decoded = try gunzipRequestBodyAlloc(&ctx, std.testing.allocator, &encoded, 2);
+    try request.replaceOwnedBodyAllocation(decoded.body, decoded.allocation);
+    try std.testing.expectEqual(encoded.len + 2, budget.stats().in_use);
+
+    ctx.deinit();
+    request.deinit();
+    try std.testing.expectEqual(encoded.len, budget.stats().in_use);
+    budget.release(encoded.len);
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
 }
 
 fn requiresInternalServicePrincipal(path: []const u8) bool {
@@ -263,6 +410,18 @@ fn graphResolverDestinationsAllowed(
 
 pub const RequestAdmission = http_server_mod.RequestAdmission;
 const default_query_body_admission_capacity: usize = 32;
+const authenticated_identity_context_key = "antfly.authenticated-identity";
+
+const CachedAuthenticatedIdentity = struct {
+    alloc: std.mem.Allocator,
+    identity: ?AuthenticatedIdentity,
+
+    fn destroy(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.identity) |*identity| identity.deinit(self.alloc);
+        self.alloc.destroy(self);
+    }
+};
 
 pub const AntflyApiHandler = struct {
     api_server: *ApiHttpServer,
@@ -300,8 +459,45 @@ pub const AntflyApiHandler = struct {
 
     fn installMiddleware(self: *AntflyApiHandler, server: *httpx.Server) !void {
         try server.use(httpx.Middleware.bind("antfly-request-stats", self, recordRequest));
-        try server.use(httpx.Middleware.bind("antfly-ha-mutation-policy", self, enforceHaMutationPolicy));
         try server.use(httpx.Middleware.bind("antfly-internal-service-auth", self, enforceInternalServiceAuth));
+        try server.use(httpx.Middleware.bind("antfly-auth-before-encoded-body", self, authorizeBeforeEncodedBody));
+        try server.use(httpx.Middleware.bind("antfly-request-content-encoding", self, decodeRequestContent));
+        try server.use(httpx.Middleware.bind("antfly-ha-mutation-policy", self, enforceHaMutationPolicy));
+    }
+
+    /// Authenticate and authorize compressed requests before spending CPU or
+    /// expanded-body memory on them. The owned identity is handed to the route
+    /// handler through request context so password/API-key work is not repeated.
+    fn authorizeBeforeEncodedBody(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
+        const raw_encoding = ctx.header("content-encoding") orelse return next.call(ctx);
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw_encoding, " \t"), "identity")) return next.call(ctx);
+        if (self.encodedBodyAuthorizationIsDeferred(ctx)) return next.call(ctx);
+
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const authenticated = identity orelse return next.call(ctx);
+
+        const cached = try self.api_server.alloc.create(CachedAuthenticatedIdentity);
+        cached.* = .{ .alloc = self.api_server.alloc, .identity = authenticated };
+        identity = null;
+        ctx.setData(authenticated_identity_context_key, cached, CachedAuthenticatedIdentity.destroy) catch |err| {
+            CachedAuthenticatedIdentity.destroy(cached);
+            return err;
+        };
+        return next.call(ctx);
+    }
+
+    fn encodedBodyAuthorizationIsDeferred(self: *const AntflyApiHandler, ctx: *const httpx.Context) bool {
+        const path = ctx.request.uri.path;
+        if (requiresInternalServicePrincipal(path)) return true;
+        if (std.mem.eql(u8, path, routes.healthz) or
+            std.mem.eql(u8, path, routes.readyz) or
+            std.mem.eql(u8, path, routes.agent_card)) return true;
+        const public_catalog = std.mem.eql(u8, path, routes.ai_catalog) and self.api_server.cfg.ard_public_catalog_enabled;
+        const carries_authentication = ctx.header("authorization") != null or
+            ctx.header(http_server_mod.trusted_principal_header) != null;
+        return public_catalog and !carries_authentication;
     }
 
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
@@ -311,6 +507,29 @@ pub const AntflyApiHandler = struct {
         establishInternalBackupDeadline(ctx);
         establishCatalogRouteFenceDeadline(ctx);
         return next.call(ctx) catch |err| mapIngressError(ctx, err);
+    }
+
+    fn decodeRequestContent(_: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
+        const raw_encoding = ctx.header("content-encoding") orelse return next.call(ctx);
+        const encoding = std.mem.trim(u8, raw_encoding, " \t");
+        if (std.ascii.eqlIgnoreCase(encoding, "identity")) return next.call(ctx);
+        if (!std.ascii.eqlIgnoreCase(encoding, "gzip") and !std.ascii.eqlIgnoreCase(encoding, "x-gzip")) {
+            return textResponse(ctx, 415, "unsupported content encoding");
+        }
+
+        const encoded = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid gzip request body");
+        const expanded_limit = @min(ctx.max_request_body_size, http_server_mod.public_api_max_request_body_bytes);
+        const decoded = gunzipRequestBodyAlloc(ctx, ctx.allocator, encoded, expanded_limit) catch |err| switch (err) {
+            error.RequestBodyTooLarge => return textResponse(ctx, 413, "request body too large"),
+            error.BodyCapacityExceeded => {
+                try ctx.setHeader("Retry-After", "1");
+                return textResponse(ctx, 503, "request body capacity exhausted");
+            },
+            else => return textResponse(ctx, 400, "invalid gzip request body"),
+        };
+        try ctx.request.replaceOwnedBodyAllocation(decoded.body, decoded.allocation);
+        _ = ctx.request.headers.remove("content-encoding");
+        return next.call(ctx);
     }
 
     fn establishCatalogRouteFenceDeadline(ctx: *httpx.Context) void {
@@ -754,20 +973,21 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
-    fn respondQueryEmbeddingOperationalError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
-        const normalized = http_server_mod.normalizeQueryEmbeddingOperationalError(err) orelse return null;
-        const response = switch (normalized) {
-            error.QueryEmbeddingInputTooLarge => .{ @as(u16, 413), "query embedding input too large", false },
-            error.QueryEmbeddingOverloaded => .{ @as(u16, 429), "query embedding overloaded", true },
-            error.EmbedRateLimited => .{ @as(u16, 429), "query embedding rate limited", true },
-            error.EmbedTransientFailure => .{ @as(u16, 503), "query embedding temporarily unavailable", true },
-            error.EmbedUpstreamFailure => .{ @as(u16, 502), "query embedding provider failed", false },
-            error.Timeout => .{ @as(u16, 504), "query embedding timed out", false },
+    fn respondQueryOperationalError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
+        const normalized = http_server_mod.normalizeQueryOperationalError(err) orelse return null;
+        var response = switch (normalized) {
+            error.QueryEmbeddingInputTooLarge => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 413, "query_embedding_input_too_large", "query embedding input too large", false),
+            error.QueryEmbeddingOverloaded => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 429, "query_embedding_overloaded", "query embedding overloaded", true),
+            error.EmbedRateLimited => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 429, "query_embedding_rate_limited", "query embedding rate limited", true),
+            error.EmbedTransientFailure => try public_table_http.queryTemporarilyUnavailableOwnedResponse(ctx.allocator, .query_embedding_temporarily_unavailable),
+            error.EmbedUpstreamFailure => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 502, "query_embedding_upstream_failure", "query embedding provider failed", false),
+            error.RerankRateLimited => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 429, "reranker_rate_limited", "reranker rate limited", true),
+            error.RerankTransientFailure => try public_table_http.queryTemporarilyUnavailableOwnedResponse(ctx.allocator, .reranker_temporarily_unavailable),
+            error.RerankUpstreamFailure => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 502, "reranker_upstream_failure", "reranker provider failed", false),
+            error.Timeout => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 504, "query_timeout", "query timed out", true),
             else => return null,
         };
-        if (response[2]) try ctx.setHeader("Retry-After", "1");
-        _ = ctx.status(response[0]);
-        return try ctx.text(response[1]);
+        return try respondOwnedApiResponse(ctx, &response);
     }
 
     const OffloadedTableBatch = struct {
@@ -2699,15 +2919,21 @@ pub const AntflyApiHandler = struct {
         if (self.api_server.cfg.user_manager == null and self.api_server.cfg.trusted_principal_secret == null) return null;
 
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
-        identity.* = self.api_server.authenticateRequest(.{
-            .authorization = ctx.header("authorization"),
-            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
-        }) catch |err| switch (err) {
-            error.Unauthorized, error.InvalidPassword, error.UserNotFound, error.ApiKeyInvalid, error.ApiKeyNotFound, error.ApiKeyExpired => {
-                return try unauthorizedResponse(ctx);
-            },
-            else => return err,
-        };
+        if (ctx.getData(authenticated_identity_context_key)) |raw| {
+            const cached: *CachedAuthenticatedIdentity = @ptrCast(@alignCast(raw));
+            identity.* = cached.identity;
+            cached.identity = null;
+        } else {
+            identity.* = self.api_server.authenticateRequest(.{
+                .authorization = ctx.header("authorization"),
+                .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+            }) catch |err| switch (err) {
+                error.Unauthorized, error.InvalidPassword, error.UserNotFound, error.ApiKeyInvalid, error.ApiKeyNotFound, error.ApiKeyExpired => {
+                    return try unauthorizedResponse(ctx);
+                },
+                else => return err,
+            };
+        }
         const authenticated = identity.*.?;
         if (authenticated.is_internal_service and
             !std.mem.startsWith(u8, path, "/internal/v1/"))
@@ -4129,6 +4355,11 @@ pub const AntflyApiHandler = struct {
     }
 
     pub fn retrievalAgent(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var diagnostic_context: query_request_diagnostics.Context = .{};
+        const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
+        defer diagnostic_scope.deinit();
+        query_request_diagnostics.reset();
+
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -4191,6 +4422,7 @@ pub const AntflyApiHandler = struct {
                 }
                 var semantic_resolver = runner.server.semanticStatusResolver(runner.query_embedding_security_scope.domain, runner.query_embedding_security_scope.value);
                 var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| {
+                    if (err == error.RerankerCandidateLimitExceeded) return err;
                     if (query_api.isPublicQueryValidationError(err)) {
                         return error.InvalidRetrievalAgentRequest;
                     }
@@ -4319,9 +4551,31 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(422);
                 return ctx.text("tree root set exceeds the bounded retrieval limit");
             },
+            error.RerankerCandidateLimitExceeded => {
+                var response = contextual_operations.jsonWithStatus(
+                    422,
+                    try public_table_http.rerankerCandidateLimitExceededBody(alloc),
+                    false,
+                );
+                return try respondOwnedApiResponse(ctx, &response);
+            },
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
                 _ = ctx.status(400);
                 return ctx.text("invalid retrieval agent request");
+            },
+            error.EmbeddingIndexNotFound => {
+                var response = try public_table_http.queryDependencyErrorOwnedResponse(
+                    alloc,
+                    422,
+                    "embedding_index_not_found",
+                    "embedding index not found",
+                    false,
+                );
+                return try respondOwnedApiResponse(ctx, &response);
+            },
+            error.MissingGenerationConfig => {
+                _ = ctx.status(422);
+                return ctx.text("steps.generation requires a step-level or top-level generator or chain");
             },
             error.TableNotFound => {
                 _ = ctx.status(404);
@@ -4336,7 +4590,7 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("doc identity unavailable");
             },
             else => {
-                if (try respondQueryEmbeddingOperationalError(ctx, err)) |response| return response;
+                if (try respondQueryOperationalError(ctx, err)) |response| return response;
                 std.log.err("public retrieval failed err={}", .{err});
                 return err;
             },
@@ -4951,6 +5205,19 @@ pub const AntflyApiHandler = struct {
     }
 
     pub fn updateSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.mutateSchema(ctx, table_name, .replace);
+    }
+
+    pub fn patchSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.mutateSchema(ctx, table_name, .merge_patch);
+    }
+
+    fn mutateSchema(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        table_name: []const u8,
+        mode: tables_api.SchemaMutationMode,
+    ) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -4961,54 +5228,18 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid schema update request");
         };
-        var invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, body_data);
-        const schema_json = table_contract.parseSchemaUpdateRequest(alloc, body_data) catch |err| {
-            invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, body_data);
-            _ = ctx.status(400);
-            return ctx.text(invalid_schema_message);
-        };
-        defer alloc.free(schema_json);
-
-        const table_before = try self.api_server.loadOwnedTableRecord(alloc, decoded_table_name);
-        if (table_before == null) {
-            _ = self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
-                error.InvalidSchemaUpdateRequest => {
-                    _ = ctx.status(400);
-                    return ctx.text(invalid_schema_message);
-                },
-                error.TableNotFound => {
-                    _ = ctx.status(404);
-                    return ctx.text("not found");
-                },
-                error.UnsupportedOperation => blk: {
-                    const table_writes_source = self.api_server.table_writes orelse {
-                        _ = ctx.status(404);
-                        return ctx.text("not found");
-                    };
-                    _ = table_writes_source.updateSchema(alloc, decoded_table_name, schema_json) catch |write_err| switch (write_err) {
-                        error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
-                            _ = ctx.status(400);
-                            return ctx.text(invalid_schema_message);
-                        },
-                        else => return write_err,
-                    } orelse {
-                        _ = ctx.status(404);
-                        return ctx.text("not found");
-                    };
-                    break :blk null;
-                },
-                else => return err,
+        var expected_version: ?u32 = null;
+        if (ctx.header("if-match")) |raw_etag| {
+            expected_version = parseSchemaEtag(raw_etag) catch {
+                _ = ctx.status(400);
+                return ctx.text("If-Match must be a strong schema ETag such as \"schema-0\"");
             };
-            var arena_impl = std.heap.ArenaAllocator.init(alloc);
-            defer arena_impl.deinit();
-            const value = try http_server_mod.buildLocalSchemaUpdateStatus(arena_impl.allocator(), decoded_table_name, schema_json);
-            return ctx.openApiJson(value);
         }
-        defer metadata_table_manager.freeTable(alloc, table_before.?);
-
+        var invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, body_data);
         var local_schema_applied = false;
-        const committed_version = self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
-            error.InvalidSchemaUpdateRequest => {
+        var mutation = self.api_server.source.mutateSchema(alloc, decoded_table_name, mode, body_data, expected_version) catch |err| switch (err) {
+            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest, error.SchemaVersionManagedByBackend => {
+                invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, body_data);
                 _ = ctx.status(400);
                 return ctx.text(invalid_schema_message);
             },
@@ -5016,7 +5247,28 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(404);
                 return ctx.text("not found");
             },
+            error.SchemaVersionChanged, error.TableGenerationChanged => {
+                _ = ctx.status(409);
+                return ctx.text("schema version changed; refresh and retry");
+            },
+            error.MetadataMutationOutcomeUnknown => {
+                return metadataMutationOutcomeUnknownResponse(ctx);
+            },
+            error.UnsupportedConditionalSchemaUpdate => {
+                _ = ctx.status(409);
+                return ctx.text("conditional schema update is unavailable; refresh and retry");
+            },
             error.UnsupportedOperation => blk: {
+                if (mode == .merge_patch) {
+                    _ = ctx.status(405);
+                    return ctx.text("schema patch is unavailable on this deployment");
+                }
+                const schema_json = table_contract.parseSchemaUpdateRequest(alloc, body_data) catch |parse_err| {
+                    invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(parse_err, body_data);
+                    _ = ctx.status(400);
+                    return ctx.text(invalid_schema_message);
+                };
+                defer alloc.free(schema_json);
                 const table_writes_source = self.api_server.table_writes orelse {
                     _ = ctx.status(405);
                     return ctx.text("method not allowed");
@@ -5029,24 +5281,33 @@ pub const AntflyApiHandler = struct {
                     else => return write_err,
                 };
                 local_schema_applied = true;
-                break :blk null;
+                break :blk tables_api.SchemaMutationResult{
+                    .version = 0,
+                    .schema_json = try alloc.dupe(u8, schema_json),
+                };
             },
             else => return err,
         };
-        var expectation = try self.api_server.schemaProjectionExpectationAlloc(alloc, &table_before.?, schema_json, committed_version);
+        defer mutation.deinit(alloc);
+        const committed_version: ?u32 = if (local_schema_applied) null else mutation.version;
+        var expectation = http_server_mod.ApiHttpServer.SchemaProjectionExpectation{
+            .schema_json = try alloc.dupe(u8, mutation.schema_json),
+        };
         defer expectation.deinit(alloc);
-        self.api_server.waitForSchemaUpdateProjection(decoded_table_name, expectation, committed_version) catch |err| switch (err) {
-            error.TableVisibilityTimeout => {
-                _ = ctx.status(500);
-                return ctx.text("schema update did not converge");
-            },
-            error.TableGenerationChanged => {
-                _ = ctx.status(409);
-                return ctx.text("schema update was superseded; retry request");
-            },
-            else => return err,
-        };
-        self.api_server.reconcileProjectedSchemaUpdate(alloc, decoded_table_name, schema_json, local_schema_applied) catch |write_err| switch (write_err) {
+        if (!local_schema_applied) {
+            self.api_server.waitForSchemaUpdateProjection(decoded_table_name, expectation, committed_version) catch |err| switch (err) {
+                error.TableVisibilityTimeout => {
+                    _ = ctx.status(500);
+                    return ctx.text("schema update did not converge");
+                },
+                error.TableGenerationChanged => {
+                    _ = ctx.status(409);
+                    return ctx.text("schema update was superseded; retry request");
+                },
+                else => return err,
+            };
+        }
+        self.api_server.reconcileProjectedSchemaUpdate(alloc, decoded_table_name, mutation.schema_json, local_schema_applied) catch |write_err| switch (write_err) {
             error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
                 _ = ctx.status(400);
                 return ctx.text(invalid_schema_message);
@@ -5054,8 +5315,9 @@ pub const AntflyApiHandler = struct {
             else => return write_err,
         };
 
-        const body = try self.api_server.encodeSchemaUpdateResponse(decoded_table_name, schema_json);
+        const body = try self.api_server.encodeSchemaUpdateResponse(decoded_table_name, mutation.schema_json);
         defer self.api_server.alloc.free(body);
+        if (!local_schema_applied) try setSchemaEtag(ctx, mutation.version);
         return jsonResponse(ctx, 200, body);
     }
 
@@ -6146,6 +6408,10 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
             try self.inner.put(prefix ++ path, handler_fn);
         }
 
+        pub fn patch(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
+            try self.inner.patch(prefix ++ path, handler_fn);
+        }
+
         pub fn delete(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
             try self.inner.delete(prefix ++ path, handler_fn);
         }
@@ -6315,6 +6581,61 @@ const AuthStatusSource = struct {
     }
 };
 
+test "compressed requests authenticate before decompression and reuse the identity" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var table_read = try usermgr.Permission.initOwned(alloc, .table, "*", .read);
+    defer table_read.deinit(alloc);
+    var reader = try auth.manager.createUser("reader", "reader", &.{table_read});
+    defer reader.deinit(alloc);
+    const authorization = try encodeBasicAuthorization(alloc, "reader", "reader");
+    defer alloc.free(authorization);
+
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const url = try std.fmt.allocPrint(alloc, "{s}/db/v1/query", .{base_url});
+    defer alloc.free(url);
+
+    const anonymous_headers = [_][2][]const u8{
+        .{ "content-type", "application/json" },
+        .{ "content-encoding", "gzip" },
+    };
+    var anonymous = try requestWithRetry(&client, client_io.io(), .POST, url, "not gzip", &anonymous_headers, 20);
+    defer anonymous.deinit();
+    try std.testing.expectEqual(@as(u16, 401), anonymous.status.code);
+
+    const authenticated_headers = [_][2][]const u8{
+        .{ "content-type", "application/json" },
+        .{ "content-encoding", "gzip" },
+        .{ "authorization", authorization },
+    };
+    var authenticated = try requestWithRetry(&client, client_io.io(), .POST, url, "not gzip", &authenticated_headers, 20);
+    defer authenticated.deinit();
+    try std.testing.expectEqual(@as(u16, 400), authenticated.status.code);
+    try std.testing.expectEqualStrings("invalid gzip request body", authenticated.body.?);
+}
+
 const LookupStatusSource = struct {
     fn iface(_: *@This()) http_server_mod.StatusSource {
         return .{
@@ -6369,6 +6690,7 @@ const SchemaUpdateStatusSource = struct {
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
                 .update_schema = updateSchema,
+                .mutate_schema = mutateSchema,
                 .wait_table_projection = waitTableProjection,
             },
         };
@@ -6424,6 +6746,36 @@ const SchemaUpdateStatusSource = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try std.testing.expectEqualStrings("docs", table_name);
         try self.replaceSchemaJson(alloc, schema_json);
+    }
+
+    fn mutateSchema(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        mode: tables_api.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !tables_api.SchemaMutationResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try std.testing.expectEqualStrings("docs", table_name);
+        const current = metadata_table_manager.TableRecord{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = tables_api.effectiveSchemaJson(self.schema_json),
+            .indexes_json = tables_api.default_indexes_json,
+            .placement_role = "data",
+        };
+        if (expected_version) |expected| {
+            if (try tables_api.schemaVersion(current.schema_json) != expected)
+                return error.SchemaVersionChanged;
+        }
+        const updated = try tables_api.applySchemaMutationRecord(alloc, &current, mode, body);
+        defer metadata_table_manager.freeTable(alloc, updated);
+        try self.replaceSchemaJson(alloc, updated.schema_json);
+        return .{
+            .version = try tables_api.schemaVersion(updated.schema_json),
+            .schema_json = try alloc.dupe(u8, updated.schema_json),
+        };
     }
 
     fn waitTableProjection(ptr: *anyopaque, table_name: []const u8, schema_json: ?[]const u8, indexes_json: ?[]const u8) !void {
@@ -8916,6 +9268,7 @@ test "httpx antfly schema update returns full table status after projection" {
     defer resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), resp.status.code);
     try std.testing.expectEqualStrings("application/json", resp.contentType().?);
+    try std.testing.expectEqualStrings("\"schema-1\"", resp.headers.get("etag").?);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.TableStatus, alloc, resp.body.?, .{});
     defer parsed.deinit();
@@ -8926,6 +9279,42 @@ test "httpx antfly schema update returns full table status after projection" {
     try std.testing.expectEqual(@as(u32, 0), writes.synchronous_update_calls.load(.monotonic));
 }
 
+test "httpx schema patch merges at the authority and accepts version zero ETag" {
+    const alloc = std.testing.allocator;
+    var source = SchemaUpdateStatusSource{};
+    defer source.deinit(alloc);
+    var writes = SchemaReconcileWriteSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
+
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const schema_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/schema", .{base_url});
+    defer alloc.free(schema_url);
+    const headers = [_][2][]const u8{
+        .{ "content-type", "application/merge-patch+json" },
+        .{ "if-match", "\"schema-0\"" },
+    };
+    var resp = try requestWithRetry(&client, client_io.io(), .PATCH, schema_url, "{\"description\":\"patched\"}", &headers, 20);
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+    try std.testing.expectEqualStrings("\"schema-1\"", resp.headers.get("etag").?);
+    try std.testing.expect(std.mem.indexOf(u8, source.schema_json.?, "\"description\":\"patched\"") != null);
+}
+
+test "schema ETags are strong and preserve version zero" {
+    try std.testing.expectEqual(@as(u32, 0), try parseSchemaEtag("\"schema-0\""));
+    try std.testing.expectEqual(@as(u32, 42), try parseSchemaEtag(" \"schema-42\" "));
+    try std.testing.expectError(error.WeakSchemaEtag, parseSchemaEtag("W/\"schema-1\""));
+    try std.testing.expectError(error.InvalidSchemaEtag, parseSchemaEtag("0"));
+}
+
 test "httpx global query table name comes from request body" {
     var parsed_table = try parseGlobalQueryTable(std.testing.allocator,
         \\{"table":"files","limit":5}
@@ -8933,6 +9322,17 @@ test "httpx global query table name comes from request body" {
     defer parsed_table.deinit();
 
     try std.testing.expectEqualStrings("files", parsed_table.table_name);
+}
+
+test "httpx global query requires a non-empty table name" {
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseGlobalQueryTable(std.testing.allocator, "{}"),
+    );
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseGlobalQueryTable(std.testing.allocator, "{\"table\":\"\"}"),
+    );
 }
 
 test "stored destination admission requires write permission on every eventual sink" {

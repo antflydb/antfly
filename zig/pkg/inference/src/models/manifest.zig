@@ -1167,7 +1167,10 @@ fn applySentenceTransformersPoolingSidecars(
 
     if (try catalog.readOptional("config_sentence_transformers.json")) |st_bytes| {
         defer allocator.free(st_bytes);
-        applySentenceTransformersPrompts(manifest, allocator, st_bytes) catch {};
+        applySentenceTransformersPrompts(manifest, allocator, st_bytes) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {},
+        };
     }
 }
 

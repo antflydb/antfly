@@ -35,9 +35,8 @@ class RetrievalAgentSteps:
                 the top-level request tools policy when both are present.
             generation (GenerationStepConfig | Unset): Configuration for the generation step. This step generates the final
                 response from retrieved documents using the reasoning as context.
-            followup (FollowupStepConfig | Unset): Configuration for generating follow-up questions. Uses a separate
-                generator
-                call which can use a cheaper/faster model.
+            followup (FollowupStepConfig | Unset): Configuration for deterministic follow-up suggestions derived from the
+                original query and the standard Antfly follow-up templates.
             confidence (ConfidenceStepConfig | Unset): Configuration for confidence assessment. Evaluates answer quality and
                 resource relevance. Can use a model calibrated for scoring tasks.
             eval_ (EvalConfig | Unset): Configuration for inline evaluation of query results.

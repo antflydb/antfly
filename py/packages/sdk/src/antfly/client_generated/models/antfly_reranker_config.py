@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.antfly_reranker_config_provider import AntflyRerankerConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="AntflyRerankerConfig")
@@ -19,16 +20,21 @@ class AntflyRerankerConfig:
         {'provider': 'antfly', 'model': 'mixedbread-ai/mxbai-rerank-base-v1', 'url': 'http://localhost:8080'}
 
     Attributes:
-        model (str): The name of the reranking model (e.g., cross-encoder model name).
+        provider (AntflyRerankerConfigProvider):
+        model (str | Unset): Optional reranking model name. When omitted, Antfly inference selects a model from its
+            reranker model directory. Set this explicitly when more than one local reranker is installed.
         url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment
             variable.
     """
 
-    model: str
+    provider: AntflyRerankerConfigProvider
+    model: str | Unset = UNSET
     url: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         url = self.url
@@ -37,9 +43,11 @@ class AntflyRerankerConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "model": model,
+                "provider": provider,
             }
         )
+        if model is not UNSET:
+            field_dict["model"] = model
         if url is not UNSET:
             field_dict["url"] = url
 
@@ -48,11 +56,14 @@ class AntflyRerankerConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        model = d.pop("model")
+        provider = AntflyRerankerConfigProvider(d.pop("provider"))
+
+        model = d.pop("model", UNSET)
 
         url = d.pop("url", UNSET)
 
         antfly_reranker_config = cls(
+            provider=provider,
             model=model,
             url=url,
         )

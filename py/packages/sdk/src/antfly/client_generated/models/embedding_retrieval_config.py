@@ -24,8 +24,9 @@ class EmbeddingRetrievalConfig:
             document_input_type (str | Unset): Provider-specific document role, such as `search_document` for
                 Cohere. When omitted, the provider adapter derives it from
                 `RETRIEVAL_DOCUMENT`.
-            query_instruction (str | Unset): Optional instruction sent only with retrieval-query embeddings.
-                Document embeddings never receive this instruction.
+            query_instruction (str | Unset): Optional instruction sent only with retrieval-query embeddings by
+                instruction-aware Antfly inference models. Provider adapters that
+                do not support free-form instructions reject this field.
     """
 
     query_input_type: str | Unset = UNSET

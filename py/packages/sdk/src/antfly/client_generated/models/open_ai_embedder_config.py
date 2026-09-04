@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.open_ai_embedder_config_provider import OpenAIEmbedderConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="OpenAIEmbedderConfig")
@@ -26,6 +27,7 @@ class OpenAIEmbedderConfig:
             {'provider': 'openai', 'model': 'text-embedding-3-small', 'api_key': 'sk-...'}
 
         Attributes:
+            provider (OpenAIEmbedderConfigProvider):
             model (str): The name of the OpenAI model to use. Default: 'text-embedding-3-small'. Example: text-
                 embedding-3-small.
             url (str | Unset): The URL of the OpenAI API endpoint. Defaults to OpenAI's API. Can be set via OPENAI_BASE_URL
@@ -35,6 +37,7 @@ class OpenAIEmbedderConfig:
                 256, 512, 1024, 1536, or 3072.
     """
 
+    provider: OpenAIEmbedderConfigProvider
     model: str = "text-embedding-3-small"
     url: str | Unset = "https://api.openai.com"
     api_key: str | Unset = UNSET
@@ -42,6 +45,8 @@ class OpenAIEmbedderConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         url = self.url
@@ -54,6 +59,7 @@ class OpenAIEmbedderConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -69,6 +75,8 @@ class OpenAIEmbedderConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = OpenAIEmbedderConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         url = d.pop("url", UNSET)
@@ -78,6 +86,7 @@ class OpenAIEmbedderConfig:
         dimensions = d.pop("dimensions", UNSET)
 
         open_ai_embedder_config = cls(
+            provider=provider,
             model=model,
             url=url,
             api_key=api_key,

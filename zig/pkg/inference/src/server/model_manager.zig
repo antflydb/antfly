@@ -543,6 +543,16 @@ pub fn compatibilitySummaryForBackend(
             .message = "production-qualified Qwen3-VL bundles require the Metal backend",
         };
     }
+    if (man.embedding_style == .qwen3_embedding and
+        man.usesGgufWeights() and
+        backend != .metal)
+    {
+        return .{
+            .level = .incompatible,
+            .code = .unsupported_backend,
+            .message = "production-qualified Qwen3-Embedding GGUF bundles require the Metal backend",
+        };
+    }
 
     // GGUF metadata is authoritative only when this route will consume GGUF.
     // ONNX/safetensors routes use the manifest architecture rather than

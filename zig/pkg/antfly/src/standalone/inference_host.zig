@@ -299,6 +299,14 @@ test "standalone data directory does not change the default models directory" {
 
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expect(!std.mem.startsWith(u8, first, "/tmp/antfly-data-"));
+
+    const first_ml = try antfly.inference_runtime.defaultMlDirForDataDirAlloc(std.testing.allocator, "/tmp/antfly-data-a");
+    defer std.testing.allocator.free(first_ml);
+    const second_ml = try antfly.inference_runtime.defaultMlDirForDataDirAlloc(std.testing.allocator, "/tmp/antfly-data-b");
+    defer std.testing.allocator.free(second_ml);
+
+    try std.testing.expectEqualStrings(first_ml, second_ml);
+    try std.testing.expect(!std.mem.startsWith(u8, first_ml, "/tmp/antfly-data-"));
 }
 
 /// Creates the standalone inference implementation inside its focused codegen
@@ -493,7 +501,26 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .rerank_texts => blk: {
             var parsed = try std.json.parseFromSlice(RerankTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            const result = try state.node.rerankTextsDirect(alloc, parsed.value.model, parsed.value.query, parsed.value.documents);
+            const CancellationControl = struct {
+                fn check(raw: ?*anyopaque) !void {
+                    const cancellation: *const http_abi.CancellationView = @ptrCast(@alignCast(raw.?));
+                    if (cancellation.requested()) return error.Cancelled;
+                }
+            };
+            var cancellation = context.cancellation;
+            const execution_control: ?inference.pipelines.RerankingExecutionControl = if (cancellation.is_cancelled != null)
+                .{ .ptr = &cancellation, .check_fn = CancellationControl.check }
+            else
+                null;
+            const result = try state.node.rerankTextsDirectWithContext(
+                alloc,
+                state.io,
+                deadline_ns,
+                execution_control,
+                parsed.value.model,
+                parsed.value.query,
+                parsed.value.documents,
+            );
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
@@ -607,6 +634,7 @@ const ManifestServer = struct {
             .post => .POST,
             .put => .PUT,
             .delete => .DELETE,
+            .patch => .PATCH,
         }, path, handler) catch |err| {
             std.log.err("linked inference route manifest rejected method={s} path={s} err={}", .{
                 @tagName(method),
@@ -644,6 +672,10 @@ const ManifestServer = struct {
     pub fn delete(self: *const ManifestServer, comptime path: []const u8, handler: httpx.Handler) !void {
         try self.register(.delete, path, handler);
     }
+
+    pub fn patch(self: *const ManifestServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.patch, path, handler);
+    }
 };
 
 const RouteMetadata = struct {
@@ -657,6 +689,7 @@ fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
         .post => "POST",
         .put => "PUT",
         .delete => "DELETE",
+        .patch => "PATCH",
     };
     const relative_path = if (std.mem.startsWith(u8, path, inference.server.public_api_prefix))
         path[inference.server.public_api_prefix.len..]
@@ -696,6 +729,7 @@ const DirectServer = struct {
             .post => .POST,
             .put => .PUT,
             .delete => .DELETE,
+            .patch => .PATCH,
         }, path, localInferenceHttpHandler, route);
     }
 
@@ -713,6 +747,10 @@ const DirectServer = struct {
 
     pub fn delete(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
         try self.register(.delete, path, handler);
+    }
+
+    pub fn patch(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.patch, path, handler);
     }
 };
 
@@ -738,6 +776,7 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
         .post => .POST,
         .put => .PUT,
         .delete => .DELETE,
+        .patch => .PATCH,
     }, target);
     defer http_request.deinit();
     const input_headers = if (request.headers_ptr) |ptr| ptr[0..request.headers_len] else &.{};
@@ -1016,8 +1055,8 @@ fn localAntflyEmbedDenseTextsWithContext(
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     return try node.embedDenseTextsDirectWithContextAndTask(
         alloc,
-        context.io,
-        context.deadline_ns,
+        context.request.io,
+        context.request.deadline_ns,
         model,
         texts,
         context.task_type.canonical(),

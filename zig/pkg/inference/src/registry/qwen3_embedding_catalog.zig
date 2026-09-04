@@ -52,6 +52,8 @@ pub const gguf_bundle_model_manifest =
     "\"prefix\":\"Instruct: Given a web search query, retrieve relevant passages that answer the query\\nQuery:\"," ++
     "\"instruction_template\":\"Instruct: {instruction}\\nQuery:\"}," ++
     "\"document\":{\"prefix\":\"\"}}}\n";
+pub const gguf_bundle_model_manifest_sha256 =
+    "d07fad596a5839ef429562db9e22f217da17063aa05d4d1b8bfaef0c43557c03";
 
 const tokenizer_sidecar = Artifact{
     .repo = safetensors_repo,
