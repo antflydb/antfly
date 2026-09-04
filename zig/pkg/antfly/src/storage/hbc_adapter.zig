@@ -4084,6 +4084,13 @@ pub const HBCIndex = struct {
         rerank_cache_observations: u64 = 0,
         exact_observations: u64 = 0,
         hbc_observations: u64 = 0,
+        /// Adaptive layout feedback for node-wide search admission.
+        /// The high water reacts immediately to skew and decays slowly after
+        /// compaction repairs oversized postings.
+        scan_vectors_per_leaf_ewma: u64 = 0,
+        scan_vectors_per_leaf_high_water: u64 = 0,
+        scan_bytes_per_leaf_ewma: u64 = 0,
+        scan_bytes_per_leaf_high_water: u64 = 0,
         last_route: DenseRoute = .unknown,
     };
 
@@ -14798,7 +14805,18 @@ pub const HBCIndex = struct {
             std.math.divCeil(u64, node_count - 1, branching_factor) catch unreachable;
         const estimated_leaf_count = @max(node_count -| estimated_internal_nodes, 1);
         const mean_leaf_occupancy = std.math.divCeil(u64, active_count, estimated_leaf_count) catch unreachable;
-        const candidate_count = @min(active_count, search_width *| mean_leaf_occupancy);
+        const route_cost = self.denseRouteCostSnapshot();
+        const learned_occupancy = @max(
+            route_cost.scan_vectors_per_leaf_high_water,
+            route_cost.scan_vectors_per_leaf_ewma,
+        );
+        // `leaf_size` protects the first query after open; observed high-water
+        // corrects layouts containing overflow or otherwise skewed postings.
+        const admitted_leaf_occupancy = @max(
+            mean_leaf_occupancy,
+            @max(@as(u64, self.config.leaf_size), learned_occupancy),
+        );
+        const candidate_count = @min(active_count, search_width *| admitted_leaf_occupancy);
         const dimensions: u64 = @intCast(@max(self.config.dims, 1));
         // RaBitQ scans one bit per transformed dimension. Non-quantized
         // indexes scan their resident f32 plane. Directory and heap metadata
@@ -14808,7 +14826,17 @@ pub const HBCIndex = struct {
             std.math.divCeil(u64, dimensions, 8) catch unreachable
         else
             dimensions *| @sizeOf(f32);
-        const estimated_scan_bytes = @max(candidate_count *| bytes_per_candidate, 1);
+        const baseline_scan_bytes = candidate_count *| bytes_per_candidate;
+        const learned_leaf_bytes = @max(
+            route_cost.scan_bytes_per_leaf_high_water,
+            route_cost.scan_bytes_per_leaf_ewma,
+        );
+        const learned_scan_bytes = search_width *| learned_leaf_bytes;
+        const max_possible_scan_bytes = active_count *| dimensions *| @sizeOf(f32);
+        const estimated_scan_bytes = @max(
+            @min(@max(baseline_scan_bytes, learned_scan_bytes), max_possible_scan_bytes),
+            1,
+        );
         const cancellation: ?resource_manager_mod.DenseSearchCancellation = if (req.cancellation) |token|
             .{ .ptr = token.ptr, .is_cancelled = token.is_cancelled_fn }
         else
@@ -14901,6 +14929,30 @@ pub const HBCIndex = struct {
         while (!self.dense_route_cost_mu.tryLock()) std.atomic.spinLoopHint();
         defer self.dense_route_cost_mu.unlock();
         const state = &self.dense_route_cost;
+        if (profile.max_leaf_vectors_considered > 0) {
+            const sample = profile.max_leaf_vectors_considered;
+            state.scan_vectors_per_leaf_ewma = routeRateEwma(
+                state.scan_vectors_per_leaf_ewma,
+                sample,
+            );
+            const previous_high_water = state.scan_vectors_per_leaf_high_water;
+            state.scan_vectors_per_leaf_high_water = if (sample >= previous_high_water)
+                sample
+            else
+                @max(sample, previous_high_water -| @max(previous_high_water / 64, 1));
+        }
+        if (profile.max_leaf_scan_bytes > 0) {
+            const sample = profile.max_leaf_scan_bytes;
+            state.scan_bytes_per_leaf_ewma = routeRateEwma(
+                state.scan_bytes_per_leaf_ewma,
+                sample,
+            );
+            const previous_high_water = state.scan_bytes_per_leaf_high_water;
+            state.scan_bytes_per_leaf_high_water = if (sample >= previous_high_water)
+                sample
+            else
+                @max(sample, previous_high_water -| @max(previous_high_water / 64, 1));
+        }
         state.filter_scan_ns_per_candidate = routeRateEwma(
             state.filter_scan_ns_per_candidate,
             perUnit(profile.filter_metadata_batch_ns, profile.filter_candidates),
@@ -19211,7 +19263,7 @@ test "hbc search charges estimated quantized scan bytes to node admission" {
     defer tp.cleanup();
 
     var resource_manager = resource_manager_mod.ResourceManager.init(.{
-        .dense_search_bandwidth_capacity_bytes = 64,
+        .dense_search_bandwidth_capacity_bytes = 256,
     });
     defer resource_manager.deinit(alloc);
     var idx = try HBCIndex.open(alloc, path, .{
@@ -19234,6 +19286,23 @@ test "hbc search charges estimated quantized scan bytes to node admission" {
     try std.testing.expectEqual(@as(u64, 16), stats.peak_active_bytes);
     try std.testing.expectEqual(@as(u64, 1), stats.peak_active_queries);
     try std.testing.expectEqual(@as(u64, 0), stats.active_queries);
+
+    // A real oversized posting immediately raises subsequent admission. The
+    // estimate uses the observed posting high-water rather than assuming this
+    // synthetic tree is balanced from only its aggregate node count.
+    idx.observeSearchCacheBenefit(&.{
+        .approx_leaves_scored = 1,
+        .approx_vectors_scored = 7,
+        .max_leaf_vectors_considered = 7,
+        .max_leaf_scan_bytes = 56,
+    });
+    var skew_lease = try idx.acquireSearchAdmission(100, 51, .{
+        .query = &first,
+        .k = 1,
+        .search_width = 2,
+    });
+    try std.testing.expectEqual(@as(u64, 112), skew_lease.bytes);
+    idx.releaseSearchAdmission(&skew_lease);
 }
 
 test "hbc resource manager reattachment is idempotent and transfers local cache usage" {

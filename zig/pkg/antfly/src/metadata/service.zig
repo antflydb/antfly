@@ -6991,7 +6991,10 @@ pub const MetadataHttpService = struct {
                     ctx.membership_fingerprint,
                     version,
                 );
-                const ready = if (common_version) |version| version >= ctx.required_version else false;
+                const ready = if (common_version) |version|
+                    metadata_runtime_status_protocol.profileSatisfies(version, ctx.required_version)
+                else
+                    false;
                 ctx.completed = true;
                 ctx.service.finishRuntimeStatusProtocolProbe(ready);
                 // A lower common version is useful too: status ingestion can
@@ -7129,7 +7132,7 @@ pub const MetadataHttpService = struct {
         defer if (required_node_ids.len > 0) self.alloc.free(required_node_ids);
         if (required_node_ids.len == 0) return null;
 
-        var all_voters_current = true;
+        var common_profile: metadata_runtime_status_protocol.Profile = .current;
 
         var client = metadata_http_client.MetadataHttpClient.init(
             self.alloc,
@@ -7172,14 +7175,13 @@ pub const MetadataHttpService = struct {
                 );
                 return null;
             }
-            if (peer_status.runtime_status_record_version != metadata_runtime_status_protocol.current_record_version)
-                all_voters_current = false;
+            common_profile = metadata_runtime_status_protocol.greatestCommonProfile(
+                common_profile.wireVersion(),
+                peer_status.runtime_status_record_version,
+            ) orelse return null;
         }
-        const common_version = if (all_voters_current)
-            metadata_runtime_status_protocol.current_record_version
-        else
-            metadata_runtime_status_protocol.v0_2_0_record_version;
-        if (common_version < required_version) {
+        const common_version = common_profile.wireVersion();
+        if (!metadata_runtime_status_protocol.profileSatisfies(common_version, required_version)) {
             std.log.info(
                 "runtime-status protocol activation awaiting upgrade: requested={d} common={d}",
                 .{ required_version, common_version },

@@ -3067,9 +3067,14 @@ fn nativeColdSequentialReaderCapacity(state: *const NativeStorageState) usize {
 }
 
 const NativeColdSequentialReader = struct {
+    const direct_alignment: usize = 4096;
+
     allocator: Allocator,
     fd_permit: NativeFdPermit,
     fd: std.posix.fd_t,
+    direct_io: std.atomic.Value(bool) = .init(false),
+    direct_mutex: std.atomic.Mutex = .unlocked,
+    direct_scratch: ?[]align(direct_alignment) u8 = null,
 
     const vtable: ColdSequentialReader.VTable = .{
         .read_range_alloc = readRangeAlloc,
@@ -3079,26 +3084,57 @@ const NativeColdSequentialReader = struct {
 
     const Intent = enum { sequential, random };
 
+    const OpenedFd = struct {
+        fd: std.posix.fd_t,
+        direct_io: bool,
+    };
+
+    fn openCold(path: []const u8) !OpenedFd {
+        const regular_flags: std.posix.O = .{
+            .ACCMODE = .RDONLY,
+            .CLOEXEC = true,
+        };
+        if (comptime builtin.os.tag == .linux) {
+            var direct_flags = regular_flags;
+            direct_flags.DIRECT = true;
+            if (std.posix.openat(std.posix.AT.FDCWD, path, direct_flags, 0)) |fd| {
+                return .{ .fd = fd, .direct_io = true };
+            } else |_| {
+                // Some filesystems (notably tmpfs and network filesystems) do
+                // not support O_DIRECT. Preserve availability with a buffered
+                // descriptor whose pages are marked as one-shot below.
+            }
+        }
+        return .{
+            .fd = try std.posix.openat(std.posix.AT.FDCWD, path, regular_flags, 0),
+            .direct_io = false,
+        };
+    }
+
     fn create(allocator: Allocator, path: []const u8, state: *NativeStorageState, intent: Intent) !ColdSequentialReader {
         if (comptime !supports_posix_fd_cache) return error.UnsupportedNativeStorageRuntime;
 
         var permit = try state.acquireFdPermit();
         errdefer permit.release();
-        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
-            .ACCMODE = .RDONLY,
-            .CLOEXEC = true,
-        }, 0);
-        errdefer closeFd(fd);
+        const opened = try openCold(path);
+        errdefer closeFd(opened.fd);
 
         switch (builtin.os.tag) {
             .macos, .ios, .tvos, .watchos, .visionos =>
             // This descriptor is maintenance-private, so F_NOCACHE cannot
             // alter foreground query reads through the shared descriptor cache.
-            _ = std.posix.system.fcntl(fd, std.posix.F.NOCACHE, @as(usize, 1)),
-            .linux => _ = std.os.linux.fadvise(fd, 0, 0, switch (intent) {
-                .sequential => std.os.linux.POSIX_FADV.SEQUENTIAL,
-                .random => std.os.linux.POSIX_FADV.RANDOM,
-            }),
+            _ = std.posix.system.fcntl(opened.fd, std.posix.F.NOCACHE, @as(usize, 1)),
+            .linux => if (!opened.direct_io) {
+                _ = std.os.linux.fadvise(opened.fd, 0, 0, switch (intent) {
+                    .sequential => std.os.linux.POSIX_FADV.SEQUENTIAL,
+                    .random => std.os.linux.POSIX_FADV.RANDOM,
+                });
+                // Since Linux 6.3 NOREUSE tells the replacement algorithm that
+                // these pages are maintenance-only. Older kernels safely treat
+                // it as a no-op; unlike DONTNEED it cannot evict a foreground
+                // mmap of the same immutable inode.
+                _ = std.os.linux.fadvise(opened.fd, 0, 0, std.os.linux.POSIX_FADV.NOREUSE);
+            },
             else => {},
         }
 
@@ -3106,7 +3142,8 @@ const NativeColdSequentialReader = struct {
         self.* = .{
             .allocator = allocator,
             .fd_permit = permit.take(),
-            .fd = fd,
+            .fd = opened.fd,
+            .direct_io = .init(opened.direct_io),
         };
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -3125,14 +3162,74 @@ const NativeColdSequentialReader = struct {
     }
 
     fn readInto(self: *NativeColdSequentialReader, offset: u64, out: []u8) !void {
-        try readAllAtOffset(self.fd, out, offset);
-        if (builtin.os.tag == .linux) {
-            _ = std.os.linux.fadvise(self.fd, @intCast(offset), @intCast(out.len), std.os.linux.POSIX_FADV.DONTNEED);
+        if (!self.direct_io.load(.acquire)) return try readAllAtOffset(self.fd, out, offset);
+        if (out.len == 0) return;
+
+        // O_DIRECT requires aligned offsets, lengths, and destination buffers.
+        // One reusable window per descriptor keeps sparse projection reads out
+        // of the page cache without allocating per vector. Calls sharing a
+        // shard descriptor serialize only while copying through that window;
+        // distinct shards remain fully parallel.
+        const locked = lockAtomic(&self.direct_mutex);
+        defer if (locked) self.direct_mutex.unlock();
+        if (!self.direct_io.load(.acquire)) return try readAllAtOffset(self.fd, out, offset);
+        const aligned_offset = offset - (offset % direct_alignment);
+        const prefix: usize = @intCast(offset - aligned_offset);
+        const required = std.math.add(usize, prefix, out.len) catch return error.OutOfMemory;
+        const padded_required = std.math.add(usize, required, direct_alignment - 1) catch return error.OutOfMemory;
+        const aligned_len = padded_required & ~(direct_alignment - 1);
+        if (self.direct_scratch == null or self.direct_scratch.?.len < aligned_len) {
+            const replacement = try self.allocator.alignedAlloc(
+                u8,
+                .fromByteUnits(direct_alignment),
+                aligned_len,
+            );
+            if (self.direct_scratch) |scratch| self.allocator.free(scratch);
+            self.direct_scratch = replacement;
+        }
+        const scratch = self.direct_scratch.?[0..aligned_len];
+        const read_len = readAtMostAtOffset(self.fd, scratch, aligned_offset) catch |err| switch (err) {
+            error.InvalidArgument => {
+                // A filesystem may accept O_DIRECT at open but impose a larger
+                // per-inode alignment. Disable it atomically for this private
+                // descriptor and retain the one-shot buffered fallback.
+                try self.disableDirectIo();
+                self.direct_io.store(false, .release);
+                return try readAllAtOffset(self.fd, out, offset);
+            },
+            else => return err,
+        };
+        if (read_len < required) return error.EndOfStream;
+        @memcpy(out, scratch[prefix..required]);
+    }
+
+    fn disableDirectIo(self: *NativeColdSequentialReader) !void {
+        if (comptime builtin.os.tag != .linux) return;
+        var flags: usize = while (true) {
+            const rc = std.posix.system.fcntl(self.fd, std.posix.F.GETFL, @as(usize, 0));
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => break @intCast(rc),
+                .INTR => continue,
+                else => |err| return std.posix.unexpectedErrno(err),
+            }
+        };
+        flags &= ~(@as(usize, 1) << @bitOffsetOf(std.posix.O, "DIRECT"));
+        while (true) {
+            const rc = std.posix.system.fcntl(self.fd, std.posix.F.SETFL, flags);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {
+                    _ = std.os.linux.fadvise(self.fd, 0, 0, std.os.linux.POSIX_FADV.NOREUSE);
+                    return;
+                },
+                .INTR => continue,
+                else => |err| return std.posix.unexpectedErrno(err),
+            }
         }
     }
 
     fn deinitErased(ptr: *anyopaque) void {
         const self: *NativeColdSequentialReader = @ptrCast(@alignCast(ptr));
+        if (self.direct_scratch) |scratch| self.allocator.free(scratch);
         closeFd(self.fd);
         self.fd_permit.release();
         const allocator = self.allocator;

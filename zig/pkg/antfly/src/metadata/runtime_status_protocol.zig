@@ -49,6 +49,22 @@ pub fn profileSatisfies(available_version: u16, required_version: u16) bool {
     };
 }
 
+/// Returns the strongest named wire profile understood by both endpoints.
+/// Version integers identify formats; compatibility is never inferred from
+/// numeric ordering.
+pub fn greatestCommonProfile(left_version: u16, right_version: u16) ?Profile {
+    const candidates = [_]Profile{ .current, .positional, .released_v0_2_0 };
+    for (candidates) |candidate| {
+        const version = candidate.wireVersion();
+        if (profileSatisfies(left_version, version) and
+            profileSatisfies(right_version, version))
+        {
+            return candidate;
+        }
+    }
+    return null;
+}
+
 /// Facts already encoded by the positional V15 profile.
 pub const repair_status_record_version: u16 = positional_record_version;
 pub const native_restore_identity_record_version: u16 = positional_record_version;
@@ -103,6 +119,20 @@ test "runtime status exposes only released compatibility profiles" {
     try std.testing.expect(!profileSatisfies(14, 15));
     try std.testing.expect(!profileSatisfies(17, 15));
     try std.testing.expect(!profileSatisfies(15, 16));
+
+    try std.testing.expectEqual(Profile.current, greatestCommonProfile(16, 16).?);
+    try std.testing.expectEqual(Profile.positional, greatestCommonProfile(16, 15).?);
+    try std.testing.expectEqual(Profile.positional, greatestCommonProfile(15, 16).?);
+    try std.testing.expectEqual(Profile.released_v0_2_0, greatestCommonProfile(16, 12).?);
+    try std.testing.expectEqual(Profile.released_v0_2_0, greatestCommonProfile(15, 12).?);
+    try std.testing.expectEqual(@as(?Profile, null), greatestCommonProfile(16, 14));
+    try std.testing.expectEqual(@as(?Profile, null), greatestCommonProfile(17, 16));
+
+    var rolling_common = Profile.current;
+    for ([_]u16{ 16, 15, 16 }) |peer_version| {
+        rolling_common = greatestCommonProfile(rolling_common.wireVersion(), peer_version).?;
+    }
+    try std.testing.expectEqual(Profile.positional, rolling_common);
 }
 
 const std = @import("std");

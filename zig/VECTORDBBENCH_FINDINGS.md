@@ -4422,13 +4422,15 @@ cancellations, and cumulative wait time.
 The same experiment isolates full-checkpoint projection reads from query
 residency. One projection-build lifecycle pins a single exact vector generation
 at the requested source sequence for the whole posting generation. Native
-storage opens maintenance-private, FD-governed random-read descriptors; on
-macOS they use `F_NOCACHE`, and on Linux they use random advice plus per-read
-`DONTNEED`. Query mmap/descriptor policy is never changed. If a generation has
-more blocks than the private-descriptor capacity, publication retains the
-pinned-generation correctness boundary and falls back to ordinary positional
-reads. Focused tests prove descriptor accounting, byte-equivalent batched
-projection reads, FIFO/work-weighted admission, and cancelled-waiter removal.
+storage opens maintenance-private, FD-governed random-read descriptors. macOS
+uses `F_NOCACHE`; Linux now prefers `O_DIRECT` through one reusable aligned
+window per block and falls back to `NOREUSE` when the filesystem cannot honor
+direct I/O. This replaces ineffective sub-page `DONTNEED` calls and never
+evicts a foreground mmap of the same immutable inode. If a generation has more
+blocks than the private-descriptor capacity, publication retains the pinned-
+generation correctness boundary and falls back to ordinary positional reads.
+Focused tests prove descriptor accounting, byte-equivalent batched projection
+reads, FIFO/work-weighted admission, and cancelled-waiter removal.
 
 A fresh public-API 50K qualification used batch 100, four load workers, native
 HBC, float16 vector blocks, boundary rerank, and 30-second concurrency phases.
@@ -4460,6 +4462,17 @@ A restarted reverse-order 30/20/10/1 curve delivered
 is therefore 9.5 percent faster with 16.9 percent lower p95 than the uncapped
 reverse-order control (608.3 QPS / 99.54 ms). It is within 1.2 percent of
 r126's 673.7 QPS while improving on r126's 92.88-ms p95.
+
+The first governor used aggregate mean leaf occupancy, which is accurate for
+the balanced qualification build but can undercharge a skewed online tree.
+Search profiles now measure the largest posting presented to the candidate
+loop before filtering. Admission takes the maximum of aggregate mean,
+configured leaf size, an EWMA, and an immediately reacting, slowly decaying
+observed high water. It records both posting occupancy and actual per-leaf scan
+bytes, so stale-payload float32 fallback cannot be charged as RaBitQ merely
+because the index is normally quantized. The observation runs after the query
+has released its MVCC transaction and request scratch and affects only later
+permits, so it never introduces a wait while those resources are held.
 
 Candidate work and exact completion stayed unchanged at 239,918 approximate
 and 146.6 exact vectors/query. The admission gain is not a recall, routing, or

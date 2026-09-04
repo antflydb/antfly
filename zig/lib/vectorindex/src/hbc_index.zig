@@ -3553,6 +3553,15 @@ pub fn scoreLeafMembers(
     return try @This().scoreLeafMemberIds(self, txn, leaf_posting.id, leaf_posting.usesNonQuantizedPayload(), leaf_posting.hasFreshStoredPayload(), member_ids, null, null, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, true, now_fn_u64, elapsed_fn_u64);
 }
 
+fn noteLeafScanBytes(
+    profile: *search_types.SearchProfile,
+    vector_count: usize,
+    bytes_per_vector: u64,
+) void {
+    const bytes = @as(u64, @intCast(vector_count)) *| bytes_per_vector;
+    profile.max_leaf_scan_bytes = @max(profile.max_leaf_scan_bytes, bytes);
+}
+
 fn scoreLeafMemberIds(
     self: anytype,
     txn: anytype,
@@ -3577,6 +3586,10 @@ fn scoreLeafMemberIds(
 ) !void {
     const start = now_fn_u64();
     defer profile.leaf_score_ns += elapsed_fn_u64(start);
+    profile.max_leaf_vectors_considered = @max(
+        profile.max_leaf_vectors_considered,
+        @as(u64, @intCast(member_ids.len)),
+    );
     const coverage_policy = search_types.coveragePolicy(req);
     try scratch.ensureVectorFetchCapacity(self.alloc, member_ids.len);
 
@@ -3684,6 +3697,11 @@ fn scoreLeafMemberIds(
                 );
                 profile.approx_leaves_scored += 1;
                 profile.approx_vectors_scored += count;
+                noteLeafScanBytes(
+                    profile,
+                    count,
+                    std.math.divCeil(u64, @intCast(self.config.dims), 8) catch unreachable,
+                );
                 return;
             }
             const query_norm: f32 = switch (self.config.metric) {
@@ -3756,6 +3774,7 @@ fn scoreLeafMemberIds(
             }
             profile.approx_leaves_scored += 1;
             profile.approx_vectors_scored += filtered_count;
+            noteLeafScanBytes(profile, filtered_count, @as(u64, self.config.dims) *| @sizeOf(f16));
             return;
         }
     }
@@ -3797,6 +3816,11 @@ fn scoreLeafMemberIds(
                 }
             }
             profile.approx_vectors_scored += count;
+            noteLeafScanBytes(
+                profile,
+                count,
+                std.math.divCeil(u64, @intCast(self.config.dims), 8) catch unreachable,
+            );
             return;
         }
     }
@@ -3809,6 +3833,7 @@ fn scoreLeafMemberIds(
         }
     }
 
+    noteLeafScanBytes(profile, scoring_member_ids.len, @as(u64, self.config.dims) *| @sizeOf(f32));
     const fetch_member_ids = scratch.vector_ids[0..scoring_member_ids.len];
     var fetch_count: usize = 0;
     for (scoring_member_ids, 0..) |member_id, i| {

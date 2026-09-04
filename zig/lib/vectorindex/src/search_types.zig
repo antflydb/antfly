@@ -213,6 +213,13 @@ pub const SearchProfile = struct {
     approx_nodes_expanded: u64 = 0,
     approx_leaves_scored: u64 = 0,
     approx_vectors_scored: u64 = 0,
+    /// Largest posting presented to the candidate loop. This is intentionally
+    /// measured before request filtering: routing and quantized payload reads
+    /// still consume bandwidth for rejected members.
+    max_leaf_vectors_considered: u64 = 0,
+    /// Largest candidate scoring plane consumed by one leaf after its actual
+    /// encoding path (RaBitQ, float16, or float32 fallback) is known.
+    max_leaf_scan_bytes: u64 = 0,
     exact_vectors_scored: u64 = 0,
     // Leaves that fell back to exact member scoring because their quantized
     // payload was stale (payload_dirty) or absent from storage.
