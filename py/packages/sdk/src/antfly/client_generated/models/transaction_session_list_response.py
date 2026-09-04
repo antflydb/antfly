@@ -19,7 +19,7 @@ T = TypeVar("T", bound="TransactionSessionListResponse")
 class TransactionSessionListResponse:
     """
     Attributes:
-        session_count (int | Unset): Number of authorized sessions returned in this page.
+        session_count (int | Unset): Number of authorized sessions returned in this response.
         lease_held_count (int | Unset):
         lease_expired_count (int | Unset):
         sessions (list[TransactionSessionStatus] | Unset):

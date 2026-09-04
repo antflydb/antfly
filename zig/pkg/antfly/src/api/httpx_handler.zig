@@ -3331,10 +3331,23 @@ pub const AntflyApiHandler = struct {
         }
     }
 
-    pub fn listTransactionSessions(
+    pub fn listTransactionSessions(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = self.api_server.alloc;
+        const sessions = try self.api_server.listAuthorizedTransactionSessions(authenticated_identity);
+        defer alloc.free(sessions);
+        var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena_impl.deinit();
+        const response = try transactions_api.buildSessionListResponse(arena_impl.allocator(), sessions);
+        return ctx.openApiJson(response);
+    }
+
+    pub fn listTransactionSessionInventory(
         self: *AntflyApiHandler,
         ctx: *httpx.Context,
-        params: metadata_openapi.server.ListTransactionSessionsParams,
+        params: metadata_openapi.server.ListTransactionSessionInventoryParams,
     ) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -5124,7 +5137,13 @@ pub const AntflyApiHandler = struct {
                 error.SessionLimitExceeded, error.SessionCapacityUnavailable => {
                     if (!attempted_capacity_reclaim) {
                         attempted_capacity_reclaim = true;
-                        if (try self.api_server.reclaimExpiredReceiptCapacity() > 0) continue;
+                        _ = self.api_server.reclaimExpiredReceiptCapacity(ctx.io) catch |cleanup_err| {
+                            // Reclamation is opportunistic and did not create
+                            // this receipt. Preserve the typed capacity result,
+                            // but retry once in case another caller freed space.
+                            std.log.warn("idempotent receipt admission cleanup failed err={s}", .{@errorName(cleanup_err)});
+                        };
+                        continue;
                     }
                     return try idempotentBatchError(ctx, 429, "unknown", "idempotency_capacity_exhausted", "durable idempotency capacity is exhausted; retry the same Idempotency-Key", true, &txn_hex);
                 },
@@ -9904,7 +9923,7 @@ test "httpx idempotent batch reclaims expired receipt capacity before rejecting 
         .session_ttl_ns = 10 * std.time.ns_per_ms,
         .session_receipt_ttl_ns = 10 * std.time.ns_per_ms,
         .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
-        .session_cleanup_max_records = 1,
+        .session_admission_cleanup_max_records = 1,
         .session_max_receipt_count = 1,
         .backend_runtime = &runtime,
     }, source.iface(), null, writes.source());

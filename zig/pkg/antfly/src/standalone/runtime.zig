@@ -70,6 +70,8 @@ const standalone_session_ttl_ns: u64 = std.time.ns_per_hour;
 const standalone_session_receipt_ttl_ns: u64 = std.time.ns_per_hour;
 const standalone_session_cleanup_interval_ns: u64 = std.time.ns_per_min;
 const standalone_session_cleanup_max_records: usize = 4096;
+const standalone_session_admission_cleanup_max_records: usize = 32;
+const standalone_session_admission_cleanup_budget_ns: u64 = 25 * std.time.ns_per_ms;
 const standalone_session_max_count: usize = 1024;
 const standalone_session_max_receipt_count: usize = 65536;
 const standalone_session_max_receipt_bytes: usize = 512 * 1024 * 1024;
@@ -2376,6 +2378,8 @@ pub fn runFromIterator(
             .session_receipt_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.receipt_ttl_seconds * std.time.ns_per_s else standalone_session_receipt_ttl_ns,
             .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,
             .session_cleanup_max_records = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_max_records else standalone_session_cleanup_max_records,
+            .session_admission_cleanup_max_records = if (loaded_config) |*cfg| cfg.transaction_sessions.admission_cleanup_max_records else standalone_session_admission_cleanup_max_records,
+            .session_admission_cleanup_budget_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.admission_cleanup_budget_ms * std.time.ns_per_ms else standalone_session_admission_cleanup_budget_ns,
             .session_max_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_count else standalone_session_max_count,
             .session_max_receipt_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_receipt_count else standalone_session_max_receipt_count,
             .session_max_receipt_bytes = if (loaded_config) |*cfg| cfg.transaction_sessions.max_receipt_bytes else standalone_session_max_receipt_bytes,

@@ -11656,7 +11656,7 @@ pub const TransactionSessionDetailsResponse = struct {
 };
 
 pub const TransactionSessionListResponse = struct {
-    /// Number of authorized sessions returned in this page.
+    /// Number of authorized sessions returned in this response.
     session_count: ?i64 = null,
     lease_held_count: ?i64 = null,
     lease_expired_count: ?i64 = null,

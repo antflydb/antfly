@@ -2601,6 +2601,28 @@ paths:
       tags:
         - data_operations
       operationId: listTransactionSessions
+      deprecated: true
+      description: Compatibility view of all authorized live interactive transaction sessions. Retained
+        idempotency receipts are available through the bounded transaction-session inventory endpoint.
+      responses:
+        '200':
+          description: Active interactive transaction sessions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSessionListResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/transactions/inventory:
+    get:
+      summary: List the bounded transaction-session inventory
+      tags:
+        - data_operations
+      operationId: listTransactionSessionInventory
       parameters:
         - name: limit
           in: query
@@ -2619,7 +2641,7 @@ paths:
             type: string
       responses:
         '200':
-          description: Active transaction sessions
+          description: Active sessions and retained idempotency receipts
           content:
             application/json:
               schema:
@@ -12673,7 +12695,7 @@ components:
       properties:
         session_count:
           type: integer
-          description: Number of authorized sessions returned in this page.
+          description: Number of authorized sessions returned in this response.
         lease_held_count:
           type: integer
         lease_expired_count:

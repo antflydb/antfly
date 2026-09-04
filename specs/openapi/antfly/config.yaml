@@ -1046,7 +1046,19 @@ components:
           minimum: 1
           maximum: 1048576
           default: 4096
-          description: Maximum expired transaction sessions reclaimed by one scheduled or admission-time cleanup pass.
+          description: Maximum expired transaction sessions reclaimed by one scheduled cleanup pass.
+        admission_cleanup_max_records:
+          type: integer
+          minimum: 1
+          maximum: 1024
+          default: 32
+          description: Maximum expired idempotency receipts considered by one capacity-admission cleanup pass.
+        admission_cleanup_budget_ms:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 25
+          description: Monotonic wall-time budget for one capacity-admission cleanup pass.
         max_count:
           type: integer
           minimum: 1

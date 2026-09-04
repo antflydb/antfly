@@ -97,6 +97,7 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "reauthorizeTableDestinations", .class = .none },
     .{ .operation_id = "updateSchema", .class = .none },
     .{ .operation_id = "listTransactionSessions", .class = .none },
+    .{ .operation_id = "listTransactionSessionInventory", .class = .none },
     .{ .operation_id = "beginTransaction", .class = .none },
     .{ .operation_id = "cleanupTransactionSessions", .class = .none },
     .{ .operation_id = "commitTransaction", .class = .write },

@@ -5955,6 +5955,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_session_maintenance_test_mod,
         .filters = &.{
             "durable session mutations publish only after persistence succeeds",
+            "session publication reservations accumulate across durable IO gaps",
             "cluster shared session capacity is enforced by the durable create transaction",
             "node local leased session capacity uses the reserved durable count",
             "receipt capacity is independent and uses one atomic ledger bootstrap",

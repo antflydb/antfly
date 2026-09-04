@@ -463,13 +463,6 @@ pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !st
     return std.json.parseFromSlice(antfly_schema_openapi.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-pub const ListTransactionSessionsParams = struct {
-    /// Maximum number of principal-owned session records scanned for this page.
-    limit: ?[]const u8 = null,
-    /// Opaque cursor returned by the previous page.
-    cursor: ?[]const u8 = null,
-};
-
 /// Parse the JSON request body for beginTransaction.
 pub fn parseBeginTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionBeginRequest) {
     return std.json.parseFromSlice(types.TransactionBeginRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -483,6 +476,13 @@ pub const CleanupTransactionSessionsParams = struct {
 pub fn parseCommitTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
     return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
+
+pub const ListTransactionSessionInventoryParams = struct {
+    /// Maximum number of principal-owned session records scanned for this page.
+    limit: ?[]const u8 = null,
+    /// Opaque cursor returned by the previous page.
+    cursor: ?[]const u8 = null,
+};
 
 /// Get transaction session details
 pub const GetTransactionSessionPathParams = struct {
@@ -624,6 +624,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/transactions/begin", .operation_id = "beginTransaction", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/commit", .operation_id = "commitTransaction", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/transactions/inventory", .operation_id = "listTransactionSessionInventory", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/transactions/{transaction_id}", .operation_id = "getTransactionSession", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/{transaction_id}/abort", .operation_id = "abortTransactionSession", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/{transaction_id}/commit", .operation_id = "commitTransactionSession", .request_body = .buffered, .streaming_response = false },
@@ -703,6 +704,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "beginTransaction")) @compileError("ServerRouter: Impl missing required method 'beginTransaction'");
         if (!@hasDecl(Impl, "cleanupTransactionSessions")) @compileError("ServerRouter: Impl missing required method 'cleanupTransactionSessions'");
         if (!@hasDecl(Impl, "commitTransaction")) @compileError("ServerRouter: Impl missing required method 'commitTransaction'");
+        if (!@hasDecl(Impl, "listTransactionSessionInventory")) @compileError("ServerRouter: Impl missing required method 'listTransactionSessionInventory'");
         if (!@hasDecl(Impl, "getTransactionSession")) @compileError("ServerRouter: Impl missing required method 'getTransactionSession'");
         if (!@hasDecl(Impl, "abortTransactionSession")) @compileError("ServerRouter: Impl missing required method 'abortTransactionSession'");
         if (!@hasDecl(Impl, "commitTransactionSession")) @compileError("ServerRouter: Impl missing required method 'commitTransactionSession'");
@@ -780,6 +782,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/transactions/begin", httpx.Handler.bind(self.impl, beginTransaction));
             try server.post("/transactions/cleanup", httpx.Handler.bind(self.impl, cleanupTransactionSessions));
             try server.post("/transactions/commit", httpx.Handler.bind(self.impl, commitTransaction));
+            try server.get("/transactions/inventory", httpx.Handler.bind(self.impl, listTransactionSessionInventory));
             try server.get("/transactions/:transaction_id", httpx.Handler.bind(self.impl, getTransactionSession));
             try server.post("/transactions/:transaction_id/abort", httpx.Handler.bind(self.impl, abortTransactionSession));
             try server.post("/transactions/:transaction_id/commit", httpx.Handler.bind(self.impl, commitTransactionSession));
@@ -1205,11 +1208,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// List transaction sessions
         /// GET /transactions
         fn listTransactionSessions(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            const query_params = ListTransactionSessionsParams{
-                .limit = try ctx.queryDecoded("limit"),
-                .cursor = try ctx.queryDecoded("cursor"),
-            };
-            return impl.listTransactionSessions(ctx, query_params);
+            return impl.listTransactionSessions(ctx);
         }
 
         /// Begin a transaction session
@@ -1231,6 +1230,16 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /transactions/commit
         fn commitTransaction(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.commitTransaction(ctx);
+        }
+
+        /// List the bounded transaction-session inventory
+        /// GET /transactions/inventory
+        fn listTransactionSessionInventory(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const query_params = ListTransactionSessionInventoryParams{
+                .limit = try ctx.queryDecoded("limit"),
+                .cursor = try ctx.queryDecoded("cursor"),
+            };
+            return impl.listTransactionSessionInventory(ctx, query_params);
         }
 
         /// Get transaction session details
@@ -1354,10 +1363,11 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context, params: ListTransactionSessionsParams) !httpx.Response
+//   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn beginTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response
 //   fn commitTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listTransactionSessionInventory(self: *Impl, ctx: *httpx.Context, params: ListTransactionSessionInventoryParams) !httpx.Response
 //   fn getTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
 //   fn abortTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
 //   fn commitTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response

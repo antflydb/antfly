@@ -1711,8 +1711,12 @@ pub const TransactionSessionConfig = struct {
     /// Retention window for compact terminal idempotency receipts.
     receipt_ttl_seconds: ?i64 = null,
     cleanup_interval_seconds: ?i64 = null,
-    /// Maximum expired transaction sessions reclaimed by one scheduled or admission-time cleanup pass.
+    /// Maximum expired transaction sessions reclaimed by one scheduled cleanup pass.
     cleanup_max_records: ?i64 = null,
+    /// Maximum expired idempotency receipts considered by one capacity-admission cleanup pass.
+    admission_cleanup_max_records: ?i64 = null,
+    /// Monotonic wall-time budget for one capacity-admission cleanup pass.
+    admission_cleanup_budget_ms: ?i64 = null,
     max_count: ?i64 = null,
     /// Independent count budget for pending and retained idempotency receipts.
     max_receipt_count: ?i64 = null,
@@ -1727,6 +1731,8 @@ pub const TransactionSessionConfig = struct {
         .{ "receipt_ttl_seconds", "receipt_ttl_seconds", true },
         .{ "cleanup_interval_seconds", "cleanup_interval_seconds", true },
         .{ "cleanup_max_records", "cleanup_max_records", true },
+        .{ "admission_cleanup_max_records", "admission_cleanup_max_records", true },
+        .{ "admission_cleanup_budget_ms", "admission_cleanup_budget_ms", true },
         .{ "max_count", "max_count", true },
         .{ "max_receipt_count", "max_receipt_count", true },
         .{ "max_receipt_bytes", "max_receipt_bytes", true },
@@ -1758,6 +1764,14 @@ pub const TransactionSessionConfig = struct {
         }
         if (self.cleanup_max_records) |value| {
             try jw.objectField("cleanup_max_records");
+            try jw.write(value);
+        }
+        if (self.admission_cleanup_max_records) |value| {
+            try jw.objectField("admission_cleanup_max_records");
+            try jw.write(value);
+        }
+        if (self.admission_cleanup_budget_ms) |value| {
+            try jw.objectField("admission_cleanup_budget_ms");
             try jw.write(value);
         }
         if (self.max_count) |value| {

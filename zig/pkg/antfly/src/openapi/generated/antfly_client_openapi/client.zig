@@ -96,15 +96,15 @@ pub const GetDocumentArtifactManifestParams = struct {
     detail: ?[]const u8 = null,
 };
 
-pub const ListTransactionSessionsParams = struct {
+pub const CleanupTransactionSessionsParams = struct {
+    cutoff_ns: ?[]const u8 = null,
+};
+
+pub const ListTransactionSessionInventoryParams = struct {
     /// Maximum number of principal-owned session records scanned for this page.
     limit: ?[]const u8 = null,
     /// Opaque cursor returned by the previous page.
     cursor: ?[]const u8 = null,
-};
-
-pub const CleanupTransactionSessionsParams = struct {
-    cutoff_ns: ?[]const u8 = null,
 };
 
 /// Raw HTTP response for streaming/binary endpoints.
@@ -1476,33 +1476,9 @@ pub const Client = struct {
 
     /// List transaction sessions
     /// GET /db/v1/transactions
-    pub fn listTransactionSessions(self: *@This(), params: ListTransactionSessionsParams) !ApiResponse(types.TransactionSessionListResponse) {
-        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions", .{self.base_url});
+    pub fn listTransactionSessions(self: *@This()) !ApiResponse(types.TransactionSessionListResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions", .{self.base_url});
         defer self.allocator.free(url);
-        var query_buf = std.ArrayListUnmanaged(u8).empty;
-        defer query_buf.deinit(self.allocator);
-        var sep: u8 = '?';
-        if (params.limit) |v| {
-            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
-            defer self.allocator.free(encoded_query_value);
-            try query_buf.appendSlice(self.allocator, &.{sep});
-            try query_buf.appendSlice(self.allocator, "limit=");
-            try query_buf.appendSlice(self.allocator, encoded_query_value);
-            sep = '&';
-        }
-        if (params.cursor) |v| {
-            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
-            defer self.allocator.free(encoded_query_value);
-            try query_buf.appendSlice(self.allocator, &.{sep});
-            try query_buf.appendSlice(self.allocator, "cursor=");
-            try query_buf.appendSlice(self.allocator, encoded_query_value);
-            sep = '&';
-        }
-        if (query_buf.items.len > 0) {
-            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
-            self.allocator.free(url);
-            url = new_url;
-        }
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.TransactionSessionListResponse).fromResponse(self.allocator, &resp);
     }
@@ -1555,6 +1531,39 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.TransactionCommitResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// List the bounded transaction-session inventory
+    /// GET /db/v1/transactions/inventory
+    pub fn listTransactionSessionInventory(self: *@This(), params: ListTransactionSessionInventoryParams) !ApiResponse(types.TransactionSessionListResponse) {
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/inventory", .{self.base_url});
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TransactionSessionListResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Get transaction session details

@@ -649,13 +649,6 @@ pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !st
     return std.json.parseFromSlice(antfly_schema_openapi.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-pub const ListTransactionSessionsParams = struct {
-    /// Maximum number of principal-owned session records scanned for this page.
-    limit: ?[]const u8 = null,
-    /// Opaque cursor returned by the previous page.
-    cursor: ?[]const u8 = null,
-};
-
 /// Parse the JSON request body for beginTransaction.
 pub fn parseBeginTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionBeginRequest) {
     return std.json.parseFromSlice(types.TransactionBeginRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -669,6 +662,13 @@ pub const CleanupTransactionSessionsParams = struct {
 pub fn parseCommitTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
     return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
+
+pub const ListTransactionSessionInventoryParams = struct {
+    /// Maximum number of principal-owned session records scanned for this page.
+    limit: ?[]const u8 = null,
+    /// Opaque cursor returned by the previous page.
+    cursor: ?[]const u8 = null,
+};
 
 /// Get transaction session details
 pub const GetTransactionSessionPathParams = struct {
@@ -834,6 +834,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/transactions/begin", .operation_id = "beginTransaction", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/commit", .operation_id = "commitTransaction", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/transactions/inventory", .operation_id = "listTransactionSessionInventory", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/transactions/{transaction_id}", .operation_id = "getTransactionSession", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/{transaction_id}/abort", .operation_id = "abortTransactionSession", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/{transaction_id}/commit", .operation_id = "commitTransactionSession", .request_body = .buffered, .streaming_response = false },
@@ -924,10 +925,11 @@ pub const routes = [_]Route{
 //   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context, params: ListTransactionSessionsParams) !httpx.Response
+//   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn beginTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response
 //   fn commitTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listTransactionSessionInventory(self: *Impl, ctx: *httpx.Context, params: ListTransactionSessionInventoryParams) !httpx.Response
 //   fn getTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
 //   fn abortTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
 //   fn commitTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response

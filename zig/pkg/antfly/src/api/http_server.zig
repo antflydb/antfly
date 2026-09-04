@@ -1104,6 +1104,8 @@ pub const ApiHttpServerConfig = struct {
     session_receipt_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
     session_cleanup_max_records: usize = 4096,
+    session_admission_cleanup_max_records: usize = 32,
+    session_admission_cleanup_budget_ns: u64 = 25 * std.time.ns_per_ms,
     session_owner_lease_ttl_ns: ?u64 = null,
     session_owner_lease_renew_interval_ns: ?u64 = null,
     session_savepoint_limit: ?usize = null,
@@ -2664,6 +2666,7 @@ pub const ApiHttpServer = struct {
     owned_foreign_registry: ?*foreign_mod.Registry = null,
     txn_sessions: transactions_api.SessionRegistry = .{},
     last_session_cleanup_ns: std.atomic.Value(u64) = .init(0),
+    receipt_admission_cleanup_mutex: std.atomic.Mutex = .unlocked,
     last_session_lease_renew_ns: std.atomic.Value(u64) = .init(0),
     last_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
     created_at_ns: u64 = 0,
@@ -6870,16 +6873,27 @@ pub const ApiHttpServer = struct {
 
     /// Capacity rejection is often caused by receipts that have already
     /// crossed their retention boundary but have not reached the periodic
-    /// reaper yet. Reclaim a bounded page synchronously before returning 429.
-    pub fn reclaimExpiredReceiptCapacity(self: *ApiHttpServer) !usize {
+    /// reaper yet. Concurrent callers coalesce behind one short, bounded pass;
+    /// followers wait for that pass and retry admission without repeating the
+    /// same storage scan.
+    pub fn reclaimExpiredReceiptCapacity(self: *ApiHttpServer, io: std.Io) !usize {
+        if (!self.receipt_admission_cleanup_mutex.tryLock()) {
+            platform_sync.lockYieldingIo(&self.receipt_admission_cleanup_mutex, io);
+            self.receipt_admission_cleanup_mutex.unlock();
+            return 0;
+        }
+        defer self.receipt_admission_cleanup_mutex.unlock();
+
         const ttl_ns = self.cfg.session_ttl_ns orelse return 0;
         const receipt_ttl_ns = self.cfg.session_receipt_ttl_ns orelse ttl_ns;
         const now_ns = platform_time.realtimeNs();
-        return try self.txn_sessions.cleanupExpiredWithCutoffsLimit(
+        const deadline_ns = platform_time.monotonicNs() +| self.cfg.session_admission_cleanup_budget_ns;
+        return try self.txn_sessions.cleanupExpiredWithCutoffsBudget(
             self.alloc,
             0,
             now_ns -| receipt_ttl_ns,
-            self.cfg.session_cleanup_max_records,
+            self.cfg.session_admission_cleanup_max_records,
+            deadline_ns,
         );
     }
 
@@ -10374,6 +10388,27 @@ pub const ApiHttpServer = struct {
         sessions: []transactions_api.SessionStatus,
         next_cursor: ?transactions_api.SessionListCursor,
     };
+
+    /// Preserves the original `/transactions` contract: all authorized live
+    /// interactive sessions, without retained idempotency receipts. New code
+    /// should use the explicitly bounded inventory endpoint below.
+    pub fn listAuthorizedTransactionSessions(
+        self: *ApiHttpServer,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) ![]transactions_api.SessionStatus {
+        const candidates = try self.txn_sessions.listInteractiveStatusesForPrincipal(
+            self.alloc,
+            transactionPrincipal(authenticated_identity),
+        );
+        defer self.alloc.free(candidates);
+        var authorized = std.ArrayListUnmanaged(transactions_api.SessionStatus).empty;
+        errdefer authorized.deinit(self.alloc);
+        for (candidates) |status| {
+            if (try self.transactionSessionAccessible(status.txn_id, authenticated_identity))
+                try authorized.append(self.alloc, status);
+        }
+        return try authorized.toOwnedSlice(self.alloc);
+    }
 
     pub fn listAuthorizedTransactionSessionsPage(
         self: *ApiHttpServer,
@@ -32798,7 +32833,7 @@ test "api http server paginates transaction session inventory" {
 
     var first = try executeHttpxTestRequest(&server, .{
         .method = .GET,
-        .uri = "/transactions?limit=2",
+        .uri = "/transactions/inventory?limit=2",
     });
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), first.status);
@@ -32807,7 +32842,7 @@ test "api http server paginates transaction session inventory" {
     try std.testing.expectEqual(@as(usize, 2), first_page.value.session_count);
     try std.testing.expect(first_page.value.next_cursor != null);
 
-    const next_uri = try std.fmt.allocPrint(alloc, "/transactions?limit=2&cursor={s}", .{first_page.value.next_cursor.?});
+    const next_uri = try std.fmt.allocPrint(alloc, "/transactions/inventory?limit=2&cursor={s}", .{first_page.value.next_cursor.?});
     defer alloc.free(next_uri);
     var second = try executeHttpxTestRequest(&server, .{
         .method = .GET,

@@ -218,8 +218,29 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List transaction sessions */
+        /**
+         * List transaction sessions
+         * @deprecated
+         * @description Compatibility view of all authorized live interactive transaction sessions. Retained idempotency receipts are available through the bounded transaction-session inventory endpoint.
+         */
         get: operations["listTransactionSessions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/transactions/inventory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the bounded transaction-session inventory */
+        get: operations["listTransactionSessionInventory"];
         put?: never;
         post?: never;
         delete?: never;
@@ -5531,7 +5552,7 @@ export interface components {
             savepoint_ids?: number[];
         };
         TransactionSessionListResponse: {
-            /** @description Number of authorized sessions returned in this page. */
+            /** @description Number of authorized sessions returned in this response. */
             session_count?: number;
             lease_held_count?: number;
             lease_expired_count?: number;
@@ -15714,6 +15735,27 @@ export interface operations {
     };
     listTransactionSessions: {
         parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Active interactive transaction sessions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TransactionSessionListResponse"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listTransactionSessionInventory: {
+        parameters: {
             query?: {
                 /** @description Maximum number of principal-owned session records scanned for this page. */
                 limit?: number;
@@ -15726,7 +15768,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Active transaction sessions */
+            /** @description Active sessions and retained idempotency receipts */
             200: {
                 headers: {
                     [name: string]: unknown;

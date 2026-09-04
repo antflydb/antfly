@@ -2034,6 +2034,12 @@ pub const SessionRegistry = struct {
     owner_incarnation: u64 = 0,
     known_durable_session_count: ?usize = null,
     reserved_session_count: usize = 0,
+    /// Hash-map capacity reserved by sessions whose durable creation is in
+    /// flight. `ensureUnusedCapacity(1)` alone is not a reservation: multiple
+    /// writers can otherwise all observe and consume the same spare slot
+    /// before publishing with `putAssumeCapacity`.
+    pending_session_publications: u32 = 0,
+    pending_lease_publications: u32 = 0,
     recovery_index_cursors: [2]?db_mod.types.TxnId = .{ null, null },
     recovery_audit_cursors: [2]?db_mod.types.TxnId = .{ null, null },
     recovery_namespace_cursor: SessionKind = .interactive,
@@ -2141,11 +2147,8 @@ pub const SessionRegistry = struct {
             self.mutex.unlock();
             return err;
         };
-        self.sessions.ensureUnusedCapacity(alloc, 1) catch |err| {
-            self.mutex.unlock();
-            return err;
-        };
-        if (self.shouldTrackLeaseRenewal(session)) self.lease_renewal_candidates.ensureUnusedCapacity(alloc, 1) catch |err| {
+        const track_lease = self.shouldTrackLeaseRenewal(session);
+        self.reserveSessionPublicationLocked(alloc, track_lease) catch |err| {
             self.mutex.unlock();
             return err;
         };
@@ -2155,6 +2158,7 @@ pub const SessionRegistry = struct {
         defer if (reservation_active) {
             self.mutex.lock();
             self.reserved_session_count -= 1;
+            self.releaseSessionPublicationLocked(track_lease);
             self.mutex.unlock();
         };
         if (self.durable != null and self.lease_store != null and self.owner_lease_ttl_ns != null) {
@@ -2172,8 +2176,9 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.sessions.putAssumeCapacity(txn_id, session);
-        if (self.shouldTrackLeaseRenewal(session))
+        if (track_lease)
             self.lease_renewal_candidates.putAssumeCapacity(txn_id, sessionKind(session));
+        self.releaseSessionPublicationLocked(track_lease);
         session_owned = false;
         self.reserved_session_count -= 1;
         reservation_active = false;
@@ -2232,15 +2237,18 @@ pub const SessionRegistry = struct {
         session.staged = try sealed_request.clone(alloc);
 
         self.mutex.lock();
-        self.sessions.ensureUnusedCapacity(alloc, 1) catch |err| {
-            self.mutex.unlock();
-            return err;
-        };
-        if (self.shouldTrackLeaseRenewal(session)) self.lease_renewal_candidates.ensureUnusedCapacity(alloc, 1) catch |err| {
+        const track_lease = self.shouldTrackLeaseRenewal(session);
+        self.reserveSessionPublicationLocked(alloc, track_lease) catch |err| {
             self.mutex.unlock();
             return err;
         };
         self.mutex.unlock();
+        var publication_reserved = true;
+        defer if (publication_reserved) {
+            self.mutex.lock();
+            self.releaseSessionPublicationLocked(track_lease);
+            self.mutex.unlock();
+        };
 
         if (self.durable != null and self.lease_store != null and self.owner_lease_ttl_ns != null) {
             const ttl_ms = sessionLeaseStorageTtlMs(self.owner_lease_ttl_ns.?);
@@ -2271,11 +2279,37 @@ pub const SessionRegistry = struct {
 
         self.mutex.lock();
         self.sessions.putAssumeCapacity(txn_id, session);
-        if (self.shouldTrackLeaseRenewal(session))
+        if (track_lease)
             self.lease_renewal_candidates.putAssumeCapacity(txn_id, sessionKind(session));
+        self.releaseSessionPublicationLocked(track_lease);
         self.mutex.unlock();
+        publication_reserved = false;
         session_owned = false;
         return session.info();
+    }
+
+    /// Reserves actual insertion headroom across the durable write performed
+    /// without `mutex`. Repeated `ensureUnusedCapacity(1)` calls do not
+    /// accumulate reservations, so the in-flight counts must be included.
+    fn reserveSessionPublicationLocked(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        track_lease: bool,
+    ) !void {
+        try self.sessions.ensureUnusedCapacity(alloc, self.pending_session_publications + 1);
+        if (track_lease)
+            try self.lease_renewal_candidates.ensureUnusedCapacity(alloc, self.pending_lease_publications + 1);
+        self.pending_session_publications += 1;
+        if (track_lease) self.pending_lease_publications += 1;
+    }
+
+    fn releaseSessionPublicationLocked(self: *SessionRegistry, track_lease: bool) void {
+        std.debug.assert(self.pending_session_publications > 0);
+        self.pending_session_publications -= 1;
+        if (track_lease) {
+            std.debug.assert(self.pending_lease_publications > 0);
+            self.pending_lease_publications -= 1;
+        }
     }
 
     pub const PrincipalAccess = enum {
@@ -3138,7 +3172,7 @@ pub const SessionRegistry = struct {
     }
 
     pub fn listStatuses(self: *SessionRegistry, alloc: std.mem.Allocator) ![]SessionStatus {
-        return try self.listStatusesFiltered(alloc, .all);
+        return try self.listStatusesFiltered(alloc, .all, null);
     }
 
     pub fn listStatusesForPrincipal(
@@ -3146,7 +3180,18 @@ pub const SessionRegistry = struct {
         alloc: std.mem.Allocator,
         principal: ?[]const u8,
     ) ![]SessionStatus {
-        return try self.listStatusesFiltered(alloc, .{ .principal = principal });
+        return try self.listStatusesFiltered(alloc, .{ .principal = principal }, null);
+    }
+
+    /// Compatibility inventory for the original transaction-session endpoint.
+    /// Idempotency receipts live in a separate namespace and are exposed only
+    /// by the explicitly paginated inventory operation.
+    pub fn listInteractiveStatusesForPrincipal(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        principal: ?[]const u8,
+    ) ![]SessionStatus {
+        return try self.listStatusesFiltered(alloc, .{ .principal = principal }, .interactive);
     }
 
     const StatusPrincipalFilter = union(enum) {
@@ -3158,6 +3203,7 @@ pub const SessionRegistry = struct {
         self: *SessionRegistry,
         alloc: std.mem.Allocator,
         principal_filter: StatusPrincipalFilter,
+        kind_filter: ?SessionKind,
     ) ![]SessionStatus {
         var statuses = std.ArrayListUnmanaged(SessionStatus).empty;
         errdefer statuses.deinit(alloc);
@@ -3200,6 +3246,7 @@ pub const SessionRegistry = struct {
                 .principal_filter = principal_filter,
             };
             for ([_]SessionKind{ .interactive, .idempotent_receipt }) |kind| {
+                if (kind_filter) |required| if (kind != required) continue;
                 scan.kind = kind;
                 scan.prefix = sessionPrefix(kind);
                 try durable.scanPrefixWithContext(scan.prefix, &scan, Scan.visit);
@@ -3215,6 +3262,7 @@ pub const SessionRegistry = struct {
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             const session = entry.value_ptr.*;
+            if (kind_filter) |required| if (sessionKind(session) != required) continue;
             switch (principal_filter) {
                 .all => {},
                 .principal => |principal| if (!principalsEqual(session.principal, principal)) continue,
@@ -3345,6 +3393,24 @@ pub const SessionRegistry = struct {
         );
     }
 
+    pub fn cleanupExpiredWithCutoffsBudget(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        interactive_cutoff_ns: u64,
+        receipt_cutoff_ns: u64,
+        scan_limit: usize,
+        monotonic_deadline_ns: u64,
+    ) !usize {
+        return try self.cleanupExpiredAtLimitDeadline(
+            alloc,
+            interactive_cutoff_ns,
+            receipt_cutoff_ns,
+            nextTxnTimestamp(),
+            scan_limit,
+            monotonic_deadline_ns,
+        );
+    }
+
     fn cleanupExpiredWithCutoffsAt(
         self: *SessionRegistry,
         alloc: std.mem.Allocator,
@@ -3362,6 +3428,25 @@ pub const SessionRegistry = struct {
         receipt_cutoff_ns: u64,
         now_ns: u64,
         scan_limit: usize,
+    ) !usize {
+        return try self.cleanupExpiredAtLimitDeadline(
+            alloc,
+            interactive_cutoff_ns,
+            receipt_cutoff_ns,
+            now_ns,
+            scan_limit,
+            null,
+        );
+    }
+
+    fn cleanupExpiredAtLimitDeadline(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        interactive_cutoff_ns: u64,
+        receipt_cutoff_ns: u64,
+        now_ns: u64,
+        scan_limit: usize,
+        monotonic_deadline_ns: ?u64,
     ) !usize {
         var expired_ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         defer expired_ids.deinit(alloc);
@@ -3403,6 +3488,8 @@ pub const SessionRegistry = struct {
 
         var removed_count: usize = 0;
         for (expired_ids.items) |txn_id| {
+            if (monotonic_deadline_ns) |deadline_ns|
+                if (platform_time.monotonicNs() >= deadline_ns) break;
             const session_lock = self.sessionLock(txn_id);
             session_lock.lock();
             defer session_lock.unlock();
@@ -7056,6 +7143,37 @@ test "durable session limits bound count and encoded record size" {
     try std.testing.expectEqual(@as(usize, 0), small_registry.sessions.count());
 }
 
+test "session publication reservations accumulate across durable IO gaps" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+
+    registry.mutex.lock();
+    defer registry.mutex.unlock();
+    for (0..16) |_| try registry.reserveSessionPublicationLocked(alloc, true);
+    try std.testing.expectEqual(@as(u32, 16), registry.pending_session_publications);
+    try std.testing.expectEqual(@as(u32, 16), registry.pending_lease_publications);
+
+    for (0..16) |i| {
+        var txn_id = [_]u8{0} ** @sizeOf(db_mod.types.TxnId);
+        txn_id[txn_id.len - 1] = @intCast(i + 1);
+        const session: Session = .{
+            .txn_id = txn_id,
+            .owner_node_id = 1,
+            .begin_timestamp = @intCast(i + 1),
+            .last_touched_timestamp = @intCast(i + 1),
+            .sync_level = .write,
+        };
+        registry.sessions.putAssumeCapacity(txn_id, session);
+        registry.lease_renewal_candidates.putAssumeCapacity(txn_id, .interactive);
+        registry.releaseSessionPublicationLocked(true);
+    }
+    try std.testing.expectEqual(@as(u32, 0), registry.pending_session_publications);
+    try std.testing.expectEqual(@as(u32, 0), registry.pending_lease_publications);
+    try std.testing.expectEqual(@as(usize, 16), registry.sessions.count());
+    try std.testing.expectEqual(@as(usize, 16), registry.lease_renewal_candidates.count());
+}
+
 test "cluster shared session capacity is enforced by the durable create transaction" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7961,6 +8079,10 @@ test "transaction session inventory cursor traverses durable namespaces without 
     defer alice_second.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), alice_second.sessions.len);
     try std.testing.expect(alice_second.next_cursor == null);
+
+    const alice_compat = try registry.listInteractiveStatusesForPrincipal(alloc, "alice");
+    defer alloc.free(alice_compat);
+    try std.testing.expectEqual(@as(usize, 0), alice_compat.len);
 }
 
 test "session cleanup response encodes removed count and cutoff" {
@@ -8254,6 +8376,13 @@ test "interactive sessions and compact receipts have independent retention cutof
     _ = (try registry.recordIdempotentPreExecutionRejection(alloc, receipt_id, "table_not_found", "table not found")).?;
     registry.sessions.getPtr(interactive.txn_id).?.last_touched_timestamp = 1;
     registry.sessions.getPtr(receipt_id).?.last_touched_timestamp = 1;
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try registry.cleanupExpiredWithCutoffsBudget(alloc, 2, 2, 2, 0),
+    );
+    try std.testing.expect(registry.getInfo(interactive.txn_id) != null);
+    try std.testing.expect(registry.getInfo(receipt_id) != null);
 
     try std.testing.expectEqual(@as(usize, 1), try registry.cleanupExpiredWithCutoffs(alloc, 2, 0));
     try std.testing.expect(registry.getInfo(interactive.txn_id) == null);
