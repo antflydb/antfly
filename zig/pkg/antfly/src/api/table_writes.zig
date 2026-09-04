@@ -14994,7 +14994,8 @@ pub const ProvisionedTableWriteSource = struct {
         defer io_impl.deinit();
         Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
         defer Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
-        const maintenance_deadline_ns = platform_time.monotonicNs() +| std.time.ns_per_s;
+        const maintenance_clock = db.backend_runtime.monotonicClock();
+        const maintenance_deadline_ns = maintenance_clock.nowRealtimeNs() +| std.time.ns_per_s;
         _ = db.snapshotHASeed(snapshot_token, maintenance_deadline_ns) catch |err| switch (err) {
             error.EnrichmentWaitCanceled,
             error.EnrichmentWaitTimeout,

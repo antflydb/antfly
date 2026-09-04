@@ -18718,9 +18718,11 @@ pub const DB = struct {
                 // reconciliation round trip, while waiting after the global
                 // barrier closes would deadlock its eventual publication.
                 error.EnrichmentRetryInProgress => {
-                    const now_ns = platform_time.monotonicNs();
+                    const wait_clock = self.backend_runtime.monotonicClock();
+                    const now_ns = wait_clock.nowRealtimeNs();
                     if (now_ns >= deadline_ns) return error.EnrichmentWaitTimeout;
-                    sleepNs(@min(25 * std.time.ns_per_ms, deadline_ns - now_ns));
+                    const sleep_ns = @min(25 * std.time.ns_per_ms, deadline_ns - now_ns);
+                    wait_clock.sleepMs(@max(1, @divTrunc(sleep_ns +| std.time.ns_per_ms - 1, std.time.ns_per_ms)));
                     continue;
                 },
                 else => return err,

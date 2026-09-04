@@ -1769,11 +1769,9 @@ const RaftTableApplyStateMachine = struct {
         if (applied_index > existing) {
             if (@import("builtin").is_test and self.test_faults.applied_index_publication_failure_once) {
                 self.test_faults.applied_index_publication_failure_once = false;
-                self.applied_mutex.unlock();
                 return error.TestAppliedIndexPublicationFailure;
             }
             self.applied_indexes.put(self.alloc, group_id, applied_index) catch |err| {
-                self.applied_mutex.unlock();
                 return err;
             };
         }
@@ -6874,7 +6872,11 @@ pub const DataServer = struct {
         if (metadata_snapshot.tables.len == 0 or metadata_snapshot.ranges.len == 0)
             return error.HASeedSnapshotIncompleteTopology;
 
-        const deadline_ns = platform_time.monotonicNs() +| ha_seed_snapshot_preflight_timeout_ns;
+        const now_ns = if (self.write_source.backend_runtime) |backend_runtime|
+            backend_runtime.monotonicClock().nowRealtimeNs()
+        else
+            platform_time.monotonicNs();
+        const deadline_ns = now_ns +| ha_seed_snapshot_preflight_timeout_ns;
         for (metadata_snapshot.ranges) |range| {
             const table = findHASeedTable(metadata_snapshot.tables, range.table_id) orelse
                 return error.HASeedSnapshotTableMissingFromTopology;
@@ -8975,7 +8977,7 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const write_route_fence: ?antfly.metadata_api.CatalogRouteFence = switch (authority) {
             .catalog => |fence| fence,
-            .transaction, .split_replication => null,
+            .transaction, .split_replication, .merge_replication => null,
         };
         var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(cancellation_token);
         const leader_wait_ns = dataRaftForwardedLeaderWaitNs(forwarding);
@@ -9560,11 +9562,19 @@ pub const DataServer = struct {
                 if (self.dataRaftMonotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 if (route.write_route_fence) |fence| {
+                    // Catalog admission APIs use the process monotonic clock,
+                    // while the Raft loop's deadline belongs to its borrowed
+                    // std.Io clock. Preserve the remaining duration when the
+                    // two authorities differ (notably under VoprIo).
+                    const admission_now_ns = self.dataRaftMonotonicNs();
+                    if (admission_now_ns >= deadline_ns) return error.LeaderUnavailable;
+                    const admission_deadline_ns = platform_time.monotonicNs() +|
+                        (deadline_ns - admission_now_ns);
                     routed_write_admission = try admission_source.acquireRoutedWriteAdmission(
                         alloc,
                         table_name,
                         fence,
-                        deadline_ns,
+                        admission_deadline_ns,
                         route.visibility_cancellation,
                     );
                 }
@@ -30507,7 +30517,7 @@ test "data runtime repair debt hook targets the affected group queue" {
     defer runtime.deinit();
     var server: DataServer = .{
         .alloc = alloc,
-        .provisioned_storage = undefined,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = undefined,
         .write_source = undefined,
         .status_source = undefined,
@@ -30516,6 +30526,7 @@ test "data runtime repair debt hook targets the affected group queue" {
         .backend_runtime = runtime.ptr(),
         .listener_cfg = undefined,
     };
+    defer server.provisioned_storage.deinit();
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
     defer server.provisioned_index_repair_cancel_groups.deinit(alloc);
 
@@ -34707,16 +34718,69 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     defer runtime.deinit();
 
     const Metadata = struct {
+        snapshot: ?*const antfly.metadata_api.AdminSnapshot = null,
+
         fn execute(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: antfly.common.http.HttpRequest,
+            ptr: *anyopaque,
+            response_alloc: std.mem.Allocator,
+            request: antfly.common.http.HttpRequest,
         ) !antfly.common.http.HttpResponse {
-            return .{ .status = 503 };
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const snapshot = self.snapshot orelse return .{ .status = 503 };
+            if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.capabilities)) {
+                return .{
+                    .status = 200,
+                    .body = try std.json.Stringify.valueAlloc(response_alloc, antfly.metadata_api.MetadataCapabilities{
+                        .catalog_routing_protocol_min = antfly.metadata_api.catalog_routing_protocol_current,
+                        .catalog_routing_protocol_max = antfly.metadata_api.catalog_routing_protocol_current,
+                    }, .{}),
+                };
+            }
+            if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.head) or
+                std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.internal_linearizable_head))
+            {
+                return .{
+                    .status = 200,
+                    .body = try std.json.Stringify.valueAlloc(response_alloc, antfly.metadata_api.MetadataHead{
+                        .metadata_group_id = snapshot.status.metadata_group_id,
+                        .metadata_incarnation = snapshot.status.metadata_incarnation,
+                        .metadata_epoch = snapshot.status.metadata_epoch,
+                    }, .{}),
+                };
+            }
+            if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.admin_snapshot) or
+                std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.internal_linearizable_snapshot))
+            {
+                return .{
+                    .status = 200,
+                    .body = try std.json.Stringify.valueAlloc(response_alloc, snapshot.*, .{}),
+                };
+            }
+            if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.routing_snapshot) or
+                std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.internal_linearizable_routing_snapshot))
+            {
+                return .{
+                    .status = 200,
+                    .body = try std.json.Stringify.valueAlloc(response_alloc, antfly.metadata_api.CatalogRoutingSnapshot{
+                        .metadata_group_id = snapshot.status.metadata_group_id,
+                        .metadata_incarnation = snapshot.status.metadata_incarnation,
+                        .catalog_revision = snapshot.status.metadata_epoch,
+                        .change_token = .{
+                            .metadata_group_id = snapshot.status.metadata_group_id,
+                            .metadata_incarnation = snapshot.status.metadata_incarnation,
+                            .revision = snapshot.status.metadata_epoch,
+                        },
+                        .tables = snapshot.tables,
+                        .ranges = snapshot.ranges,
+                    }, .{}),
+                };
+            }
+            return .{ .status = 404 };
         }
     };
+    var metadata = Metadata{};
     const metadata_executor = antfly.common.http.RequestExecutor{
-        .ptr = undefined,
+        .ptr = &metadata,
         .vtable = &.{ .execute = Metadata.execute },
     };
 
@@ -34863,15 +34927,27 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         .split_transitions = split_records[0..0],
         .merge_transitions = merge_records[0..],
     };
+    metadata.snapshot = &snapshot;
 
     const SnapshotPublisher = struct {
         fn publish(server: *DataServer, current: antfly.metadata_api.AdminSnapshot) !void {
             const remote = server.remote_metadata orelse return error.MissingRemoteMetadata;
             const owned = try cloneAdminSnapshotOwned(server.alloc, current);
+            const ticket = remote.beginLinearizableSnapshot();
             try std.testing.expectEqual(
                 RemoteMetadataSource.LinearizableSnapshotAcceptance.published,
-                try remote.acceptLinearizableSnapshot(owned, remote.beginLinearizableSnapshot()),
+                try remote.acceptLinearizableSnapshot(owned, ticket),
             );
+            var routing = try remote.ownedRoutingSnapshotUntil(
+                current.status.metadata_group_id,
+                current.status.metadata_incarnation,
+                current.status.metadata_epoch,
+                current.tables,
+                current.ranges,
+                null,
+            );
+            defer freeRoutingSnapshotOwned(server.alloc, &routing);
+            try remote.publishRoutingSnapshot(routing, ticket.invalidation_generation, null);
         }
     };
     for (&servers) |*server| try SnapshotPublisher.publish(server, snapshot);
@@ -35665,15 +35741,37 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         }
 
         fn writeSplitDelta(self: *@This()) !void {
+            // The fixture owns the modeled metadata projection directly. Keep
+            // its data-node caches current after a long split-bootstrap wait
+            // so the short Raft proposal budget is spent on the write itself.
+            for (self.servers, 0..) |*server, i| {
+                if (!self.initialized[i]) continue;
+                try SnapshotPublisher.publish(server, self.snapshot.*);
+            }
             var executor = antfly.common.http.IoHttpExecutor.init(self.alloc, self.io, .{});
             defer executor.deinit();
             var client = antfly.public_api.ApiHttpClient.init(self.alloc, executor.executor());
-            var response = try client.fetchBatch(self.api_uris[0], self.split_record.table_contract.table_name,
-                \\{"inserts":{"doc:y":{"side":"split-delta"}},"sync_level":"write"}
-            );
-            defer response.deinit(self.alloc);
-            try std.testing.expect(response.status == 201 or response.status == 202);
-            try std.testing.expect(std.mem.indexOf(u8, response.body, "\"inserted\":1") != null);
+            for (0..30) |_| {
+                var response = try client.fetchBatchResponse(self.api_uris[0], self.split_record.table_contract.table_name,
+                    \\{"inserts":{"doc:y":{"side":"split-delta"}},"sync_level":"write"}
+                );
+                if (response.status == 201 or response.status == 202) {
+                    defer response.deinit(self.alloc);
+                    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"inserted\":1") != null);
+                    return;
+                }
+                const retryable = response.status == 503 and
+                    std.mem.eql(u8, response.body, "write unavailable");
+                if (!retryable) std.log.err(
+                    "multi-owner split delta failed status={} body={s}",
+                    .{ response.status, response.body },
+                );
+                response.deinit(self.alloc);
+                if (!retryable) return error.VoprDataServerSplitDeltaWriteFailed;
+                if (self.driver_failure) |err| return err;
+                try self.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return error.VoprDataServerSplitDeltaWriteTimeout;
         }
 
         const SplitProgress = enum { bootstrapped, caught_up };
@@ -38698,7 +38796,7 @@ test "remote metadata source retries fenced snapshot generations until success" 
     };
     source.cached_snapshot = try cloneAdminSnapshotOwned(std.testing.allocator, snapshot);
     source.cached_head = RemoteMetadataSource.snapshotHead(&snapshot);
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = source.awakeMs();
     source.cached_snapshot_at_ms = now_ms;
     source.cached_head_at_ms = now_ms;
     source.test_faults.force_snapshot_cache_miss = true;

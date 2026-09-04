@@ -24212,8 +24212,34 @@ test "hosted hierarchy navigation routes projection-safe hydration and advances 
                     .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
                     .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
                     .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                    .route_identity = routeIdentity,
+                    .route_fence = routeFence,
                 },
             };
+        }
+
+        fn routeFence(_: *anyopaque, group_id: u64) !?metadata_api.CatalogRouteFence {
+            if (group_id != 7 and group_id != 8) return null;
+            return .{
+                .metadata_group_id = 1,
+                .catalog_revision = 1,
+                .table_id = 7,
+                .topology_epoch = 1,
+                .route = .{
+                    .group_id = group_id,
+                    .range_id = group_id,
+                    .identity_namespace = .{
+                        .table_id = 7,
+                        .shard_id = group_id,
+                        .range_id = group_id,
+                    },
+                },
+            };
+        }
+
+        fn routeIdentity(_: *anyopaque, table_name: []const u8, group_id: u64) !?metadata_api.CatalogIdentityNamespace {
+            if (!std.mem.eql(u8, table_name, "docs") or (group_id != 7 and group_id != 8)) return null;
+            return .{ .table_id = 7, .shard_id = group_id, .range_id = group_id };
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
@@ -28937,7 +28963,7 @@ test "routed internal reads require an explicit peer fence acknowledgement" {
     var hosted = HostedProvisionedTableReadSource{
         .replica_root_dir = "",
         .catalog = FakeCatalog.source(),
-        .requester = undefined,
+        .read_safety_barrier = undefined,
         .router = undefined,
         .executor = executor.iface(),
     };
@@ -29000,7 +29026,7 @@ test "join job-state polling bypasses storage route fencing without weakening st
     var hosted = HostedProvisionedTableReadSource{
         .replica_root_dir = "",
         .catalog = state.catalog(),
-        .requester = undefined,
+        .read_safety_barrier = undefined,
         .router = undefined,
         .executor = state.executor(),
     };

@@ -78,7 +78,7 @@ fn ensureRequestBudget(budget: ?RequestBudget) !void {
         if (value.cancellation) |signal| {
             if (signal.isCancelled()) return error.Cancelled;
         }
-        if (platform_time.monotonicNs() >= value.deadline_ns) return error.Timeout;
+        if (value.nowNs() >= value.deadline_ns) return error.Timeout;
     }
 }
 
