@@ -4685,6 +4685,7 @@ pub fn build(b: *std.Build) void {
         "data runtime preserves tagged aggregate index repair wake semantics",
         "index repair no-op audit stays below operator log level",
         "index repair terminal operator events are transition based",
+        "index repair terminal log state survives metadata churn for local groups",
         "data runtime exact repair requeue is allocation-free and failed new enqueue is atomic",
         "data runtime repair queue links and removes debt in constant time",
         "data runtime startup catch-up parks scheduler when only quarantined debt remains",
