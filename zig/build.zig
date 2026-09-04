@@ -6556,6 +6556,7 @@ pub fn build(b: *std.Build) void {
             "runtime status best effort overlay cannot clear readiness under apply contention",
             "db source commit publishes exact target observation sequence",
             "collectManagedSyncTargets includes graph index for graph artifact journal changes",
+            "visibility targets include graph replay blocked by a missing dependency",
             "index status exposes compact repair state without internal diagnostics",
             "index status aggregation preserves actionable repair diagnostics for the requested incarnation",
             "rebuild quarantine remains an explicit failed public index status",

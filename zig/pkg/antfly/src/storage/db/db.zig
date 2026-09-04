@@ -2087,6 +2087,10 @@ const TtlCleanupContext = struct {
 const ManagedSyncTargets = struct {
     full_text_indexes: []const []const u8 = &.{},
     all_indexes: []const []const u8 = &.{},
+    // Owned names backing target_identities. Visibility targets are broader
+    // than synchronous wait targets: a record with a missing dependency still
+    // advances that index's durable replay target and must fence completion.
+    target_index_names: []const []const u8 = &.{},
     target_identities: []const IndexTargetVisibility = &.{},
     target_scope_known: bool = false,
 
@@ -2096,6 +2100,8 @@ const ManagedSyncTargets = struct {
         for (self.all_indexes) |name| alloc.free(@constCast(name));
         if (self.all_indexes.len > 0) alloc.free(self.all_indexes);
         if (self.target_identities.len > 0) alloc.free(self.target_identities);
+        for (self.target_index_names) |name| alloc.free(@constCast(name));
+        if (self.target_index_names.len > 0) alloc.free(self.target_index_names);
         self.* = undefined;
     }
 };
@@ -23452,14 +23458,14 @@ pub const DB = struct {
                 .enrichments => {},
                 .full_text => {
                     if (index_ref.kind == .full_text) {
-                        try appendUniqueOwnedName(self.alloc, &full_text_indexes, index_ref.name);
-                        try appendUniqueOwnedName(self.alloc, &all_indexes, index_ref.name);
+                        try appendOwnedManagedIndexName(self.alloc, &full_text_indexes, index_ref.name);
+                        try appendOwnedManagedIndexName(self.alloc, &all_indexes, index_ref.name);
                     }
                 },
                 .full_index => {
-                    try appendUniqueOwnedName(self.alloc, &all_indexes, index_ref.name);
+                    try appendOwnedManagedIndexName(self.alloc, &all_indexes, index_ref.name);
                     if (index_ref.kind == .full_text) {
-                        try appendUniqueOwnedName(self.alloc, &full_text_indexes, index_ref.name);
+                        try appendOwnedManagedIndexName(self.alloc, &full_text_indexes, index_ref.name);
                     }
                 },
             }
@@ -50012,16 +50018,26 @@ fn collectManagedSyncTargets(
         for (all_indexes.items) |name| alloc.free(@constCast(name));
         all_indexes.deinit(alloc);
     }
+    var target_indexes = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (target_indexes.items) |name| alloc.free(@constCast(name));
+        target_indexes.deinit(alloc);
+    }
 
     for (managed_indexes) |index_ref| {
-        if (!batchAffectsManagedIndex(index_manager, batch, index_ref)) continue;
-        try appendUniqueOwnedName(alloc, &all_indexes, index_ref.name);
-        if (index_ref.kind == .full_text) {
-            try appendUniqueOwnedName(alloc, &full_text_indexes, index_ref.name);
+        switch (managedIndexBatchApplicability(index_manager, batch, index_ref)) {
+            .irrelevant => continue,
+            .missing_dependency => try appendOwnedManagedIndexName(alloc, &target_indexes, index_ref.name),
+            .relevant => {
+                try appendOwnedManagedIndexName(alloc, &target_indexes, index_ref.name);
+                try appendOwnedManagedIndexName(alloc, &all_indexes, index_ref.name);
+                if (index_ref.kind == .full_text)
+                    try appendOwnedManagedIndexName(alloc, &full_text_indexes, index_ref.name);
+            },
         }
     }
 
-    return try finishManagedSyncTargets(alloc, index_manager, &full_text_indexes, &all_indexes);
+    return try finishManagedSyncTargets(alloc, index_manager, &full_text_indexes, &all_indexes, &target_indexes);
 }
 
 fn collectManagedSyncTargetsForRecord(
@@ -50045,15 +50061,26 @@ fn collectManagedSyncTargetsForRecord(
         for (all_indexes.items) |name| alloc.free(@constCast(name));
         all_indexes.deinit(alloc);
     }
-
-    for (managed_indexes) |index_ref| {
-        if (managedIndexRecordApplicability(index_manager, record, index_ref) != .relevant) continue;
-        try appendUniqueOwnedName(alloc, &all_indexes, index_ref.name);
-        if (index_ref.kind == .full_text)
-            try appendUniqueOwnedName(alloc, &full_text_indexes, index_ref.name);
+    var target_indexes = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (target_indexes.items) |name| alloc.free(@constCast(name));
+        target_indexes.deinit(alloc);
     }
 
-    return try finishManagedSyncTargets(alloc, index_manager, &full_text_indexes, &all_indexes);
+    for (managed_indexes) |index_ref| {
+        switch (managedIndexRecordApplicability(index_manager, record, index_ref)) {
+            .irrelevant => continue,
+            .missing_dependency => try appendOwnedManagedIndexName(alloc, &target_indexes, index_ref.name),
+            .relevant => {
+                try appendOwnedManagedIndexName(alloc, &target_indexes, index_ref.name);
+                try appendOwnedManagedIndexName(alloc, &all_indexes, index_ref.name);
+                if (index_ref.kind == .full_text)
+                    try appendOwnedManagedIndexName(alloc, &full_text_indexes, index_ref.name);
+            },
+        }
+    }
+
+    return try finishManagedSyncTargets(alloc, index_manager, &full_text_indexes, &all_indexes, &target_indexes);
 }
 
 fn finishManagedSyncTargets(
@@ -50061,6 +50088,7 @@ fn finishManagedSyncTargets(
     index_manager: *index_manager_mod.IndexManager,
     full_text_indexes: *std.ArrayListUnmanaged([]const u8),
     all_indexes: *std.ArrayListUnmanaged([]const u8),
+    target_indexes: *std.ArrayListUnmanaged([]const u8),
 ) !ManagedSyncTargets {
     const owned_full_text = try full_text_indexes.toOwnedSlice(alloc);
     errdefer {
@@ -50072,10 +50100,15 @@ fn finishManagedSyncTargets(
         for (owned_all) |name| alloc.free(@constCast(name));
         if (owned_all.len > 0) alloc.free(owned_all);
     }
+    const owned_targets = try target_indexes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_targets) |name| alloc.free(@constCast(name));
+        if (owned_targets.len > 0) alloc.free(owned_targets);
+    }
 
-    const identities = try alloc.alloc(IndexTargetVisibility, owned_all.len);
+    const identities = try alloc.alloc(IndexTargetVisibility, owned_targets.len);
     var scope_known = true;
-    for (owned_all, 0..) |name, i| {
+    for (owned_targets, 0..) |name, i| {
         const cfg = index_manager.get(name) orelse {
             scope_known = false;
             break;
@@ -50099,20 +50132,23 @@ fn finishManagedSyncTargets(
     return .{
         .full_text_indexes = owned_full_text,
         .all_indexes = owned_all,
+        .target_index_names = owned_targets,
         .target_identities = if (scope_known) identities else &.{},
         .target_scope_known = scope_known,
     };
 }
 
-fn appendUniqueOwnedName(
+fn appendOwnedManagedIndexName(
     alloc: Allocator,
     items: *std.ArrayListUnmanaged([]const u8),
     value: []const u8,
 ) !void {
-    for (items.items) |existing| {
-        if (std.mem.eql(u8, existing, value)) return;
-    }
-    try items.append(alloc, try alloc.dupe(u8, value));
+    // IndexManager.managedIndexes() returns one entry per index name, so each
+    // filtered projection is already unique. Preserve that invariant here
+    // instead of turning target discovery into an O(indexes^2) duplicate scan.
+    const owned = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned);
+    try items.append(alloc, owned);
 }
 
 fn waitForManagedIndexesApplied(self: *DB, sequence: u64, index_names: []const []const u8) !void {
@@ -73103,6 +73139,38 @@ test "collectManagedSyncTargets includes graph index for graph artifact journal 
     try std.testing.expectEqual(types.IndexKind.graph, sync_targets.target_identities[0].kind);
     try std.testing.expect(sync_targets.target_identities[0].incarnation > 0);
     try std.testing.expect(sync_targets.target_identities[0].config_hash > 0);
+}
+
+test "visibility targets include graph replay blocked by a missing dependency" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "missing_resolver");
+    defer alloc.free(resolution_key);
+    var targets = try collectManagedSyncTargetsForRecord(alloc, db.core.index_manager, .{
+        .sequence = 1,
+        .changed_artifact_keys = &.{resolution_key},
+    });
+    defer targets.deinit(alloc);
+
+    // Missing dependencies are not foreground sync targets, but the graph's
+    // replay target still advanced and completion must be fenced exactly.
+    try std.testing.expectEqual(@as(usize, 0), targets.all_indexes.len);
+    try std.testing.expect(targets.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 1), targets.target_identities.len);
+    try std.testing.expectEqualStrings("gr_v1", targets.target_identities[0].index_name);
+    try std.testing.expectEqual(types.IndexKind.graph, targets.target_identities[0].kind);
 }
 
 test "db full_index supports dense parent search for template chunked embeddings" {
