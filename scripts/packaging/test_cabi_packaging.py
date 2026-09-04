@@ -205,12 +205,22 @@ class CAbiPackagingTests(unittest.TestCase):
             'test "$TRIGGER_HEAD_BRANCH" = "$DEFAULT_BRANCH"', build_controller_workflow
         )
         self.assertIn("build_controller_commit:", artifact_build_workflow)
-        self.assertIn('tags:\n      - "v*"', release_build_workflow)
+        self.assertIn("workflow_dispatch:", release_build_workflow)
+        self.assertNotIn('tags:\n      - "v*"', release_build_workflow)
+        self.assertIn("environment: release-cut", release_build_workflow)
+        self.assertIn(
+            "python scripts/release/release_lines.py resolve", release_build_workflow
+        )
+        self.assertIn(
+            "python scripts/release/github_rulesets.py check", release_build_workflow
+        )
+        self.assertIn('git tag -a "$RELEASE_TAG"', release_build_workflow)
         self.assertIn("permissions:\n  contents: read", release_build_workflow)
-        self.assertNotIn("contents: write", release_build_workflow)
+        self.assertIn("contents: write", release_build_workflow)
         self.assertNotIn("id-token: write", release_build_workflow)
-        self.assertNotIn("environment:", release_build_workflow)
         self.assertNotIn("publish_objectstorage.py", release_build_workflow)
+        for field in ("release_line:", "source_ref:", "source_ref_head:"):
+            self.assertIn(field, artifact_build_workflow)
         self.assertIn("permissions:\n  contents: read", artifact_build_workflow)
         self.assertNotIn("contents: write", artifact_build_workflow)
         self.assertNotIn("id-token: write", artifact_build_workflow)
@@ -223,6 +233,7 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("repository_dispatch:", release_workflow)
         self.assertIn("promote-cli-release", release_workflow)
         self.assertIn("promote-release-channel", release_workflow)
+        self.assertIn("github_rulesets.py check", release_workflow)
         self.assertIn("release_channels.py resolve", artifact_build_workflow)
         self.assertIn("release_platforms.py github-matrix", artifact_build_workflow)
         self.assertIn("verify_release_ledger.py", release_workflow)
@@ -402,6 +413,7 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertNotIn("environment: container-publish", release_gc_workflow)
         self.assertEqual(release_gc_workflow.count("environment: release-promotion"), 1)
         self.assertIn("github_environment.py check", release_gc_workflow)
+        self.assertIn("github_rulesets.py check", release_gc_workflow)
         self.assertIn(
             'test "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH"',
             release_gc_workflow,
@@ -413,7 +425,10 @@ class CAbiPackagingTests(unittest.TestCase):
             release_gc_workflow.index("group: antfly-release-storage"),
         )
         environments = environment_policy["environments"]
-        self.assertEqual(set(environments), {"container-publish", "release-promotion"})
+        self.assertEqual(
+            set(environments),
+            {"container-publish", "release-cut", "release-promotion"},
+        )
         container_refs = {
             (policy["name"], policy["type"])
             for policy in environments["container-publish"]["branch_policies"]
@@ -422,10 +437,15 @@ class CAbiPackagingTests(unittest.TestCase):
             (policy["name"], policy["type"])
             for policy in environments["release-promotion"]["branch_policies"]
         }
+        release_cut_refs = {
+            (policy["name"], policy["type"])
+            for policy in environments["release-cut"]["branch_policies"]
+        }
         self.assertNotIn(("main", "branch"), container_refs)
         self.assertTrue(container_refs)
         self.assertTrue(all(policy_type == "tag" for _, policy_type in container_refs))
         self.assertEqual(release_refs, {("main", "branch")})
+        self.assertEqual(release_cut_refs, {("main", "branch")})
         sdk_npm_workflow = (
             REPO_ROOT / ".github" / "workflows" / "ts-npm-publish.yml"
         ).read_text()
