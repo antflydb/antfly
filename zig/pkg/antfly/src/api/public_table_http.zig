@@ -3391,6 +3391,10 @@ test "public table query handler preserves structured filter and hierarchy diagn
 }
 
 test "public table query handler preserves retryable failure status" {
+    // Corrupt persistent storage is intentionally logged at error severity;
+    // the strict CI runner requires tests to declare those exercised paths.
+    @import("../test_error_logs.zig").expectErrorLogs(2);
+
     const Backend = struct {
         err: TableApi.ExecuteQueryError,
 

@@ -591,10 +591,12 @@ test "gelu" {
 test "exact gelu matches erf reference values" {
     var data = [_]f32{ 0.0, 1.0, -1.0, 2.0 };
     geluExact(&data);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), data[0], 2e-7);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.8413447), data[1], 2e-7);
-    try std.testing.expectApproxEqAbs(@as(f32, -0.15865526), data[2], 2e-7);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.9544997), data[3], 2e-7);
+    // libm exp rounding differs by a few f32 ULPs across supported targets.
+    const tolerance: f32 = 5e-7;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), data[0], tolerance);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8413447), data[1], tolerance);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.15865526), data[2], tolerance);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.9544997), data[3], tolerance);
 }
 
 // Vector vs scalar parity for gelu/silu/sigmoid/quickGelu across full activation range,
