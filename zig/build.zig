@@ -314,6 +314,18 @@ fn compileFiltersWithAnchors(
     return filters[0..count];
 }
 
+fn addAntflyTestRunArtifact(
+    b: *std.Build,
+    tests: *std.Build.Step.Compile,
+) *std.Build.Step.Run {
+    if (tests.test_runner == null) {
+        const runner_path = b.path("pkg/antfly/src/test_runner.zig");
+        tests.test_runner = .{ .path = runner_path, .mode = .simple };
+        runner_path.addStepDependencies(&tests.step);
+    }
+    return b.addRunArtifact(tests);
+}
+
 /// Zig's compile-time filters can retain imported anonymous tests needed for
 /// semantic analysis. Give every filtered artifact the exact-filter runner and
 /// apply the caller's independently selected runtime filters so compile-only
@@ -323,12 +335,7 @@ fn addFilteredTestRunArtifactWithRuntimeFilters(
     tests: *std.Build.Step.Compile,
     runtime_filters: []const []const u8,
 ) *std.Build.Step.Run {
-    if (tests.test_runner == null) {
-        const runner_path = b.path("pkg/antfly/src/test_runner.zig");
-        tests.test_runner = .{ .path = runner_path, .mode = .simple };
-        runner_path.addStepDependencies(&tests.step);
-    }
-    const run = b.addRunArtifact(tests);
+    const run = addAntflyTestRunArtifact(b, tests);
     addRuntimeTestFilters(b, run, runtime_filters);
     return run;
 }
@@ -7444,7 +7451,9 @@ pub fn build(b: *std.Build) void {
     const lib_template_tests = b.addTest(.{
         .root_module = template_test_mod,
     });
-    const run_lib_template_tests = b.addRunArtifact(lib_template_tests);
+    // template_remote imports Antfly runtime ABI tests, whose intentional
+    // error paths use the repository runner's expected-log accounting.
+    const run_lib_template_tests = addAntflyTestRunArtifact(b, lib_template_tests);
     const lib_template_test_step = b.step("lib-template-test", "Run template rendering tests");
     lib_template_test_step.dependOn(&run_lib_template_tests.step);
 
