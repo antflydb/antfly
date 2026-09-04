@@ -183,6 +183,8 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
         print("capability_florence2: {}\n", .{compute.supportsProfile(.florence2)});
         print("capability_gliner2: {}\n", .{compute.supportsProfile(.gliner2)});
         print("capability_gemma4: {}\n", .{compute.supportsProfile(.gemma4)});
+        print("capability_qwen3_embedding: {}\n", .{compute.supportsProfile(.qwen3_embedding)});
+        print("capability_qwen3_vl_generation: {}\n", .{compute.supportsProfile(.qwen3_vl_generation)});
 
         if (smoke) {
             cuda_kernels.smokeFill(allocator) catch |err| {
@@ -225,6 +227,11 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
                 std.process.exit(1);
             };
             print("smoke: gemma4_primitives ok\n", .{});
+            cuda_kernels.smokeQwen3VlPrimitives(allocator) catch |err| {
+                print("smoke: qwen3_vl_primitives failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            print("smoke: qwen3_vl_primitives ok\n", .{});
             cuda_kernels.smokeFlorence2Primitives(allocator) catch |err| {
                 print("smoke: florence2_primitives failed\nreason: {s}\n", .{@errorName(err)});
                 std.process.exit(1);

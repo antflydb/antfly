@@ -35,6 +35,7 @@ const gguf_tensor_types = @import("../gguf/tensor_types.zig");
 const gguf_writer = @import("../gguf/writer.zig");
 const clipclap_format_mod = @import("../architectures/clipclap_format.zig");
 const projector_format_mod = @import("../architectures/projector_format.zig");
+const qwen3vl_reranker = @import("../architectures/qwen3vl_reranker.zig");
 const hf_tokenizer = @import("inference_hf_tokenizer");
 const sentencepiece = @import("inference_tokenizer").sentencepiece;
 const tokenizer_mod = @import("inference_tokenizer");
@@ -169,6 +170,7 @@ const NativeCompanion = struct {
 const ProjectorDecoderFamily = enum {
     gemma3,
     gemma4,
+    qwen3vl,
     unsupported,
 };
 
@@ -182,6 +184,8 @@ const ProjectorDecoderContract = struct {
 
 fn projectorDecoderFamilyForArchitecture(architecture: []const u8) ProjectorDecoderFamily {
     if (std.mem.eql(u8, architecture, "gemma3")) return .gemma3;
+    if (std.mem.eql(u8, architecture, "qwen3_vl") or
+        std.mem.eql(u8, architecture, "qwen3vl")) return .qwen3vl;
     if (std.mem.eql(u8, architecture, "gemma4") or
         std.mem.eql(u8, architecture, "gemma4_unified"))
     {
@@ -196,12 +200,21 @@ fn projectorMatchesDecoder(
 ) bool {
     return switch (projector) {
         .antfly_gemma3 => decoder.family == .gemma3,
+        .clip_qwen3vl_image => decoder.family == .qwen3vl,
         .clip_gemma4_image,
         .clip_gemma4_audio,
         .clip_gemma4_image_audio,
         => decoder.family == .gemma4,
         .unknown => false,
     };
+}
+
+test "Qwen3-VL projectors are paired only with Qwen3-VL decoders" {
+    const qwen = ProjectorDecoderContract{ .family = .qwen3vl };
+    const gemma = ProjectorDecoderContract{ .family = .gemma4 };
+    try std.testing.expect(projectorMatchesDecoder(.clip_qwen3vl_image, qwen));
+    try std.testing.expect(!projectorMatchesDecoder(.clip_qwen3vl_image, gemma));
+    try std.testing.expect(!projectorMatchesDecoder(.clip_gemma4_image, qwen));
 }
 
 fn validateGgufCompanionForBackend(
@@ -252,7 +265,7 @@ fn validateGgufCompanionForBackend(
             return .{
                 .level = .incompatible,
                 .code = .unsupported_backend,
-                .message = "a projector GGUF does not declare a supported Antfly Gemma 3 or Gemma 4 CLIP projector format",
+                .message = "a projector GGUF does not declare a supported Antfly Gemma 3, Gemma 4, or Qwen3-VL CLIP projector format",
             };
         }
         const contract = projector_format_mod.inspectFileContract(&file) catch {
@@ -529,6 +542,13 @@ pub fn compatibilitySummaryForBackend(
     defer inspection.deinit(allocator);
     const assessment = model_compatibility.assessInspection(&candidate_manifest, inspection);
     if (assessment.level == .incompatible) return summaryFromAssessment(assessment);
+    if (!qwen3VlPromotionSupportsBackend(inspection.qwen3vl_promotion, backend)) {
+        return .{
+            .level = .incompatible,
+            .code = .unsupported_backend,
+            .message = "production-qualified Qwen3-VL bundles require the Metal backend",
+        };
+    }
 
     var projector_decoder = ProjectorDecoderContract{
         .family = projectorDecoderFamilyForArchitecture(man.config_model_arch),
@@ -654,6 +674,13 @@ pub fn compatibilitySummaryForBackend(
         }
     }
     return summaryFromAssessment(assessment);
+}
+
+fn qwen3VlPromotionSupportsBackend(
+    promotion: model_compatibility.Qwen3VlPromotion,
+    backend: backends.BackendType,
+) bool {
+    return promotion == .none or backend == .metal;
 }
 
 /// Aggregate candidate compatibility as an OR: a model bundle is usable when
@@ -1764,12 +1791,38 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
         const id = std.math.cast(i32, index) orelse return error.InvalidTokenizerMetadata;
         try tok.addTokenIdAliasForDecode(token, id);
     }
+    const bos_id = metadataTokenId(&parsed, "tokenizer.ggml.bos_token_id");
+    const eos_id = metadataTokenId(&parsed, "tokenizer.ggml.eos_token_id");
     tok.applySpecialTokenIds(
-        metadataTokenId(&parsed, "tokenizer.ggml.bos_token_id"),
-        metadataTokenId(&parsed, "tokenizer.ggml.eos_token_id"),
+        bos_id,
+        eos_id,
         metadataTokenId(&parsed, "tokenizer.ggml.padding_token_id"),
         metadataTokenId(&parsed, "tokenizer.ggml.unknown_token_id"),
     );
+    // Honor the checkpoint's declared wrap semantics when present. Without
+    // this, encodeForModel wraps with bos AND eos unconditionally — for
+    // Qwen3-Embedding GGUFs (add_bos_token=false, add_eos_token=true) that
+    // injects a leading <|endoftext|> the HF reference does not produce,
+    // shifting every position and breaking embedding parity. GGUFs that
+    // declare neither flag keep the legacy wrap unchanged.
+    const gguf_view = gguf_metadata.View.init(&parsed);
+    const add_bos = gguf_view.getBool("tokenizer.ggml.add_bos_token");
+    const add_eos = gguf_view.getBool("tokenizer.ggml.add_eos_token");
+    if (add_bos != null or add_eos != null) {
+        var prepend_buf: [1]i32 = undefined;
+        var append_buf: [1]i32 = undefined;
+        var prepend: []const i32 = &.{};
+        var append: []const i32 = &.{};
+        if ((add_bos orelse false) and bos_id != null) {
+            prepend_buf[0] = bos_id.?;
+            prepend = prepend_buf[0..1];
+        }
+        if ((add_eos orelse false) and eos_id != null) {
+            append_buf[0] = eos_id.?;
+            append = append_buf[0..1];
+        }
+        try tok.applyModelWrapTemplate(prepend, append);
+    }
     return tok;
 }
 
@@ -2618,6 +2671,12 @@ pub const LoadedModel = struct {
             .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or generic_encoder != null,
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
             .resident_text_encoder = resident_text_encoder,
+            // Last-token pooling reads the EOS position; guarantee exactly
+            // one trailing EOS regardless of tokenizer.json snapshot age.
+            .ensure_trailing_eos_id = if (isJinaStyleEmbeddingManifest(&self.manifest) and tok.specialTokens().sep_id >= 0)
+                tok.specialTokens().sep_id
+            else
+                null,
         });
         if (usesClipImagePreprocessProfile(&self.manifest)) {
             pipeline.config.image_preprocess_profile = .clip;
@@ -2661,16 +2720,22 @@ pub const LoadedModel = struct {
 
     pub fn rerankingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) RerankingPipeline {
         const tok = self.getTokenizer();
+        const is_qwen3vl_reranker = self.manifest.isQwen3VlReranker();
         var pipeline = RerankingPipeline.init(allocator, self.session, tok, .{
-            .max_length = self.manifest.maxTextSequenceLength(),
-            .mode = if (self.manifest.hasCapability("late_interaction") or
+            .max_length = if (is_qwen3vl_reranker)
+                @min(self.manifest.maxTextSequenceLength(), qwen3vl_reranker.default_max_length)
+            else
+                self.manifest.maxTextSequenceLength(),
+            .mode = if (is_qwen3vl_reranker)
+                ScoringMode.generative_yes_no
+            else if (self.manifest.hasCapability("late_interaction") or
                 self.manifest.hasCapability("colbert") or
                 self.manifest.hasCapability("colqwen") or
                 self.manifest.hasCapability("multimodal_late_interaction"))
                 ScoringMode.late_interaction
             else
                 ScoringMode.cross_encoder,
-            .single_text_encoding = if (self.manifest.prefersGenerationEncodingForLateInteraction()) .generation else .encoder,
+            .single_text_encoding = if (is_qwen3vl_reranker or self.manifest.prefersGenerationEncodingForLateInteraction()) .generation else .encoder,
             .add_bos_token = self.manifest.add_bos_token,
             .distributed = runtime.distributed.configFromEnv(),
         });
@@ -2819,8 +2884,7 @@ pub const LoadedModel = struct {
 };
 
 fn isJinaStyleEmbeddingManifest(manifest: *const manifest_mod.ModelManifest) bool {
-    return std.mem.eql(u8, manifest.config_model_arch, "jina_embeddings_v5") or
-        (manifest.pooling == .last and std.mem.eql(u8, manifest.embedding_text_prefix, "Document: "));
+    return manifest.isLastTokenDecoderEmbedder();
 }
 
 fn targetInferenceExecutionMutexForBackend(
@@ -4454,8 +4518,15 @@ pub const ModelManager = struct {
                     }
                     if (!self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
-                    ))
+                    )) {
+                        const denied_request = [_]runtime.tier.memory.AdmissionRequest{.{
+                            .backend_class = backend_class,
+                            .limits = limits,
+                            .amounts = amounts,
+                        }};
+                        self.logRunAdmissionDenied(pressure, &denied_request);
                         return error.ResourceTemporarilyUnavailable;
+                    }
                 }
             },
             else => return first_err,
@@ -4489,12 +4560,55 @@ pub const ModelManager = struct {
                     }
                     if (!self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
-                    ))
+                    )) {
+                        self.logRunAdmissionDenied(pressure, requests);
                         return error.ResourceTemporarilyUnavailable;
+                    }
                 }
             },
             else => return first_err,
         };
+    }
+
+    /// Keep client responses deliberately generic while leaving enough
+    /// operator evidence to distinguish stable-policy saturation from current
+    /// live-memory pressure. Artifact paths and request contents are excluded.
+    fn logRunAdmissionDenied(
+        self: *ModelManager,
+        pressure: ?runtime.tier.memory.AdmissionPressure,
+        requests: []const runtime.tier.memory.AdmissionRequest,
+    ) void {
+        if (builtin.is_test) return;
+        const admitted = self.admissionController().snapshot();
+        std.log.warn(
+            "inference run admission denied pressure={s} request_count={d} admitted_host_bytes={d} admitted_backend_bytes={d} admitted_kv_bytes={d} admitted_scratch_bytes={d}",
+            .{
+                if (pressure) |value| @tagName(std.meta.activeTag(value)) else "unknown",
+                requests.len,
+                admitted.hostTotalBytes(),
+                admitted.backendTotalBytes(),
+                admitted.kvTotalBytes(),
+                admitted.scratchTotalBytes(),
+            },
+        );
+        for (requests, 0..) |request, index| {
+            std.log.warn(
+                "inference run admission request index={d} backend={s} host_bytes={d} backend_bytes={d} kv_bytes={d} scratch_bytes={d} host_limit_bytes={d} backend_limit_bytes={d} combined_limit_bytes={d} kv_limit_bytes={d} scratch_limit_bytes={d}",
+                .{
+                    index,
+                    @tagName(request.backend_class),
+                    request.amounts.hostTotalBytes(),
+                    request.amounts.backendTotalBytes(),
+                    request.amounts.kvTotalBytes(),
+                    request.amounts.scratchTotalBytes(),
+                    request.limits.host_limit_bytes,
+                    request.limits.backend_limit_bytes,
+                    request.limits.combined_limit_bytes,
+                    request.limits.kv_limit_bytes,
+                    request.limits.scratch_limit_bytes,
+                },
+            );
+        }
     }
 
     fn evictExpired(self: *ModelManager) void {
@@ -4868,6 +4982,28 @@ pub const ModelManager = struct {
         return limits;
     }
 
+    /// Apply architecture/artifact residency floors before attaching the hard
+    /// serving envelope. Explicit per-bucket operator overrides remain the
+    /// final authority; the model floor only widens automatically derived
+    /// defaults such as the generic Metal host-cache allowance.
+    fn admissionLimitsForModelPath(
+        self: *const ModelManager,
+        model_path: []const u8,
+        backend_runtime: backends.BackendRuntime,
+    ) !runtime.tier.memory.Limits {
+        var limits = self.admissionLimitsForBackend(backend_runtime);
+        limits = try session_factory.widenBudgetLimitsForModelPath(
+            self.allocator,
+            model_path,
+            limits,
+            backend_runtime.backend,
+        );
+        return runtime.tier.memory.applyLimitOverrides(
+            limits,
+            self.admission_limit_overrides,
+        );
+    }
+
     /// Lazily loaded composite-model components participate in the same
     /// process-wide admission accounting as the primary session. Reserve their
     /// construction peak immediately before import, then retain only completed
@@ -4944,7 +5080,13 @@ pub const ModelManager = struct {
                     continue;
                 };
                 resident_amounts = admission_plan.resident;
-                admission_limits = self.admissionLimitsForBackend(backend_runtime);
+                admission_limits = self.admissionLimitsForModelPath(
+                    model_path,
+                    backend_runtime,
+                ) catch |err| {
+                    rememberPreferredLoadError(&first_err, err);
+                    continue;
+                };
                 if (try admittedSessionCudaLimit(
                     backend_runtime,
                     resident_amounts,
@@ -7191,13 +7333,32 @@ fn estimateModelArtifactBytes(
 /// residency. Charge its mapped artifact to the request that owns that mapping.
 pub fn projectorRunAdmissionAmounts(
     man: manifest_mod.ModelManifest,
+    backend: runtime.kv.pool.BackendKind,
+    media: generation.NativeGenerationMediaAdmission,
 ) !runtime.tier.memory.AdmissionAmounts {
     const path = man.gguf_projector_path orelse return .{};
     const bytes = std.math.cast(
         usize,
         try c_file.fileSize(man.allocator, path),
     ) orelse return error.ResourceLimitExceeded;
-    return .{ .host_weight_bytes = bytes };
+    return switch (backend) {
+        .native => .{
+            .host_weight_bytes = bytes,
+            .host_scratch_bytes = std.math.add(
+                usize,
+                media.host_scratch_bytes,
+                media.backend_scratch_bytes,
+            ) catch return error.ResourceLimitExceeded,
+        },
+        .metal, .cuda => .{
+            // The GGUF mapping remains resident on the host while the request
+            // weight cache exposes the same tensors to the accelerator.
+            .host_weight_bytes = bytes,
+            .backend_weight_bytes = bytes,
+            .host_scratch_bytes = media.host_scratch_bytes,
+            .backend_scratch_bytes = media.backend_scratch_bytes,
+        },
+    };
 }
 
 fn estimateModelLoadAdmission(
@@ -7439,7 +7600,13 @@ fn loadSessionForPreferredBackends(
                 continue;
             };
             resident_amounts = admission_plan.resident;
-            admission_limits = manager.admissionLimitsForBackend(backend_runtime);
+            admission_limits = manager.admissionLimitsForModelPath(
+                model_dir,
+                backend_runtime,
+            ) catch |err| {
+                rememberPreferredLoadError(&first_err, err);
+                continue;
+            };
             if (admittedSessionCudaLimit(
                 backend_runtime,
                 resident_amounts,
@@ -8367,6 +8534,23 @@ test "safetensors compatibility rejects a missing referenced shard" {
     try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
 }
 
+test "production-qualified Qwen3-VL promotions are Metal only" {
+    try std.testing.expect(qwen3VlPromotionSupportsBackend(.none, .native));
+    try std.testing.expect(qwen3VlPromotionSupportsBackend(.none, .onnx));
+    try std.testing.expect(qwen3VlPromotionSupportsBackend(.none, .metal));
+    try std.testing.expect(qwen3VlPromotionSupportsBackend(.none, .cuda));
+
+    inline for (.{
+        model_compatibility.Qwen3VlPromotion.generation_2b_q4_k_m,
+        model_compatibility.Qwen3VlPromotion.reranker_2b_q8_0,
+    }) |promotion| {
+        try std.testing.expect(!qwen3VlPromotionSupportsBackend(promotion, .native));
+        try std.testing.expect(!qwen3VlPromotionSupportsBackend(promotion, .onnx));
+        try std.testing.expect(qwen3VlPromotionSupportsBackend(promotion, .metal));
+        try std.testing.expect(!qwen3VlPromotionSupportsBackend(promotion, .cuda));
+    }
+}
+
 test "native compatibility rejects a missing lazy GGUF companion" {
     const allocator = std.testing.allocator;
     var dir = std.testing.tmpDir(.{});
@@ -9194,9 +9378,18 @@ test "projector residency follows its request-scoped lifecycle" {
         decoder_bytes,
         try estimateModelArtifactBytes(man, .native),
     );
-    const request = try projectorRunAdmissionAmounts(man);
+    const request = try projectorRunAdmissionAmounts(man, .native, .{});
     try std.testing.expectEqual(projector_bytes, request.host_weight_bytes);
     try std.testing.expectEqual(projector_bytes, request.hostTotalBytes());
+
+    const metal_request = try projectorRunAdmissionAmounts(man, .metal, .{
+        .host_scratch_bytes = 32,
+        .backend_scratch_bytes = 64,
+    });
+    try std.testing.expectEqual(projector_bytes, metal_request.host_weight_bytes);
+    try std.testing.expectEqual(projector_bytes, metal_request.backend_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 32), metal_request.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 64), metal_request.backend_scratch_bytes);
 }
 
 test "onnx admission separates encoded staging from completed residency" {
@@ -10043,6 +10236,62 @@ fn buildTestGgufWithGpt2Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_bos_token", true);
 
     return data.toOwnedSlice(allocator);
+}
+
+/// Qwen3-Embedding-shaped tokenizer metadata: bos and eos share one id
+/// (<|endoftext|>), add_bos_token=false, add_eos_token=true. The historical
+/// bos->cls mapping would wrap encodeForModel sequences with a leading eos
+/// the HF reference never emits.
+fn buildTestGgufWithQwen3EmbeddingTokenizer(allocator: std.mem.Allocator) ![]u8 {
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, gguf_format.magic);
+    try appendTestLe(u32, allocator, &data, 3);
+    try appendTestLe(u64, allocator, &data, 0);
+    try appendTestLe(u64, allocator, &data, 9);
+
+    try appendTestMetadataString(allocator, &data, "general.architecture", "qwen3");
+    try appendTestMetadataString(allocator, &data, "tokenizer.ggml.model", "gpt2");
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.tokens", &.{
+        "hello",
+        "world",
+        "<|endoftext|>",
+    });
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.merges", &.{});
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.bos_token_id", 2);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 2);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.padding_token_id", 2);
+    try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_bos_token", false);
+    try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_eos_token", true);
+
+    return data.toOwnedSlice(allocator);
+}
+
+test "load huggingface tokenizer from gguf qwen3 embedding metadata wraps eos only" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gguf_bytes = try buildTestGgufWithQwen3EmbeddingTokenizer(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "qwen3-embedding-q8_0.gguf", .data = gguf_bytes });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    const gguf_path = try std.fs.path.join(allocator, &.{ model_dir, "qwen3-embedding-q8_0.gguf" });
+    defer allocator.free(gguf_path);
+
+    var tok = try loadHuggingFaceTokenizerFromDirOrGguf(allocator, model_dir, gguf_path);
+    defer tok.deinitSelf();
+
+    var encoded = try tok.tokenizer().encodeForModel(allocator, "hello", 4);
+    defer encoded.deinit();
+
+    // No leading token; one trailing <|endoftext|>; padding masked out.
+    try std.testing.expectEqualSlices(i32, &.{ 0, 2, 2, 2 }, encoded.ids);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 1, 0, 0 }, encoded.attention_mask);
 }
 
 fn buildTestGgufWithGemma4Tokenizer(allocator: std.mem.Allocator) ![]u8 {

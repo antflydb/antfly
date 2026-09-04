@@ -23,7 +23,7 @@ T = TypeVar("T", bound="InferenceEmbedRequest")
 
 @_attrs_define
 class InferenceEmbedRequest:
-    """OpenAI-compatible embedding request with inference multimodal content-part extension
+    r"""OpenAI-compatible embedding request with inference multimodal content-part extension
 
     Attributes:
         model (str): Model name to use for embedding generation
@@ -36,10 +36,16 @@ class InferenceEmbedRequest:
         encoding_format (InferenceEmbedRequestEncodingFormat | Unset): Encoding format for the embeddings (only "float"
             supported) Default: InferenceEmbedRequestEncodingFormat.FLOAT.
         dimensions (int | Unset): Optional truncation size for dense embeddings. Must be a positive integer no larger
-            than the model embedding size. Not supported for sparse models.
+            than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka
+            semantics, matching the OpenAI dimensions parameter). Not supported for sparse models.
         task_type (InferenceEmbedRequestTaskType | Unset): Optional embedding task type using Google embedding task-type
             names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the
-            document prefix.
+            document prefix. For Qwen3-Embedding models, all task types except RETRIEVAL_DOCUMENT wrap the input with the
+            model's instruction format ("Instruct: {task}\nQuery:{input}"); documents are embedded raw.
+        instruction (str | Unset): Optional task description for instruction-aware embedding models (Qwen3-Embedding).
+            Replaces the model's default task description inside the query instruction wrapper ("Instruct:
+            {instruction}\nQuery:{input}"). Requires a query-side task_type; rejected for models without instruction
+            support.
         input_type (InferenceEmbedRequestInputType | Unset): Deprecated compatibility alias for task_type.
             search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification
             and clustering map to their Google task_type equivalents.
@@ -57,6 +63,7 @@ class InferenceEmbedRequest:
     encoding_format: InferenceEmbedRequestEncodingFormat | Unset = InferenceEmbedRequestEncodingFormat.FLOAT
     dimensions: int | Unset = UNSET
     task_type: InferenceEmbedRequestTaskType | Unset = UNSET
+    instruction: str | Unset = UNSET
     input_type: InferenceEmbedRequestInputType | Unset = UNSET
     error_policy: InferenceEmbedRequestErrorPolicy | Unset = InferenceEmbedRequestErrorPolicy.FAIL_FAST
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -97,6 +104,8 @@ class InferenceEmbedRequest:
         if not isinstance(self.task_type, Unset):
             task_type = self.task_type.value
 
+        instruction = self.instruction
+
         input_type: str | Unset = UNSET
         if not isinstance(self.input_type, Unset):
             input_type = self.input_type.value
@@ -119,6 +128,8 @@ class InferenceEmbedRequest:
             field_dict["dimensions"] = dimensions
         if task_type is not UNSET:
             field_dict["task_type"] = task_type
+        if instruction is not UNSET:
+            field_dict["instruction"] = instruction
         if input_type is not UNSET:
             field_dict["input_type"] = input_type
         if error_policy is not UNSET:
@@ -205,6 +216,8 @@ class InferenceEmbedRequest:
         else:
             task_type = InferenceEmbedRequestTaskType(_task_type)
 
+        instruction = d.pop("instruction", UNSET)
+
         _input_type = d.pop("input_type", UNSET)
         input_type: InferenceEmbedRequestInputType | Unset
         if isinstance(_input_type, Unset):
@@ -225,6 +238,7 @@ class InferenceEmbedRequest:
             encoding_format=encoding_format,
             dimensions=dimensions,
             task_type=task_type,
+            instruction=instruction,
             input_type=input_type,
             error_policy=error_policy,
         )

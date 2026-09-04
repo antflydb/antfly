@@ -975,6 +975,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q6_k_linear_reduce_rows_9_64: u64 = 0,
     metal_runtime_q6_k_linear_reduce_rows_65_plus: u64 = 0,
     metal_runtime_q6_k_linear_reduce_f16_input: u64 = 0,
+    metal_runtime_q6_k_high_row_mm_matrix_dispatches: u64 = 0,
     metal_runtime_lm_head_q4_q6_refine_dispatches: u64 = 0,
     metal_runtime_lm_head_q4_resident_sampling_rejections: u64 = 0,
     /// Generated small-batch quant kernel dispatch counters indexed by
@@ -1935,6 +1936,12 @@ pub const ComputeBackend = struct {
         /// Returns: [batch*seq_len, num_heads*head_dim].
         scaledDotProductAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
 
+        /// Optional Qwen3-VL vision-attention route. It has the same unmasked,
+        /// unbiased semantics as scaledDotProductAttention with an empty mask,
+        /// but lets a backend select a model-scoped kernel without changing
+        /// unrelated vision encoders that happen to share a tensor shape.
+        scaledDotProductAttentionQwen3VlVision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
+
         /// Optional bidirectional attention with no mask. This is equivalent
         /// to scaledDotProductAttention with an all-ones mask, but lets
         /// backends avoid a host mask allocation/upload.
@@ -2069,6 +2076,15 @@ pub const ComputeBackend = struct {
         /// input: [total, dim] where total = batch*seq_len.
         /// Rotates pairs of dimensions using sin/cos of position-dependent angles.
         rope: *const fn (ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!CT,
+
+        /// Qwen3-VL interleaved multi-axis RoPE. `positions` is axis-major
+        /// [temporal][height][width], with `token_count` entries per axis.
+        /// Returns null when the backend has no strict device implementation.
+        mrope: ?*const fn (ctx: *anyopaque, input: CT, token_count: usize, head_dim: usize, theta: f32, freq_scale: f32, positions: []const u32, sections: [3]u32) anyerror!?CT = null,
+
+        /// Qwen3-VL vision RoPE. `positions` is axis-major [height][width].
+        /// Each axis owns half of the rotary frequencies in every head.
+        visionRope: ?*const fn (ctx: *anyopaque, input: CT, token_count: usize, head_dim: usize, theta: f32, positions: []const u32) anyerror!?CT = null,
 
         /// Apply scalar multiply and RoPE in one backend op. Used by Gemma
         /// variants that pre-scale Q before attention.
@@ -3533,6 +3549,15 @@ pub const ComputeBackend = struct {
         return self.vtable.scaledDotProductAttention(self.ptr, Q, K, V, mask, attn_bias, batch, seq_len, num_heads, head_dim);
     }
 
+    /// Runs Qwen3-VL's unmasked vision attention. Backends that do not expose
+    /// a model-scoped route retain the regular portable implementation.
+    pub fn scaledDotProductAttentionQwen3VlVision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
+        if (self.vtable.scaledDotProductAttentionQwen3VlVision) |f| {
+            return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
+        }
+        return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
+    }
+
     pub fn scaledDotProductAttentionFull(self: *const ComputeBackend, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
         if (self.vtable.scaledDotProductAttentionFull) |f| {
             return f(self.ptr, Q, K, V, attn_bias, batch, seq_len, num_heads, head_dim);
@@ -3756,6 +3781,16 @@ pub const ComputeBackend = struct {
 
     pub fn rope(self: *const ComputeBackend, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) !CT {
         return self.vtable.rope(self.ptr, input, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs);
+    }
+
+    pub fn mrope(self: *const ComputeBackend, input: CT, token_count: usize, head_dim: usize, theta: f32, freq_scale: f32, positions: []const u32, sections: [3]u32) !?CT {
+        const op = self.vtable.mrope orelse return null;
+        return op(self.ptr, input, token_count, head_dim, theta, freq_scale, positions, sections);
+    }
+
+    pub fn visionRope(self: *const ComputeBackend, input: CT, token_count: usize, head_dim: usize, theta: f32, positions: []const u32) !?CT {
+        const op = self.vtable.visionRope orelse return null;
+        return op(self.ptr, input, token_count, head_dim, theta, positions);
     }
 
     pub fn ropeScaled(self: *const ComputeBackend, input: CT, scale: f32, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) !?CT {
