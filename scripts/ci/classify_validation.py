@@ -56,7 +56,6 @@ SDK_FILES = {
     "scripts/openapi_joiner.py",
     "scripts/public_openapi_overlays.py",
     "scripts/generate_graph_identifier_policy.py",
-    "scripts/ci/check_toolchain_policy.py",
     "scripts/pyproject.toml",
     "scripts/uv.lock",
     ".github/workflows/py-pypi-publish.yml",
@@ -92,6 +91,8 @@ FORMAT_INFRASTRUCTURE = {
 FULL_VALIDATION_FILES = {
     "Makefile",
     "scripts/ci/check.sh",
+    "scripts/ci/check_toolchain_policy.py",
+    "scripts/ci/classify_validation.py",
     "scripts/ci/toolchain-policy.json",
     ".github/workflows/sdks-ci.yml",
 }

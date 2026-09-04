@@ -70,6 +70,8 @@ class ClassifyValidationTests(unittest.TestCase):
             ".github/workflows/sdks-ci.yml",
             ".github/actions/load-toolchain-policy/action.yml",
             "scripts/ci/check.sh",
+            "scripts/ci/check_toolchain_policy.py",
+            "scripts/ci/classify_validation.py",
             "scripts/ci/toolchain-policy.json",
             "Makefile",
         ):
