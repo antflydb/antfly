@@ -2083,6 +2083,9 @@ pub fn runFromIterator(
     var local_inference_connection_context = LocalInferenceConnectionContext{
         .handle = antfly_node,
     };
+    var embedded_provider_lifetime = EmbeddedInferenceProviderLifetime{
+        .handle = antfly_node,
+    };
     // Until DataServer exists, error cleanup is owned here. Once its
     // ResourceManager is attached below, the regular defer is registered
     // after DataServer's so tokenizer budget callbacks are torn down first.
@@ -2421,7 +2424,11 @@ pub fn runFromIterator(
         // embedded provider. Drain them while the node is valid, then release
         // tokenizer reservations while DataServer's ResourceManager is valid.
         // The earlier data_server.deinit defer performs final storage teardown.
-        data_server.quiesceBackgroundWorkWithDeadline(supervisor.deadline());
+        data_server.quiesceExternalProviderUsersWithDeadline(supervisor.deadline()) catch |err| {
+            std.log.err("standalone provider shutdown barrier failed err={s}", .{@errorName(err)});
+            @panic("standalone provider shutdown barrier failed");
+        };
+        embedded_provider_lifetime.quiesce();
         if (comptime inline_inference_codegen)
             inference_host.linkedInferenceDestroy(antfly_node)
         else
@@ -2487,7 +2494,7 @@ pub fn runFromIterator(
         )).configure(&configure_context);
         if (!configure_status.isOk()) return inference_bridge.errorFromStatus(configure_status);
     }
-    data_server.setAntflyProvider(inferenceBoundaryProvider(antfly_node));
+    data_server.setAntflyProvider(inferenceBoundaryProvider(&embedded_provider_lifetime));
 
     // Initialize API server (wires caches + sources) without binding a listener.
     try data_server.initApiServer();
@@ -2500,11 +2507,17 @@ pub fn runFromIterator(
         std.log.err("standalone startup failed step=register_node err={}", .{err});
         return err;
     };
-    data_server.requestProvisionedStartupCatchUpNow() catch |err| {
-        std.log.warn("standalone startup provisioned startup catch-up skipped err={}", .{err});
-    };
-    data_server.requestProvisionedCacheWarmup() catch |err| {
-        std.log.warn("standalone startup provisioned cache warmup skipped err={}", .{err});
+    // Warm the query owner before starting recovery. The warmup completion is
+    // the single handoff into provisioned startup catch-up; launching both
+    // workers concurrently lets catch-up win the gate while warmup exits as
+    // "already active", leaving neither a query owner nor a retry for the
+    // warmup. If warmup itself cannot be scheduled, retain availability by
+    // falling back to the durable catch-up owner directly.
+    data_server.requestProvisionedCacheWarmup() catch |warmup_err| {
+        std.log.warn("standalone startup provisioned cache warmup skipped err={}", .{warmup_err});
+        data_server.requestProvisionedStartupCatchUpNow() catch |catch_up_err| {
+            std.log.warn("standalone startup provisioned startup catch-up skipped err={}", .{catch_up_err});
+        };
     };
 
     // ---------------------------------------------------------------
@@ -4774,9 +4787,95 @@ fn resolveInferenceBudgetOverrides(cli: CliConfig) !InferenceBudgetOverrides {
     };
 }
 
-fn inferenceBoundaryProvider(handle: *anyopaque) antfly.inference.managed_embedder.AntflyProvider {
+/// Process-owned lifetime fence for the embedded provider callback ABI. DB and
+/// API runtimes borrow this stable object rather than the model-manager handle
+/// directly, so shutdown can reject new calls and wait for every admitted call
+/// before destroying the underlying inference node.
+const EmbeddedInferenceProviderLifetime = struct {
+    const closed_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
+    const count_mask: usize = closed_bit - 1;
+
+    handle: *anyopaque,
+    // Admission and borrower count share one modification order. A separate
+    // accepting flag and counter would leave a check/increment window where
+    // shutdown could observe zero and destroy the node before that borrower
+    // committed its reference.
+    state: std.atomic.Value(usize) = .init(0),
+
+    const CallGuard = struct {
+        owner: *EmbeddedInferenceProviderLifetime,
+        active: bool = true,
+
+        fn deinit(self: *@This()) void {
+            if (!self.active) return;
+            const previous = self.owner.state.fetchSub(1, .acq_rel);
+            std.debug.assert(previous & count_mask > 0);
+            self.active = false;
+        }
+    };
+
+    fn acquire(self: *EmbeddedInferenceProviderLifetime) !CallGuard {
+        var observed = self.state.load(.acquire);
+        while (true) {
+            if (observed & closed_bit != 0) return error.InferenceProviderShuttingDown;
+            if (observed & count_mask == count_mask)
+                return error.InferenceProviderCallCapacityExhausted;
+            if (self.state.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire)) |actual| {
+                observed = actual;
+                continue;
+            }
+            return .{ .owner = self };
+        }
+    }
+
+    fn quiesce(self: *EmbeddedInferenceProviderLifetime) void {
+        _ = self.state.fetchOr(closed_bit, .acq_rel);
+        while (self.activeCallCount() != 0) {
+            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn isAccepting(self: *const EmbeddedInferenceProviderLifetime) bool {
+        return self.state.load(.acquire) & closed_bit == 0;
+    }
+
+    fn activeCallCount(self: *const EmbeddedInferenceProviderLifetime) usize {
+        return self.state.load(.acquire) & count_mask;
+    }
+};
+
+test "embedded provider lifetime rejects new calls and joins admitted calls" {
+    var handle_storage: u8 = 0;
+    var lifetime = EmbeddedInferenceProviderLifetime{ .handle = &handle_storage };
+    var guard = try lifetime.acquire();
+
+    const Quiesce = struct {
+        lifetime: *EmbeddedInferenceProviderLifetime,
+        returned: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.lifetime.quiesce();
+            self.returned.store(true, .release);
+        }
+    };
+    var quiesce = Quiesce{ .lifetime = &lifetime };
+    const thread = try std.Thread.spawn(.{}, Quiesce.run, .{&quiesce});
+    while (lifetime.isAccepting()) std.atomic.spinLoopHint();
+
+    try std.testing.expect(!quiesce.returned.load(.acquire));
+    try std.testing.expectError(error.InferenceProviderShuttingDown, lifetime.acquire());
+    guard.deinit();
+    thread.join();
+
+    try std.testing.expect(quiesce.returned.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), lifetime.activeCallCount());
+    try std.testing.expectError(error.InferenceProviderShuttingDown, lifetime.acquire());
+}
+
+fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) antfly.inference.managed_embedder.AntflyProvider {
     return .{
-        .ptr = handle,
+        .ptr = lifetime,
         .owns_invocation_admission = true,
         .embed_dense_texts = inferenceProviderEmbedDenseTexts,
         .embed_dense_texts_with_context = inferenceProviderEmbedDenseTextsWithContext,
@@ -4803,24 +4902,28 @@ fn inferenceBoundaryProvider(handle: *anyopaque) antfly.inference.managed_embedd
 fn invokeInferenceProvider(
     comptime Result: type,
     alloc: std.mem.Allocator,
-    handle: *anyopaque,
+    provider_context: *anyopaque,
     operation: inference_bridge.ProviderOperation,
     request: anytype,
     deadline_ns: ?u64,
 ) !Result {
-    return try invokeInferenceProviderWithBinary(Result, alloc, handle, operation, request, deadline_ns, &.{}, &.{});
+    return try invokeInferenceProviderWithBinary(Result, alloc, provider_context, operation, request, deadline_ns, &.{}, &.{});
 }
 
 fn invokeInferenceProviderWithBinary(
     comptime Result: type,
     alloc: std.mem.Allocator,
-    handle: *anyopaque,
+    provider_context: *anyopaque,
     operation: inference_bridge.ProviderOperation,
     request: anytype,
     deadline_ns: ?u64,
     binary_payloads: []const inference_bridge.ProviderBinaryPayload,
     attachment_refs: []const inference_bridge.ProviderAttachmentRef,
 ) !Result {
+    const lifetime: *EmbeddedInferenceProviderLifetime = @ptrCast(@alignCast(provider_context));
+    var call_guard = try lifetime.acquire();
+    defer call_guard.deinit();
+    const handle = lifetime.handle;
     const request_json = try std.json.Stringify.valueAlloc(alloc, request, .{});
     defer alloc.free(request_json);
     var response_handle: ?*anyopaque = null;
@@ -6220,11 +6323,12 @@ test "standalone encoded reader ABI round trips borrowed payloads" {
     var state: inference_host.LinkedInferenceState = undefined;
     state.alloc = alloc;
     state.read_encoded_images_override = .{ .ptr = &fake, .read_fn = FakeReader.read };
+    var lifetime = EmbeddedInferenceProviderLifetime{ .handle = &state };
 
     // Traverse the production caller, ProviderInvokeContext construction,
     // host operation dispatch, borrowed-payload decode, JSON response, and
     // response destruction without loading a model.
-    const results = try inferenceProviderReadEncodedImages(&state, alloc, "florence2", request);
+    const results = try inferenceProviderReadEncodedImages(&lifetime, alloc, "florence2", request);
     defer {
         for (results) |*result| antfly.readers.deinitResult(alloc, result);
         alloc.free(results);
@@ -6257,7 +6361,7 @@ test "standalone encoded reader ABI round trips borrowed payloads" {
     const invalid_mime_images = [_]antfly.readers.EncodedImage{.{ .bytes = &png, .mime_type = "" }};
     try std.testing.expectError(
         error.InvalidArguments,
-        inferenceProviderReadEncodedImages(&state, alloc, "florence2", .{ .images = &invalid_mime_images }),
+        inferenceProviderReadEncodedImages(&lifetime, alloc, "florence2", .{ .images = &invalid_mime_images }),
     );
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
 

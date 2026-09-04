@@ -64,7 +64,13 @@ pub const AlgebraicIndexStatsIndexType = enum {
 pub const AlgebraicIndexStats = struct {
     /// Discriminator for the index stats variant.
     index_type: AlgebraicIndexStatsIndexType,
+    /// Deprecated compatibility projection. Use milestones and revision fields.
     readiness: ?IndexReadinessStatus = null,
+    /// Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
+    incarnation: ?[]const u8 = null,
+    target_revision: ?i64 = null,
+    published_revision: ?i64 = null,
+    milestones: ?IndexMilestones = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Number of documents reflected in the algebraic sidecar
@@ -160,6 +166,10 @@ pub const AlgebraicIndexStats = struct {
     pub const openApiFieldMetadata = .{
         .{ "index_type", "index_type", false },
         .{ "readiness", "readiness", true },
+        .{ "incarnation", "incarnation", true },
+        .{ "target_revision", "target_revision", true },
+        .{ "published_revision", "published_revision", true },
+        .{ "milestones", "milestones", true },
         .{ "error", "error", true },
         .{ "total_indexed", "total_indexed", true },
         .{ "disk_usage", "disk_usage", true },
@@ -243,6 +253,22 @@ pub const AlgebraicIndexStats = struct {
         try jw.write(self.index_type);
         if (self.readiness) |value| {
             try jw.objectField("readiness");
+            try jw.write(value);
+        }
+        if (self.incarnation) |value| {
+            try jw.objectField("incarnation");
+            try jw.write(value);
+        }
+        if (self.target_revision) |value| {
+            try jw.objectField("target_revision");
+            try jw.write(value);
+        }
+        if (self.published_revision) |value| {
+            try jw.objectField("published_revision");
+            try jw.write(value);
+        }
+        if (self.milestones) |value| {
+            try jw.objectField("milestones");
             try jw.write(value);
         }
         if (self.@"error") |value| {
@@ -2245,9 +2271,20 @@ pub const CreatedProviderConfig = struct {
     }
 };
 
+/// Exact dense-vector publication cardinality for the observed index incarnation.
+pub const DenseVectorPublicationStatus = struct {
+    /// Exact durable vector target for the current dense-index incarnation.
+    target_vectors: i64,
+    /// Physical vectors currently visible to queries.
+    searchable_vectors: i64,
+    /// Whether searchable_vectors exactly equals target_vectors.
+    complete: bool,
+};
+
 /// A structured reason why the coverage projection cannot be treated as globally complete.
 pub const DerivedCoverageObservationIncompleteReason = enum {
     runtime_unavailable,
+    target_observation,
     missing_group,
     unknown_group,
     remote_unknown_group,
@@ -2259,6 +2296,7 @@ pub const DerivedCoverageObservationIncompleteReason = enum {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .runtime_unavailable => "runtime_unavailable",
+            .target_observation => "target_observation",
             .missing_group => "missing_group",
             .unknown_group => "unknown_group",
             .remote_unknown_group => "remote_unknown_group",
@@ -2277,6 +2315,7 @@ pub const DerivedCoverageObservationIncompleteReason = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "target_observation", .target_observation },
             .{ "missing_group", .missing_group },
             .{ "unknown_group", .unknown_group },
             .{ "remote_unknown_group", .remote_unknown_group },
@@ -2639,6 +2678,170 @@ pub const EdgeTypeConfig = struct {
     }
 };
 
+/// Volatile index-incarnation activity. It explains motion but never participates in readiness.
+pub const EmbeddingIndexActivity = struct {
+    /// Opaque worker-and-index-incarnation identity. Rates are valid only between samples with the same epoch.
+    epoch: []const u8,
+    phase: EmbeddingIndexActivityPhase,
+    /// Chunks created for this index during the activity epoch.
+    chunks_created: i64,
+    embedding_batches_completed: i64,
+    /// Embedding vectors successfully computed for this index during the activity epoch.
+    embeddings_computed: i64,
+    /// Items currently submitted to an embedding provider for this index.
+    active_batch_size: i64,
+    /// Completion time of the latest successful embedding batch, or null before the first batch.
+    last_progress_at: ?[]const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "epoch", "epoch", false },
+        .{ "phase", "phase", false },
+        .{ "chunks_created", "chunks_created", false },
+        .{ "embedding_batches_completed", "embedding_batches_completed", false },
+        .{ "embeddings_computed", "embeddings_computed", false },
+        .{ "active_batch_size", "active_batch_size", false },
+        .{ "last_progress_at", "last_progress_at", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("epoch");
+        try jw.write(self.epoch);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("chunks_created");
+        try jw.write(self.chunks_created);
+        try jw.objectField("embedding_batches_completed");
+        try jw.write(self.embedding_batches_completed);
+        try jw.objectField("embeddings_computed");
+        try jw.write(self.embeddings_computed);
+        try jw.objectField("active_batch_size");
+        try jw.write(self.active_batch_size);
+        try jw.objectField("last_progress_at");
+        try jw.write(self.last_progress_at);
+        try jw.endObject();
+    }
+};
+
+pub const EmbeddingIndexActivityPhase = enum {
+    preparing,
+    embedding,
+    publishing,
+    waiting_retry,
+    idle,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .preparing => "preparing",
+            .embedding => "embedding",
+            .publishing => "publishing",
+            .waiting_retry => "waiting_retry",
+            .idle => "idle",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "preparing", .preparing },
+            .{ "embedding", .embedding },
+            .{ "publishing", .publishing },
+            .{ "waiting_retry", .waiting_retry },
+            .{ "idle", .idle },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const EmbeddingSourceCoverageStatus = struct {
+    policy: DerivedCoverageStatusPolicy,
+    /// Whether total and all outcome counts are exact across the expected shards.
+    observation_complete: bool,
+    observation_incomplete_reasons: []const DerivedCoverageObservationIncompleteReason,
+    /// Semantic configuration fingerprint for the observed index incarnation.
+    config_fingerprint: []const u8,
+    /// Source documents in scope. This is a lower bound when observation_complete is false.
+    total: i64,
+    /// Sources awaiting a terminal generation decision; null when the observation is incomplete.
+    pending: ?i64,
+    /// Sources that durably produced material for this index incarnation.
+    covered: i64,
+    /// Sources intentionally producing no material after generation evaluated them.
+    skipped: i64,
+    /// Sources whose generation reached a non-retryable failure.
+    failed: i64,
+    /// Whether source outcomes satisfy the configured coverage policy. Replay and publication are reported independently by revisions and milestones.
+    complete: bool,
+    healthy: bool,
+    degraded: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "policy", "policy", false },
+        .{ "observation_complete", "observation_complete", false },
+        .{ "observation_incomplete_reasons", "observation_incomplete_reasons", false },
+        .{ "config_fingerprint", "config_fingerprint", false },
+        .{ "total", "total", false },
+        .{ "pending", "pending", false },
+        .{ "covered", "covered", false },
+        .{ "skipped", "skipped", false },
+        .{ "failed", "failed", false },
+        .{ "complete", "complete", false },
+        .{ "healthy", "healthy", false },
+        .{ "degraded", "degraded", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("policy");
+        try jw.write(self.policy);
+        try jw.objectField("observation_complete");
+        try jw.write(self.observation_complete);
+        try jw.objectField("observation_incomplete_reasons");
+        try jw.write(self.observation_incomplete_reasons);
+        try jw.objectField("config_fingerprint");
+        try jw.write(self.config_fingerprint);
+        try jw.objectField("total");
+        try jw.write(self.total);
+        try jw.objectField("pending");
+        try jw.write(self.pending);
+        try jw.objectField("covered");
+        try jw.write(self.covered);
+        try jw.objectField("skipped");
+        try jw.write(self.skipped);
+        try jw.objectField("failed");
+        try jw.write(self.failed);
+        try jw.objectField("complete");
+        try jw.write(self.complete);
+        try jw.objectField("healthy");
+        try jw.write(self.healthy);
+        try jw.objectField("degraded");
+        try jw.write(self.degraded);
+        try jw.endObject();
+    }
+};
+
 /// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
 pub const EmbeddingsIndexConfig = struct {
     publication_policy: ?IndexPublicationPolicy = null,
@@ -2827,7 +3030,20 @@ pub const EmbeddingsIndexStatsIndexType = enum {
 pub const EmbeddingsIndexStats = struct {
     /// Discriminator for the index stats variant.
     index_type: EmbeddingsIndexStatsIndexType,
+    /// Deprecated compatibility projection. Use milestones and the explicit status dimensions.
     readiness: ?IndexReadinessStatus = null,
+    /// Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
+    incarnation: ?[]const u8 = null,
+    target_revision: ?i64 = null,
+    published_revision: ?i64 = null,
+    milestones: ?IndexMilestones = null,
+    source_coverage: ?EmbeddingSourceCoverageStatus = null,
+    /// Physical vectors or sparse entries visible to queries; chunked indexes may exceed source coverage.
+    searchable_vectors: ?i64 = null,
+    /// Dense-only exact publication status; absent for sparse indexes and when the target proof is unavailable.
+    publication: ?DenseVectorPublicationStatus = null,
+    /// Fresh owner-reported activity, or null when no heartbeat for this index incarnation is available.
+    activity: OpenApiOptionalNullable(EmbeddingIndexActivity) = .absent,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Number of vectors/documents in the index
@@ -2914,6 +3130,14 @@ pub const EmbeddingsIndexStats = struct {
     pub const openApiFieldMetadata = .{
         .{ "index_type", "index_type", false },
         .{ "readiness", "readiness", true },
+        .{ "incarnation", "incarnation", true },
+        .{ "target_revision", "target_revision", true },
+        .{ "published_revision", "published_revision", true },
+        .{ "milestones", "milestones", true },
+        .{ "source_coverage", "source_coverage", true },
+        .{ "searchable_vectors", "searchable_vectors", true },
+        .{ "publication", "publication", true },
+        .{ "activity", "activity", false },
         .{ "error", "error", true },
         .{ "total_indexed", "total_indexed", true },
         .{ "disk_usage", "disk_usage", true },
@@ -2989,6 +3213,45 @@ pub const EmbeddingsIndexStats = struct {
         if (self.readiness) |value| {
             try jw.objectField("readiness");
             try jw.write(value);
+        }
+        if (self.incarnation) |value| {
+            try jw.objectField("incarnation");
+            try jw.write(value);
+        }
+        if (self.target_revision) |value| {
+            try jw.objectField("target_revision");
+            try jw.write(value);
+        }
+        if (self.published_revision) |value| {
+            try jw.objectField("published_revision");
+            try jw.write(value);
+        }
+        if (self.milestones) |value| {
+            try jw.objectField("milestones");
+            try jw.write(value);
+        }
+        if (self.source_coverage) |value| {
+            try jw.objectField("source_coverage");
+            try jw.write(value);
+        }
+        if (self.searchable_vectors) |value| {
+            try jw.objectField("searchable_vectors");
+            try jw.write(value);
+        }
+        if (self.publication) |value| {
+            try jw.objectField("publication");
+            try jw.write(value);
+        }
+        switch (self.activity) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("activity");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("activity");
+                try jw.write(value);
+            },
         }
         if (self.@"error") |value| {
             try jw.objectField("error");
@@ -3566,7 +3829,13 @@ pub const FullTextIndexStatsIndexType = enum {
 pub const FullTextIndexStats = struct {
     /// Discriminator for the index stats variant.
     index_type: FullTextIndexStatsIndexType,
+    /// Deprecated compatibility projection. Use milestones and revision fields.
     readiness: ?IndexReadinessStatus = null,
+    /// Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
+    incarnation: ?[]const u8 = null,
+    target_revision: ?i64 = null,
+    published_revision: ?i64 = null,
+    milestones: ?IndexMilestones = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Number of documents in the index
@@ -3639,6 +3908,10 @@ pub const FullTextIndexStats = struct {
     pub const openApiFieldMetadata = .{
         .{ "index_type", "index_type", false },
         .{ "readiness", "readiness", true },
+        .{ "incarnation", "incarnation", true },
+        .{ "target_revision", "target_revision", true },
+        .{ "published_revision", "published_revision", true },
+        .{ "milestones", "milestones", true },
         .{ "error", "error", true },
         .{ "total_indexed", "total_indexed", true },
         .{ "disk_usage", "disk_usage", true },
@@ -3699,6 +3972,22 @@ pub const FullTextIndexStats = struct {
         try jw.write(self.index_type);
         if (self.readiness) |value| {
             try jw.objectField("readiness");
+            try jw.write(value);
+        }
+        if (self.incarnation) |value| {
+            try jw.objectField("incarnation");
+            try jw.write(value);
+        }
+        if (self.target_revision) |value| {
+            try jw.objectField("target_revision");
+            try jw.write(value);
+        }
+        if (self.published_revision) |value| {
+            try jw.objectField("published_revision");
+            try jw.write(value);
+        }
+        if (self.milestones) |value| {
+            try jw.objectField("milestones");
             try jw.write(value);
         }
         if (self.@"error") |value| {
@@ -4999,7 +5288,13 @@ pub const GraphIndexStatsIndexType = enum {
 pub const GraphIndexStats = struct {
     /// Discriminator for the index stats variant.
     index_type: GraphIndexStatsIndexType,
+    /// Deprecated compatibility projection. Use milestones and revision fields.
     readiness: ?IndexReadinessStatus = null,
+    /// Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
+    incarnation: ?[]const u8 = null,
+    target_revision: ?i64 = null,
+    published_revision: ?i64 = null,
+    milestones: ?IndexMilestones = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Total number of edges in the graph
@@ -5073,6 +5368,10 @@ pub const GraphIndexStats = struct {
     pub const openApiFieldMetadata = .{
         .{ "index_type", "index_type", false },
         .{ "readiness", "readiness", true },
+        .{ "incarnation", "incarnation", true },
+        .{ "target_revision", "target_revision", true },
+        .{ "published_revision", "published_revision", true },
+        .{ "milestones", "milestones", true },
         .{ "error", "error", true },
         .{ "total_edges", "total_edges", true },
         .{ "edge_types", "edge_types", true },
@@ -5135,6 +5434,22 @@ pub const GraphIndexStats = struct {
         try jw.write(self.index_type);
         if (self.readiness) |value| {
             try jw.objectField("readiness");
+            try jw.write(value);
+        }
+        if (self.incarnation) |value| {
+            try jw.objectField("incarnation");
+            try jw.write(value);
+        }
+        if (self.target_revision) |value| {
+            try jw.objectField("target_revision");
+            try jw.write(value);
+        }
+        if (self.published_revision) |value| {
+            try jw.objectField("published_revision");
+            try jw.write(value);
+        }
+        if (self.milestones) |value| {
+            try jw.objectField("milestones");
             try jw.write(value);
         }
         if (self.@"error") |value| {
@@ -7008,6 +7323,18 @@ pub const IndexExecutionConfig = struct {
     }
 };
 
+pub const IndexMilestoneStatus = struct {
+    /// Whether this milestone is satisfied by the observed index incarnation.
+    reached: bool,
+    /// Milestone-specific, machine-readable blockers. Empty whenever reached is true.
+    blockers: []const []const u8,
+};
+
+pub const IndexMilestones = struct {
+    queryable: IndexMilestoneStatus,
+    complete: IndexMilestoneStatus,
+};
+
 /// Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
 pub const IndexPublicationPolicy = enum {
     progressive,
@@ -7039,6 +7366,7 @@ pub const IndexReadinessReason = enum {
     load_failure,
     enrichment_failure,
     runtime_unavailable,
+    target_observation,
     shard_observation_incomplete,
     incarnation_pending,
     source_publication,
@@ -7053,6 +7381,7 @@ pub const IndexReadinessReason = enum {
             .load_failure => "load_failure",
             .enrichment_failure => "enrichment_failure",
             .runtime_unavailable => "runtime_unavailable",
+            .target_observation => "target_observation",
             .shard_observation_incomplete => "shard_observation_incomplete",
             .incarnation_pending => "incarnation_pending",
             .source_publication => "source_publication",
@@ -7074,6 +7403,7 @@ pub const IndexReadinessReason = enum {
             .{ "load_failure", .load_failure },
             .{ "enrichment_failure", .enrichment_failure },
             .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "target_observation", .target_observation },
             .{ "shard_observation_incomplete", .shard_observation_incomplete },
             .{ "incarnation_pending", .incarnation_pending },
             .{ "source_publication", .source_publication },
@@ -8516,6 +8846,51 @@ pub const TraversalRules = struct {
         try jw.endObject();
     }
 };
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+            if (source == .null) return .null_value;
+            return .{ .value = try std.json.parseFromValueLeaky(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}
 
 /// Parse an OpenAPI object without materializing a second JSON tree while
 /// rejecting explicit null for optional properties whose schemas are non-nullable.
