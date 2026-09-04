@@ -3331,16 +3331,38 @@ pub const AntflyApiHandler = struct {
         }
     }
 
-    pub fn listTransactionSessions(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+    pub fn listTransactionSessions(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        params: metadata_openapi.server.ListTransactionSessionsParams,
+    ) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = self.api_server.alloc;
-        const sessions = try self.api_server.listAuthorizedTransactionSessions(authenticated_identity);
-        defer alloc.free(sessions);
+        const limit = if (params.limit) |value|
+            std.fmt.parseUnsigned(usize, value, 10) catch {
+                _ = ctx.status(400);
+                return ctx.text("invalid transaction session page limit");
+            }
+        else
+            100;
+        if (limit == 0 or limit > 1000) {
+            _ = ctx.status(400);
+            return ctx.text("transaction session page limit must be between 1 and 1000");
+        }
+        const after = if (params.cursor) |value|
+            transactions_api.decodeSessionListCursor(value) catch {
+                _ = ctx.status(400);
+                return ctx.text("invalid transaction session cursor");
+            }
+        else
+            null;
+        const page = try self.api_server.listAuthorizedTransactionSessionsPage(authenticated_identity, after, limit);
+        defer alloc.free(page.sessions);
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
-        const response = try transactions_api.buildSessionListResponse(arena_impl.allocator(), sessions);
+        const response = try transactions_api.buildSessionListPageResponse(arena_impl.allocator(), page.sessions, page.next_cursor);
         return ctx.openApiJson(response);
     }
 
@@ -5088,25 +5110,34 @@ pub const AntflyApiHandler = struct {
         {
             return try idempotentBatchError(ctx, 503, "unknown", "idempotency_unavailable", "atomically fenced durable idempotency storage is not configured", true, &txn_hex);
         }
-        const session = self.api_server.txn_sessions.beginIdempotentForPrincipal(
-            alloc,
-            txn_id,
-            .{ .sync_level = parsed_batch.req.sync_level },
-            self.api_server.localSessionNodeId(),
-            principal,
-            &supplied,
-        ) catch |err| switch (err) {
-            error.IdempotencyConflict, error.TransactionCommitRequestMismatch => return try idempotentBatchError(ctx, 409, "not_applied", "idempotency_conflict", "idempotency key is already bound to a different request", false, &txn_hex),
-            error.SessionLimitExceeded, error.SessionCapacityUnavailable => return try idempotentBatchError(ctx, 429, "unknown", "idempotency_capacity_exhausted", "durable idempotency capacity is exhausted; retry the same Idempotency-Key", true, &txn_hex),
-            error.SessionRecordTooLarge => return respondJsonErrorBody(ctx, 413, "{\"error\":\"idempotent batch exceeds durable receipt capacity\"}"),
-            error.OutOfMemory, error.InvalidTransactionSessionRecord => return err,
-            else => {
-                // Atomic receipt creation can fail after the storage engine's
-                // commit point. Never turn that ambiguity into an untyped 500
-                // that invites a caller to choose a new key.
-                std.log.warn("idempotent receipt publication is ambiguous txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                return try idempotentBatchError(ctx, 409, "unknown", "idempotency_receipt_pending", "durable receipt creation is still being reconciled; retry the same Idempotency-Key", true, &txn_hex);
-            },
+        var attempted_capacity_reclaim = false;
+        const session = while (true) {
+            break self.api_server.txn_sessions.beginIdempotentForPrincipal(
+                alloc,
+                txn_id,
+                .{ .sync_level = parsed_batch.req.sync_level },
+                self.api_server.localSessionNodeId(),
+                principal,
+                &supplied,
+            ) catch |err| switch (err) {
+                error.IdempotencyConflict, error.TransactionCommitRequestMismatch => return try idempotentBatchError(ctx, 409, "not_applied", "idempotency_conflict", "idempotency key is already bound to a different request", false, &txn_hex),
+                error.SessionLimitExceeded, error.SessionCapacityUnavailable => {
+                    if (!attempted_capacity_reclaim) {
+                        attempted_capacity_reclaim = true;
+                        if (try self.api_server.reclaimExpiredReceiptCapacity() > 0) continue;
+                    }
+                    return try idempotentBatchError(ctx, 429, "unknown", "idempotency_capacity_exhausted", "durable idempotency capacity is exhausted; retry the same Idempotency-Key", true, &txn_hex);
+                },
+                error.SessionRecordTooLarge => return respondJsonErrorBody(ctx, 413, "{\"error\":\"idempotent batch exceeds durable receipt capacity\"}"),
+                error.OutOfMemory, error.InvalidTransactionSessionRecord => return err,
+                else => {
+                    // Atomic receipt creation can fail after the storage engine's
+                    // commit point. Never turn that ambiguity into an untyped 500
+                    // that invites a caller to choose a new key.
+                    std.log.warn("idempotent receipt publication is ambiguous txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                    return try idempotentBatchError(ctx, 409, "unknown", "idempotency_receipt_pending", "durable receipt creation is still being reconciled; retry the same Idempotency-Key", true, &txn_hex);
+                },
+            };
         };
 
         // Terminal receipts are immutable reads. Serve them before consulting
@@ -9823,6 +9854,77 @@ test "httpx idempotent batch admission returns its documented JSON receipt error
     try std.testing.expectEqualStrings("unknown", parsed_capacity.value.object.get("status").?.string);
     try std.testing.expectEqualStrings("idempotency_capacity_exhausted", parsed_capacity.value.object.get("code").?.string);
     try std.testing.expect(parsed_capacity.value.object.get("retryable").?.bool);
+}
+
+test "httpx idempotent batch reclaims expired receipt capacity before rejecting admission" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const FakeWrites = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .commit_transaction_with_id = commitTransactionWithId,
+            } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn commitTransactionWithId(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const session_path = "/tmp/antfly-httpx-idempotent-expired-capacity";
+    var cleanup_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer cleanup_io.deinit();
+    std.Io.Dir.cwd().deleteTree(cleanup_io.io(), session_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(cleanup_io.io(), session_path) catch {};
+
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    var writes = FakeWrites{};
+    var api_server = try ApiHttpServer.initWithConfig(alloc, .{
+        .deployment_mode = .standalone,
+        .session_store_path = session_path,
+        .session_ttl_ns = 10 * std.time.ns_per_ms,
+        .session_receipt_ttl_ns = 10 * std.time.ns_per_ms,
+        .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
+        .session_cleanup_max_records = 1,
+        .session_max_receipt_count = 1,
+        .backend_runtime = &runtime,
+    }, source.iface(), null, writes.source());
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    const body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"sync_level\":\"write\"}";
+
+    inline for ([_][]const u8{ "expired-capacity-first", "expired-capacity-second" }, 0..) |key, i| {
+        if (i == 1) std.testing.io.sleep(std.Io.Duration.fromMilliseconds(75), .awake) catch {};
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/idempotent-batch");
+        defer request.deinit();
+        request.body = body;
+        try request.headers.append("idempotency-key", key);
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.idempotentBatchWrite(&ctx, "docs");
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 201), response.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 2), writes.calls.load(.acquire));
 }
 
 test "httpx idempotent batch continues after adopting an expired remote owner" {

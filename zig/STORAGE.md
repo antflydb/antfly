@@ -406,16 +406,23 @@ remain owned by the Lite constructor so conflicting duplicates fail closed.
 There is no storage-specific HTTP namespace. Clients use the same `/db/v1`
 contract regardless of whether standalone storage is `local` or `lite`.
 
-Durable multi-request transaction sessions have bounded, configurable
-retention. Defaults are one hour, cleanup every minute, 1,024 sessions, a
-16 MiB encoded record per session, and 64 savepoints:
+Durable multi-request transaction sessions and compact idempotency receipts
+have independent, bounded retention and capacity. Defaults are one hour for
+both retention windows, cleanup every minute with at most 4,096 records per
+pass, 1,024 interactive sessions, 65,536 receipts / 512 MiB of aggregate
+receipt storage, a 16 MiB encoded record, and 64 savepoints. Capacity admission
+also performs one bounded cleanup pass before rejecting a new receipt:
 
 ```json
 {
   "transaction_sessions": {
     "ttl_seconds": 3600,
+    "receipt_ttl_seconds": 3600,
     "cleanup_interval_seconds": 60,
+    "cleanup_max_records": 4096,
     "max_count": 1024,
+    "max_receipt_count": 65536,
+    "max_receipt_bytes": 536870912,
     "max_record_bytes": 16777216,
     "max_savepoints": 64
   }

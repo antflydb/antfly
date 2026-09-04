@@ -1103,6 +1103,7 @@ pub const ApiHttpServerConfig = struct {
     session_ttl_ns: ?u64 = null,
     session_receipt_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
+    session_cleanup_max_records: usize = 4096,
     session_owner_lease_ttl_ns: ?u64 = null,
     session_owner_lease_renew_interval_ns: ?u64 = null,
     session_savepoint_limit: ?usize = null,
@@ -6826,10 +6827,26 @@ pub const ApiHttpServer = struct {
         const previous_ns = self.last_session_cleanup_ns.load(.acquire);
         if (previous_ns != 0 and now_ns -| previous_ns < interval_ns) return;
         self.last_session_cleanup_ns.store(now_ns, .release);
-        _ = try self.txn_sessions.cleanupExpiredWithCutoffs(
+        _ = try self.txn_sessions.cleanupExpiredWithCutoffsLimit(
             self.alloc,
             now_ns -| ttl_ns,
             now_ns -| receipt_ttl_ns,
+            self.cfg.session_cleanup_max_records,
+        );
+    }
+
+    /// Capacity rejection is often caused by receipts that have already
+    /// crossed their retention boundary but have not reached the periodic
+    /// reaper yet. Reclaim a bounded page synchronously before returning 429.
+    pub fn reclaimExpiredReceiptCapacity(self: *ApiHttpServer) !usize {
+        const ttl_ns = self.cfg.session_ttl_ns orelse return 0;
+        const receipt_ttl_ns = self.cfg.session_receipt_ttl_ns orelse ttl_ns;
+        const now_ns = platform_time.realtimeNs();
+        return try self.txn_sessions.cleanupExpiredWithCutoffsLimit(
+            self.alloc,
+            0,
+            now_ns -| receipt_ttl_ns,
+            self.cfg.session_cleanup_max_records,
         );
     }
 
@@ -10272,22 +10289,34 @@ pub const ApiHttpServer = struct {
         return try self.transactionSessionDetailsAuthorized(authenticated_identity, details);
     }
 
-    pub fn listAuthorizedTransactionSessions(
+    pub const AuthorizedTransactionSessionPage = struct {
+        sessions: []transactions_api.SessionStatus,
+        next_cursor: ?transactions_api.SessionListCursor,
+    };
+
+    pub fn listAuthorizedTransactionSessionsPage(
         self: *ApiHttpServer,
         authenticated_identity: ?AuthenticatedIdentity,
-    ) ![]transactions_api.SessionStatus {
-        const candidates = try self.txn_sessions.listStatusesForPrincipal(
+        after: ?transactions_api.SessionListCursor,
+        limit: usize,
+    ) !AuthorizedTransactionSessionPage {
+        var candidates = try self.txn_sessions.listDetailsPageForPrincipal(
             self.alloc,
             transactionPrincipal(authenticated_identity),
+            after,
+            limit,
         );
-        defer self.alloc.free(candidates);
+        defer candidates.deinit(self.alloc);
         var authorized = std.ArrayListUnmanaged(transactions_api.SessionStatus).empty;
         errdefer authorized.deinit(self.alloc);
-        for (candidates) |status| {
-            if (try self.transactionSessionAccessible(status.txn_id, authenticated_identity))
-                try authorized.append(self.alloc, status);
+        for (candidates.sessions) |details| {
+            if (try self.transactionSessionDetailsAuthorized(authenticated_identity, details))
+                try authorized.append(self.alloc, details.status);
         }
-        return try authorized.toOwnedSlice(self.alloc);
+        return .{
+            .sessions = try authorized.toOwnedSlice(self.alloc),
+            .next_cursor = candidates.next_cursor,
+        };
     }
 
     fn transactionSessionDetailsAuthorized(
@@ -32628,6 +32657,55 @@ test "api http server serves transaction session cleanup route" {
     var parsed_list = try std.json.parseFromSlice(transactions_api.SessionListResponse, std.testing.allocator, list_resp.body, .{});
     defer parsed_list.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed_list.value.session_count);
+}
+
+test "api http server paginates transaction session inventory" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    for (0..3) |_| {
+        var begin = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = routes.Routes.transactions_begin,
+            .content_type = "application/json",
+            .body = "{}",
+        });
+        begin.deinit(alloc);
+    }
+
+    var first = try executeHttpxTestRequest(&server, .{
+        .method = .GET,
+        .uri = "/transactions?limit=2",
+    });
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), first.status);
+    var first_page = try std.json.parseFromSlice(transactions_api.SessionListResponse, alloc, first.body, .{});
+    defer first_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), first_page.value.session_count);
+    try std.testing.expect(first_page.value.next_cursor != null);
+
+    const next_uri = try std.fmt.allocPrint(alloc, "/transactions?limit=2&cursor={s}", .{first_page.value.next_cursor.?});
+    defer alloc.free(next_uri);
+    var second = try executeHttpxTestRequest(&server, .{
+        .method = .GET,
+        .uri = next_uri,
+    });
+    defer second.deinit(alloc);
+    var second_page = try std.json.parseFromSlice(transactions_api.SessionListResponse, alloc, second.body, .{});
+    defer second_page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), second_page.value.session_count);
+    try std.testing.expect(second_page.value.next_cursor == null);
 }
 
 test "api http server reloads durable transaction sessions after restart" {

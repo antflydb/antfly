@@ -115,10 +115,11 @@ def sync_detailed(
     rolling-upgrade safe because older servers reject it instead of silently ignoring the idempotency
     contract. Keys are scoped to the authenticated principal and table and may be replayed after
     timeouts, lost responses, topology changes, or process restarts. Receipts use the configured
-    transaction-session retention period; callers must not reuse a key after that period. Terminal
-    rejections persist and replay their original status, code, message, and retryability. Every durable
-    receipt store uses atomic owner fencing so an expired process incarnation can be recovered after
-    restart; distributed deployments also fail closed unless that fenced store is cluster-shared.
+    idempotency receipt retention period (`transaction_sessions.receipt_ttl_seconds`); callers must not
+    reuse a key after that period. Terminal rejections persist and replay their original status, code,
+    message, and retryability. Every durable receipt store uses atomic owner fencing so an expired
+    process incarnation can be recovered after restart; distributed deployments also fail closed unless
+    that fenced store is cluster-shared.
 
     Args:
         table_name (str):
@@ -191,10 +192,11 @@ def sync(
     rolling-upgrade safe because older servers reject it instead of silently ignoring the idempotency
     contract. Keys are scoped to the authenticated principal and table and may be replayed after
     timeouts, lost responses, topology changes, or process restarts. Receipts use the configured
-    transaction-session retention period; callers must not reuse a key after that period. Terminal
-    rejections persist and replay their original status, code, message, and retryability. Every durable
-    receipt store uses atomic owner fencing so an expired process incarnation can be recovered after
-    restart; distributed deployments also fail closed unless that fenced store is cluster-shared.
+    idempotency receipt retention period (`transaction_sessions.receipt_ttl_seconds`); callers must not
+    reuse a key after that period. Terminal rejections persist and replay their original status, code,
+    message, and retryability. Every durable receipt store uses atomic owner fencing so an expired
+    process incarnation can be recovered after restart; distributed deployments also fail closed unless
+    that fenced store is cluster-shared.
 
     Args:
         table_name (str):
@@ -262,10 +264,11 @@ async def asyncio_detailed(
     rolling-upgrade safe because older servers reject it instead of silently ignoring the idempotency
     contract. Keys are scoped to the authenticated principal and table and may be replayed after
     timeouts, lost responses, topology changes, or process restarts. Receipts use the configured
-    transaction-session retention period; callers must not reuse a key after that period. Terminal
-    rejections persist and replay their original status, code, message, and retryability. Every durable
-    receipt store uses atomic owner fencing so an expired process incarnation can be recovered after
-    restart; distributed deployments also fail closed unless that fenced store is cluster-shared.
+    idempotency receipt retention period (`transaction_sessions.receipt_ttl_seconds`); callers must not
+    reuse a key after that period. Terminal rejections persist and replay their original status, code,
+    message, and retryability. Every durable receipt store uses atomic owner fencing so an expired
+    process incarnation can be recovered after restart; distributed deployments also fail closed unless
+    that fenced store is cluster-shared.
 
     Args:
         table_name (str):
@@ -336,10 +339,11 @@ async def asyncio(
     rolling-upgrade safe because older servers reject it instead of silently ignoring the idempotency
     contract. Keys are scoped to the authenticated principal and table and may be replayed after
     timeouts, lost responses, topology changes, or process restarts. Receipts use the configured
-    transaction-session retention period; callers must not reuse a key after that period. Terminal
-    rejections persist and replay their original status, code, message, and retryability. Every durable
-    receipt store uses atomic owner fencing so an expired process incarnation can be recovered after
-    restart; distributed deployments also fail closed unless that fenced store is cluster-shared.
+    idempotency receipt retention period (`transaction_sessions.receipt_ttl_seconds`); callers must not
+    reuse a key after that period. Terminal rejections persist and replay their original status, code,
+    message, and retryability. Every durable receipt store uses atomic owner fencing so an expired
+    process incarnation can be recovered after restart; distributed deployments also fail closed unless
+    that fenced store is cluster-shared.
 
     Args:
         table_name (str):

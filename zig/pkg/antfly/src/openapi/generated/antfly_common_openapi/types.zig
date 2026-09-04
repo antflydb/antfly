@@ -1711,6 +1711,8 @@ pub const TransactionSessionConfig = struct {
     /// Retention window for compact terminal idempotency receipts.
     receipt_ttl_seconds: ?i64 = null,
     cleanup_interval_seconds: ?i64 = null,
+    /// Maximum expired transaction sessions reclaimed by one scheduled or admission-time cleanup pass.
+    cleanup_max_records: ?i64 = null,
     max_count: ?i64 = null,
     /// Independent count budget for pending and retained idempotency receipts.
     max_receipt_count: ?i64 = null,
@@ -1724,6 +1726,7 @@ pub const TransactionSessionConfig = struct {
         .{ "ttl_seconds", "ttl_seconds", true },
         .{ "receipt_ttl_seconds", "receipt_ttl_seconds", true },
         .{ "cleanup_interval_seconds", "cleanup_interval_seconds", true },
+        .{ "cleanup_max_records", "cleanup_max_records", true },
         .{ "max_count", "max_count", true },
         .{ "max_receipt_count", "max_receipt_count", true },
         .{ "max_receipt_bytes", "max_receipt_bytes", true },
@@ -1751,6 +1754,10 @@ pub const TransactionSessionConfig = struct {
         }
         if (self.cleanup_interval_seconds) |value| {
             try jw.objectField("cleanup_interval_seconds");
+            try jw.write(value);
+        }
+        if (self.cleanup_max_records) |value| {
+            try jw.objectField("cleanup_max_records");
             try jw.write(value);
         }
         if (self.max_count) |value| {

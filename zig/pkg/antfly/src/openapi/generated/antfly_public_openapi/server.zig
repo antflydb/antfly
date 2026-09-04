@@ -649,6 +649,13 @@ pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !st
     return std.json.parseFromSlice(antfly_schema_openapi.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+pub const ListTransactionSessionsParams = struct {
+    /// Maximum number of principal-owned session records scanned for this page.
+    limit: ?[]const u8 = null,
+    /// Opaque cursor returned by the previous page.
+    cursor: ?[]const u8 = null,
+};
+
 /// Parse the JSON request body for beginTransaction.
 pub fn parseBeginTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionBeginRequest) {
     return std.json.parseFromSlice(types.TransactionBeginRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -917,7 +924,7 @@ pub const routes = [_]Route{
 //   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context, params: ListTransactionSessionsParams) !httpx.Response
 //   fn beginTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response
 //   fn commitTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response

@@ -2601,6 +2601,22 @@ paths:
       tags:
         - data_operations
       operationId: listTransactionSessions
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of principal-owned session records scanned for this page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque cursor returned by the previous page.
+          schema:
+            type: string
       responses:
         '200':
           description: Active transaction sessions
@@ -4046,11 +4062,12 @@ paths:
         Executes a batch under a durable, payload-sealed idempotency receipt. The separate endpoint is
         rolling-upgrade safe because older servers reject it instead of silently ignoring the idempotency
         contract. Keys are scoped to the authenticated principal and table and may be replayed after timeouts,
-        lost responses, topology changes, or process restarts. Receipts use the configured transaction-session
-        retention period; callers must not reuse a key after that period. Terminal rejections persist
-        and replay their original status, code, message, and retryability. Every durable receipt store
-        uses atomic owner fencing so an expired process incarnation can be recovered after restart; distributed
-        deployments also fail closed unless that fenced store is cluster-shared.
+        lost responses, topology changes, or process restarts. Receipts use the configured idempotency
+        receipt retention period (`transaction_sessions.receipt_ttl_seconds`); callers must not reuse
+        a key after that period. Terminal rejections persist and replay their original status, code, message,
+        and retryability. Every durable receipt store uses atomic owner fencing so an expired process
+        incarnation can be recovered after restart; distributed deployments also fail closed unless that
+        fenced store is cluster-shared.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -12656,6 +12673,7 @@ components:
       properties:
         session_count:
           type: integer
+          description: Number of authorized sessions returned in this page.
         lease_held_count:
           type: integer
         lease_expired_count:
@@ -12664,6 +12682,10 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/TransactionSessionStatus'
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next bounded inventory page, if one exists.
     TransactionSessionCleanupResponse:
       type: object
       properties:

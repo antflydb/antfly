@@ -55,7 +55,7 @@ const LocalSchemaProgressProvider = struct {
 };
 const default_public_port: u16 = 8080;
 const cors_default_methods = [_][]const u8{ "GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH" };
-const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin" };
+const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "Idempotency-Key", "X-Requested-With", "Accept", "Origin" };
 const cors_default_exposed_headers = [_][]const u8{
     "X-Request-ID",
     "Retry-After",
@@ -69,6 +69,7 @@ const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
 const standalone_session_ttl_ns: u64 = std.time.ns_per_hour;
 const standalone_session_receipt_ttl_ns: u64 = std.time.ns_per_hour;
 const standalone_session_cleanup_interval_ns: u64 = std.time.ns_per_min;
+const standalone_session_cleanup_max_records: usize = 4096;
 const standalone_session_max_count: usize = 1024;
 const standalone_session_max_receipt_count: usize = 65536;
 const standalone_session_max_receipt_bytes: usize = 512 * 1024 * 1024;
@@ -2371,6 +2372,7 @@ pub fn runFromIterator(
             .session_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.ttl_seconds * std.time.ns_per_s else standalone_session_ttl_ns,
             .session_receipt_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.receipt_ttl_seconds * std.time.ns_per_s else standalone_session_receipt_ttl_ns,
             .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,
+            .session_cleanup_max_records = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_max_records else standalone_session_cleanup_max_records,
             .session_max_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_count else standalone_session_max_count,
             .session_max_receipt_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_receipt_count else standalone_session_max_receipt_count,
             .session_max_receipt_bytes = if (loaded_config) |*cfg| cfg.transaction_sessions.max_receipt_bytes else standalone_session_max_receipt_bytes,
@@ -6142,12 +6144,12 @@ test "standalone CORS middleware enforces dynamic configuration" {
             .OPTIONS,
             "https://any.example",
             "POST",
-            "content-type, AUTHORIZATION",
+            "content-type, AUTHORIZATION, idempotency-key",
         );
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 204), response.status.code);
         try std.testing.expectEqualStrings("GET, POST, PUT, DELETE, OPTIONS, PATCH", response.headers.get("Access-Control-Allow-Methods").?);
-        try std.testing.expectEqualStrings("Content-Type, Authorization, X-Requested-With, Accept, Origin", response.headers.get("Access-Control-Allow-Headers").?);
+        try std.testing.expectEqualStrings("Content-Type, Authorization, Idempotency-Key, X-Requested-With, Accept, Origin", response.headers.get("Access-Control-Allow-Headers").?);
         try std.testing.expectEqualStrings("3600", response.headers.get("Access-Control-Max-Age").?);
     }
     {

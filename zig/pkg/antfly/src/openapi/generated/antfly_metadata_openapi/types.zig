@@ -11656,10 +11656,13 @@ pub const TransactionSessionDetailsResponse = struct {
 };
 
 pub const TransactionSessionListResponse = struct {
+    /// Number of authorized sessions returned in this page.
     session_count: ?i64 = null,
     lease_held_count: ?i64 = null,
     lease_expired_count: ?i64 = null,
     sessions: ?[]const TransactionSessionStatus = null,
+    /// Opaque cursor for the next bounded inventory page, if one exists.
+    next_cursor: OpenApiOptionalNullable([]const u8) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -11667,6 +11670,7 @@ pub const TransactionSessionListResponse = struct {
         .{ "lease_held_count", "lease_held_count", true },
         .{ "lease_expired_count", "lease_expired_count", true },
         .{ "sessions", "sessions", true },
+        .{ "next_cursor", "next_cursor", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -11694,6 +11698,17 @@ pub const TransactionSessionListResponse = struct {
         if (self.sessions) |value| {
             try jw.objectField("sessions");
             try jw.write(value);
+        }
+        switch (self.next_cursor) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("next_cursor");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("next_cursor");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }

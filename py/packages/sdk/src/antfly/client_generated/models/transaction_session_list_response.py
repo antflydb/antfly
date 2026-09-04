@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -19,16 +19,18 @@ T = TypeVar("T", bound="TransactionSessionListResponse")
 class TransactionSessionListResponse:
     """
     Attributes:
-        session_count (int | Unset):
+        session_count (int | Unset): Number of authorized sessions returned in this page.
         lease_held_count (int | Unset):
         lease_expired_count (int | Unset):
         sessions (list[TransactionSessionStatus] | Unset):
+        next_cursor (None | str | Unset): Opaque cursor for the next bounded inventory page, if one exists.
     """
 
     session_count: int | Unset = UNSET
     lease_held_count: int | Unset = UNSET
     lease_expired_count: int | Unset = UNSET
     sessions: list[TransactionSessionStatus] | Unset = UNSET
+    next_cursor: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -45,6 +47,12 @@ class TransactionSessionListResponse:
                 sessions_item = sessions_item_data.to_dict()
                 sessions.append(sessions_item)
 
+        next_cursor: None | str | Unset
+        if isinstance(self.next_cursor, Unset):
+            next_cursor = UNSET
+        else:
+            next_cursor = self.next_cursor
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -56,6 +64,8 @@ class TransactionSessionListResponse:
             field_dict["lease_expired_count"] = lease_expired_count
         if sessions is not UNSET:
             field_dict["sessions"] = sessions
+        if next_cursor is not UNSET:
+            field_dict["next_cursor"] = next_cursor
 
         return field_dict
 
@@ -79,11 +89,21 @@ class TransactionSessionListResponse:
 
                 sessions.append(sessions_item)
 
+        def _parse_next_cursor(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        next_cursor = _parse_next_cursor(d.pop("next_cursor", UNSET))
+
         transaction_session_list_response = cls(
             session_count=session_count,
             lease_held_count=lease_held_count,
             lease_expired_count=lease_expired_count,
             sessions=sessions,
+            next_cursor=next_cursor,
         )
 
         transaction_session_list_response.additional_properties = d
