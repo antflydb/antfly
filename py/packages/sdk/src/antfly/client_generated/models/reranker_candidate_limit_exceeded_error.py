@@ -18,9 +18,9 @@ class RerankerCandidateLimitExceededError:
     Attributes:
         status (RerankerCandidateLimitExceededErrorStatus):
         error (RerankerCandidateLimitExceededErrorError):
-        message (str):
+        message (str): Human-readable summary of the selected provider's candidate ceiling.
         provider (RerankerProvider): The reranking provider to use.
-        maximum (int):
+        maximum (int): Maximum candidate window accepted by the selected provider.
         retryable (bool):
     """
 

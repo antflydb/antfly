@@ -27,6 +27,7 @@ const google_auth = @import("antfly_google").auth;
 
 pub const Config = lib.Config;
 pub const Provider = lib.Provider;
+pub const max_candidate_count = lib.max_candidate_count;
 
 /// Long-lived resources shared by reranking requests. This keeps HTTP
 /// connections warm and lets ADC refresh single-flight per credential/scope.

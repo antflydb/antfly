@@ -3104,9 +3104,13 @@ export interface components {
             status: 422;
             /** @enum {string} */
             error: "reranker_candidate_limit_exceeded";
+            /** @description Human-readable summary of the selected provider's candidate ceiling. */
             message: string;
             provider: components["schemas"]["RerankerProvider"];
-            /** Format: int32 */
+            /**
+             * Format: int32
+             * @description Maximum candidate window accepted by the selected provider.
+             */
             maximum: number;
             /** @enum {boolean} */
             retryable: false;

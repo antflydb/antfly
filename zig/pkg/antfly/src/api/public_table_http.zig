@@ -25,7 +25,7 @@ const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagn
 const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
 const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
-const graph_request_diagnostics = @import("graph_request_diagnostics.zig");
+const query_request_diagnostics = @import("query_request_diagnostics.zig");
 const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -882,16 +882,28 @@ pub const RerankerCandidateLimitExceededError = struct {
     status: u16 = 422,
     @"error": []const u8 = "reranker_candidate_limit_exceeded",
     message: []const u8 = "reranker candidate window exceeds the selected provider limit",
-    provider: []const u8,
+    provider: reranking_contract.Provider,
     maximum: u32,
     retryable: bool = false,
 };
 
-pub fn vertexRerankerCandidateLimitExceededBody(alloc: std.mem.Allocator) ![]u8 {
+pub fn rerankerCandidateLimitExceededBody(alloc: std.mem.Allocator) ![]u8 {
+    const diagnostic = reranking_contract.takeCandidateLimitDiagnostic() orelse
+        return error.MissingRerankerCandidateLimitDiagnostic;
     return try std.json.Stringify.valueAlloc(alloc, RerankerCandidateLimitExceededError{
-        .provider = "vertex",
-        .maximum = reranking_contract.vertex_max_candidate_count,
+        .provider = diagnostic.provider,
+        .maximum = diagnostic.maximum,
     }, .{});
+}
+
+pub fn rerankerCandidateLimitExceededMessageAlloc(alloc: std.mem.Allocator) ![]u8 {
+    const diagnostic = reranking_contract.takeCandidateLimitDiagnostic() orelse
+        return error.MissingRerankerCandidateLimitDiagnostic;
+    return try std.fmt.allocPrint(
+        alloc,
+        "{s} reranker supports at most {d} candidates per query",
+        .{ @tagName(diagnostic.provider), diagnostic.maximum },
+    );
 }
 
 pub fn isNonRetryableTableStorageReadError(err: anyerror) bool {
@@ -1417,8 +1429,8 @@ pub fn handleTableQueryRequest(
     row_filter_json: ?[]const u8,
     api: TableApi,
 ) !OwnedResponse {
-    var diagnostic_context: graph_request_diagnostics.Context = .{};
-    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    var diagnostic_context: query_request_diagnostics.Context = .{};
+    const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
     defer diagnostic_scope.deinit();
 
     if (try bodyHasInternalShardQueryFields(alloc, body)) {
@@ -1427,10 +1439,7 @@ pub fn handleTableQueryRequest(
     }
 
     db_mod.resetLastSortRejectionDiagnostic();
-    graph_query_diagnostic.reset();
-    graph_distinct_budget_diagnostic.reset();
-    graph_work_budget_diagnostic.reset();
-    graph_path_weight_diagnostic.reset();
+    query_request_diagnostics.reset();
     query_contract.validatePublicQuerySortTupleContract(alloc, body) catch |err| switch (err) {
         error.InvalidQueryRequest => {
             std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
@@ -1515,7 +1524,7 @@ pub fn handleTableQueryRequest(
             },
             error.RerankerCandidateLimitExceeded => {
                 std.log.warn("public table query exceeds reranker provider candidate limit table={s}", .{table_name});
-                return .{ .status = 422, .body = try vertexRerankerCandidateLimitExceededBody(alloc), .json = true };
+                return .{ .status = 422, .body = try rerankerCandidateLimitExceededBody(alloc), .json = true };
             },
             error.GraphWorkBudgetExceeded => {
                 std.log.warn("public table graph work budget exceeded table={s}", .{table_name});
@@ -3362,6 +3371,64 @@ test "public table query handler maps doc identity unavailable errors" {
     );
 }
 
+test "public table query reports the selected reranker candidate ceiling" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteQueryError![]u8 {
+            const cfg = reranking_contract.Config{
+                .provider = .antfly,
+                .field = "body",
+                .candidate_count = reranking_contract.max_candidate_count + 1,
+            };
+            cfg.validate() catch |err| switch (err) {
+                error.RerankerCandidateLimitExceeded => return error.RerankerCandidateLimitExceeded,
+                else => return error.InvalidQueryRequest,
+            };
+            return error.InvalidQueryRequest;
+        }
+    };
+
+    var response = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"full_text_search":{"query":"raft"},"reranker":{"provider":"antfly","model":"reranker","field":"body","candidate_count":1001}}
+    , null, Backend.iface());
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), response.status);
+    var parsed = try std.json.parseFromSlice(
+        RerankerCandidateLimitExceededError,
+        std.testing.allocator,
+        response.body,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(reranking_contract.Provider.antfly, parsed.value.provider);
+    try std.testing.expectEqual(reranking_contract.max_candidate_count, parsed.value.maximum);
+}
+
 test "public table query handler preserves structured filter and hierarchy diagnostics" {
     const Backend = struct {
         err: TableApi.ExecuteQueryError,
@@ -3482,6 +3549,8 @@ test "public table query handler preserves structured filter and hierarchy diagn
 }
 
 test "public table query handler preserves retryable failure status" {
+    @import("../test_error_logs.zig").expectErrorLogs(2);
+
     const Backend = struct {
         err: TableApi.ExecuteQueryError,
 
@@ -3520,21 +3589,22 @@ test "public table query handler preserves retryable failure status" {
         status: u16,
         body: []const u8,
         json: bool = false,
+        retry_after_seconds: ?u32 = null,
         unavailable_code: ?[]const u8 = null,
         unavailable_message: []const u8 = "",
     };
     const cases = [_]Case{
-        .{ .err = error.QueryEmbeddingInputTooLarge, .status = 413, .body = "query embedding input too large" },
-        .{ .err = error.QueryEmbeddingOverloaded, .status = 429, .body = "query embedding overloaded" },
-        .{ .err = error.EmbedRateLimited, .status = 429, .body = "query embedding rate limited" },
-        .{ .err = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
-        .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "query embedding provider failed" },
-        .{ .err = error.IndexRebuilding, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
-        .{ .err = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
+        .{ .err = error.QueryEmbeddingInputTooLarge, .status = 413, .body = "{\"code\":\"query_embedding_input_too_large\",\"error\":\"query_embedding_input_too_large\",\"message\":\"query embedding input too large\",\"retryable\":false}", .json = true },
+        .{ .err = error.QueryEmbeddingOverloaded, .status = 429, .body = "{\"code\":\"query_embedding_overloaded\",\"error\":\"query_embedding_overloaded\",\"message\":\"query embedding overloaded\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },
+        .{ .err = error.EmbedRateLimited, .status = 429, .body = "{\"code\":\"query_embedding_rate_limited\",\"error\":\"query_embedding_rate_limited\",\"message\":\"query embedding rate limited\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },
+        .{ .err = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
+        .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "{\"code\":\"query_embedding_upstream_failure\",\"error\":\"query_embedding_upstream_failure\",\"message\":\"query embedding provider failed\",\"retryable\":false}", .json = true },
+        .{ .err = error.IndexRebuilding, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
+        .{ .err = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
         .{ .err = error.HierarchyCursorStale, .status = 409, .body = "{\"status\":409,\"error\":\"hierarchy_cursor_stale\",\"message\":\"the source hierarchy changed after this cursor was issued\",\"action\":\"restart_hierarchy_traversal\",\"restart_without\":\"search_after\",\"retryable\":false}", .json = true },
         .{ .err = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
         .{ .err = error.CorruptInput, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"CorruptInput\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
-        .{ .err = error.IncompletePublishedSnapshot, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
+        .{ .err = error.IncompletePublishedSnapshot, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
     };
 
     for (cases) |tc| {
@@ -3550,10 +3620,7 @@ test "public table query handler preserves retryable failure status" {
             try std.testing.expectEqualStrings(tc.body, resp.body);
         }
         try std.testing.expectEqual(tc.json, resp.json);
-        try std.testing.expectEqual(
-            if (tc.unavailable_code != null) @as(?u32, 1) else null,
-            resp.retry_after_seconds,
-        );
+        try std.testing.expectEqual(tc.retry_after_seconds, resp.retry_after_seconds);
     }
 }
 
@@ -4368,8 +4435,8 @@ test "unsupported graph diagnostics identify the rejected operation feature" {
 }
 
 test "runtime graph capability diagnostics preserve the failing named operation" {
-    var diagnostic_context: graph_request_diagnostics.Context = .{};
-    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    var diagnostic_context: query_request_diagnostics.Context = .{};
+    const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
     defer diagnostic_scope.deinit();
     graph_query_diagnostic.reset();
     graph_query_diagnostic.record(
@@ -4396,8 +4463,8 @@ test "runtime graph capability diagnostics preserve the failing named operation"
 }
 
 test "recorded graph diagnostics explain serverless legacy rejection" {
-    var diagnostic_context: graph_request_diagnostics.Context = .{};
-    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    var diagnostic_context: query_request_diagnostics.Context = .{};
+    const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
     defer diagnostic_scope.deinit();
     graph_query_diagnostic.reset();
     defer graph_query_diagnostic.reset();
@@ -4433,8 +4500,8 @@ test "recorded graph diagnostics explain serverless legacy rejection" {
 }
 
 test "recorded graph diagnostics identify unsupported request controls" {
-    var diagnostic_context: graph_request_diagnostics.Context = .{};
-    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    var diagnostic_context: query_request_diagnostics.Context = .{};
+    const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
     defer diagnostic_scope.deinit();
     graph_query_diagnostic.reset();
     defer graph_query_diagnostic.reset();

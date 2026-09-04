@@ -6477,6 +6477,7 @@ pub fn build(b: *std.Build) void {
             "public create index exposes unsupported deployment capability",
             "public create index returns normalized created resource",
             "public table query handler maps doc identity unavailable errors",
+            "public table query reports the selected reranker candidate ceiling",
             "public table query handler maps exact graph execution failures",
             "graph path weight error body fails closed without its diagnostic",
             "public table query handler preserves structured filter and hierarchy diagnostics",

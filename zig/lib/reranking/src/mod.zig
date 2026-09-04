@@ -23,6 +23,59 @@ pub const OpenApiConfig = openapi.RerankerConfig;
 pub const max_candidate_count: u32 = 1000;
 pub const vertex_max_candidate_count: u32 = 200;
 
+pub const CandidateLimitDiagnostic = struct {
+    provider: Provider,
+    maximum: u32,
+};
+
+/// Request-owned storage for the structured detail attached to
+/// `RerankerCandidateLimitExceeded`. Zig errors intentionally carry no
+/// payload, so public request boundaries bind this storage while synchronous
+/// query validation runs.
+pub const CandidateLimitDiagnosticStorage = struct {
+    diagnostic: ?CandidateLimitDiagnostic = null,
+};
+
+threadlocal var active_candidate_limit_storage: ?*CandidateLimitDiagnosticStorage = null;
+
+pub const CandidateLimitDiagnosticBinding = struct {
+    previous: ?*CandidateLimitDiagnosticStorage,
+
+    pub fn deinit(self: CandidateLimitDiagnosticBinding) void {
+        active_candidate_limit_storage = self.previous;
+    }
+};
+
+pub fn bindCandidateLimitDiagnostic(storage: *CandidateLimitDiagnosticStorage) CandidateLimitDiagnosticBinding {
+    const previous = active_candidate_limit_storage;
+    active_candidate_limit_storage = storage;
+    return .{ .previous = previous };
+}
+
+pub fn resetCandidateLimitDiagnostic() void {
+    if (active_candidate_limit_storage) |storage| storage.diagnostic = null;
+}
+
+pub fn takeCandidateLimitDiagnostic() ?CandidateLimitDiagnostic {
+    const storage = active_candidate_limit_storage orelse return null;
+    const diagnostic = storage.diagnostic;
+    storage.diagnostic = null;
+    return diagnostic;
+}
+
+fn recordCandidateLimitDiagnostic(provider: Provider) void {
+    const storage = active_candidate_limit_storage orelse return;
+    storage.diagnostic = .{
+        .provider = provider,
+        .maximum = maxCandidateCountForProvider(provider),
+    };
+}
+
+fn candidateLimitExceeded(provider: Provider) error{RerankerCandidateLimitExceeded} {
+    recordCandidateLimitDiagnostic(provider);
+    return error.RerankerCandidateLimitExceeded;
+}
+
 /// The provider request is deliberately a single globally-ranked window. Keep
 /// its ceiling aligned with each upstream API instead of accepting work that
 /// the selected provider cannot execute or splitting scores into incomparable
@@ -83,11 +136,11 @@ pub const Config = struct {
         const provider_max = maxCandidateCountForProvider(self.provider);
         if (self.candidate_count) |candidate_count| {
             if (candidate_count == 0) return error.InvalidRerankerConfig;
-            if (candidate_count > provider_max) return error.RerankerCandidateLimitExceeded;
+            if (candidate_count > provider_max) return candidateLimitExceeded(self.provider);
         }
         if (self.top_n) |top_n| {
             if (top_n == 0) return error.InvalidRerankerConfig;
-            if (top_n > provider_max) return error.RerankerCandidateLimitExceeded;
+            if (top_n > provider_max) return candidateLimitExceeded(self.provider);
         }
         if (self.candidate_count != null and self.top_n != null and self.top_n.? > self.candidate_count.?) {
             return error.InvalidRerankerConfig;
@@ -111,7 +164,7 @@ pub fn validateQueryWindow(cfg: Config, offset: u32, limit: u32) !void {
     const output_limit = cfg.top_n orelse limit;
     const effective_candidates = cfg.candidate_count orelse offset +| output_limit;
     if (effective_candidates > maxCandidateCountForProvider(cfg.provider))
-        return error.RerankerCandidateLimitExceeded;
+        return candidateLimitExceeded(cfg.provider);
 }
 
 pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
@@ -230,6 +283,45 @@ test "reranker candidate limits follow provider request capabilities" {
         .model = "rerank-v4.0-pro",
     };
     try validateQueryWindow(cohere, 0, max_candidate_count);
+}
+
+test "reranker candidate limit diagnostics are request scoped and provider specific" {
+    var outer_storage: CandidateLimitDiagnosticStorage = .{};
+    const outer_binding = bindCandidateLimitDiagnostic(&outer_storage);
+    defer outer_binding.deinit();
+
+    const cohere = Config{
+        .provider = .cohere,
+        .field = "body",
+        .model = "rerank-v4.0-pro",
+        .candidate_count = max_candidate_count + 1,
+    };
+    try std.testing.expectError(error.RerankerCandidateLimitExceeded, cohere.validate());
+    const outer = takeCandidateLimitDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Provider.cohere, outer.provider);
+    try std.testing.expectEqual(max_candidate_count, outer.maximum);
+    try std.testing.expect(takeCandidateLimitDiagnostic() == null);
+
+    recordCandidateLimitDiagnostic(.antfly);
+    var inner_storage: CandidateLimitDiagnosticStorage = .{};
+    const inner_binding = bindCandidateLimitDiagnostic(&inner_storage);
+    const vertex = Config{
+        .provider = .vertex,
+        .field = "body",
+        .model = "semantic-ranker-default@latest",
+    };
+    try std.testing.expectError(
+        error.RerankerCandidateLimitExceeded,
+        validateQueryWindow(vertex, 0, vertex_max_candidate_count + 1),
+    );
+    const inner = takeCandidateLimitDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Provider.vertex, inner.provider);
+    try std.testing.expectEqual(vertex_max_candidate_count, inner.maximum);
+    inner_binding.deinit();
+
+    const restored = takeCandidateLimitDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Provider.antfly, restored.provider);
+    try std.testing.expectEqual(max_candidate_count, restored.maximum);
 }
 
 test "reranker config requires field or template" {

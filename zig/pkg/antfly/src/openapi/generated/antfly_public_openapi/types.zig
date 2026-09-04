@@ -8682,8 +8682,10 @@ pub const ReplicationTransformOp = struct {
 pub const RerankerCandidateLimitExceededError = struct {
     status: i32,
     @"error": []const u8,
+    /// Human-readable summary of the selected provider's candidate ceiling.
     message: []const u8,
     provider: antfly_reranking_openapi.RerankerProvider,
+    /// Maximum candidate window accepted by the selected provider.
     maximum: i32,
     retryable: bool,
 

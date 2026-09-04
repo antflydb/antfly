@@ -54,6 +54,7 @@ const backups_api = @import("backups.zig");
 const batch_api = @import("batch.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const public_table_http = @import("public_table_http.zig");
+const query_request_diagnostics = @import("query_request_diagnostics.zig");
 const stored_destination_authorization = @import("stored_destination_authorization.zig");
 const tables_api = @import("tables.zig");
 const table_contract = @import("table_contract.zig");
@@ -4335,6 +4336,11 @@ pub const AntflyApiHandler = struct {
     }
 
     pub fn retrievalAgent(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var diagnostic_context: query_request_diagnostics.Context = .{};
+        const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
+        defer diagnostic_scope.deinit();
+        query_request_diagnostics.reset();
+
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -4529,7 +4535,7 @@ pub const AntflyApiHandler = struct {
             error.RerankerCandidateLimitExceeded => {
                 var response = contextual_operations.jsonWithStatus(
                     422,
-                    try public_table_http.vertexRerankerCandidateLimitExceededBody(alloc),
+                    try public_table_http.rerankerCandidateLimitExceededBody(alloc),
                     false,
                 );
                 return try respondOwnedApiResponse(ctx, &response);

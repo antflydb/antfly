@@ -32,7 +32,7 @@ const batch_api = @import("batch.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
-const graph_request_diagnostics = @import("graph_request_diagnostics.zig");
+const query_request_diagnostics = @import("query_request_diagnostics.zig");
 const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
 const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
 const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
@@ -6313,6 +6313,11 @@ pub const ApiHttpServer = struct {
         query_embedding_security_scope: QueryEmbeddingSecurityScope,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !void {
+        var diagnostic_context: query_request_diagnostics.Context = .{};
+        const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
+        defer diagnostic_scope.deinit();
+        query_request_diagnostics.reset();
+
         const source = self.table_reads orelse {
             try queue.status(alloc, task_id, context_id, "failed", "not found");
             return;
@@ -6546,7 +6551,9 @@ pub const ApiHttpServer = struct {
                 return;
             },
             error.RerankerCandidateLimitExceeded => {
-                try queue.status(alloc, task_id, context_id, "failed", "vertex reranker supports at most 200 candidates per query");
+                const message = try public_table_http.rerankerCandidateLimitExceededMessageAlloc(alloc);
+                defer alloc.free(message);
+                try queue.status(alloc, task_id, context_id, "failed", message);
                 return;
             },
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
@@ -14109,8 +14116,8 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) ![]u8 {
-        var diagnostic_context: graph_request_diagnostics.Context = .{};
-        const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+        var diagnostic_context: query_request_diagnostics.Context = .{};
+        const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
         defer diagnostic_scope.deinit();
 
         comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.query) == .query);
@@ -14120,10 +14127,7 @@ pub const ApiHttpServer = struct {
         defer if (row_filter_json) |value| self.alloc.free(value);
         const source = self.table_reads orelse return error.TableNotFound;
         db_mod.resetLastSortRejectionDiagnostic();
-        graph_query_diagnostic.reset();
-        graph_distinct_budget_diagnostic.reset();
-        graph_path_weight_diagnostic.reset();
-        graph_work_budget_diagnostic.reset();
+        query_request_diagnostics.reset();
         var query_response = try self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
@@ -14753,8 +14757,8 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
-        var diagnostic_context: graph_request_diagnostics.Context = .{};
-        const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+        var diagnostic_context: query_request_diagnostics.Context = .{};
+        const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
         defer diagnostic_scope.deinit();
 
         // `/query` selects its table from the body, so path middleware cannot
@@ -14767,10 +14771,7 @@ pub const ApiHttpServer = struct {
 
         const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
         db_mod.resetLastSortRejectionDiagnostic();
-        graph_query_diagnostic.reset();
-        graph_distinct_budget_diagnostic.reset();
-        graph_path_weight_diagnostic.reset();
-        graph_work_budget_diagnostic.reset();
+        query_request_diagnostics.reset();
         const query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
@@ -14799,8 +14800,8 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
-        var diagnostic_context: graph_request_diagnostics.Context = .{};
-        const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+        var diagnostic_context: query_request_diagnostics.Context = .{};
+        const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
         defer diagnostic_scope.deinit();
 
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -14848,10 +14849,7 @@ pub const ApiHttpServer = struct {
 
             const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
             db_mod.resetLastSortRejectionDiagnostic();
-            graph_query_diagnostic.reset();
-            graph_distinct_budget_diagnostic.reset();
-            graph_path_weight_diagnostic.reset();
-            graph_work_budget_diagnostic.reset();
+            query_request_diagnostics.reset();
             var query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
                 self.alloc,
                 source,
@@ -18030,7 +18028,7 @@ fn contextualRerankerCandidateLimitExceededResponse(alloc: std.mem.Allocator) !c
     return .{
         .status = 422,
         .content_type = "application/json",
-        .body = try public_table_http.vertexRerankerCandidateLimitExceededBody(alloc),
+        .body = try public_table_http.rerankerCandidateLimitExceededBody(alloc),
     };
 }
 
@@ -22100,14 +22098,25 @@ test "api http query budget rejection response exposes stable sort reason" {
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_detail);
     try std.testing.expectEqualStrings("full_text_index_v0", parsed.value.sort_rejection_field);
 
+    var diagnostic_context: query_request_diagnostics.Context = .{};
+    const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
+    defer diagnostic_scope.deinit();
+    const cohere = reranking_runtime.Config{
+        .provider = .cohere,
+        .field = "body",
+        .model = "rerank-v4.0-pro",
+        .candidate_count = reranking_runtime.max_candidate_count + 1,
+    };
+    try std.testing.expectError(error.RerankerCandidateLimitExceeded, cohere.validate());
+
     var reranker_resp = try contextualRerankerCandidateLimitExceededResponse(alloc);
     defer reranker_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 422), reranker_resp.status);
     var reranker_error = try std.json.parseFromSlice(public_table_http.RerankerCandidateLimitExceededError, alloc, reranker_resp.body, .{});
     defer reranker_error.deinit();
     try std.testing.expectEqualStrings("reranker_candidate_limit_exceeded", reranker_error.value.@"error");
-    try std.testing.expectEqualStrings("vertex", reranker_error.value.provider);
-    try std.testing.expectEqual(@as(u32, 200), reranker_error.value.maximum);
+    try std.testing.expectEqual(reranking_runtime.Provider.cohere, reranker_error.value.provider);
+    try std.testing.expectEqual(reranking_runtime.max_candidate_count, reranker_error.value.maximum);
     try std.testing.expect(!reranker_error.value.retryable);
 }
 
