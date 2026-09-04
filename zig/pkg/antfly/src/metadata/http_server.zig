@@ -112,6 +112,7 @@ pub const AdminSource = struct {
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         create_table_with_context: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
+        replace_table_definition_stamped: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!metadata_api.CatalogMutationStamp = null,
         restore_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -266,6 +267,13 @@ pub const AdminSource = struct {
     pub fn replaceTableDefinition(self: AdminSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
         const fn_ptr = self.vtable.replace_table_definition orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, expected, replacement);
+    }
+
+    pub fn replaceTableDefinitionStamped(self: AdminSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !?metadata_api.CatalogMutationStamp {
+        if (self.vtable.replace_table_definition_stamped) |fn_ptr|
+            return try fn_ptr(self.ptr, expected, replacement);
+        try self.replaceTableDefinition(expected, replacement);
+        return null;
     }
 
     pub fn restoreTable(
@@ -484,6 +492,7 @@ pub const AdminSource = struct {
                 .create_table = metadataServiceCreateTable,
                 .create_table_with_context = metadataServiceCreateTableWithContext,
                 .replace_table_definition = metadataServiceReplaceTableDefinition,
+                .replace_table_definition_stamped = metadataServiceReplaceTableDefinitionStamped,
                 .restore_table = metadataServiceRestoreTable,
                 .restore_table_with_context = metadataServiceRestoreTableWithContext,
                 .drop_table = metadataServiceDropTable,
@@ -543,6 +552,7 @@ pub const AdminSource = struct {
                 .create_table = metadataHttpServiceCreateTable,
                 .create_table_with_context = metadataHttpServiceCreateTableWithContext,
                 .replace_table_definition = metadataHttpServiceReplaceTableDefinition,
+                .replace_table_definition_stamped = metadataHttpServiceReplaceTableDefinitionStamped,
                 .restore_table = metadataHttpServiceRestoreTable,
                 .restore_table_with_context = metadataHttpServiceRestoreTableWithContext,
                 .drop_table = metadataHttpServiceDropTable,
@@ -691,6 +701,14 @@ pub const AdminSource = struct {
         expected: metadata_table_manager.TableRecord,
         replacement: metadata_table_manager.TableRecord,
     ) !void {
+        _ = try replaceTableDefinitionOnServiceStamped(svc, expected, replacement);
+    }
+
+    fn replaceTableDefinitionOnServiceStamped(
+        svc: anytype,
+        expected: metadata_table_manager.TableRecord,
+        replacement: metadata_table_manager.TableRecord,
+    ) !metadata_api.CatalogMutationStamp {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const current = findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
@@ -703,7 +721,7 @@ pub const AdminSource = struct {
             expected,
             replacement,
         )) return error.ExtensionOwnedObject;
-        try svc.replaceTableDefinition(expected, replacement);
+        return try svc.replaceTableDefinitionStamped(expected, replacement);
     }
 
     fn metadataServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
@@ -719,6 +737,13 @@ pub const AdminSource = struct {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         try replaceTableDefinitionOnService(svc, expected, replacement);
         try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceReplaceTableDefinitionStamped(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !metadata_api.CatalogMutationStamp {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        const stamp = try replaceTableDefinitionOnServiceStamped(svc, expected, replacement);
+        try flushMetadataServiceMutation(svc);
+        return stamp;
     }
 
     fn metadataServiceRestoreTable(
@@ -1141,6 +1166,13 @@ pub const AdminSource = struct {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         try replaceTableDefinitionOnService(svc, expected, replacement);
         try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceReplaceTableDefinitionStamped(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !metadata_api.CatalogMutationStamp {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        const stamp = try replaceTableDefinitionOnServiceStamped(svc, expected, replacement);
+        try flushMetadataHttpServiceMutation(svc);
+        return stamp;
     }
 
     fn metadataHttpServiceRestoreTable(
@@ -2552,6 +2584,10 @@ pub const MetadataHttpServer = struct {
             .create_table = createTableOperation,
             .create_table_with_context = createTableOperationWithContext,
             .replace_definition = replaceTableDefinitionOperation,
+            .replace_definition_stamped = if (self.source.vtable.replace_table_definition_stamped != null)
+                replaceTableDefinitionOperationStamped
+            else
+                null,
             .restore_table = restoreTableOperation,
             .restore_table_with_context = restoreTableOperationWithContext,
             .drop_table = dropTableOperation,
@@ -2582,6 +2618,12 @@ pub const MetadataHttpServer = struct {
     fn replaceTableDefinitionOperation(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         return self.source.replaceTableDefinition(expected, replacement);
+    }
+
+    fn replaceTableDefinitionOperationStamped(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !metadata_api.CatalogMutationStamp {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return (try self.source.replaceTableDefinitionStamped(expected, replacement)) orelse
+            return error.UnsupportedOperation;
     }
 
     fn restoreTableOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, request: table_operations.RestoreRequest) !void {
@@ -2789,7 +2831,7 @@ pub const MetadataHttpServer = struct {
         var parsed = std.json.parseFromSlice(ReplaceTableDefinitionRequest, ctx.allocator, (try ctx.body()) orelse "", .{ .allocate = .alloc_always }) catch
             return ctx.status(400).text("invalid table definition replacement");
         defer parsed.deinit();
-        self.tableOperations().replaceDefinition(requestContext(ctx), table_name, parsed.value.expected, parsed.value.definition) catch |err| switch (err) {
+        const stamp = self.tableOperations().replaceDefinitionStamped(requestContext(ctx), table_name, parsed.value.expected, parsed.value.definition) catch |err| switch (err) {
             error.TableNameMismatch => return ctx.status(400).text("table definition name mismatch"),
             error.ExpectedTableNameMismatch => return ctx.status(400).text("expected table definition name mismatch"),
             error.TableNotFound => return ctx.status(404).text("table not found"),
@@ -2798,6 +2840,9 @@ pub const MetadataHttpServer = struct {
             error.ExtensionOwnedObject, error.UnsupportedOperation => return ctx.status(405).text("method not allowed"),
             else => return metadataReadError(ctx, err),
         };
+        if (stamp) |committed| {
+            return ctx.status(202).json(committed);
+        }
         return ctx.status(202).text("accepted");
     }
 

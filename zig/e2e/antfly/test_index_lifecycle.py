@@ -1276,7 +1276,9 @@ def test_stateful_drop_tables_with_pending_enrichment_preserves_unrelated_owner(
                 for detail in pending_statuses.values()
             ]
             if not all(
-                isinstance(pending, int) and not isinstance(pending, bool) and pending > 0
+                isinstance(pending, int)
+                and not isinstance(pending, bool)
+                and pending > 0
                 for pending in pending_counts
             ):
                 return None

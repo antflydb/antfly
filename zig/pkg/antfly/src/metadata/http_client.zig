@@ -947,14 +947,25 @@ pub const MetadataHttpClient = struct {
         base_uri: []const u8,
         table_name: []const u8,
         body: []const u8,
-    ) !void {
+    ) !metadata_api.CatalogMutationStamp {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.internal_tables_prefix,
             table_name,
             routes.Routes.internal_table_definition_suffix,
         });
         defer self.alloc.free(path);
-        try self.requestWithBody(base_uri, .PUT, path, body, error.InvalidTableDefinitionReplacement, error.TableNotFound, error.TableGenerationChanged);
+        var parsed = try self.requestJsonWithBody(
+            metadata_api.CatalogMutationStamp,
+            base_uri,
+            .PUT,
+            path,
+            body,
+            error.InvalidTableDefinitionReplacement,
+            error.TableNotFound,
+            error.TableGenerationChanged,
+        );
+        defer parsed.deinit();
+        return parsed.value;
     }
 
     pub fn restoreTable(

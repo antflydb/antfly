@@ -10,6 +10,7 @@ const operation = @import("../api/operation.zig");
 const backups_api = @import("../api/backups.zig");
 const tables_api = @import("../api/tables.zig");
 const table_manager = @import("table_manager.zig");
+const metadata_api = @import("api.zig");
 
 pub const RestoreRequest = struct {
     backup_id: []const u8,
@@ -52,6 +53,7 @@ pub const Source = struct {
         create_table: *const fn (*anyopaque, std.mem.Allocator, []const u8, tables_api.CreateTableRequest) anyerror!void,
         create_table_with_context: ?*const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, []const u8, tables_api.CreateTableRequest) anyerror!void = null,
         replace_definition: *const fn (*anyopaque, table_manager.TableRecord, table_manager.TableRecord) anyerror!void,
+        replace_definition_stamped: ?*const fn (*anyopaque, table_manager.TableRecord, table_manager.TableRecord) anyerror!metadata_api.CatalogMutationStamp = null,
         restore_table: *const fn (*anyopaque, std.mem.Allocator, []const u8, RestoreRequest) anyerror!void,
         restore_table_with_context: ?*const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, []const u8, RestoreRequest) anyerror!void = null,
         drop_table: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!void,
@@ -80,10 +82,17 @@ pub const Operations = struct {
     }
 
     pub fn replaceDefinition(self: Operations, ctx: operation.RequestContext, table_name: []const u8, expected: table_manager.TableRecord, replacement: table_manager.TableRecord) !void {
+        _ = try self.replaceDefinitionStamped(ctx, table_name, expected, replacement);
+    }
+
+    pub fn replaceDefinitionStamped(self: Operations, ctx: operation.RequestContext, table_name: []const u8, expected: table_manager.TableRecord, replacement: table_manager.TableRecord) !?metadata_api.CatalogMutationStamp {
         try validateNameAndContext(ctx, table_name);
         if (!std.mem.eql(u8, expected.name, table_name)) return error.ExpectedTableNameMismatch;
         if (!std.mem.eql(u8, replacement.name, table_name)) return error.TableNameMismatch;
+        if (self.source.vtable.replace_definition_stamped) |replace_fn|
+            return try replace_fn(self.source.ptr, expected, replacement);
         try self.source.vtable.replace_definition(self.source.ptr, expected, replacement);
+        return null;
     }
 
     pub fn restore(self: Operations, alloc: std.mem.Allocator, ctx: operation.RequestContext, table_name: []const u8, request: RestoreRequest) !void {

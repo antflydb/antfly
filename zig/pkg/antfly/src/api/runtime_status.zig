@@ -209,7 +209,35 @@ pub const TableRuntimeSummary = struct {
     async_indexing: db_mod.types.AsyncIndexingStats = .{},
 };
 
+/// Stable status-plane failure classes. This deliberately does not import
+/// metadata's RPC progress type: storage/runtime status is below that layer and
+/// callers translate their transport-specific enum at the boundary.
+pub const IndexActivationFailureCode = enum(u8) {
+    invalid_target = 1,
+    conflicting_target = 2,
+    unsupported = 3,
+    publication_failed = 4,
+    internal = 5,
+
+    fn stableName(self: @This()) []const u8 {
+        return switch (self) {
+            .invalid_target => "InvalidIndexActivationTarget",
+            .conflicting_target => "IndexActivationTargetConflict",
+            .unsupported => "UnsupportedOperation",
+            .publication_failed => "IndexActivationPublicationFailed",
+            .internal => "IndexActivationInternalFailure",
+        };
+    }
+};
+
 const TargetedIndexAuthority = struct {
+    const GroupAcknowledgement = struct {
+        // Serving authority is independent of exact-identity acceptance. Keep
+        // the proof supplied by the resident owner until the all-group handoff
+        // completes, even if a cache-only refresh replaces the visible row.
+        serviceable: bool = false,
+    };
+
     const Identity = struct {
         kind: db_mod.types.IndexKind,
         incarnation: u64,
@@ -235,6 +263,11 @@ const TargetedIndexAuthority = struct {
         // Durable per-index target ordering. The runtime row must prove that
         // its replay target includes this source commit.
         source_target_sequence: u64,
+    };
+
+    const TerminalFailure = struct {
+        expectation: Expectation,
+        code: IndexActivationFailureCode,
     };
 
     // Globally unique operation revision. Every control-plane mutation gets a
@@ -266,13 +299,128 @@ const TargetedIndexAuthority = struct {
     // catch-up. Retain the fence until a later fresh table publication
     // performs the actual authority handoff.
     release_after_observation_generation: ?u64 = null,
+    // Groups which have published the exact structural expectation after the
+    // transition boundary. This turns handoff into an incremental reduction:
+    // each group publication is inspected once instead of rescanning every
+    // index in every group for every active transition.
+    handoff_groups: std.AutoHashMapUnmanaged(u64, GroupAcknowledgement) = .empty,
+    // Terminal owner outcomes are durable authority for this exact desired
+    // identity, not transient handoff bookkeeping. Settlement may discard
+    // acknowledgements after every group has crossed the release boundary,
+    // but the public action-required result must survive until a new catalog
+    // transition (or an explicit replan to a different identity) replaces it.
+    terminal_failures: std.AutoHashMapUnmanaged(u64, TerminalFailure) = .empty,
+    // Immutable catalog group set for this transition. Handoff is measured
+    // against desired topology, never against whichever groups happen to have
+    // a cached runtime observation at the time of publication.
+    expected_handoff_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    handoff_topology_bound: bool = false,
     // Independent convergence watermarks by shard/group. These are attached
     // to the exact expectation above, so a delayed event for a retired
     // incarnation cannot fence its same-name replacement.
     convergence_requirements: std.AutoHashMapUnmanaged(u64, ConvergenceRequirement) = .empty,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.handoff_groups.deinit(alloc);
+        self.terminal_failures.deinit(alloc);
+        self.expected_handoff_groups.deinit(alloc);
         self.convergence_requirements.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+/// Copy-on-write acknowledgement capacity for one retained table lane.
+/// Authority readers synchronize only through the global cache mutex, so a
+/// live hash map must never reallocate while that mutex is available. Build
+/// replacements under exact table ownership, swap them after epoch
+/// revalidation, and retire the displaced maps after the commit unlocks.
+const TargetAcknowledgementCapacityPreparation = struct {
+    const Item = struct {
+        authority: *TargetedIndexAuthority,
+        replacement: std.AutoHashMapUnmanaged(u64, TargetedIndexAuthority.GroupAcknowledgement),
+    };
+
+    items: []Item = &.{},
+    initialized: usize = 0,
+    installed: bool = false,
+
+    fn init(
+        alloc: std.mem.Allocator,
+        authorities: *std.StringHashMapUnmanaged(TargetedIndexAuthority),
+        statuses: []const LocalTableRuntimeStatus,
+    ) !@This() {
+        if (statuses.len == 0) return .{};
+        var growth_count: usize = 0;
+        var count_it = authorities.valueIterator();
+        while (count_it.next()) |authority| {
+            if (!authority.transition_active or authority.target_authority_handed_off) continue;
+            const required = try requiredCapacity(authority.*, statuses);
+            if (maximumCount(authority.handoff_groups.capacity()) < required)
+                growth_count += 1;
+        }
+        if (growth_count == 0) return .{};
+
+        const items = try alloc.alloc(Item, growth_count);
+        var out = @This(){ .items = items };
+        errdefer out.deinit(alloc);
+        var authority_it = authorities.valueIterator();
+        while (authority_it.next()) |authority| {
+            if (!authority.transition_active or authority.target_authority_handed_off) continue;
+            const required = try requiredCapacity(authority.*, statuses);
+            if (maximumCount(authority.handoff_groups.capacity()) >= required) continue;
+            var replacement = std.AutoHashMapUnmanaged(
+                u64,
+                TargetedIndexAuthority.GroupAcknowledgement,
+            ).empty;
+            errdefer replacement.deinit(alloc);
+            try replacement.ensureTotalCapacity(
+                alloc,
+                std.math.cast(u32, required) orelse return error.OutOfMemory,
+            );
+            var acknowledgement_it = authority.handoff_groups.iterator();
+            while (acknowledgement_it.next()) |entry|
+                replacement.putAssumeCapacityNoClobber(entry.key_ptr.*, entry.value_ptr.*);
+            out.items[out.initialized] = .{
+                .authority = authority,
+                .replacement = replacement,
+            };
+            out.initialized += 1;
+        }
+        return out;
+    }
+
+    fn requiredCapacity(
+        authority: TargetedIndexAuthority,
+        statuses: []const LocalTableRuntimeStatus,
+    ) !usize {
+        var required: usize = authority.handoff_groups.count();
+        for (statuses) |status| {
+            if (authority.handoff_groups.contains(status.group_id) or
+                (authority.handoff_topology_bound and
+                    !authority.expected_handoff_groups.contains(status.group_id))) continue;
+            required = std.math.add(usize, required, 1) catch return error.OutOfMemory;
+        }
+        return required;
+    }
+
+    fn maximumCount(capacity: usize) usize {
+        return (capacity * std.hash_map.default_max_load_percentage) / 100;
+    }
+
+    fn install(self: *@This()) void {
+        std.debug.assert(!self.installed);
+        for (self.items[0..self.initialized]) |*item|
+            std.mem.swap(
+                std.AutoHashMapUnmanaged(u64, TargetedIndexAuthority.GroupAcknowledgement),
+                &item.authority.handoff_groups,
+                &item.replacement,
+            );
+        self.installed = true;
+    }
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.items[0..self.initialized]) |*item| item.replacement.deinit(alloc);
+        if (self.items.len > 0) alloc.free(self.items);
         self.* = undefined;
     }
 };
@@ -382,6 +530,48 @@ const IndexDeltaMergeSpec = struct {
     merged_index_count: usize,
 };
 
+const TargetObservationUpdate = enum {
+    group_applied,
+    index_applied,
+    no_change,
+    state_invalidated,
+};
+
+const TargetAuthorityAcknowledgementKey = struct {
+    index_name: []const u8,
+    group_id: u64,
+};
+
+const TargetAuthorityAcknowledgementKeyContext = struct {
+    pub fn hash(_: @This(), key: TargetAuthorityAcknowledgementKey) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(std.mem.asBytes(&key.group_id));
+        hasher.update(key.index_name);
+        return hasher.final();
+    }
+
+    pub fn eql(_: @This(), lhs: TargetAuthorityAcknowledgementKey, rhs: TargetAuthorityAcknowledgementKey) bool {
+        return lhs.group_id == rhs.group_id and std.mem.eql(u8, lhs.index_name, rhs.index_name);
+    }
+};
+
+const TargetAuthorityAcknowledgementCandidates = std.HashMapUnmanaged(
+    TargetAuthorityAcknowledgementKey,
+    struct {
+        transition_revision: u64,
+        serviceable: bool,
+    },
+    TargetAuthorityAcknowledgementKeyContext,
+    std.hash_map.default_max_load_percentage,
+);
+
+const TargetAuthorityAcknowledgementPresence = std.HashMapUnmanaged(
+    TargetAuthorityAcknowledgementKey,
+    void,
+    TargetAuthorityAcknowledgementKeyContext,
+    std.hash_map.default_max_load_percentage,
+);
+
 const TestStructuralPublishPreparationHook = struct {
     ptr: *anyopaque,
     run: *const fn (*anyopaque) void,
@@ -389,13 +579,209 @@ const TestStructuralPublishPreparationHook = struct {
 
 var test_after_structural_publish_preparation_hook: ?TestStructuralPublishPreparationHook = null;
 
+const TestReadGroupPreparationHook = struct {
+    ptr: *anyopaque,
+    run: *const fn (*anyopaque) void,
+};
+
+var test_read_group_preparation_hook: ?TestReadGroupPreparationHook = null;
+var test_read_group_retirement_hook: ?TestReadGroupPreparationHook = null;
+var test_authority_sync_index_visits: std.atomic.Value(usize) = .init(0);
+
 fn runTestAfterStructuralPublishPreparationHook() void {
     if (comptime builtin.is_test) {
         if (test_after_structural_publish_preparation_hook) |hook| hook.run(hook.ptr);
     }
 }
 
+fn runTestReadGroupPreparationHook() void {
+    if (comptime builtin.is_test) {
+        if (test_read_group_preparation_hook) |hook| hook.run(hook.ptr);
+    }
+}
+
+fn runTestReadGroupRetirementHook() void {
+    if (comptime builtin.is_test) {
+        if (test_read_group_retirement_hook) |hook| hook.run(hook.ptr);
+    }
+}
+
 pub const TableRuntimeSnapshotCache = struct {
+    const ReadIndexAuthority = struct {
+        target_observation_complete: std.atomic.Value(bool),
+        observation_stale: std.atomic.Value(bool),
+        observation_serviceable: std.atomic.Value(bool),
+        targeted_sibling: std.atomic.Value(bool),
+        terminal_failure_code: std.atomic.Value(u8),
+
+        fn init(status: db_mod.types.DBIndexStats) @This() {
+            return .{
+                .target_observation_complete = .init(status.runtime_target_observation_complete),
+                .observation_stale = .init(status.runtime_observation_stale),
+                .observation_serviceable = .init(status.runtime_observation_serviceable),
+                .targeted_sibling = .init(status.runtime_observation_targeted_sibling),
+                .terminal_failure_code = .init(0),
+            };
+        }
+
+        fn store(self: *@This(), status: db_mod.types.DBIndexStats) void {
+            // Withdraw optimistic facts first and publish them last. Readers
+            // may observe either side of a concurrent transition, but never
+            // a new unfenced/serviceable claim without its preceding proof.
+            if (!status.runtime_target_observation_complete)
+                self.target_observation_complete.store(false, .release);
+            if (status.runtime_observation_stale)
+                self.observation_stale.store(true, .release);
+            self.observation_serviceable.store(status.runtime_observation_serviceable, .release);
+            self.targeted_sibling.store(status.runtime_observation_targeted_sibling, .release);
+            if (!status.runtime_observation_stale)
+                self.observation_stale.store(false, .release);
+            if (status.runtime_target_observation_complete)
+                self.target_observation_complete.store(true, .release);
+        }
+
+        fn storeTerminalFailure(self: *@This(), failure: ?IndexActivationFailureCode) void {
+            self.terminal_failure_code.store(if (failure) |code| @intFromEnum(code) else 0, .release);
+        }
+
+        fn terminalFailure(self: *const @This()) ?IndexActivationFailureCode {
+            const raw = self.terminal_failure_code.load(.acquire);
+            return if (raw == 0) null else @enumFromInt(raw);
+        }
+    };
+
+    const ReadGroupAuthority = struct {
+        target_observation_complete: std.atomic.Value(bool),
+        indexes: []ReadIndexAuthority,
+        index_by_name: std.StringHashMapUnmanaged(usize) = .empty,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            self.index_by_name.deinit(alloc);
+            alloc.free(self.indexes);
+            self.* = undefined;
+        }
+    };
+
+    const ReadGroupSnapshot = struct {
+        ref_count: std.atomic.Value(usize) = .init(1),
+        status: LocalTableRuntimeStatus,
+        authority: ReadGroupAuthority,
+
+        fn init(
+            alloc: std.mem.Allocator,
+            status: LocalTableRuntimeStatus,
+        ) !*@This() {
+            runTestReadGroupPreparationHook();
+            const group_snapshot = try alloc.create(@This());
+            errdefer alloc.destroy(group_snapshot);
+            var owned_status = try status.clone(alloc);
+            errdefer owned_status.deinit(alloc);
+            const indexes = try alloc.alloc(ReadIndexAuthority, owned_status.stats.indexes.len);
+            var authority = ReadGroupAuthority{
+                .target_observation_complete = .init(owned_status.metadata.target_observation_complete),
+                .indexes = indexes,
+            };
+            errdefer alloc.free(indexes);
+            try authority.index_by_name.ensureTotalCapacity(alloc, @intCast(indexes.len));
+            for (owned_status.stats.indexes, 0..) |index_status, index| {
+                indexes[index] = ReadIndexAuthority.init(index_status);
+                authority.index_by_name.putAssumeCapacityNoClobber(index_status.name, index);
+            }
+            group_snapshot.* = .{
+                .status = owned_status,
+                .authority = authority,
+            };
+            return group_snapshot;
+        }
+
+        fn retain(self: *@This()) void {
+            _ = self.ref_count.fetchAdd(1, .acq_rel);
+        }
+
+        fn release(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.ref_count.fetchSub(1, .acq_rel) != 1) return;
+            runTestReadGroupRetirementHook();
+            self.authority.deinit(alloc);
+            self.status.deinit(alloc);
+            alloc.destroy(self);
+        }
+
+        fn applyAuthority(
+            self: *const @This(),
+            alloc: std.mem.Allocator,
+            status: *LocalTableRuntimeStatus,
+        ) !void {
+            status.metadata.target_observation_complete = self.authority.target_observation_complete.load(.acquire);
+            for (status.stats.indexes, self.authority.indexes) |*index_status, *index_authority| {
+                index_status.runtime_target_observation_complete = index_authority.target_observation_complete.load(.acquire);
+                index_status.runtime_observation_stale = index_authority.observation_stale.load(.acquire);
+                index_status.runtime_observation_serviceable = index_authority.observation_serviceable.load(.acquire);
+                index_status.runtime_observation_targeted_sibling = index_authority.targeted_sibling.load(.acquire);
+                if (index_authority.terminalFailure()) |failure|
+                    try projectIndexActivationFailure(alloc, index_status, failure);
+            }
+        }
+    };
+
+    /// Immutable topology whose group payloads are independent ref-counted COW
+    /// snapshots. Ordinary group publication swaps one slot; only a genuine
+    /// topology change constructs and publishes a replacement view.
+    const ReadView = struct {
+        ref_count: std.atomic.Value(usize) = .init(1),
+        groups: []*ReadGroupSnapshot,
+        group_by_id: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+
+        fn init(alloc: std.mem.Allocator, statuses: LocalTableRuntimeStatuses) !*@This() {
+            const view = try alloc.create(@This());
+            errdefer alloc.destroy(view);
+            const groups = try alloc.alloc(*ReadGroupSnapshot, statuses.items.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (groups[0..initialized]) |group| group.release(alloc);
+                alloc.free(groups);
+            }
+            var group_by_id = std.AutoHashMapUnmanaged(u64, usize).empty;
+            errdefer group_by_id.deinit(alloc);
+            try group_by_id.ensureTotalCapacity(alloc, @intCast(statuses.items.len));
+            for (statuses.items, 0..) |status, group_index| {
+                groups[group_index] = try ReadGroupSnapshot.init(alloc, status);
+                group_by_id.putAssumeCapacityNoClobber(status.group_id, group_index);
+                initialized += 1;
+            }
+            view.* = .{
+                .groups = groups,
+                .group_by_id = group_by_id,
+            };
+            return view;
+        }
+
+        fn retain(self: *@This()) void {
+            _ = self.ref_count.fetchAdd(1, .acq_rel);
+        }
+
+        fn release(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.ref_count.fetchSub(1, .acq_rel) != 1) return;
+            for (self.groups) |group| group.release(alloc);
+            alloc.free(self.groups);
+            self.group_by_id.deinit(alloc);
+            alloc.destroy(self);
+        }
+
+        fn groupPosition(self: *const @This(), group_id: u64) ?usize {
+            return self.group_by_id.get(group_id);
+        }
+    };
+
+    const RetiredReadView = struct {
+        name: []const u8,
+        view: *ReadView,
+
+        fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+            alloc.free(@constCast(self.name));
+            self.view.release(alloc);
+        }
+    };
+
     pub const IndexIdentity = struct {
         index_name: []const u8,
         kind: db_mod.types.IndexKind,
@@ -432,6 +818,12 @@ pub const TableRuntimeSnapshotCache = struct {
         published,
         stale_table,
         stale_observation,
+    };
+
+    pub const RecordTerminalFailureResult = enum {
+        recorded,
+        superseded,
+        storage_failure,
     };
 
     pub const CatalogToken = struct {
@@ -478,6 +870,8 @@ pub const TableRuntimeSnapshotCache = struct {
             source_target_sequence: u64,
         };
 
+        ref_count: std.atomic.Value(usize) = .init(1),
+        mutation_mutex: std.Io.Mutex = .init,
         epoch: TableEpoch,
         groups: std.AutoHashMapUnmanaged(u64, LocalTableRuntimeStatus) = .empty,
         // Latest commit watermark that each group must have observed before
@@ -505,30 +899,111 @@ pub const TableRuntimeSnapshotCache = struct {
             self.index_authorities.deinit(alloc);
             self.* = undefined;
         }
+
+        fn retain(self: *@This()) void {
+            _ = self.ref_count.fetchAdd(1, .acq_rel);
+        }
+
+        fn release(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.ref_count.fetchSub(1, .acq_rel) != 1) return;
+            self.deinit(alloc);
+            alloc.destroy(self);
+        }
     };
 
     alloc: std.mem.Allocator,
+    read_view_alloc: std.mem.Allocator,
+    // Ordinary writers serialize only with mutations for the same table while
+    // retaining a shared lifecycle lease. Catalog-wide replacement/clear uses
+    // the exclusive side. This keeps stable heap-owned table state alive while
+    // group payloads are prepared off the main cache lock without convoying
+    // unrelated tables behind inference-sized clone/allocation work.
+    mutation_barrier: std.Io.RwLock = .init,
     mutex: std.atomic.Mutex = .unlocked,
+    read_view_mutex: std.atomic.Mutex = .unlocked,
     topology_revision: u64 = 1,
     next_invalidation_epoch: u64 = 1,
     next_observation_generation: u64 = 1,
     next_targeted_index_transition_revision: u64 = 1,
     target_observation_revision: u64 = 1,
-    tables: std.StringHashMapUnmanaged(TableState) = .empty,
+    tables: std.StringHashMapUnmanaged(*TableState) = .empty,
+    read_views: std.StringHashMapUnmanaged(*ReadView) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) @This() {
-        return .{ .alloc = alloc };
+        return .{ .alloc = alloc, .read_view_alloc = alloc };
+    }
+
+    fn lockExistingTableMutation(self: *@This(), table_name: []const u8) ?*TableState {
+        self.mutation_barrier.lockSharedUncancelable(std.Options.debug_io);
+        lockAtomic(&self.mutex);
+        const state = self.tables.get(table_name);
+        if (state) |value| value.retain();
+        self.mutex.unlock();
+        self.mutation_barrier.unlockShared(std.Options.debug_io);
+        if (state == null) {
+            return null;
+        }
+        state.?.mutation_mutex.lockUncancelable(std.Options.debug_io);
+        self.mutation_barrier.lockSharedUncancelable(std.Options.debug_io);
+        lockAtomic(&self.mutex);
+        const still_current = self.tables.get(table_name) == state.?;
+        self.mutex.unlock();
+        if (!still_current) {
+            self.mutation_barrier.unlockShared(std.Options.debug_io);
+            state.?.mutation_mutex.unlock(std.Options.debug_io);
+            state.?.release(self.alloc);
+            return null;
+        }
+        return state.?;
+    }
+
+    fn lockEnsuredTableMutation(self: *@This(), table_name: []const u8) !*TableState {
+        while (true) {
+            self.mutation_barrier.lockSharedUncancelable(std.Options.debug_io);
+            lockAtomic(&self.mutex);
+            const state = self.ensureTableLocked(table_name) catch |err| {
+                self.mutex.unlock();
+                self.mutation_barrier.unlockShared(std.Options.debug_io);
+                return err;
+            };
+            state.retain();
+            self.mutex.unlock();
+            self.mutation_barrier.unlockShared(std.Options.debug_io);
+            state.mutation_mutex.lockUncancelable(std.Options.debug_io);
+            self.mutation_barrier.lockSharedUncancelable(std.Options.debug_io);
+            lockAtomic(&self.mutex);
+            const still_current = self.tables.get(table_name) == state;
+            self.mutex.unlock();
+            if (still_current) return state;
+            self.mutation_barrier.unlockShared(std.Options.debug_io);
+            state.mutation_mutex.unlock(std.Options.debug_io);
+            state.release(self.alloc);
+        }
+    }
+
+    fn unlockTableMutation(self: *@This(), state: *TableState) void {
+        state.mutation_mutex.unlock(std.Options.debug_io);
+        self.mutation_barrier.unlockShared(std.Options.debug_io);
+        state.release(self.alloc);
     }
 
     pub fn deinit(self: *@This()) void {
+        self.mutation_barrier.lockUncancelable(std.Options.debug_io);
         lockAtomic(&self.mutex);
         self.clearTablesLocked();
         self.tables.deinit(self.alloc);
         self.mutex.unlock();
+        self.clearReadViews();
+        lockAtomic(&self.read_view_mutex);
+        self.read_views.deinit(self.read_view_alloc);
+        self.read_view_mutex.unlock();
+        self.mutation_barrier.unlock(std.Options.debug_io);
         self.* = undefined;
     }
 
     pub fn clear(self: *@This()) void {
+        self.mutation_barrier.lockUncancelable(std.Options.debug_io);
+        defer self.mutation_barrier.unlock(std.Options.debug_io);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         self.advanceInvalidationEpochLocked();
@@ -537,23 +1012,23 @@ pub const TableRuntimeSnapshotCache = struct {
     }
 
     pub fn invalidateTable(self: *@This(), table_name: []const u8) void {
+        const mutation_state = self.lockEnsuredTableMutation(table_name) catch {
+            self.clear();
+            return;
+        };
+        defer self.unlockTableMutation(mutation_state);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         self.advanceInvalidationEpochLocked();
         self.advanceTopologyRevisionLocked();
 
-        const state = self.ensureTableLocked(table_name) catch {
-            // Invalidation is a correctness boundary. If recording its table
-            // tombstone fails, clear all states so no old token can match.
-            self.clearTablesLocked();
-            self.advanceInvalidationEpochLocked();
-            return;
-        };
+        const state = mutation_state;
         self.clearGroupsLocked(state);
         self.clearIndexAuthoritiesLocked(state);
         state.epoch.invalidation_epoch = self.next_invalidation_epoch;
         state.epoch.root_generation +%= 1;
         if (state.epoch.root_generation == 0) state.epoch.root_generation = 1;
+        self.removeReadView(table_name);
     }
 
     /// Fence observations captured before an in-place, index-targeted catalog
@@ -562,16 +1037,17 @@ pub const TableRuntimeSnapshotCache = struct {
     /// immutable observations is safe; subsequent publication still uses the
     /// new epoch and rejects every pre-mutation token.
     pub fn fenceTablePublications(self: *@This(), table_name: []const u8) void {
+        const mutation_state = self.lockEnsuredTableMutation(table_name) catch {
+            self.clear();
+            return;
+        };
+        defer self.unlockTableMutation(mutation_state);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         self.advanceInvalidationEpochLocked();
         self.advanceTopologyRevisionLocked();
 
-        const state = self.ensureTableLocked(table_name) catch {
-            self.clearTablesLocked();
-            self.advanceInvalidationEpochLocked();
-            return;
-        };
+        const state = mutation_state;
         state.epoch.invalidation_epoch = self.next_invalidation_epoch;
     }
 
@@ -586,22 +1062,23 @@ pub const TableRuntimeSnapshotCache = struct {
         table_name: []const u8,
         index_name: ?[]const u8,
     ) bool {
+        const mutation_state = self.lockEnsuredTableMutation(table_name) catch {
+            self.clear();
+            return false;
+        };
+        defer self.unlockTableMutation(mutation_state);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         self.advanceInvalidationEpochLocked();
         self.advanceTopologyRevisionLocked();
 
-        const state = self.ensureTableLocked(table_name) catch {
-            self.clearTablesLocked();
-            self.advanceInvalidationEpochLocked();
-            return false;
-        };
+        const state = mutation_state;
         const target = index_name orelse {
-            self.invalidateTableStateLocked(state);
+            self.invalidateTableStateLocked(table_name, state);
             return false;
         };
         const fence = state.index_authorities.getPtr(target) orelse {
-            self.invalidateTableStateLocked(state);
+            self.invalidateTableStateLocked(table_name, state);
             return false;
         };
         if (!fence.owner_active) {
@@ -619,6 +1096,16 @@ pub const TableRuntimeSnapshotCache = struct {
         if (!fence.transition_active) state.active_index_transition_count += 1;
         fence.transition_active = true;
         fence.target_authority_handed_off = false;
+        fence.handoff_groups.clearRetainingCapacity();
+        fence.terminal_failures.clearRetainingCapacity();
+        fence.handoff_groups.ensureTotalCapacity(self.alloc, @intCast(state.groups.count())) catch {
+            self.invalidateTableStateLocked(table_name, state);
+            return false;
+        };
+        resetExpectedHandoffGroupsFromSnapshotLocked(fence, state, self.alloc) catch {
+            self.invalidateTableStateLocked(table_name, state);
+            return false;
+        };
         if (!fence.owner_active) {
             fence.release_after_observation_generation = self.next_observation_generation;
         }
@@ -629,6 +1116,7 @@ pub const TableRuntimeSnapshotCache = struct {
             }
         }
         state.epoch.invalidation_epoch = self.next_invalidation_epoch;
+        self.syncReadViewAuthorityLocked(table_name, state);
         return true;
     }
 
@@ -642,16 +1130,17 @@ pub const TableRuntimeSnapshotCache = struct {
         table_name: []const u8,
         index_name: []const u8,
     ) ?TargetedIndexTransitionToken {
+        const mutation_state = self.lockEnsuredTableMutation(table_name) catch {
+            self.clear();
+            return null;
+        };
+        defer self.unlockTableMutation(mutation_state);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         self.advanceInvalidationEpochLocked();
         self.advanceTopologyRevisionLocked();
 
-        const state = self.ensureTableLocked(table_name) catch {
-            self.clearTablesLocked();
-            self.advanceInvalidationEpochLocked();
-            return null;
-        };
+        const state = mutation_state;
         const transition_revision = self.takeTargetedIndexTransitionRevisionLocked();
         if (state.index_authorities.getPtr(index_name)) |fence| {
             if (!fence.transition_active) state.active_index_transition_count += 1;
@@ -662,6 +1151,8 @@ pub const TableRuntimeSnapshotCache = struct {
             fence.expectation = .unknown;
             fence.expectation_observation_generation = self.next_observation_generation;
             fence.target_authority_handed_off = false;
+            fence.handoff_groups.clearRetainingCapacity();
+            fence.terminal_failures.clearRetainingCapacity();
             fence.release_after_observation_generation = null;
             fence.convergence_requirements.clearRetainingCapacity();
         } else {
@@ -684,6 +1175,15 @@ pub const TableRuntimeSnapshotCache = struct {
             };
             state.active_index_transition_count += 1;
         }
+        const authority = state.index_authorities.getPtr(index_name).?;
+        authority.handoff_groups.ensureTotalCapacity(self.alloc, @intCast(state.groups.count())) catch {
+            self.invalidateTableStateLocked(table_name, state);
+            return null;
+        };
+        resetExpectedHandoffGroupsFromSnapshotLocked(authority, state, self.alloc) catch {
+            self.invalidateTableStateLocked(table_name, state);
+            return null;
+        };
         var status_it = state.groups.valueIterator();
         while (status_it.next()) |status| {
             for (status.stats.indexes) |*item| {
@@ -691,6 +1191,7 @@ pub const TableRuntimeSnapshotCache = struct {
             }
         }
         state.epoch.invalidation_epoch = self.next_invalidation_epoch;
+        self.syncReadViewAuthorityLocked(table_name, state);
         return .{
             .root_generation = state.epoch.root_generation,
             .revision = transition_revision,
@@ -705,15 +1206,26 @@ pub const TableRuntimeSnapshotCache = struct {
         index_name: []const u8,
         token: TargetedIndexTransitionToken,
     ) bool {
+        const mutation_state = self.lockExistingTableMutation(table_name) orelse return false;
+        defer self.unlockTableMutation(mutation_state);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        const state = self.tables.getPtr(table_name) orelse return false;
+        const state = self.tables.get(table_name) orelse return false;
         const fence = currentTargetedIndexAuthority(state, index_name, token) orelse return false;
         if (!fence.owner_active) return false;
         fence.accept_target_after_observation_generation = self.next_observation_generation;
         fence.expectation = .unknown;
         fence.expectation_observation_generation = self.next_observation_generation;
         fence.target_authority_handed_off = false;
+        fence.handoff_groups.clearRetainingCapacity();
+        fence.handoff_groups.ensureTotalCapacity(self.alloc, @intCast(state.groups.count())) catch {
+            self.invalidateTableStateLocked(table_name, state);
+            return false;
+        };
+        resetExpectedHandoffGroupsFromSnapshotLocked(fence, state, self.alloc) catch {
+            self.invalidateTableStateLocked(table_name, state);
+            return false;
+        };
         fence.convergence_requirements.clearRetainingCapacity();
         var status_it = state.groups.valueIterator();
         while (status_it.next()) |status| {
@@ -721,6 +1233,7 @@ pub const TableRuntimeSnapshotCache = struct {
                 if (std.mem.eql(u8, item.name, index_name)) item.runtime_observation_stale = true;
             }
         }
+        self.syncReadViewAuthorityLocked(table_name, state);
         return true;
     }
 
@@ -735,9 +1248,11 @@ pub const TableRuntimeSnapshotCache = struct {
         token: TargetedIndexTransitionToken,
         expected: TargetedIndexExpectation,
     ) bool {
+        const mutation_state = self.lockExistingTableMutation(table_name) orelse return false;
+        defer self.unlockTableMutation(mutation_state);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        const state = self.tables.getPtr(table_name) orelse return false;
+        const state = self.tables.get(table_name) orelse return false;
         const authority = currentTargetedIndexAuthority(state, index_name, token) orelse return false;
         if (!authority.owner_active) return false;
         const normalized: TargetedIndexAuthority.Expectation = switch (expected) {
@@ -760,9 +1275,227 @@ pub const TableRuntimeSnapshotCache = struct {
         authority.expectation = normalized;
         authority.expectation_observation_generation = self.next_observation_generation;
         authority.target_authority_handed_off = false;
+        authority.handoff_groups.clearRetainingCapacity();
         authority.convergence_requirements.clearRetainingCapacity();
         markTargetObservationStaleLocked(state, index_name);
+        self.syncReadViewAuthorityLocked(table_name, state);
         return true;
+    }
+
+    /// Binds the transition to the catalog topology captured by its owner.
+    /// The set replaces the snapshot-derived fallback installed by `fence`;
+    /// later cache population cannot shrink or expand this authority boundary.
+    pub fn bindTargetedIndexExpectedGroups(
+        self: *@This(),
+        table_name: []const u8,
+        index_name: []const u8,
+        token: TargetedIndexTransitionToken,
+        group_ids: []const u64,
+    ) bool {
+        const mutation_state = self.lockExistingTableMutation(table_name) orelse return false;
+        defer self.unlockTableMutation(mutation_state);
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.tables.get(table_name) orelse return false;
+        const authority = currentTargetedIndexAuthority(state, index_name, token) orelse return false;
+        if (!authority.owner_active) return false;
+        authority.handoff_groups.ensureUnusedCapacity(self.alloc, @intCast(group_ids.len)) catch {
+            self.invalidateTableStateLocked(table_name, state);
+            return false;
+        };
+        authority.terminal_failures.ensureUnusedCapacity(self.alloc, @intCast(group_ids.len)) catch {
+            self.invalidateTableStateLocked(table_name, state);
+            return false;
+        };
+        authority.expected_handoff_groups.ensureTotalCapacity(self.alloc, @intCast(group_ids.len)) catch {
+            self.invalidateTableStateLocked(table_name, state);
+            return false;
+        };
+        authority.expected_handoff_groups.clearRetainingCapacity();
+        for (group_ids) |group_id| {
+            if (authority.expected_handoff_groups.contains(group_id)) continue;
+            authority.expected_handoff_groups.putAssumeCapacity(group_id, {});
+        }
+        authority.handoff_topology_bound = true;
+        var acknowledged = authority.handoff_groups.iterator();
+        while (acknowledged.next()) |entry| {
+            if (!authority.expected_handoff_groups.contains(entry.key_ptr.*))
+                authority.handoff_groups.removeByPtr(entry.key_ptr);
+        }
+        var failed = authority.terminal_failures.iterator();
+        while (failed.next()) |entry| {
+            if (!authority.expected_handoff_groups.contains(entry.key_ptr.*))
+                authority.terminal_failures.removeByPtr(entry.key_ptr);
+        }
+        _ = self.advanceTargetedIndexAuthorityLocked(state);
+        self.syncReadViewAuthorityLocked(table_name, state);
+        return true;
+    }
+
+    /// Reports completion only for the currently bound catalog identity and
+    /// exact group. Control-plane dispatchers use this as their acknowledgement
+    /// boundary: queue admission alone is not proof that the resident owner
+    /// survived a leadership transfer and published the target.
+    pub fn targetedIndexGroupAcknowledged(
+        self: *@This(),
+        table_name: []const u8,
+        index_name: []const u8,
+        expected: TargetedIndexExpectation,
+        group_id: u64,
+    ) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.tables.get(table_name) orelse return false;
+        const authority = state.index_authorities.getPtr(index_name) orelse return false;
+        const matches = switch (expected) {
+            .absent => authority.expectation == .absent,
+            .exact => |identity| switch (authority.expectation) {
+                .exact => |actual| std.mem.eql(u8, identity.index_name, index_name) and
+                    identity.kind == actual.kind and
+                    identity.incarnation == actual.incarnation and
+                    identity.config_hash == actual.config_hash,
+                .unknown, .absent => false,
+            },
+        };
+        return matches and authority.handoff_groups.contains(group_id);
+    }
+
+    /// Returns the serving proof attached to an exact resident-owner
+    /// acknowledgement. Null means that identity/group is not acknowledged;
+    /// false means it is acknowledged but has no queryable generation yet.
+    pub fn targetedIndexGroupServiceability(
+        self: *@This(),
+        table_name: []const u8,
+        index_name: []const u8,
+        expected: TargetedIndexExpectation,
+        group_id: u64,
+    ) ?bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.tables.get(table_name) orelse return null;
+        const authority = state.index_authorities.getPtr(index_name) orelse return null;
+        const matches = switch (expected) {
+            .absent => authority.expectation == .absent,
+            .exact => |identity| switch (authority.expectation) {
+                .exact => |actual| std.mem.eql(u8, identity.index_name, index_name) and
+                    identity.kind == actual.kind and
+                    identity.incarnation == actual.incarnation and
+                    identity.config_hash == actual.config_hash,
+                .unknown, .absent => false,
+            },
+        };
+        if (!matches) return null;
+        return (authority.handoff_groups.get(group_id) orelse return null).serviceable;
+    }
+
+    /// Records an exact acknowledgement returned by the resident group owner.
+    /// This is the cross-process handoff channel used by a coordinator whose
+    /// private cache does not receive the resident's local publications.
+    pub fn acknowledgeTargetedIndexGroup(
+        self: *@This(),
+        table_name: []const u8,
+        index_name: []const u8,
+        token: TargetedIndexTransitionToken,
+        expected: TargetedIndexExpectation,
+        group_id: u64,
+        serviceable: bool,
+    ) bool {
+        const mutation_state = self.lockExistingTableMutation(table_name) orelse return false;
+        defer self.unlockTableMutation(mutation_state);
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.tables.get(table_name) orelse return false;
+        const authority = currentTargetedIndexAuthority(state, index_name, token) orelse return false;
+        if (!authority.owner_active) return false;
+        const matches = switch (expected) {
+            .absent => authority.expectation == .absent,
+            .exact => |identity| switch (authority.expectation) {
+                .exact => |actual| std.mem.eql(u8, identity.index_name, index_name) and
+                    identity.kind == actual.kind and
+                    identity.incarnation == actual.incarnation and
+                    identity.config_hash == actual.config_hash,
+                .unknown, .absent => false,
+            },
+        };
+        const group_in_scope = if (authority.handoff_topology_bound)
+            authority.expected_handoff_groups.contains(group_id)
+        else
+            state.groups.contains(group_id);
+        if (!matches or !group_in_scope or
+            (targetExpectationIsAbsent(authority.expectation) and
+                authority.terminal_failures.contains(group_id))) return false;
+        authority.handoff_groups.ensureUnusedCapacity(self.alloc, 1) catch return false;
+        recordTargetGroupAcknowledgement(authority, group_id, serviceable);
+        if (self.advanceTargetedIndexAuthorityLocked(state))
+            self.syncReadViewAuthorityLocked(table_name, state)
+        else
+            self.syncReadGroupAuthorityLocked(table_name, state, group_id);
+        return true;
+    }
+
+    /// Publishes an operator-actionable result for one exact activation owner.
+    /// The error is authority, not activity: it survives heartbeat loss and
+    /// cache-only refreshes, but it is scoped to the transition revision,
+    /// desired incarnation, and resident group which reported it. Starting a
+    /// newer targeted transition clears the acknowledgement and its error.
+    pub fn recordTargetedIndexTerminalFailure(
+        self: *@This(),
+        table_name: []const u8,
+        index_name: []const u8,
+        token: TargetedIndexTransitionToken,
+        expected: TargetedIndexExpectation,
+        group_id: u64,
+        code: IndexActivationFailureCode,
+    ) RecordTerminalFailureResult {
+        const mutation_state = self.lockExistingTableMutation(table_name) orelse return .superseded;
+        defer self.unlockTableMutation(mutation_state);
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.tables.get(table_name) orelse return .superseded;
+        const authority = currentTargetedIndexAuthority(state, index_name, token) orelse return .superseded;
+        if (!authority.owner_active) return .superseded;
+        const matches = switch (expected) {
+            .absent => authority.expectation == .absent,
+            .exact => |exact_identity| switch (authority.expectation) {
+                .exact => |actual| std.mem.eql(u8, exact_identity.index_name, index_name) and
+                    exact_identity.kind == actual.kind and
+                    exact_identity.incarnation == actual.incarnation and
+                    exact_identity.config_hash == actual.config_hash,
+                .unknown, .absent => false,
+            },
+        };
+        const group_in_scope = if (authority.handoff_topology_bound)
+            authority.expected_handoff_groups.contains(group_id)
+        else
+            state.groups.contains(group_id);
+        if (!matches or !group_in_scope) return .superseded;
+        if (!authority.handoff_topology_bound) {
+            authority.handoff_groups.ensureUnusedCapacity(self.alloc, 1) catch return .storage_failure;
+            authority.terminal_failures.ensureUnusedCapacity(self.alloc, 1) catch return .storage_failure;
+        }
+        const terminal_absence = targetExpectationIsAbsent(authority.expectation);
+        const revoked_handoff = terminal_absence and authority.target_authority_handed_off;
+        if (terminal_absence) {
+            // A terminal drop result is not evidence that the desired absence
+            // exists. Revoke any earlier same-transition absence reduction and
+            // prevent later refreshes from silently converting this terminal
+            // owner result into success. Only a new transition may supersede
+            // it.
+            authority.target_authority_handed_off = false;
+            _ = authority.handoff_groups.remove(group_id);
+        } else {
+            recordTargetGroupAcknowledgement(authority, group_id, false);
+        }
+        authority.terminal_failures.putAssumeCapacity(group_id, .{
+            .expectation = authority.expectation,
+            .code = code,
+        });
+        if (revoked_handoff) markTargetObservationStaleLocked(state, index_name);
+        if (revoked_handoff or self.advanceTargetedIndexAuthorityLocked(state))
+            self.syncReadViewAuthorityLocked(table_name, state)
+        else
+            self.syncReadGroupAuthorityLocked(table_name, state, group_id);
+        return .recorded;
     }
 
     /// Requests release after the named mutation's last synchronous/queued
@@ -775,15 +1508,18 @@ pub const TableRuntimeSnapshotCache = struct {
         index_name: []const u8,
         token: TargetedIndexTransitionToken,
     ) void {
+        const mutation_state = self.lockExistingTableMutation(table_name) orelse return;
+        defer self.unlockTableMutation(mutation_state);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        const state = self.tables.getPtr(table_name) orelse return;
+        const state = self.tables.get(table_name) orelse return;
         const fence = currentTargetedIndexAuthority(state, index_name, token) orelse return;
         if (!fence.owner_active) return;
         fence.owner_active = false;
         fence.release_after_observation_generation = self.next_observation_generation;
-        self.advanceTargetedIndexAuthorityLocked(state);
+        _ = self.advanceTargetedIndexAuthorityLocked(state);
         self.settleReleasedIndexAuthoritiesLocked(state);
+        self.syncReadViewAuthorityLocked(table_name, state);
     }
 
     /// Returns true only when the exact transition has already installed its
@@ -798,7 +1534,7 @@ pub const TableRuntimeSnapshotCache = struct {
     ) bool {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        const state = self.tables.getPtr(table_name) orelse return false;
+        const state = self.tables.get(table_name) orelse return false;
         const authority = currentTargetedIndexAuthority(state, index_name, token) orelse return false;
         return authority.target_authority_handed_off;
     }
@@ -813,9 +1549,11 @@ pub const TableRuntimeSnapshotCache = struct {
         index_name: []const u8,
         token: TargetedIndexTransitionToken,
     ) void {
+        const mutation_state = self.lockExistingTableMutation(table_name) orelse return;
+        defer self.unlockTableMutation(mutation_state);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        const state = self.tables.getPtr(table_name) orelse return;
+        const state = self.tables.get(table_name) orelse return;
         const fence = currentTargetedIndexAuthority(state, index_name, token) orelse return;
         if (!fence.owner_active) return;
         // Desired identity is write-once for a transition. A successful create
@@ -825,15 +1563,19 @@ pub const TableRuntimeSnapshotCache = struct {
         fence.expectation = .absent;
         fence.expectation_observation_generation = self.next_observation_generation;
         fence.target_authority_handed_off = false;
-        self.advanceTargetedIndexAuthorityLocked(state);
+        fence.handoff_groups.clearRetainingCapacity();
+        _ = self.advanceTargetedIndexAuthorityLocked(state);
         self.settleReleasedIndexAuthoritiesLocked(state);
+        self.syncReadViewAuthorityLocked(table_name, state);
     }
 
     /// Captures the table lifecycle before a DB is opened or inspected.
     pub fn capturePublicationToken(self: *@This(), table_name: []const u8) !PublicationToken {
+        const mutation_state = try self.lockEnsuredTableMutation(table_name);
+        defer self.unlockTableMutation(mutation_state);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        const state = try self.ensureTableLocked(table_name);
+        const state = mutation_state;
         return .{
             .table_epoch = state.epoch,
             .observation_generation = self.takeObservationGenerationLocked(),
@@ -858,6 +1600,8 @@ pub const TableRuntimeSnapshotCache = struct {
         };
         errdefer token.deinit();
 
+        self.mutation_barrier.lockSharedUncancelable(std.Options.debug_io);
+        defer self.mutation_barrier.unlockShared(std.Options.debug_io);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         token.topology_revision = self.topology_revision;
@@ -873,7 +1617,7 @@ pub const TableRuntimeSnapshotCache = struct {
             var cached_it = self.tables.iterator();
             while (cached_it.next()) |entry| {
                 const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
-                token.table_epochs.putAssumeCapacityNoClobber(owned_name, entry.value_ptr.epoch);
+                token.table_epochs.putAssumeCapacityNoClobber(owned_name, entry.value_ptr.*.epoch);
             }
         }
         for (table_names) |table_name| {
@@ -894,23 +1638,85 @@ pub const TableRuntimeSnapshotCache = struct {
         table_name: []const u8,
         status: LocalTableRuntimeStatus,
     ) !PublishResult {
+        const mutation_state = self.lockExistingTableMutation(table_name) orelse return .stale_table;
+        defer self.unlockTableMutation(mutation_state);
         var owned = try status.clone(self.alloc);
-        errdefer owned.deinit(self.alloc);
-        var incoming_lookup = try IndexObservationLookup.init(self.alloc, owned.stats.indexes);
+        var owned_transferred = false;
+        defer if (!owned_transferred) owned.deinit(self.alloc);
+        var incoming_lookup = try IndexObservationLookup.init(self.alloc, status.stats.indexes);
         defer incoming_lookup.deinit(self.alloc);
         owned.cache_observation_generation = token.observation_generation;
         const now_ns = platform_time.monotonicNs();
         owned.withMetadataDefaults(.live_writer_publish, now_ns);
 
+        // Pin the exact previous payload with mutation ownership, then perform
+        // all merge cloning/allocation while the global cache mutex is free.
         lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        const state = self.tables.getPtr(table_name) orelse {
-            owned.deinit(self.alloc);
+        const initial_state = self.tables.get(table_name) orelse {
+            self.mutex.unlock();
+            return .stale_table;
+        };
+        if (!std.meta.eql(initial_state.epoch, token.table_epoch)) {
+            self.mutex.unlock();
+            return .stale_table;
+        }
+        initial_state.groups.ensureUnusedCapacity(self.alloc, 1) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        reserveTargetAcknowledgementCapacityLocked(initial_state, 1, self.alloc) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        const previous = initial_state.groups.getPtr(status.group_id);
+        const previous_generation = if (previous) |value| value.cache_observation_generation else null;
+        if (previous_generation) |generation| {
+            if (generation > token.observation_generation) {
+                self.mutex.unlock();
+                return .stale_observation;
+            }
+        }
+        self.mutex.unlock();
+
+        try self.mergeRefreshStatusLocked(
+            previous,
+            &owned,
+            now_ns,
+            &initial_state.index_authorities,
+            initial_state.active_index_transition_count != 0,
+            &incoming_lookup,
+        );
+        const prepared = ReadGroupSnapshot.init(self.read_view_alloc, owned) catch null;
+        var prepared_owned = prepared != null;
+        defer if (prepared_owned) prepared.?.release(self.read_view_alloc);
+        var retired_status: ?LocalTableRuntimeStatus = null;
+        defer if (retired_status) |*retired| retired.deinit(self.alloc);
+        var retired_read_group: ?*ReadGroupSnapshot = null;
+        defer if (retired_read_group) |retired| retired.release(self.read_view_alloc);
+        var needs_topology_refresh = false;
+
+        lockAtomic(&self.mutex);
+        const state = self.tables.get(table_name) orelse {
+            self.mutex.unlock();
             return .stale_table;
         };
         if (!std.meta.eql(state.epoch, token.table_epoch)) {
-            owned.deinit(self.alloc);
+            self.mutex.unlock();
             return .stale_table;
+        }
+        const current = state.groups.getPtr(status.group_id);
+        if (previous_generation) |expected_generation| {
+            const value = current orelse {
+                self.mutex.unlock();
+                return error.RuntimeStatusPublicationContended;
+            };
+            if (value.cache_observation_generation != expected_generation) {
+                self.mutex.unlock();
+                return error.RuntimeStatusPublicationContended;
+            }
+        } else if (current != null) {
+            self.mutex.unlock();
+            return error.RuntimeStatusPublicationContended;
         }
         self.applyTargetObservationAuthorityLocked(
             state,
@@ -918,32 +1724,47 @@ pub const TableRuntimeSnapshotCache = struct {
             &owned,
             token.target_observation_revision,
         );
-        if (state.groups.getPtr(status.group_id)) |previous| {
-            if (previous.cache_observation_generation > token.observation_generation) {
-                owned.deinit(self.alloc);
-                return .stale_observation;
-            }
-            // Single-group lifecycle publications must obey the same merge
-            // contract as catalog refreshes. In particular, a synthetic
-            // startup/status placeholder may withdraw convergence authority,
-            // but it cannot erase a newer owner-acknowledged incarnation or
-            // its serving facts.
-            try self.mergeRefreshStatusLocked(
-                previous,
-                &owned,
-                now_ns,
-                &state.index_authorities,
-                state.active_index_transition_count != 0,
-                &incoming_lookup,
-            );
-            previous.deinit(self.alloc);
-            previous.* = owned;
+        if (current) |value| {
+            retired_status = value.*;
+            value.* = owned;
         } else {
-            try state.groups.put(self.alloc, status.group_id, owned);
+            state.groups.putAssumeCapacityNoClobber(status.group_id, owned);
         }
-        self.enforceIndexAuthoritiesInStatusLocked(state, state.groups.getPtr(status.group_id).?);
-        self.advanceTargetedIndexAuthorityLocked(state);
+        owned_transferred = true;
+        const published_status = state.groups.getPtr(status.group_id).?;
+        self.enforceIndexAuthoritiesInStatusLocked(state, published_status);
+        recordGroupTargetAuthorityAcknowledgementsLocked(
+            state,
+            published_status,
+            status.stats.indexes,
+            &incoming_lookup,
+        );
+        const completed_global_handoff = self.advanceTargetedIndexAuthorityLocked(state);
         self.settleReleasedIndexAuthoritiesLocked(state);
+
+        if (completed_global_handoff) self.syncReadViewAuthorityLocked(table_name, state);
+        if (prepared) |group| {
+            group.status.cache_observation_generation = published_status.cache_observation_generation;
+            group.status.metadata = published_status.metadata;
+            syncReadGroupAuthorityFromStateLocked(state, group);
+            lockAtomic(&self.read_view_mutex);
+            if (self.read_views.get(table_name)) |view| {
+                if (view.groupPosition(status.group_id)) |position| {
+                    retired_read_group = view.groups[position];
+                    view.groups[position] = group;
+                    prepared_owned = false;
+                } else {
+                    needs_topology_refresh = true;
+                }
+            } else {
+                needs_topology_refresh = true;
+            }
+            self.read_view_mutex.unlock();
+        }
+        self.mutex.unlock();
+
+        if (needs_topology_refresh or prepared == null)
+            self.refreshReadViewPrepared(table_name, token.table_epoch);
         return .published;
     }
 
@@ -1005,6 +1826,8 @@ pub const TableRuntimeSnapshotCache = struct {
         transition_token: ?TargetedIndexTransitionToken,
         statuses: []const LocalTableRuntimeStatus,
     ) !PublishResult {
+        const mutation_state = self.lockExistingTableMutation(table_name) orelse return .stale_table;
+        defer self.unlockTableMutation(mutation_state);
         for (statuses, 0..) |status, index| {
             for (statuses[0..index]) |previous| {
                 if (previous.group_id == status.group_id) return error.DuplicateRuntimeStatusGroup;
@@ -1034,7 +1857,7 @@ pub const TableRuntimeSnapshotCache = struct {
             for (incoming_lookups[0..initialized_lookups]) |*lookup| lookup.deinit(self.alloc);
             if (incoming_lookups.len > 0) self.alloc.free(incoming_lookups);
         }
-        for (owned, 0..) |status, index| {
+        for (statuses, 0..) |status, index| {
             incoming_lookups[index] = try IndexObservationLookup.init(self.alloc, status.stats.indexes);
             initialized_lookups += 1;
         }
@@ -1049,7 +1872,7 @@ pub const TableRuntimeSnapshotCache = struct {
         lockAtomic(&self.mutex);
         {
             defer self.mutex.unlock();
-            const state = self.tables.getPtr(table_name) orelse return .stale_table;
+            const state = self.tables.get(table_name) orelse return .stale_table;
             if (!std.meta.eql(state.epoch, token.table_epoch)) return .stale_table;
             var missing_group_count: usize = 0;
             for (statuses) |status| {
@@ -1061,6 +1884,7 @@ pub const TableRuntimeSnapshotCache = struct {
             // case and asks the durable owner to retry instead of allocating
             // or rehashing in the commit section.
             try state.groups.ensureUnusedCapacity(self.alloc, @intCast(missing_group_count));
+            try reserveTargetAcknowledgementCapacityLocked(state, statuses.len, self.alloc);
             for (statuses, incoming_lookups, 0..) |status, incoming_lookup, index| {
                 const previous = state.groups.getPtr(status.group_id) orelse continue;
                 if (previous.cache_observation_generation > token.observation_generation) continue;
@@ -1096,9 +1920,21 @@ pub const TableRuntimeSnapshotCache = struct {
 
         runTestAfterStructuralPublishPreparationHook();
 
+        var refresh_read_groups = false;
+        defer if (refresh_read_groups) {
+            for (statuses, publishable) |status, should_publish| {
+                if (!should_publish) continue;
+                self.refreshReadGroupPrepared(
+                    table_name,
+                    token.table_epoch,
+                    status.group_id,
+                    token.observation_generation,
+                );
+            }
+        };
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        const state = self.tables.getPtr(table_name) orelse return .stale_table;
+        const state = self.tables.get(table_name) orelse return .stale_table;
         if (!std.meta.eql(state.epoch, token.table_epoch)) return .stale_table;
         if (transition_token) |transition| {
             const name = target_index_name orelse return .stale_observation;
@@ -1130,6 +1966,11 @@ pub const TableRuntimeSnapshotCache = struct {
         const maximum_group_count = (state.groups.capacity() * std.hash_map.default_max_load_percentage) / 100;
         if (maximum_group_count - state.groups.count() < new_groups)
             return error.RuntimeStatusPublicationContended;
+        // A publisher may have consumed acknowledgement-map spare capacity
+        // while payload preparation ran without the cache mutex. Re-reserve
+        // at the final preflight, before any ownership transfer, so the commit
+        // phase remains allocation-free and `putAssumeCapacity` is sound.
+        try reserveTargetAcknowledgementCapacityLocked(state, statuses.len, self.alloc);
 
         const now_ns = platform_time.monotonicNs();
         if (target_index_name) |name| {
@@ -1227,11 +2068,19 @@ pub const TableRuntimeSnapshotCache = struct {
                 next.* = undefined;
             }
             self.enforceIndexAuthoritiesInStatusLocked(state, state.groups.getPtr(status.group_id).?);
+            recordGroupTargetAuthorityAcknowledgementsLocked(
+                state,
+                state.groups.getPtr(status.group_id).?,
+                status.stats.indexes,
+                &incoming_lookups[owned_index],
+            );
             transferred[owned_index] = true;
             published = true;
         }
-        self.advanceTargetedIndexAuthorityLocked(state);
+        const completed_global_handoff = self.advanceTargetedIndexAuthorityLocked(state);
+        if (completed_global_handoff) self.syncReadViewAuthorityLocked(table_name, state);
         self.settleReleasedIndexAuthoritiesLocked(state);
+        refresh_read_groups = true;
         return if (published or statuses.len == 0) .published else .stale_observation;
     }
 
@@ -1244,6 +2093,8 @@ pub const TableRuntimeSnapshotCache = struct {
         table_name: []const u8,
         statuses: []const LocalTableRuntimeStatus,
     ) !PublishResult {
+        const mutation_state = self.lockExistingTableMutation(table_name) orelse return .stale_table;
+        defer self.unlockTableMutation(mutation_state);
         for (statuses, 0..) |status, index| {
             for (statuses[0..index]) |previous| {
                 if (previous.group_id == status.group_id) return error.DuplicateRuntimeStatusGroup;
@@ -1263,8 +2114,46 @@ pub const TableRuntimeSnapshotCache = struct {
             replacement.putAssumeCapacityNoClobber(status.group_id, owned);
         }
 
+        var prepared_read_view: ?*ReadView = if (statuses.len == 0)
+            null
+        else
+            ReadView.init(self.read_view_alloc, .{ .items = @constCast(statuses) }) catch null;
+        var prepared_read_owned = prepared_read_view != null;
+        defer if (prepared_read_owned) prepared_read_view.?.release(self.read_view_alloc);
+        var prepared_read_name = if (prepared_read_view != null)
+            self.read_view_alloc.dupe(u8, table_name) catch null
+        else
+            null;
+        if (prepared_read_view != null and prepared_read_name == null) {
+            prepared_read_view.?.release(self.read_view_alloc);
+            prepared_read_view = null;
+            prepared_read_owned = false;
+        }
+        var prepared_read_name_owned = prepared_read_name != null;
+        defer if (prepared_read_name_owned) self.read_view_alloc.free(prepared_read_name.?);
+        if (prepared_read_view != null) {
+            lockAtomic(&self.read_view_mutex);
+            self.read_views.ensureUnusedCapacity(self.read_view_alloc, 1) catch {
+                self.read_view_mutex.unlock();
+                prepared_read_view.?.release(self.read_view_alloc);
+                prepared_read_view = null;
+                prepared_read_owned = false;
+                self.read_view_alloc.free(prepared_read_name.?);
+                prepared_read_name = null;
+                prepared_read_name_owned = false;
+            };
+            if (prepared_read_view != null) self.read_view_mutex.unlock();
+        }
+
+        var retired_read_view: ?*ReadView = null;
+        var retired_read_name: ?[]const u8 = null;
+        defer {
+            if (retired_read_name) |name| self.read_view_alloc.free(@constCast(name));
+            if (retired_read_view) |view| view.release(self.read_view_alloc);
+        }
+
         lockAtomic(&self.mutex);
-        const state = self.tables.getPtr(table_name) orelse {
+        const state = self.tables.get(table_name) orelse {
             self.mutex.unlock();
             return .stale_table;
         };
@@ -1296,6 +2185,32 @@ pub const TableRuntimeSnapshotCache = struct {
         replacement = .empty;
         replacement_owned = false;
         self.clearIndexAuthoritiesLocked(state);
+
+        if (prepared_read_view) |view| {
+            for (view.groups) |group| {
+                const current = state.groups.get(group.status.group_id).?;
+                group.status.cache_observation_generation = current.cache_observation_generation;
+                group.status.metadata = current.metadata;
+                syncReadGroupAuthorityFromStateLocked(state, group);
+            }
+            lockAtomic(&self.read_view_mutex);
+            if (self.read_views.getPtr(table_name)) |current| {
+                retired_read_view = current.*;
+                current.* = view;
+            } else {
+                self.read_views.putAssumeCapacity(prepared_read_name.?, view);
+                prepared_read_name_owned = false;
+            }
+            prepared_read_owned = false;
+            self.read_view_mutex.unlock();
+        } else {
+            lockAtomic(&self.read_view_mutex);
+            if (self.read_views.fetchRemove(table_name)) |removed| {
+                retired_read_name = removed.key;
+                retired_read_view = removed.value;
+            }
+            self.read_view_mutex.unlock();
+        }
         self.mutex.unlock();
 
         var retired_it = retired.valueIterator();
@@ -1325,20 +2240,24 @@ pub const TableRuntimeSnapshotCache = struct {
             seen_tables.deinit(self.alloc);
         }
         try seen_tables.ensureTotalCapacity(self.alloc, @intCast(snapshots.len));
+        const retired_read_views = try self.alloc.alloc(RetiredReadView, catalog_token.table_epochs.count());
+        var retired_read_view_count: usize = 0;
+        defer {
+            for (retired_read_views[0..retired_read_view_count]) |retired| retired.deinit(self.read_view_alloc);
+            if (retired_read_views.len > 0) self.alloc.free(retired_read_views);
+        }
         for (snapshots) |snapshot_entry| {
             if (seen_tables.contains(snapshot_entry.table_name)) return error.DuplicateRuntimeStatusTable;
             const owned_name = try self.alloc.dupe(u8, snapshot_entry.table_name);
             seen_tables.putAssumeCapacityNoClobber(owned_name, {});
         }
 
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
         const now_ns = platform_time.monotonicNs();
-
         for (snapshots) |*snapshot_entry| {
             const expected_epoch = catalog_token.table_epochs.get(snapshot_entry.table_name);
-            const state = self.tables.getPtr(snapshot_entry.table_name);
+            const state = self.lockExistingTableMutation(snapshot_entry.table_name);
             if (expected_epoch == null or state == null or !std.meta.eql(expected_epoch.?, state.?.epoch)) {
+                if (state) |value| self.unlockTableMutation(value);
                 const rejected_name = try self.alloc.dupe(u8, snapshot_entry.table_name);
                 errdefer self.alloc.free(rejected_name);
                 try result.rejected_tables.append(self.alloc, rejected_name);
@@ -1347,20 +2266,48 @@ pub const TableRuntimeSnapshotCache = struct {
                 continue;
             }
 
-            try self.publishTableRefreshLocked(
+            self.publishTableRefreshLocked(
                 state.?,
+                snapshot_entry.table_name,
+                expected_epoch.?,
                 &snapshot_entry.statuses,
                 catalog_token.observation_generation,
                 catalog_token.target_observation_revision,
                 now_ns,
-            );
+            ) catch |err| {
+                self.unlockTableMutation(state.?);
+                return err;
+            };
+            self.refreshReadViewPrepared(snapshot_entry.table_name, expected_epoch.?);
+            self.unlockTableMutation(state.?);
             snapshot_entry.deinit(self.alloc);
             next_unconsumed += 1;
             result.published_tables += 1;
         }
 
         if (!catalog_token.complete_catalog) return result;
+        const RetiredTableState = struct {
+            name: []const u8,
+            state: *TableState,
+        };
+        const retired_tables = try self.alloc.alloc(RetiredTableState, catalog_token.table_epochs.count());
+        var retired_table_count: usize = 0;
+        defer {
+            for (retired_tables[0..retired_table_count]) |retired| {
+                self.alloc.free(@constCast(retired.name));
+                retired.state.release(self.alloc);
+            }
+            if (retired_tables.len > 0) self.alloc.free(retired_tables);
+        }
+
+        // Only catalog absence/topology commitment is global. All expensive
+        // per-table merge, clone, and read-view construction above ran through
+        // exact table ownership while unrelated publishers remained runnable.
+        self.mutation_barrier.lockUncancelable(std.Options.debug_io);
+        lockAtomic(&self.mutex);
         if (catalog_token.topology_revision != self.topology_revision) {
+            self.mutex.unlock();
+            self.mutation_barrier.unlock(std.Options.debug_io);
             result.removals_deferred = true;
             return result;
         }
@@ -1370,23 +2317,38 @@ pub const TableRuntimeSnapshotCache = struct {
         while (it.next()) |entry| {
             if (seen_tables.contains(entry.key_ptr.*)) continue;
             const expected_epoch = catalog_token.table_epochs.get(entry.key_ptr.*) orelse continue;
-            if (!std.meta.eql(expected_epoch, entry.value_ptr.epoch)) continue;
+            const retired_state = entry.value_ptr.*;
+            if (!std.meta.eql(expected_epoch, retired_state.epoch)) continue;
             if (!advanced_invalidation_epoch) {
                 self.advanceInvalidationEpochLocked();
                 advanced_invalidation_epoch = true;
             }
-            self.alloc.free(@constCast(entry.key_ptr.*));
-            entry.value_ptr.deinit(self.alloc);
+            lockAtomic(&self.read_view_mutex);
+            if (self.read_views.fetchRemove(entry.key_ptr.*)) |removed| {
+                retired_read_views[retired_read_view_count] = .{
+                    .name = removed.key,
+                    .view = removed.value,
+                };
+                retired_read_view_count += 1;
+            }
+            self.read_view_mutex.unlock();
+            retired_tables[retired_table_count] = .{
+                .name = entry.key_ptr.*,
+                .state = retired_state,
+            };
+            retired_table_count += 1;
             self.tables.removeByPtr(entry.key_ptr);
             result.removed_tables += 1;
         }
+        self.mutex.unlock();
+        self.mutation_barrier.unlock(std.Options.debug_io);
         return result;
     }
 
-    pub fn snapshot(self: *@This(), alloc: std.mem.Allocator, table_name: []const u8) !?LocalTableRuntimeStatuses {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        const state = self.tables.getPtr(table_name) orelse return null;
+    fn cloneStableTableStatuses(
+        state: *const TableState,
+        alloc: std.mem.Allocator,
+    ) !?LocalTableRuntimeStatuses {
         if (state.groups.count() == 0) return null;
         const ordered = try alloc.alloc(*const LocalTableRuntimeStatus, state.groups.count());
         defer alloc.free(ordered);
@@ -1408,6 +2370,288 @@ pub const TableRuntimeSnapshotCache = struct {
         return .{ .items = items };
     }
 
+    fn removeReadView(self: *@This(), table_name: []const u8) void {
+        var retired: ?*ReadView = null;
+        lockAtomic(&self.read_view_mutex);
+        if (self.read_views.fetchRemove(table_name)) |entry| {
+            self.read_view_alloc.free(@constCast(entry.key));
+            retired = entry.value;
+        }
+        self.read_view_mutex.unlock();
+        if (retired) |view| view.release(self.read_view_alloc);
+    }
+
+    /// Prepare a complete topology replacement without the mutable-cache lock.
+    /// The caller holds the exact table mutex and a shared lifecycle lease,
+    /// so the captured table/status backing
+    /// remains stable; the final lock still revalidates exact epoch and every
+    /// group generation before publishing the immutable view.
+    fn refreshReadViewPrepared(
+        self: *@This(),
+        table_name: []const u8,
+        expected_epoch: TableEpoch,
+    ) void {
+        lockAtomic(&self.mutex);
+        const initial_state = self.tables.get(table_name) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        if (!std.meta.eql(initial_state.epoch, expected_epoch) or initial_state.groups.count() == 0) {
+            self.mutex.unlock();
+            return;
+        }
+        self.mutex.unlock();
+
+        var statuses = (cloneStableTableStatuses(initial_state, self.read_view_alloc) catch return) orelse return;
+        defer statuses.deinit(self.read_view_alloc);
+        const prepared = ReadView.init(self.read_view_alloc, statuses) catch return;
+        var prepared_owned = true;
+        defer if (prepared_owned) prepared.release(self.read_view_alloc);
+        const owned_name = self.read_view_alloc.dupe(u8, table_name) catch return;
+        var name_owned = true;
+        defer if (name_owned) self.read_view_alloc.free(owned_name);
+
+        // Any missing table slot can now be inserted without allocating in the
+        // final main-mutex section. The table lane excludes another topology
+        // writer from consuming this reservation before the swap.
+        lockAtomic(&self.read_view_mutex);
+        self.read_views.ensureUnusedCapacity(self.read_view_alloc, 1) catch {
+            self.read_view_mutex.unlock();
+            return;
+        };
+        self.read_view_mutex.unlock();
+
+        var retired: ?*ReadView = null;
+        defer if (retired) |old| old.release(self.read_view_alloc);
+        lockAtomic(&self.mutex);
+        const state = self.tables.get(table_name) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        if (!std.meta.eql(state.epoch, expected_epoch) or state.groups.count() != prepared.groups.len) {
+            self.mutex.unlock();
+            return;
+        }
+        for (prepared.groups) |group| {
+            const current = state.groups.get(group.status.group_id) orelse {
+                self.mutex.unlock();
+                return;
+            };
+            if (current.cache_observation_generation != group.status.cache_observation_generation) {
+                self.mutex.unlock();
+                return;
+            }
+            syncReadGroupAuthorityFromStateLocked(state, group);
+        }
+
+        lockAtomic(&self.read_view_mutex);
+        if (self.read_views.getPtr(table_name)) |current| {
+            retired = current.*;
+            current.* = prepared;
+        } else {
+            self.read_views.putAssumeCapacity(owned_name, prepared);
+            name_owned = false;
+        }
+        prepared_owned = false;
+        self.read_view_mutex.unlock();
+        self.mutex.unlock();
+    }
+
+    /// Clone a committed group while mutable writers are serialized but the
+    /// global cache mutex is available to readers/control-plane lookups. The
+    /// final lock validates the exact epoch and observation generation before
+    /// swapping one COW slot; all allocation and retirement happen off-lock.
+    fn refreshReadGroupPrepared(
+        self: *@This(),
+        table_name: []const u8,
+        expected_epoch: TableEpoch,
+        group_id: u64,
+        expected_generation: u64,
+    ) void {
+        lockAtomic(&self.mutex);
+        const initial_state = self.tables.get(table_name) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        if (!std.meta.eql(initial_state.epoch, expected_epoch)) {
+            self.mutex.unlock();
+            return;
+        }
+        const initial_status = initial_state.groups.getPtr(group_id) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        if (initial_status.cache_observation_generation != expected_generation) {
+            self.mutex.unlock();
+            return;
+        }
+        // The table lane and stable heap-owned table state pin the status
+        // payload while the main mutex is released for cloning.
+        self.mutex.unlock();
+
+        const prepared = ReadGroupSnapshot.init(self.read_view_alloc, initial_status.*) catch return;
+        var prepared_owned = true;
+        defer if (prepared_owned) prepared.release(self.read_view_alloc);
+        var retired: ?*ReadGroupSnapshot = null;
+        defer if (retired) |old| old.release(self.read_view_alloc);
+
+        lockAtomic(&self.mutex);
+        const state = self.tables.get(table_name) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        if (!std.meta.eql(state.epoch, expected_epoch)) {
+            self.mutex.unlock();
+            return;
+        }
+        const current_status = state.groups.getPtr(group_id) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        if (current_status.cache_observation_generation != expected_generation) {
+            self.mutex.unlock();
+            return;
+        }
+        syncReadGroupAuthorityFromStateLocked(state, prepared);
+
+        lockAtomic(&self.read_view_mutex);
+        if (self.read_views.get(table_name)) |view| {
+            if (view.groupPosition(group_id)) |position| {
+                const current = view.groups[position];
+                if (current.status.cache_observation_generation <= expected_generation) {
+                    view.groups[position] = prepared;
+                    prepared_owned = false;
+                    retired = current;
+                }
+                self.read_view_mutex.unlock();
+                self.mutex.unlock();
+                return;
+            }
+        }
+        self.read_view_mutex.unlock();
+        self.mutex.unlock();
+
+        // No read topology exists yet (or this group is new). Build that rare
+        // lifecycle replacement off-lock and revalidate every group at swap.
+        self.refreshReadViewPrepared(table_name, expected_epoch);
+    }
+
+    fn retainReadView(self: *@This(), table_name: []const u8) ?*ReadView {
+        lockAtomic(&self.read_view_mutex);
+        defer self.read_view_mutex.unlock();
+        const view = self.read_views.get(table_name) orelse return null;
+        view.retain();
+        return view;
+    }
+
+    fn syncReadViewAuthorityLocked(self: *@This(), table_name: []const u8, state: *const TableState) void {
+        lockAtomic(&self.read_view_mutex);
+        defer self.read_view_mutex.unlock();
+        const view = self.read_views.get(table_name) orelse return;
+        for (view.groups) |group| syncReadGroupAuthorityFromStateLocked(state, group);
+    }
+
+    fn syncReadGroupAuthorityLocked(
+        self: *@This(),
+        table_name: []const u8,
+        state: *const TableState,
+        group_id: u64,
+    ) void {
+        lockAtomic(&self.read_view_mutex);
+        defer self.read_view_mutex.unlock();
+        const view = self.read_views.get(table_name) orelse return;
+        const position = view.groupPosition(group_id) orelse return;
+        syncReadGroupAuthorityFromStateLocked(state, view.groups[position]);
+    }
+
+    fn syncReadGroupAuthorityFromStateLocked(
+        state: *const TableState,
+        group: *ReadGroupSnapshot,
+    ) void {
+        const status = state.groups.get(group.status.group_id) orelse return;
+        const view_authority = &group.authority;
+        if (!status.metadata.target_observation_complete)
+            view_authority.target_observation_complete.store(false, .release);
+        for (status.stats.indexes) |index_status| {
+            if (comptime builtin.is_test) _ = test_authority_sync_index_visits.fetchAdd(1, .monotonic);
+            const index = view_authority.index_by_name.get(index_status.name) orelse continue;
+            const index_authority = &view_authority.indexes[index];
+            index_authority.store(index_status);
+            const terminal_failure = if (state.index_authorities.get(index_status.name)) |authority|
+                if (authority.terminal_failures.get(group.status.group_id)) |failure|
+                    if (targetExpectationsEqual(authority.expectation, failure.expectation) and
+                        targetExpectationAcceptsIdentity(failure.expectation, index_status))
+                        failure.code
+                    else
+                        null
+                else
+                    null
+            else
+                null;
+            index_authority.storeTerminalFailure(terminal_failure);
+        }
+        if (status.metadata.target_observation_complete)
+            view_authority.target_observation_complete.store(true, .release);
+    }
+
+    fn markReadViewGroupTargetPendingLocked(self: *@This(), table_name: []const u8, group_id: u64) void {
+        lockAtomic(&self.read_view_mutex);
+        defer self.read_view_mutex.unlock();
+        const view = self.read_views.get(table_name) orelse return;
+        const group_index = view.groupPosition(group_id) orelse return;
+        view.groups[group_index].authority.target_observation_complete.store(false, .release);
+    }
+
+    fn markReadViewIndexTargetsPendingLocked(
+        self: *@This(),
+        table_name: []const u8,
+        group_id: u64,
+        identities: anytype,
+        applied_positions: []const ?usize,
+    ) void {
+        lockAtomic(&self.read_view_mutex);
+        defer self.read_view_mutex.unlock();
+        const view = self.read_views.get(table_name) orelse return;
+        const group_index = view.groupPosition(group_id) orelse return;
+        const group = view.groups[group_index];
+        for (identities, applied_positions) |identity, applied_position| {
+            if (applied_position == null) continue;
+            const index = group.authority.index_by_name.get(identity.index_name) orelse continue;
+            if (!indexMatchesTargetIdentity(group.status.stats.indexes[index], identity)) continue;
+            group.authority.indexes[index].target_observation_complete.store(false, .release);
+        }
+    }
+
+    pub fn snapshot(self: *@This(), alloc: std.mem.Allocator, table_name: []const u8) !?LocalTableRuntimeStatuses {
+        if (self.retainReadView(table_name)) |view| {
+            defer view.release(self.read_view_alloc);
+            const retained = try alloc.alloc(*ReadGroupSnapshot, view.groups.len);
+            defer alloc.free(retained);
+            lockAtomic(&self.read_view_mutex);
+            for (view.groups, 0..) |group, index| {
+                group.retain();
+                retained[index] = group;
+            }
+            self.read_view_mutex.unlock();
+            defer for (retained) |group| group.release(self.read_view_alloc);
+
+            const items = try alloc.alloc(LocalTableRuntimeStatus, retained.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (items[0..initialized]) |*status| status.deinit(alloc);
+                alloc.free(items);
+            }
+            for (retained, 0..) |group, index| {
+                items[index] = try group.status.clone(alloc);
+                errdefer items[index].deinit(alloc);
+                try group.applyAuthority(alloc, &items[index]);
+                initialized += 1;
+            }
+            return .{ .items = items };
+        }
+        return null;
+    }
+
     /// Records one group's committed target advance without changing any
     /// published serving fact. This is an O(1) commit-path watermark update
     /// under the small status-cache mutex; HTTP readers only clone the result
@@ -1421,25 +2665,31 @@ pub const TableRuntimeSnapshotCache = struct {
         group_id: u64,
         source_target_sequence: ?u64,
     ) void {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        const state = self.ensureTableLocked(table_name) catch {
-            self.clearTablesLocked();
-            self.advanceInvalidationEpochLocked();
+        const mutation_state = self.lockEnsuredTableMutation(table_name) catch {
+            self.clear();
             return;
         };
-        self.markGroupTargetObservationPendingLocked(state, group_id, source_target_sequence);
+        defer self.unlockTableMutation(mutation_state);
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = mutation_state;
+        switch (self.markGroupTargetObservationPendingLocked(table_name, state, group_id, source_target_sequence)) {
+            .group_applied => self.markReadViewGroupTargetPendingLocked(table_name, group_id),
+            .index_applied => unreachable,
+            .no_change, .state_invalidated => {},
+        }
     }
 
     fn markGroupTargetObservationPendingLocked(
         self: *@This(),
+        table_name: []const u8,
         state: *TableState,
         group_id: u64,
         source_target_sequence: ?u64,
-    ) void {
+    ) TargetObservationUpdate {
         if (source_target_sequence) |sequence| {
             if (state.required_target_observation_revisions.get(group_id)) |required| {
-                if (sequence <= required.source_target_sequence) return;
+                if (sequence <= required.source_target_sequence) return .no_change;
             }
         }
         self.advanceTargetObservationRevisionLocked();
@@ -1450,11 +2700,12 @@ pub const TableRuntimeSnapshotCache = struct {
         state.required_target_observation_revisions.put(self.alloc, group_id, requirement) catch {
             // Failure to record the convergence fence cannot leave an older
             // completion proof visible. Retire the table observation instead.
-            self.invalidateTableStateLocked(state);
-            return;
+            self.invalidateTableStateLocked(table_name, state);
+            return .state_invalidated;
         };
         if (state.groups.getPtr(group_id)) |status|
             status.metadata.target_observation_complete = false;
+        return .group_applied;
     }
 
     /// Records a committed target advance for one exact index incarnation.
@@ -1487,45 +2738,85 @@ pub const TableRuntimeSnapshotCache = struct {
         source_target_sequence: u64,
     ) void {
         if (identities.len == 0) return;
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        const state = self.ensureTableLocked(table_name) catch {
-            self.clearTablesLocked();
-            self.advanceInvalidationEpochLocked();
+
+        // Build the event-side lookup before taking the cache mutex. Commit
+        // callbacks may affect every configured index; allocating and hashing
+        // that set while holding the process-wide status lock would make HTTP
+        // snapshot latency depend on write fan-out.
+        var event_lookup = std.StringHashMapUnmanaged(usize).empty;
+        defer event_lookup.deinit(self.alloc);
+        event_lookup.ensureTotalCapacity(self.alloc, @intCast(identities.len)) catch {
+            self.markGroupTargetObservationPending(table_name, group_id, source_target_sequence);
             return;
         };
-
-        const current_status = state.groups.getPtr(group_id);
-        var current_lookup: ?IndexObservationLookup = if (current_status) |status|
-            IndexObservationLookup.init(self.alloc, status.stats.indexes) catch {
-                self.markGroupTargetObservationPendingLocked(state, group_id, source_target_sequence);
+        const current_positions = self.alloc.alloc(?usize, identities.len) catch {
+            self.markGroupTargetObservationPending(table_name, group_id, source_target_sequence);
+            return;
+        };
+        defer self.alloc.free(current_positions);
+        @memset(current_positions, null);
+        for (identities, 0..) |identity, identity_index| {
+            const result = event_lookup.getOrPutAssumeCapacity(identity.index_name);
+            if (result.found_existing) {
+                self.markGroupTargetObservationPending(table_name, group_id, source_target_sequence);
                 return;
             }
-        else
-            null;
-        defer if (current_lookup) |*lookup| lookup.deinit(self.alloc);
+            result.value_ptr.* = identity_index;
+        }
 
-        for (identities) |identity| {
-            self.markOneIndexTargetObservationPendingLocked(
+        const mutation_state = self.lockEnsuredTableMutation(table_name) catch {
+            self.clear();
+            return;
+        };
+        defer self.unlockTableMutation(mutation_state);
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = mutation_state;
+        const current_status = state.groups.getPtr(group_id);
+        if (current_status) |status| {
+            for (status.stats.indexes, 0..) |item, item_index| {
+                const identity_index = event_lookup.get(item.name) orelse continue;
+                if (indexMatchesTargetIdentity(item, identities[identity_index]))
+                    current_positions[identity_index] = item_index;
+            }
+        }
+
+        var group_fallback_applied = false;
+        for (identities, current_positions, 0..) |identity, current_position, identity_index| {
+            switch (self.markOneIndexTargetObservationPendingLocked(
+                table_name,
                 state,
                 current_status,
-                current_lookup,
+                current_position,
                 group_id,
                 identity,
                 source_target_sequence,
-            );
+            )) {
+                .index_applied => {},
+                .group_applied => {
+                    group_fallback_applied = true;
+                    current_positions[identity_index] = null;
+                },
+                .no_change => current_positions[identity_index] = null,
+                .state_invalidated => return,
+            }
         }
+        if (group_fallback_applied)
+            self.markReadViewGroupTargetPendingLocked(table_name, group_id)
+        else
+            self.markReadViewIndexTargetsPendingLocked(table_name, group_id, identities, current_positions);
     }
 
     fn markOneIndexTargetObservationPendingLocked(
         self: *@This(),
+        table_name: []const u8,
         state: *TableState,
         current_status: ?*LocalTableRuntimeStatus,
-        current_lookup: ?IndexObservationLookup,
+        current_position: ?usize,
         group_id: u64,
         identity: anytype,
         source_target_sequence: u64,
-    ) void {
+    ) TargetObservationUpdate {
         const index_name = identity.index_name;
 
         var authority = state.index_authorities.getPtr(index_name);
@@ -1534,9 +2825,9 @@ pub const TableRuntimeSnapshotCache = struct {
                 .exact => |value| value,
                 // An active structural transition owns the identity decision;
                 // a data-plane callback cannot fill or overturn it.
-                .unknown, .absent => return,
+                .unknown, .absent => return .no_change,
             };
-            if (!targetIdentitiesEqual(expected, identity)) return;
+            if (!targetIdentitiesEqual(expected, identity)) return .no_change;
         } else {
             // If status already knows this name, require the event to match
             // that exact row before creating persistent authority. This makes
@@ -1544,14 +2835,9 @@ pub const TableRuntimeSnapshotCache = struct {
             // first runtime snapshot exists, the commit event's durable exact
             // identity is itself the authority; do not widen known scope and
             // unnecessarily fence sibling convergence.
-            if (current_status) |status| {
-                const lookup = current_lookup orelse return;
-                const current_index = lookup.by_name.get(index_name) orelse return;
-                if (!indexMatchesTargetIdentity(status.stats.indexes[current_index], identity)) return;
-            }
+            if (current_status != null and current_position == null) return .no_change;
             const owned_name = self.alloc.dupe(u8, index_name) catch {
-                self.markGroupTargetObservationPendingLocked(state, group_id, source_target_sequence);
-                return;
+                return self.markGroupTargetObservationPendingLocked(table_name, state, group_id, source_target_sequence);
             };
             state.index_authorities.put(self.alloc, owned_name, .{
                 .transition_revision = 0,
@@ -1567,14 +2853,13 @@ pub const TableRuntimeSnapshotCache = struct {
                 .target_authority_handed_off = true,
             }) catch {
                 self.alloc.free(owned_name);
-                self.markGroupTargetObservationPendingLocked(state, group_id, source_target_sequence);
-                return;
+                return self.markGroupTargetObservationPendingLocked(table_name, state, group_id, source_target_sequence);
             };
             authority = state.index_authorities.getPtr(owned_name).?;
         }
 
         if (authority.?.convergence_requirements.get(group_id)) |required| {
-            if (source_target_sequence <= required.source_target_sequence) return;
+            if (source_target_sequence <= required.source_target_sequence) return .no_change;
         }
         self.advanceTargetObservationRevisionLocked();
         authority.?.convergence_requirements.put(self.alloc, group_id, .{
@@ -1584,20 +2869,19 @@ pub const TableRuntimeSnapshotCache = struct {
             // Exact-scope bookkeeping failed, so conservatively widen this
             // one event to the established group-wide convergence fence.
             // Serving authority remains independent and is not revoked.
-            self.markGroupTargetObservationPendingLocked(
+            return self.markGroupTargetObservationPendingLocked(
+                table_name,
                 state,
                 group_id,
                 source_target_sequence,
             );
-            return;
         };
         if (current_status) |status| {
-            const lookup = current_lookup orelse return;
-            const current_index = lookup.by_name.get(index_name) orelse return;
-            const item = &status.stats.indexes[current_index];
+            const item = &status.stats.indexes[current_position orelse return .index_applied];
             if (indexMatchesTargetIdentity(item.*, identity))
                 item.runtime_target_observation_complete = false;
         }
+        return .index_applied;
     }
 
     /// A runtime owner disappearing makes current-target convergence unknown,
@@ -1608,9 +2892,11 @@ pub const TableRuntimeSnapshotCache = struct {
         self: *@This(),
         table_name: []const u8,
     ) void {
+        const mutation_state = self.lockExistingTableMutation(table_name) orelse return;
+        defer self.unlockTableMutation(mutation_state);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        const state = self.tables.getPtr(table_name) orelse return;
+        const state = self.tables.get(table_name) orelse return;
         if (state.groups.count() == 0) return;
         state.required_target_observation_revisions.ensureTotalCapacity(
             self.alloc,
@@ -1621,6 +2907,7 @@ pub const TableRuntimeSnapshotCache = struct {
             // authoritative owner publication can recover it.
             var statuses = state.groups.valueIterator();
             while (statuses.next()) |status| status.metadata.target_observation_complete = false;
+            self.syncReadViewAuthorityLocked(table_name, state);
             return;
         };
         self.advanceTargetObservationRevisionLocked();
@@ -1633,6 +2920,7 @@ pub const TableRuntimeSnapshotCache = struct {
             state.required_target_observation_revisions.putAssumeCapacity(entry.key_ptr.*, requirement);
             entry.value_ptr.metadata.target_observation_complete = false;
         }
+        self.syncReadViewAuthorityLocked(table_name, state);
     }
 
     pub fn snapshotGroupStatus(
@@ -1641,11 +2929,20 @@ pub const TableRuntimeSnapshotCache = struct {
         table_name: []const u8,
         group_id: u64,
     ) !?LocalTableRuntimeStatus {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        const state = self.tables.getPtr(table_name) orelse return null;
-        const status = state.groups.getPtr(group_id) orelse return null;
-        return try status.clone(alloc);
+        if (self.retainReadView(table_name)) |view| {
+            defer view.release(self.read_view_alloc);
+            const group_index = view.groupPosition(group_id) orelse return null;
+            lockAtomic(&self.read_view_mutex);
+            const group = view.groups[group_index];
+            group.retain();
+            self.read_view_mutex.unlock();
+            defer group.release(self.read_view_alloc);
+            var cloned = try group.status.clone(alloc);
+            errdefer cloned.deinit(alloc);
+            try group.applyAuthority(alloc, &cloned);
+            return cloned;
+        }
+        return null;
     }
 
     fn mergeRefreshStatusLocked(
@@ -1701,7 +2998,8 @@ pub const TableRuntimeSnapshotCache = struct {
 
         var result: TableRuntimeSummary = .{};
         var table_it = self.tables.valueIterator();
-        while (table_it.next()) |entry| {
+        while (table_it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
             if (entry.groups.count() == 0) continue;
             result.table_count += 1;
             var table_has_replay_debt = false;
@@ -1735,11 +3033,30 @@ pub const TableRuntimeSnapshotCache = struct {
     fn publishTableRefreshLocked(
         self: *@This(),
         state: *TableState,
+        table_name: []const u8,
+        expected_epoch: TableEpoch,
         statuses: *LocalTableRuntimeStatuses,
         observation_generation: u64,
         target_observation_revision: u64,
         now_ns: u64,
     ) !void {
+        // Validate the retained table/epoch in a short global-cache section.
+        // Exact table ownership pins its authority maps during the
+        // allocation-heavy preparation below; unrelated tables remain free.
+        lockAtomic(&self.mutex);
+        if (self.tables.get(table_name) != state or !std.meta.eql(state.epoch, expected_epoch)) {
+            self.mutex.unlock();
+            return error.RuntimeStatusPublicationContended;
+        }
+        self.mutex.unlock();
+
+        var acknowledgement_capacity = try TargetAcknowledgementCapacityPreparation.init(
+            self.alloc,
+            &state.index_authorities,
+            statuses.items,
+        );
+        defer acknowledgement_capacity.deinit(self.alloc);
+
         var replacement = std.AutoHashMapUnmanaged(u64, LocalTableRuntimeStatus).empty;
         errdefer {
             var it = replacement.valueIterator();
@@ -1749,16 +3066,50 @@ pub const TableRuntimeSnapshotCache = struct {
         try replacement.ensureTotalCapacity(self.alloc, @intCast(statuses.items.len));
 
         const source_items = statuses.items;
+        var last_source_by_group = std.AutoHashMapUnmanaged(u64, usize).empty;
+        defer last_source_by_group.deinit(self.alloc);
+        try last_source_by_group.ensureTotalCapacity(self.alloc, @intCast(source_items.len));
+        for (source_items, 0..) |source_status, source_index|
+            last_source_by_group.putAssumeCapacity(source_status.group_id, source_index);
+
+        var acknowledgement_candidates = TargetAuthorityAcknowledgementCandidates.empty;
+        defer acknowledgement_candidates.deinit(self.alloc);
+        var maximum_acknowledgement_candidates: usize = 0;
+        for (source_items) |source_status| {
+            maximum_acknowledgement_candidates = std.math.add(
+                usize,
+                maximum_acknowledgement_candidates,
+                source_status.stats.indexes.len,
+            ) catch return error.OutOfMemory;
+        }
+        var active_absence_authorities: usize = 0;
+        var absence_count_it = state.index_authorities.valueIterator();
+        while (absence_count_it.next()) |authority| {
+            if (authority.transition_active and !authority.target_authority_handed_off and
+                targetExpectationIsAbsent(authority.expectation))
+                active_absence_authorities += 1;
+        }
+        maximum_acknowledgement_candidates = std.math.add(
+            usize,
+            maximum_acknowledgement_candidates,
+            std.math.mul(usize, active_absence_authorities, source_items.len) catch return error.OutOfMemory,
+        ) catch return error.OutOfMemory;
+        try acknowledgement_candidates.ensureTotalCapacity(
+            self.alloc,
+            @intCast(maximum_acknowledgement_candidates),
+        );
         var moved: usize = 0;
         defer {
             for (source_items[moved..]) |*status| status.deinit(self.alloc);
             if (source_items.len > 0) self.alloc.free(source_items);
             statuses.items = &.{};
         }
-        for (source_items) |*source_status| {
+        for (source_items, 0..) |*source_status, source_index| {
             var owned = source_status.*;
             source_status.* = undefined;
             moved += 1;
+            var owned_needs_deinit = true;
+            defer if (owned_needs_deinit) owned.deinit(self.alloc);
             owned.cache_observation_generation = observation_generation;
             owned.withMetadataDefaults(.background_refresh, now_ns);
             self.applyTargetObservationAuthorityLocked(
@@ -1767,6 +3118,58 @@ pub const TableRuntimeSnapshotCache = struct {
                 &owned,
                 target_observation_revision,
             );
+            if (state.active_index_transition_count != 0 and
+                last_source_by_group.get(owned.group_id).? == source_index and
+                owned.metadata.source != .synthetic_config and
+                owned.metadata.source != .cached_snapshot)
+            {
+                var raw_lookup = try IndexObservationLookup.init(self.alloc, owned.stats.indexes);
+                defer raw_lookup.deinit(self.alloc);
+                for (owned.stats.indexes) |item| {
+                    const authority = state.index_authorities.getPtr(item.name) orelse continue;
+                    if (!authority.transition_active or authority.target_authority_handed_off or
+                        (authority.handoff_topology_bound and
+                            !authority.expected_handoff_groups.contains(owned.group_id)) or
+                        observation_generation < authority.accept_target_after_observation_generation or
+                        observation_generation < authority.expectation_observation_generation or
+                        !targetAuthorityAcceptsIdentity(authority.*, item)) continue;
+                    acknowledgement_candidates.putAssumeCapacity(.{
+                        .index_name = state.index_authorities.getKey(item.name).?,
+                        .group_id = owned.group_id,
+                    }, .{
+                        .transition_revision = authority.transition_revision,
+                        .serviceable = targetObservationProvesServiceability(
+                            item,
+                            owned,
+                            authority.expectation,
+                        ),
+                    });
+                }
+                var absence_it = state.index_authorities.iterator();
+                while (absence_it.next()) |entry| {
+                    const authority = entry.value_ptr;
+                    if (!authority.transition_active or authority.target_authority_handed_off or
+                        (authority.handoff_topology_bound and
+                            !authority.expected_handoff_groups.contains(owned.group_id)) or
+                        !targetExpectationIsAbsent(authority.expectation) or
+                        authority.terminal_failures.contains(owned.group_id) or
+                        observation_generation < authority.accept_target_after_observation_generation or
+                        observation_generation < authority.expectation_observation_generation or
+                        raw_lookup.by_name.contains(entry.key_ptr.*)) continue;
+                    acknowledgement_candidates.putAssumeCapacity(.{
+                        .index_name = entry.key_ptr.*,
+                        .group_id = owned.group_id,
+                    }, .{
+                        .transition_revision = authority.transition_revision,
+                        .serviceable = false,
+                    });
+                }
+            }
+            // prepareRefreshStatusLocked consumes `owned` on both success and
+            // error. Disarm the local guard only at that ownership boundary;
+            // errors above it (notably raw lookup allocation) must still free
+            // the status already removed from `source_items`.
+            owned_needs_deinit = false;
             owned = try self.prepareRefreshStatusLocked(
                 state.groups.getPtr(owned.group_id),
                 owned,
@@ -1783,10 +3186,89 @@ pub const TableRuntimeSnapshotCache = struct {
             }
         }
 
+        // Materialize the effective identity set before transferring the
+        // replacement into the cache. Allocation failure must leave the
+        // previous snapshot intact; mutating `state.groups` first would both
+        // publish a partial refresh and leak the displaced map on OOM.
+        var effective_presence = TargetAuthorityAcknowledgementPresence.empty;
+        defer effective_presence.deinit(self.alloc);
+        var effective_index_count: usize = 0;
+        var replacement_status_it = replacement.valueIterator();
+        while (replacement_status_it.next()) |status| {
+            effective_index_count = std.math.add(
+                usize,
+                effective_index_count,
+                status.stats.indexes.len,
+            ) catch return error.OutOfMemory;
+        }
+        try effective_presence.ensureTotalCapacity(self.alloc, @intCast(effective_index_count));
+        replacement_status_it = replacement.valueIterator();
+        while (replacement_status_it.next()) |status| {
+            for (status.stats.indexes) |effective| {
+                effective_presence.putAssumeCapacity(.{
+                    .index_name = effective.name,
+                    .group_id = status.group_id,
+                }, {});
+            }
+        }
+
+        lockAtomic(&self.mutex);
+        if (self.tables.get(table_name) != state or !std.meta.eql(state.epoch, expected_epoch)) {
+            self.mutex.unlock();
+            return error.RuntimeStatusPublicationContended;
+        }
+        acknowledgement_capacity.install();
         var old_groups = state.groups;
         state.groups = replacement;
-        self.advanceTargetedIndexAuthorityLocked(state);
+        var authority_it = state.index_authorities.valueIterator();
+        while (authority_it.next()) |authority| {
+            if (!authority.transition_active or authority.target_authority_handed_off) continue;
+            // Exact acknowledgements are monotonic for groups which remain in
+            // the topology. Retain them across a background refresh, pruning
+            // only groups no longer present; clearing every acknowledgement
+            // could strand a multi-group handoff after its owner had already
+            // published one shard exactly once.
+            if (authority.handoff_topology_bound) continue;
+            var ack_it = authority.handoff_groups.iterator();
+            while (ack_it.next()) |ack| {
+                if (!state.groups.contains(ack.key_ptr.*))
+                    authority.handoff_groups.removeByPtr(ack.key_ptr);
+            }
+        }
+        var acknowledged_status_it = state.groups.valueIterator();
+        while (acknowledged_status_it.next()) |status| {
+            for (status.stats.indexes) |effective| {
+                const candidate_key = TargetAuthorityAcknowledgementKey{
+                    .index_name = effective.name,
+                    .group_id = status.group_id,
+                };
+                const candidate = acknowledgement_candidates.get(candidate_key) orelse continue;
+                const authority = state.index_authorities.getPtr(effective.name) orelse continue;
+                if (!authority.transition_active or authority.target_authority_handed_off or
+                    authority.transition_revision != candidate.transition_revision or
+                    !targetObservationHandsOffAuthority(effective, status.*, authority.expectation)) continue;
+                recordTargetGroupAcknowledgement(
+                    authority,
+                    status.group_id,
+                    candidate.serviceable,
+                );
+            }
+        }
+        var absence_candidate_it = acknowledgement_candidates.iterator();
+        while (absence_candidate_it.next()) |candidate| {
+            const authority = state.index_authorities.getPtr(candidate.key_ptr.index_name) orelse continue;
+            if (!authority.transition_active or authority.target_authority_handed_off or
+                authority.transition_revision != candidate.value_ptr.transition_revision or
+                !targetExpectationIsAbsent(authority.expectation) or
+                authority.terminal_failures.contains(candidate.key_ptr.group_id) or
+                effective_presence.contains(candidate.key_ptr.*)) continue;
+            const status = state.groups.get(candidate.key_ptr.group_id) orelse continue;
+            if (status.metadata.freshness != .fresh) continue;
+            recordTargetGroupAcknowledgement(authority, candidate.key_ptr.group_id, false);
+        }
+        _ = self.advanceTargetedIndexAuthorityLocked(state);
         self.settleReleasedIndexAuthoritiesLocked(state);
+        self.mutex.unlock();
         var old_it = old_groups.valueIterator();
         while (old_it.next()) |status| status.deinit(self.alloc);
         old_groups.deinit(self.alloc);
@@ -1814,16 +3296,19 @@ pub const TableRuntimeSnapshotCache = struct {
     }
 
     fn ensureTableLocked(self: *@This(), table_name: []const u8) !*TableState {
-        if (self.tables.getPtr(table_name)) |state| return state;
+        if (self.tables.get(table_name)) |state| return state;
         const owned_name = try self.alloc.dupe(u8, table_name);
         errdefer self.alloc.free(owned_name);
-        try self.tables.put(self.alloc, owned_name, .{
+        const state = try self.alloc.create(TableState);
+        errdefer self.alloc.destroy(state);
+        state.* = .{
             .epoch = .{
                 .invalidation_epoch = self.next_invalidation_epoch,
                 .root_generation = 0,
             },
-        });
-        return self.tables.getPtr(owned_name).?;
+        };
+        try self.tables.put(self.alloc, owned_name, state);
+        return state;
     }
 
     fn clearGroupsLocked(self: *@This(), state: *TableState) void {
@@ -1833,9 +3318,10 @@ pub const TableRuntimeSnapshotCache = struct {
         state.required_target_observation_revisions.clearRetainingCapacity();
     }
 
-    fn invalidateTableStateLocked(self: *@This(), state: *TableState) void {
+    fn invalidateTableStateLocked(self: *@This(), table_name: []const u8, state: *TableState) void {
         self.clearGroupsLocked(state);
         self.clearIndexAuthoritiesLocked(state);
+        self.removeReadView(table_name);
         state.epoch.invalidation_epoch = self.next_invalidation_epoch;
         state.epoch.root_generation +%= 1;
         if (state.epoch.root_generation == 0) state.epoch.root_generation = 1;
@@ -1853,89 +3339,190 @@ pub const TableRuntimeSnapshotCache = struct {
 
     fn settleReleasedIndexAuthoritiesLocked(self: *@This(), state: *TableState) void {
         if (state.groups.count() == 0 or state.active_index_transition_count == 0) return;
-        while (true) {
-            var settled_name: ?[]const u8 = null;
-            var fence_it = state.index_authorities.iterator();
-            while (fence_it.next()) |entry| {
-                if (!entry.value_ptr.transition_active) continue;
-                if (entry.value_ptr.owner_active) continue;
-                if (!entry.value_ptr.target_authority_handed_off) continue;
-                const release_generation = entry.value_ptr.release_after_observation_generation orelse continue;
-                var all_groups_authoritative = true;
-                var group_it = state.groups.valueIterator();
-                while (group_it.next()) |status| {
-                    if (status.metadata.freshness != .fresh or
-                        status.cache_observation_generation < release_generation)
-                    {
-                        all_groups_authoritative = false;
-                        break;
-                    }
-                }
-                if (all_groups_authoritative) {
-                    settled_name = entry.key_ptr.*;
-                    break;
-                }
-            }
-            const name = settled_name orelse return;
-            const authority = state.index_authorities.getPtr(name).?;
+        // Release is independent of target identity: every group must have
+        // produced a fresh observation after the owner released its lease.
+        // Reduce that table-wide fact once, then settle every eligible
+        // transition in one authority pass.
+        var minimum_fresh_generation: u64 = std.math.maxInt(u64);
+        var group_it = state.groups.valueIterator();
+        while (group_it.next()) |status| {
+            if (status.metadata.freshness != .fresh) return;
+            minimum_fresh_generation = @min(
+                minimum_fresh_generation,
+                status.cache_observation_generation,
+            );
+        }
+
+        var fence_it = state.index_authorities.iterator();
+        while (fence_it.next()) |entry| {
+            const authority = entry.value_ptr;
+            if (!authority.transition_active or authority.owner_active or
+                !authority.target_authority_handed_off) continue;
+            const release_generation = authority.release_after_observation_generation orelse continue;
+            if (minimum_fresh_generation < release_generation) continue;
+
             std.debug.assert(state.active_index_transition_count > 0);
             state.active_index_transition_count -= 1;
             if (targetExpectationIsAbsent(authority.expectation)) {
-                const removed = state.index_authorities.fetchRemove(name).?;
-                self.alloc.free(@constCast(removed.key));
-                var removed_authority = removed.value;
-                removed_authority.deinit(self.alloc);
+                const owned_name = entry.key_ptr.*;
+                authority.deinit(self.alloc);
+                state.index_authorities.removeByPtr(entry.key_ptr);
+                self.alloc.free(@constCast(owned_name));
             } else {
                 authority.transition_active = false;
                 authority.release_after_observation_generation = null;
+                authority.handoff_groups.clearRetainingCapacity();
             }
         }
     }
 
-    fn advanceTargetedIndexAuthorityLocked(self: *@This(), state: *TableState) void {
+    fn reserveTargetAcknowledgementCapacityLocked(
+        state: *TableState,
+        maximum_new_groups: usize,
+        alloc: std.mem.Allocator,
+    ) !void {
+        if (maximum_new_groups == 0 or state.active_index_transition_count == 0) return;
+        var authority_it = state.index_authorities.valueIterator();
+        while (authority_it.next()) |authority| {
+            if (!authority.transition_active or authority.target_authority_handed_off) continue;
+            // Reserve before any status ownership is transferred. Each input
+            // group can contribute at most one acknowledgement to an exact
+            // transition, so the commit path can remain allocation-free and
+            // cannot silently lose its only handoff edge under memory pressure.
+            try authority.handoff_groups.ensureUnusedCapacity(alloc, @intCast(maximum_new_groups));
+        }
+    }
+
+    fn resetExpectedHandoffGroupsFromSnapshotLocked(
+        authority: *TargetedIndexAuthority,
+        state: *const TableState,
+        alloc: std.mem.Allocator,
+    ) !void {
+        authority.handoff_topology_bound = false;
+        authority.expected_handoff_groups.clearRetainingCapacity();
+        try authority.expected_handoff_groups.ensureTotalCapacity(alloc, @intCast(state.groups.count()));
+        var groups = state.groups.keyIterator();
+        while (groups.next()) |group_id|
+            authority.expected_handoff_groups.putAssumeCapacity(group_id.*, {});
+    }
+
+    fn recordTargetGroupAcknowledgement(
+        authority: *TargetedIndexAuthority,
+        group_id: u64,
+        serviceable: bool,
+    ) void {
+        const entry = authority.handoff_groups.getOrPutAssumeCapacity(group_id);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        // A later catch-up/cache observation cannot revoke a serving proof
+        // already supplied by this exact incarnation's resident owner.
+        entry.value_ptr.serviceable = entry.value_ptr.serviceable or serviceable;
+    }
+
+    fn recordGroupTargetAuthorityAcknowledgementsLocked(
+        state: *TableState,
+        status: *LocalTableRuntimeStatus,
+        observed_indexes: []const db_mod.types.DBIndexStats,
+        observed_lookup: *const IndexObservationLookup,
+    ) void {
+        if (state.active_index_transition_count == 0 or
+            status.metadata.source == .synthetic_config or
+            status.metadata.source == .cached_snapshot) return;
+
+        // Walk the effective rows once and resolve their raw owner rows by
+        // name. This preserves retained same-incarnation serving facts without
+        // turning bulk activation into one linear effective-row search per
+        // observed index.
+        for (status.stats.indexes) |*effective| {
+            const observed_position = observed_lookup.by_name.get(effective.name) orelse continue;
+            const item = observed_indexes[observed_position];
+            const authority = state.index_authorities.getPtr(effective.name) orelse continue;
+            if (!authority.transition_active or authority.target_authority_handed_off or
+                (authority.handoff_topology_bound and
+                    !authority.expected_handoff_groups.contains(status.group_id)) or
+                status.cache_observation_generation < authority.accept_target_after_observation_generation or
+                status.cache_observation_generation < authority.expectation_observation_generation or
+                !targetAuthorityAcceptsIdentity(authority.*, item)) continue;
+            // Presence and identity must come from this observation; serving
+            // visibility may come from the same-incarnation snapshot retained
+            // by the merge policy while its owner reports catch-up.
+            if (!targetObservationHandsOffAuthority(effective.*, status.*, authority.expectation)) continue;
+            // Record each group's serving proof when that owner publishes it,
+            // independently of the later all-groups identity handoff. The row
+            // remains stale for aggregate admission until every group acks,
+            // but a cached refresh can safely retain this exact proof.
+            const serviceable = targetObservationProvesServiceability(
+                effective.*,
+                status.*,
+                authority.expectation,
+            );
+            effective.runtime_observation_serviceable = serviceable;
+            recordTargetGroupAcknowledgement(authority, status.group_id, serviceable);
+        }
+
+        // Absence has no index row to drive the name lookup. Active absence
+        // transitions are bounded by the configured catalog, and each is
+        // checked once against this already-materialized group observation.
+        var authority_it = state.index_authorities.iterator();
+        while (authority_it.next()) |entry| {
+            const authority = entry.value_ptr;
+            if (!authority.transition_active or authority.target_authority_handed_off or
+                (authority.handoff_topology_bound and
+                    !authority.expected_handoff_groups.contains(status.group_id)) or
+                !targetExpectationIsAbsent(authority.expectation) or
+                authority.terminal_failures.contains(status.group_id) or
+                status.cache_observation_generation < authority.accept_target_after_observation_generation or
+                status.cache_observation_generation < authority.expectation_observation_generation or
+                status.metadata.freshness != .fresh or
+                observed_lookup.by_name.contains(entry.key_ptr.*)) continue;
+            recordTargetGroupAcknowledgement(authority, status.group_id, false);
+        }
+    }
+
+    fn advanceTargetedIndexAuthorityLocked(self: *@This(), state: *TableState) bool {
         _ = self;
-        if (state.groups.count() == 0 or state.active_index_transition_count == 0) return;
+        if (state.groups.count() == 0 or state.active_index_transition_count == 0) return false;
+        var handed_off_any = false;
         var fence_it = state.index_authorities.iterator();
         while (fence_it.next()) |entry| {
             const fence = entry.value_ptr;
             if (!fence.transition_active) continue;
             if (fence.target_authority_handed_off) continue;
-            var all_groups_authoritative = true;
-            var group_it = state.groups.valueIterator();
-            while (group_it.next()) |status| {
-                if (status.cache_observation_generation < fence.accept_target_after_observation_generation or
-                    status.metadata.source == .synthetic_config or
-                    status.metadata.source == .cached_snapshot)
-                {
-                    all_groups_authoritative = false;
-                    break;
-                }
-                const target = findIndexStatusByName(status.stats.indexes, entry.key_ptr.*);
-                if (target) |item| {
-                    if (!targetObservationHandsOffAuthority(item, status.*, fence.expectation)) {
-                        all_groups_authoritative = false;
-                        break;
-                    }
-                } else if (!targetExpectationIsAbsent(fence.expectation) or status.metadata.freshness != .fresh) {
-                    all_groups_authoritative = false;
-                    break;
-                }
-            }
-            if (!all_groups_authoritative) {
-                markTargetObservationStaleLocked(state, entry.key_ptr.*);
-                continue;
-            }
+            const required_group_count = if (fence.handoff_topology_bound)
+                fence.expected_handoff_groups.count()
+            else
+                state.groups.count();
+            if (required_group_count == 0 or fence.handoff_groups.count() != required_group_count) continue;
             fence.target_authority_handed_off = true;
-            var status_it = state.groups.valueIterator();
-            while (status_it.next()) |status| {
-                for (status.stats.indexes) |*item| {
-                    if (!std.mem.eql(u8, item.name, entry.key_ptr.*)) continue;
-                    item.runtime_observation_stale = false;
-                    item.runtime_observation_serviceable = true;
-                    item.runtime_observation_targeted_sibling = true;
-                }
+            handed_off_any = true;
+        }
+        if (!handed_off_any) return false;
+
+        // Publish serviceability for every transition completed by this
+        // observation in one table pass. Bulk activation therefore remains
+        // O(active transitions + published indexes), not O(indexes squared).
+        var status_it = state.groups.valueIterator();
+        while (status_it.next()) |status| {
+            for (status.stats.indexes) |*item| {
+                const authority = state.index_authorities.get(item.name) orelse continue;
+                if (!authority.target_authority_handed_off or
+                    !targetAuthorityAcceptsIdentity(authority, item.*)) continue;
+                item.runtime_observation_stale = false;
+                // Exact identity acceptance and query admission are separate
+                // authorities. A failed owner row may complete the handoff so
+                // its incarnation-scoped diagnostics become visible, but it
+                // must not manufacture a serving proof for an unpublished or
+                // blocked generation.
+                const acknowledged_serviceable = if (authority.handoff_groups.get(status.group_id)) |ack|
+                    ack.serviceable
+                else
+                    false;
+                item.runtime_observation_serviceable = item.runtime_observation_serviceable or
+                    acknowledged_serviceable or
+                    targetObservationProvesServiceability(item.*, status.*, authority.expectation);
+                item.runtime_observation_targeted_sibling = true;
             }
         }
+        return true;
     }
 
     /// Applies persistent live-index authority independently of transition
@@ -1952,7 +3539,8 @@ pub const TableRuntimeSnapshotCache = struct {
             const authority = state.index_authorities.get(item.name) orelse continue;
             const accepted = switch (authority.expectation) {
                 .unknown, .absent => false,
-                .exact => targetAuthorityAcceptsIdentity(authority, item.*),
+                .exact => authority.target_authority_handed_off and
+                    targetAuthorityAcceptsIdentity(authority, item.*),
             };
             if (accepted) continue;
             item.runtime_observation_stale = true;
@@ -1976,9 +3564,31 @@ pub const TableRuntimeSnapshotCache = struct {
         var it = self.tables.iterator();
         while (it.next()) |entry| {
             self.alloc.free(@constCast(entry.key_ptr.*));
-            entry.value_ptr.deinit(self.alloc);
+            entry.value_ptr.*.release(self.alloc);
         }
         self.tables.clearRetainingCapacity();
+        self.clearReadViews();
+    }
+
+    fn clearReadViews(self: *@This()) void {
+        while (true) {
+            var retired_name: ?[]const u8 = null;
+            var retired_view: ?*ReadView = null;
+            lockAtomic(&self.read_view_mutex);
+            var it = self.read_views.iterator();
+            if (it.next()) |entry| {
+                const removed = self.read_views.fetchRemove(entry.key_ptr.*).?;
+                retired_name = removed.key;
+                retired_view = removed.value;
+            }
+            self.read_view_mutex.unlock();
+            if (retired_view) |view| {
+                self.read_view_alloc.free(@constCast(retired_name.?));
+                view.release(self.read_view_alloc);
+                continue;
+            }
+            return;
+        }
     }
 
     fn advanceInvalidationEpochLocked(self: *@This()) void {
@@ -2040,6 +3650,284 @@ fn lessThanGroupIdPtr(_: void, lhs: *const LocalTableRuntimeStatus, rhs: *const 
     return lhs.group_id < rhs.group_id;
 }
 
+fn projectIndexActivationFailure(
+    alloc: std.mem.Allocator,
+    item: *db_mod.types.DBIndexStats,
+    failure: IndexActivationFailureCode,
+) !void {
+    const error_name = failure.stableName();
+    const load_error = try alloc.dupe(u8, error_name);
+    errdefer alloc.free(load_error);
+    const repair_error = try alloc.dupe(u8, error_name);
+
+    if (item.load_error) |value| alloc.free(value);
+    if (item.index_repair_last_error) |value| alloc.free(value);
+    item.load_error = load_error;
+    item.repair_degraded = true;
+    item.repair_issue_count = @max(item.repair_issue_count, 1);
+    item.repair_summary_ready = true;
+    item.index_lifecycle_work_class = .repair;
+    item.index_repair_trigger = "index_activation";
+    item.index_repair_phase = "terminal";
+    item.index_repair_automation = "paused";
+    item.index_repair_last_error = repair_error;
+    item.index_repair_wait_reason = "action_required";
+    item.index_repair_status = .failed;
+    item.index_repair_action_required = true;
+    item.index_repair_active_generation_serviceable = item.runtime_observation_serviceable;
+}
+
+test "activation failure projection preserves every stable failure code" {
+    const cases = [_]struct {
+        code: IndexActivationFailureCode,
+        name: []const u8,
+    }{
+        .{ .code = .invalid_target, .name = "InvalidIndexActivationTarget" },
+        .{ .code = .conflicting_target, .name = "IndexActivationTargetConflict" },
+        .{ .code = .unsupported, .name = "UnsupportedOperation" },
+        .{ .code = .publication_failed, .name = "IndexActivationPublicationFailed" },
+        .{ .code = .internal, .name = "IndexActivationInternalFailure" },
+    };
+    for (cases) |case| {
+        var item = db_mod.types.DBIndexStats{
+            .name = "thumbnail",
+            .kind = .dense_vector,
+            .runtime_observation_serviceable = true,
+        };
+        try projectIndexActivationFailure(std.testing.allocator, &item, case.code);
+        try std.testing.expectEqualStrings(case.name, item.load_error.?);
+        try std.testing.expectEqualStrings(case.name, item.index_repair_last_error.?);
+        try std.testing.expectEqual(db_mod.types.IndexRepairStatus.failed, item.index_repair_status.?);
+        try std.testing.expect(item.index_repair_action_required);
+        try std.testing.expect(item.index_repair_active_generation_serviceable);
+        std.testing.allocator.free(item.load_error.?);
+        std.testing.allocator.free(item.index_repair_last_error.?);
+    }
+}
+
+test "terminal activation failure precedes and binds its exact catalog row" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const transition = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
+    const expected = TableRuntimeSnapshotCache.TargetedIndexExpectation{ .exact = .{
+        .index_name = "thumbnail",
+        .kind = .dense_vector,
+        .incarnation = 42,
+        .config_hash = 77,
+    } };
+    try std.testing.expect(cache.bindTargetedIndexExpectation("docs", "thumbnail", transition, expected));
+    try std.testing.expect(cache.bindTargetedIndexExpectedGroups("docs", "thumbnail", transition, &.{7}));
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.RecordTerminalFailureResult.recorded, cache.recordTargetedIndexTerminalFailure(
+        "docs",
+        "thumbnail",
+        transition,
+        expected,
+        7,
+        .publication_failed,
+    ));
+
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .coverage_generation = 42,
+        .coverage_config_hash = 77,
+        .coverage_identity_ready = true,
+    }};
+    const publication = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(publication, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .synthetic_config, .freshness = .opening },
+            .stats = .{ .index_count = 1, .indexes = &indexes },
+        }),
+    );
+
+    var failed = (try cache.snapshot(alloc, "docs")).?;
+    defer failed.deinit(alloc);
+    const item = failed.items[0].stats.indexes[0];
+    try std.testing.expectEqualStrings("IndexActivationPublicationFailed", item.load_error.?);
+    try std.testing.expectEqual(db_mod.types.IndexRepairStatus.failed, item.index_repair_status.?);
+    try std.testing.expect(item.index_repair_action_required);
+    try std.testing.expect(!item.runtime_observation_serviceable);
+
+    cache.releaseTargetedIndexPublications("docs", "thumbnail", transition);
+    const settled_publication = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(settled_publication, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .index_count = 1, .indexes = &indexes },
+        }),
+    );
+    try std.testing.expect(!cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?.transition_active);
+    var settled = (try cache.snapshot(alloc, "docs")).?;
+    defer settled.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "IndexActivationPublicationFailed",
+        settled.items[0].stats.indexes[0].load_error.?,
+    );
+    try std.testing.expect(settled.items[0].stats.indexes[0].index_repair_action_required);
+
+    _ = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
+    var superseded = (try cache.snapshot(alloc, "docs")).?;
+    defer superseded.deinit(alloc);
+    try std.testing.expect(superseded.items[0].stats.indexes[0].load_error == null);
+}
+
+test "terminal drop failure never acknowledges absence and remains actionable" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .coverage_generation = 41,
+        .coverage_config_hash = 76,
+        .coverage_identity_ready = true,
+        .serving_snapshot_ready = true,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(initial, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .index_count = 1, .indexes = &indexes },
+        }),
+    );
+
+    const transition = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
+    const absent = TableRuntimeSnapshotCache.TargetedIndexExpectation.absent;
+    try std.testing.expect(cache.bindTargetedIndexExpectation("docs", "thumbnail", transition, absent));
+    try std.testing.expect(cache.bindTargetedIndexExpectedGroups("docs", "thumbnail", transition, &.{7}));
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.RecordTerminalFailureResult.recorded,
+        cache.recordTargetedIndexTerminalFailure(
+            "docs",
+            "thumbnail",
+            transition,
+            absent,
+            7,
+            .publication_failed,
+        ),
+    );
+    try std.testing.expect(!cache.targetedIndexGroupAcknowledged("docs", "thumbnail", absent, 7));
+    try std.testing.expect(!cache.targetedIndexAuthorityHandedOff("docs", "thumbnail", transition));
+    try std.testing.expect(!cache.acknowledgeTargetedIndexGroup(
+        "docs",
+        "thumbnail",
+        transition,
+        absent,
+        7,
+        false,
+    ));
+
+    cache.releaseTargetedIndexPublications("docs", "thumbnail", transition);
+    const later = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(later, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            // Even a later raw observation of absence cannot reinterpret the
+            // terminal owner result as a successful drop. The fenced
+            // predecessor remains the public action-required row.
+            .stats = .{},
+        }),
+    );
+    const authority = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
+    try std.testing.expect(authority.transition_active);
+    try std.testing.expect(!authority.target_authority_handed_off);
+    try std.testing.expect(!cache.targetedIndexGroupAcknowledged("docs", "thumbnail", absent, 7));
+    var failed = (try cache.snapshot(alloc, "docs")).?;
+    defer failed.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "IndexActivationPublicationFailed",
+        failed.items[0].stats.indexes[0].load_error.?,
+    );
+    try std.testing.expect(failed.items[0].stats.indexes[0].index_repair_action_required);
+
+    _ = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
+    var superseded = (try cache.snapshot(alloc, "docs")).?;
+    defer superseded.deinit(alloc);
+    try std.testing.expect(superseded.items[0].stats.indexes[0].load_error == null);
+}
+
+test "terminal failure result distinguishes supersession and reserved storage" {
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var cache = TableRuntimeSnapshotCache.init(failing.allocator());
+        defer cache.deinit();
+        const initial = try cache.capturePublicationToken("docs");
+        try std.testing.expectEqual(
+            TableRuntimeSnapshotCache.PublishResult.published,
+            try cache.publishGroup(initial, "docs", .{ .group_id = 7, .stats = .{} }),
+        );
+        const transition = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
+        const absent = TableRuntimeSnapshotCache.TargetedIndexExpectation.absent;
+        try std.testing.expect(cache.bindTargetedIndexExpectation("docs", "thumbnail", transition, absent));
+        failing.fail_index = failing.alloc_index;
+        try std.testing.expectEqual(
+            TableRuntimeSnapshotCache.RecordTerminalFailureResult.storage_failure,
+            cache.recordTargetedIndexTerminalFailure(
+                "docs",
+                "thumbnail",
+                transition,
+                absent,
+                7,
+                .publication_failed,
+            ),
+        );
+        try std.testing.expect(failing.has_induced_failure);
+    }
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var cache = TableRuntimeSnapshotCache.init(failing.allocator());
+        defer cache.deinit();
+        const transition = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
+        const absent = TableRuntimeSnapshotCache.TargetedIndexExpectation.absent;
+        try std.testing.expect(cache.bindTargetedIndexExpectation("docs", "thumbnail", transition, absent));
+        try std.testing.expect(cache.bindTargetedIndexExpectedGroups("docs", "thumbnail", transition, &.{7}));
+        failing.fail_index = failing.alloc_index;
+        try std.testing.expectEqual(
+            TableRuntimeSnapshotCache.RecordTerminalFailureResult.recorded,
+            cache.recordTargetedIndexTerminalFailure(
+                "docs",
+                "thumbnail",
+                transition,
+                absent,
+                7,
+                .publication_failed,
+            ),
+        );
+        try std.testing.expect(!failing.has_induced_failure);
+    }
+    {
+        var cache = TableRuntimeSnapshotCache.init(std.testing.allocator);
+        defer cache.deinit();
+        const transition = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
+        const absent = TableRuntimeSnapshotCache.TargetedIndexExpectation.absent;
+        try std.testing.expect(cache.bindTargetedIndexExpectation("docs", "thumbnail", transition, absent));
+        _ = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
+        try std.testing.expectEqual(
+            TableRuntimeSnapshotCache.RecordTerminalFailureResult.superseded,
+            cache.recordTargetedIndexTerminalFailure(
+                "docs",
+                "thumbnail",
+                transition,
+                absent,
+                7,
+                .publication_failed,
+            ),
+        );
+    }
+}
+
 fn preserveArtifactVisibilityOnReplayRegression(
     alloc: std.mem.Allocator,
     previous: LocalTableRuntimeStatus,
@@ -2085,7 +3973,20 @@ fn preserveArtifactVisibilityUsingLookup(
         const accepted_authority_continuity = if (index_authorities) |authorities|
             if (authorities.get(dst.name)) |authority|
                 (!authority.transition_active or authority.target_authority_handed_off) and
-                    targetAuthorityAcceptsIdentity(authority, cached.*)
+                    targetAuthorityAcceptsIdentity(authority, cached.*) and
+                    cached.runtime_observation_serviceable
+            else
+                false
+        else
+            false;
+        const pending_cached_target_continuity = if (index_authorities) |authorities|
+            if (authorities.get(dst.name)) |authority|
+                authority.transition_active and
+                    !authority.target_authority_handed_off and
+                    incoming.metadata.source == .cached_snapshot and
+                    targetAuthorityAcceptsIdentity(authority, cached.*) and
+                    targetAuthorityAcceptsIdentity(authority, dst.*) and
+                    cached.runtime_observation_serviceable
             else
                 false
         else
@@ -2182,6 +4083,7 @@ fn preserveArtifactVisibilityUsingLookup(
             indexHasPublishedGenerationVisibility(cached.*);
         const serviceable_continuity = serviceable_catch_up_continuity or
             targeted_sibling_continuity or
+            pending_cached_target_continuity or
             accepted_authority_continuity;
         dst.runtime_observation_serviceable = serviceable_continuity;
         dst.runtime_observation_targeted_sibling = targeted_sibling_continuity;
@@ -2405,6 +4307,34 @@ fn targetObservationHandsOffAuthority(
     return indexHasPublishedArtifactVisibility(item);
 }
 
+fn targetObservationProvesServiceability(
+    item: db_mod.types.DBIndexStats,
+    status: LocalTableRuntimeStatus,
+    expectation: TargetedIndexAuthority.Expectation,
+) bool {
+    const expected = switch (expectation) {
+        .exact => |identity| identity,
+        .unknown, .absent => return false,
+    };
+    if (!indexMatchesAuthorityIdentity(item, expected)) return false;
+
+    const derived = item.kind == .dense_vector or item.kind == .sparse_vector;
+    if (item.load_error != null or status.metadata.freshness == .failed) {
+        if (!item.index_repair_active_generation_serviceable) return false;
+        return if (derived) item.serving_snapshot_ready else true;
+    }
+    if (status.metadata.freshness == .fresh)
+        return if (derived) item.serving_snapshot_ready else true;
+    if (status.metadata.freshness != .opening and status.metadata.freshness != .catching_up)
+        return false;
+    if (derived) {
+        return item.coverage_identity_ready and
+            item.coverage_summary_ready and
+            item.serving_snapshot_ready;
+    }
+    return indexHasPublishedArtifactVisibility(item);
+}
+
 fn targetExpectationIsAbsent(expectation: TargetedIndexAuthority.Expectation) bool {
     return switch (expectation) {
         .absent => true,
@@ -2435,6 +4365,20 @@ fn targetAuthorityAcceptsIdentity(
         .unknown, .absent => return false,
     };
     return indexMatchesAuthorityIdentity(item, expected);
+}
+
+fn targetExpectationAcceptsIdentity(
+    expectation: TargetedIndexAuthority.Expectation,
+    item: db_mod.types.DBIndexStats,
+) bool {
+    return switch (expectation) {
+        .exact => |identity| indexMatchesAuthorityIdentity(item, identity),
+        // An absent expectation belongs to the authority map entry selected
+        // by this row's name. Project its failed drop onto the retained
+        // predecessor without pretending that absence was acknowledged.
+        .absent => true,
+        .unknown => false,
+    };
 }
 
 fn indexMatchesAuthorityIdentity(
@@ -3494,6 +5438,7 @@ test "runtime status cache stable absence removal retires the old table epoch" {
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.removed_tables);
     try std.testing.expect((try cache.snapshot(alloc, "logs")) == null);
+    try std.testing.expect((try cache.snapshotGroupStatus(alloc, "logs", 9)) == null);
     try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.stale_table, try cache.publishGroup(
         stale_logs_token,
         "logs",
@@ -3501,6 +5446,367 @@ test "runtime status cache stable absence removal retires the old table epoch" {
     ));
     const recreated = try cache.capturePublicationToken("logs");
     try std.testing.expect(!std.meta.eql(stale_logs_token.table_epoch, recreated.table_epoch));
+}
+
+test "runtime status snapshots never wait for mutable cache ownership" {
+    const alloc = std.heap.page_allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    const token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(
+        token,
+        "docs",
+        .{ .group_id = 7, .stats = .{ .doc_count = 9 } },
+    ));
+
+    const Snapshot = struct {
+        cache: *TableRuntimeSnapshotCache,
+        done: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var snapshot = self.cache.snapshot(std.heap.page_allocator, "docs") catch {
+                self.failed.store(true, .release);
+                self.done.store(true, .release);
+                return;
+            } orelse {
+                self.failed.store(true, .release);
+                self.done.store(true, .release);
+                return;
+            };
+            snapshot.deinit(std.heap.page_allocator);
+            self.done.store(true, .release);
+        }
+    };
+    var snapshot = Snapshot{ .cache = &cache };
+    lockAtomic(&cache.mutex);
+    const thread = try std.Thread.spawn(.{}, Snapshot.run, .{&snapshot});
+    var completed_while_locked = false;
+    for (0..10_000) |_| {
+        if (snapshot.done.load(.acquire)) {
+            completed_while_locked = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    cache.mutex.unlock();
+    thread.join();
+    try std.testing.expect(completed_while_locked);
+    try std.testing.expect(!snapshot.failed.load(.acquire));
+}
+
+test "group read payload preparation and retirement stay off the global cache mutex" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const group_count = 256;
+    const statuses = try alloc.alloc(LocalTableRuntimeStatus, group_count);
+    defer alloc.free(statuses);
+    for (statuses, 0..) |*status, index| status.* = .{
+        .group_id = @intCast(index + 1),
+        .stats = .{ .doc_count = 1 },
+    };
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishLifecycleTransition(initial, "docs", statuses),
+    );
+    const view = cache.read_views.get("docs").?;
+    const untouched_position = view.groupPosition(2).?;
+    const untouched_group = view.groups[untouched_position];
+
+    const Probe = struct {
+        cache: *TableRuntimeSnapshotCache,
+        calls: usize = 0,
+        mutex_available: bool = true,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.cache.mutex.tryLock()) {
+                self.cache.mutex.unlock();
+            } else {
+                self.mutex_available = false;
+            }
+        }
+    };
+    var preparation = Probe{ .cache = &cache };
+    var retirement = Probe{ .cache = &cache };
+    test_read_group_preparation_hook = .{ .ptr = &preparation, .run = Probe.run };
+    defer test_read_group_preparation_hook = null;
+    test_read_group_retirement_hook = .{ .ptr = &retirement, .run = Probe.run };
+    defer test_read_group_retirement_hook = null;
+
+    const update = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(update, "docs", .{ .group_id = 1, .stats = .{ .doc_count = 2 } }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), preparation.calls);
+    try std.testing.expect(preparation.mutex_available);
+    try std.testing.expectEqual(@as(usize, 1), retirement.calls);
+    try std.testing.expect(retirement.mutex_available);
+    try std.testing.expect(cache.read_views.get("docs").?.groups[untouched_position] == untouched_group);
+}
+
+test "blocked read payload preparation does not convoy an unrelated table" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const initial_a = try cache.capturePublicationToken("table-a");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishLifecycleTransition(initial_a, "table-a", &.{.{
+            .group_id = 1,
+            .stats = .{ .doc_count = 1 },
+        }}),
+    );
+    const initial_b = try cache.capturePublicationToken("table-b");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishLifecycleTransition(initial_b, "table-b", &.{.{
+            .group_id = 2,
+            .stats = .{ .doc_count = 1 },
+        }}),
+    );
+    const token_a = try cache.capturePublicationToken("table-a");
+    const token_b = try cache.capturePublicationToken("table-b");
+
+    const BlockFirstPreparation = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.calls.fetchAdd(1, .acq_rel) != 0) return;
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+    const Publish = struct {
+        cache: *TableRuntimeSnapshotCache,
+        token: TableRuntimeSnapshotCache.PublicationToken,
+        table_name: []const u8,
+        group_id: u64,
+        done: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            const result = self.cache.publishGroup(self.token, self.table_name, .{
+                .group_id = self.group_id,
+                .stats = .{ .doc_count = 2 },
+            }) catch {
+                self.failed.store(true, .release);
+                self.done.store(true, .release);
+                return;
+            };
+            if (result != .published) self.failed.store(true, .release);
+            self.done.store(true, .release);
+        }
+    };
+
+    var blocker = BlockFirstPreparation{};
+    test_read_group_preparation_hook = .{ .ptr = &blocker, .run = BlockFirstPreparation.run };
+    defer test_read_group_preparation_hook = null;
+    var publish_a = Publish{ .cache = &cache, .token = token_a, .table_name = "table-a", .group_id = 1 };
+    var publish_b = Publish{ .cache = &cache, .token = token_b, .table_name = "table-b", .group_id = 2 };
+    const thread_a = try std.Thread.spawn(.{}, Publish.run, .{&publish_a});
+    while (!blocker.entered.load(.acquire)) std.Thread.yield() catch {};
+    const thread_b = try std.Thread.spawn(.{}, Publish.run, .{&publish_b});
+    var unrelated_completed = false;
+    for (0..100_000) |_| {
+        if (publish_b.done.load(.acquire)) {
+            unrelated_completed = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    blocker.release.store(true, .release);
+    thread_a.join();
+    thread_b.join();
+    try std.testing.expect(unrelated_completed);
+    try std.testing.expect(!publish_a.failed.load(.acquire));
+    try std.testing.expect(!publish_b.failed.load(.acquire));
+}
+
+test "blocked table refresh preparation does not convoy unrelated publication" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    for ([_][]const u8{ "table-a", "table-b" }, [_]u64{ 1, 2 }) |table_name, group_id| {
+        const token = try cache.capturePublicationToken(table_name);
+        try std.testing.expectEqual(
+            TableRuntimeSnapshotCache.PublishResult.published,
+            try cache.publishLifecycleTransition(token, table_name, &.{.{
+                .group_id = group_id,
+                .stats = .{ .doc_count = 1 },
+            }}),
+        );
+    }
+    const names = [_][]const u8{"table-a"};
+    var refresh_token = try cache.captureCatalogToken(alloc, &names, false);
+    defer refresh_token.deinit();
+    const refresh_statuses = try alloc.alloc(LocalTableRuntimeStatus, 1);
+    refresh_statuses[0] = .{ .group_id = 1, .stats = .{ .doc_count = 2 } };
+    const snapshots = try alloc.alloc(TableRuntimeSnapshot, 1);
+    defer alloc.free(snapshots);
+    snapshots[0] = .{
+        .table_name = try alloc.dupe(u8, "table-a"),
+        .statuses = .{ .items = refresh_statuses },
+    };
+    const token_b = try cache.capturePublicationToken("table-b");
+
+    const BlockFirstPreparation = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.calls.fetchAdd(1, .acq_rel) != 0) return;
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+    const Refresh = struct {
+        cache: *TableRuntimeSnapshotCache,
+        token: *const TableRuntimeSnapshotCache.CatalogToken,
+        snapshots: []TableRuntimeSnapshot,
+        failed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var result = self.cache.publishRefresh(self.token, self.snapshots) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            result.deinit();
+        }
+    };
+    const Publish = struct {
+        cache: *TableRuntimeSnapshotCache,
+        token: TableRuntimeSnapshotCache.PublicationToken,
+        done: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            const result = self.cache.publishGroup(self.token, "table-b", .{
+                .group_id = 2,
+                .stats = .{ .doc_count = 2 },
+            }) catch {
+                self.failed.store(true, .release);
+                self.done.store(true, .release);
+                return;
+            };
+            if (result != .published) self.failed.store(true, .release);
+            self.done.store(true, .release);
+        }
+    };
+
+    var blocker = BlockFirstPreparation{};
+    test_read_group_preparation_hook = .{ .ptr = &blocker, .run = BlockFirstPreparation.run };
+    defer test_read_group_preparation_hook = null;
+    var refresh = Refresh{ .cache = &cache, .token = &refresh_token, .snapshots = snapshots };
+    var publish = Publish{ .cache = &cache, .token = token_b };
+    const refresh_thread = try std.Thread.spawn(.{}, Refresh.run, .{&refresh});
+    var preparation_entered = false;
+    for (0..100_000) |_| {
+        if (blocker.entered.load(.acquire)) {
+            preparation_entered = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    if (!preparation_entered) {
+        blocker.release.store(true, .release);
+        refresh_thread.join();
+        try std.testing.expect(preparation_entered);
+        return;
+    }
+    const publish_thread = try std.Thread.spawn(.{}, Publish.run, .{&publish});
+    var unrelated_completed = false;
+    for (0..100_000) |_| {
+        if (publish.done.load(.acquire)) {
+            unrelated_completed = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    blocker.release.store(true, .release);
+    refresh_thread.join();
+    publish_thread.join();
+    try std.testing.expect(unrelated_completed);
+    try std.testing.expect(!refresh.failed.load(.acquire));
+    try std.testing.expect(!publish.failed.load(.acquire));
+}
+
+test "target invalidation retires only its table read view" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var cache = TableRuntimeSnapshotCache.init(failing.allocator());
+    cache.read_view_alloc = std.testing.allocator;
+    defer cache.deinit();
+
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic"),
+        .kind = .dense_vector,
+        .coverage_generation = 5,
+        .coverage_config_hash = 15,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const docs = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(
+        docs,
+        "docs",
+        .{ .group_id = 7, .stats = .{ .index_count = 1, .indexes = indexes[0..] } },
+    ));
+    const logs = try cache.capturePublicationToken("logs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(
+        logs,
+        "logs",
+        .{ .group_id = 9, .stats = .{ .doc_count = 9 } },
+    ));
+
+    failing.fail_index = failing.alloc_index;
+    cache.markIndexTargetObservationPending("docs", 7, .{
+        .index_name = "semantic",
+        .kind = .dense_vector,
+        .incarnation = 5,
+        .config_hash = 15,
+    }, 1);
+    try std.testing.expect((try cache.snapshot(std.testing.allocator, "docs")) == null);
+    var unaffected = (try cache.snapshot(std.testing.allocator, "logs")).?;
+    defer unaffected.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 9), unaffected.items[0].stats.doc_count);
+}
+
+test "lifecycle mirror failure cannot expose the retired generation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var cache = TableRuntimeSnapshotCache.init(std.testing.allocator);
+    cache.read_view_alloc = failing.allocator();
+    defer cache.deinit();
+
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(
+        initial,
+        "docs",
+        .{ .group_id = 7, .stats = .{ .doc_count = 7 } },
+    ));
+    failing.fail_index = failing.alloc_index;
+    const replacement = [_]LocalTableRuntimeStatus{.{ .group_id = 8, .stats = .{ .doc_count = 8 } }};
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishLifecycleTransition(
+            try cache.capturePublicationToken("docs"),
+            "docs",
+            &replacement,
+        ),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect((try cache.snapshot(std.testing.allocator, "docs")) == null);
+    try std.testing.expectEqual(@as(u64, 8), cache.tables.get("docs").?.groups.get(8).?.stats.doc_count);
 }
 
 test "table runtime snapshot cache clones stored status" {
@@ -4442,7 +6748,7 @@ test "targeted publication fence preserves only untouched siblings during catch 
     try std.testing.expect(!thumbnail.runtime_observation_targeted_sibling);
 
     cache.releaseTargetedIndexPublications("docs", "thumbnail", transition);
-    try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.transition_active);
+    try std.testing.expect(cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?.transition_active);
     var fresh_indexes = [_]db_mod.types.DBIndexStats{
         .{
             .name = "semantic_idx",
@@ -4479,7 +6785,7 @@ test "targeted publication fence preserves only untouched siblings during catch 
     );
     // Freshness alone cannot retire an unknown desired target. Only the
     // structural publication may bind the incarnation and complete handoff.
-    try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.transition_active);
+    try std.testing.expect(cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?.transition_active);
     const structural_token = try cache.capturePublicationToken("docs");
     try std.testing.expectEqual(
         TableRuntimeSnapshotCache.PublishResult.published,
@@ -4489,7 +6795,7 @@ test "targeted publication fence preserves only untouched siblings during catch 
             .stats = .{ .source_doc_count = 2, .doc_count = 2, .index_count = fresh_indexes.len, .indexes = &fresh_indexes },
         }}),
     );
-    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.transition_active);
+    try std.testing.expect(!cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?.transition_active);
 }
 
 test "new targeted transition supersedes delayed controls from an older owner" {
@@ -4498,7 +6804,7 @@ test "new targeted transition supersedes delayed controls from an older owner" {
 
     const older = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
     const newer = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
-    var fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    var fence = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expect(older.revision != newer.revision);
     try std.testing.expect(fence.owner_active);
     try std.testing.expectEqual(@as(?u64, null), fence.release_after_observation_generation);
@@ -4507,7 +6813,7 @@ test "new targeted transition supersedes delayed controls from an older owner" {
     // mutation's authority.
     try std.testing.expect(!cache.armTargetedIndexPublications("docs", "thumbnail", older));
     cache.acknowledgeTargetedIndexAbsence("docs", "thumbnail", older);
-    fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    fence = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expect(fence.expectation == .unknown);
     var current_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = @constCast("thumbnail"),
@@ -4536,15 +6842,15 @@ test "new targeted transition supersedes delayed controls from an older owner" {
         TableRuntimeSnapshotCache.PublishResult.published,
         try cache.publishTargetedGroupsForTransition(publication, newer, "docs", "thumbnail", &.{current_status}),
     );
-    fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    fence = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expect(fence.expectation == .exact);
     cache.releaseTargetedIndexPublications("docs", "thumbnail", older);
-    fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    fence = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expect(fence.owner_active);
     try std.testing.expectEqual(@as(?u64, null), fence.release_after_observation_generation);
 
     cache.releaseTargetedIndexPublications("docs", "thumbnail", newer);
-    fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    fence = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expect(!fence.owner_active);
     try std.testing.expect(fence.release_after_observation_generation != null);
 
@@ -4552,12 +6858,12 @@ test "new targeted transition supersedes delayed controls from an older owner" {
     // not allowed to settle the newly observed durable repair edge.
     const racing_token = try cache.capturePublicationToken("docs");
     try std.testing.expect(cache.fenceIndexRepairPublications("docs", "thumbnail"));
-    fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    fence = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expect(fence.transition_revision != newer.revision);
     try std.testing.expect(!fence.target_authority_handed_off);
     try std.testing.expect(fence.accept_target_after_observation_generation > racing_token.observation_generation);
     cache.releaseTargetedIndexPublications("docs", "thumbnail", newer);
-    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.owner_active);
+    try std.testing.expect(!cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?.owner_active);
 }
 
 test "targeted catch up hands off same incarnation serving authority" {
@@ -4614,7 +6920,66 @@ test "targeted catch up hands off same incarnation serving authority" {
     try std.testing.expect(target.runtime_observation_serviceable);
     try std.testing.expectEqual(@as(u64, 3), target.doc_count);
     try std.testing.expectEqual(@as(u64, 3), target.coverage_produced_count);
-    try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.target_authority_handed_off);
+    try std.testing.expect(cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?.target_authority_handed_off);
+}
+
+test "failed exact handoff accepts identity without fabricating serving authority" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const transition = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
+    try std.testing.expect(cache.armTargetedIndexPublications("docs", "thumbnail", transition));
+    try std.testing.expect(cache.bindTargetedIndexExpectation("docs", "thumbnail", transition, .{ .exact = .{
+        .index_name = "thumbnail",
+        .kind = .dense_vector,
+        .incarnation = 12,
+        .config_hash = 44,
+    } }));
+    var failed_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .load_error = @constCast("InvalidIndexConfig"),
+        .coverage_generation = 12,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const publication = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishTargetedGroupsForTransition(
+        publication,
+        transition,
+        "docs",
+        "thumbnail",
+        &.{
+            .{ .group_id = 7, .metadata = .{ .source = .live_writer_publish, .freshness = .failed }, .stats = .{ .index_count = 1, .indexes = failed_indexes[0..] } },
+            .{ .group_id = 8, .metadata = .{ .source = .live_writer_publish, .freshness = .failed }, .stats = .{ .index_count = 1, .indexes = failed_indexes[0..] } },
+        },
+    ));
+
+    const authority = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
+    try std.testing.expect(authority.target_authority_handed_off);
+    try std.testing.expectEqual(@as(usize, 2), authority.handoff_groups.count());
+    // Persistent identity authority may retain a serving proof, but it cannot
+    // create one. Repeating the same failed incarnation after handoff must
+    // remain non-serviceable.
+    const repeated = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroups(
+        repeated,
+        "docs",
+        &.{
+            .{ .group_id = 7, .metadata = .{ .source = .live_writer_publish, .freshness = .failed }, .stats = .{ .index_count = 1, .indexes = failed_indexes[0..] } },
+            .{ .group_id = 8, .metadata = .{ .source = .live_writer_publish, .freshness = .failed }, .stats = .{ .index_count = 1, .indexes = failed_indexes[0..] } },
+        },
+    ));
+    var observed = (try cache.snapshot(alloc, "docs")).?;
+    defer observed.deinit(alloc);
+    for (observed.items) |status| {
+        const target = findIndexStatusByName(status.stats.indexes, "thumbnail").?;
+        try std.testing.expect(!target.runtime_observation_stale);
+        try std.testing.expect(!target.runtime_observation_serviceable);
+        try std.testing.expectEqualStrings("InvalidIndexConfig", target.load_error.?);
+    }
 }
 
 test "target authority settles only after every group acknowledges the exact incarnation" {
@@ -4669,7 +7034,7 @@ test "target authority settles only after every group acknowledges the exact inc
         }}),
     );
     cache.releaseTargetedIndexPublications("docs", "thumbnail", transition);
-    var authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    var authority = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expect(authority.transition_active);
     try std.testing.expect(!authority.target_authority_handed_off);
 
@@ -4682,7 +7047,7 @@ test "target authority settles only after every group acknowledges the exact inc
             .stats = .{ .index_count = 1, .indexes = desired_indexes[0..] },
         }),
     );
-    authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    authority = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expect(authority.target_authority_handed_off);
     try std.testing.expect(authority.transition_active);
 
@@ -4697,9 +7062,153 @@ test "target authority settles only after every group acknowledges the exact inc
             .stats = .{ .index_count = 1, .indexes = desired_indexes[0..] },
         }),
     );
-    authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    authority = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expect(!authority.transition_active);
-    try std.testing.expectEqual(@as(usize, 0), cache.tables.getPtr("docs").?.active_index_transition_count);
+    try std.testing.expectEqual(@as(usize, 0), cache.tables.get("docs").?.active_index_transition_count);
+}
+
+test "target authority uses bound catalog groups instead of cached group count" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var predecessor = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .coverage_generation = 11,
+        .coverage_config_hash = 33,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(initial, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .index_count = 1, .indexes = predecessor[0..] },
+    }));
+
+    const transition = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
+    try std.testing.expect(cache.armTargetedIndexPublications("docs", "thumbnail", transition));
+    const expectation: TableRuntimeSnapshotCache.TargetedIndexExpectation = .{ .exact = .{
+        .index_name = "thumbnail",
+        .kind = .dense_vector,
+        .incarnation = 12,
+        .config_hash = 44,
+    } };
+    try std.testing.expect(cache.bindTargetedIndexExpectation("docs", "thumbnail", transition, expectation));
+    try std.testing.expect(cache.bindTargetedIndexExpectedGroups("docs", "thumbnail", transition, &.{ 7, 8 }));
+
+    var replacement = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .serving_snapshot_ready = true,
+        .coverage_produced_count = 1,
+        .coverage_generation = 12,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const group_a = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(group_a, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .index_count = 1, .indexes = replacement[0..] },
+    }));
+    try std.testing.expect(cache.targetedIndexGroupAcknowledged("docs", "thumbnail", expectation, 7));
+    try std.testing.expect(!cache.targetedIndexAuthorityHandedOff("docs", "thumbnail", transition));
+
+    const group_b = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(group_b, "docs", .{
+        .group_id = 8,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .index_count = 1, .indexes = replacement[0..] },
+    }));
+    try std.testing.expect(cache.targetedIndexGroupAcknowledged("docs", "thumbnail", expectation, 8));
+    try std.testing.expect(cache.targetedIndexAuthorityHandedOff("docs", "thumbnail", transition));
+}
+
+test "resident serving acknowledgement hands off a separate coordinator cache" {
+    const alloc = std.testing.allocator;
+    var coordinator = TableRuntimeSnapshotCache.init(alloc);
+    defer coordinator.deinit();
+    var resident = TableRuntimeSnapshotCache.init(alloc);
+    defer resident.deinit();
+
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic"),
+        .kind = .dense_vector,
+        .coverage_generation = 42,
+        .coverage_config_hash = 84,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .serving_snapshot_ready = true,
+        .runtime_observation_serviceable = true,
+    }};
+    for ([_]*TableRuntimeSnapshotCache{ &coordinator, &resident }) |cache| {
+        const initial = try cache.capturePublicationToken("docs");
+        try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(
+            initial,
+            "docs",
+            .{
+                .group_id = 7001,
+                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+                .stats = .{ .index_count = 1, .indexes = indexes[0..] },
+            },
+        ));
+    }
+    const expected = TableRuntimeSnapshotCache.TargetedIndexExpectation{ .exact = .{
+        .index_name = "semantic",
+        .kind = .dense_vector,
+        .incarnation = 42,
+        .config_hash = 84,
+    } };
+    const expected_groups = [_]u64{7001};
+
+    const coordinator_transition = coordinator.fenceTargetedIndexPublications("docs", "semantic").?;
+    try std.testing.expect(coordinator.bindTargetedIndexExpectation("docs", "semantic", coordinator_transition, expected));
+    try std.testing.expect(coordinator.bindTargetedIndexExpectedGroups("docs", "semantic", coordinator_transition, &expected_groups));
+
+    const resident_transition = resident.fenceTargetedIndexPublications("docs", "semantic").?;
+    try std.testing.expect(resident.bindTargetedIndexExpectation("docs", "semantic", resident_transition, expected));
+    try std.testing.expect(resident.bindTargetedIndexExpectedGroups("docs", "semantic", resident_transition, &expected_groups));
+    const resident_observation = try resident.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try resident.publishTargetedGroupsForTransition(
+        resident_observation,
+        resident_transition,
+        "docs",
+        "semantic",
+        &.{.{
+            .group_id = 7001,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .index_count = 1, .indexes = indexes[0..] },
+        }},
+    ));
+    const serviceable = resident.targetedIndexGroupServiceability(
+        "docs",
+        "semantic",
+        expected,
+        7001,
+    ).?;
+    try std.testing.expect(serviceable);
+    try std.testing.expect(coordinator.acknowledgeTargetedIndexGroup(
+        "docs",
+        "semantic",
+        coordinator_transition,
+        expected,
+        7001,
+        serviceable,
+    ));
+    try std.testing.expect(coordinator.targetedIndexAuthorityHandedOff(
+        "docs",
+        "semantic",
+        coordinator_transition,
+    ));
+    var observed = (try coordinator.snapshotGroupStatus(alloc, "docs", 7001)).?;
+    defer observed.deinit(alloc);
+    const semantic = findIndexStatusByName(observed.stats.indexes, "semantic").?;
+    try std.testing.expect(!semantic.runtime_observation_stale);
+    try std.testing.expect(semantic.runtime_observation_serviceable);
 }
 
 test "targeted publication rejects a completed stale incarnation until structural acknowledgement" {
@@ -4747,7 +7256,7 @@ test "targeted publication rejects a completed stale incarnation until structura
     const stale = findIndexStatusByName(fenced.stats.indexes, "semantic_idx").?;
     try std.testing.expect(stale.runtime_observation_stale);
     try std.testing.expect(!stale.runtime_observation_serviceable);
-    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?.target_authority_handed_off);
+    try std.testing.expect(!cache.tables.get("docs").?.index_authorities.getPtr("semantic_idx").?.target_authority_handed_off);
 
     var new_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = @constCast("semantic_idx"),
@@ -4772,7 +7281,7 @@ test "targeted publication rejects a completed stale incarnation until structura
     const current = findIndexStatusByName(acknowledged.stats.indexes, "semantic_idx").?;
     try std.testing.expectEqual(@as(u64, 13), current.coverage_generation);
     try std.testing.expect(!current.runtime_observation_stale);
-    try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?.target_authority_handed_off);
+    try std.testing.expect(cache.tables.get("docs").?.index_authorities.getPtr("semantic_idx").?.target_authority_handed_off);
 }
 
 test "settled target authority preserves the accepted incarnation against late publishers" {
@@ -4833,7 +7342,7 @@ test "settled target authority preserves the accepted incarnation against late p
             .stats = .{ .source_doc_count = 3, .doc_count = 1, .index_count = 1, .indexes = new_indexes[0..] },
         }),
     );
-    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?.transition_active);
+    try std.testing.expect(!cache.tables.get("docs").?.index_authorities.getPtr("semantic_idx").?.transition_active);
 
     // Persistent identity authority rejects superseded incarnations, but it
     // must not freeze ordinary publication progress from the accepted one.
@@ -4937,7 +7446,7 @@ test "accepted authority requires identity containment not equal cardinality" {
     // Model two persistent catalog authorities on a newly repopulated group:
     // the cached owner observed only A and a partial incoming owner observes
     // only B. Cache teardown owns and frees these authority names.
-    const state = cache.tables.getPtr("docs").?;
+    const state = cache.tables.get("docs").?;
     {
         const owned_name = try alloc.dupe(u8, "accepted_a");
         errdefer alloc.free(owned_name);
@@ -5031,7 +7540,7 @@ test "accepted group identity survives late predecessor before global handoff" {
         "semantic",
         &.{.{ .group_id = 7, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .index_count = 1, .indexes = replacement[0..] } }},
     ));
-    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic").?.target_authority_handed_off);
+    try std.testing.expect(!cache.tables.get("docs").?.index_authorities.getPtr("semantic").?.target_authority_handed_off);
 
     // A late generic owner reports the predecessor for group A. The group
     // publication is accepted as a delta, but the exact replacement row is
@@ -5061,7 +7570,7 @@ test "accepted group identity survives late predecessor before global handoff" {
         .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{ .index_count = 1, .indexes = wrong_kind[0..] },
     }));
-    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic").?.target_authority_handed_off);
+    try std.testing.expect(!cache.tables.get("docs").?.index_authorities.getPtr("semantic").?.target_authority_handed_off);
 }
 
 test "catalog identity rejects a wrong first structural observation" {
@@ -5095,7 +7604,7 @@ test "catalog identity rejects a wrong first structural observation" {
             .stats = .{ .index_count = 1, .indexes = wrong_kind[0..] },
         }}),
     );
-    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic").?.target_authority_handed_off);
+    try std.testing.expect(!cache.tables.get("docs").?.index_authorities.getPtr("semantic").?.target_authority_handed_off);
 
     const absent = try cache.capturePublicationToken("docs");
     try std.testing.expectEqual(
@@ -5106,7 +7615,7 @@ test "catalog identity rejects a wrong first structural observation" {
             .stats = .{},
         }}),
     );
-    try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic").?.expectation == .exact);
+    try std.testing.expect(cache.tables.get("docs").?.index_authorities.getPtr("semantic").?.expectation == .exact);
 }
 
 test "exact target advances fence only their index incarnation" {
@@ -5280,12 +7789,69 @@ test "exact target advance allocation failure remains fail closed" {
         }, 9);
         try std.testing.expect(failing.has_induced_failure);
 
-        const state = cache.tables.getPtr("docs") orelse continue;
+        const state = cache.tables.get("docs") orelse continue;
         const observed = state.groups.getPtr(3) orelse continue;
         const item = findIndexStatusByName(observed.stats.indexes, "semantic").?;
         try std.testing.expect(!observed.metadata.target_observation_complete or
             !item.runtime_target_observation_complete);
     }
+}
+
+test "batched target advance stops after fallback invalidates cached state" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var indexes = [_]db_mod.types.DBIndexStats{
+        .{
+            .name = @constCast("semantic"),
+            .kind = .dense_vector,
+            .coverage_generation = 7,
+            .coverage_config_hash = 17,
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+        },
+        .{
+            .name = @constCast("thumbnail"),
+            .kind = .dense_vector,
+            .coverage_generation = 8,
+            .coverage_config_hash = 18,
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+        },
+    };
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(initial, "docs", .{
+        .group_id = 3,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .index_count = indexes.len, .indexes = indexes[0..] },
+    }));
+
+    // Let the event lookup allocate, then exhaust the allocator while the
+    // first identity attempts to establish exact authority. Its group-wide
+    // fallback also fails and retires the cached observations. Processing the
+    // second identity must stop instead of dereferencing those retired rows.
+    failing.fail_index = failing.alloc_index + 1;
+    const target_batch = [_]TableRuntimeSnapshotCache.IndexIdentity{
+        TableRuntimeSnapshotCache.IndexIdentity{
+            .index_name = "semantic",
+            .kind = .dense_vector,
+            .incarnation = 7,
+            .config_hash = 17,
+        },
+        TableRuntimeSnapshotCache.IndexIdentity{
+            .index_name = "thumbnail",
+            .kind = .dense_vector,
+            .incarnation = 8,
+            .config_hash = 18,
+        },
+    };
+    cache.markIndexTargetsObservationPending("docs", 3, target_batch[0..], 9);
+    try std.testing.expect(failing.has_induced_failure);
+    const state = cache.tables.get("docs").?;
+    try std.testing.expectEqual(@as(usize, 0), state.groups.count());
+    try std.testing.expectEqual(@as(usize, 0), state.index_authorities.count());
 }
 
 test "per-index delta merge stays bounded across many accepted authorities" {
@@ -5314,7 +7880,7 @@ test "per-index delta merge stays bounded across many accepted authorities" {
         .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{ .index_count = index_count, .indexes = indexes },
     }));
-    const state = cache.tables.getPtr("docs").?;
+    const state = cache.tables.get("docs").?;
     try state.index_authorities.ensureTotalCapacity(alloc, index_count);
     for (indexes) |item| {
         const owned_name = try alloc.dupe(u8, item.name);
@@ -5346,10 +7912,137 @@ test "per-index delta merge stays bounded across many accepted authorities" {
     try std.testing.expectEqual(index_count, observed.stats.indexes.len);
 }
 
+test "bulk target handoff reduces per-group acknowledgements linearly" {
+    const alloc = std.testing.allocator;
+    const index_count = 256;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const indexes = try alloc.alloc(db_mod.types.DBIndexStats, index_count);
+    defer alloc.free(indexes);
+    defer for (indexes) |item| alloc.free(@constCast(item.name));
+    for (indexes, 0..) |*item, i| {
+        item.* = .{
+            .name = try std.fmt.allocPrint(alloc, "index-{d}", .{i}),
+            .kind = .dense_vector,
+            .coverage_generation = @intCast(i + 1),
+            .coverage_config_hash = @intCast(i + 1000),
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+            .serving_snapshot_ready = true,
+        };
+    }
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroups(initial, "docs", &.{
+        .{ .group_id = 7, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .index_count = index_count, .indexes = indexes } },
+        .{ .group_id = 8, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .index_count = index_count, .indexes = indexes } },
+    }));
+
+    // Establish many simultaneous exact transitions directly so setup cost
+    // does not dominate the publication contract under test.
+    const state = cache.tables.get("docs").?;
+    try state.index_authorities.ensureTotalCapacity(alloc, index_count);
+    const boundary = cache.next_observation_generation;
+    for (indexes, 0..) |item, i| {
+        const owned_name = try alloc.dupe(u8, item.name);
+        var authority = TargetedIndexAuthority{
+            .transition_revision = @intCast(i + 1),
+            .accept_target_after_observation_generation = boundary,
+            .expectation = .{ .exact = .{
+                .kind = item.kind,
+                .incarnation = item.coverage_generation,
+                .config_hash = item.coverage_config_hash,
+            } },
+            .expectation_observation_generation = boundary,
+        };
+        try authority.handoff_groups.ensureTotalCapacity(alloc, 2);
+        state.index_authorities.putAssumeCapacityNoClobber(owned_name, authority);
+    }
+    state.active_index_transition_count = index_count;
+
+    const handoff = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroups(handoff, "docs", &.{
+        .{ .group_id = 7, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .index_count = index_count, .indexes = indexes } },
+        .{ .group_id = 8, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .index_count = index_count, .indexes = indexes } },
+    }));
+
+    var authority_it = state.index_authorities.valueIterator();
+    while (authority_it.next()) |authority| {
+        try std.testing.expect(authority.target_authority_handed_off);
+        try std.testing.expectEqual(@as(usize, 2), authority.handoff_groups.count());
+    }
+    var observed = (try cache.snapshot(alloc, "docs")).?;
+    defer observed.deinit(alloc);
+    for (observed.items) |status| for (status.stats.indexes) |item| {
+        try std.testing.expect(!item.runtime_observation_stale);
+        try std.testing.expect(item.runtime_observation_serviceable);
+    };
+}
+
+test "incremental group acknowledgement sync is linear with one global handoff" {
+    const alloc = std.testing.allocator;
+    const group_count = 64;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .coverage_generation = 42,
+        .coverage_config_hash = 77,
+        .coverage_identity_ready = true,
+        .serving_snapshot_ready = true,
+    }};
+    const statuses = try alloc.alloc(LocalTableRuntimeStatus, group_count);
+    defer alloc.free(statuses);
+    const group_ids = try alloc.alloc(u64, group_count);
+    defer alloc.free(group_ids);
+    for (statuses, group_ids, 0..) |*status, *group_id, index| {
+        group_id.* = @intCast(index + 1);
+        status.* = .{
+            .group_id = group_id.*,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .index_count = 1, .indexes = &indexes },
+        };
+    }
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishLifecycleTransition(initial, "docs", statuses),
+    );
+    const transition = cache.fenceTargetedIndexPublications("docs", "semantic").?;
+    const expected = TableRuntimeSnapshotCache.TargetedIndexExpectation{ .exact = .{
+        .index_name = "semantic",
+        .kind = .dense_vector,
+        .incarnation = 42,
+        .config_hash = 77,
+    } };
+    try std.testing.expect(cache.bindTargetedIndexExpectation("docs", "semantic", transition, expected));
+    try std.testing.expect(cache.bindTargetedIndexExpectedGroups("docs", "semantic", transition, group_ids));
+
+    test_authority_sync_index_visits.store(0, .release);
+    for (group_ids) |group_id|
+        try std.testing.expect(cache.acknowledgeTargetedIndexGroup(
+            "docs",
+            "semantic",
+            transition,
+            expected,
+            group_id,
+            true,
+        ));
+    const visits = test_authority_sync_index_visits.load(.acquire);
+    try std.testing.expect(visits <= (2 * group_count));
+    try std.testing.expect(cache.targetedIndexAuthorityHandedOff("docs", "semantic", transition));
+}
+
 test "multi-group delta allocation failure is atomic and leak free" {
     const Runner = struct {
         fn run(alloc: std.mem.Allocator) !void {
             var cache = TableRuntimeSnapshotCache.init(alloc);
+            // This test injects failures into the atomic status-state commit;
+            // the independently best-effort read mirror has its own leak-
+            // checked allocator so an expected mirror refresh cannot swallow
+            // the injection intended for the commit path.
+            cache.read_view_alloc = std.testing.allocator;
             defer cache.deinit();
 
             var accepted = [_]db_mod.types.DBIndexStats{.{
@@ -5375,7 +8068,17 @@ test "multi-group delta allocation failure is atomic and leak free" {
                 else => return err,
             };
 
-            var observed = (try cache.snapshot(alloc, "docs")).?;
+            var observed = (try cache.snapshot(alloc, "docs")) orelse {
+                // A mirror allocation may be the injected failure. The
+                // authoritative commit must still be all-old or all-new;
+                // the next successful publication recreates the read view.
+                const state = cache.tables.get("docs").?;
+                const first = state.groups.get(7).?.stats.doc_count;
+                const second = state.groups.get(8).?.stats.doc_count;
+                try std.testing.expectEqual(first, second);
+                try std.testing.expect(first == 10 or first == 20);
+                return;
+            };
             defer observed.deinit(alloc);
             try std.testing.expectEqual(@as(usize, 2), observed.items.len);
             try std.testing.expect(observed.items[0].stats.doc_count == observed.items[1].stats.doc_count);
@@ -5390,10 +8093,11 @@ test "multi-group commit uses preflight group capacity without allocation" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();
     var cache = TableRuntimeSnapshotCache.init(alloc);
+    cache.read_view_alloc = std.testing.allocator;
     defer cache.deinit();
 
     _ = try cache.capturePublicationToken("docs");
-    const state = cache.tables.getPtr("docs").?;
+    const state = cache.tables.get("docs").?;
     try state.groups.ensureTotalCapacity(alloc, 512);
     const initial_capacity = state.groups.capacity();
     const initial_maximum_count = (initial_capacity * std.hash_map.default_max_load_percentage) / 100;
@@ -5407,6 +8111,15 @@ test "multi-group commit uses preflight group capacity without allocation" {
         });
     }
     try std.testing.expectEqual(initial_maximum_count, state.groups.count());
+
+    const owned_target_name = try alloc.dupe(u8, "retired-index");
+    try state.index_authorities.put(alloc, owned_target_name, .{
+        .transition_revision = 1,
+        .accept_target_after_observation_generation = cache.next_observation_generation,
+        .expectation = .absent,
+        .expectation_observation_generation = cache.next_observation_generation,
+    });
+    state.active_index_transition_count = 1;
 
     const FailAfterPreparation = struct {
         allocator: *std.testing.FailingAllocator,
@@ -5429,6 +8142,10 @@ test "multi-group commit uses preflight group capacity without allocation" {
     }}));
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expect(state.groups.contains(new_group_id));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        state.index_authorities.getPtr("retired-index").?.handoff_groups.count(),
+    );
 }
 
 test "prepared index delta commit performs no allocation" {
@@ -5548,7 +8265,7 @@ test "targeted authority binding is monotonic under reversed publication order" 
             .stats = .{ .index_count = 1, .indexes = older_indexes[0..] },
         }}),
     );
-    const authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?;
+    const authority = cache.tables.get("docs").?.index_authorities.getPtr("semantic_idx").?;
     switch (authority.expectation) {
         .exact => |identity| try std.testing.expectEqual(@as(u64, 13), identity.incarnation),
         .unknown, .absent => return error.TestUnexpectedResult,
@@ -5605,7 +8322,7 @@ test "wholly stale targeted publication cannot bind unknown authority" {
             .stats = .{ .index_count = 1, .indexes = desired_indexes[0..] },
         }}),
     );
-    var authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?;
+    var authority = cache.tables.get("docs").?.index_authorities.getPtr("semantic_idx").?;
     try std.testing.expect(authority.expectation == .unknown);
 
     const current_structural = try cache.capturePublicationToken("docs");
@@ -5617,7 +8334,7 @@ test "wholly stale targeted publication cannot bind unknown authority" {
             .stats = .{ .index_count = 1, .indexes = desired_indexes[0..] },
         }}),
     );
-    authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?;
+    authority = cache.tables.get("docs").?.index_authorities.getPtr("semantic_idx").?;
     switch (authority.expectation) {
         .exact => |identity| try std.testing.expectEqual(@as(u64, 13), identity.incarnation),
         .unknown, .absent => return error.TestUnexpectedResult,
@@ -5650,7 +8367,7 @@ test "targeted deletion hands off only after authoritative absence" {
     const transition = cache.fenceTargetedIndexPublications("docs", "semantic_idx").?;
     try std.testing.expect(cache.armTargetedIndexPublications("docs", "semantic_idx", transition));
     cache.acknowledgeTargetedIndexAbsence("docs", "semantic_idx", transition);
-    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?.target_authority_handed_off);
+    try std.testing.expect(!cache.tables.get("docs").?.index_authorities.getPtr("semantic_idx").?.target_authority_handed_off);
     cache.releaseTargetedIndexPublications("docs", "semantic_idx", transition);
 
     const absent = try cache.capturePublicationToken("docs");
@@ -5664,7 +8381,7 @@ test "targeted deletion hands off only after authoritative absence" {
     );
     // Settled deletion state is represented by the authoritative catalog and
     // group absence; it does not leave an unbounded per-name tombstone behind.
-    try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx") == null);
+    try std.testing.expect(cache.tables.get("docs").?.index_authorities.getPtr("semantic_idx") == null);
     var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
     defer observed.deinit(alloc);
     try std.testing.expect(findIndexStatusByName(observed.stats.indexes, "semantic_idx") == null);
@@ -5843,7 +8560,7 @@ test "synthetic refresh cannot outrank targeted structural owner observation" {
     );
     try std.testing.expectEqual(
         initial_token.observation_generation,
-        cache.tables.getPtr("docs").?.groups.getPtr(7).?.cache_observation_generation,
+        cache.tables.get("docs").?.groups.getPtr(7).?.cache_observation_generation,
     );
 
     var structural_indexes = [_]db_mod.types.DBIndexStats{.{
@@ -5872,7 +8589,255 @@ test "synthetic refresh cannot outrank targeted structural owner observation" {
     try std.testing.expect(!target.runtime_observation_stale);
     try std.testing.expect(target.runtime_observation_serviceable);
     try std.testing.expectEqual(@as(u64, 1), target.doc_count);
-    try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.target_authority_handed_off);
+    try std.testing.expect(cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?.target_authority_handed_off);
+}
+
+test "background refresh completes exact multi-group target handoff incrementally" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var predecessor = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .coverage_generation = 11,
+        .coverage_config_hash = 33,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroups(initial, "docs", &.{
+        .{ .group_id = 7, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .index_count = 1, .indexes = predecessor[0..] } },
+        .{ .group_id = 8, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .index_count = 1, .indexes = predecessor[0..] } },
+    }));
+
+    const transition = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
+    try std.testing.expect(cache.armTargetedIndexPublications("docs", "thumbnail", transition));
+    try std.testing.expect(cache.bindTargetedIndexExpectation("docs", "thumbnail", transition, .{ .exact = .{
+        .index_name = "thumbnail",
+        .kind = .dense_vector,
+        .incarnation = 12,
+        .config_hash = 44,
+    } }));
+
+    var replacement = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .serving_snapshot_ready = true,
+        .coverage_produced_count = 1,
+        .coverage_generation = 12,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const group_a = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishTargetedGroupsForTransition(
+        group_a,
+        transition,
+        "docs",
+        "thumbnail",
+        &.{.{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .source_doc_count = 1, .index_count = 1, .indexes = replacement[0..] },
+        }},
+    ));
+    var authority = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
+    try std.testing.expectEqual(@as(usize, 1), authority.handoff_groups.count());
+    try std.testing.expect(!authority.target_authority_handed_off);
+
+    // A catalog refresh may combine a retained/cache-only row for a group
+    // which already acknowledged with a fresh raw owner row for the remaining
+    // group. Only the raw row may add an acknowledgement; the retained first
+    // acknowledgement must nevertheless survive the table replacement.
+    const refresh_statuses = try alloc.alloc(LocalTableRuntimeStatus, 2);
+    refresh_statuses[0] = .{
+        .group_id = 7,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .stale },
+        .stats = try cloneDBStats(alloc, .{ .source_doc_count = 1, .index_count = 1, .indexes = replacement[0..] }),
+    };
+    refresh_statuses[1] = .{
+        .group_id = 8,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = try cloneDBStats(alloc, .{ .source_doc_count = 1, .index_count = 1, .indexes = replacement[0..] }),
+    };
+    const snapshots = try alloc.alloc(TableRuntimeSnapshot, 1);
+    defer alloc.free(snapshots);
+    snapshots[0] = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .statuses = .{ .items = refresh_statuses },
+    };
+    try publishRefreshForTest(&cache, snapshots);
+
+    authority = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
+    try std.testing.expectEqual(@as(usize, 2), authority.handoff_groups.count());
+    try std.testing.expect(authority.target_authority_handed_off);
+    var observed = (try cache.snapshot(alloc, "docs")).?;
+    defer observed.deinit(alloc);
+    for (observed.items) |status| {
+        const target = findIndexStatusByName(status.stats.indexes, "thumbnail").?;
+        try std.testing.expect(target.runtime_observation_serviceable);
+        try std.testing.expect(!target.runtime_observation_stale);
+        try std.testing.expectEqual(@as(u64, 12), target.coverage_generation);
+    }
+}
+
+test "background refresh exact target allocation failure is atomic and leak free" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var cache = TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+
+            var predecessor = [_]db_mod.types.DBIndexStats{.{
+                .name = @constCast("thumbnail"),
+                .kind = .dense_vector,
+                .coverage_generation = 11,
+                .coverage_config_hash = 33,
+                .coverage_identity_ready = true,
+                .coverage_summary_ready = true,
+            }};
+            const initial = try cache.capturePublicationToken("docs");
+            try std.testing.expectEqual(
+                TableRuntimeSnapshotCache.PublishResult.published,
+                try cache.publishGroups(initial, "docs", &.{.{
+                    .group_id = 7,
+                    .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+                    .stats = .{ .index_count = 1, .indexes = predecessor[0..] },
+                }}),
+            );
+
+            const transition = cache.fenceTargetedIndexPublications("docs", "thumbnail") orelse
+                return error.OutOfMemory;
+            try std.testing.expect(cache.armTargetedIndexPublications("docs", "thumbnail", transition));
+            try std.testing.expect(cache.bindTargetedIndexExpectation("docs", "thumbnail", transition, .{ .exact = .{
+                .index_name = "thumbnail",
+                .kind = .dense_vector,
+                .incarnation = 12,
+                .config_hash = 44,
+            } }));
+
+            const refresh_items = try alloc.alloc(LocalTableRuntimeStatus, 1);
+            var refresh_items_owned = true;
+            errdefer if (refresh_items_owned) {
+                refresh_items[0].deinit(alloc);
+                alloc.free(refresh_items);
+            };
+            refresh_items[0] = .{
+                .group_id = 7,
+                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+                .stats = .{
+                    .source_doc_count = 1,
+                    .index_count = 1,
+                },
+            };
+            const refresh_name = try alloc.dupe(u8, "thumbnail");
+            var refresh_name_owned = true;
+            errdefer if (refresh_name_owned) alloc.free(refresh_name);
+            const refresh_indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1);
+            refresh_indexes[0] = .{
+                .name = refresh_name,
+                .kind = .dense_vector,
+                .doc_count = 1,
+                .serving_snapshot_ready = true,
+                .coverage_produced_count = 1,
+                .coverage_generation = 12,
+                .coverage_config_hash = 44,
+                .coverage_identity_ready = true,
+                .coverage_summary_ready = true,
+            };
+            refresh_items[0].stats.indexes = refresh_indexes;
+            refresh_name_owned = false;
+            const snapshots = try alloc.alloc(TableRuntimeSnapshot, 1);
+            defer alloc.free(snapshots);
+            snapshots[0] = .{
+                .table_name = try alloc.dupe(u8, "docs"),
+                .statuses = .{ .items = refresh_items },
+            };
+            refresh_items_owned = false;
+            publishRefreshForTest(&cache, snapshots) catch |err| switch (err) {
+                error.OutOfMemory => {},
+                else => return err,
+            };
+
+            var observed = (try cache.snapshot(alloc, "docs")).?;
+            defer observed.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), observed.items.len);
+            const target = findIndexStatusByName(observed.items[0].stats.indexes, "thumbnail").?;
+            try std.testing.expect(target.coverage_generation == 11 or target.coverage_generation == 12);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "background refresh completes absent multi-group target handoff incrementally" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var predecessor = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .coverage_generation = 11,
+        .coverage_config_hash = 33,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroups(initial, "docs", &.{
+        .{ .group_id = 7, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .index_count = 1, .indexes = predecessor[0..] } },
+        .{ .group_id = 8, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .index_count = 1, .indexes = predecessor[0..] } },
+    }));
+
+    const transition = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
+    try std.testing.expect(cache.armTargetedIndexPublications("docs", "thumbnail", transition));
+    try std.testing.expect(cache.bindTargetedIndexExpectation("docs", "thumbnail", transition, .absent));
+
+    const group_a = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishTargetedGroupsForTransition(
+        group_a,
+        transition,
+        "docs",
+        "thumbnail",
+        &.{.{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{},
+        }},
+    ));
+    var authority = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
+    try std.testing.expectEqual(@as(usize, 1), authority.handoff_groups.count());
+    try std.testing.expect(!authority.target_authority_handed_off);
+
+    // The first group's exact absence acknowledgement survives a cache-only
+    // refresh while the second group's raw owner absence completes handoff.
+    const refresh_statuses = try alloc.alloc(LocalTableRuntimeStatus, 2);
+    refresh_statuses[0] = .{
+        .group_id = 7,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .stale },
+        .stats = .{},
+    };
+    refresh_statuses[1] = .{
+        .group_id = 8,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{},
+    };
+    const snapshots = try alloc.alloc(TableRuntimeSnapshot, 1);
+    defer alloc.free(snapshots);
+    snapshots[0] = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .statuses = .{ .items = refresh_statuses },
+    };
+    try publishRefreshForTest(&cache, snapshots);
+
+    authority = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
+    try std.testing.expectEqual(@as(usize, 2), authority.handoff_groups.count());
+    try std.testing.expect(authority.target_authority_handed_off);
+    var observed = (try cache.snapshot(alloc, "docs")).?;
+    defer observed.deinit(alloc);
+    for (observed.items) |status|
+        try std.testing.expect(findIndexStatusByName(status.stats.indexes, "thumbnail") == null);
 }
 
 test "synthetic refresh preserves post-fence target facts before serving handoff" {
@@ -5902,7 +8867,7 @@ test "synthetic refresh preserves post-fence target facts before serving handoff
             .stats = .{ .source_doc_count = 100, .index_count = 1, .indexes = owner_indexes[0..] },
         }}),
     );
-    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.target_authority_handed_off);
+    try std.testing.expect(!cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?.target_authority_handed_off);
     cache.releaseTargetedIndexPublications("docs", "thumbnail", transition);
 
     const synthetic_token = try cache.capturePublicationToken("docs");

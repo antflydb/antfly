@@ -8003,6 +8003,7 @@ pub const DataServer = struct {
             .vtable = &.{
                 .fetch_median_key = localFetchMedianKey,
                 .schema_index_ready = localSchemaIndexReady,
+                .activate_index = localAcceptIndexTarget,
             },
         };
     }
@@ -10326,6 +10327,18 @@ pub const DataServer = struct {
             .backend_runtime = try self.ensureBackendRuntime(),
         };
         return try fallback.adapter().schemaIndexReady(alloc, table_name, group_id, schema_version, read_schema_version);
+    }
+
+    fn localAcceptIndexTarget(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        target: antfly.metadata.IndexActivationTarget,
+    ) !antfly.metadata.IndexActivationProgress {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.group_leadership_source) |leadership| {
+            if (!leadership.isLocalLeader(target.group_id)) return error.GroupLeaderUnavailable;
+        }
+        return try self.liveRuntimeWriteSource().acceptIndexActivationTarget(target);
     }
 
     fn localObserveSplit(ptr: *anyopaque, _: u64, record: antfly.metadata.SplitTransitionRecord) !antfly.metadata.transition_state.SplitObservation {
@@ -18494,7 +18507,7 @@ const RemoteMetadataSource = struct {
         defer self.alloc.free(body);
         try self.withMetadataApiClient(void, struct {
             fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !void {
-                try client.replaceTableDefinition(base_uri, ctx.table_name, ctx.body);
+                _ = try client.replaceTableDefinition(base_uri, ctx.table_name, ctx.body);
             }
         }.call, .{ .table_name = replacement.name, .body = body });
         self.invalidateCache();

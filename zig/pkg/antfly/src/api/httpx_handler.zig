@@ -77,6 +77,7 @@ const metadata_authority = @import("../metadata/authority.zig");
 const metadata_http_routes = @import("../metadata/http_routes.zig");
 const metadata_table_topology_mutations = @import("../metadata/table_topology_mutations.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
+const metadata_shard_db_adapter = @import("../metadata/shard_db_adapter.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const platform_time = @import("antfly_platform").time;
 const usermgr = @import("../usermgr/mod.zig");
@@ -643,6 +644,7 @@ pub const AntflyApiHandler = struct {
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
         try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
+        try server.post(group_prefix ++ routes.group_db_index_activation_suffix, httpx.Handler.bind(self, internalGroupIndexActivation));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_suffix, httpx.Handler.bind(self, internalDocumentArtifactManifests));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ ":artifact_name", httpx.Handler.bind(self, internalDocumentArtifactManifest));
@@ -1485,11 +1487,14 @@ pub const AntflyApiHandler = struct {
         if (sharedInternalHttpErrorSpec(err)) |spec|
             return textResponse(ctx, spec.status, spec.message);
         return switch (err) {
+            error.InvalidArgument => textResponse(ctx, 400, "InvalidArgument"),
             error.NotFound => textResponse(ctx, 404, "not found"),
             error.Unsupported => textResponse(ctx, 405, "method not allowed"),
             error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
             error.IdentityReadGenerationChanged => textResponse(ctx, 409, "identity read generation changed"),
             error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
+            error.GroupLeaderUnavailable => textResponse(ctx, 503, "group leader unavailable"),
+            error.Unavailable => textResponse(ctx, 503, "temporarily unavailable"),
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
             error.QueryCandidateBudgetExceeded => textResponse(ctx, 422, "query candidate budget exceeded"),
@@ -1510,6 +1515,28 @@ pub const AntflyApiHandler = struct {
         ) catch |err| return internalGroupErrorResponse(ctx, err);
         defer if (median_key) |value| ctx.allocator.free(value);
         return ctx.json(.{ .median_key = median_key });
+    }
+
+    fn internalGroupIndexActivation(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const group_id_raw = ctx.param("group_id") orelse return textResponse(ctx, 400, "invalid group id");
+        const group_id = std.fmt.parseUnsigned(u64, group_id_raw, 10) catch
+            return textResponse(ctx, 400, "invalid group id");
+        const body = (try ctx.body()) orelse
+            return textResponse(ctx, 400, "invalid index activation target");
+        var parsed = std.json.parseFromSlice(
+            metadata_shard_db_adapter.IndexActivationTarget,
+            ctx.allocator,
+            body,
+            .{ .allocate = .alloc_always },
+        ) catch return textResponse(ctx, 400, "invalid index activation target");
+        defer parsed.deinit();
+        const progress = self.internalGroupOperations().acceptIndexTarget(
+            ctx.allocator,
+            operationContext(ctx, null),
+            group_id,
+            parsed.value,
+        ) catch |err| return internalGroupErrorResponse(ctx, err);
+        return ctx.json(progress);
     }
 
     fn internalGroupBackupShard(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

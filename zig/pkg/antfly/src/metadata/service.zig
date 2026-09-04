@@ -3509,6 +3509,8 @@ pub const MetadataService = struct {
     local_replica_root_reconcile_permit_hook: ?LocalReplicaRootReconcilePermitHook = null,
     lifecycle_listener_mutex: std.Io.Mutex = .init,
     lifecycle_listener_registered: bool = false,
+    lifecycle_listener_closing: bool = false,
+    lifecycle_listener_registration: ?metadata_storage.raft_apply_store.LifecycleListenerRegistration = null,
     embedding_activity_cache: EmbeddingActivityCache = .{},
     catalog_mutation_mutex: std.Io.RwLock = .init,
     table_catalog_mutation_lanes: [table_catalog_mutation_lane_count]std.Io.Mutex = @splat(.init),
@@ -3593,8 +3595,13 @@ pub const MetadataService = struct {
 
     pub fn deinit(self: *MetadataService) void {
         shutdownCdcRuntimeJobs(self);
-        // Projection listeners retain `self`; stop and drain their Raft apply
-        // producer before releasing any callback-owned service state.
+        self.closeLifecycleListener();
+        // Hosted lifecycle owners borrow the catalog, Raft router, and backend
+        // runtime. Listener detachment above prevents a concurrent Raft apply
+        // from re-entering or recreating an owner while this drain runs.
+        if (self.replica_root_dir) |replica_root_dir| {
+            api_table_writes.closeHostedManagedDbCacheForRoot(replica_root_dir);
+        }
         self.raft.deinit();
         self.embedding_activity_cache.deinit(self.alloc);
         self.catalog_projection_reader.deinit(self.alloc);
@@ -3603,9 +3610,6 @@ pub const MetadataService = struct {
         self.lifecycle_signal.deinit();
         self.linearizable_read_tracker.deinit();
         self.alloc.destroy(self.linearizable_read_tracker);
-        if (self.replica_root_dir) |replica_root_dir| {
-            api_table_writes.closeHostedManagedDbCacheForRoot(replica_root_dir);
-        }
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         self.owned_backend_runtime = null;
         self.backend_runtime = null;
@@ -3764,9 +3768,10 @@ pub const MetadataService = struct {
     fn ensureLifecycleListenerRegistered(self: *MetadataService) !void {
         self.lifecycle_listener_mutex.lockUncancelable(std.Options.debug_io);
         defer self.lifecycle_listener_mutex.unlock(std.Options.debug_io);
+        if (self.lifecycle_listener_closing) return error.ServiceClosing;
         if (self.lifecycle_listener_registered) return;
         const store = self.projectedStore() orelse return;
-        try store.addLifecycleListeners(
+        self.lifecycle_listener_registration = try store.addLifecycleListeners(
             .{
                 .ptr = self,
                 .commit_barrier_kind = .placement_intent,
@@ -3785,6 +3790,26 @@ pub const MetadataService = struct {
             },
         );
         self.lifecycle_listener_registered = true;
+    }
+
+    /// Permanently closes listener admission and drains any callback already
+    /// executing under the apply-store mutex. General public service calls are
+    /// still required not to race `deinit`; this closes the retained callback
+    /// path owned by Raft itself.
+    fn closeLifecycleListener(self: *MetadataService) void {
+        self.lifecycle_listener_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.lifecycle_listener_mutex.unlock(std.Options.debug_io);
+        self.lifecycle_listener_closing = true;
+        if (self.lifecycle_listener_registration) |value| {
+            const store = self.projectedStore() orelse {
+                std.debug.assert(false);
+                return;
+            };
+            const removed = store.removeLifecycleListeners(value);
+            std.debug.assert(removed);
+            self.lifecycle_listener_registration = null;
+            self.lifecycle_listener_registered = false;
+        }
     }
 
     fn metadataServicePlacementCommitBegin(ptr: *anyopaque) void {
@@ -4473,6 +4498,14 @@ pub const MetadataService = struct {
         expected: metadata_table_manager.TableRecord,
         replacement: metadata_table_manager.TableRecord,
     ) !void {
+        _ = try self.replaceTableDefinitionStamped(expected, replacement);
+    }
+
+    pub fn replaceTableDefinitionStamped(
+        self: *MetadataService,
+        expected: metadata_table_manager.TableRecord,
+        replacement: metadata_table_manager.TableRecord,
+    ) !metadata_api.CatalogMutationStamp {
         if (expected.table_id == 0 or
             replacement.table_id != expected.table_id or
             !std.mem.eql(u8, replacement.name, expected.name))
@@ -4483,7 +4516,9 @@ pub const MetadataService = struct {
             expected.table_id,
         );
         if (baseline_fence.active()) return error.TableTransitionActive;
-        try self.proposeTransitionCommand(.{ .compare_and_replace_table = .{
+        const metadata_incarnation = (try self.metadataIncarnation()) orelse
+            return error.MissingMetadataIncarnation;
+        const receipt = try self.proposeTransitionCommandWithReceipt(.{ .compare_and_replace_table = .{
             .expected = expected,
             .replacement = replacement,
         } });
@@ -4496,7 +4531,12 @@ pub const MetadataService = struct {
                 expected.table_id,
             )) orelse return error.TableNotFound;
             defer metadata_table_manager.freeTable(self.alloc, current);
-            if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return;
+            if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return .{
+                .metadata_group_id = self.metadata_group_id,
+                .metadata_incarnation = metadata_incarnation,
+                .term = receipt.term,
+                .index = receipt.index,
+            };
             if (!metadata_table_manager.tableDefinitionsEqual(current, expected))
                 return error.TableGenerationChanged;
 
@@ -6029,6 +6069,8 @@ pub const MetadataHttpService = struct {
     local_replica_root_reconcile_permit_hook: ?LocalReplicaRootReconcilePermitHook = null,
     lifecycle_listener_mutex: std.Io.Mutex = .init,
     lifecycle_listener_registered: bool = false,
+    lifecycle_listener_closing: bool = false,
+    lifecycle_listener_registration: ?metadata_storage.raft_apply_store.LifecycleListenerRegistration = null,
     embedding_activity_cache: EmbeddingActivityCache = .{},
     catalog_projection_reader: catalog_projection_reader.CatalogProjectionReader = .{},
     cdc_write_source_override: ?api_table_writes.TableWriteSource = null,
@@ -6142,8 +6184,17 @@ pub const MetadataHttpService = struct {
     pub fn deinit(self: *MetadataHttpService) void {
         shutdownRuntimeStatusProtocolProbe(self);
         shutdownCdcRuntimeJobs(self);
-        // Projection listeners retain `self`; stop and drain their Raft apply
-        // producer before releasing any callback-owned service state.
+        // Stop new Raft HTTP ingress before closing retained apply callbacks.
+        // In-process Ready work may still be finishing, so listener detach is
+        // also required and is the actual callback drain boundary.
+        self.raft.stop();
+        self.closeLifecycleListener();
+        // Persistent activation/cleanup owners borrow the routed Raft adapter
+        // and catalog projection; quiesce them only after no apply callback can
+        // submit or recreate work, and before either dependency is destroyed.
+        if (self.replica_root_dir) |replica_root_dir| {
+            api_table_writes.closeHostedManagedDbCacheForRoot(replica_root_dir);
+        }
         self.raft.deinit();
         self.embedding_activity_cache.deinit(self.alloc);
         self.catalog_projection_reader.deinit(self.alloc);
@@ -6154,9 +6205,6 @@ pub const MetadataHttpService = struct {
         self.lifecycle_signal.deinit();
         self.linearizable_read_tracker.deinit();
         self.alloc.destroy(self.linearizable_read_tracker);
-        if (self.replica_root_dir) |replica_root_dir| {
-            api_table_writes.closeHostedManagedDbCacheForRoot(replica_root_dir);
-        }
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         self.owned_backend_runtime = null;
         self.backend_runtime = null;
@@ -6236,9 +6284,10 @@ pub const MetadataHttpService = struct {
     fn ensureLifecycleListenerRegistered(self: *MetadataHttpService) !void {
         self.lifecycle_listener_mutex.lockUncancelable(std.Options.debug_io);
         defer self.lifecycle_listener_mutex.unlock(std.Options.debug_io);
+        if (self.lifecycle_listener_closing) return error.ServiceClosing;
         if (self.lifecycle_listener_registered) return;
         const store = self.projectedStore() orelse return;
-        try store.addLifecycleListeners(
+        self.lifecycle_listener_registration = try store.addLifecycleListeners(
             .{
                 .ptr = self,
                 .commit_barrier_kind = .placement_intent,
@@ -6257,6 +6306,22 @@ pub const MetadataHttpService = struct {
             },
         );
         self.lifecycle_listener_registered = true;
+    }
+
+    fn closeLifecycleListener(self: *MetadataHttpService) void {
+        self.lifecycle_listener_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.lifecycle_listener_mutex.unlock(std.Options.debug_io);
+        self.lifecycle_listener_closing = true;
+        if (self.lifecycle_listener_registration) |value| {
+            const store = self.projectedStore() orelse {
+                std.debug.assert(false);
+                return;
+            };
+            const removed = store.removeLifecycleListeners(value);
+            std.debug.assert(removed);
+            self.lifecycle_listener_registration = null;
+            self.lifecycle_listener_registered = false;
+        }
     }
 
     fn metadataHttpServicePlacementCommitBegin(ptr: *anyopaque) void {
@@ -7101,6 +7166,14 @@ pub const MetadataHttpService = struct {
         expected: metadata_table_manager.TableRecord,
         replacement: metadata_table_manager.TableRecord,
     ) !void {
+        _ = try self.replaceTableDefinitionStamped(expected, replacement);
+    }
+
+    pub fn replaceTableDefinitionStamped(
+        self: *MetadataHttpService,
+        expected: metadata_table_manager.TableRecord,
+        replacement: metadata_table_manager.TableRecord,
+    ) !metadata_api.CatalogMutationStamp {
         if (expected.table_id == 0 or
             replacement.table_id != expected.table_id or
             !std.mem.eql(u8, replacement.name, expected.name))
@@ -7111,7 +7184,9 @@ pub const MetadataHttpService = struct {
             expected.table_id,
         );
         if (baseline_fence.active()) return error.TableTransitionActive;
-        try self.proposeTransitionCommand(.{ .compare_and_replace_table = .{
+        const metadata_incarnation = (try self.metadataIncarnation()) orelse
+            return error.MissingMetadataIncarnation;
+        const receipt = try self.proposeTransitionCommandWithReceipt(.{ .compare_and_replace_table = .{
             .expected = expected,
             .replacement = replacement,
         } });
@@ -7124,7 +7199,12 @@ pub const MetadataHttpService = struct {
                 expected.table_id,
             )) orelse return error.TableNotFound;
             defer metadata_table_manager.freeTable(self.alloc, current);
-            if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return;
+            if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return .{
+                .metadata_group_id = self.metadata_group_id,
+                .metadata_incarnation = metadata_incarnation,
+                .term = receipt.term,
+                .index = receipt.index,
+            };
             if (!metadata_table_manager.tableDefinitionsEqual(current, expected))
                 return error.TableGenerationChanged;
 
@@ -18046,6 +18126,14 @@ test "metadata http service catalog cache is independent from volatile projectio
     try std.testing.expectEqual(live_raft.votes_granted, fallback_status.metadata_raft_votes_granted);
     try std.testing.expectEqual(live_raft.votes_rejected, fallback_status.metadata_raft_votes_rejected);
     try std.testing.expectEqual(live_raft.votes_unknown, fallback_status.metadata_raft_votes_unknown);
+
+    // Teardown closes callback admission permanently. A concurrent catalog
+    // reader must observe cancellation instead of silently proceeding after
+    // the listener pair was detached from Raft.
+    svc.closeLifecycleListener();
+    try std.testing.expect(!svc.lifecycle_listener_registered);
+    try std.testing.expect(svc.lifecycle_listener_registration == null);
+    try std.testing.expectError(error.ServiceClosing, svc.ensureLifecycleListenerRegistered());
 }
 
 test "metadata http service linearizable read waits for leader discovery" {
