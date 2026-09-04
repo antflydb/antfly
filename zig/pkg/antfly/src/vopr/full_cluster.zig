@@ -3815,7 +3815,9 @@ test "full cluster production query embedding cache deadline owner restart and e
     );
 }
 
-test "full cluster production serverless generation progress conflict exact replay" {
+// Keep this production-sized scenario out of the broad `serverless` unit shard.
+// Its bounded CI target is `production-cluster-serverless-fencing-vopr-test`.
+test "full cluster production generation progress conflict exact replay" {
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
     const ordinal = Scenario.production_serverless_fencing_ordinal;

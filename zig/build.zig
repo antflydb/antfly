@@ -7862,7 +7862,7 @@ pub fn build(b: *std.Build) void {
 
     const production_cluster_serverless_fencing_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"full cluster production serverless generation progress conflict exact replay"},
+        .filters = &.{"full cluster production generation progress conflict exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_serverless_fencing_vopr_tests = b.addRunArtifact(production_cluster_serverless_fencing_vopr_tests);
