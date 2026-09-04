@@ -218,6 +218,11 @@ pub const MetadataServer = struct {
             _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
+            _ = public_read_source.withBackendRuntime(backend_runtime);
+            _ = public_read_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
+            _ = public_read_source.withSecretStore(cfg.api_server_cfg.secret_store);
+            _ = public_read_source.withRemoteContent(cfg.api_server_cfg.remote_content);
+            _ = public_read_source.withRemoteCapabilityCache(try public_write_source.remoteCapabilityCache());
             _ = public_write_source.withInternalServiceAuth(
                 cfg.api_server_cfg.internal_service_secret,
                 cfg.api_server_cfg.internal_service_issuer,

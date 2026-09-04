@@ -192,6 +192,7 @@ pub const Provider = struct {
     frequency_penalty: ?f32 = null,
     presence_penalty: ?f32 = null,
     max_response_bytes: ?usize = null,
+    request_timeout_ms: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -282,6 +283,10 @@ pub const Provider = struct {
 
     pub fn setMaxResponseBytes(self: *Provider, max_response_bytes: ?usize) void {
         self.max_response_bytes = max_response_bytes;
+    }
+
+    pub fn setRequestTimeoutMs(self: *Provider, timeout_ms: ?u64) void {
+        self.request_timeout_ms = timeout_ms;
     }
 
     pub fn setSamplingOptions(
@@ -515,8 +520,12 @@ pub const Provider = struct {
         var resp = try self.http.post(url, .{
             .json = json_body,
             .headers = self.requestHeaders(),
-            .timeout_ms = 300_000,
+            .timeout_ms = self.request_timeout_ms orelse 300_000,
             .max_response_size = self.max_response_bytes,
+            .cancellation = if (self.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
         });
         defer resp.deinit();
         if (!resp.ok()) return if (isCapabilityStaleResponse(resp))
@@ -583,7 +592,16 @@ pub const Provider = struct {
             .prompts = documents,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.requestHeaders() });
+        var resp = try self.http.post(url, .{
+            .json = json_body,
+            .headers = self.requestHeaders(),
+            .timeout_ms = self.request_timeout_ms,
+            .max_response_size = self.max_response_bytes,
+            .cancellation = if (self.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
+        });
         defer resp.deinit();
         if (!resp.ok()) return if (isCapabilityStaleResponse(resp))
             error.InferenceCapabilitiesStale

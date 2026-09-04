@@ -22,6 +22,7 @@ const inference = @import("inference_server");
 const inference_bridge = @import("inference_bridge.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const platform_sync = @import("antfly_platform").sync;
+const platform_time = @import("antfly_platform").time;
 const runtime_http_bridge = @import("../runtime_http_bridge.zig");
 const inference_api = @import("inference_api");
 const inference_chunker = @import("inference_chunker");
@@ -157,6 +158,29 @@ test "standalone linked inference ABI validates the supported function-table pre
     try std.testing.expect(!inference_bridge.validFunctionTable(&table, inference_bridge.Capability.provider));
     table.struct_size = inference_bridge.requiredFunctionTableSize(inference_bridge.Capability.provider).?;
     try std.testing.expect(inference_bridge.validFunctionTable(&table, inference_bridge.Capability.provider));
+}
+
+test "standalone provider ABI rejects cancellation before dispatch" {
+    const Canceled = struct {
+        fn requested(_: ?*const anyopaque) callconv(.c) u8 {
+            return 1;
+        }
+    };
+    var marker: u8 = 0;
+    var response_handle: ?*anyopaque = null;
+    var response_json: inference_bridge.String = undefined;
+    const context = inference_bridge.ProviderInvokeContext{
+        .abi_version = inference_bridge.abi_version,
+        .handle = undefined,
+        .operation = 0,
+        .request_json = inference_bridge.String.init(""),
+        .deadline_ns = std.math.maxInt(u64),
+        .has_deadline = 1,
+        .out_response_handle = &response_handle,
+        .out_response_json = &response_json,
+        .cancellation = .{ .context = &marker, .is_cancelled = Canceled.requested },
+    };
+    try std.testing.expectError(error.Canceled, linkedInferenceInvokeProvider(&context));
 }
 
 const ModelTextsRequest = struct {
@@ -710,6 +734,7 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
 }
 
 pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderInvokeContext) !void {
+    try checkProviderInvokeControls(context);
     const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
     const operation = std.enums.fromInt(inference_bridge.ProviderOperation, context.operation) orelse
         return error.UnsupportedOperation;
@@ -772,7 +797,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             var parsed = try std.json.parseFromSlice(RerankTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
             try validateLinkedTextInvocation(&state.node, state.io, parsed.value.model, .rerank, parsed.value.documents, parsed.value.query.len, parsed.value.documents.len, 0);
-            const result = try state.node.rerankTextsDirect(alloc, parsed.value.model, parsed.value.query, parsed.value.documents);
+            const result = try state.node.rerankTextsDirectWithContext(state.io, deadline_ns, alloc, parsed.value.model, parsed.value.query, parsed.value.documents);
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
@@ -987,7 +1012,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 },
             }
             try chunk_capabilities.validateInvocation(.chunk, chunk_shape);
-            const result = try state.node.chunkInputDirect(alloc, parsed.value.model, input, .{
+            const result = try state.node.chunkInputDirectWithContext(deadline_ns, alloc, parsed.value.model, input, .{
                 .model = if (cfg.model.len > 0) cfg.model else "fixed",
                 .max_chunks = if (cfg.max_chunks > 0) @intCast(cfg.max_chunks) else 50,
                 .threshold = cfg.threshold,
@@ -1074,10 +1099,17 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         },
     };
     errdefer alloc.free(response_json);
+    try checkProviderInvokeControls(context);
     const response = try alloc.create(ProviderResponseState);
     response.* = .{ .alloc = alloc, .json = response_json };
     context.out_response_handle.* = response;
     context.out_response_json.* = inference_bridge.String.init(response_json);
+}
+
+fn checkProviderInvokeControls(context: *const inference_bridge.ProviderInvokeContext) !void {
+    if (context.cancellation.requested()) return error.Canceled;
+    if (context.has_deadline != 0 and platform_time.monotonicNs() >= context.deadline_ns)
+        return error.Timeout;
 }
 
 pub fn linkedInferenceDestroyProviderResponse(handle: *anyopaque) void {

@@ -4413,6 +4413,11 @@ pub const HostedProvisionedTableReadSource = struct {
     internal_service_issuer: ?[]const u8 = null,
     io_impl: ?*std.Io.Threaded = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
+    inference_api_url: ?[]const u8 = null,
+    secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
+    remote_capability_cache: ?*remote_capabilities.Cache = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
     incoming_graph_routes: ?*distributed_graph.IncomingSourceGroupCache = null,
 
@@ -4440,6 +4445,58 @@ pub const HostedProvisionedTableReadSource = struct {
     pub fn withBackendRuntime(self: *HostedProvisionedTableReadSource, backend_runtime: *db_mod.background_runtime.BackendRuntime) *HostedProvisionedTableReadSource {
         self.backend_runtime = backend_runtime;
         return self;
+    }
+
+    pub fn withAntflyProvider(
+        self: *HostedProvisionedTableReadSource,
+        provider: ?managed_embedder.AntflyProvider,
+    ) *HostedProvisionedTableReadSource {
+        self.antfly_provider = providerWithCapabilityCache(provider, self.remote_capability_cache);
+        return self;
+    }
+
+    pub fn withInferenceAPIURL(
+        self: *HostedProvisionedTableReadSource,
+        inference_api_url: ?[]const u8,
+    ) *HostedProvisionedTableReadSource {
+        self.inference_api_url = inference_api_url;
+        return self;
+    }
+
+    pub fn withSecretStore(
+        self: *HostedProvisionedTableReadSource,
+        secret_store: ?*common_secrets.FileStore,
+    ) *HostedProvisionedTableReadSource {
+        self.secret_store = secret_store;
+        return self;
+    }
+
+    pub fn withRemoteContent(
+        self: *HostedProvisionedTableReadSource,
+        remote_content: ?*const scraping.RemoteContentConfig,
+    ) *HostedProvisionedTableReadSource {
+        self.remote_content = remote_content;
+        return self;
+    }
+
+    pub fn withRemoteCapabilityCache(
+        self: *HostedProvisionedTableReadSource,
+        cache: ?*remote_capabilities.Cache,
+    ) *HostedProvisionedTableReadSource {
+        self.remote_capability_cache = cache;
+        self.antfly_provider = providerWithCapabilityCache(self.antfly_provider, cache);
+        return self;
+    }
+
+    fn managedReadRuntimeConfig(self: *const HostedProvisionedTableReadSource) ManagedReadRuntimeConfig {
+        return .{
+            .backend_runtime = self.backend_runtime,
+            .antfly_provider = providerWithCapabilityCache(self.antfly_provider, self.remote_capability_cache),
+            .inference_api_url = self.inference_api_url,
+            .secret_store = self.secret_store,
+            .remote_content = self.remote_content,
+            .remote_capability_cache = self.remote_capability_cache,
+        };
     }
 
     pub fn withIncomingGraphRoutes(
@@ -5068,7 +5125,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer route.deinit(alloc);
 
             if (route == .local) {
-                var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+                var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, consistency);
                 defer execution.releaseDb();
                 try checkQueryDeadline(execution.request);
                 var result = execution.result;
@@ -5083,10 +5140,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, execution.db(), consistency);
                 execution.releaseDb();
                 try checkQueryDeadline(response_req);
-                try applyQueryPostProcessing(alloc, response_req, &result, &meta, .{
-                    .backend_runtime = self.backend_runtime,
-                    .source_table = table_name,
-                });
+                try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.managedReadRuntimeConfig().forTable(table_name));
                 return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
             }
         }
@@ -5135,10 +5189,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer meta.deinit(alloc);
             try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, consistency);
             try checkQueryDeadline(graph_req);
-            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, .{
-                .backend_runtime = self.backend_runtime,
-                .source_table = table_name,
-            });
+            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         var merged = try queryHostedAcrossGroups(self, alloc, group_ids, req, table_name, consistency);
@@ -5152,10 +5203,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer meta.deinit(alloc);
         try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, null, consistency);
         try checkQueryDeadline(req);
-        try applyQueryPostProcessing(alloc, req, &merged, &meta, .{
-            .backend_runtime = self.backend_runtime,
-            .source_table = table_name,
-        });
+        try applyQueryPostProcessing(alloc, req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
 
@@ -5297,7 +5345,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const start_ns = platform_time.monotonicNs();
-        var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+        var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency);
         defer execution.releaseDb();
         var result = execution.result;
         defer result.deinit();
@@ -5310,10 +5358,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer meta.deinit(alloc);
         try applyHostedProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), consistency);
         execution.releaseDb();
-        try applyQueryPostProcessing(alloc, response_req, &result, &meta, .{
-            .backend_runtime = self.backend_runtime,
-            .source_table = table_name,
-        });
+        try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.managedReadRuntimeConfig().forTable(table_name));
         return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
     }
 
@@ -5330,7 +5375,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency),
+            .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency),
             .remote => null,
         };
     }
@@ -5522,7 +5567,7 @@ pub const HostedProvisionedTableReadSource = struct {
                         .frontier_id = item.id,
                         .frontier_key = try alloc.dupe(u8, item.key),
                         .graph_result = graph_blk: {
-                            var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, search_req, consistency);
+                            var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, search_req, consistency);
                             defer result.deinit();
                             var graph_result = if (result.graph_results.len > 0)
                                 try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
@@ -5621,7 +5666,7 @@ fn providerWithCapabilityCache(
     cache: ?*remote_capabilities.Cache,
 ) ?managed_embedder.AntflyProvider {
     var bound = provider orelse return null;
-    bound.remote_capability_cache = cache;
+    bound.remote_capability_cache = cache orelse bound.remote_capability_cache;
     return bound;
 }
 
@@ -9165,7 +9210,7 @@ fn queryHostedAcrossGroupsPhase(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         shard_results[i] = switch (route) {
-            .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, group_req, consistency),
+            .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, group_req, consistency),
             .remote => |remote| try queryRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, group_req),
         };
         initialized += 1;
@@ -17273,11 +17318,14 @@ fn applyReranker(
         initialized_docs += 1;
     }
 
+    var inference_lane: ?db_mod.background_runtime.BackendRuntime.InferenceLaneLease = null;
+    defer if (inference_lane) |*lease| lease.release();
     var fallback_io: ?std.Io.Threaded = null;
     defer if (fallback_io) |*io_impl| io_impl.deinit();
-    const io = if (runtime_cfg.backend_runtime) |backend|
-        backend.io()
-    else blk: {
+    const io = if (runtime_cfg.backend_runtime) |backend| blk: {
+        inference_lane = try backend.acquireInferenceLane();
+        break :blk inference_lane.?.io();
+    } else blk: {
         fallback_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
         break :blk fallback_io.?.io();
     };
@@ -17297,6 +17345,8 @@ fn applyReranker(
                 .capability_cache = runtime_cfg.remote_capability_cache,
                 .io = io,
                 .routing = .{ .source_table = runtime_cfg.source_table },
+                .deadline_ns = req.execution_deadline_ns,
+                .cancellation = req.cancellation orelse .none,
             },
         },
         req.reranker_query_text,

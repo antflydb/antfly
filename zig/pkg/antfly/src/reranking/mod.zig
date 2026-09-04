@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const httpx = @import("httpx");
 const lib = @import("antfly_reranking");
 const managed_embedder = @import("../inference/managed_embedder.zig");
@@ -53,6 +54,9 @@ pub const Options = struct {
     execution: execution_context.Context = .{},
 };
 
+const remote_rerank_max_response_bytes: usize = 4 << 20;
+const remote_rerank_max_timeout_ms: u64 = 300_000;
+
 pub fn rerankDocumentsWithOptions(
     alloc: std.mem.Allocator,
     http: *httpx.Client,
@@ -73,18 +77,32 @@ pub fn rerankDocumentsWithOptions(
         .antfly => {
             const explicit_endpoint = if (std.mem.trim(u8, cfg.url, " \t\r\n").len > 0) cfg.url else null;
             const linked_reranker = if (options.antfly_provider) |local| local.rerank_texts else null;
+            const linked_context_reranker = if (options.antfly_provider) |local| local.rerank_texts_with_context else null;
             const resolved_endpoint = options.execution.resolveAntflyEndpoint(
                 explicit_endpoint,
-                linked_reranker != null,
+                linked_context_reranker != null or linked_reranker != null,
             );
-            if (resolved_endpoint == null and linked_reranker != null) {
+            if (resolved_endpoint == null and (linked_context_reranker != null or linked_reranker != null)) {
                 const local = options.antfly_provider.?;
-                return try linked_reranker.?(local.ptr, alloc, cfg.model, query, documents);
+                const io = options.execution.io orelse http.io;
+                const request_context = options.execution.requestContext(io);
+                try request_context.check();
+                const scores = if (linked_context_reranker) |rerank|
+                    try rerank(local.ptr, alloc, cfg.model, query, documents, request_context)
+                else
+                    try linked_reranker.?(local.ptr, alloc, cfg.model, query, documents);
+                errdefer alloc.free(scores);
+                try request_context.check();
+                return scores;
             }
             const endpoint = resolved_endpoint orelse cfg.defaultedUrl();
             var provider = antfly_provider.Provider.init(alloc, http, endpoint);
             defer provider.deinit();
             try provider.setSourceTable(options.execution.routing.source_table);
+            provider.setRequestCancellation(options.execution.cancellation);
+            provider.setMaxResponseBytes(options.execution.boundedResponseBytes(
+                remote_rerank_max_response_bytes,
+            ));
             var authorization_header: ?[]u8 = null;
             defer if (authorization_header) |value| alloc.free(value);
             var header_storage: [2][2][]const u8 = undefined;
@@ -107,12 +125,13 @@ pub fn rerankDocumentsWithOptions(
                 fallback_cache = remote_capabilities.Cache.init(alloc, http.io);
                 capability_cache = &fallback_cache.?;
             }
-            const capability_lease = try capability_cache.?.getOrDiscoverLease(
+            const capability_lease = try capability_cache.?.getOrDiscoverLeaseWithContext(
                 http,
                 endpoint,
                 cfg.model,
                 .rerank,
                 headers,
+                options.execution.waitContext(),
             );
             if (capability_lease.capabilities) |capabilities| {
                 try capabilities.validateInvocation(.rerank, .{
@@ -127,6 +146,13 @@ pub fn rerankDocumentsWithOptions(
                 try provider.setCapabilityToken(token.slice());
             if (capability_lease.descriptor_revision) |revision|
                 try provider.setCapabilityRevision(revision.slice());
+            // Discovery and execution share one absolute deadline. Recompute
+            // the transport duration only after discovery so catalog latency
+            // cannot extend the owning query.
+            provider.setRequestTimeoutMs(try options.execution.remainingTimeoutMs(
+                platform_time.monotonicNs(),
+                remote_rerank_max_timeout_ms,
+            ));
             var result = provider.reranker().rerank(alloc, cfg.model, query, documents) catch |err| {
                 if (err == error.InferenceCapabilitiesStale)
                     try capability_cache.?.invalidate(endpoint, cfg.model, .rerank, headers);
@@ -226,7 +252,8 @@ test "reranking runtime routes antfly provider to local antfly" {
     defer client.deinit();
 
     const State = struct {
-        called: bool = false,
+        legacy_called: bool = false,
+        context_calls: usize = 0,
 
         fn dense(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
             return try a.alloc([]f32, 0);
@@ -238,7 +265,19 @@ test "reranking runtime routes antfly provider to local antfly" {
 
         fn rerank(ptr: *anyopaque, a: std.mem.Allocator, model: []const u8, query: []const u8, documents: []const []const u8) anyerror![]f32 {
             const state: *@This() = @ptrCast(@alignCast(ptr));
-            state.called = true;
+            state.legacy_called = true;
+            _ = a;
+            _ = model;
+            _ = query;
+            _ = documents;
+            return error.TestUnexpectedResult;
+        }
+
+        fn rerankWithContext(ptr: *anyopaque, a: std.mem.Allocator, model: []const u8, query: []const u8, documents: []const []const u8, context: execution_context.RequestContext) anyerror![]f32 {
+            const state: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            try std.testing.expect(context.deadline_ns != null);
+            state.context_calls += 1;
             try std.testing.expectEqualStrings("local-reranker", model);
             try std.testing.expectEqualStrings("query", query);
             try std.testing.expectEqual(@as(usize, 2), documents.len);
@@ -255,14 +294,26 @@ test "reranking runtime routes antfly provider to local antfly" {
         .embed_dense_texts = State.dense,
         .embed_sparse_texts = State.sparse,
         .rerank_texts = State.rerank,
+        .rerank_texts_with_context = State.rerankWithContext,
     };
     const cfg = Config{
         .provider = .antfly,
         .model = "local-reranker",
         .field = "body",
     };
-    const scores = try rerankDocumentsWithAntflyProvider(alloc, &client, cfg, local, "query", &.{ "doc1", "doc2" });
+    const scores = try rerankDocumentsWithOptions(alloc, &client, cfg, .{
+        .antfly_provider = local,
+        .execution = .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
+    }, "query", &.{ "doc1", "doc2" });
     defer alloc.free(scores);
-    try std.testing.expect(state.called);
+    try std.testing.expectEqual(@as(usize, 1), state.context_calls);
+    try std.testing.expect(!state.legacy_called);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), scores[1], 0.0001);
+
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, rerankDocumentsWithOptions(alloc, &client, cfg, .{
+        .antfly_provider = local,
+        .execution = .{ .cancellation = .fromAtomic(&canceled) },
+    }, "query", &.{ "doc1", "doc2" }));
+    try std.testing.expectEqual(@as(usize, 1), state.context_calls);
 }

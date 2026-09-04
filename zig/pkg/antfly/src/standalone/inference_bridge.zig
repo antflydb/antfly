@@ -20,7 +20,7 @@ const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
 
-pub const abi_version: u32 = 23;
+pub const abi_version: u32 = 24;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -210,6 +210,9 @@ pub const ProviderInvokeContext = extern struct {
     binary_payloads_len: usize = 0,
     attachment_refs: ?[*]const ProviderAttachmentRef = null,
     attachment_refs_len: usize = 0,
+    /// Borrowed invocation cancellation. Appended so the versioned ABI rejects
+    /// older layouts instead of silently dropping caller control.
+    cancellation: http_abi.CancellationView = .{},
 };
 
 pub const RouteManifestEntry = extern struct {

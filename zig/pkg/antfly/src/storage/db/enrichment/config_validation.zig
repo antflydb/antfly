@@ -84,7 +84,7 @@ test "public enrichment validation rejects invalid execution and producer config
         .name = "units",
         .kind = .asset,
         .field = "url",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":20,\"config\":{\"provider\":\"antfly\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":20,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     }));
     try std.testing.expectError(error.InvalidEnrichmentConfig, validatePublicConfig(std.testing.allocator, .{
         .name = "chunks",

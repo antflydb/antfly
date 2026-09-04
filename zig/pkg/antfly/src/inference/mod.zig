@@ -103,6 +103,10 @@ test "managed embedder cancels an in-flight remote embedding request" {
     try managed_embedder.testRemoteEmbeddingCancellation();
 }
 
+test "managed embedder single multimodal admission counts inline image pixels" {
+    try managed_embedder.testSingleMultimodalEmbeddingAdmission();
+}
+
 test "managed embedder rejects malformed provider vectors" {
     try managed_embedder.testEmbeddingProviderResultValidation();
 }

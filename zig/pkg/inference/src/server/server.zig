@@ -3792,17 +3792,30 @@ pub const Node = struct {
         query: []const u8,
         documents: []const []const u8,
     ) ![]f32 {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        return try self.rerankTextsDirectWithContext(io_impl.io(), null, allocator, model_name, query, documents);
+    }
+
+    pub fn rerankTextsDirectWithContext(
+        self: *Node,
+        io: std.Io,
+        deadline_ns: ?u64,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        query: []const u8,
+        documents: []const []const u8,
+    ) ![]f32 {
         if (documents.len == 0) return try allocator.alloc(f32, 0);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         try self.acquireAdmissionUnits(1);
         defer self.releaseAdmission();
         self.metrics.incRequest("rerank.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rerankers");
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "rerankers");
         defer self.allocator.free(model_path);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "rerank");
         try validateTextExecutorInvocation(executor_contract, 1, documents, query.len, 0, documents.len, 0);
         var model_handle = try self.model_manager.acquireFromDir(model_path);
@@ -3819,7 +3832,10 @@ pub const Node = struct {
             documents.len,
             0,
         );
-        return try pipeline.rerank(query, documents);
+        const scores = try pipeline.rerank(query, documents);
+        errdefer allocator.free(scores);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+        return scores;
     }
 
     pub fn chunkInputDirect(
@@ -3829,6 +3845,18 @@ pub const Node = struct {
         input: lib_chunker.Input,
         requested: lib_chunker.FixedChunkConfig,
     ) ![]lib_chunker.Chunk {
+        return try self.chunkInputDirectWithContext(null, allocator, model_name, input, requested);
+    }
+
+    pub fn chunkInputDirectWithContext(
+        self: *Node,
+        deadline_ns: ?u64,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        input: lib_chunker.Input,
+        requested: lib_chunker.FixedChunkConfig,
+    ) ![]lib_chunker.Chunk {
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         if (canonicalFixedChunkModel(model_name) == null or canonicalFixedChunkModel(requested.model) == null)
             return error.UnsupportedChunkerProvider;
         try self.acquireAdmissionUnits(1);
@@ -3837,7 +3865,10 @@ pub const Node = struct {
         defer self.metrics.decActive();
         var config = requested;
         config.model = "fixed";
-        return try lib_chunker.fixed_multimodal.chunkInput(allocator, input, config);
+        const chunks = try lib_chunker.fixed_multimodal.chunkInput(allocator, input, config);
+        errdefer lib_chunker.types.freeChunks(allocator, chunks);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+        return chunks;
     }
 
     pub fn rewriteTextsDirect(

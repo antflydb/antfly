@@ -3113,6 +3113,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         if (self.config.dense_embedder) |dense_embedder| dense_embedder.deinit(self.alloc);
         if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.deinit(self.alloc);
         if (self.config.asset_producer) |producer| producer.deinit(self.alloc);
+        if (self.config.chunk_provider) |*provider| provider.deinit();
         self.* = undefined;
     }
 
@@ -3576,6 +3577,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         if (self.config.dense_embedder) |dense_embedder| dense_embedder.deinit(self.alloc);
         if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.deinit(self.alloc);
         if (self.config.asset_producer) |producer| producer.deinit(self.alloc);
+        if (self.config.chunk_provider) |*provider| provider.deinit();
         self.* = undefined;
     }
 
@@ -3622,6 +3624,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         if (self.config.dense_embedder) |dense_embedder| dense_embedder.setCancellation(cancellation);
         if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.setCancellation(cancellation);
         const io = io_impl.io();
+        if (self.config.chunk_provider) |*provider| {
+            provider.execution.cancellation = cancellation;
+            provider.execution.io = io;
+        }
         self.future = try io.concurrent(workerMain, .{self});
     }
 

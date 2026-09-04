@@ -25296,13 +25296,13 @@ test "asset registration validates document extraction OCR config" {
         .name = "document_units",
         .kind = .asset,
         .source_field = "url",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":20,\"config\":{\"provider\":\"antfly\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":20,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     }));
     try manager.validateEnrichmentConfig(.{
         .name = "document_units",
         .kind = .asset,
         .source_field = "url",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":150,\"config\":{\"provider\":\"antfly\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":150,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     });
 }
 

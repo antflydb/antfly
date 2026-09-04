@@ -1503,6 +1503,69 @@ document. They are architectural requirements, not Florence-specific cleanup:
     Provider-specific defaults remain available only to providers whose
     contracts define them; Antfly's distributed route identity is always
     explicit.
+164. **Query-time reranking treated an optional backend executor as an
+    unconditional I/O value.** Reranking now acquires a lifetime-fenced
+    inference-lane lease from the backend runtime and uses a private threaded
+    executor only for standalone construction. This both restores the complete
+    Linux storage-kernel build and prevents shutdown from retiring the shared
+    inference executor during an active query.
+165. **The production hosted-read coordinator did not receive the distributed
+    inference context.** Hosted reads now carry the configured inference
+    endpoint, backend runtime, secret and remote-content services, and the same
+    hosted-root capability cache as durable writes. Local-shard query opening
+    and coordinator post-processing use that complete context, so a URL-less
+    Antfly reranker or query embedder cannot accidentally target coordinator
+    localhost.
+166. **The shared execution context described cancellation and bounds but
+    could not carry them.** It now includes an absolute monotonic deadline, a
+    transport-neutral cancellation token, and a caller response ceiling.
+    Reranker discovery and execution intersect those controls with finite
+    family limits; generation also forwards provider cancellation through its
+    HTTP request. A canceled or expired public query therefore bounds both
+    catalog discovery and the admitted inference request.
+167. **Durable semantic chunking retained only I/O and a capability-cache
+    pointer.** Chunking now resolves explicit, linked, and provisioned-default
+    routes through the same execution context, scopes discovery and execution
+    by source table, binds the capability token and revision, and applies
+    cancellation, deadline, and response limits. The durable chunk provider
+    owns copies of endpoint and source-table strings, so request-scoped catalog
+    slices cannot escape into background replay.
+168. **Only batched page-image embedding consumed its capability lease.**
+    Remote single-item multimodal, sparse-text, and dense-text embedding now
+    discover and validate the concrete invocation, bind its routing token and
+    descriptor revision, and invalidate the exact scoped lease on a stale
+    response. Every Antfly embedding surface therefore uses the same
+    model/operation/auth/source-table fence. Hosted execution borrows its
+    runtime-owned concurrent I/O lane; standalone managed embedders own one
+    concurrent executor for their complete lifetime, so request volume cannot
+    multiply thread pools and bounded capability discovery never runs on a
+    non-concurrent singleton event loop. Catalog-only dimension probes bind a
+    scoped executor for the complete validation operation.
+169. **Linked reranking and chunking dropped request controls at the callback
+    boundary.** Their provider contracts now prefer contextual callbacks that
+    receive the caller-owned I/O executor, absolute deadline, and semantic
+    cancellation token. The versioned standalone provider ABI carries the same
+    borrowed cancellation view and applies uniform pre/post dispatch checks;
+    reranking and chunking also pass the absolute deadline into their direct
+    inference entry points. Legacy callbacks remain compatibility fallbacks,
+    but production standalone registration publishes the contextual variants.
+170. **Remote transport timeouts were computed before capability discovery.**
+    Reranking and every remote Antfly embedding path now capture one absolute
+    operation deadline, use it for discovery, and recompute the residual
+    transport timeout immediately before execution. Discovery latency can no
+    longer reset or extend the owning query/enrichment budget.
+171. **An unused provider-only enrichment set leaked after a successful plain
+    managed DB open.** Enrichment construction now follows unconditional
+    owner cleanup: `takeConfig` clears each transferred owner, and the local
+    aggregate is always deinitialized on both success and error. The same rule
+    applies to active and paused reconfiguration, while partial construction
+    is guarded by one aggregate `errdefer`.
+172. **Standalone remote embedding allocated a threaded executor per request.**
+    A `ManagedEmbedder` without injected runtime I/O now creates one stable,
+    heap-backed concurrent executor, shares it across all entries and calls,
+    and destroys it only after entries and pacers drain. Remote request code
+    fails closed when no owner-bound HTTP executor exists, preventing a future
+    fallback from silently restoring thread-pool amplification.
 
 ### Post-review implementation contract
 
@@ -2004,6 +2067,12 @@ The hardening above follows these long-term rules:
     `DeletedFinalStateUnknown` tombstones. A missed Kubernetes delete can no
     longer leave a stale route policy, generation, or capability-routing path
     installed indefinitely.
+60. **Implemented after end-to-end execution-context review:** hosted reads,
+    reranking, semantic chunking, and every remote embedding variant now use
+    one route-aware, deadline/cancellation-bounded, capability-lease-fenced
+    execution contract. Persistent adapters own any routing strings that
+    outlive an invocation, while query adapters hold an inference-lane lifetime
+    lease for the complete remote call.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

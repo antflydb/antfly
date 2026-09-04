@@ -3992,7 +3992,7 @@ test "document extraction defaults OCR to PDF routes and accepts explicit image 
     try std.testing.expect(!ocrEnabledForRoute(defaults, "image"));
     try std.testing.expectEqualStrings(default_ocr_config_json, effectiveOcrConfigJson(defaults));
 
-    var image_enabled = try parseConfig(alloc, "{\"ocr\":{\"config\":{\"provider\":\"antfly\"}}}");
+    var image_enabled = try parseConfig(alloc, "{\"ocr\":{\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}");
     defer image_enabled.deinit(alloc);
     try std.testing.expect(ocrEnabledForRoute(image_enabled, "image"));
 

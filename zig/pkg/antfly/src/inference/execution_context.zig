@@ -10,6 +10,8 @@
 
 const std = @import("std");
 const remote_capabilities = @import("remote_capabilities.zig");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const platform_time = @import("antfly_platform").time;
 
 pub const source_table_header = "X-Antfly-Source-Table";
 
@@ -46,6 +48,14 @@ pub const InferenceExecutionContext = struct {
     capability_cache: ?*remote_capabilities.Cache = null,
     io: ?std.Io = null,
     routing: RoutingContext = .{},
+    /// Absolute monotonic deadline for discovery and execution. Task adapters
+    /// may apply a stricter family-specific ceiling, but must never extend it.
+    deadline_ns: ?u64 = null,
+    cancellation: CancellationToken = .none,
+    /// Optional caller-owned response ceiling. Task adapters intersect this
+    /// with their own hard limit rather than treating it as permission to
+    /// allocate more.
+    max_response_bytes: ?usize = null,
 
     pub fn resolveAntflyEndpoint(
         self: InferenceExecutionContext,
@@ -61,9 +71,67 @@ pub const InferenceExecutionContext = struct {
         }
         return null;
     }
+
+    pub fn waitContext(self: InferenceExecutionContext) remote_capabilities.WaitContext {
+        return .{
+            .deadline_ns = self.deadline_ns,
+            .cancellation = self.cancellation,
+        };
+    }
+
+    pub fn requestContext(self: InferenceExecutionContext, io: std.Io) RequestContext {
+        return .{
+            .io = io,
+            .deadline_ns = self.deadline_ns,
+            .cancellation = self.cancellation,
+        };
+    }
+
+    pub fn check(self: InferenceExecutionContext, now_ns: u64) !void {
+        try self.cancellation.check();
+        if (self.deadline_ns) |deadline| if (now_ns >= deadline) return error.Timeout;
+    }
+
+    pub fn boundedResponseBytes(self: InferenceExecutionContext, family_limit: usize) usize {
+        return if (self.max_response_bytes) |requested|
+            @min(requested, family_limit)
+        else
+            family_limit;
+    }
+
+    pub fn remainingTimeoutMs(
+        self: InferenceExecutionContext,
+        now_ns: u64,
+        family_limit_ms: u64,
+    ) !u64 {
+        try self.check(now_ns);
+        const deadline = self.deadline_ns orelse return family_limit_ms;
+        const remaining_ns = deadline - now_ns;
+        const rounded_ms = @max(
+            @as(u64, 1),
+            std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1,
+        );
+        return @min(rounded_ms, family_limit_ms);
+    }
 };
 
 pub const Context = InferenceExecutionContext;
+
+/// Invocation-local control plane for linked task callbacks. It deliberately
+/// excludes routing, caches, and provider configuration: callbacks receive
+/// only the executor and controls they must observe while work is in flight.
+pub const RequestContext = struct {
+    io: std.Io,
+    deadline_ns: ?u64 = null,
+    cancellation: CancellationToken = .none,
+
+    pub fn check(self: RequestContext) !void {
+        try self.cancellation.check();
+        if (self.deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+        }
+    }
+};
 
 test "execution context gives explicit and linked routes precedence" {
     const context = Context{ .default_endpoint = "http://distributed" };
@@ -86,4 +154,19 @@ test "routing context appends trusted table header" {
     try std.testing.expectEqual(@as(usize, 2), count);
     try std.testing.expectEqualStrings(source_table_header, storage[1][0]);
     try std.testing.expectEqualStrings("docs", storage[1][1]);
+}
+
+test "execution context preserves control and resource bounds" {
+    var canceled = std.atomic.Value(bool).init(false);
+    const context = Context{
+        .deadline_ns = 200,
+        .cancellation = CancellationToken.fromAtomic(&canceled),
+        .max_response_bytes = 512,
+    };
+    try context.check(199);
+    try std.testing.expectError(error.Timeout, context.check(200));
+    try std.testing.expectEqual(@as(usize, 512), context.boundedResponseBytes(1024));
+    try std.testing.expectEqual(@as(?u64, 200), context.waitContext().deadline_ns);
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, context.check(0));
 }
