@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class EvaluatorName(str, Enum):
+class EvaluatorName(StrEnum):
     CITATION_QUALITY = "citation_quality"
     COHERENCE = "coherence"
     COMPLETENESS = "completeness"

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class SerperSearchConfigSearchType(str, Enum):
+class SerperSearchConfigSearchType(StrEnum):
     IMAGES = "images"
     NEWS = "news"
     PLACES = "places"

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TableRestoreStatusStatus(str, Enum):
+class TableRestoreStatusStatus(StrEnum):
     COMMITTED = "committed"
     DURABILITY_PENDING = "durability_pending"
     FAILED = "failed"

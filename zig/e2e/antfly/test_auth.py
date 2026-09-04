@@ -66,7 +66,9 @@ def _wait_for_auth_server(url: str, timeout: float = 30.0) -> bool:
     return False
 
 
-def _wait_for_admin_auth(auth_url: str, timeout: float = AUTH_STARTUP_TIMEOUT_SECONDS) -> bool:
+def _wait_for_admin_auth(
+    auth_url: str, timeout: float = AUTH_STARTUP_TIMEOUT_SECONDS
+) -> bool:
     deadline = time.monotonic() + timeout
     session = requests.Session()
     session.headers["Connection"] = "close"
@@ -75,7 +77,10 @@ def _wait_for_admin_auth(auth_url: str, timeout: float = AUTH_STARTUP_TIMEOUT_SE
         try:
             request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
             response = session.get(f"{auth_url}/me", timeout=request_timeout)
-            if response.status_code == 200 and response.json().get("username") == "admin":
+            if (
+                response.status_code == 200
+                and response.json().get("username") == "admin"
+            ):
                 return True
         except (ValueError, requests.RequestException):
             pass
@@ -105,7 +110,9 @@ def _try_lookup(api: "AuthApi", table_name: str, key: str):
 
 
 class AuthApi:
-    def __init__(self, base_url: str, server_ref: "StandaloneAuthServer | SplitAuthServer"):
+    def __init__(
+        self, base_url: str, server_ref: "StandaloneAuthServer | SplitAuthServer"
+    ):
         self.url = base_url.rstrip("/")
         self.auth_url = self._auth_url_from_db_url(self.url)
         self.s = requests.Session()
@@ -123,7 +130,7 @@ class AuthApi:
         if path == AUTH_PUBLIC_API_ROOT:
             return self.auth_url
         if path.startswith(f"{AUTH_PUBLIC_API_ROOT}/"):
-            return f"{self.auth_url}{path[len(AUTH_PUBLIC_API_ROOT):]}"
+            return f"{self.auth_url}{path[len(AUTH_PUBLIC_API_ROOT) :]}"
         return f"{self.url}{path}"
 
     def _check(self, response: requests.Response):
@@ -200,7 +207,9 @@ class AuthApi:
             raise_if_server_process_exited(self._server)
             try:
                 with self._request_lock:
-                    response = self.s.post(f"{self.url}/tables/{table_name}", json=body, timeout=30)
+                    response = self.s.post(
+                        f"{self.url}/tables/{table_name}", json=body, timeout=30
+                    )
             except requests.RequestException as err:
                 if time.monotonic() >= deadline:
                     raise_request_error_with_logs(err, self._server)
@@ -220,7 +229,9 @@ class AuthApi:
 
     def scan_keys(self, table_name: str, payload: dict) -> list[dict]:
         raise_if_server_process_exited(self._server)
-        response = self.s.post(f"{self.url}/tables/{table_name}/documents", json=payload, timeout=30)
+        response = self.s.post(
+            f"{self.url}/tables/{table_name}/documents", json=payload, timeout=30
+        )
         if response.status_code >= 400:
             self._check(response)
         if not response.content:
@@ -242,7 +253,9 @@ class StandaloneAuthServer:
             self.root = root
             self.log_path = root / "server.log"
             self.log_file = setup.enter_context(self.log_path.open("w"))
-            command = _standalone_stateful_command(binary, host=host, port=port, root=root)
+            command = _standalone_stateful_command(
+                binary, host=host, port=port, root=root
+            )
             command.extend(["--auth", "true"])
             self.proc: subprocess.Popen[str] | None = None
             setup.pop_all()
@@ -262,12 +275,16 @@ class StandaloneAuthServer:
         if not wait_for_server(self.api_url, allow_unauthorized=True):
             self.stop()
             out = _read_log_tail(self.log_path)
-            raise RuntimeError(f"Auth standalone failed to start at {self.api_url}\n{out}")
+            raise RuntimeError(
+                f"Auth standalone failed to start at {self.api_url}\n{out}"
+            )
         self.metadata_admin_url = self._poll_metadata_admin_url()
         if not _wait_for_admin_auth(AuthApi._auth_url_from_db_url(self.api_url)):
             out = self.debug_logs()
             self.stop()
-            raise RuntimeError(f"Auth standalone failed to initialize admin auth at {self.api_url}\n{out}")
+            raise RuntimeError(
+                f"Auth standalone failed to initialize admin auth at {self.api_url}\n{out}"
+            )
 
     def debug_logs(self) -> str:
         self.log_file.flush()
@@ -277,7 +294,9 @@ class StandaloneAuthServer:
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             logs = _read_log_tail(self.log_path)
-            matches = re.findall(r"(?:standalone )?metadata admin api listening on (http://[^\s]+)", logs)
+            matches = re.findall(
+                r"(?:standalone )?metadata admin api listening on (http://[^\s]+)", logs
+            )
             if matches:
                 return matches[-1].rstrip("/")
             time.sleep(0.1)
@@ -305,7 +324,9 @@ class SplitAuthServer:
         if not _wait_for_admin_auth(AuthApi._auth_url_from_db_url(self.api_url)):
             out = self.debug_logs()
             self.stop()
-            raise RuntimeError(f"Stateful auth server failed to initialize admin auth at {self.api_url}\n{out}")
+            raise RuntimeError(
+                f"Stateful auth server failed to initialize admin auth at {self.api_url}\n{out}"
+            )
 
     def debug_logs(self) -> str:
         return self._server.debug_logs()
@@ -354,7 +375,9 @@ def test_standalone_auth_defaults_to_local_admin_user(auth_api: AuthApi):
     me = auth_api.get("/auth/v1/me")
     assert me["username"] == "admin"
     assert any(
-        permission["resource_type"] == "*" and permission["resource"] == "*" and permission["type"] == "admin"
+        permission["resource_type"] == "*"
+        and permission["resource"] == "*"
+        and permission["type"] == "admin"
         for permission in me["permissions"]
     )
 
@@ -377,7 +400,9 @@ def test_standalone_auth_user_and_api_key_flow(auth_api: AuthApi):
     )
     assert created["username"] == "alice"
 
-    row_filter = auth_api.put("/auth/v1/users/alice/row-filters/docs", {"term": {"tier": "gold"}})
+    row_filter = auth_api.put(
+        "/auth/v1/users/alice/row-filters/docs", {"term": {"tier": "gold"}}
+    )
     assert row_filter["table"] == "docs"
     assert row_filter["filter"]["term"]["tier"] == "gold"
 
@@ -387,13 +412,18 @@ def test_standalone_auth_user_and_api_key_flow(auth_api: AuthApi):
     assert api_key["encoded"]
 
     subjects = auth_api.get("/auth/v1/subjects")
-    assert any(subject["subject"] == "alice" and subject["kind"] == "user" for subject in subjects)
+    assert any(
+        subject["subject"] == "alice" and subject["kind"] == "user"
+        for subject in subjects
+    )
 
     auth_api.s.headers["Authorization"] = f"Bearer {api_key['encoded']}"
     me = auth_api.get("/auth/v1/me")
     assert me["username"] == "alice"
     assert any(
-        permission["resource_type"] == "table" and permission["resource"] == "docs" and permission["type"] == "read"
+        permission["resource_type"] == "table"
+        and permission["resource"] == "docs"
+        and permission["type"] == "read"
         for permission in me["permissions"]
     )
 
@@ -432,7 +462,9 @@ def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
         },
     )
 
-    full_key = auth_api.post("/auth/v1/users/alice/api-keys", {"name": "full-access key"})
+    full_key = auth_api.post(
+        "/auth/v1/users/alice/api-keys", {"name": "full-access key"}
+    )
     assert full_key["username"] == "alice"
     assert full_key["encoded"]
 
@@ -554,7 +586,9 @@ def test_standalone_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthA
     visible = _wait_until(lambda: _try_lookup(auth_api, "docs", "doc:gold"))
     assert visible["title"] == "gold doc"
 
-    hidden_lookup = auth_api.s.get(f"{auth_api.url}/tables/docs/documents/doc:silver", timeout=30)
+    hidden_lookup = auth_api.s.get(
+        f"{auth_api.url}/tables/docs/documents/doc:silver", timeout=30
+    )
     assert hidden_lookup.status_code == 404
 
     scan_result = _wait_until(
@@ -582,7 +616,9 @@ def test_stateful_auth_defaults_to_local_admin_user(stateful_auth_api: AuthApi):
     me = stateful_auth_api.get("/auth/v1/me")
     assert me["username"] == "admin"
     assert any(
-        permission["resource_type"] == "*" and permission["resource"] == "*" and permission["type"] == "admin"
+        permission["resource_type"] == "*"
+        and permission["resource"] == "*"
+        and permission["type"] == "admin"
         for permission in me["permissions"]
     )
 
@@ -636,7 +672,9 @@ def test_stateful_auth_enforces_table_permissions(stateful_auth_api: AuthApi):
     assert admin_resp.status_code == 403
 
 
-def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(stateful_auth_api: AuthApi):
+def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(
+    stateful_auth_api: AuthApi,
+):
     stateful_auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
     stateful_auth_api.create_table("docs")
     stateful_auth_api.batch_write(
@@ -671,7 +709,9 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(stateful_auth_api
             ],
         },
     )
-    stateful_auth_api.put("/auth/v1/users/reader/row-filters/docs", {"term": {"tier": "gold"}})
+    stateful_auth_api.put(
+        "/auth/v1/users/reader/row-filters/docs", {"term": {"tier": "gold"}}
+    )
 
     stateful_auth_api.s.headers["Authorization"] = _basic_auth("reader", "reader")
 
@@ -679,7 +719,9 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(stateful_auth_api
     assert visible is not None
     assert visible["title"] == "gold doc"
 
-    hidden_lookup = stateful_auth_api.s.get(f"{stateful_auth_api.url}/tables/docs/documents/doc:silver", timeout=30)
+    hidden_lookup = stateful_auth_api.s.get(
+        f"{stateful_auth_api.url}/tables/docs/documents/doc:silver", timeout=30
+    )
     assert hidden_lookup.status_code == 404
 
     scan_result = _wait_until(

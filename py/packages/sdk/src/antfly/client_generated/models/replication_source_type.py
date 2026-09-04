@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ReplicationSourceType(str, Enum):
+class ReplicationSourceType(StrEnum):
     POSTGRES = "postgres"
 
     def __str__(self) -> str:

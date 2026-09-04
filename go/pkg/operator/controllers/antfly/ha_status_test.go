@@ -164,6 +164,52 @@ func TestHASeedPlanPreservesObservedSourcePVCUIDOnlyForTheSameClaim(t *testing.T
 	}
 }
 
+func TestHASeedPlanRetainsCompletedReceiptsUntilExactTopologyChanges(t *testing.T) {
+	standby := antflyv1.HAStandbySpec{
+		Name: "standby-a", SlotName: "standby-a",
+		SeedArtifact: &antflyv1.HASeedArtifactSpec{
+			Location: "s3://ha-seeds/cluster-a", Generation: "seed-standby-a-10", StagingRoot: "/target/staging",
+			TopologyID: "topology-a", TopologyGeneration: 7, NodeID: "standby-a", TargetPVCUID: "target-pvc-uid",
+			SourcePVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+			TargetPVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+		},
+	}
+	ha := &antflyv1.HighAvailabilitySpec{Standbys: []antflyv1.HAStandbySpec{standby}}
+	completed := haPlannedActionStatuses(
+		haSeedCompletionActions(standby, "standby-a", 10, "test", ""),
+		ha,
+		&antflyv1.HAStatus{},
+	)
+	if len(completed) != 8 {
+		t.Fatalf("expected complete eight-action portable seed chain, got %d", len(completed))
+	}
+	for i := range completed {
+		completed[i].AdminJobName = "completed-action"
+		completed[i].AdminJobPhase = haAdminJobPhaseSucceeded
+	}
+	prune := &completed[len(completed)-1]
+	prune.SeedArtifactReceipt = &antflyv1.HASeedArtifactReceiptStatus{
+		FormatVersion: 1, Generation: prune.SeedArtifactGeneration, SlotName: prune.SlotName,
+		RetainedCount: 1,
+	}
+
+	retained := haPlannedActionStatuses(nil, ha, &antflyv1.HAStatus{PlannedActions: completed})
+	if len(retained) != len(completed) {
+		t.Fatalf("COMPLETED_SEED_RECEIPTS_DROPPED: expected %d retained actions, got %#v", len(completed), retained)
+	}
+	for i := range retained {
+		if retained[i].Kind != completed[i].Kind || retained[i].OperationID != completed[i].OperationID {
+			t.Fatalf("retained seed action %d changed immutable identity: got %#v want %#v", i, retained[i], completed[i])
+		}
+	}
+
+	replacement := ha.DeepCopy()
+	replacement.Standbys[0].SeedArtifact.TopologyGeneration++
+	if stale := haPlannedActionStatuses(nil, replacement, &antflyv1.HAStatus{PlannedActions: completed}); len(stale) != 0 {
+		t.Fatalf("STALE_SEED_RECEIPTS_RETAINED: topology advance must drop old receipt chain, got %#v", stale)
+	}
+}
+
 func TestHAReplicationIdentityAllowsWholeInstanceScope(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Identity: &antflyv1.HAReplicationIdentitySpec{
@@ -471,6 +517,31 @@ func TestHAPlannedActionOperationIDVersionsTopologyBindingWithoutRekeyingLegacyA
 	boundID := haPlannedActionOperationID(bound)
 	if !strings.HasPrefix(boundID, "haop-v2-") || boundID == legacyID {
 		t.Fatalf("topology-bound seed action must use a distinct versioned identity, legacy=%q bound=%q", legacyID, boundID)
+	}
+
+	assessment := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionDemoteFormerPrimary),
+		Executor:        string(haActionExecutorAdminAPI),
+		StandbyName:     "primary-a",
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 7,
+	}
+	assessmentID := haPlannedActionOperationID(assessment)
+	if !strings.HasPrefix(assessmentID, "haop-v2-") {
+		t.Fatalf("promotion-generation-bound former-primary assessment must not use a legacy retry identity, got %q", assessmentID)
+	}
+}
+
+func TestHAFormerPrimaryActionDependencySeparatesAssessmentFromMutation(t *testing.T) {
+	fenceDependency := haActionIsolateFormerPrimary
+	if got := haFormerPrimaryActionDependency(haActionDemoteFormerPrimary, fenceDependency); got != haActionPromoteStandby {
+		t.Fatalf("former-primary assessment must follow the promotion receipt, got %q", got)
+	}
+	for _, kind := range []haActionKind{haActionRewindFormerPrimary, haActionReseedFormerPrimary} {
+		if got := haFormerPrimaryActionDependency(kind, fenceDependency); got != fenceDependency {
+			t.Fatalf("mutating former-primary action %q must follow physical fencing, got %q", kind, got)
+		}
 	}
 }
 
@@ -846,6 +917,90 @@ func TestHAPlannedActionStatusesRetainSuccessfulFormerPrimaryAssessmentUntilDisp
 	}
 	if _, ok := haPlannedActionByKind(actions, haActionReseedFormerPrimary); !ok {
 		t.Fatalf("expected current reseed disposition alongside assessment evidence, got %#v", actions)
+	}
+}
+
+func TestHAPlannedActionStatusesRetainAlreadyCurrentAssessmentAsDisposition(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Standbys: []antflyv1.HAStandbySpec{{
+			Name:     "old-primary",
+			AdminURL: "http://old-primary-ha.default.svc:8081",
+		}},
+	}
+	assessment := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionDemoteFormerPrimary),
+		Phase:           string(haActionPhaseRejoin),
+		Executor:        string(haActionExecutorAdminAPI),
+		DependsOn:       string(haActionPromoteStandby),
+		StandbyName:     "old-primary",
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 4,
+		AdminURL:        "http://old-primary-ha.default.svc:8081",
+		AdminNodeID:     "old-primary",
+		AdminMethod:     "POST",
+		AdminPath:       haAdminRejoinAssessPath,
+		AdminJobName:    haAdminDirectAPIName,
+		AdminJobPhase:   haAdminJobPhaseSucceeded,
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			SchemaVersion:    1,
+			ActionID:         "rejoin_assess:old-primary",
+			ActionKind:       "rejoin_assess",
+			ActionTarget:     "old-primary",
+			ActionState:      "assessed",
+			ActionNodeID:     "old-primary",
+			RejoinAction:     "already_current",
+			RejoinReason:     "current_timeline",
+			FormerNodeID:     "old-primary",
+			TargetTimelineID: 2,
+			TargetEpoch:      2,
+			ForkLSN:          10,
+			FormerLastLSN:    10,
+			RetainedFromLSN:  8,
+		},
+	}
+	status := &antflyv1.HAStatus{
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "old-primary",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  1,
+			ParentEpoch:       1,
+			NewTimelineID:     2,
+			NewEpoch:          2,
+			RequiredLSN:       10,
+			ObservedLSN:       10,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   4,
+			FenceToken:        "ha-fence-token",
+		},
+		FormerPrimary: &antflyv1.HAFormerPrimaryStatus{
+			NodeID:           "old-primary",
+			Fenced:           true,
+			FenceAuthority:   antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceHolder:      "standby-a",
+			FenceGeneration:  4,
+			TargetTimelineID: 2,
+			TargetEpoch:      2,
+			ForkLSN:          10,
+			FormerLastLSN:    10,
+			RetainedFromLSN:  8,
+			AssessedAction:   "already_current",
+			AssessedReason:   "current_timeline",
+		},
+		PlannedActions: []antflyv1.HAPlannedActionStatus{assessment},
+	}
+
+	retained := haPlannedActionStatuses(nil, ha, status)
+	completed, ok := haPlannedActionByKind(retained, haActionDemoteFormerPrimary)
+	if !ok || completed.AdminJobPhase != haAdminJobPhaseSucceeded || completed.AdminResult == nil ||
+		completed.AdminResult.RejoinAction != "already_current" {
+		t.Fatalf("expected terminal already-current assessment receipt to remain auditable, got %#v", retained)
+	}
+
+	status.LastPromotion.FenceGeneration++
+	if stale := haPlannedActionStatuses(nil, ha, status); len(stale) != 0 {
+		t.Fatalf("expected receipt with mismatched promotion fence to be dropped, got %#v", stale)
 	}
 }
 
@@ -1404,7 +1559,7 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 		t.Fatalf("SEED_CAPTURE_NOT_RUNTIME_OWNED: capture must execute atomically in the mounted primary runtime, got %#v", actions[0])
 	}
 	if actions[4].Executor != string(haActionExecutorCLIJob) ||
-		actions[4].SeedArtifactGeneration != "base-standby-a-10" {
+		actions[4].TargetLSN != initial || actions[4].SeedArtifactGeneration != "base-standby-a-5" {
 		t.Fatalf("TARGET_ACTIVATION_MISSING: activation must be a generation-bound target-PVC job, got %#v", actions[4])
 	}
 	digest := strings.Repeat("a", 64)
@@ -1413,17 +1568,17 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
 	cluster.Status.HAStatus.PlannedActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
 		SchemaVersion:          1,
-		ActionID:               "seed_capture:base-standby-a-10",
+		ActionID:               "seed_capture:base-standby-a-5",
 		ActionKind:             "seed_capture",
-		ActionTarget:           "base-standby-a-10",
+		ActionTarget:           "base-standby-a-5",
 		ActionState:            "applied",
 		ActionNodeID:           "primary-a",
 		SlotName:               "standby-a",
-		ManifestID:             "base-standby-a-10",
-		BackupLSN:              10,
-		CheckpointLSN:          10,
-		EndRecordLSN:           11,
-		SeedArtifactGeneration: "base-standby-a-10",
+		ManifestID:             "base-standby-a-5",
+		BackupLSN:              5,
+		CheckpointLSN:          5,
+		EndRecordLSN:           6,
+		SeedArtifactGeneration: "base-standby-a-5",
 		ManifestSHA256:         digest,
 		CaptureReceiptSHA256:   captureDigest,
 		SeedClusterID:          100,
@@ -1432,23 +1587,23 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 		SeedSourcePlanSHA256:   digest,
 		SeedFileCount:          2,
 		SeedTotalBytes:         20,
-		SeedGenerationRoot:     "/antflydb/ha/seed-captures/generations/base-standby-a-10",
-		SeedContentRoot:        "/antflydb/ha/seed-captures/generations/base-standby-a-10/content",
-		SeedManifestPath:       "/antflydb/ha/seed-captures/generations/base-standby-a-10/manifest.afha",
+		SeedGenerationRoot:     "/antflydb/ha/seed-captures/generations/base-standby-a-5",
+		SeedContentRoot:        "/antflydb/ha/seed-captures/generations/base-standby-a-5/content",
+		SeedManifestPath:       "/antflydb/ha/seed-captures/generations/base-standby-a-5/manifest.afha",
 		SeedAlreadyCaptured:    false,
 	}
 	(&AntflyClusterReconciler{}).updateHAStatusAndConditions(cluster)
 	publish := cluster.Status.HAStatus.PlannedActions[1]
-	if publish.SeedManifestPath != "/antflydb/ha/seed-captures/generations/base-standby-a-10/manifest.afha" ||
-		publish.SeedContentRoot != "/antflydb/ha/seed-captures/generations/base-standby-a-10/content" ||
+	if publish.SeedManifestPath != "/antflydb/ha/seed-captures/generations/base-standby-a-5/manifest.afha" ||
+		publish.SeedContentRoot != "/antflydb/ha/seed-captures/generations/base-standby-a-5/content" ||
 		!reflect.DeepEqual(publish.AdminCommand, []string{
 			"artifact", "publish",
 			"--location", "s3://ha-seeds/cluster-a",
-			"--generation", "base-standby-a-10",
+			"--generation", "base-standby-a-5",
 			"--slot", "standby-a",
-			"--manifest", "/antflydb/ha/seed-captures/generations/base-standby-a-10/manifest.afha",
-			"--content-root", "/antflydb/ha/seed-captures/generations/base-standby-a-10/content",
-			"--capture-receipt", "/antflydb/ha/seed-captures/generations/base-standby-a-10/COMPLETE.json",
+			"--manifest", "/antflydb/ha/seed-captures/generations/base-standby-a-5/manifest.afha",
+			"--content-root", "/antflydb/ha/seed-captures/generations/base-standby-a-5/content",
+			"--capture-receipt", "/antflydb/ha/seed-captures/generations/base-standby-a-5/COMPLETE.json",
 			"--capture-receipt-sha256", captureDigest,
 			"--topology-id", "topology-a",
 			"--topology-generation", "7",
@@ -1542,6 +1697,11 @@ func TestPlanHAInitialPortableSeedIgnoresSyntheticStandbyStatusUntilPrimarySlotO
 		if !reflect.DeepEqual(gotKinds, wantKinds) {
 			t.Fatalf("PREMATURE_RESUME_SLOT: initial portable seed requires %v before a primary slot exists, got %v (%#v)", wantKinds, gotKinds, plan.Actions)
 		}
+		for _, action := range plan.Actions {
+			if action.TargetLSN != initial {
+				t.Fatalf("runtime-owned seed must preserve configured initial LSN %d for %s, got %#v", initial, action.Kind, action)
+			}
+		}
 	})
 
 	t.Run("reachable empty primary starts seed at the backup control record", func(t *testing.T) {
@@ -1623,8 +1783,8 @@ func TestPlanHAInitialPortableSeedIgnoresSyntheticStandbyStatusUntilPrimarySlotO
 			t.Fatalf("CAPTURE_PROGRESS_DROPPED: replan must preserve completed capture evidence, got %#v", actions[0])
 		}
 		for _, action := range actions {
-			if action.TargetLSN != 10 {
-				t.Fatalf("SEED_TARGET_RETARGETED: in-flight portable seed must remain frozen at LSN 10, got %#v", action)
+			if action.TargetLSN != initial {
+				t.Fatalf("SEED_TARGET_RETARGETED: in-flight portable seed must preserve requested boundary LSN %d while receipts carry the newer checkpoint, got %#v", initial, action)
 			}
 		}
 	})
@@ -2239,7 +2399,7 @@ func TestOperatorCRDExposesHAAdminRuntimeFields(t *testing.T) {
 
 	admin := crdSchemaProperty(t, ha, "admin")
 	adminProperties := crdSchemaProperties(t, admin)
-	for _, field := range []string{"primaryURL", "executePlannedActions", "tokenEnvVar", "jobBackoffLimit", "volumes", "volumeMounts"} {
+	for _, field := range []string{"primaryURL", "primaryActionURL", "executePlannedActions", "tokenEnvVar", "jobBackoffLimit", "volumes", "volumeMounts"} {
 		if _, ok := adminProperties[field]; !ok {
 			t.Fatalf("operator CRD spec.highAvailability.admin is missing %q", field)
 		}
@@ -2389,7 +2549,10 @@ func TestHADirectAdminSupportMatchesAdminOperations(t *testing.T) {
 
 func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
-		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Admin: &antflyv1.HAAdminSpec{
+			PrimaryURL:       "http://primary-route.default.svc:80",
+			PrimaryActionURL: "http://primary-ha.default.svc:8081",
+		},
 		Standbys: []antflyv1.HAStandbySpec{{
 			Name:     "standby-a",
 			AdminURL: "http://standby-a-ha.default.svc:8081",
@@ -2397,6 +2560,9 @@ func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
 			Name:     "old-primary",
 			AdminURL: "http://old-primary-ha.default.svc:8081",
 		}},
+	}
+	if got := haCurrentPrimaryAdminURL(ha, nil); got != "http://primary-route.default.svc:80" {
+		t.Fatalf("status observation must retain the routed primary URL, got %q", got)
 	}
 
 	tests := []struct {
@@ -2767,6 +2933,10 @@ func TestHADirectAdminRequestBodiesMarshalOpenAPIFields(t *testing.T) {
 		rejoinJSON["allow_rewind_after_forced_promotion"] != false {
 		t.Fatalf("unexpected rejoin request JSON: %#v", rejoinJSON)
 	}
+	rejoinIdentity := rejoinJSON["identity"].(map[string]any)
+	if rejoinIdentity["timeline_id"] != float64(4) || rejoinIdentity["epoch"] != float64(6) {
+		t.Fatalf("expected rejoin assessment to describe the former-primary parent identity, got %#v", rejoinIdentity)
+	}
 	receipt := rejoinJSON["receipt"].(map[string]any)
 	if receipt["old_primary_id"] != "primary-a" ||
 		receipt["promoted_node_id"] != "standby-a" ||
@@ -2778,6 +2948,23 @@ func TestHADirectAdminRequestBodiesMarshalOpenAPIFields(t *testing.T) {
 	receiptIdentity := receipt["identity"].(map[string]any)
 	if receiptIdentity["timeline_id"] != float64(5) || receiptIdentity["epoch"] != float64(7) {
 		t.Fatalf("expected rejoin receipt identity to use promoted timeline, got %#v", receiptIdentity)
+	}
+
+	// Colony adopts the child identity before it asks the former-primary
+	// controller to repair. That declarative advance must not cause assessment
+	// to describe the winner as the former primary.
+	cluster.Spec.HighAvailability.Identity.TimelineID = 5
+	cluster.Spec.HighAvailability.Identity.Epoch = 7
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	adoptedRejoin, ok := haRejoinAssessBody(cluster, antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionDemoteFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       12,
+		ObservedLSN:     13,
+		RetainedFromLSN: 8,
+	})
+	if !ok || adoptedRejoin.Identity.TimelineId != 4 || adoptedRejoin.Identity.Epoch != 6 {
+		t.Fatalf("adopted topology lost former-primary parent identity: %#v", adoptedRejoin)
 	}
 
 	cluster.Status.HAStatus.LastPromotion.FenceAuthority = ""
@@ -3190,6 +3377,7 @@ func TestHAFenceAdminCommandUsesFenceReasonFallback(t *testing.T) {
 		"--promoted-node-id", "standby-a",
 		"--new-timeline-id", "5",
 		"--new-epoch", "7",
+		"--generation", "3",
 		"--required-lsn", "12",
 		"--observed-lsn", "12",
 		"--reason", "LeaseHeld",
@@ -3764,6 +3952,7 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 		"--promoted-node-id", "standby-a",
 		"--new-timeline-id", "5",
 		"--new-epoch", "7",
+		"--generation", "1",
 		"--required-lsn", "12",
 		"--observed-lsn", "12",
 		"--reason", "AutomaticFailoverReady",
@@ -4093,10 +4282,14 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 	sts.Generation = 1
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:              cluster.Name + "-standalone-0",
-			Namespace:         cluster.Namespace,
-			UID:               types.UID("former-primary-pod-uid"),
-			Labels:            serviceSelectorLabels(cluster.Name, "standalone"),
+			Name:      cluster.Name + "-standalone-0",
+			Namespace: cluster.Namespace,
+			UID:       types.UID("former-primary-pod-uid"),
+			// Deliberately model the live StatefulSet behavior after its selector
+			// label is poisoned: the controller orphans the still-running Pod.
+			// Physical isolation must recover it through the exact runtime-attested
+			// Pod UID and stable ordinal name, not mutable labels or ownership.
+			Labels:            serviceSelectorLabels(cluster.Name+"-missing", "standalone"),
 			DeletionTimestamp: ptr.To(metav1.NewTime(now)),
 			Finalizers:        []string{"test.antfly.io/keep-terminating"},
 		},
@@ -4123,8 +4316,12 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 	if beforeScale.Spec.Replicas == nil || *beforeScale.Spec.Replicas != 1 {
 		t.Fatalf("old writer was scaled before the durable intent checkpoint: %#v", beforeScale.Spec.Replicas)
 	}
-	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); err != nil {
-		t.Fatalf("start physical isolation after persisted intent: %v", err)
+	intent := cluster.Status.HAStatus.PlannedActions[0].PhysicalIsolationReceipt
+	if intent == nil || intent.WatchdogProof == nil || len(intent.InitialOldPods) != 1 || intent.InitialOldPods[0].UID != string(pod.UID) {
+		t.Fatalf("physical-isolation intent did not bind the label-poisoned old process: %#v", intent)
+	}
+	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); !errors.Is(err, errHAStatusCheckpointed) {
+		t.Fatalf("physical isolation did not force an immediate reconciliation checkpoint: %v", err)
 	}
 	observedSTS := &appsv1.StatefulSet{}
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(sts), observedSTS); err != nil {
@@ -4273,6 +4470,30 @@ func TestPhysicalIsolationReceiptRejectsForgedPartialAndStaleEvidence(t *testing
 	}
 }
 
+func TestPhysicalIsolationReceiptPreservesLeaseAcquireTimePrecision(t *testing.T) {
+	transfer := time.Date(2026, 8, 23, 20, 41, 22, 49_555_000, time.UTC)
+	receipt := antflyv1.HAPhysicalIsolationReceiptStatus{
+		LeaseTransferTime: metav1.NewMicroTime(transfer),
+	}
+
+	encoded, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatalf("marshal physical-isolation receipt: %v", err)
+	}
+	var persisted antflyv1.HAPhysicalIsolationReceiptStatus
+	if err := json.Unmarshal(encoded, &persisted); err != nil {
+		t.Fatalf("unmarshal physical-isolation receipt: %v", err)
+	}
+	if !persisted.LeaseTransferTime.Time.Equal(transfer) {
+		t.Fatalf(
+			"Lease acquireTime precision changed across status persistence: got %s want %s JSON=%s",
+			persisted.LeaseTransferTime.Format(time.RFC3339Nano),
+			transfer.Format(time.RFC3339Nano),
+			encoded,
+		)
+	}
+}
+
 func TestPhysicalIsolationReceiptAcceptsOlderExactProcessSelfFencePromise(t *testing.T) {
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	cluster, action := validPhysicalIsolationReceiptFixture(now)
@@ -4376,7 +4597,7 @@ func validPhysicalIsolationReceiptFixture(now time.Time) (*antflyv1.AntflyCluste
 		InitialPodListResourceVersion: "pods-initial", LeaseName: "topology-ha-fence", LeaseUID: "lease-uid",
 		LeaseResourceVersion: "1", LeaseHolder: "standby-a", LeaseGeneration: 2,
 		LeaseScope:        antflyv1.HAPhysicalIsolationLeaseScope{TopologyID: "topology-anchor-uid", ClusterID: 100, TimelineID: 4, Epoch: 6, CurrentPrimaryID: "primary-a", PrimaryLSN: 12},
-		LeaseTransferTime: metav1.NewTime(now), WatchdogMaxFenceLatencyMS: 10_000,
+		LeaseTransferTime: metav1.NewMicroTime(now), WatchdogMaxFenceLatencyMS: 10_000,
 		IsolatedStatefulSetGeneration: 2, IsolatedStatefulSetObservedGeneration: 2,
 		IsolatedStatefulSetResourceVersion: "2", ObservedLeaseResourceVersion: "2", AbsenceProven: true,
 		AbsencePodListResourceVersion: "pods-absence", FrozenBoundaryLSN: 12, ObservedAt: observed.DeepCopy(), CompletedAt: observed.DeepCopy(),
@@ -4388,6 +4609,57 @@ func validPhysicalIsolationReceiptFixture(now time.Time) (*antflyv1.AntflyCluste
 		},
 	}
 	return cluster, action
+}
+
+func TestPlanHAPhysicalIsolationRequiresPortableReseedWithoutCallingMissingFormerLog(t *testing.T) {
+	now := time.Date(2026, 8, 26, 21, 8, 36, 0, time.UTC)
+	cluster, isolation := validPhysicalIsolationReceiptFixture(now)
+	cluster.Status.HAStatus.LastPromotion = &antflyv1.HAPromotionStatus{
+		ClusterID:         100,
+		OldPrimaryID:      "primary-a",
+		PromotedStandbyID: "standby-a",
+		ParentTimelineID:  4,
+		ParentEpoch:       6,
+		NewTimelineID:     5,
+		NewEpoch:          7,
+		SwitchLSN:         13,
+		RequiredLSN:       12,
+		ObservedLSN:       12,
+		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration:   2,
+		FenceReason:       "LeaseHeld",
+		FenceToken:        "ha-fence-token",
+	}
+	cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{
+		NodeID:          "primary-a",
+		Fenced:          true,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 2,
+	}
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{isolation}
+	if got := haSucceededFormerPrimaryIsolation(cluster, cluster.Status.HAStatus, cluster.Status.HAStatus.LastPromotion); got == nil {
+		t.Fatalf("fixture must carry valid completed physical isolation: %v", validateHAPhysicalIsolationIntent(cluster, &isolation))
+	}
+
+	plan := planHA(cluster)
+	if !plan.FormerPrimary.RejoinRequired || plan.FormerPrimary.RewindPossible ||
+		!plan.FormerPrimary.ReseedRequired ||
+		plan.FormerPrimary.Action != string(haActionReseedFormerPrimary) ||
+		plan.FormerPrimary.Reason != "FormerPrimaryPhysicallyIsolatedRequiresReseed" {
+		t.Fatalf("expected physical isolation to require portable reseed, got %#v", plan.FormerPrimary)
+	}
+	for _, action := range plan.Actions {
+		if action.Kind == haActionDemoteFormerPrimary || action.Kind == haActionRewindFormerPrimary ||
+			action.Kind == haActionReseedFormerPrimary {
+			t.Fatalf("physically absent former-primary log must not receive direct rejoin action: %#v", plan.Actions)
+		}
+	}
+	rendered := haPlannedActionStatuses(plan.Actions, cluster.Spec.HighAvailability, cluster.Status.HAStatus, cluster)
+	isolationPlan, ok := haPlannedActionByKind(rendered, haActionIsolateFormerPrimary)
+	if !ok || isolationPlan.AdminJobPhase != haAdminJobPhaseSucceeded || isolationPlan.PhysicalIsolationReceipt == nil {
+		t.Fatalf("expected exact physical-isolation evidence to remain durable, got %#v", isolationPlan)
+	}
 }
 
 func TestUpdateHAStatusBlocksAutomaticPromotionWithoutStandbyAdminURL(t *testing.T) {
@@ -5179,7 +5451,9 @@ func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.
 func TestUpdateHAStatusPlansPrimaryRouteAfterCompletedPromotion(t *testing.T) {
 	cluster := haCluster()
 	cluster.Status.HAStatus = &antflyv1.HAStatus{
-		PrimaryLSN: 12,
+		// The new primary is allowed to advance after the promotion receipt is
+		// committed. Route publication must remain bound to that receipt's LSN.
+		PrimaryLSN: 13,
 		PrimaryRoute: antflyv1.HAPrimaryRouteStatus{
 			CurrentTarget: "primary",
 		},
@@ -5211,6 +5485,7 @@ func TestUpdateHAStatusPlansPrimaryRouteAfterCompletedPromotion(t *testing.T) {
 	if !ok ||
 		routeAction.RouteFrom != "primary" ||
 		routeAction.RouteTo != "standby-a" ||
+		routeAction.TargetLSN != 12 ||
 		routeAction.FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		routeAction.FenceGeneration != 5 ||
 		routeAction.FenceReason != "operator-approved" {
@@ -6054,26 +6329,167 @@ func TestReconcileHAFencingLeaseKeepsCommittedLowerBoundWhileOldPrimaryTailMoves
 	}
 }
 
-func TestPeriodicRequeueRenewsKubernetesLeaseBeforeExpiry(t *testing.T) {
+func TestReconcileHAFencingLeaseAdvancesPhysicalIsolationBoundaryBeforePromotion(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	cluster, isolation := validPhysicalIsolationReceiptFixture(now)
+	cluster.Status.HAStatus.Fencing = readyFencingStatus()
+	cluster.Status.HAStatus.Fencing.Generation = 2
+	// The transfer linearized at 12, then physical isolation proved that the old
+	// writer's actual frozen tail was 13.
+	isolation.TargetLSN = 13
+	isolation.ObservedLSN = 13
+	isolation.PhysicalIsolationReceipt.FrozenBoundaryLSN = 13
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{isolation}
+
+	lease := haFenceLease(cluster, now.Add(-time.Second), 30, 2, "standby-a")
+	authorizeHandoffRenewalForTest(lease, cluster, "primary-a", 2)
+	if got := lease.Annotations[haFencingLeaseAnnotationPrimaryLSN]; got != "12" {
+		t.Fatalf("fixture must begin at election boundary 12, got %q", got)
+	}
+	reconciler := testHAReconciler(t, cluster, lease)
+	reconciler.Now = func() time.Time { return now }
+
+	lower, ok := haCommittedFencingLeaseLowerBoundScope(cluster, "standby-a", 2)
+	if !ok || lower.primaryLSN != 12 {
+		t.Fatalf("expected physical-isolation receipt to preserve election lower bound 12, got %#v, %t", lower, ok)
+	}
+	committed, ok := haCommittedFencingLeaseScope(cluster, "standby-a", 2)
+	if !ok || committed.primaryLSN != 13 {
+		t.Fatalf("expected physical-isolation receipt to commit frozen boundary 13, got %#v, %t", committed, ok)
+	}
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("advance transferred Lease to frozen boundary: %v", err)
+	}
+	observed := &coordinationv1.Lease{}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
+		t.Fatalf("get advanced Lease: %v", err)
+	}
+	if got := observed.Annotations[haFencingLeaseAnnotationPrimaryLSN]; got != "13" {
+		t.Fatalf("expected Lease boundary to advance to frozen tail 13, got %q", got)
+	}
+	if observed.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" {
+		t.Fatal("former-holder renewal must preserve the committed transfer receipt")
+	}
+}
+
+func TestPromotionRequiresExactFreshFrozenLeaseBoundary(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	cluster, _ := validPhysicalIsolationReceiptFixture(now)
+	lease := haFenceLease(cluster, now, 30, 2, "standby-a")
+	authorizeHandoffRenewalForTest(lease, cluster, "primary-a", 2)
+	reconciler := testHAReconciler(t, lease)
+	reconciler.Now = func() time.Time { return now }
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionPromoteStandby),
+		StandbyName:     "standby-a",
+		TargetLSN:       13,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 2,
+	}
+
+	ready, err := reconciler.haCurrentLeaseAuthorizesPromotionBoundary(context.Background(), cluster, action)
+	if err != nil {
+		t.Fatalf("check stale promotion Lease: %v", err)
+	}
+	if ready {
+		t.Fatal("promotion was authorized by the weaker election boundary")
+	}
+
+	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "13"
+	if err := reconciler.Update(context.Background(), lease); err != nil {
+		t.Fatalf("publish frozen Lease boundary: %v", err)
+	}
+	ready, err = reconciler.haCurrentLeaseAuthorizesPromotionBoundary(context.Background(), cluster, action)
+	if err != nil {
+		t.Fatalf("check frozen promotion Lease: %v", err)
+	}
+	if !ready {
+		t.Fatal("exact fresh frozen Lease boundary did not authorize promotion")
+	}
+
+	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "14"
+	if err := reconciler.Update(context.Background(), lease); err != nil {
+		t.Fatalf("publish unproven Lease boundary: %v", err)
+	}
+	ready, err = reconciler.haCurrentLeaseAuthorizesPromotionBoundary(context.Background(), cluster, action)
+	if err != nil {
+		t.Fatalf("check unproven promotion Lease: %v", err)
+	}
+	if ready {
+		t.Fatal("promotion accepted a Lease boundary above its applied-LSN proof")
+	}
+}
+
+func TestCompletedPhysicalIsolationRevalidationAcceptsOnlyFrozenLeaseAdvance(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	cluster, action := validPhysicalIsolationReceiptFixture(now)
+	action.TargetLSN = 13
+	action.ObservedLSN = 13
+	action.PhysicalIsolationReceipt.FrozenBoundaryLSN = 13
+	originalScope, ok := haPhysicalIsolationReceiptScope(action.PhysicalIsolationReceipt)
+	if !ok || originalScope.primaryLSN != 12 {
+		t.Fatalf("expected election scope 12, got %#v, %t", originalScope, ok)
+	}
+	lease := haFenceLease(cluster, now, 30, 2, "standby-a")
+	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "13"
+
+	if err := validateCurrentPhysicalIsolationLease(lease, &action, originalScope); err != nil {
+		t.Fatalf("frozen Lease advance invalidated completed isolation receipt: %v", err)
+	}
+	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "14"
+	if err := validateCurrentPhysicalIsolationLease(lease, &action, originalScope); err == nil {
+		t.Fatal("unproven Lease boundary was accepted during receipt revalidation")
+	}
+}
+
+func TestFullReconcileOwnsRuntimeObservationButNotLeaseRenewalClock(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 
-	if got, want := periodicRequeueAfter(cluster), 10*time.Second/3; got != want {
-		t.Fatalf("expected HA lease renewal requeue %s, got %s", want, got)
+	if got, want := periodicRequeueAfter(cluster), haRuntimeStatusObservationRequeueAfter; got != want {
+		t.Fatalf("expected independent HA runtime observation cadence %s, got %s", want, got)
 	}
 
 	cluster.Spec.DataNodes.AutoScaling = &antflyv1.AutoScalingSpec{Enabled: true}
-	if got, want := periodicRequeueAfter(cluster), 10*time.Second/3; got != want {
-		t.Fatalf("expected HA lease requeue to win over autoscaling, got %s", got)
+	if got, want := periodicRequeueAfter(cluster), haRuntimeStatusObservationRequeueAfter; got != want {
+		t.Fatalf("expected HA runtime observation to win over autoscaling, got %s", got)
 	}
 
 	cluster.Spec.HighAvailability.Runtime.FencingLease.WatchdogGraceSeconds = 18
-	if got, want := periodicRequeueAfter(cluster), 6*time.Second; got != want {
-		t.Fatalf("expected configured watchdog grace to derive renewal cadence %s, got %s", want, got)
+	if got, want := periodicRequeueAfter(cluster), haRuntimeStatusObservationRequeueAfter; got != want {
+		t.Fatalf("watchdog grace must not change the fixed runtime observation cadence, got %s", got)
 	}
 
 	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{Enabled: false}
-	if got, want := periodicRequeueAfter(cluster), 30*time.Second; got != want {
-		t.Fatalf("expected autoscaling requeue without HA renewal, got %s", got)
+	if got, want := periodicRequeueAfter(cluster), haRuntimeStatusObservationRequeueAfter; got != want {
+		t.Fatalf("manual HA still requires runtime health observation, got %s", got)
+	}
+
+	cluster.Spec.HighAvailability.Mode = antflyv1.HAModeDisabled
+	cluster.Spec.DataNodes.AutoScaling = nil
+	if got := periodicRequeueAfter(cluster); got != 0 {
+		t.Fatalf("disabled HA must stop runtime observation, got %s", got)
+	}
+}
+
+func TestPeriodicRequeueObservesPeerSeedReceiptWhileStartupGateIsSuspended(t *testing.T) {
+	cluster := startupGatedStandaloneControllerCluster(false)
+	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{Enabled: false}
+
+	if got := periodicRequeueAfter(cluster); got != haStartupGateObservationRequeueAfter {
+		t.Fatalf("expected suspended exact startup gate requeue %s, got %s", haStartupGateObservationRequeueAfter, got)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = true
+	if got := periodicRequeueAfter(cluster); got != haRuntimeStatusObservationRequeueAfter {
+		t.Fatalf("expected only baseline HA runtime observation after declarative eligibility, got %s", got)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = false
+	cluster.Spec.HighAvailability.Runtime.StartupGate.Policy = antflyv1.HAStartupGatePolicySuspend
+	if got := periodicRequeueAfter(cluster); got != haRuntimeStatusObservationRequeueAfter {
+		t.Fatalf("expected intentionally suspended runtime to keep only baseline HA health observation, got %s", got)
 	}
 }
 
@@ -6092,23 +6508,26 @@ func TestPeriodicRequeueRetriesDirectHAAdminAction(t *testing.T) {
 		}},
 	}
 
-	if got, want := periodicRequeueAfterAt(cluster, now), 17*time.Second; got != want {
-		t.Fatalf("expected direct HA admin retry requeue %s, got %s", want, got)
+	if got, want := haDirectAdminRetryRequeueAfter(cluster, now), 17*time.Second; got != want {
+		t.Fatalf("expected persisted direct HA admin retry deadline %s, got %s", want, got)
+	}
+	if got, want := periodicRequeueAfterAt(cluster, now), haRuntimeStatusObservationRequeueAfter; got != want {
+		t.Fatalf("expected runtime observation to service the later direct HA admin retry, got %s", got)
 	}
 	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{Enabled: false}
-	if got, want := periodicRequeueAfterAt(cluster, now), 17*time.Second; got != want {
-		t.Fatalf("expected persisted direct HA admin retry requeue %s, got %s", want, got)
+	if got, want := periodicRequeueAfterAt(cluster, now), haRuntimeStatusObservationRequeueAfter; got != want {
+		t.Fatalf("expected manual HA runtime observation to service persisted retry, got %s", got)
 	}
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminError = ""
-	if got := periodicRequeueAfterAt(cluster, now); got != 0 {
-		t.Fatalf("expected no retry requeue without transient error, got %s", got)
+	if got := periodicRequeueAfterAt(cluster, now); got != haRuntimeStatusObservationRequeueAfter {
+		t.Fatalf("expected only baseline runtime observation without transient error, got %s", got)
 	}
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminError = "HA admin API returned status 503"
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobName = "antfly-ha-action"
-	if got := periodicRequeueAfterAt(cluster, now); got != 0 {
-		t.Fatalf("expected no retry requeue for CLI admin job, got %s", got)
+	if got := periodicRequeueAfterAt(cluster, now); got != haRuntimeStatusObservationRequeueAfter {
+		t.Fatalf("expected only baseline runtime observation for CLI admin job, got %s", got)
 	}
 }
 
@@ -6325,5 +6744,89 @@ func readyFencingStatus() antflyv1.HAFencingStatus {
 		Holder:     "standby-a",
 		Generation: 1,
 		Reason:     "LeaseHeld",
+	}
+}
+
+func TestStandbyPromotionEligibleAllowsOnlyCaughtUpUpstreamTransportLoss(t *testing.T) {
+	base := antflyv1.HAStandbyStatus{
+		Active: true, CaughtUpToReceived: true, CanServeSafeReads: true,
+		ReceivedLSN: 12, AppliedLSN: 12, SafeReadLSN: 12,
+	}
+	tests := []struct {
+		name      string
+		lastError string
+		mutate    func(*antflyv1.HAStandbyStatus)
+		want      bool
+	}{
+		{name: "healthy", want: true},
+		{name: "old primary refused connection", lastError: "ConnectionRefused", want: true},
+		{name: "old primary reset connection", lastError: "ConnectionResetByPeer", want: true},
+		{name: "old primary timed out", lastError: "Timeout", want: true},
+		{name: "old primary connection timed out", lastError: "ConnectionTimedOut", want: true},
+		{name: "old primary network unreachable", lastError: "NetworkUnreachable", want: true},
+		{name: "old primary host unreachable", lastError: "HostUnreachable", want: true},
+		{name: "local network unavailable", lastError: "NetworkDown", want: true},
+		{name: "local address unavailable", lastError: "AddressUnavailable", want: true},
+		{name: "temporary DNS failure", lastError: "TemporaryNameServerFailure", want: true},
+		{name: "DNS server failure", lastError: "NameServerFailure", want: true},
+		{name: "semantic timeline failure", lastError: "WrongTimeline", want: false},
+		{name: "unknown timeout remains fail closed", lastError: "standby admin timeout", want: false},
+		{name: "transport loss before apply caught up", lastError: "ConnectionRefused", mutate: func(s *antflyv1.HAStandbyStatus) { s.CaughtUpToReceived = false }, want: false},
+		{name: "transport loss without safe read proof", lastError: "EndOfStream", mutate: func(s *antflyv1.HAStandbyStatus) { s.CanServeSafeReads = false }, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			standby := base
+			standby.LastError = tt.lastError
+			if tt.mutate != nil {
+				tt.mutate(&standby)
+			}
+			if got := standbyPromotionEligible(standby); got != tt.want {
+				t.Fatalf("standbyPromotionEligible() = %t, want %t for %#v", got, tt.want, standby)
+			}
+		})
+	}
+}
+
+func TestPromotionReceiptRemainsRecordedAfterIdentityAdoptsChildTopology(t *testing.T) {
+	promotion := haCompletePromotionReceipt("primary-a", "standby-a")
+	ha := haCluster().Spec.HighAvailability
+	ha.Identity = &antflyv1.HAReplicationIdentitySpec{
+		ClusterID: 100, ShardID: 10, TableID: 20,
+		TimelineID: promotion.NewTimelineID, Epoch: promotion.NewEpoch,
+		CurrentPrimaryID: promotion.PromotedStandbyID,
+	}
+	status := &antflyv1.HAStatus{LastPromotion: promotion}
+	if !haPromotionAlreadyRecorded(ha, status) {
+		t.Fatal("expected durable promotion receipt to remain valid after spec adopts child identity")
+	}
+	ha.Identity.Epoch++
+	if haPromotionAlreadyRecorded(ha, status) {
+		t.Fatal("expected unrelated advanced identity to reject stale promotion receipt")
+	}
+}
+
+func TestPhysicalIsolationReceiptRemainsValidAfterTopologyAdoption(t *testing.T) {
+	cluster, action := validPhysicalIsolationReceiptFixture(time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC))
+	promotion := haCompletePromotionReceipt(action.StandbyName, action.RouteTo)
+	promotion.FenceGeneration = action.FenceGeneration
+	promotion.ShardID = cluster.Spec.HighAvailability.Identity.ShardID
+	promotion.TableID = cluster.Spec.HighAvailability.Identity.TableID
+	cluster.Status.HAStatus.LastPromotion = promotion
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{action}
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = promotion.PromotedStandbyID
+	cluster.Spec.HighAvailability.Identity.TimelineID = promotion.NewTimelineID
+	cluster.Spec.HighAvailability.Identity.Epoch = promotion.NewEpoch
+
+	if !haPhysicalIsolationTopologyAdvanced(cluster, &action) {
+		t.Fatal("expected exact promotion receipt to identify adopted child topology")
+	}
+	if !haPhysicalIsolationSucceededWithEvidence(cluster, action) {
+		t.Fatal("expected completed parent isolation evidence to survive child topology adoption")
+	}
+
+	cluster.Status.HAStatus.LastPromotion.FenceGeneration++
+	if haPhysicalIsolationSucceededWithEvidence(cluster, action) {
+		t.Fatal("expected mismatched promotion generation to reject historical isolation evidence")
 	}
 }

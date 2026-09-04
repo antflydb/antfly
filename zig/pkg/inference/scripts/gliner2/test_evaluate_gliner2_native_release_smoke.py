@@ -62,7 +62,9 @@ class NativeReleaseQualityTest(unittest.TestCase):
             labels, _ = release_entity_schema(adapter_dir, eval_data)
             self.assertEqual(["person"], labels)
 
-    def test_native_command_scores_the_full_dataset_with_both_release_floors(self) -> None:
+    def test_native_command_scores_the_full_dataset_with_both_release_floors(
+        self,
+    ) -> None:
         command = build_command(
             Path("/model"),
             Path("/adapter"),
@@ -85,12 +87,16 @@ class NativeReleaseQualityTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing required"):
             parse_full_task_minima([])
         values = [f"{key}=0.5" for key in FULL_TASK_MINIMUM_KEYS]
-        self.assertEqual(set(FULL_TASK_MINIMUM_KEYS), parse_full_task_minima(values).keys())
+        self.assertEqual(
+            set(FULL_TASK_MINIMUM_KEYS), parse_full_task_minima(values).keys()
+        )
         values[-1] = "count.accuracy=0"
         with self.assertRaisesRegex(ValueError, "greater than 0"):
             parse_full_task_minima(values)
 
-    def test_structured_schema_allows_comma_labels_and_more_than_256_globally(self) -> None:
+    def test_structured_schema_allows_comma_labels_and_more_than_256_globally(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             adapter_dir = root / "adapter"

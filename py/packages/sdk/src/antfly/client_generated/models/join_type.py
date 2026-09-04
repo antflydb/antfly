@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class JoinType(str, Enum):
+class JoinType(StrEnum):
     INNER = "inner"
     LEFT = "left"
     RIGHT = "right"

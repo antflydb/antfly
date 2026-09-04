@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class HierarchyChildrenOrderByItemField(str, Enum):
+class HierarchyChildrenOrderByItemField(StrEnum):
     VALUE_0 = "_hierarchy.position"
 
     def __str__(self) -> str:

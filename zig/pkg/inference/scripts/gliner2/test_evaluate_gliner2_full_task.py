@@ -22,10 +22,23 @@ class FullTaskEvaluationTest(unittest.TestCase):
             "output": {
                 "entities": {"person": ["Alice"], "organization": ["Acme"]},
                 "classifications": [
-                    {"task": "priority", "labels": ["normal", "urgent"], "true_label": ["urgent"]}
+                    {
+                        "task": "priority",
+                        "labels": ["normal", "urgent"],
+                        "true_label": ["urgent"],
+                    }
                 ],
                 "json_structures": [
-                    {"company": {"name": "Acme", "place": "Paris", "status": {"value": "active", "choices": ["active", "closed"]}}}
+                    {
+                        "company": {
+                            "name": "Acme",
+                            "place": "Paris",
+                            "status": {
+                                "value": "active",
+                                "choices": ["active", "closed"],
+                            },
+                        }
+                    }
                 ],
                 "relations": [{"founded": {"head": "Alice", "tail": "Acme"}}],
             },
@@ -40,7 +53,9 @@ class FullTaskEvaluationTest(unittest.TestCase):
             {
                 "entities": [{"person": ["Alice"], "organization": ["Acme"]}],
                 "priority": ("urgent", 0.9),
-                "company": [{"name": ["Acme"], "place": ["Paris"], "status": ["active"]}],
+                "company": [
+                    {"name": ["Acme"], "place": ["Paris"], "status": ["active"]}
+                ],
                 "founded": [("Alice", "Acme")],
             },
         )
@@ -58,7 +73,11 @@ class FullTaskEvaluationTest(unittest.TestCase):
                 "input": "Urgent.",
                 "output": {
                     "classifications": [
-                        {"task": "priority", "labels": ["normal", "urgent"], "true_label": ["urgent"]}
+                        {
+                            "task": "priority",
+                            "labels": ["normal", "urgent"],
+                            "true_label": ["urgent"],
+                        }
                     ]
                 },
             }
@@ -93,7 +112,9 @@ class FullTaskEvaluationTest(unittest.TestCase):
             }
         )
         self.assertEqual(schema["entity_descriptions"], {"person": "A human name"})
-        self.assertEqual(schema["json_descriptions"], {"report": {"company": "Named company"}})
+        self.assertEqual(
+            schema["json_descriptions"], {"report": {"company": "Named company"}}
+        )
         self.assertEqual(
             schema["classifications"][0],
             {
@@ -175,7 +196,11 @@ class FullTaskEvaluationTest(unittest.TestCase):
                 "output": {
                     "entities": {},
                     "classifications": [
-                        {"task": "priority", "labels": ["normal", "urgent"], "true_label": ["urgent"]}
+                        {
+                            "task": "priority",
+                            "labels": ["normal", "urgent"],
+                            "true_label": ["urgent"],
+                        }
                     ],
                     "json_structures": [],
                     "relations": [],
@@ -190,7 +215,11 @@ class FullTaskEvaluationTest(unittest.TestCase):
                 "input": "This record has no assigned priority.",
                 "output": {
                     "classifications": [
-                        {"task": "priority", "labels": ["normal", "urgent"], "true_label": []}
+                        {
+                            "task": "priority",
+                            "labels": ["normal", "urgent"],
+                            "true_label": [],
+                        }
                     ]
                 },
             }
@@ -202,12 +231,24 @@ class FullTaskEvaluationTest(unittest.TestCase):
         self.assertEqual(metrics["false_positive"], 1)
         self.assertEqual(metrics["exact_match"], 0.0)
 
-    def test_rejects_relation_fields_the_upstream_public_decoder_cannot_return(self) -> None:
+    def test_rejects_relation_fields_the_upstream_public_decoder_cannot_return(
+        self,
+    ) -> None:
         with self.assertRaisesRegex(ValueError, "non-head/tail"):
             schema_and_gold(
                 {
                     "input": "Alice founded Acme in Paris.",
-                    "output": {"relations": [{"founded": {"head": "Alice", "tail": "Acme", "place": "Paris"}}]},
+                    "output": {
+                        "relations": [
+                            {
+                                "founded": {
+                                    "head": "Alice",
+                                    "tail": "Acme",
+                                    "place": "Paris",
+                                }
+                            }
+                        ]
+                    },
                 }
             )
 
@@ -218,8 +259,11 @@ class FullTaskEvaluationTest(unittest.TestCase):
             {"head": ["Alice", "Bob"], "tail": "Acme"},
         )
         for fields in invalid_fields:
-            with self.subTest(fields=fields), self.assertRaisesRegex(
-                ValueError, "must contain exactly|exactly one non-empty"
+            with (
+                self.subTest(fields=fields),
+                self.assertRaisesRegex(
+                    ValueError, "must contain exactly|exactly one non-empty"
+                ),
             ):
                 schema_and_gold(
                     {
@@ -230,7 +274,9 @@ class FullTaskEvaluationTest(unittest.TestCase):
 
     def test_minima_are_complete_unique_and_bounded(self) -> None:
         items = [f"{key}=0.5" for key in sorted(REQUIRED_MINIMA)]
-        self.assertEqual(set(parse_minima(items)), {item.split("=", 1)[0] for item in items})
+        self.assertEqual(
+            set(parse_minima(items)), {item.split("=", 1)[0] for item in items}
+        )
         with self.assertRaisesRegex(ValueError, "missing"):
             parse_minima(items[:-1])
         with self.assertRaisesRegex(ValueError, "invalid or duplicate"):

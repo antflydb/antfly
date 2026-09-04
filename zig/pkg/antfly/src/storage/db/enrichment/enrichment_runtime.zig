@@ -69,6 +69,19 @@ else
     @import("antfly_scraping");
 const mapper = @import("../document_mapper.zig");
 
+var activity_epoch_salt = std.atomic.Value(u64).init(1);
+
+fn newActivityEpoch(config: Config) u64 {
+    var hasher = std.hash.Wyhash.init(0x414e54464c594143);
+    hasher.update(config.owner_id);
+    var value_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &value_buf, config.clock.nowRealtimeNs(), .little);
+    hasher.update(&value_buf);
+    std.mem.writeInt(u64, &value_buf, activity_epoch_salt.fetchAdd(1, .monotonic), .little);
+    hasher.update(&value_buf);
+    return hasher.final() | 1;
+}
+
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
 }
@@ -82,6 +95,13 @@ pub const Config = struct {
     enable_without_producers: bool = false,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    /// Runtime-owned execution context for template remote I/O. Production
+    /// runtimes replace this with their backend executor during `init` so
+    /// remote fetches share lifecycle, cancellation, and scheduling policy.
+    io: ?Io = null,
+    /// Runtime-owned cancellation propagated through template remote I/O and
+    /// provider calls. Set by `start`; callers do not configure this directly.
+    cancellation: CancellationToken = .none,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     inline_retry_max_attempts: u32 = transient_embed_retry_max_attempts,
@@ -212,9 +232,14 @@ pub const NotifyFn = *const fn (ptr: *anyopaque, sequence: u64) void;
 pub const StatusHook = struct {
     ptr: *anyopaque,
     on_change: *const fn (ptr: *anyopaque) void,
+    on_activity: ?*const fn (ptr: *anyopaque) void = null,
 
     pub fn notify(self: @This()) void {
         self.on_change(self.ptr);
+    }
+
+    pub fn notifyActivity(self: @This()) void {
+        if (self.on_activity) |callback| callback(self.ptr);
     }
 };
 
@@ -222,6 +247,12 @@ pub const scope_name = "generated";
 const writer_locked_retry_count: usize = 1000;
 const writer_locked_retry_sleep_ns: u64 = 100_000;
 const generated_replay_default_window_items: usize = 2048;
+/// Bound source preparation independently from the larger derived-record
+/// publication window. Preparing an entire corpus before the first provider
+/// batch delays queryability after restart and retains one request plan and
+/// chunk set per document. This window still spans several provider batches,
+/// preserving throughput while producing an early durable partial generation.
+const generated_preparation_default_window_items: usize = 64;
 const generated_embed_default_batch_items: usize = 8;
 const generated_embed_default_batch_bytes: usize = 256 * 1024;
 const generated_ocr_default_batch_items: usize = 4;
@@ -298,6 +329,8 @@ const GeneratedReplayWindow = struct {
     sparse_embeddings: std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite) = .empty,
     coverage_transitions: std.ArrayListUnmanaged(CoverageOutcomeTransition) = .empty,
     coverage_transition_keys: std.StringHashMapUnmanaged(void) = .empty,
+    activity_runtime: ?*EnrichmentRuntime = null,
+    publishing_indexes: std.ArrayListUnmanaged([]u8) = .empty,
 
     fn hasDerivedItems(self: *const @This()) bool {
         return self.documents.items.len != 0 or
@@ -335,6 +368,7 @@ const GeneratedReplayWindow = struct {
     }
 
     fn deinit(self: *@This()) void {
+        completeWindowPublishing(self);
         for (self.documents.items) |doc| {
             self.alloc.free(@constCast(doc.key));
             if (doc.cleaned_value) |value| self.alloc.free(@constCast(value));
@@ -367,6 +401,9 @@ const GeneratedReplayWindow = struct {
         clearQueuedCoverageTransitions(self.alloc, &self.coverage_transitions, &self.coverage_transition_keys);
         self.coverage_transitions.deinit(self.alloc);
         self.coverage_transition_keys.deinit(self.alloc);
+
+        for (self.publishing_indexes.items) |index_name| self.alloc.free(index_name);
+        self.publishing_indexes.deinit(self.alloc);
     }
 };
 
@@ -376,6 +413,42 @@ fn generatedReplayWindowItems() usize {
     if (raw.len == 0) return generated_replay_default_window_items;
     const parsed = std.fmt.parseUnsigned(usize, raw, 10) catch return generated_replay_default_window_items;
     return @max(@as(usize, 1), parsed);
+}
+
+fn generatedPreparationWindowItems() usize {
+    if (comptime builtin.os.tag == .freestanding) return generated_preparation_default_window_items;
+    const raw = getenv("ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS") orelse return generated_preparation_default_window_items;
+    if (raw.len == 0) return generated_preparation_default_window_items;
+    const parsed = std.fmt.parseUnsigned(usize, raw, 10) catch return generated_preparation_default_window_items;
+    return @max(@as(usize, 1), parsed);
+}
+
+fn deferredGeneratedWorkShouldFlush(
+    plain_dense_count: usize,
+    chunked_dense_count: usize,
+    asset_count: usize,
+    max_items: usize,
+) bool {
+    return plain_dense_count +| chunked_dense_count +| asset_count >= max_items;
+}
+
+test "enrichment generated preparation window bounds time to first publication" {
+    try std.testing.expect(!deferredGeneratedWorkShouldFlush(31, 31, 1, 64));
+    try std.testing.expect(deferredGeneratedWorkShouldFlush(31, 31, 2, 64));
+    try std.testing.expect(deferredGeneratedWorkShouldFlush(std.math.maxInt(usize), 1, 0, 64));
+}
+
+test "enrichment replay cursor is sequence and document ordered" {
+    const cursor = enrichment_state.ReplayCursor{
+        .base_applied_sequence = 10,
+        .sequence = 12,
+        .doc_key = @constCast("doc:m"),
+    };
+    try std.testing.expect(replayCursorCoversGroup(cursor, 10, .{ .sequence = 11, .doc_key = "doc:z" }));
+    try std.testing.expect(replayCursorCoversGroup(cursor, 10, .{ .sequence = 12, .doc_key = "doc:m" }));
+    try std.testing.expect(!replayCursorCoversGroup(cursor, 10, .{ .sequence = 12, .doc_key = "doc:n" }));
+    try std.testing.expect(!replayCursorCoversGroup(cursor, 10, .{ .sequence = 13, .doc_key = "doc:a" }));
+    try std.testing.expect(!replayCursorCoversGroup(cursor, 9, .{ .sequence = 11, .doc_key = "doc:a" }));
 }
 
 fn generatedEmbedBatchItems() usize {
@@ -535,7 +608,241 @@ fn elapsedNsSince(runtime: *EnrichmentRuntime, start_ns: u64) u64 {
     return end_ns - start_ns;
 }
 
-fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, items: usize, bytes: usize, max_bytes: usize) void {
+fn embeddingActivityEpoch(runtime_epoch: u64, index_generation: u64, index_name: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(runtime_epoch);
+    hasher.update(std.mem.asBytes(&index_generation));
+    hasher.update(index_name);
+    const epoch = hasher.final();
+    return if (epoch == 0) 1 else epoch;
+}
+
+fn advanceEmbeddingActivitySample(activity: *types.EmbeddingActivityStats) void {
+    activity.sample_sequence +|= 1;
+    if (activity.sample_sequence == 0) activity.sample_sequence = 1;
+}
+
+fn indexEmbeddingActivityPtrAssumeLocked(runtime: *EnrichmentRuntime, index_name: []const u8) ?*types.EmbeddingActivityStats {
+    const index_generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse 0;
+    if (runtime.index_embedding_activity.getPtr(index_name)) |activity| {
+        if (activity.index_generation != index_generation) {
+            activity.* = .{
+                .epoch = embeddingActivityEpoch(runtime.activity_epoch, index_generation, index_name),
+                .sample_sequence = 1,
+                .index_generation = index_generation,
+            };
+        }
+        return activity;
+    }
+    const owned_name = runtime.alloc.dupe(u8, index_name) catch return null;
+    const result = runtime.index_embedding_activity.getOrPut(runtime.alloc, owned_name) catch {
+        runtime.alloc.free(owned_name);
+        return null;
+    };
+    if (result.found_existing) {
+        runtime.alloc.free(owned_name);
+    } else {
+        result.value_ptr.* = .{
+            .epoch = embeddingActivityEpoch(runtime.activity_epoch, index_generation, index_name),
+            .sample_sequence = 1,
+            .index_generation = index_generation,
+        };
+    }
+    return result.value_ptr;
+}
+
+const EmbeddingWorkOwner = enum {
+    supervised_replay,
+    synchronous_request,
+};
+
+fn noteIndexEmbedBatchStartedAssumeLocked(
+    runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
+    items: usize,
+    owner: EmbeddingWorkOwner,
+) void {
+    for (index_names) |index_name| {
+        const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
+        activity.active_batch_size +|= @intCast(items);
+        if (owner == .supervised_replay) {
+            activity.retrying = false;
+            activity.retry_fingerprint = runtime.active_failure_fingerprint;
+        }
+        advanceEmbeddingActivitySample(activity);
+    }
+}
+
+fn noteIndexEmbedBatchFinishedAssumeLocked(
+    runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
+    items: usize,
+    success: bool,
+    owner: EmbeddingWorkOwner,
+) void {
+    const completed_at_ms = runtime.config.clock.nowRealtimeMs();
+    for (index_names) |index_name| {
+        const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
+        activity.active_batch_size -|= @intCast(items);
+        if (!success) {
+            advanceEmbeddingActivitySample(activity);
+            continue;
+        }
+        if (owner == .supervised_replay) activity.retry_fingerprint = 0;
+        activity.embedding_batches_completed +|= 1;
+        activity.embeddings_computed +|= @intCast(items);
+        activity.last_progress_at_ms = @max(activity.last_progress_at_ms, completed_at_ms);
+        advanceEmbeddingActivitySample(activity);
+    }
+}
+
+fn markScheduledIndexEmbeddingRetryAssumeLocked(runtime: *EnrichmentRuntime) void {
+    if (runtime.active_failure_fingerprint == 0) return;
+    var iter = runtime.index_embedding_activity.valueIterator();
+    while (iter.next()) |activity| {
+        if (activity.retry_fingerprint == runtime.active_failure_fingerprint and !activity.retrying) {
+            activity.retrying = true;
+            advanceEmbeddingActivitySample(activity);
+        }
+    }
+}
+
+fn clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime: *EnrichmentRuntime) void {
+    var iter = runtime.index_embedding_activity.valueIterator();
+    while (iter.next()) |activity| {
+        if (activity.retrying or activity.retry_fingerprint != 0) {
+            activity.retrying = false;
+            activity.retry_fingerprint = 0;
+            advanceEmbeddingActivitySample(activity);
+        }
+    }
+}
+
+fn noteIndexPreparationStartedAssumeLocked(runtime: *EnrichmentRuntime, index_names: []const []const u8) void {
+    for (index_names) |index_name| {
+        const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
+        activity.active_preparations +|= 1;
+        advanceEmbeddingActivitySample(activity);
+    }
+}
+
+fn noteIndexPreparationFinishedAssumeLocked(runtime: *EnrichmentRuntime, index_names: []const []const u8, chunks_created: usize) void {
+    const completed_at_ms = if (chunks_created == 0) 0 else runtime.config.clock.nowRealtimeMs();
+    for (index_names) |index_name| {
+        const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
+        activity.active_preparations -|= 1;
+        activity.chunks_created +|= @intCast(chunks_created);
+        if (chunks_created != 0) {
+            activity.last_progress_at_ms = @max(activity.last_progress_at_ms, completed_at_ms);
+        }
+        advanceEmbeddingActivitySample(activity);
+    }
+}
+
+fn updateIndexPreparation(runtime: *EnrichmentRuntime, index_names: []const []const u8, started: bool, chunks_created: usize) void {
+    if (comptime builtin.os.tag == .freestanding) {
+        if (started)
+            noteIndexPreparationStartedAssumeLocked(runtime, index_names)
+        else
+            noteIndexPreparationFinishedAssumeLocked(runtime, index_names, chunks_created);
+    } else if (runtime.io_impl) |io_impl| {
+        const io = io_impl.io();
+        runtime.mutex.lockUncancelable(io);
+        if (started)
+            noteIndexPreparationStartedAssumeLocked(runtime, index_names)
+        else
+            noteIndexPreparationFinishedAssumeLocked(runtime, index_names, chunks_created);
+        runtime.mutex.unlock(io);
+    } else {
+        if (started)
+            noteIndexPreparationStartedAssumeLocked(runtime, index_names)
+        else
+            noteIndexPreparationFinishedAssumeLocked(runtime, index_names, chunks_created);
+    }
+    runtime.notifyActivityHook();
+}
+
+/// Records completed request-path chunk work. The synchronous caller does not
+/// expose a preparation lifetime, so this updates throughput counters without
+/// manufacturing an in-flight phase.
+pub fn noteIndexChunksCreated(runtime: *EnrichmentRuntime, index_names: []const []const u8, count: usize) void {
+    if (count == 0) return;
+    updateIndexPreparation(runtime, index_names, false, count);
+}
+
+fn updateIndexPublishing(runtime: *EnrichmentRuntime, index_names: []const []const u8, started: bool) void {
+    if (comptime builtin.os.tag == .freestanding) {
+        for (index_names) |index_name| {
+            const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
+            if (started) activity.active_publications +|= 1 else activity.active_publications -|= 1;
+            advanceEmbeddingActivitySample(activity);
+        }
+    } else if (runtime.io_impl) |io_impl| {
+        const io = io_impl.io();
+        runtime.mutex.lockUncancelable(io);
+        for (index_names) |index_name| {
+            const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
+            if (started) activity.active_publications +|= 1 else activity.active_publications -|= 1;
+            advanceEmbeddingActivitySample(activity);
+        }
+        runtime.mutex.unlock(io);
+    } else {
+        for (index_names) |index_name| {
+            const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
+            if (started) activity.active_publications +|= 1 else activity.active_publications -|= 1;
+            advanceEmbeddingActivitySample(activity);
+        }
+    }
+    runtime.notifyActivityHook();
+}
+
+fn markWindowPublishing(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, index_names: []const []const u8) !void {
+    if (window.activity_runtime) |owner| {
+        if (owner != runtime) return error.EnrichmentActivityOwnerMismatch;
+    } else {
+        window.activity_runtime = runtime;
+    }
+    const first_new = window.publishing_indexes.items.len;
+    errdefer {
+        for (window.publishing_indexes.items[first_new..]) |name| window.alloc.free(name);
+        window.publishing_indexes.shrinkRetainingCapacity(first_new);
+    }
+    for (index_names) |index_name| {
+        var found = false;
+        for (window.publishing_indexes.items) |existing| {
+            if (std.mem.eql(u8, existing, index_name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            try window.publishing_indexes.ensureUnusedCapacity(window.alloc, 1);
+            const owned_name = try window.alloc.dupe(u8, index_name);
+            window.publishing_indexes.appendAssumeCapacity(owned_name);
+        }
+    }
+    updateIndexPublishing(runtime, window.publishing_indexes.items[first_new..], true);
+}
+
+fn completeWindowPublishing(window: *GeneratedReplayWindow) void {
+    if (window.activity_runtime) |runtime| updateIndexPublishing(runtime, window.publishing_indexes.items, false);
+    for (window.publishing_indexes.items) |name| window.alloc.free(name);
+    window.publishing_indexes.clearRetainingCapacity();
+    window.activity_runtime = null;
+}
+
+fn freeOwnedIndexNames(alloc: Allocator, names: [][]u8) void {
+    for (names) |name| alloc.free(name);
+    alloc.free(names);
+}
+
+fn clearIndexEmbeddingActivity(runtime: *EnrichmentRuntime) void {
+    var iter = runtime.index_embedding_activity.keyIterator();
+    while (iter.next()) |key| runtime.alloc.free(@constCast(key.*));
+    runtime.index_embedding_activity.deinit(runtime.alloc);
+    runtime.index_embedding_activity = .empty;
+}
+
+fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []const u8, items: usize, bytes: usize, max_bytes: usize) void {
     const now_ms = runtime.config.clock.nowRealtimeMs();
     if (comptime builtin.os.tag == .freestanding) {
         runtime.embed_batches_started += 1;
@@ -544,19 +851,21 @@ fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, items: usize, bytes: usize
         runtime.active_embed_batch_bytes = @intCast(bytes);
         runtime.active_embed_batch_max_bytes = @intCast(max_bytes);
         runtime.active_embed_batch_started_ms = now_ms;
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .supervised_replay);
         return;
     }
 
     if (runtime.io_impl) |io_impl| {
         const io = io_impl.io();
         runtime.mutex.lockUncancelable(io);
-        defer runtime.mutex.unlock(io);
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
         runtime.active_embed_batch_items = @intCast(items);
         runtime.active_embed_batch_bytes = @intCast(bytes);
         runtime.active_embed_batch_max_bytes = @intCast(max_bytes);
         runtime.active_embed_batch_started_ms = now_ms;
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .supervised_replay);
+        runtime.mutex.unlock(io);
     } else {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
@@ -564,10 +873,12 @@ fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, items: usize, bytes: usize
         runtime.active_embed_batch_bytes = @intCast(bytes);
         runtime.active_embed_batch_max_bytes = @intCast(max_bytes);
         runtime.active_embed_batch_started_ms = now_ms;
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .supervised_replay);
     }
+    runtime.notifyActivityHook();
 }
 
-fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usize, max_bytes: usize, elapsed_ns: u64, success: bool) void {
+fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []const u8, items: usize, bytes: usize, max_bytes: usize, elapsed_ns: u64, success: bool) void {
     if (comptime builtin.os.tag == .freestanding) {
         if (success) {
             runtime.embed_batches_completed += 1;
@@ -583,13 +894,13 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
         runtime.active_embed_batch_bytes = 0;
         runtime.active_embed_batch_max_bytes = 0;
         runtime.active_embed_batch_started_ms = 0;
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success, .supervised_replay);
         return;
     }
 
     if (runtime.io_impl) |io_impl| {
         const io = io_impl.io();
         runtime.mutex.lockUncancelable(io);
-        defer runtime.mutex.unlock(io);
         if (success) {
             runtime.embed_batches_completed += 1;
             runtime.embed_items_completed += @intCast(items);
@@ -604,6 +915,8 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
         runtime.active_embed_batch_bytes = 0;
         runtime.active_embed_batch_max_bytes = 0;
         runtime.active_embed_batch_started_ms = 0;
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success, .supervised_replay);
+        runtime.mutex.unlock(io);
     } else {
         if (success) {
             runtime.embed_batches_completed += 1;
@@ -619,7 +932,9 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
         runtime.active_embed_batch_bytes = 0;
         runtime.active_embed_batch_max_bytes = 0;
         runtime.active_embed_batch_started_ms = 0;
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success, .supervised_replay);
     }
+    runtime.notifyActivityHook();
 }
 
 // Request-path embeddings can overlap each other and the single replay
@@ -627,34 +942,52 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
 // deliberately do not overwrite the replay worker's single active-batch
 // snapshot. Treating concurrent request batches as that one slot lets the
 // first completion clear another still-running batch from runtime status.
-fn noteTrackedRequestEmbedBatchStarted(runtime: *EnrichmentRuntime, items: usize) void {
+fn noteTrackedRequestEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []const u8, items: usize) void {
     if (comptime builtin.os.tag == .freestanding) {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .synchronous_request);
         return;
     }
 
     if (runtime.io_impl) |io_impl| {
         const io = io_impl.io();
         runtime.mutex.lockUncancelable(io);
-        defer runtime.mutex.unlock(io);
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .synchronous_request);
+        runtime.mutex.unlock(io);
     } else {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .synchronous_request);
     }
+    runtime.notifyActivityHook();
 }
 
 fn noteTrackedRequestEmbedBatchFinished(
     runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
     items: usize,
     bytes: usize,
     max_bytes: usize,
     elapsed_ns: u64,
     success: bool,
 ) void {
-    if (!success) return;
+    if (!success) {
+        if (comptime builtin.os.tag == .freestanding) {
+            noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false, .synchronous_request);
+        } else if (runtime.io_impl) |io_impl| {
+            const io = io_impl.io();
+            runtime.mutex.lockUncancelable(io);
+            noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false, .synchronous_request);
+            runtime.mutex.unlock(io);
+        } else {
+            noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false, .synchronous_request);
+        }
+        runtime.notifyActivityHook();
+        return;
+    }
 
     if (comptime builtin.os.tag == .freestanding) {
         runtime.embed_batches_completed += 1;
@@ -665,13 +998,13 @@ fn noteTrackedRequestEmbedBatchFinished(
         runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
         runtime.last_embed_batch_ns = elapsed_ns;
         runtime.total_embed_ns += elapsed_ns;
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, true, .synchronous_request);
         return;
     }
 
     if (runtime.io_impl) |io_impl| {
         const io = io_impl.io();
         runtime.mutex.lockUncancelable(io);
-        defer runtime.mutex.unlock(io);
         runtime.embed_batches_completed += 1;
         runtime.embed_items_completed += @intCast(items);
         runtime.last_embed_batch_items = @intCast(items);
@@ -680,6 +1013,8 @@ fn noteTrackedRequestEmbedBatchFinished(
         runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
         runtime.last_embed_batch_ns = elapsed_ns;
         runtime.total_embed_ns += elapsed_ns;
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, true, .synchronous_request);
+        runtime.mutex.unlock(io);
     } else {
         runtime.embed_batches_completed += 1;
         runtime.embed_items_completed += @intCast(items);
@@ -689,7 +1024,9 @@ fn noteTrackedRequestEmbedBatchFinished(
         runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
         runtime.last_embed_batch_ns = elapsed_ns;
         runtime.total_embed_ns += elapsed_ns;
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, true, .synchronous_request);
     }
+    runtime.notifyActivityHook();
 }
 
 const TextBatchByteStats = struct {
@@ -712,24 +1049,26 @@ fn textBatchByteStats(texts: []const []const u8) TextBatchByteStats {
 /// policy, while runtime status must still reflect all provider work.
 pub fn embedDenseTracked(
     runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
     alloc: Allocator,
     dense_embedder: embedder_mod.DenseEmbedder,
     embedding_name: []const u8,
     text: []const u8,
     dims: u32,
 ) ![]f32 {
-    noteTrackedRequestEmbedBatchStarted(runtime, 1);
+    noteTrackedRequestEmbedBatchStarted(runtime, index_names, 1);
     const started_ns = runtime.config.clock.nowRealtimeNs();
     const vector = dense_embedder.embedDense(alloc, embedding_name, text, dims) catch |err| {
-        noteTrackedRequestEmbedBatchFinished(runtime, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), false);
+        noteTrackedRequestEmbedBatchFinished(runtime, index_names, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), false);
         return err;
     };
-    noteTrackedRequestEmbedBatchFinished(runtime, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), true);
+    noteTrackedRequestEmbedBatchFinished(runtime, index_names, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), true);
     return vector;
 }
 
 pub fn embedDenseBatchTracked(
     runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
     alloc: Allocator,
     dense_embedder: embedder_mod.DenseEmbedder,
     embedding_name: []const u8,
@@ -737,23 +1076,24 @@ pub fn embedDenseBatchTracked(
     dims: u32,
 ) ![]const []const f32 {
     const stats = textBatchByteStats(texts);
-    noteTrackedRequestEmbedBatchStarted(runtime, texts.len);
+    noteTrackedRequestEmbedBatchStarted(runtime, index_names, texts.len);
     const started_ns = runtime.config.clock.nowRealtimeNs();
     const vectors = dense_embedder.embedDenseBatch(alloc, embedding_name, texts, dims) catch |err| {
-        noteTrackedRequestEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
+        noteTrackedRequestEmbedBatchFinished(runtime, index_names, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
         return err;
     };
     if (vectors.len != texts.len) {
         embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
-        noteTrackedRequestEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
+        noteTrackedRequestEmbedBatchFinished(runtime, index_names, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
         return error.InvalidEmbeddingResponse;
     }
-    noteTrackedRequestEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), true);
+    noteTrackedRequestEmbedBatchFinished(runtime, index_names, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), true);
     return vectors;
 }
 
 pub fn embedDensePartsTracked(
     runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
     alloc: Allocator,
     dense_embedder: embedder_mod.DenseEmbedder,
     embedding_name: []const u8,
@@ -771,14 +1111,56 @@ pub fn embedDensePartsTracked(
         total_bytes +|= bytes;
         max_bytes = @max(max_bytes, bytes);
     }
-    noteTrackedRequestEmbedBatchStarted(runtime, 1);
+    noteTrackedRequestEmbedBatchStarted(runtime, index_names, 1);
     const started_ns = runtime.config.clock.nowRealtimeNs();
     const vector = dense_embedder.embedDenseParts(alloc, embedding_name, parts, dims) catch |err| {
-        noteTrackedRequestEmbedBatchFinished(runtime, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), false);
+        noteTrackedRequestEmbedBatchFinished(runtime, index_names, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), false);
         return err;
     };
-    noteTrackedRequestEmbedBatchFinished(runtime, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), true);
+    noteTrackedRequestEmbedBatchFinished(runtime, index_names, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), true);
     return vector;
+}
+
+pub fn embedSparseTracked(
+    runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
+    alloc: Allocator,
+    sparse_embedder: embedder_mod.SparseEmbedder,
+    embedding_name: []const u8,
+    text: []const u8,
+) !embedder_mod.SparseEmbedding {
+    noteTrackedRequestEmbedBatchStarted(runtime, index_names, 1);
+    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const sparse = sparse_embedder.embedSparse(alloc, embedding_name, text) catch |err| {
+        noteTrackedRequestEmbedBatchFinished(runtime, index_names, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), false);
+        return err;
+    };
+    noteTrackedRequestEmbedBatchFinished(runtime, index_names, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), true);
+    return sparse;
+}
+
+pub fn embedSparseBatchTracked(
+    runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
+    alloc: Allocator,
+    sparse_embedder: embedder_mod.SparseEmbedder,
+    embedding_name: []const u8,
+    texts: []const []const u8,
+) ![]embedder_mod.SparseEmbedding {
+    const stats = textBatchByteStats(texts);
+    noteTrackedRequestEmbedBatchStarted(runtime, index_names, texts.len);
+    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const sparse_batch = sparse_embedder.embedSparseBatch(alloc, embedding_name, texts) catch |err| {
+        noteTrackedRequestEmbedBatchFinished(runtime, index_names, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
+        return err;
+    };
+    if (sparse_batch.len != texts.len) {
+        embedder_mod.freeSparseEmbeddingBatch(alloc, sparse_batch);
+        noteTrackedRequestEmbedBatchFinished(runtime, index_names, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
+        return error.InvalidEmbeddingResponse;
+    }
+    noteTrackedRequestEmbedBatchFinished(runtime, index_names, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), true);
+    return sparse_batch;
 }
 
 test "request embedding telemetry preserves an overlapping replay batch snapshot" {
@@ -797,19 +1179,149 @@ test "request embedding telemetry preserves an overlapping replay batch snapshot
         .config = .{},
         .ownership = undefined,
     };
-    noteEmbedBatchStarted(&runtime, 4, 400, 125);
-    noteTrackedRequestEmbedBatchStarted(&runtime, 2);
-    noteTrackedRequestEmbedBatchFinished(&runtime, 2, 80, 40, 10, true);
+    noteEmbedBatchStarted(&runtime, &.{}, 4, 400, 125);
+    noteTrackedRequestEmbedBatchStarted(&runtime, &.{}, 2);
+    noteTrackedRequestEmbedBatchFinished(&runtime, &.{}, 2, 80, 40, 10, true);
     try std.testing.expectEqual(@as(u64, 4), runtime.active_embed_batch_items);
     try std.testing.expectEqual(@as(u64, 400), runtime.active_embed_batch_bytes);
     try std.testing.expectEqual(@as(u64, 125), runtime.active_embed_batch_max_bytes);
 
-    noteEmbedBatchFinished(&runtime, 4, 400, 125, 20, true);
+    noteEmbedBatchFinished(&runtime, &.{}, 4, 400, 125, 20, true);
     try std.testing.expectEqual(@as(u64, 0), runtime.active_embed_batch_items);
     try std.testing.expectEqual(@as(u64, 2), runtime.embed_batches_started);
     try std.testing.expectEqual(@as(u64, 2), runtime.embed_batches_completed);
     try std.testing.expectEqual(@as(u64, 6), runtime.embed_items_started);
     try std.testing.expectEqual(@as(u64, 6), runtime.embed_items_completed);
+}
+
+test "enrichment runtime status scopes embedding activity to exact consumer indexes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/activity-indexes", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .activity_epoch = 17,
+        .config = .{},
+        .ownership = undefined,
+    };
+    defer clearIndexEmbeddingActivity(&runtime);
+
+    noteEmbedBatchStarted(&runtime, &.{"semantic"}, 4, 400, 125);
+    noteEmbedBatchFinished(&runtime, &.{"semantic"}, 4, 400, 125, 20, true);
+    updateIndexPreparation(&runtime, &.{"semantic"}, true, 0);
+    updateIndexPreparation(&runtime, &.{"semantic"}, false, 9);
+    var publication_window = GeneratedReplayWindow{ .alloc = alloc };
+    defer publication_window.deinit();
+    try markWindowPublishing(&runtime, &publication_window, &.{"semantic"});
+    runtime.active_failure_fingerprint = 41;
+    noteEmbedBatchStarted(&runtime, &.{"visual"}, 3, 300, 100);
+    noteEmbedBatchFinished(&runtime, &.{"visual"}, 3, 300, 100, 15, false);
+
+    const semantic = runtime.indexEmbeddingActivity("semantic");
+    try std.testing.expect(semantic.epoch != 0);
+    try std.testing.expectEqual(@as(u64, 9), semantic.chunks_created);
+    try std.testing.expectEqual(@as(u64, 1), semantic.embedding_batches_completed);
+    try std.testing.expectEqual(@as(u64, 4), semantic.embeddings_computed);
+    try std.testing.expectEqual(@as(u64, 0), semantic.active_batch_size);
+    try std.testing.expect(!semantic.retrying);
+    try std.testing.expectEqual(types.EmbeddingActivityPhase.publishing, semantic.effectivePhase());
+
+    const visual = runtime.indexEmbeddingActivity("visual");
+    try std.testing.expect(visual.epoch != 0);
+    try std.testing.expectEqual(@as(u64, 0), visual.chunks_created);
+    try std.testing.expectEqual(@as(u64, 0), visual.embedding_batches_completed);
+    try std.testing.expectEqual(@as(u64, 0), visual.embeddings_computed);
+    try std.testing.expectEqual(@as(u64, 0), visual.active_batch_size);
+    // A provider failure is only a retry candidate. It becomes `retrying`
+    // when the supervisor accepts ownership and schedules the next attempt.
+    try std.testing.expect(!visual.retrying);
+    markScheduledIndexEmbeddingRetryAssumeLocked(&runtime);
+    try std.testing.expect(runtime.indexEmbeddingActivity("visual").retrying);
+    try std.testing.expectEqual(types.EmbeddingActivityPhase.waiting_retry, runtime.indexEmbeddingActivity("visual").effectivePhase());
+    try std.testing.expect(!runtime.indexEmbeddingActivity("semantic").retrying);
+
+    runtime.active_failure_fingerprint = 99;
+    markScheduledIndexEmbeddingRetryAssumeLocked(&runtime);
+    try std.testing.expect(runtime.indexEmbeddingActivity("visual").retrying);
+
+    noteEmbedBatchStarted(&runtime, &.{"visual"}, 3, 300, 100);
+    try std.testing.expect(!runtime.indexEmbeddingActivity("visual").retrying);
+    try std.testing.expectEqual(types.EmbeddingActivityPhase.embedding, runtime.indexEmbeddingActivity("visual").effectivePhase());
+
+    noteEmbedBatchFinished(&runtime, &.{"visual"}, 3, 300, 100, 10, true);
+    try markWindowPublishing(&runtime, &publication_window, &.{"visual"});
+    completeWindowPublishing(&publication_window);
+    try std.testing.expectEqual(types.EmbeddingActivityPhase.idle, runtime.indexEmbeddingActivity("semantic").effectivePhase());
+    try std.testing.expectEqual(types.EmbeddingActivityPhase.idle, runtime.indexEmbeddingActivity("visual").effectivePhase());
+}
+
+test "request embedding failure never claims a supervised retry" {
+    const alloc = std.testing.allocator;
+    const FailingSparseEmbedder = struct {
+        fn embed(
+            _: *anyopaque,
+            _: Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!embedder_mod.SparseEmbedding {
+            return error.TestSparseRequestFailure;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/request-activity-indexes", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .activity_epoch = 23,
+        .config = .{},
+        .ownership = undefined,
+        .active_failure_fingerprint = 41,
+    };
+    defer clearIndexEmbeddingActivity(&runtime);
+
+    var failing_sparse: u8 = 0;
+    const sparse_embedder = embedder_mod.SparseEmbedder{
+        .ptr = &failing_sparse,
+        .sparse_embed_fn = FailingSparseEmbedder.embed,
+    };
+    try std.testing.expectError(
+        error.TestSparseRequestFailure,
+        embedSparseTracked(&runtime, &.{"semantic"}, alloc, sparse_embedder, "sparse_v1", "hello"),
+    );
+    markScheduledIndexEmbeddingRetryAssumeLocked(&runtime);
+    const activity = runtime.indexEmbeddingActivity("semantic");
+    try std.testing.expectEqual(@as(u64, 0), activity.active_batch_size);
+    try std.testing.expectEqual(@as(u64, 0), activity.retry_fingerprint);
+    try std.testing.expect(!activity.retrying);
 }
 
 fn boundedTextBatchEnd(texts: []const []const u8, start: usize, max_items: usize, max_bytes: usize) usize {
@@ -857,6 +1369,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.InvalidDocumentExtractionConfig,
         error.InvalidEnrichmentConfig,
         error.InvalidEmbeddingResponse,
+        error.InvalidEmbeddingDimensions,
         error.ReadRequestFailed,
         error.OcrPromptEcho,
         error.TrivialOcrOutput,
@@ -924,9 +1437,11 @@ fn updateFailureFingerprintBytes(hasher: *std.hash.Wyhash, value: []const u8) vo
 
 fn updateFailureFingerprintForRequest(hasher: *std.hash.Wyhash, request: enrichment_types.GeneratedEnrichmentRequest) void {
     const kind: u8 = @intFromEnum(request.kind);
+    const input_kind: u8 = @intFromEnum(request.input_kind);
     var sequence_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &sequence_bytes, request.sequence, .little);
     hasher.update(&.{kind});
+    hasher.update(&.{input_kind});
     hasher.update(&sequence_bytes);
     updateFailureFingerprintBytes(hasher, request.doc_key);
     updateFailureFingerprintBytes(hasher, requestArtifactName(request));
@@ -944,13 +1459,15 @@ fn sameRequestFailureIdentity(
     rhs: enrichment_types.GeneratedEnrichmentRequest,
 ) bool {
     return lhs.kind == rhs.kind and
+        lhs.input_kind == rhs.input_kind and
         lhs.sequence == rhs.sequence and
         std.mem.eql(u8, lhs.doc_key, rhs.doc_key) and
         std.mem.eql(u8, requestArtifactName(lhs), requestArtifactName(rhs)) and
         std.mem.eql(u8, requestEmbeddingName(lhs), requestEmbeddingName(rhs));
 }
 
-fn batchFailureFingerprint(items: anytype) u64 {
+fn batchFailureFingerprint(comptime Item: type, items: []const Item) u64 {
+    comptime std.debug.assert(@typeInfo(Item) == .@"struct");
     var hasher = std.hash.Wyhash.init(0x616e74666c795f62);
     var count_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &count_bytes, items.len, .little);
@@ -1004,6 +1521,19 @@ fn clearRequestRetryAuthorization(runtime: *EnrichmentRuntime) void {
     runtime.retry_error_has_request_identity = false;
 }
 
+fn restoreDeferredRequestRetryAuthorization(runtime: *EnrichmentRuntime, fingerprint: u64) void {
+    std.debug.assert(fingerprint != 0);
+    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
+    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
+    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    runtime.active_failure_fingerprint = fingerprint;
+    // shouldYieldRequestError already admitted this exact request against its
+    // durable budget. Independent work may temporarily replace the active
+    // fingerprint, but it must not turn the deferred request into a synthetic
+    // pipeline failure at the supervisor boundary.
+    runtime.retry_error_has_request_identity = true;
+}
+
 fn requestAttemptNumber(runtime: *EnrichmentRuntime) u64 {
     const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
     if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
@@ -1055,27 +1585,52 @@ fn pipelineFailureFingerprint(_: anyerror) u64 {
     return finishFailureFingerprint(&hasher);
 }
 
-fn workerLoopRetryBudgetAllowsYield(runtime: *EnrichmentRuntime, err: anyerror) bool {
+const WorkerRetryScope = enum {
+    request,
+    pipeline,
+};
+
+fn workerLoopRetryScopeIfAllowed(runtime: *EnrichmentRuntime, err: anyerror) ?WorkerRetryScope {
     const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
     if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
     defer if (maybe_io) |io| runtime.mutex.unlock(io);
 
-    // Only shouldYieldRequestError may authorize reuse of a request identity.
-    // Any other error reaching the worker boundary is a pipeline failure, even
-    // if a previously completed request left its fingerprint active.
-    if (!runtime.retry_error_has_request_identity or runtime.active_failure_fingerprint == 0)
-        runtime.active_failure_fingerprint = pipelineFailureFingerprint(err);
+    // Request-owned failures have already been admitted by
+    // shouldYieldRequestError against their exact durable identity budget.
+    // They must not also consume the table-wide pipeline budget: otherwise a
+    // bad source can stop every sibling index before the next pass parks that
+    // source in the repair ledger. Errors without that one-shot authorization
+    // are pipeline failures and retain the generation-wide no-progress cap.
+    const request_owned = runtime.retry_error_has_request_identity and
+        runtime.active_failure_fingerprint != 0;
     runtime.retry_error_has_request_identity = false;
+    if (request_owned) {
+        const request_prior_attempts = requestPriorAttempts(
+            runtime.active_failure_fingerprint,
+            runtime.retry_failure_fingerprint,
+            runtime.retry_failure_count,
+        );
+        return if (retryBudgetAllowsYield(request_prior_attempts, runtime.config.worker_retry_max_attempts))
+            .request
+        else
+            null;
+    }
+
+    runtime.active_failure_fingerprint = pipelineFailureFingerprint(err);
     const request_prior_attempts = requestPriorAttempts(
         runtime.active_failure_fingerprint,
         runtime.retry_failure_fingerprint,
         runtime.retry_failure_count,
     );
-    // One durable no-progress ceiling covers request and pipeline failures.
-    // The identity budget additionally prevents one bad document from
-    // consuming every retry in otherwise progressing work.
-    return retryBudgetAllowsYield(runtime.consecutive_retry_count, runtime.config.worker_retry_max_attempts) and
-        retryBudgetAllowsYield(request_prior_attempts, runtime.config.worker_retry_max_attempts);
+    return if (retryBudgetAllowsYield(runtime.consecutive_retry_count, runtime.config.worker_retry_max_attempts) and
+        retryBudgetAllowsYield(request_prior_attempts, runtime.config.worker_retry_max_attempts))
+        .pipeline
+    else
+        null;
+}
+
+fn workerLoopRetryBudgetAllowsYield(runtime: *EnrichmentRuntime, err: anyerror) bool {
+    return workerLoopRetryScopeIfAllowed(runtime, err) != null;
 }
 
 fn shouldYieldRequestError(runtime: *EnrichmentRuntime, err: anyerror) bool {
@@ -1133,6 +1688,7 @@ test "enrichment distinguishes transient capacity from permanent resource limits
 test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.UnexpectedEndOfInput));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnsupportedEmbeddingProvider));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.InvalidEmbeddingDimensions));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.ReadRequestFailed));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.OcrPromptEcho));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.TrivialOcrOutput));
@@ -1255,7 +1811,7 @@ test "pipeline failure replaces stale request retry identity" {
     try std.testing.expectEqual(pipeline_fingerprint, runtime.active_failure_fingerprint);
 }
 
-test "mixed request and pipeline failures exhaust one no-progress budget" {
+test "request-owned retries do not inherit unrelated pipeline debt" {
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
         .io_impl = null,
@@ -1284,7 +1840,11 @@ test "mixed request and pipeline failures exhaust one no-progress budget" {
 
     runtime.active_failure_fingerprint = 101;
     runtime.retry_error_has_request_identity = true;
-    try std.testing.expect(!workerLoopRetryBudgetAllowsYield(&runtime, error.EmbedRateLimited));
+    try std.testing.expectEqual(
+        WorkerRetryScope.request,
+        workerLoopRetryScopeIfAllowed(&runtime, error.EmbedRateLimited).?,
+    );
+    try std.testing.expectEqual(@as(u32, 2), runtime.consecutive_retry_count);
 }
 
 test "worker retry preserves only an explicitly authorized request identity" {
@@ -1897,11 +2457,9 @@ fn requestUsesMaterializedChunkArtifact(
 }
 
 const StaleEmbeddingDeletes = struct {
-    vector_keys: [][]u8 = &.{},
     artifact_delete_keys: [][]u8 = &.{},
 
     fn deinit(self: *@This(), alloc: Allocator) void {
-        freeKeyList(alloc, self.vector_keys);
         freeKeyList(alloc, self.artifact_delete_keys);
         self.* = .{};
     }
@@ -1937,15 +2495,15 @@ const AssetProducerBatchItem = struct {
 };
 
 fn assetProducerBatchFailureFingerprint(items: []const AssetProducerBatchItem) u64 {
-    return batchFailureFingerprint(items);
+    return batchFailureFingerprint(AssetProducerBatchItem, items);
 }
 
 fn plainDenseBatchFailureFingerprint(items: []const PlainDenseBatchItem) u64 {
-    return batchFailureFingerprint(items);
+    return batchFailureFingerprint(PlainDenseBatchItem, items);
 }
 
 fn chunkedDenseBatchFailureFingerprint(items: []const ChunkedDenseWindowItem) u64 {
-    return batchFailureFingerprint(items);
+    return batchFailureFingerprint(ChunkedDenseWindowItem, items);
 }
 
 test "enrichment batch retry identity covers every work item" {
@@ -1983,14 +2541,24 @@ test "enrichment batch retry identity covers every work item" {
         .chunk_key = second.chunk_key,
         .source_hash = 21,
     };
+    var changed_input = second;
+    changed_input.request.input_kind = .materialized_chunks;
     const original = [_]TestItem{ first, second };
     const changed = [_]TestItem{ first, replacement };
     const changed_content = [_]TestItem{ first, changed_materialization };
     const reordered = [_]TestItem{ second, first };
-    try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(&changed));
-    try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(&changed_content));
-    try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(&reordered));
-    try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(original[0..1]));
+    const changed_input_items = [_]TestItem{ first, changed_input };
+    const original_slice: []const TestItem = &original;
+    const changed_slice: []const TestItem = &changed;
+    const changed_content_slice: []const TestItem = &changed_content;
+    const changed_input_slice: []const TestItem = &changed_input_items;
+    const reordered_slice: []const TestItem = &reordered;
+    const shortened_slice: []const TestItem = original_slice.ptr[0..1];
+    try std.testing.expect(batchFailureFingerprint(TestItem, original_slice) != batchFailureFingerprint(TestItem, changed_slice));
+    try std.testing.expect(batchFailureFingerprint(TestItem, original_slice) != batchFailureFingerprint(TestItem, changed_content_slice));
+    try std.testing.expect(batchFailureFingerprint(TestItem, original_slice) != batchFailureFingerprint(TestItem, changed_input_slice));
+    try std.testing.expect(batchFailureFingerprint(TestItem, original_slice) != batchFailureFingerprint(TestItem, reordered_slice));
+    try std.testing.expect(batchFailureFingerprint(TestItem, original_slice) != batchFailureFingerprint(TestItem, shortened_slice));
 }
 
 fn freePlainDenseBatchItems(alloc: Allocator, items: []PlainDenseBatchItem) void {
@@ -2034,13 +2602,36 @@ fn freeRequestPlanCache(alloc: Allocator, cache: *std.ArrayListUnmanaged(Request
     cache.deinit(alloc);
 }
 
+fn clearWorkerChunkCache(alloc: Allocator, cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry)) void {
+    for (cache.items) |entry| {
+        alloc.free(entry.key);
+        chunker_mod.freeChunks(alloc, entry.chunks);
+    }
+    cache.clearRetainingCapacity();
+}
+
+fn clearRequestPlanCache(alloc: Allocator, cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry)) void {
+    for (cache.items) |entry| {
+        alloc.free(entry.doc_key);
+        enrichment_types.deinitGeneratedRequests(alloc, entry.requests);
+    }
+    cache.clearRetainingCapacity();
+}
+
 fn requestHasChunking(request: enrichment_types.GeneratedEnrichmentRequest) bool {
     return request.chunk_size > 0 or request.chunker_json.len > 0;
 }
 
+fn requestHasChunkSource(request: enrichment_types.GeneratedEnrichmentRequest) bool {
+    return switch (request.kind) {
+        .dense_embedding, .sparse_embedding => request.input_kind != .document,
+        .asset, .chunk_text => false,
+    };
+}
+
 fn requestCanBatchPlainDense(request: enrichment_types.GeneratedEnrichmentRequest) bool {
     return request.kind == .dense_embedding and
-        !requestHasChunking(request) and
+        !requestHasChunkSource(request) and
         request.source_template.len == 0;
 }
 
@@ -2049,6 +2640,7 @@ fn samePlainDenseBatchKey(
     rhs: enrichment_types.GeneratedEnrichmentRequest,
 ) bool {
     return lhs.expected_dims == rhs.expected_dims and
+        lhs.input_kind == rhs.input_kind and
         std.mem.eql(u8, requestEmbeddingName(lhs), requestEmbeddingName(rhs)) and
         std.mem.eql(u8, lhs.execution_json, rhs.execution_json);
 }
@@ -2183,10 +2775,16 @@ fn getOrCreateRequestChunks(
     };
     defer runtime.alloc.free(source_text);
 
+    const activity_indexes = runtime.index_manager.vectorIndexesForChunk(runtime.alloc, requestArtifactName(request)) catch null;
+    defer if (activity_indexes) |names| freeOwnedIndexNames(runtime.alloc, names);
+    var chunks_created: usize = 0;
+    if (activity_indexes) |names| updateIndexPreparation(runtime, names, true, 0);
+    defer if (activity_indexes) |names| updateIndexPreparation(runtime, names, false, chunks_created);
     const chunks = if (request.chunker_json.len > 0)
         try chunker_mod.chunkTextWithConfigJson(runtime.alloc, source_text, request.chunker_json)
     else
         try chunker_mod.chunkText(runtime.alloc, source_text, request.chunk_size, request.chunk_overlap);
+    chunks_created = chunks.len;
 
     try cache.append(runtime.alloc, .{
         .key = cache_key,
@@ -2215,6 +2813,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     config: Config,
     applied_sequence: u64 = 0,
     target_sequence: u64 = 0,
+    activity_epoch: u64 = 0,
     processed_requests: u64 = 0,
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
@@ -2250,6 +2849,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     dense_artifact_bytes_written: u64 = 0,
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
+    index_embedding_activity: std.StringHashMapUnmanaged(types.EmbeddingActivityStats) = .empty,
     published_generated_artifacts: std.StringHashMapUnmanaged(void) = .empty,
     isolated_failed_indexes: std.StringHashMapUnmanaged(void) = .empty,
     isolated_failed_sources: std.StringHashMapUnmanaged(void) = .empty,
@@ -2291,6 +2891,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .failure_pending_fence = failure_pending_fence,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
+            .activity_epoch = newActivityEpoch(config),
             .config = .{
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
@@ -2299,6 +2900,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .enable_without_producers = config.enable_without_producers,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
+                .io = config.io,
                 .resource_manager = config.resource_manager,
                 .clock = config.clock,
                 .inline_retry_max_attempts = config.inline_retry_max_attempts,
@@ -2323,6 +2925,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn deinit(self: *@This()) void {
+        clearIndexEmbeddingActivity(self);
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         if (self.owns_store) self.store.deinit();
@@ -2360,9 +2963,11 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             try saveAppliedSequenceWithRetry(self, scope_name, next_applied);
             self.applied_sequence = next_applied;
         }
+        try clearReplayCursorWithRetry(self);
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         self.retrying = false;
+        clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
         self.worker_failed = false;
         self.consecutive_retry_count = 0;
         self.next_retry_at_ms = 0;
@@ -2456,6 +3061,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.notifySequence(sequence);
         const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.replay_source, self.applied_sequence);
         defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
+        var replay_cursor = try loadReplayCursorForPass(self, self.applied_sequence);
+        defer if (replay_cursor) |*cursor| cursor.deinit(self.alloc);
 
         var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
         defer freeWorkerChunkCache(self.alloc, &chunk_cache);
@@ -2473,23 +3080,33 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         var window = GeneratedReplayWindow{ .alloc = self.alloc };
         defer window.deinit();
         const max_window_items = generatedReplayWindowItems();
+        const max_preparation_items = generatedPreparationWindowItems();
         var processed_request_count: u64 = 0;
 
         var max_seen = self.applied_sequence;
+        var last_processed: ?enrichment_worker.PendingDocumentGroup = null;
         for (pending) |group| {
             try guard.check();
             max_seen = @max(max_seen, group.sequence);
+            if (replayCursorCoversGroup(replay_cursor, self.applied_sequence, group)) continue;
             try processPendingDocumentGroup(self, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count, guard);
-            if (window.itemCount() >= max_window_items) try flushGeneratedReplayWindow(self, &window);
+            last_processed = group;
+            if (deferredGeneratedWorkShouldFlush(
+                deferred_plain_dense.items.len,
+                deferred_chunked_dense.items.len,
+                deferred_assets.items.len,
+                max_preparation_items,
+            )) {
+                try flushDeferredGeneratedWork(self, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window);
+                try saveReplayCursorForGroup(self, self.applied_sequence, group);
+            } else if (window.itemCount() >= max_window_items) {
+                try flushGeneratedReplayWindow(self, &window);
+                try saveReplayCursorForGroup(self, self.applied_sequence, group);
+            }
         }
         try guard.check();
-        try flushAssetProducerBatch(self, &deferred_assets, &window);
-        try guard.check();
-        try processPlainDenseWindow(self, deferred_plain_dense.items, &window);
-        try guard.check();
-        try processChunkedDenseWindow(self, deferred_chunked_dense.items, &chunk_cache, &window);
-        try guard.check();
-        try flushGeneratedReplayWindow(self, &window);
+        try flushDeferredGeneratedWork(self, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window);
+        if (last_processed) |group| try saveReplayCursorForGroup(self, self.applied_sequence, group);
         if (pending.len == 0) {
             max_seen = sequence;
         }
@@ -2499,8 +3116,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.retry_error_has_request_identity = false;
             try saveAppliedSequenceWithRetry(self, scope_name, max_seen);
             self.applied_sequence = max_seen;
+            try clearReplayCursorWithRetry(self);
             self.processed_requests += processed_request_count;
             self.retrying = false;
+            clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
             self.worker_failed = false;
             self.consecutive_retry_count = 0;
             self.next_retry_at_ms = 0;
@@ -2520,6 +3139,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         }
         try saveAppliedSequenceWithRetry(self, scope_name, sequence);
         self.applied_sequence = sequence;
+        try clearReplayCursorWithRetry(self);
         self.target_sequence = @max(self.target_sequence, sequence);
         self.consecutive_retry_count = 0;
         self.next_retry_at_ms = 0;
@@ -2584,6 +3204,21 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         return self.isolated_failed_indexes.contains(index_name);
     }
 
+    pub fn indexEmbeddingActivity(self: *@This(), index_name: []const u8) types.EmbeddingActivityStats {
+        const index_generation = self.index_manager.coverageGenerationForIndex(index_name) orelse 0;
+        const activity = self.index_embedding_activity.get(index_name) orelse return .{
+            .epoch = embeddingActivityEpoch(self.activity_epoch, index_generation, index_name),
+            .sample_sequence = 1,
+            .index_generation = index_generation,
+        };
+        if (activity.index_generation != index_generation) return .{
+            .epoch = embeddingActivityEpoch(self.activity_epoch, index_generation, index_name),
+            .sample_sequence = 1,
+            .index_generation = index_generation,
+        };
+        return activity;
+    }
+
     pub fn indexSourceHasIsolatedFailure(self: *@This(), index_name: []const u8, artifact_name: []const u8) bool {
         var it = self.isolated_failed_sources.iterator();
         while (it.next()) |entry| if (isolatedFailedSourceMatches(entry.key_ptr.*, index_name, artifact_name)) return true;
@@ -2615,7 +3250,13 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     sync_waiter_count: std.atomic.Value(u32) = .init(0),
     replay_pass_active: bool = false,
     shutdown: bool = false,
+    /// Provider-visible cooperative cancellation for lifecycle handoff. The
+    /// runtime's bool is mutex-protected for worker coordination; this atomic
+    /// is intentionally separate so provider callbacks can observe shutdown
+    /// without acquiring a lock held by the lifecycle owner.
+    shutdown_requested: std.atomic.Value(bool) = .init(false),
     target_sequence: u64 = 0,
+    activity_epoch: u64 = 0,
     applied_sequence: u64 = 0,
     processed_requests: u64 = 0,
     error_count: u64 = 0,
@@ -2652,6 +3293,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     dense_artifact_bytes_written: u64 = 0,
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
+    index_embedding_activity: std.StringHashMapUnmanaged(types.EmbeddingActivityStats) = .empty,
     last_error_name: ?[]const u8 = null,
     published_generated_artifacts: std.StringHashMapUnmanaged(void) = .empty,
     isolated_failed_indexes: std.StringHashMapUnmanaged(void) = .empty,
@@ -2700,6 +3342,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .failure_pending_fence = failure_pending_fence,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
+            .activity_epoch = newActivityEpoch(config),
             .config = .{
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
@@ -2708,6 +3351,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .enable_without_producers = config.enable_without_producers,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
+                .io = backend_runtime.inferenceIo() orelse config.io,
                 .resource_manager = config.resource_manager,
                 .clock = config.clock,
                 .inline_retry_max_attempts = config.inline_retry_max_attempts,
@@ -2739,6 +3383,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn deinit(self: *EnrichmentRuntime) void {
         self.stop();
+        clearIndexEmbeddingActivity(self);
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         self.ownership.deinit(self.alloc);
@@ -2750,6 +3395,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn stop(self: *EnrichmentRuntime) void {
+        self.shutdown_requested.store(true, .release);
         if (self.io_impl) |io_impl| {
             const io = io_impl.io();
             self.mutex.lockUncancelable(io);
@@ -2758,6 +3404,20 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.mutex.unlock(io);
 
             if (self.future) |*future| _ = future.await(io);
+
+            // Cancellation is an admission signal, not proof that a native
+            // provider callback has left the runtime. In particular, an
+            // in-process inference kernel may observe cancellation only after
+            // returning its allocator-owned result. The background future is
+            // not the lifetime authority for foreground/drain replay owners,
+            // so runtime/provider teardown must also drain the single-flight
+            // replay ownership fence. shutdown=true prevents new passes from
+            // entering while the current owner exits.
+            self.mutex.lockUncancelable(io);
+            while (self.replay_pass_active) {
+                self.cond.waitUncancelable(io, &self.mutex);
+            }
+            self.mutex.unlock(io);
         }
         self.future = null;
         self.shutdown = false;
@@ -2771,6 +3431,11 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn start(self: *EnrichmentRuntime) !void {
         if (self.future != null) return;
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
+        self.shutdown_requested.store(false, .release);
+        const cancellation = CancellationToken.fromAtomic(&self.shutdown_requested);
+        self.config.cancellation = cancellation;
+        if (self.config.dense_embedder) |dense_embedder| dense_embedder.setCancellation(cancellation);
+        if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.setCancellation(cancellation);
         const io = io_impl.io();
         self.future = try io.concurrent(workerMain, .{self});
     }
@@ -2795,6 +3460,17 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             break :blk self.status_hook;
         };
         if (hook) |value| value.notify();
+    }
+
+    fn notifyActivityHook(self: *EnrichmentRuntime) void {
+        const hook = blk: {
+            const io_impl = self.io_impl orelse break :blk self.status_hook;
+            const io = io_impl.io();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            break :blk self.status_hook;
+        };
+        if (hook) |value| value.notifyActivity();
     }
 
     pub fn notifySequence(self: *EnrichmentRuntime, sequence: u64) void {
@@ -2823,6 +3499,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.target_sequence = @max(self.target_sequence, @max(target_sequence, next_applied));
         self.last_error_name = null;
         self.retrying = false;
+        clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
         self.worker_failed = false;
         self.consecutive_retry_count = 0;
         self.next_retry_at_ms = 0;
@@ -2839,6 +3516,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         if (next_applied != current_applied) {
             try saveAppliedSequenceWithRetry(self, scope_name, next_applied);
         }
+        try clearReplayCursorWithRetry(self);
         // Persist retry retirement even when resume keeps the same applied
         // checkpoint; otherwise restart reloads stale failure counters.
         try saveRuntimeStatusWithRetry(self, scope_name, status);
@@ -3076,6 +3754,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.target_sequence = @max(self.target_sequence, sequence);
         self.last_error_name = null;
         self.retrying = false;
+        clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
         self.worker_failed = false;
         self.consecutive_retry_count = 0;
         self.next_retry_at_ms = 0;
@@ -3092,6 +3771,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         if (changed) {
             try saveAppliedSequenceWithRetry(self, scope_name, sequence);
         }
+        try clearReplayCursorWithRetry(self);
         try saveRuntimeStatusWithRetry(self, scope_name, status);
         self.notifyStatusHook();
     }
@@ -3171,6 +3851,24 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         return self.isolated_failed_indexes.contains(index_name);
     }
 
+    pub fn indexEmbeddingActivity(self: *EnrichmentRuntime, index_name: []const u8) types.EmbeddingActivityStats {
+        const maybe_io = if (self.io_impl) |io_impl| io_impl.io() else null;
+        if (maybe_io) |io| self.mutex.lockUncancelable(io);
+        defer if (maybe_io) |io| self.mutex.unlock(io);
+        const index_generation = self.index_manager.coverageGenerationForIndex(index_name) orelse 0;
+        const activity = self.index_embedding_activity.get(index_name) orelse return .{
+            .epoch = embeddingActivityEpoch(self.activity_epoch, index_generation, index_name),
+            .sample_sequence = 1,
+            .index_generation = index_generation,
+        };
+        if (activity.index_generation != index_generation) return .{
+            .epoch = embeddingActivityEpoch(self.activity_epoch, index_generation, index_name),
+            .sample_sequence = 1,
+            .index_generation = index_generation,
+        };
+        return activity;
+    }
+
     pub fn indexSourceHasIsolatedFailure(self: *EnrichmentRuntime, index_name: []const u8, artifact_name: []const u8) bool {
         const maybe_io = if (self.io_impl) |io_impl| io_impl.io() else null;
         if (maybe_io) |io| self.mutex.lockUncancelable(io);
@@ -3187,6 +3885,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.error_count += 1;
         self.fatal_error_count += 1;
         self.retrying = false;
+        clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
         self.next_retry_at_ms = 0;
         self.worker_failed = true;
         self.retry_error_has_request_identity = false;
@@ -3200,20 +3899,25 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.notifyStatusHook();
     }
 
-    fn recordRetryableError(self: *EnrichmentRuntime, io: Io, err: anyerror) void {
-        std.log.warn("enrichment worker transient failure, will retry: {s}", .{@errorName(err)});
+    fn recordRetryableError(self: *EnrichmentRuntime, io: Io, err: anyerror, scope: WorkerRetryScope) void {
+        std.log.warn("enrichment {s} transient failure, will retry: {s}", .{ @tagName(scope), @errorName(err) });
         var status: enrichment_state.RuntimeStatus = .{};
         self.mutex.lockUncancelable(io);
         self.error_count += 1;
         self.retryable_error_count += 1;
-        self.consecutive_retry_count +|= 1;
+        if (scope == .pipeline) self.consecutive_retry_count +|= 1;
         if (self.retry_failure_fingerprint != self.active_failure_fingerprint) {
             self.retry_failure_fingerprint = self.active_failure_fingerprint;
             self.retry_failure_count = 0;
         }
         self.retry_failure_count +|= 1;
-        self.next_retry_at_ms = self.config.clock.nowRealtimeMs() +| workerRetryDelayMs(self.consecutive_retry_count);
+        const retry_ordinal = if (scope == .request)
+            self.retry_failure_count
+        else
+            self.consecutive_retry_count;
+        self.next_retry_at_ms = self.config.clock.nowRealtimeMs() +| workerRetryDelayMs(retry_ordinal);
         self.retrying = true;
+        markScheduledIndexEmbeddingRetryAssumeLocked(self);
         self.retry_error_has_request_identity = false;
         status = runtimeStatusSnapshot(self);
         broadcastRuntimeStateChanged(self, io);
@@ -3463,11 +4167,11 @@ test "foreground enrichment rejects providers without a bounded-operation contra
 
 fn handleWorkerLoopError(runtime: *EnrichmentRuntime, io: Io, err: anyerror) void {
     if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
-    if (enrichmentErrorDisposition(err) == .retryable_request and
-        workerLoopRetryBudgetAllowsYield(runtime, err))
-    {
-        runtime.recordRetryableError(io, err);
-        return;
+    if (enrichmentErrorDisposition(err) == .retryable_request) {
+        if (workerLoopRetryScopeIfAllowed(runtime, err)) |scope| {
+            runtime.recordRetryableError(io, err, scope);
+            return;
+        }
     }
     runtime.recordError(io, err);
 }
@@ -3695,6 +4399,7 @@ fn noteTerminalRequestFailure(
     runtime.error_count += 1;
     runtime.fatal_error_count += 1;
     runtime.retrying = false;
+    clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime);
     runtime.next_retry_at_ms = 0;
     runtime.worker_failed = false;
     for (indexes) |index_name| if (index_name.len > 0) {
@@ -3720,7 +4425,7 @@ fn failureIdentityForRequest(request: enrichment_types.GeneratedEnrichmentReques
             .asset, .chunk_text => requestArtifactName(request),
         },
         .source_artifact_name = switch (request.kind) {
-            .dense_embedding, .sparse_embedding => if (requestHasChunking(request)) requestArtifactName(request) else "",
+            .dense_embedding, .sparse_embedding => if (requestHasChunkSource(request)) request.artifact_name else "",
             .asset, .chunk_text => "",
         },
         .doc_key = request.doc_key,
@@ -3792,7 +4497,7 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
                     .asset, .chunk_text => requestArtifactName(request),
                 },
                 .source_artifact_name = switch (request.kind) {
-                    .dense_embedding, .sparse_embedding => if (requestHasChunking(request)) requestArtifactName(request) else "",
+                    .dense_embedding, .sparse_embedding => if (requestHasChunkSource(request)) request.artifact_name else "",
                     .asset, .chunk_text => "",
                 },
                 .doc_key = request.doc_key,
@@ -4099,6 +4804,7 @@ test "malformed chunked dense batch is isolated without failing the worker" {
         .config = .{},
         .ownership = undefined,
     };
+    defer clearIndexEmbeddingActivity(&runtime);
     defer clearIsolatedFailedIndexes(&runtime);
     const request = enrichment_types.GeneratedEnrichmentRequest{
         .kind = .dense_embedding,
@@ -4347,6 +5053,8 @@ fn runForegroundCatchUpPassOwned(
 
     const pending = try enrichment_worker.collectPendingDocumentGroups(runtime.alloc, runtime.replay_source, runtime.applied_sequence);
     defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, pending);
+    var replay_cursor = try loadReplayCursorForPass(runtime, runtime.applied_sequence);
+    defer if (replay_cursor) |*cursor| cursor.deinit(runtime.alloc);
     try guard.check();
 
     var processed_request_count: u64 = 0;
@@ -4370,13 +5078,16 @@ fn runForegroundCatchUpPassOwned(
         var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
         defer window.deinit();
         const max_window_items = generatedReplayWindowItems();
+        const max_preparation_items = generatedPreparationWindowItems();
 
         processed_request_count = 0;
         max_seen = runtime.applied_sequence;
+        var last_processed: ?enrichment_worker.PendingDocumentGroup = null;
 
         for (pending) |group| {
             try guard.check();
             max_seen = @max(max_seen, group.sequence);
+            if (replayCursorCoversGroup(replay_cursor, runtime.applied_sequence, group)) continue;
             processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count, guard) catch |err| {
                 if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
                 // The embedder already performed its bounded inline retry
@@ -4385,31 +5096,35 @@ fn runForegroundCatchUpPassOwned(
                 // replay window without backoff.
                 return err;
             };
-            flushGeneratedReplayWindowIfNeeded(runtime, &window, max_window_items) catch |err| {
-                if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-                return err;
-            };
+            last_processed = group;
+            if (deferredGeneratedWorkShouldFlush(
+                deferred_plain_dense.items.len,
+                deferred_chunked_dense.items.len,
+                deferred_assets.items.len,
+                max_preparation_items,
+            )) {
+                flushDeferredGeneratedWork(runtime, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window) catch |err| {
+                    if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
+                    return err;
+                };
+                try saveReplayCursorForGroup(runtime, runtime.applied_sequence, group);
+            } else {
+                const publish_window = window.itemCount() >= max_window_items;
+                flushGeneratedReplayWindowIfNeeded(runtime, &window, max_window_items) catch |err| {
+                    if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
+                    return err;
+                };
+                if (publish_window) {
+                    try saveReplayCursorForGroup(runtime, runtime.applied_sequence, group);
+                }
+            }
         }
         try guard.check();
-        flushAssetProducerBatch(runtime, &deferred_assets, &window) catch |err| {
+        flushDeferredGeneratedWork(runtime, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
             return err;
         };
-        try guard.check();
-        processPlainDenseWindow(runtime, deferred_plain_dense.items, &window) catch |err| {
-            if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            return err;
-        };
-        try guard.check();
-        processChunkedDenseWindow(runtime, deferred_chunked_dense.items, &chunk_cache, &window) catch |err| {
-            if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            return err;
-        };
-        try guard.check();
-        flushGeneratedReplayWindow(runtime, &window) catch |err| {
-            if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            return err;
-        };
+        if (last_processed) |group| try saveReplayCursorForGroup(runtime, runtime.applied_sequence, group);
         break;
     }
     if (pending.len == 0) {
@@ -4419,11 +5134,13 @@ fn runForegroundCatchUpPassOwned(
     if (max_seen > runtime.applied_sequence) {
         setActiveFailureFingerprint(runtime, 0);
         try saveAppliedSequenceWithRetry(runtime, scope_name, max_seen);
+        try clearReplayCursorWithRetry(runtime);
         var status: enrichment_state.RuntimeStatus = .{};
         runtime.mutex.lockUncancelable(io);
         runtime.applied_sequence = max_seen;
         runtime.processed_requests += processed_request_count;
         runtime.retrying = false;
+        clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime);
         runtime.worker_failed = false;
         runtime.consecutive_retry_count = 0;
         runtime.next_retry_at_ms = 0;
@@ -4441,6 +5158,7 @@ fn runForegroundCatchUpPassOwned(
         var status: enrichment_state.RuntimeStatus = .{};
         runtime.mutex.lockUncancelable(io);
         runtime.retrying = false;
+        clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime);
         runtime.worker_failed = false;
         runtime.consecutive_retry_count = 0;
         runtime.next_retry_at_ms = 0;
@@ -4483,7 +5201,7 @@ fn processPendingDocumentGroup(
             try deferred_plain_dense.append(runtime.alloc, request);
             continue;
         }
-        if (request.kind == .dense_embedding and requestHasChunking(request)) {
+        if (request.kind == .dense_embedding and requestHasChunkSource(request)) {
             try deferred_chunked_dense.append(runtime.alloc, request);
             continue;
         }
@@ -4511,6 +5229,32 @@ fn processPendingDocumentGroup(
             },
         }
     }
+}
+
+/// Finish one bounded preparation quantum and publish all output before
+/// inspecting more source documents. Request and chunk caches own the strings
+/// borrowed by the deferred queues, so they are cleared only after every queue
+/// has completed and the derived window is durable.
+fn flushDeferredGeneratedWork(
+    runtime: *EnrichmentRuntime,
+    chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
+    request_plan_cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry),
+    deferred_plain_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+    deferred_chunked_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+    deferred_assets: *std.ArrayListUnmanaged(AssetProducerBatchItem),
+    window: *GeneratedReplayWindow,
+) !void {
+    if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+    try flushAssetProducerBatch(runtime, deferred_assets, window);
+    if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+    try processPlainDenseWindow(runtime, deferred_plain_dense.items, window);
+    deferred_plain_dense.clearRetainingCapacity();
+    if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+    try processChunkedDenseWindow(runtime, deferred_chunked_dense.items, chunk_cache, window);
+    deferred_chunked_dense.clearRetainingCapacity();
+    try flushGeneratedReplayWindow(runtime, window);
+    clearWorkerChunkCache(runtime.alloc, chunk_cache);
+    clearRequestPlanCache(runtime.alloc, request_plan_cache);
 }
 
 fn processAsset(
@@ -4669,6 +5413,7 @@ fn flushAssetProducerBatch(
     window: *GeneratedReplayWindow,
 ) !void {
     if (items.items.len == 0) return;
+    if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
     setActiveFailureFingerprint(runtime, assetProducerBatchFailureFingerprint(items.items));
     defer clearAssetProducerBatchItems(runtime.alloc, items);
 
@@ -4710,6 +5455,7 @@ fn flushAssetProducerBatch(
     }
 
     for (items.items, produced, 0..) |*item, output, idx| {
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         applyAssetProducerBatchOutput(runtime, item.*, output, window) catch |err| {
             runtime.alloc.free(output);
             produced[idx] = "";
@@ -4730,6 +5476,7 @@ fn flushAssetProducerBatchSequential(
     window: *GeneratedReplayWindow,
 ) !void {
     for (items) |item| {
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         setActiveFailureFingerprint(runtime, requestFailureFingerprint(item.request));
         const request = item.asRequest();
         const produced = assetProducerProduceGuarded(runtime, producer, runtime.alloc, request) catch |err| {
@@ -4844,10 +5591,15 @@ fn processDocumentExtractionAsset(
     defer if (download_budgeted) |*allocator| allocator.deinit();
     const download_alloc = if (download_budgeted) |*allocator| allocator.allocator() else runtime.alloc;
 
-    const fetched = template_remote.downloadRemoteContentOutcomeAllocWithConfig(
+    const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
         download_alloc,
-        runtime.config.remote_content,
-        runtime.config.secret_store,
+        remoteRenderConfig(
+            runtime.config.secret_store,
+            runtime.config.remote_content,
+            runtime.config.io,
+            runtime.config.cancellation,
+            null,
+        ),
         source_url,
         if (config.credentials.len > 0) config.credentials else null,
     ) catch |raw_err| {
@@ -8766,10 +9518,10 @@ fn flushChunkedDenseItems(
     setActiveFailureFingerprint(runtime, chunkedDenseBatchFailureFingerprint(batch_items));
     const batch_stats = textBatchByteStats(batch_texts);
     yieldToInteractiveEmbeds(runtime);
-    noteEmbedBatchStarted(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
+    noteEmbedBatchStarted(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
     const embed_started_ns = runtime.config.clock.nowRealtimeNs();
     const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, batch_texts, expected_dims) catch |err| {
-        noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         if (shouldYieldRequestError(runtime, err)) return err;
         try recordUniqueChunkedDenseRequestErrors(runtime, window, batch_items, err);
         clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
@@ -8777,12 +9529,12 @@ fn flushChunkedDenseItems(
     };
     defer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
     if (vectors.len != batch_items.len) {
-        noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         try recordUniqueChunkedDenseRequestErrors(runtime, window, batch_items, error.InvalidEmbeddingResponse);
         clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
         return false;
     }
-    noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
+    noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
 
     var embeddings = try runtime.alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, batch_items.len);
     var initialized_embeddings: usize = 0;
@@ -8792,7 +9544,6 @@ fn flushChunkedDenseItems(
     }
 
     for (batch_items, vectors, 0..) |item, vector, idx| {
-        try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, item.chunk_key);
         try writeEmbeddingArtifact(runtime, .{
             .base_key = item.chunk_key,
             .parent_doc_key = item.parent_doc_key,
@@ -9026,9 +9777,6 @@ fn processMaterializedChunkDenseRequest(
 
     for (existing_embedding_keys.items) |embedding_key| {
         if (try derivedEmbeddingBelongsToDesiredChunkSet(runtime.alloc, embedding_key, &desired_chunk_keys)) continue;
-        if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, embedding_key)) |base_key| {
-            try appendUniqueOwnedKey(runtime.alloc, &window.deleted_keys, base_key);
-        }
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
@@ -9055,7 +9803,7 @@ fn flushMaterializedSparseChunkSources(
     if (sources.items.len == 0) return;
     defer clearChunkEmbeddingSourceList(runtime.alloc, sources);
 
-    const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, sources.items);
+    const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, consumer_indexes, sources.items);
     defer {
         for (chunk_embeddings) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
         if (chunk_embeddings.len > 0) runtime.alloc.free(chunk_embeddings);
@@ -9245,9 +9993,6 @@ fn processMaterializedChunkSparseRequest(
 
     for (existing_embedding_keys.items) |embedding_key| {
         if (try derivedEmbeddingBelongsToDesiredChunkSet(runtime.alloc, embedding_key, &desired_chunk_keys)) continue;
-        if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, embedding_key)) |base_key| {
-            try appendUniqueOwnedKey(runtime.alloc, &window.deleted_keys, base_key);
-        }
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
@@ -9327,18 +10072,18 @@ fn flushPlainDenseItems(
     }
 
     yieldToInteractiveEmbeds(runtime);
-    noteEmbedBatchStarted(runtime, items.len, total_source_bytes, max_source_bytes);
+    noteEmbedBatchStarted(runtime, consumer_indexes, items.len, total_source_bytes, max_source_bytes);
     const embed_started_ns = runtime.config.clock.nowRealtimeNs();
     const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, texts, expected_dims) catch |err| {
-        noteEmbedBatchFinished(runtime, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        noteEmbedBatchFinished(runtime, consumer_indexes, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         return err;
     };
     defer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
     if (vectors.len != items.len) {
-        noteEmbedBatchFinished(runtime, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        noteEmbedBatchFinished(runtime, consumer_indexes, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         return error.InvalidEmbeddingResponse;
     }
-    noteEmbedBatchFinished(runtime, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), true);
+    noteEmbedBatchFinished(runtime, consumer_indexes, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), true);
 
     for (items, vectors) |item, vector| {
         try writeEmbeddingArtifact(runtime, .{
@@ -9372,9 +10117,12 @@ fn processPlainDenseWindow(
     const processed = try runtime.alloc.alloc(bool, requests.len);
     defer runtime.alloc.free(processed);
     @memset(processed, false);
+    var deferred_retry_error: ?anyerror = null;
+    var deferred_retry_fingerprint: u64 = 0;
 
     var i: usize = 0;
     while (i < requests.len) : (i += 1) {
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         if (processed[i]) continue;
         processed[i] = true;
 
@@ -9417,10 +10165,36 @@ fn processPlainDenseWindow(
         }
 
         flushPlainDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, items.items, window) catch |err| {
-            if (shouldYieldRequestError(runtime, err)) return err;
+            if (shouldYieldRequestError(runtime, err)) {
+                if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                    return err;
+                // One provider/config key must not monopolize the group-wide
+                // replay owner. Skip the rest of this exact key for the
+                // current quantum, continue independent indexes, publish their
+                // successful work, and only then yield the original retry to
+                // the durable supervisor. The applied source prefix remains
+                // unchanged, so the failed key is retried after backoff while
+                // successful artifacts are crash-idempotent on replay.
+                if (deferred_retry_error == null) {
+                    deferred_retry_error = err;
+                    deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+                }
+                var remaining = i + 1;
+                while (remaining < requests.len) : (remaining += 1) {
+                    if (samePlainDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
+                }
+                continue;
+            }
             for (items.items) |item| try recordIsolatedRequestError(runtime, window, item.request, err);
             continue;
         };
+    }
+    if (deferred_retry_error) |err| {
+        // Do not discard independent progress just because this replay quantum
+        // must retain an earlier request's durable retry identity.
+        try flushGeneratedReplayWindow(runtime, window);
+        restoreDeferredRequestRetryAuthorization(runtime, deferred_retry_fingerprint);
+        return err;
     }
 }
 
@@ -9439,6 +10213,7 @@ fn processChunkedDenseWindow(
 
     var i: usize = 0;
     while (i < requests.len) : (i += 1) {
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         if (processed[i]) continue;
         processed[i] = true;
 
@@ -9468,6 +10243,7 @@ fn processChunkedDenseWindow(
 
         var j: usize = i;
         while (j < requests.len) : (j += 1) {
+            if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
             if (processed[j] and j != i) continue;
             const request = requests[j];
             if (!sameChunkedDenseBatchKey(seed, request)) continue;
@@ -9496,6 +10272,7 @@ fn processChunkedDenseWindow(
             }
 
             source_loop: for (source_set.sources) |*source| {
+                if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
                 const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, embedding_artifact_name);
                 defer runtime.alloc.free(embedding_key);
@@ -9616,6 +10393,7 @@ fn flushGeneratedReplayWindow(
         try applyCoverageOutcomeTransitions(runtime, window.coverage_transitions.items);
         clearQueuedCoverageTransitions(runtime.alloc, &window.coverage_transitions, &window.coverage_transition_keys);
         try noteDurableRetryProgress(runtime, previous_failure_fingerprint);
+        completeWindowPublishing(window);
         succeeded = true;
         return;
     }
@@ -9631,6 +10409,7 @@ fn flushGeneratedReplayWindow(
     try rememberPublishedGeneratedBatch(runtime, batch);
     runtime.notify_fn(runtime.notify_ctx, sequence);
     try noteDurableRetryProgress(runtime, previous_failure_fingerprint);
+    completeWindowPublishing(window);
     succeeded = true;
 }
 
@@ -9703,6 +10482,7 @@ fn appendOwnedDenseEmbeddingsToWindow(
     embeddings: *[]derived_types.DerivedDenseEmbeddingWrite,
 ) !void {
     if (embeddings.*.len == 0) return;
+    for (embeddings.*) |embedding| try markWindowPublishing(runtime, window, &.{embedding.index_name});
     try window.dense_embeddings.appendSlice(runtime.alloc, embeddings.*);
     runtime.alloc.free(embeddings.*);
     embeddings.* = &.{};
@@ -9714,6 +10494,7 @@ fn appendOwnedSparseEmbeddingsToWindow(
     embeddings: *[]derived_types.DerivedSparseEmbeddingWrite,
 ) !void {
     if (embeddings.*.len == 0) return;
+    for (embeddings.*) |embedding| try markWindowPublishing(runtime, window, &.{embedding.index_name});
     try window.sparse_embeddings.appendSlice(runtime.alloc, embeddings.*);
     runtime.alloc.free(embeddings.*);
     embeddings.* = &.{};
@@ -9773,8 +10554,6 @@ fn mergeOwnedStaleEmbeddingDeletesIntoWindow(
     stale: *StaleEmbeddingDeletes,
 ) !void {
     errdefer stale.deinit(runtime.alloc);
-    try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale.vector_keys);
-    stale.vector_keys = &.{};
     try mergeOwnedArtifactDeleteKeysIntoWindow(runtime, window, stale.artifact_delete_keys);
     stale.artifact_delete_keys = &.{};
 }
@@ -9799,10 +10578,22 @@ fn processChunkText(
     }
 
     const persist_chunks = try shouldStoreChunkArtifacts(runtime.alloc, request, text_indexes.len != 0);
-    const desired_chunks: []const chunker_mod.Chunk = if (persist_chunks) chunks else &.{};
-    const desired_chunk_keys = try chunkKeysForChunks(runtime.alloc, request.doc_key, artifact_name, desired_chunks);
+    // Stored chunk rows and derived embeddings have independent lifecycles.
+    // An ephemeral chunker intentionally wants no chunk records, but its
+    // deterministic virtual chunk identities still own the embedding
+    // artifacts published for those chunks. Conflating the two desired sets
+    // makes every idempotent replay delete the serving vectors before adding
+    // them back.
+    const desired_chunk_keys = try chunkKeysForChunks(runtime.alloc, request.doc_key, artifact_name, chunks);
     defer freeKeyList(runtime.alloc, desired_chunk_keys);
-    const stale_vector_keys = try deleteStaleChunkArtifacts(runtime, request.doc_key, artifact_name, desired_chunk_keys);
+    const desired_stored_chunk_keys: []const []const u8 = if (persist_chunks) desired_chunk_keys else &.{};
+    const stale_vector_keys = try deleteStaleChunkArtifacts(
+        runtime,
+        request.doc_key,
+        artifact_name,
+        desired_stored_chunk_keys,
+        desired_chunk_keys,
+    );
     // Graph reconciliation consumes the artifact journal, not the vector/text
     // deletion stream. Publish stale chunk identities there as well so graph
     // edges disappear when a source document shrinks or is rechunked.
@@ -9950,7 +10741,7 @@ fn processDenseEmbedding(
         runtime.alloc.free(consumer_indexes);
     }
     if (consumer_indexes.len == 0) return;
-    if ((request.chunk_size > 0 or request.chunker_json.len > 0) and chunk_artifact_name.len > 0) {
+    if (requestHasChunkSource(request)) {
         var source_set = try chunkEmbeddingSourceSetForRequest(runtime, request, chunk_artifact_name, chunk_cache);
         defer source_set.deinit(runtime.alloc);
 
@@ -9962,7 +10753,7 @@ fn processDenseEmbedding(
             return;
         }
 
-        const chunk_embeddings = try buildChunkDenseEmbeddingsFromSources(runtime, request, dense_embedder, source_set.sources);
+        const chunk_embeddings = try buildChunkDenseEmbeddingsFromSources(runtime, request, dense_embedder, consumer_indexes, source_set.sources);
         defer {
             for (chunk_embeddings) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
             runtime.alloc.free(chunk_embeddings);
@@ -9974,9 +10765,6 @@ fn processDenseEmbedding(
             return;
         }
 
-        for (chunk_embeddings) |embedding| {
-            if (embedding.vector.len > 0) try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, embedding.doc_key);
-        }
         try writeChunkEmbeddingArtifacts(runtime, request.doc_key, request.source_field, request.producer_json, embedding_artifact_name, chunk_embeddings);
         try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
         var expanded = try expandDenseEmbeddingsForConsumers(runtime, chunk_embeddings, consumer_indexes);
@@ -10090,7 +10878,7 @@ fn processSparseEmbedding(
     if (consumer_indexes.len == 0) return;
 
     const chunk_artifact_name = requestArtifactName(request);
-    if ((request.chunk_size > 0 or request.chunker_json.len > 0) and chunk_artifact_name.len > 0) {
+    if (requestHasChunkSource(request)) {
         if (requestUsesMaterializedChunkArtifact(runtime, chunk_artifact_name)) {
             try processMaterializedChunkSparseRequest(runtime, request, chunk_artifact_name, embedding_artifact_name, sparse_embedder, consumer_indexes, window);
             return;
@@ -10106,7 +10894,7 @@ fn processSparseEmbedding(
             return;
         }
 
-        const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, source_set.sources);
+        const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, consumer_indexes, source_set.sources);
         defer {
             for (chunk_embeddings) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
             runtime.alloc.free(chunk_embeddings);
@@ -10153,7 +10941,13 @@ fn processSparseEmbedding(
         return;
     }
 
-    var sparse = try embedSparseWithRetry(sparse_embedder, runtime, embedding_artifact_name, source_text);
+    noteEmbedBatchStarted(runtime, consumer_indexes, 1, source_text.len, source_text.len);
+    const embed_started_ns = runtime.config.clock.nowRealtimeNs();
+    var sparse = embedSparseWithRetry(sparse_embedder, runtime, embedding_artifact_name, source_text) catch |err| {
+        noteEmbedBatchFinished(runtime, consumer_indexes, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), false);
+        return err;
+    };
+    noteEmbedBatchFinished(runtime, consumer_indexes, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), true);
     defer sparse.deinit(runtime.alloc);
     try writeSparseEmbeddingArtifact(runtime, request.doc_key, embedding_artifact_name, source_hash, sparse.indices, sparse.values);
     try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
@@ -10170,6 +10964,7 @@ fn buildChunkDenseEmbeddingsFromSources(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
     dense_embedder: embedder_mod.DenseEmbedder,
+    consumer_indexes: []const []const u8,
     sources: []const ChunkEmbeddingSource,
 ) ![]derived_types.DerivedDenseEmbeddingWrite {
     if (sources.len == 0) return try runtime.alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, 0);
@@ -10227,18 +11022,18 @@ fn buildChunkDenseEmbeddingsFromSources(
         const batch_texts = chunk_texts.items[start..end];
         const batch_keys = chunk_keys.items[start..end];
         const batch_stats = textBatchByteStats(batch_texts);
-        noteEmbedBatchStarted(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
+        noteEmbedBatchStarted(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
         const embed_started_ns = runtime.config.clock.nowRealtimeNs();
         const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, requestEmbeddingName(request), batch_texts, request.expected_dims) catch |err| {
-            noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+            noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return err;
         };
         errdefer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
         if (vectors.len != batch_keys.len) {
-            noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+            noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return error.InvalidEmbeddingResponse;
         }
-        noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
+        noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
 
         for (batch_keys, vectors) |chunk_key, vector| {
             try embeddings.append(runtime.alloc, .{
@@ -10294,6 +11089,7 @@ fn buildChunkSparseEmbeddingsFromSources(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
     sparse_embedder: embedder_mod.SparseEmbedder,
+    consumer_indexes: []const []const u8,
     sources: []const ChunkEmbeddingSource,
 ) ![]derived_types.DerivedSparseEmbeddingWrite {
     if (sources.len == 0) return try runtime.alloc.alloc(derived_types.DerivedSparseEmbeddingWrite, 0);
@@ -10355,18 +11151,18 @@ fn buildChunkSparseEmbeddingsFromSources(
         const batch_keys = chunk_keys.items[start..end];
         const batch_hashes = chunk_hashes.items[start..end];
         const batch_stats = textBatchByteStats(batch_texts);
-        noteEmbedBatchStarted(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
+        noteEmbedBatchStarted(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
         const embed_started_ns = runtime.config.clock.nowRealtimeNs();
         const sparse_batch = embedSparseBatchWithRetry(sparse_embedder, runtime, requestEmbeddingName(request), batch_texts) catch |err| {
-            noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+            noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return err;
         };
         errdefer embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, sparse_batch);
         if (sparse_batch.len != batch_keys.len) {
-            noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+            noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return error.InvalidEmbeddingResponse;
         }
-        noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
+        noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
 
         for (batch_keys, batch_hashes, sparse_batch) |chunk_key, source_hash, sparse| {
             try writeSparseEmbeddingArtifact(runtime, chunk_key, requestEmbeddingName(request), source_hash, sparse.indices, sparse.values);
@@ -11421,17 +12217,17 @@ fn documentExtractionManifestHasLastError(alloc: Allocator, manifest_json: []con
     return parsed.value.object.get("last_error") != null;
 }
 
-fn documentExtractionEmptyCoverageOutcome(alloc: Allocator, manifest_json: []const u8) !CoverageOutcome {
+pub fn documentExtractionEmptyCoverageIsTerminalFailure(alloc: Allocator, manifest_json: []const u8) !bool {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
     const object = parsed.value.object;
-    if (object.get("last_error") != null) return .terminal_failed;
+    if (object.get("last_error") != null) return true;
     if (object.get("merge_status")) |value| {
-        if (value == .string and std.mem.eql(u8, value.string, "failed")) return .terminal_failed;
+        if (value == .string and std.mem.eql(u8, value.string, "failed")) return true;
     }
     if (object.get("route_type")) |value| {
-        if (value == .string and std.mem.eql(u8, value.string, "error")) return .terminal_failed;
+        if (value == .string and std.mem.eql(u8, value.string, "error")) return true;
     }
     const chunk_count = try jsonObjectU64(object, "chunk_count");
     const ocr_failed_count = try jsonObjectU64(object, "ocr_failed_count");
@@ -11439,8 +12235,14 @@ fn documentExtractionEmptyCoverageOutcome(alloc: Allocator, manifest_json: []con
         if (value == .array) value.array.items.len else 0
     else
         0;
-    if (chunk_count == 0 and (ocr_failed_count > 0 or failed_pages > 0)) return .terminal_failed;
-    return .skipped;
+    return chunk_count == 0 and (ocr_failed_count > 0 or failed_pages > 0);
+}
+
+fn documentExtractionEmptyCoverageOutcome(alloc: Allocator, manifest_json: []const u8) !CoverageOutcome {
+    return if (try documentExtractionEmptyCoverageIsTerminalFailure(alloc, manifest_json))
+        .terminal_failed
+    else
+        .skipped;
 }
 
 fn queueCoverageOutcomeForRequest(
@@ -12225,8 +13027,6 @@ fn deleteStaleChunkEmbeddingArtifacts(
     defer backend_scan.freeResults(runtime.alloc, existing);
     if (existing.len == 0) return .{};
 
-    var stale_vector_keys = std.ArrayListUnmanaged([]u8).empty;
-    errdefer freeKeyList(runtime.alloc, stale_vector_keys.items);
     var artifact_delete_keys = std.ArrayListUnmanaged([]u8).empty;
     errdefer freeKeyList(runtime.alloc, artifact_delete_keys.items);
 
@@ -12234,13 +13034,9 @@ fn deleteStaleChunkEmbeddingArtifacts(
         if (!internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) continue;
         if (!internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, embedding_artifact_name)) continue;
         if (derivedEmbeddingBelongsToDesiredChunk(entry.key, desired_chunk_keys)) continue;
-        if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, entry.key)) |base_key| {
-            try appendUniqueOwnedKey(runtime.alloc, &stale_vector_keys, base_key);
-        }
         try appendUniqueDupeKey(runtime.alloc, &artifact_delete_keys, entry.key);
     }
     return .{
-        .vector_keys = try stale_vector_keys.toOwnedSlice(runtime.alloc),
         .artifact_delete_keys = try artifact_delete_keys.toOwnedSlice(runtime.alloc),
     };
 }
@@ -12249,7 +13045,8 @@ fn deleteStaleChunkArtifacts(
     runtime: *EnrichmentRuntime,
     doc_key: []const u8,
     artifact_name: []const u8,
-    desired_chunk_keys: []const []const u8,
+    desired_stored_chunk_keys: []const []const u8,
+    desired_logical_chunk_keys: []const []const u8,
 ) ![][]u8 {
     const prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "chunk", artifact_name);
     defer runtime.alloc.free(prefix);
@@ -12267,13 +13064,18 @@ fn deleteStaleChunkArtifacts(
 
     for (existing) |entry| {
         if (internal_keys.isChunkArtifactRecordKey(entry.key)) {
-            if (keyInList(entry.key, desired_chunk_keys)) continue;
-            try appendUniqueDupeKey(runtime.alloc, &stale_vector_keys, entry.key);
+            if (keyInList(entry.key, desired_stored_chunk_keys)) continue;
+            // Dropping an optional stored chunk row does not retire its
+            // logical identity. Only a chunk absent from the current chunking
+            // result should be withdrawn from downstream indexes.
+            if (!keyInList(entry.key, desired_logical_chunk_keys)) {
+                try appendUniqueDupeKey(runtime.alloc, &stale_vector_keys, entry.key);
+            }
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
             continue;
         }
         if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) {
-            if (derivedEmbeddingBelongsToDesiredChunk(entry.key, desired_chunk_keys)) continue;
+            if (derivedEmbeddingBelongsToDesiredChunk(entry.key, desired_logical_chunk_keys)) continue;
             if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, entry.key)) |base_key| {
                 try appendUniqueOwnedKey(runtime.alloc, &stale_vector_keys, base_key);
             }
@@ -12291,29 +13093,19 @@ fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, s
     };
     defer runtime.alloc.free(raw);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, runtime.alloc, raw, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const source = parsed.value.object.get(source_field) orelse return null;
-    if (source != .string) return null;
-    return enrichment_artifact_codec.hashEmbeddingSource(source.string, producer_json);
+    const source = try chunk_artifact_mod.artifactTextAlloc(runtime.alloc, raw, source_field) orelse return null;
+    defer runtime.alloc.free(source);
+    return enrichment_artifact_codec.hashEmbeddingSource(source, producer_json);
 }
 
 fn chunkPayloadHasText(alloc: Allocator, payload: []const u8, source_field: []const u8) !bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const source = parsed.value.object.get(source_field) orelse return false;
-    return source == .string and source.string.len > 0;
+    const source = try chunk_artifact_mod.artifactTextAlloc(alloc, payload, source_field) orelse return false;
+    defer alloc.free(source);
+    return true;
 }
 
 fn chunkPayloadTextAlloc(alloc: Allocator, payload: []const u8, source_field: []const u8) !?[]u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const source = parsed.value.object.get(source_field) orelse return null;
-    if (source != .string or source.string.len == 0) return null;
-    return try alloc.dupe(u8, source.string);
+    return try chunk_artifact_mod.artifactTextAlloc(alloc, payload, source_field);
 }
 
 fn storedChunkEmbeddingSourcesForRequest(
@@ -12752,6 +13544,87 @@ fn saveAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, 
         checkpoint.status = runtimeProjectionStatus(runtime.retrying, runtime.worker_failed);
         checkpoint.config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
         enrichment_state.saveProjectionCheckpoint(runtime.store, scope, checkpoint) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+}
+
+fn loadReplayCursorForPass(
+    runtime: *EnrichmentRuntime,
+    applied_sequence: u64,
+) !?enrichment_state.ReplayCursor {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        const loaded = enrichment_state.loadReplayCursor(runtime.alloc, runtime.store, scope_name) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            error.InvalidEnrichmentState => {
+                // A cursor is only an optimization. Corruption must never
+                // fabricate progress or strand the worker; discard it and
+                // replay idempotently from the authoritative applied fence.
+                std.log.warn("discarding corrupt enrichment replay cursor", .{});
+                try clearReplayCursorWithRetry(runtime);
+                return null;
+            },
+            else => return err,
+        };
+        if (loaded) |cursor| {
+            if (cursor.base_applied_sequence == applied_sequence) return cursor;
+            var stale = cursor;
+            stale.deinit(runtime.alloc);
+            try clearReplayCursorWithRetry(runtime);
+        }
+        return null;
+    }
+}
+
+fn replayCursorCoversGroup(
+    cursor: ?enrichment_state.ReplayCursor,
+    applied_sequence: u64,
+    group: enrichment_worker.PendingDocumentGroup,
+) bool {
+    const value = cursor orelse return false;
+    if (value.base_applied_sequence != applied_sequence) return false;
+    if (group.sequence != value.sequence) return group.sequence < value.sequence;
+    return std.mem.order(u8, group.doc_key, value.doc_key) != .gt;
+}
+
+fn saveReplayCursorForGroup(
+    runtime: *EnrichmentRuntime,
+    applied_sequence: u64,
+    group: enrichment_worker.PendingDocumentGroup,
+) !void {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        enrichment_state.saveReplayCursor(runtime.store, scope_name, .{
+            .base_applied_sequence = applied_sequence,
+            .sequence = group.sequence,
+            .doc_key = @constCast(group.doc_key),
+        }) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+}
+
+fn clearReplayCursorWithRetry(runtime: *EnrichmentRuntime) !void {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        enrichment_state.clearReplayCursor(runtime.store, scope_name) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -13605,6 +14478,8 @@ fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: [
 fn remoteRenderConfig(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    io: ?Io,
+    cancellation: CancellationToken,
     max_media_parts: ?usize,
 ) template_remote.RenderConfig {
     var config: template_remote.RenderConfig = .{};
@@ -13617,7 +14492,36 @@ fn remoteRenderConfig(
     if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
         config.max_media_parts = max_media_parts;
     }
+    if (comptime @hasField(template_remote.RenderConfig, "io")) {
+        config.io = io;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
+        config.cancellation = scraping.CancellationToken.fromCallback(
+            cancellation.ptr,
+            cancellation.is_cancelled_fn,
+        );
+    }
     return config;
+}
+
+test "enrichment remote render config preserves runtime execution context" {
+    var canceled = std.atomic.Value(bool).init(false);
+    const config = remoteRenderConfig(
+        null,
+        null,
+        std.Io.Threaded.global_single_threaded.io(),
+        CancellationToken.fromAtomic(&canceled),
+        null,
+    );
+    if (comptime @hasField(template_remote.RenderConfig, "io")) {
+        try std.testing.expect(config.io != null);
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
+        const token = config.cancellation orelse return error.TestUnexpectedResult;
+        try token.check();
+        canceled.store(true, .release);
+        try std.testing.expectError(error.Canceled, token.check());
+    }
 }
 
 /// Extract the source text for an enrichment request from a document.
@@ -13662,14 +14566,14 @@ fn renderSourceTemplateText(
             alloc,
             source_template,
             raw_doc,
-            remoteRenderConfig(config.secret_store, config.remote_content, null),
+            remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null),
         );
     }
     return try template_remote.renderJsonToTextWithConfig(
         alloc,
         source_template,
         raw_doc,
-        remoteRenderConfig(config.secret_store, config.remote_content, null),
+        remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null),
     );
 }
 
@@ -13720,7 +14624,7 @@ fn renderSourceParts(
 ) !?[]template.ContentPart {
     if (request.source_template.len == 0) return null;
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
-        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, max_media_parts)) catch |err| switch (err) {
+        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, max_media_parts)) catch |err| switch (err) {
             error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         }

@@ -136,9 +136,17 @@ pub const WalReplicaProvider = struct {
 
     fn buildDescriptor(ptr: *anyopaque, record: catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
         const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
-        var desc = try self.base_factory.buildDescriptor(record);
-        errdefer self.base_factory.freeDescriptor(self.alloc, &desc);
         const state = try self.ensureState(record);
+        // A fetched snapshot becomes the local restart authority after its WAL
+        // state is durable. Do not re-consume an intentionally short-lived
+        // bootstrap artifact on every process restart.
+        var effective_record = record;
+        if (try state.storage().lastIndex() > 0) {
+            effective_record.bootstrap_mode = .persisted;
+            effective_record.snapshot_bootstrap = null;
+        }
+        var desc = try self.base_factory.buildDescriptor(effective_record);
+        errdefer self.base_factory.freeDescriptor(self.alloc, &desc);
         try state.seedConfStateIfEmpty(desc.initial_voters orelse desc.group.raft_config.peers);
         desc.group.storage = state.storage();
         desc.group.raft_config.applied = state.appliedIndex();

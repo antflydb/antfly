@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TableRepairJobPhase(str, Enum):
+class TableRepairJobPhase(StrEnum):
     CANCELLED = "cancelled"
     FAILED = "failed"
     QUEUED = "queued"

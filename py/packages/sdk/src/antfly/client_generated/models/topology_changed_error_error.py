@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TopologyChangedErrorError(str, Enum):
+class TopologyChangedErrorError(StrEnum):
     TOPOLOGY_CHANGED = "topology_changed"
 
     def __str__(self) -> str:

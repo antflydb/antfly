@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ExtensionObjectKind(str, Enum):
+class ExtensionObjectKind(StrEnum):
     A2A_AGENT = "a2a_agent"
     AGENT = "agent"
     API_ENDPOINT = "api_endpoint"

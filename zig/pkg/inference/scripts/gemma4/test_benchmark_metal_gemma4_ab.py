@@ -44,7 +44,7 @@ def executable(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
-FAKE_ANTFLY = r'''#!/usr/bin/env python3
+FAKE_ANTFLY = r"""#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
@@ -405,7 +405,7 @@ print(
     f"decode_embedding={d['embedding']} decode_other={d['other']} "
     f"samples={stage['samples']} failures={stage['failures']}"
 )
-'''
+"""
 
 
 class RouteFormulaTests(unittest.TestCase):
@@ -427,7 +427,8 @@ class RouteFormulaTests(unittest.TestCase):
                     paired["logical_decode_q4"],
                 )
                 self.assertEqual(
-                    sum(paired["q4_rows"]) - paired["q4_decode_row_one"]
+                    sum(paired["q4_rows"])
+                    - paired["q4_decode_row_one"]
                     + 2 * paired["prefill_pairs"],
                     paired["logical_prefill_q4"],
                 )
@@ -464,7 +465,9 @@ class RouteFormulaTests(unittest.TestCase):
         )
         self.assertEqual(
             (210 * OUTPUT_TOKENS, 0, 0, 342),
-            _route_expectations("split_ffn", OUTPUT_TOKENS, prompt_tokens=65)["q4_rows"],
+            _route_expectations("split_ffn", OUTPUT_TOKENS, prompt_tokens=65)[
+                "q4_rows"
+            ],
         )
 
     def test_split_rollback_has_all_paged_decode_and_no_below_floor_hits(self) -> None:
@@ -608,7 +611,12 @@ class HarnessTests(unittest.TestCase):
         )
         self.assertEqual(
             summary["metadata"]["stage_timing_contract"]["sampling"],
-            {"prefill_max": 1, "decode_start": 32, "decode_stride": 64, "decode_max": 5},
+            {
+                "prefill_max": 1,
+                "decode_start": 32,
+                "decode_stride": 64,
+                "decode_max": 5,
+            },
         )
         self.assertEqual(
             summary["metadata"]["stage_timing_contract"]["scope"], "runtime_frame"
@@ -642,7 +650,9 @@ class HarnessTests(unittest.TestCase):
                 },
             },
         )
-        self.assertIsNone(summary["metadata"]["effective_baseline_env"]["CANDIDATE_ONLY"])
+        self.assertIsNone(
+            summary["metadata"]["effective_baseline_env"]["CANDIDATE_ONLY"]
+        )
         self.assertIsNone(
             summary["metadata"]["effective_baseline_env"][
                 "TERMITE_METAL_DISABLE_SWA_SCAN_CLAMP"
@@ -663,7 +673,9 @@ class HarnessTests(unittest.TestCase):
                 "TERMITE_METAL_STAGE_TIMING_ROOFLINE"
             ]
         )
-        self.assertEqual(summary["metadata"]["effective_candidate_env"]["CANDIDATE_ONLY"], "1")
+        self.assertEqual(
+            summary["metadata"]["effective_candidate_env"]["CANDIDATE_ONLY"], "1"
+        )
         self.assertEqual(
             summary["metadata"]["effective_candidate_env"][
                 "TERMITE_METAL_TRACE_DECODE_GQA_SPLIT_SCHEDULE"
@@ -757,7 +769,9 @@ class HarnessTests(unittest.TestCase):
                 "fallbacks=1 invalid_overrides=0",
             )
         )
-        with self.assertRaisesRegex(BenchmarkContractError, "fallback/invalid override"):
+        with self.assertRaisesRegex(
+            BenchmarkContractError, "fallback/invalid override"
+        ):
             build_summary(out)
 
     def test_gqa_split_rollback_profile_attests_all_paged_route(self) -> None:
@@ -848,7 +862,9 @@ class HarnessTests(unittest.TestCase):
         out = self.tmp / "prompt-row-bucket"
         command = self.paired_command(out)
         command[command.index("--expected-prompt-tokens") + 1] = "8"
-        command[command.index("--expected-prompt-token-ids-sha256") + 1] = token_digest(8)
+        command[command.index("--expected-prompt-token-ids-sha256") + 1] = token_digest(
+            8
+        )
         command.extend(("--common-env", "FAKE_PROMPT_TOKENS=8"))
         environment = os.environ.copy()
         environment["STAGE_TIMING_RUNS"] = "0"
@@ -916,7 +932,9 @@ class HarnessTests(unittest.TestCase):
 
         payload["metal"]["device_registry_id"] = 123457
         json_path.write_text(json.dumps(payload))
-        with self.assertRaisesRegex(BenchmarkContractError, "changed between A/B samples"):
+        with self.assertRaisesRegex(
+            BenchmarkContractError, "changed between A/B samples"
+        ):
             build_summary(out)
 
     def test_pair_decode_and_prefill_route_profile_is_exact(self) -> None:
@@ -952,12 +970,8 @@ class HarnessTests(unittest.TestCase):
         routes = candidate["routes"]
         self.assertEqual(routes["q4_linear_reduce_rows"], [16_128, 0, 258, 0])
         self.assertEqual(routes["q4_pair_activation_decode"], 5_376)
-        self.assertEqual(
-            routes["q4_pair_activation_policy"]["mmv_nr4_nsg2"], 5_376
-        )
-        self.assertEqual(
-            routes["q4_pair_activation_policy"]["mm_m32_n64_tail"], 42
-        )
+        self.assertEqual(routes["q4_pair_activation_policy"]["mmv_nr4_nsg2"], 5_376)
+        self.assertEqual(routes["q4_pair_activation_policy"]["mm_m32_n64_tail"], 42)
         self.assertEqual(routes["q4_pair_activation_total"], 5_418)
 
     def test_lm_head_repack_profile_attests_q4_nomination_and_q6_refine(self) -> None:
@@ -985,8 +999,12 @@ class HarnessTests(unittest.TestCase):
             for sample in summary["performance_samples"]
             if sample["index"] == 1
         }
-        self.assertEqual(by_variant["baseline"]["routes"]["q4_k_linear_reduce_rows"], [0, 0, 0, 0])
-        self.assertEqual(by_variant["baseline"]["routes"]["q6_linear_reduce_rows"], [129, 0, 0, 0])
+        self.assertEqual(
+            by_variant["baseline"]["routes"]["q4_k_linear_reduce_rows"], [0, 0, 0, 0]
+        )
+        self.assertEqual(
+            by_variant["baseline"]["routes"]["q6_linear_reduce_rows"], [129, 0, 0, 0]
+        )
         candidate = by_variant["candidate"]["routes"]
         self.assertEqual(candidate["q4_k_linear_reduce_rows"], [128, 0, 0, 0])
         self.assertEqual(candidate["q6_linear_reduce_rows"], [1, 0, 0, 0])
@@ -1041,9 +1059,7 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(routes["q4_linear_reduce_rows"], [13_440, 0, 275, 0])
         self.assertEqual(routes["q4_mmv_variants"], [8_960, 4_480, 0, 0])
         self.assertEqual(routes["q4_pair_activation_decode"], 4_480)
-        self.assertEqual(
-            routes["q4_pair_activation_policy"]["mmv_nr4_nsg4"], 4_480
-        )
+        self.assertEqual(routes["q4_pair_activation_policy"]["mmv_nr4_nsg4"], 4_480)
         self.assertEqual(routes["lm_head_q4_q6_refine_dispatches"], 128)
 
     def test_q4_mmv_workload_profile_proves_role_specific_override(self) -> None:
@@ -1267,7 +1283,9 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(summary["unique_output_token_digests"], [token_digest(64)])
 
         log_path = out / "determinism-candidate-02.log"
-        log_path.write_text(log_path.read_text().replace("token_ids: 0 1 2", "token_ids: 9 1 2"))
+        log_path.write_text(
+            log_path.read_text().replace("token_ids: 0 1 2", "token_ids: 9 1 2")
+        )
         with self.assertRaisesRegex(BenchmarkContractError, "output token digest"):
             build_summary(out)
 

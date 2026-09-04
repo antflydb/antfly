@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class BackupInfoFormat(str, Enum):
+class BackupInfoFormat(StrEnum):
     NATIVE = "native"
     PORTABLE = "portable"
 

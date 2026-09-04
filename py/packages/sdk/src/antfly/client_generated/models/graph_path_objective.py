@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphPathObjective(str, Enum):
+class GraphPathObjective(StrEnum):
     MAX_WEIGHT_PRODUCT = "max_weight_product"
     MIN_HOPS = "min_hops"
     MIN_WEIGHT_SUM = "min_weight_sum"

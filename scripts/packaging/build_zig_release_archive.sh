@@ -161,9 +161,9 @@ lite_lib_prefix_path="$prefix/${lite_lib_archive_path#./}"
 cuda=false
 pjrt=false
 case "$target" in
-  *-linux-*)
-    # Both backends load their driver/plugin at runtime, so the same Linux
-    # artifact remains usable on CPU-only hosts.
+  *-linux-gnu | *-linux-gnu.*)
+    # Driver and PJRT plugins use the host glibc ABI. Keep the portable musl
+    # archives CPU-only and put runtime-loaded integrations in GNU archives.
     cuda=true
     pjrt=true
     ;;

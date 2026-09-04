@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TransformOpType(str, Enum):
+class TransformOpType(StrEnum):
     SET = "$set"
     SET_ON_INSERT = "$setOnInsert"
     UNSET = "$unset"

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class JoinOperator(str, Enum):
+class JoinOperator(StrEnum):
     EQ = "eq"
     GT = "gt"
     GTE = "gte"

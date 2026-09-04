@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class MetadataCapabilityUnavailableErrorRequiredCapability(str, Enum):
+class MetadataCapabilityUnavailableErrorRequiredCapability(StrEnum):
     LINEARIZABLE_SNAPSHOT = "linearizable_snapshot"
 
     def __str__(self) -> str:

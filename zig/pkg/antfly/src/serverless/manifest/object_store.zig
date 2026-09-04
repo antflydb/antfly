@@ -379,16 +379,16 @@ const ConditionalCreateRaceClient = struct {
 
     fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
 
-    fn bucketExists(ptr: *anyopaque, bucket: []const u8) !bool {
+    fn bucketExists(ptr: *anyopaque, bucket: []const u8, opts: object_storage.BucketOptions) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var client_impl = self.backingClient(std.testing.allocator);
-        return try client_impl.bucketExists(bucket);
+        return try client_impl.bucketExistsWithOptions(bucket, opts);
     }
 
-    fn makeBucket(ptr: *anyopaque, bucket: []const u8) !void {
+    fn makeBucket(ptr: *anyopaque, bucket: []const u8, opts: object_storage.BucketOptions) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var client_impl = self.backingClient(std.testing.allocator);
-        try client_impl.makeBucket(bucket);
+        try client_impl.makeBucketWithOptions(bucket, opts);
     }
 
     fn putObject(
