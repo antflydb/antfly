@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class IndexReadinessState(str, Enum):
+class IndexReadinessState(StrEnum):
     FAILED = "failed"
     PENDING = "pending"
     QUERYABLE_PARTIAL = "queryable_partial"

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class QueryDependencyErrorCode(str, Enum):
+class QueryDependencyErrorCode(StrEnum):
     EMBEDDING_INDEX_NOT_FOUND = "embedding_index_not_found"
     QUERY_EMBEDDING_INPUT_TOO_LARGE = "query_embedding_input_too_large"
     QUERY_EMBEDDING_OVERLOADED = "query_embedding_overloaded"

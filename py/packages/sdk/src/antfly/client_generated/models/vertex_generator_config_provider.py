@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class VertexGeneratorConfigProvider(str, Enum):
+class VertexGeneratorConfigProvider(StrEnum):
     VERTEX = "vertex"
 
     def __str__(self) -> str:

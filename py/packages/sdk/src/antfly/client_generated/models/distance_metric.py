@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class DistanceMetric(str, Enum):
+class DistanceMetric(StrEnum):
     COSINE = "cosine"
     INNER_PRODUCT = "inner_product"
     L2_SQUARED = "l2_squared"

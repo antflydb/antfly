@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class SortProfileCandidateSource(str, Enum):
+class SortProfileCandidateSource(StrEnum):
     COMPOSED = "composed"
     DISTRIBUTED_SHARDS = "distributed_shards"
     EXISTING_HITS = "existing_hits"

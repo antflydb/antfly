@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TableBackupStatusCode(str, Enum):
+class TableBackupStatusCode(StrEnum):
     BACKUP_OUTCOME_AMBIGUOUS = "backup_outcome_ambiguous"
 
     def __str__(self) -> str:

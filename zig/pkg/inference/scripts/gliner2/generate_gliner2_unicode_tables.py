@@ -33,7 +33,11 @@ def intervals(values: list[int]) -> list[tuple[int, int]]:
     return out
 
 
-def lower_tables() -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int]], list[tuple[int, tuple[int, ...]]]]:
+def lower_tables() -> tuple[
+    list[tuple[int, int, int, int]],
+    list[tuple[int, int]],
+    list[tuple[int, tuple[int, ...]]],
+]:
     mappings: list[tuple[int, int]] = []
     expansions: list[tuple[int, tuple[int, ...]]] = []
     for cp in range(sys.maxunicode + 1):
@@ -68,13 +72,19 @@ def lower_tables() -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int
     ranges.sort()
     pairs = [(cp, lower) for cp, lower in mappings if cp not in covered]
 
-    rebuilt = {cp: cp + delta for first, last, step, delta in ranges for cp in range(first, last + 1, step)}
+    rebuilt = {
+        cp: cp + delta
+        for first, last, step, delta in ranges
+        for cp in range(first, last + 1, step)
+    }
     rebuilt.update(pairs)
     assert rebuilt == dict(mappings)
     return ranges, pairs, expansions
 
 
-def final_sigma_property_tables() -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+def final_sigma_property_tables() -> tuple[
+    list[tuple[int, int]], list[tuple[int, int]]
+]:
     """Derive CPython's Cased/Case_Ignorable context from `str.lower` itself."""
     cased: list[int] = []
     case_ignorable: list[int] = []
@@ -159,20 +169,33 @@ def verify_pinned_tokenizer_json(tokenizer_json: Path) -> None:
     if sequence[0] != {"type": "Strip", "strip_left": True, "strip_right": True}:
         raise SystemExit("unsupported tokenizer Strip normalizer")
     precompiled = sequence[1]
-    if not isinstance(precompiled, dict) or set(precompiled) != {"type", "precompiled_charsmap"}:
+    if not isinstance(precompiled, dict) or set(precompiled) != {
+        "type",
+        "precompiled_charsmap",
+    }:
         raise SystemExit("unsupported tokenizer Precompiled normalizer")
-    if precompiled.get("type") != "Precompiled" or not isinstance(precompiled.get("precompiled_charsmap"), str):
+    if precompiled.get("type") != "Precompiled" or not isinstance(
+        precompiled.get("precompiled_charsmap"), str
+    ):
         raise SystemExit("unsupported tokenizer precompiled charsmap")
-    charsmap_digest = hashlib.sha256(precompiled["precompiled_charsmap"].encode()).digest()
+    charsmap_digest = hashlib.sha256(
+        precompiled["precompiled_charsmap"].encode()
+    ).digest()
     if charsmap_digest != PINNED_NORMALIZER_CHARMAP_SHA256:
         raise SystemExit("tokenizer precompiled charsmap fingerprint mismatch")
-    if sequence[2] != {"type": "Replace", "pattern": {"Regex": " {2,}"}, "content": " "}:
+    if sequence[2] != {
+        "type": "Replace",
+        "pattern": {"Regex": " {2,}"},
+        "content": " ",
+    }:
         raise SystemExit("unsupported tokenizer Replace normalizer")
 
     try:
         from tokenizers import Tokenizer
     except ImportError as exc:
-        raise SystemExit("--tokenizer-json requires the Python tokenizers package") from exc
+        raise SystemExit(
+            "--tokenizer-json requires the Python tokenizers package"
+        ) from exc
 
     runtime_normalizer = Tokenizer.from_file(str(tokenizer_json)).normalizer
     if runtime_normalizer is None:
@@ -197,10 +220,16 @@ def verify_lower_context(
     case_ignorable_ranges: list[tuple[int, int]],
 ) -> None:
     """Exhaustively differential-check scalar and final-sigma behavior."""
-    lower = {cp: cp + delta for first, last, step, delta in lower_ranges for cp in range(first, last + 1, step)}
+    lower = {
+        cp: cp + delta
+        for first, last, step, delta in lower_ranges
+        for cp in range(first, last + 1, step)
+    }
     lower.update(lower_pairs)
     cased = {cp for first, last in cased_ranges for cp in range(first, last + 1)}
-    case_ignorable = {cp for first, last in case_ignorable_ranges for cp in range(first, last + 1)}
+    case_ignorable = {
+        cp for first, last in case_ignorable_ranges for cp in range(first, last + 1)
+    }
 
     def table_lower(text: str) -> str:
         out: list[str] = []
@@ -237,8 +266,12 @@ def render() -> str:
             f"found {sys.version_info.major}.{sys.version_info.minor} / {unicodedata.unidata_version}"
         )
 
-    word = intervals([cp for cp in range(sys.maxunicode + 1) if re.fullmatch(r"\w", chr(cp))])
-    whitespace = intervals([cp for cp in range(sys.maxunicode + 1) if re.fullmatch(r"\s", chr(cp))])
+    word = intervals(
+        [cp for cp in range(sys.maxunicode + 1) if re.fullmatch(r"\w", chr(cp))]
+    )
+    whitespace = intervals(
+        [cp for cp in range(sys.maxunicode + 1) if re.fullmatch(r"\s", chr(cp))]
+    )
     lower_ranges, lower_pairs, expansions = lower_tables()
     cased, case_ignorable = final_sigma_property_tables()
     normalizer_inert = pinned_normalizer_inert_table()
@@ -246,17 +279,30 @@ def render() -> str:
     assert expansions == [(0x130, (0x69, 0x307))]
     assert "ΟΣ".lower() == "ος" and "ΟΣΑ".lower() == "οσα"
     assert "A\u0301Σ".lower() == "a\u0301ς" and "A-Σ".lower() == "a-σ"
-    assert all(any(first <= ord(char) <= last for first, last in normalizer_inert) for char in "Москва東京😀é")
-    assert all(not any(first <= ord(char) <= last for first, last in normalizer_inert) for char in "①Ａﬁ\u0301")
-    assert all(any(first <= ord(char) <= last for first, last in simple_casefold) for char in "AaÉéМосква東京😀")
-    assert all(not any(first <= ord(char) <= last for first, last in simple_casefold) for char in "ßςİ")
+    assert all(
+        any(first <= ord(char) <= last for first, last in normalizer_inert)
+        for char in "Москва東京😀é"
+    )
+    assert all(
+        not any(first <= ord(char) <= last for first, last in normalizer_inert)
+        for char in "①Ａﬁ\u0301"
+    )
+    assert all(
+        any(first <= ord(char) <= last for first, last in simple_casefold)
+        for char in "AaÉéМосква東京😀"
+    )
+    assert all(
+        not any(first <= ord(char) <= last for first, last in simple_casefold)
+        for char in "ßςİ"
+    )
     verify_lower_context(lower_ranges, lower_pairs, cased, case_ignorable)
 
     lines = [
         "// Generated by scripts/gliner2/generate_gliner2_unicode_tables.py; do not edit.",
         f'pub const unicode_version = "{UNICODE}";',
-        "pub const pinned_normalizer_charsmap_sha256 = [_]u8{" +
-        ",".join(f" 0x{byte:02x}" for byte in PINNED_NORMALIZER_CHARMAP_SHA256) + " };",
+        "pub const pinned_normalizer_charsmap_sha256 = [_]u8{"
+        + ",".join(f" 0x{byte:02x}" for byte in PINNED_NORMALIZER_CHARMAP_SHA256)
+        + " };",
         "",
         "const Range = struct { first: u21, last: u21 };",
         "const LowerRange = struct { first: u21, last: u21, step: u2, delta: i32 };",
@@ -264,24 +310,43 @@ def render() -> str:
         "",
         "const word_ranges = [_]Range{",
     ]
-    lines.extend(f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }}," for first, last in word)
+    lines.extend(
+        f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }}," for first, last in word
+    )
     lines.extend(["};", "", "const whitespace_ranges = [_]Range{"])
-    lines.extend(f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }}," for first, last in whitespace)
+    lines.extend(
+        f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }},"
+        for first, last in whitespace
+    )
     lines.extend(["};", "", "const pinned_normalizer_inert_ranges = [_]Range{"])
-    lines.extend(f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }}," for first, last in normalizer_inert)
+    lines.extend(
+        f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }},"
+        for first, last in normalizer_inert
+    )
     lines.extend(["};", "", "const simple_casefold_ranges = [_]Range{"])
-    lines.extend(f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }}," for first, last in simple_casefold)
+    lines.extend(
+        f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }},"
+        for first, last in simple_casefold
+    )
     lines.extend(["};", "", "const cased_ranges = [_]Range{"])
-    lines.extend(f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }}," for first, last in cased)
+    lines.extend(
+        f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }}," for first, last in cased
+    )
     lines.extend(["};", "", "const case_ignorable_ranges = [_]Range{"])
-    lines.extend(f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }}," for first, last in case_ignorable)
+    lines.extend(
+        f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }},"
+        for first, last in case_ignorable
+    )
     lines.extend(["};", "", "const lower_ranges = [_]LowerRange{"])
     lines.extend(
         f"    .{{ .first = 0x{first:X}, .last = 0x{last:X}, .step = {step}, .delta = {delta} }},"
         for first, last, step, delta in lower_ranges
     )
     lines.extend(["};", "", "const lower_pairs = [_]LowerPair{"])
-    lines.extend(f"    .{{ .upper = 0x{upper:X}, .lower = 0x{lower:X} }}," for upper, lower in lower_pairs)
+    lines.extend(
+        f"    .{{ .upper = 0x{upper:X}, .lower = 0x{lower:X} }},"
+        for upper, lower in lower_pairs
+    )
     lines.extend(
         [
             "};",
@@ -296,18 +361,18 @@ def render() -> str:
             "",
             "/// Conservative scalar set that the exact pinned tokenizer normalizer",
             "/// leaves unchanged in any admitted fragment context.",
-        "pub fn isPinnedNormalizerInert(cp: u21) bool {",
-        "    return inRanges(cp, &pinned_normalizer_inert_ranges);",
-        "}",
-        "",
-        "/// True when Python 3.12 / Unicode 15 casefold is exactly the",
-        "/// scalar returned by simpleLower. Expanding and distinct mappings",
-        "/// are excluded so release scoring can fail closed.",
-        "pub fn isSimpleCasefold(cp: u21) bool {",
-        "    return inRanges(cp, &simple_casefold_ranges);",
-        "}",
-        "",
-        "pub fn isCased(cp: u21) bool {",
+            "pub fn isPinnedNormalizerInert(cp: u21) bool {",
+            "    return inRanges(cp, &pinned_normalizer_inert_ranges);",
+            "}",
+            "",
+            "/// True when Python 3.12 / Unicode 15 casefold is exactly the",
+            "/// scalar returned by simpleLower. Expanding and distinct mappings",
+            "/// are excluded so release scoring can fail closed.",
+            "pub fn isSimpleCasefold(cp: u21) bool {",
+            "    return inRanges(cp, &simple_casefold_ranges);",
+            "}",
+            "",
+            "pub fn isCased(cp: u21) bool {",
             "    return inRanges(cp, &cased_ranges);",
             "}",
             "",
@@ -359,7 +424,10 @@ def main() -> int:
     if args.check:
         actual = OUTPUT.read_text()
         if actual != generated:
-            print(f"stale Unicode tables: run {Path(__file__).name} --write", file=sys.stderr)
+            print(
+                f"stale Unicode tables: run {Path(__file__).name} --write",
+                file=sys.stderr,
+            )
             return 1
         return 0
     if args.write:

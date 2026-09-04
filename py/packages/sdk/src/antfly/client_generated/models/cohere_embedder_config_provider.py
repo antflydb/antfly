@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class CohereEmbedderConfigProvider(str, Enum):
+class CohereEmbedderConfigProvider(StrEnum):
     COHERE = "cohere"
 
     def __str__(self) -> str:

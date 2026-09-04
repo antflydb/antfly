@@ -1,6 +1,6 @@
 """Ergonomic, validated constructors for canonical graph queries."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from math import isfinite
 from typing import TypeAlias
 
@@ -18,8 +18,8 @@ from .exceptions import AntflyException
 from .graph_identifier_policy_generated import is_valid_graph_identifier
 
 GraphCountAggregate: TypeAlias = GraphRowCountAggregate | GraphAliasCountAggregate
-_MIN_ANTFLY_DATETIME = datetime(1970, 1, 1, tzinfo=timezone.utc)
-_MAX_ANTFLY_DATETIME = datetime(2554, 7, 21, 23, 34, 33, 709551, tzinfo=timezone.utc)
+_MIN_ANTFLY_DATETIME = datetime(1970, 1, 1, tzinfo=UTC)
+_MAX_ANTFLY_DATETIME = datetime(2554, 7, 21, 23, 34, 33, 709551, tzinfo=UTC)
 
 
 def require_graph_identifier(value: object, path: str) -> None:
@@ -77,7 +77,7 @@ def _normalize_graph_datetime(value: object, path: str) -> datetime:
     try:
         if value.utcoffset() is None:
             raise AntflyException(f"{path} must be a timezone-aware datetime")
-        normalized = value.astimezone(timezone.utc)
+        normalized = value.astimezone(UTC)
     except (OverflowError, ValueError) as exc:
         raise AntflyException(
             f"{path} must fall within Antfly's supported Unix-nanosecond range "

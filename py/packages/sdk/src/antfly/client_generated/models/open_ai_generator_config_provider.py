@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class OpenAIGeneratorConfigProvider(str, Enum):
+class OpenAIGeneratorConfigProvider(StrEnum):
     OPENAI = "openai"
 
     def __str__(self) -> str:

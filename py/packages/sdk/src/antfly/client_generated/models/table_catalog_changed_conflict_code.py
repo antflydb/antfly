@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TableCatalogChangedConflictCode(str, Enum):
+class TableCatalogChangedConflictCode(StrEnum):
     TABLE_CATALOG_CHANGED = "table_catalog_changed"
 
     def __str__(self) -> str:

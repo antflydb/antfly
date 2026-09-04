@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class OpenRouterEmbedderConfigProvider(str, Enum):
+class OpenRouterEmbedderConfigProvider(StrEnum):
     OPENROUTER = "openrouter"
 
     def __str__(self) -> str:

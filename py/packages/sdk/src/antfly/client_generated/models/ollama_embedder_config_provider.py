@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class OllamaEmbedderConfigProvider(str, Enum):
+class OllamaEmbedderConfigProvider(StrEnum):
     OLLAMA = "ollama"
 
     def __str__(self) -> str:

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class AuthSubjectKind(str, Enum):
+class AuthSubjectKind(StrEnum):
     GROUP = "group"
     ROLE = "role"
     SUBJECT = "subject"

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GoogleEmbedderConfigProvider(str, Enum):
+class GoogleEmbedderConfigProvider(StrEnum):
     GEMINI = "gemini"
 
     def __str__(self) -> str:

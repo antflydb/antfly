@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class MergeStrategy(str, Enum):
+class MergeStrategy(StrEnum):
     RRF = "rrf"
     RSF = "rsf"
 

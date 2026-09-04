@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GoogleGeneratorConfigProvider(str, Enum):
+class GoogleGeneratorConfigProvider(StrEnum):
     GEMINI = "gemini"
 
     def __str__(self) -> str:

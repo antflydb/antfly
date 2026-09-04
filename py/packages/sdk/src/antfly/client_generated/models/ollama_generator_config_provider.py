@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class OllamaGeneratorConfigProvider(str, Enum):
+class OllamaGeneratorConfigProvider(StrEnum):
     OLLAMA = "ollama"
 
     def __str__(self) -> str:

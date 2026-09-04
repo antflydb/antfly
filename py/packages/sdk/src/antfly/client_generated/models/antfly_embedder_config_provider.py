@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class AntflyEmbedderConfigProvider(str, Enum):
+class AntflyEmbedderConfigProvider(StrEnum):
     ANTFLY = "antfly"
 
     def __str__(self) -> str:

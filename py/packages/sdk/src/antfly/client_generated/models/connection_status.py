@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ConnectionStatus(str, Enum):
+class ConnectionStatus(StrEnum):
     CONFIGURED = "configured"
     CONNECTED = "connected"
     ERROR = "error"

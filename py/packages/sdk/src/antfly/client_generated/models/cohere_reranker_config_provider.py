@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class CohereRerankerConfigProvider(str, Enum):
+class CohereRerankerConfigProvider(StrEnum):
     COHERE = "cohere"
 
     def __str__(self) -> str:

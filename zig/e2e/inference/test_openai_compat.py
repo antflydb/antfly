@@ -91,7 +91,9 @@ def test_openai_chat_with_tools(api, openai_client):
     model = _first_tool_generator_model(api)
     resp = openai_client.chat.completions.create(
         model=model,
-        messages=[{"role": "user", "content": "Use the lookup function to find order 42."}],
+        messages=[
+            {"role": "user", "content": "Use the lookup function to find order 42."}
+        ],
         max_tokens=96,
         temperature=0.1,
         tools=[

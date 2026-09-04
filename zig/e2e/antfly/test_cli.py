@@ -69,6 +69,7 @@ class TinyImageServer:
             def log_message(self, format: str, *args: object) -> None:
                 _ = format
                 _ = args
+
         # Bind port zero atomically; probing and then reopening a selected port
         # leaves an avoidable race with parallel E2E workers.
         self._server = ThreadingHTTPServer((host, 0), Handler)

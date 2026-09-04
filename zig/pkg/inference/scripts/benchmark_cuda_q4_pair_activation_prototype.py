@@ -64,9 +64,7 @@ class Cuda:
         self.check(self.cuDeviceGet(ctypes.byref(device), 0), "cuDeviceGet")
         self.device = device.value
         name = ctypes.create_string_buffer(256)
-        self.check(
-            self.cuDeviceGetName(name, len(name), device), "cuDeviceGetName"
-        )
+        self.check(self.cuDeviceGetName(name, len(name), device), "cuDeviceGetName")
         self.device_name = name.value.decode("utf-8", errors="replace")
         major = ctypes.c_int()
         minor = ctypes.c_int()
@@ -171,12 +169,8 @@ class Cuda:
         self.cuEventCreate = bind(
             "cuEventCreate", [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
         )
-        self.cuEventRecord = bind(
-            "cuEventRecord", [ctypes.c_void_p, ctypes.c_void_p]
-        )
-        self.cuEventSynchronize = bind(
-            "cuEventSynchronize", [ctypes.c_void_p]
-        )
+        self.cuEventRecord = bind("cuEventRecord", [ctypes.c_void_p, ctypes.c_void_p])
+        self.cuEventSynchronize = bind("cuEventSynchronize", [ctypes.c_void_p])
         self.cuEventElapsedTime = bind(
             "cuEventElapsedTime",
             [
@@ -201,9 +195,7 @@ class Cuda:
         self.cuGetErrorName(code, ctypes.byref(name))
         self.cuGetErrorString(code, ctypes.byref(detail))
         error_name = name.value.decode() if name.value else str(code)
-        error_detail = (
-            detail.value.decode() if detail.value else "unknown CUDA error"
-        )
+        error_detail = detail.value.decode() if detail.value else "unknown CUDA error"
         raise CudaError(f"{operation}: {error_name}: {error_detail}")
 
     def load_module(self, path: Path) -> ctypes.c_void_p:
@@ -234,26 +226,20 @@ class Cuda:
     def upload(self, pointer: int, data: bytes | bytearray) -> None:
         image = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
         self.check(
-            self.cuMemcpyHtoD(
-                pointer, ctypes.cast(image, ctypes.c_void_p), len(data)
-            ),
+            self.cuMemcpyHtoD(pointer, ctypes.cast(image, ctypes.c_void_p), len(data)),
             "cuMemcpyHtoD_v2",
         )
 
     def download(self, pointer: int, size: int) -> bytes:
         image = (ctypes.c_ubyte * size)()
         self.check(
-            self.cuMemcpyDtoH(
-                ctypes.cast(image, ctypes.c_void_p), pointer, size
-            ),
+            self.cuMemcpyDtoH(ctypes.cast(image, ctypes.c_void_p), pointer, size),
             "cuMemcpyDtoH_v2",
         )
         return bytes(image)
 
     def memset(self, pointer: int, value: int, size: int) -> None:
-        self.check(
-            self.cuMemsetD8(pointer, value, size), "cuMemsetD8_v2"
-        )
+        self.check(self.cuMemsetD8(pointer, value, size), "cuMemsetD8_v2")
 
     def launch(
         self,
@@ -264,10 +250,7 @@ class Cuda:
     ) -> None:
         values = list(arguments)
         params = (ctypes.c_void_p * len(values))(
-            *(
-                ctypes.cast(ctypes.byref(value), ctypes.c_void_p)
-                for value in values
-            )
+            *(ctypes.cast(ctypes.byref(value), ctypes.c_void_p) for value in values)
         )
         self.check(
             self.cuLaunchKernel(
@@ -294,22 +277,16 @@ class Cuda:
         stop = ctypes.c_void_p()
         self.check(self.cuEventCreate(ctypes.byref(start), 0), "cuEventCreate")
         try:
-            self.check(
-                self.cuEventCreate(ctypes.byref(stop), 0), "cuEventCreate"
-            )
+            self.check(self.cuEventCreate(ctypes.byref(stop), 0), "cuEventCreate")
             try:
                 self.check(self.cuEventRecord(start, None), "cuEventRecord(start)")
                 for _ in range(launches):
                     operation()
                 self.check(self.cuEventRecord(stop, None), "cuEventRecord(stop)")
-                self.check(
-                    self.cuEventSynchronize(stop), "cuEventSynchronize(stop)"
-                )
+                self.check(self.cuEventSynchronize(stop), "cuEventSynchronize(stop)")
                 elapsed = ctypes.c_float()
                 self.check(
-                    self.cuEventElapsedTime(
-                        ctypes.byref(elapsed), start, stop
-                    ),
+                    self.cuEventElapsedTime(ctypes.byref(elapsed), start, stop),
                     "cuEventElapsedTime",
                 )
                 return float(elapsed.value) * 1000.0 / launches
@@ -365,9 +342,7 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def parse_csv(
-    value: str, allowed: Iterable[str], option_name: str
-) -> list[str]:
+def parse_csv(value: str, allowed: Iterable[str], option_name: str) -> list[str]:
     allowed_set = set(allowed)
     if value == "all":
         return list(allowed)
@@ -408,9 +383,7 @@ def make_q8_input(pattern: str, seed: int) -> bytes:
             raise ValueError(f"unknown pattern: {pattern}")
         result[offset : offset + 2] = half_bytes(scale)
         result[offset + 2 : offset + 4] = b"\x00\x00"
-        result[offset + 4 : offset + Q8_BYTES] = bytes(
-            value & 0xFF for value in values
-        )
+        result[offset + 4 : offset + Q8_BYTES] = bytes(value & 0xFF for value in values)
     return bytes(result)
 
 
@@ -434,28 +407,20 @@ def make_q4_weights(out_dim: int, pattern: str, seed: int) -> bytes:
         struct.pack_into("<e", result, block * Q4_BYTES, scale)
         if pattern == "cancellation":
             payload = 0xF0 if block & 1 else 0x0F
-            result[
-                block * Q4_BYTES + 2 : (block + 1) * Q4_BYTES
-            ] = bytes([payload]) * 16
+            result[block * Q4_BYTES + 2 : (block + 1) * Q4_BYTES] = (
+                bytes([payload]) * 16
+            )
         elif pattern == "sparse" and block % 5:
-            result[
-                block * Q4_BYTES + 2 : (block + 1) * Q4_BYTES
-            ] = b"\x88" * 16
+            result[block * Q4_BYTES + 2 : (block + 1) * Q4_BYTES] = b"\x88" * 16
     return bytes(result)
 
 
 def output_symbol(out_dim: int, variant: str) -> str:
-    return (
-        "antfly_q4_0_pair_activation_q8_1_e2b_"
-        f"{out_dim}_{variant}_prototype"
-    )
+    return f"antfly_q4_0_pair_activation_q8_1_e2b_{out_dim}_{variant}_prototype"
 
 
 def reference_symbol(out_dim: int) -> str:
-    return (
-        "antfly_q4_0_pair_activation_q8_1_e2b_"
-        f"{out_dim}_mmv_v1"
-    )
+    return f"antfly_q4_0_pair_activation_q8_1_e2b_{out_dim}_mmv_v1"
 
 
 def allocate_buffers(cuda: Cuda, out_dim: int) -> Buffers:
@@ -543,8 +508,7 @@ def compare_outputs(reference: bytes, candidate: bytes) -> dict[str, object]:
     reference_f32 = dequantize_q8(reference)
     candidate_f32 = dequantize_q8(candidate)
     errors = [
-        abs(expected - actual)
-        for expected, actual in zip(reference_f32, candidate_f32)
+        abs(expected - actual) for expected, actual in zip(reference_f32, candidate_f32)
     ]
     rms = math.sqrt(sum(error * error for error in errors) / len(errors))
     return {
@@ -586,13 +550,9 @@ def run_guarded(
     out_dim: int,
 ) -> tuple[bytes, dict[str, object]]:
     prepare_output(cuda, output_base, buffers.output_bytes)
-    launch_once(
-        cuda, function, threads, output, buffers, activation, out_dim
-    )
+    launch_once(cuda, function, threads, output, buffers, activation, out_dim)
     cuda.synchronize()
-    image = cuda.download(
-        output_base, buffers.output_bytes + 2 * GUARD_BYTES
-    )
+    image = cuda.download(output_base, buffers.output_bytes + 2 * GUARD_BYTES)
     validation = validate_guarded_output(image, buffers.output_bytes)
     body = validation.pop("body")
     assert isinstance(body, bytes)
@@ -758,9 +718,7 @@ def main(argv: list[str]) -> int:
         ]
         variants = parse_csv(args.variants, VARIANTS, "--variants")
         patterns = parse_csv(args.patterns, PATTERNS, "--patterns")
-        activations = parse_csv(
-            args.activations, ACTIVATIONS, "--activations"
-        )
+        activations = parse_csv(args.activations, ACTIVATIONS, "--activations")
     except argparse.ArgumentTypeError as error:
         parser.error(str(error))
     for path in (args.candidate_cubin, args.baseline_cubin):
@@ -770,8 +728,7 @@ def main(argv: list[str]) -> int:
     harness_path = Path(__file__).resolve()
     inference_dir = harness_path.parents[1]
     source_path = (
-        inference_dir
-        / "src/ops/cuda/prototypes/q4_0_pair_activation_q8_1_sm89.cu"
+        inference_dir / "src/ops/cuda/prototypes/q4_0_pair_activation_q8_1_sm89.cu"
     )
     if not source_path.is_file():
         parser.error(f"prototype source is unavailable: {source_path}")
@@ -834,12 +791,8 @@ def main(argv: list[str]) -> int:
                 for pattern_index, pattern in enumerate(patterns):
                     case_seed = args.seed ^ (out_dim << 17) ^ (pattern_index << 9)
                     q8_input = make_q8_input(pattern, case_seed)
-                    gate = make_q4_weights(
-                        out_dim, pattern, case_seed ^ 0xBB67AE85
-                    )
-                    up = make_q4_weights(
-                        out_dim, pattern, case_seed ^ 0x3C6EF372
-                    )
+                    gate = make_q4_weights(out_dim, pattern, case_seed ^ 0xBB67AE85)
+                    up = make_q4_weights(out_dim, pattern, case_seed ^ 0x3C6EF372)
                     cuda.upload(buffers.q8_input, q8_input)
                     cuda.upload(buffers.weight_gate, gate)
                     cuda.upload(buffers.weight_up, up)
@@ -876,15 +829,17 @@ def main(argv: list[str]) -> int:
                                 activation,
                                 out_dim,
                             )
-                            comparison = compare_outputs(
-                                reference_body, candidate_body
-                            )
+                            comparison = compare_outputs(reference_body, candidate_body)
                             deterministic = candidate_body == second_body
-                            integrity = bool(reference_guard["ok"]) and bool(
-                                candidate_guard["ok"]
-                            ) and bool(second_guard["ok"])
+                            integrity = (
+                                bool(reference_guard["ok"])
+                                and bool(candidate_guard["ok"])
+                                and bool(second_guard["ok"])
+                            )
                             all_exact = all_exact and bool(comparison["exact"])
-                            all_integrity = all_integrity and integrity and deterministic
+                            all_integrity = (
+                                all_integrity and integrity and deterministic
+                            )
                             correctness.append(
                                 {
                                     "out_dim": out_dim,
@@ -898,15 +853,13 @@ def main(argv: list[str]) -> int:
                                     "comparison": comparison,
                                 }
                             )
-                    input_read_only = cuda.download(
-                        buffers.q8_input, len(q8_input)
-                    ) == q8_input
-                    gate_read_only = cuda.download(
-                        buffers.weight_gate, len(gate)
-                    ) == gate
-                    up_read_only = cuda.download(
-                        buffers.weight_up, len(up)
-                    ) == up
+                    input_read_only = (
+                        cuda.download(buffers.q8_input, len(q8_input)) == q8_input
+                    )
+                    gate_read_only = (
+                        cuda.download(buffers.weight_gate, len(gate)) == gate
+                    )
+                    up_read_only = cuda.download(buffers.weight_up, len(up)) == up
                     read_only = input_read_only and gate_read_only and up_read_only
                     all_integrity = all_integrity and read_only
                     for case in correctness:
@@ -922,12 +875,8 @@ def main(argv: list[str]) -> int:
                 buffers = allocate_buffers(cuda, out_dim)
                 timing_seed = args.seed ^ (out_dim << 17) ^ 0xA54FF53A
                 q8_input = make_q8_input("random", timing_seed)
-                gate = make_q4_weights(
-                    out_dim, "random", timing_seed ^ 0x510E527F
-                )
-                up = make_q4_weights(
-                    out_dim, "random", timing_seed ^ 0x9B05688C
-                )
+                gate = make_q4_weights(out_dim, "random", timing_seed ^ 0x510E527F)
+                up = make_q4_weights(out_dim, "random", timing_seed ^ 0x9B05688C)
                 cuda.upload(buffers.q8_input, q8_input)
                 cuda.upload(buffers.weight_gate, gate)
                 cuda.upload(buffers.weight_up, up)
@@ -960,9 +909,7 @@ def main(argv: list[str]) -> int:
                         )
                         timings.append(result)
 
-        correctness_pass = (
-            all_exact and all_integrity if correctness else None
-        )
+        correctness_pass = all_exact and all_integrity if correctness else None
         evidence["summary"] = {
             "correctness_case_count": len(correctness),
             "timing_case_count": len(timings),
@@ -988,9 +935,7 @@ def main(argv: list[str]) -> int:
 
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(
-            json.dumps(evidence, indent=2, sort_keys=True) + "\n"
-        )
+        args.json_out.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
     print(json.dumps(evidence["summary"], sort_keys=True))
     timings = evidence["timing"]
     assert isinstance(timings, list)

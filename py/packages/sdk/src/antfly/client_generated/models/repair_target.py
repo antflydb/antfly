@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class RepairTarget(str, Enum):
+class RepairTarget(StrEnum):
     ARTIFACT = "artifact"
     INDEX = "index"
 

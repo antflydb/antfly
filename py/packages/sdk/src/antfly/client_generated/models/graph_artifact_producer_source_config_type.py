@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphArtifactProducerSourceConfigType(str, Enum):
+class GraphArtifactProducerSourceConfigType(StrEnum):
     FIELD = "field"
     TEMPLATE = "template"
 

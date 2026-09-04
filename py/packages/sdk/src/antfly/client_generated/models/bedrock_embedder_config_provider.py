@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class BedrockEmbedderConfigProvider(str, Enum):
+class BedrockEmbedderConfigProvider(StrEnum):
     BEDROCK = "bedrock"
 
     def __str__(self) -> str:

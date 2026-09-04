@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphBoundedTraversalConfigLaw(str, Enum):
+class GraphBoundedTraversalConfigLaw(StrEnum):
     PROVENANCE_SEMIRING = "provenance_semiring"
 
     def __str__(self) -> str:
