@@ -18,6 +18,7 @@ const httpx = @import("httpx");
 const generating_runtime = @import("generating/mod.zig");
 const managed_embedder = @import("inference/managed_embedder.zig");
 const common_secrets = @import("common/secrets.zig");
+const CancellationToken = @import("common/cancellation.zig").CancellationToken;
 const readers = @import("antfly_readers");
 const reader_config = @import("antfly_reader_config");
 const transcribing = @import("antfly_transcribing");
@@ -295,26 +296,60 @@ pub const Runtime = struct {
         return self.execution.capability_cache orelse &self.capability_cache;
     }
 
+    fn requestContext(self: *const Runtime) execution_context.RequestContext {
+        return self.execution.requestContext(
+            self.execution.io orelse self.http.io,
+        );
+    }
+
+    fn linkedModelCapabilities(
+        self: *const Runtime,
+        alloc: Allocator,
+        provider: managed_embedder.AntflyProvider,
+        model: []const u8,
+        task: inference_work.Task,
+    ) !?inference_work.InferenceCapabilities {
+        if (provider.model_capabilities_with_context) |resolve|
+            return try managed_embedder.AntflyProviderBoundary.call(
+                "model_capabilities_with_context",
+                provider.boundary_dispatch,
+                resolve,
+                .{ provider.ptr, alloc, model, task, self.requestContext() },
+            );
+        const resolve = provider.model_capabilities orelse return null;
+        return try managed_embedder.AntflyProviderBoundary.call(
+            "model_capabilities",
+            provider.boundary_dispatch,
+            resolve,
+            .{ provider.ptr, alloc, model, task },
+        );
+    }
+
     fn linkedReaderAvailable(self: *const Runtime) bool {
         const provider = self.antfly_provider orelse return false;
         return provider.read_images != null or provider.read_encoded_images != null or
-            provider.read_encoded_images_reported != null;
+            provider.read_encoded_images_reported != null or provider.read_images_with_context != null or
+            provider.read_encoded_images_with_context != null or
+            provider.read_encoded_images_reported_with_context != null;
     }
 
     fn linkedGeneratorAvailable(self: *const Runtime) bool {
         const provider = self.antfly_provider orelse return false;
         return provider.generate_messages != null or provider.generate_text != null or
-            provider.generate_messages_with_attachments != null;
+            provider.generate_messages_with_attachments != null or
+            provider.generate_messages_with_context != null or
+            provider.generate_text_with_context != null or
+            provider.generate_messages_with_attachments_with_context != null;
     }
 
     fn linkedExtractorAvailable(self: *const Runtime) bool {
         const provider = self.antfly_provider orelse return false;
-        return provider.extract != null;
+        return provider.extract != null or provider.extract_with_context != null;
     }
 
     fn linkedTranscriberAvailable(self: *const Runtime) bool {
         const provider = self.antfly_provider orelse return false;
-        return provider.transcribe_audio != null;
+        return provider.transcribe_audio != null or provider.transcribe_audio_with_context != null;
     }
 
     fn routedReaderConfig(self: *const Runtime, cfg: readers.Config) readers.Config {
@@ -351,7 +386,21 @@ pub const Runtime = struct {
             // A caller-owned HTTP client may not have a finite request timeout,
             // so this borrowed interface cannot advertise the foreground
             // liveness contract.
-            .vtable = &.{ .produce = produce, .produce_batch = produceBatch, .produce_batch_reported = produceBatchReported, .batch_mode = batchMode, .can_produce_batch = canProduceBatch, .capabilities_for_requests = capabilitiesForRequests, .invocation_memory_for_requests = invocationMemoryForRequests },
+            .vtable = &.{
+                .produce = produce,
+                .produce_with_context = produceWithContext,
+                .produce_batch = produceBatch,
+                .produce_batch_with_context = produceBatchWithContext,
+                .produce_batch_reported = produceBatchReported,
+                .produce_batch_reported_with_context = produceBatchReportedWithContext,
+                .batch_mode = batchMode,
+                .batch_mode_with_context = batchModeWithContext,
+                .can_produce_batch = canProduceBatch,
+                .capabilities_for_requests = capabilitiesForRequests,
+                .capabilities_for_requests_with_context = capabilitiesForRequestsWithContext,
+                .invocation_memory_for_requests = invocationMemoryForRequests,
+                .invocation_memory_for_requests_with_context = invocationMemoryForRequestsWithContext,
+            },
         };
     }
 
@@ -360,12 +409,18 @@ pub const Runtime = struct {
             .ptr = self,
             .vtable = &.{
                 .produce = produce,
+                .produce_with_context = produceWithContext,
                 .produce_batch = produceBatch,
+                .produce_batch_with_context = produceBatchWithContext,
                 .produce_batch_reported = produceBatchReported,
+                .produce_batch_reported_with_context = produceBatchReportedWithContext,
                 .batch_mode = batchMode,
+                .batch_mode_with_context = batchModeWithContext,
                 .can_produce_batch = canProduceBatch,
                 .capabilities_for_requests = capabilitiesForRequests,
+                .capabilities_for_requests_with_context = capabilitiesForRequestsWithContext,
                 .invocation_memory_for_requests = invocationMemoryForRequests,
+                .invocation_memory_for_requests_with_context = invocationMemoryForRequestsWithContext,
                 .deinit = deinitProducer,
                 .foreground_bounded = true,
                 .foreground_bounded_for_requests = foregroundBoundedForRequests,
@@ -423,8 +478,11 @@ pub const Runtime = struct {
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
                     allocator_owner = try localInvocationAllocatorOwner(local);
-                    const binary = local.read_encoded_images != null or local.read_encoded_images_reported != null;
-                    if (!binary and local.read_images == null) return error.InferenceInvocationMemoryUnavailable;
+                    const binary = local.read_encoded_images != null or local.read_encoded_images_reported != null or
+                        local.read_encoded_images_with_context != null or
+                        local.read_encoded_images_reported_with_context != null;
+                    if (!binary and local.read_images == null and local.read_images_with_context == null)
+                        return error.InferenceInvocationMemoryUnavailable;
                     break :blk if (binary) .borrowed_binary else .data_uri;
                 }
                 break :blk .data_uri;
@@ -437,8 +495,10 @@ pub const Runtime = struct {
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
                     allocator_owner = try localInvocationAllocatorOwner(local);
-                    if (local.generate_messages_with_attachments != null) break :blk .borrowed_binary;
-                    if (local.generate_messages == null) return error.InferenceInvocationMemoryUnavailable;
+                    if (local.generate_messages_with_attachments != null or
+                        local.generate_messages_with_attachments_with_context != null) break :blk .borrowed_binary;
+                    if (local.generate_messages == null and local.generate_messages_with_context == null)
+                        return error.InferenceInvocationMemoryUnavailable;
                     break :blk .data_uri;
                 }
                 // The host sends one base64 batch body. Any serial fallback
@@ -454,7 +514,8 @@ pub const Runtime = struct {
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
                     allocator_owner = try localInvocationAllocatorOwner(local);
-                    if (local.extract == null) return error.InferenceInvocationMemoryUnavailable;
+                    if (local.extract == null and local.extract_with_context == null)
+                        return error.InferenceInvocationMemoryUnavailable;
                 }
                 break :blk extractorAttachmentTransport(parsed);
             },
@@ -469,7 +530,8 @@ pub const Runtime = struct {
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
                     allocator_owner = try localInvocationAllocatorOwner(local);
-                    if (local.transcribe_audio == null) return error.InferenceInvocationMemoryUnavailable;
+                    if (local.transcribe_audio == null and local.transcribe_audio_with_context == null)
+                        return error.InferenceInvocationMemoryUnavailable;
                 }
                 const inline_source = inference_work.hasDataUriScheme(requests[0].source_text);
                 for (requests[1..]) |request| {
@@ -544,7 +606,9 @@ pub const Runtime = struct {
             encoded_results,
             self.provider_response_envelope_bytes,
         ) catch std.math.maxInt(usize);
-        return @min(self.http.maxResponseSize(), @min(self.max_provider_response_bytes, envelope));
+        return self.execution.boundedResponseBytes(
+            @min(self.http.maxResponseSize(), @min(self.max_provider_response_bytes, envelope)),
+        );
     }
 
     fn configuredResultLimit(
@@ -581,9 +645,12 @@ pub const Runtime = struct {
                 defer parsed.deinit(alloc);
                 try self.routeGeneratorConfig(alloc, &parsed.generator);
                 const local = self.antfly_provider orelse break :blk true;
-                break :blk !(parsed.generator.provider == .antfly and
-                    parsed.generator.url.len == 0 and
-                    (local.generate_messages != null or local.generate_text != null));
+                if (parsed.generator.provider != .antfly or parsed.generator.url.len != 0)
+                    break :blk true;
+                if (request.media.len > 0)
+                    break :blk local.generate_messages_with_attachments_with_context != null;
+                break :blk local.generate_messages_with_context != null or
+                    (request.source_parts_json == null and local.generate_text_with_context != null);
             },
             .reader => blk: {
                 var parsed = try std.json.parseFromSlice(readers.Config, alloc, request.config_json, .{
@@ -593,8 +660,12 @@ pub const Runtime = struct {
                 defer parsed.deinit();
                 const cfg = self.routedReaderConfig(parsed.value);
                 const local = self.antfly_provider orelse break :blk true;
-                break :blk !(isLocalReaderProvider(cfg.provider, cfg.resolvedUrl()) and
-                    (local.read_images != null or local.read_encoded_images != null));
+                if (!isLocalReaderProvider(cfg.provider, cfg.resolvedUrl())) break :blk true;
+                break :blk if (request.media.len > 0)
+                    local.read_encoded_images_reported_with_context != null or
+                        local.read_encoded_images_with_context != null
+                else
+                    local.read_images_with_context != null;
             },
             .transcriber => blk: {
                 var parsed = try std.json.parseFromSlice(transcribing.Config, alloc, request.config_json, .{
@@ -604,16 +675,16 @@ pub const Runtime = struct {
                 defer parsed.deinit();
                 const cfg = self.routedTranscriberConfig(parsed.value);
                 const local = self.antfly_provider orelse break :blk true;
-                break :blk !(isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl()) and
-                    local.transcribe_audio != null);
+                if (!isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl())) break :blk true;
+                break :blk local.transcribe_audio_with_context != null;
             },
             .extractor => blk: {
                 var parsed = try extracting.parseConfigFromSlice(alloc, request.config_json);
                 defer parsed.deinit(alloc);
                 try self.routeExtractorConfig(alloc, &parsed);
                 const local = self.antfly_provider orelse break :blk true;
-                break :blk !(isLocalExtractionProvider(parsed.provider, parsed.resolvedUrl()) and
-                    local.extract != null);
+                if (!isLocalExtractionProvider(parsed.provider, parsed.resolvedUrl())) break :blk true;
+                break :blk local.extract_with_context != null;
             },
         };
     }
@@ -627,6 +698,106 @@ pub const Runtime = struct {
     fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         return try self.produceOne(alloc, request);
+    }
+
+    const RuntimeInvocationCancellation = struct {
+        configured: CancellationToken,
+        invocation: CancellationToken,
+
+        fn isCancelled(ptr: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            return self.configured.isCancelled() or self.invocation.isCancelled();
+        }
+    };
+
+    fn invocationRuntime(
+        ptr: *anyopaque,
+        context: asset_producer.InvocationContext,
+        cancellation: *RuntimeInvocationCancellation,
+    ) Runtime {
+        const self: *Runtime = @ptrCast(@alignCast(ptr));
+        var scoped = self.*;
+        // A copied Runtime must never operate on its copied cache mutex. Bind
+        // every scoped call to the original synchronized cache explicitly.
+        scoped.execution.capability_cache = self.capabilityCache();
+        scoped.execution.io = context.io orelse self.execution.io;
+        scoped.execution.deadline_ns = if (context.deadline_ns) |invocation_deadline|
+            if (self.execution.deadline_ns) |configured_deadline| @min(invocation_deadline, configured_deadline) else invocation_deadline
+        else
+            self.execution.deadline_ns;
+        cancellation.* = .{
+            .configured = self.execution.cancellation,
+            .invocation = context.cancellation,
+        };
+        scoped.execution.cancellation = .{
+            .ptr = cancellation,
+            .is_cancelled_fn = RuntimeInvocationCancellation.isCancelled,
+        };
+        scoped.execution.max_response_bytes = if (context.max_response_bytes) |requested|
+            if (self.execution.max_response_bytes) |configured| @min(requested, configured) else requested
+        else
+            self.execution.max_response_bytes;
+        return scoped;
+    }
+
+    fn produceWithContext(ptr: *anyopaque, alloc: Allocator, request: asset_producer.Request, context: asset_producer.InvocationContext) ![]u8 {
+        var cancellation: RuntimeInvocationCancellation = undefined;
+        var scoped = invocationRuntime(ptr, context, &cancellation);
+        try scoped.execution.check(platform.time.monotonicNs());
+        const output = try scoped.produceOne(alloc, request);
+        errdefer alloc.free(output);
+        try scoped.execution.check(platform.time.monotonicNs());
+        return output;
+    }
+
+    fn produceBatchWithContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request, context: asset_producer.InvocationContext) ![][]u8 {
+        var cancellation: RuntimeInvocationCancellation = undefined;
+        var scoped = invocationRuntime(ptr, context, &cancellation);
+        try scoped.execution.check(platform.time.monotonicNs());
+        const outputs = try produceBatch(&scoped, alloc, requests);
+        errdefer {
+            for (outputs) |output| if (output.len > 0) alloc.free(output);
+            alloc.free(outputs);
+        }
+        try scoped.execution.check(platform.time.monotonicNs());
+        return outputs;
+    }
+
+    fn produceBatchReportedWithContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request, context: asset_producer.InvocationContext) !asset_producer.ProducedBatch {
+        var cancellation: RuntimeInvocationCancellation = undefined;
+        var scoped = invocationRuntime(ptr, context, &cancellation);
+        try scoped.execution.check(platform.time.monotonicNs());
+        var batch = try produceBatchReported(&scoped, alloc, requests);
+        errdefer batch.deinit(alloc);
+        try scoped.execution.check(platform.time.monotonicNs());
+        return batch;
+    }
+
+    fn batchModeWithContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request, context: asset_producer.InvocationContext) !inference_work.BatchMode {
+        var cancellation: RuntimeInvocationCancellation = undefined;
+        var scoped = invocationRuntime(ptr, context, &cancellation);
+        try scoped.execution.check(platform.time.monotonicNs());
+        const mode = try batchMode(&scoped, alloc, requests);
+        try scoped.execution.check(platform.time.monotonicNs());
+        return mode;
+    }
+
+    fn capabilitiesForRequestsWithContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request, context: asset_producer.InvocationContext) !?inference_work.InferenceCapabilities {
+        var cancellation: RuntimeInvocationCancellation = undefined;
+        var scoped = invocationRuntime(ptr, context, &cancellation);
+        try scoped.execution.check(platform.time.monotonicNs());
+        const capabilities = try capabilitiesForRequests(&scoped, alloc, requests);
+        try scoped.execution.check(platform.time.monotonicNs());
+        return capabilities;
+    }
+
+    fn invocationMemoryForRequestsWithContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request, context: asset_producer.InvocationContext) !inference_work.InvocationMemoryPlan {
+        var cancellation: RuntimeInvocationCancellation = undefined;
+        var scoped = invocationRuntime(ptr, context, &cancellation);
+        try scoped.execution.check(platform.time.monotonicNs());
+        const plan = try invocationMemoryForRequests(&scoped, alloc, requests);
+        try scoped.execution.check(platform.time.monotonicNs());
+        return plan;
     }
 
     fn canProduceBatch(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request) !bool {
@@ -651,13 +822,7 @@ pub const Runtime = struct {
                 try self.routeGeneratorConfig(alloc, &parsed.generator);
                 if (parsed.generator.provider == .antfly and parsed.generator.url.len == 0) {
                     const local = self.antfly_provider orelse break :blk null;
-                    const resolve = local.model_capabilities orelse break :blk null;
-                    break :blk try managed_embedder.AntflyProviderBoundary.call(
-                        "model_capabilities",
-                        local.boundary_dispatch,
-                        resolve,
-                        .{ local.ptr, alloc, parsed.generator.model, inference_work.Task.generate },
-                    );
+                    break :blk try self.linkedModelCapabilities(alloc, local, parsed.generator.model, .generate);
                 }
                 if (parsed.generator.provider == .antfly and parsed.generator.url.len > 0) {
                     var secret = try common_secrets.SecretValue.initConfigOrEnv(
@@ -682,12 +847,13 @@ pub const Runtime = struct {
                     }
                     header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
                     const headers = header_storage[0..header_count];
-                    break :blk self.capabilityCache().getOrDiscover(
+                    break :blk self.capabilityCache().getOrDiscoverWithContext(
                         self.http,
                         parsed.generator.url,
                         parsed.generator.model,
                         .generate_batch,
                         headers,
+                        self.execution.waitContext(),
                     ) catch |err| switch (err) {
                         error.OutOfMemory => return err,
                         else => null,
@@ -827,25 +993,20 @@ pub const Runtime = struct {
             }
             header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
             const headers = header_storage[0..header_count];
-            return self.capabilityCache().getOrDiscover(
+            return self.capabilityCache().getOrDiscoverWithContext(
                 self.http,
                 endpoint,
                 cfg.model orelse "",
                 .read,
                 headers,
+                self.execution.waitContext(),
             ) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => null,
             };
         }
         const local = self.antfly_provider orelse return null;
-        const resolve = local.model_capabilities orelse return null;
-        const capabilities = try managed_embedder.AntflyProviderBoundary.call(
-            "model_capabilities",
-            local.boundary_dispatch,
-            resolve,
-            .{ local.ptr, alloc, cfg.model orelse "", inference_work.Task.read },
-        );
+        const capabilities = (try self.linkedModelCapabilities(alloc, local, cfg.model orelse "", .read)) orelse return null;
         try capabilities.validate();
         if (capabilities.task != .read) return error.InvalidInferenceCapabilities;
         return capabilities;
@@ -864,7 +1025,8 @@ pub const Runtime = struct {
         const cfg = parsed.generator;
         const local_serial = all_have_media and cfg.provider == .antfly and cfg.url.len == 0 and
             self.antfly_provider != null and
-            self.antfly_provider.?.generate_messages_with_attachments != null;
+            (self.antfly_provider.?.generate_messages_with_attachments_with_context != null or
+                self.antfly_provider.?.generate_messages_with_attachments != null);
         const remote_batch = cfg.provider == .antfly and cfg.url.len > 0;
         return (local_serial or remote_batch) and
             (remote_batch or cfg.api_key == null) and
@@ -904,14 +1066,8 @@ pub const Runtime = struct {
             cfg.resolvedUrl();
         if (isLocalExtractionProvider(cfg.provider, endpoint)) {
             const local = self.antfly_provider orelse return null;
-            if (local.extract == null) return null;
-            const resolve = local.model_capabilities orelse return null;
-            const capabilities = try managed_embedder.AntflyProviderBoundary.call(
-                "model_capabilities",
-                local.boundary_dispatch,
-                resolve,
-                .{ local.ptr, alloc, cfg.model, inference_work.Task.extract },
-            );
+            if (local.extract == null and local.extract_with_context == null) return null;
+            const capabilities = (try self.linkedModelCapabilities(alloc, local, cfg.model, .extract)) orelse return null;
             try capabilities.validate();
             if (capabilities.task != .extract) return error.InvalidInferenceCapabilities;
             return capabilities;
@@ -929,12 +1085,13 @@ pub const Runtime = struct {
         }
         header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
         const headers = header_storage[0..header_count];
-        return self.capabilityCache().getOrDiscover(
+        return self.capabilityCache().getOrDiscoverWithContext(
             self.http,
             remote_endpoint,
             cfg.model,
             .extract,
             headers,
+            self.execution.waitContext(),
         ) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => null,
@@ -954,12 +1111,13 @@ pub const Runtime = struct {
         }
         header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
         const headers = header_storage[0..header_count];
-        const lease = try self.capabilityCache().getOrDiscoverLease(
+        const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
             self.http,
             cfg.resolvedUrl().?,
             cfg.model,
             .extract,
             headers,
+            self.execution.waitContext(),
         );
         try replaceCapabilityLeaseFields(alloc, cfg, lease);
     }
@@ -1226,15 +1384,29 @@ pub const Runtime = struct {
         };
         var response = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) blk: {
             const local = self.antfly_provider orelse return error.BatchIncompatible;
-            const extract_fn = local.extract orelse return error.BatchIncompatible;
-            break :blk try managed_embedder.AntflyProviderBoundary.call(
-                "extract",
-                local.boundary_dispatch,
-                extract_fn,
-                .{ local.ptr, alloc, cfg.model, extract_request },
-            );
+            break :blk if (local.extract_with_context) |extract_fn|
+                try managed_embedder.AntflyProviderBoundary.call(
+                    "extract_with_context",
+                    local.boundary_dispatch,
+                    extract_fn,
+                    .{ local.ptr, alloc, cfg.model, extract_request, self.requestContext() },
+                )
+            else if (local.extract) |extract_fn|
+                try managed_embedder.AntflyProviderBoundary.call(
+                    "extract",
+                    local.boundary_dispatch,
+                    extract_fn,
+                    .{ local.ptr, alloc, cfg.model, extract_request },
+                )
+            else
+                return error.BatchIncompatible;
         } else extracting.extractWithConfigAndOptions(alloc, self.http, cfg, extract_request, .{
             .source_table = self.execution.routing.source_table,
+            .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
+            .cancellation = httpx.CancellationToken.fromCallback(
+                self.execution.cancellation.ptr,
+                self.execution.cancellation.is_cancelled_fn,
+            ),
         }) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
                 try self.invalidateExtractorCapabilityLease(alloc, cfg);
@@ -1268,7 +1440,8 @@ pub const Runtime = struct {
         if (cfg.tools_json != null or cfg.tool_choice_json != null or parsed_cfg.tool_output != .content) return error.BatchIncompatible;
         if (cfg.url.len == 0) {
             const local = self.antfly_provider orelse return error.BatchIncompatible;
-            if (local.generate_messages_with_attachments == null) return error.BatchIncompatible;
+            if (local.generate_messages_with_attachments == null and
+                local.generate_messages_with_attachments_with_context == null) return error.BatchIncompatible;
             const outputs = try self.produceBatchSequential(alloc, requests);
             return try asset_producer.producedBatchFromOutputs(
                 alloc,
@@ -1303,12 +1476,13 @@ pub const Runtime = struct {
         }
         header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
         const auth_headers = header_storage[0..header_count];
-        const capability_lease = try self.capabilityCache().getOrDiscoverLease(
+        const capability_lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
             self.http,
             cfg.url,
             cfg.model,
             .generate_batch,
             auth_headers,
+            self.execution.waitContext(),
         );
         capabilities = capability_lease.capabilities orelse return error.InvalidInferenceCapabilities;
         if (capability_lease.routing_token) |value| {
@@ -1337,6 +1511,7 @@ pub const Runtime = struct {
         var fallback_items: usize = 0;
         var start: usize = 0;
         while (start < requests.len) {
+            try self.execution.check(platform.time.monotonicNs());
             const attachment_transport: inference_work.AttachmentTransport = .base64_payload;
             const end = try generatorBatchEnd(alloc, capabilities, attachment_transport, requests, start);
             const chunk = requests[start..end];
@@ -1346,8 +1521,15 @@ pub const Runtime = struct {
             var resp = try self.http.post(batch_url, .{
                 .json = body,
                 .headers = headers,
-                .timeout_ms = 300_000,
+                .timeout_ms = try self.execution.remainingTimeoutMs(
+                    platform.time.monotonicNs(),
+                    max_asset_provider_timeout_ms,
+                ),
                 .max_response_size = self.responseLimitForTask(.generator, chunk.len),
+                .cancellation = httpx.CancellationToken.fromCallback(
+                    self.execution.cancellation.ptr,
+                    self.execution.cancellation.is_cancelled_fn,
+                ),
             });
             defer resp.deinit();
             if (!resp.ok()) {
@@ -1399,8 +1581,8 @@ pub const Runtime = struct {
         self: *Runtime,
         alloc: Allocator,
         cfg: *generating_runtime.GeneratorConfig,
-    ) !void {
-        if (cfg.provider != .antfly or cfg.url.len == 0) return;
+    ) !?inference_work.InferenceCapabilities {
+        if (cfg.provider != .antfly or cfg.url.len == 0) return null;
         var secret = try common_secrets.SecretValue.initConfigOrEnv(
             alloc,
             cfg.api_key,
@@ -1420,14 +1602,16 @@ pub const Runtime = struct {
         }
         header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
         const headers = header_storage[0..header_count];
-        const lease = try self.capabilityCache().getOrDiscoverLease(
+        const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
             self.http,
             cfg.url,
             cfg.model,
             .generate,
             headers,
+            self.execution.waitContext(),
         );
         try replaceCapabilityLeaseFields(alloc, cfg, lease);
+        return lease.capabilities;
     }
 
     fn invalidateGeneratorCapabilityLease(
@@ -1473,7 +1657,6 @@ pub const Runtime = struct {
         if (!isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) return error.BatchIncompatible;
         const model = requiredAntflyTranscriberModel(cfg_parsed.value) catch return error.BatchIncompatible;
         const local = self.antfly_provider orelse return error.BatchIncompatible;
-        const transcribe_audio = local.transcribe_audio orelse return error.BatchIncompatible;
 
         const out = try alloc.alloc([]u8, requests.len);
         errdefer {
@@ -1484,15 +1667,26 @@ pub const Runtime = struct {
         }
         for (out) |*item| item.* = "";
         for (requests, 0..) |request, i| {
-            var result = try managed_embedder.AntflyProviderBoundary.call(
-                "transcribe_audio",
-                local.boundary_dispatch,
-                transcribe_audio,
-                .{ local.ptr, alloc, model, transcribing.Request{
-                    .url = request.source_text,
-                    .language = cfg_parsed.value.language_code,
-                } },
-            );
+            const transcribe_request = transcribing.Request{
+                .url = request.source_text,
+                .language = cfg_parsed.value.language_code,
+            };
+            var result = if (local.transcribe_audio_with_context) |transcribe_audio|
+                try managed_embedder.AntflyProviderBoundary.call(
+                    "transcribe_audio_with_context",
+                    local.boundary_dispatch,
+                    transcribe_audio,
+                    .{ local.ptr, alloc, model, transcribe_request, self.requestContext() },
+                )
+            else if (local.transcribe_audio) |transcribe_audio|
+                try managed_embedder.AntflyProviderBoundary.call(
+                    "transcribe_audio",
+                    local.boundary_dispatch,
+                    transcribe_audio,
+                    .{ local.ptr, alloc, model, transcribe_request },
+                )
+            else
+                return error.BatchIncompatible;
             defer transcribing.deinitResponse(alloc, &result);
 
             out[i] = if (isJsonContentType(request.content_type))
@@ -1707,7 +1901,8 @@ pub const Runtime = struct {
         for (request.media) |media| try validateEncodedMedia(media);
         const local_attachments = cfg.provider == .antfly and cfg.url.len == 0 and
             self.antfly_provider != null and
-            self.antfly_provider.?.generate_messages_with_attachments != null and
+            (self.antfly_provider.?.generate_messages_with_attachments_with_context != null or
+                self.antfly_provider.?.generate_messages_with_attachments != null) and
             request.media.len > 0;
         var parts: ?[]generating_runtime.ContentPart = null;
         defer if (parts) |items| freeGeneratorContentParts(alloc, items);
@@ -1719,13 +1914,8 @@ pub const Runtime = struct {
         const messages = [_]generating_runtime.ChatMessage{.{ .role = .user, .content = content }};
         if (local_attachments) {
             const local = self.antfly_provider.?;
-            const resolve_capabilities = local.model_capabilities orelse return error.InvalidInferenceCapabilities;
-            const capabilities = try managed_embedder.AntflyProviderBoundary.call(
-                "model_capabilities",
-                local.boundary_dispatch,
-                resolve_capabilities,
-                .{ local.ptr, alloc, cfg.model, inference_work.Task.generate },
-            );
+            const capabilities = (try self.linkedModelCapabilities(alloc, local, cfg.model, .generate)) orelse
+                return error.InvalidInferenceCapabilities;
             var encoded_bytes: usize = 0;
             var modalities = inference_work.Modalities{ .text = true };
             for (request.media) |media| {
@@ -1751,17 +1941,26 @@ pub const Runtime = struct {
                     .page_number = request.page_number,
                 },
             };
-            const result = try managed_embedder.AntflyProviderBoundary.call(
-                "generate_messages_with_attachments",
-                local.boundary_dispatch,
-                local.generate_messages_with_attachments.?,
-                .{ local.ptr, alloc, cfg.model, &messages, attachments },
-            );
+            const result = if (local.generate_messages_with_attachments_with_context) |generate_fn|
+                try managed_embedder.AntflyProviderBoundary.call(
+                    "generate_messages_with_attachments_with_context",
+                    local.boundary_dispatch,
+                    generate_fn,
+                    .{ local.ptr, alloc, cfg.model, &messages, attachments, self.requestContext() },
+                )
+            else
+                try managed_embedder.AntflyProviderBoundary.call(
+                    "generate_messages_with_attachments",
+                    local.boundary_dispatch,
+                    local.generate_messages_with_attachments.?,
+                    .{ local.ptr, alloc, cfg.model, &messages, attachments },
+                );
             return result;
         }
         if (cfg.provider == .antfly and cfg.url.len > 0) {
-            _ = try capabilitiesForRequests(self, alloc, &.{request});
-            try self.bindGeneratorCapabilityLease(alloc, &cfg);
+            const capabilities = (try self.bindGeneratorCapabilityLease(alloc, &cfg)) orelse
+                return error.InvalidInferenceCapabilities;
+            try validateGeneratorInvocation(alloc, capabilities, .base64_payload, &.{request});
             parsed_cfg.generator.capability_token = cfg.capability_token;
             parsed_cfg.generator.capability_revision = cfg.capability_revision;
         }
@@ -1771,6 +1970,7 @@ pub const Runtime = struct {
             .secret_store = self.secret_store,
             .max_response_bytes = self.responseLimitForTask(.generator, 1),
             .source_table = self.execution.routing.source_table,
+            .execution = self.execution,
         }, &messages) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
                 try self.invalidateGeneratorCapabilityLease(alloc, cfg);
@@ -1854,12 +2054,13 @@ pub const Runtime = struct {
         const capability_auth_headers = capability_auth_storage[0..capability_auth_count];
         const discovered_capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
             const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
-            const lease = try self.capabilityCache().getOrDiscoverLease(
+            const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
                 self.http,
                 endpoint,
                 execution_cfg.model orelse "",
                 .read,
                 capability_auth_headers,
+                self.execution.waitContext(),
             );
             if (lease.routing_token) |token| execution_cfg.capability_token = token.slice();
             if (lease.descriptor_revision) |revision| execution_cfg.capability_revision = revision.slice();
@@ -1888,18 +2089,32 @@ pub const Runtime = struct {
         }
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
-            const read_images = local.read_images orelse return error.UnsupportedReaderProvider;
-            const items = try managed_embedder.AntflyProviderBoundary.call(
-                "read_images",
-                local.boundary_dispatch,
-                read_images,
-                .{ local.ptr, alloc, execution_cfg.model orelse "", request },
-            );
+            const items = if (local.read_images_with_context) |read_images|
+                try managed_embedder.AntflyProviderBoundary.call(
+                    "read_images_with_context",
+                    local.boundary_dispatch,
+                    read_images,
+                    .{ local.ptr, alloc, execution_cfg.model orelse "", request, self.requestContext() },
+                )
+            else if (local.read_images) |read_images|
+                try managed_embedder.AntflyProviderBoundary.call(
+                    "read_images",
+                    local.boundary_dispatch,
+                    read_images,
+                    .{ local.ptr, alloc, execution_cfg.model orelse "", request },
+                )
+            else
+                return error.UnsupportedReaderProvider;
             return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
         }
 
         return readers.readWithConfigReported(alloc, self.http, execution_cfg, request, .{
             .source_table = self.execution.routing.source_table,
+            .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
+            .cancellation = httpx.CancellationToken.fromCallback(
+                self.execution.cancellation.ptr,
+                self.execution.cancellation.is_cancelled_fn,
+            ),
         }) catch |err| {
             if (err == error.InferenceCapabilitiesStale and execution_cfg.provider == .antfly) {
                 const endpoint = execution_cfg.resolvedUrl() orelse return err;
@@ -1983,6 +2198,13 @@ pub const Runtime = struct {
         }
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
+            if (local.read_encoded_images_reported_with_context) |read_reported|
+                return try managed_embedder.AntflyProviderBoundary.call(
+                    "read_encoded_images_reported_with_context",
+                    local.boundary_dispatch,
+                    read_reported,
+                    .{ local.ptr, alloc, execution_cfg.model orelse "", request, self.requestContext() },
+                );
             if (local.read_encoded_images_reported) |read_reported|
                 return try managed_embedder.AntflyProviderBoundary.call(
                     "read_encoded_images_reported",
@@ -1990,13 +2212,21 @@ pub const Runtime = struct {
                     read_reported,
                     .{ local.ptr, alloc, execution_cfg.model orelse "", request },
                 );
-            if (local.read_encoded_images) |read_encoded_images| {
-                const items = try managed_embedder.AntflyProviderBoundary.call(
-                    "read_encoded_images",
-                    local.boundary_dispatch,
-                    read_encoded_images,
-                    .{ local.ptr, alloc, execution_cfg.model orelse "", request },
-                );
+            if (local.read_encoded_images_with_context != null or local.read_encoded_images != null) {
+                const items = if (local.read_encoded_images_with_context) |read_encoded_images|
+                    try managed_embedder.AntflyProviderBoundary.call(
+                        "read_encoded_images_with_context",
+                        local.boundary_dispatch,
+                        read_encoded_images,
+                        .{ local.ptr, alloc, execution_cfg.model orelse "", request, self.requestContext() },
+                    )
+                else
+                    try managed_embedder.AntflyProviderBoundary.call(
+                        "read_encoded_images",
+                        local.boundary_dispatch,
+                        local.read_encoded_images.?,
+                        .{ local.ptr, alloc, execution_cfg.model orelse "", request },
+                    );
                 errdefer {
                     for (items) |*item| readers.deinitResult(alloc, item);
                     alloc.free(items);
@@ -2071,16 +2301,26 @@ pub const Runtime = struct {
 
         if (isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) {
             const local = self.antfly_provider orelse return error.UnsupportedTranscriberProvider;
-            const transcribe_audio = local.transcribe_audio orelse return error.UnsupportedTranscriberProvider;
-            var result = try managed_embedder.AntflyProviderBoundary.call(
-                "transcribe_audio",
-                local.boundary_dispatch,
-                transcribe_audio,
-                .{ local.ptr, alloc, antfly_model.?, transcribing.Request{
-                    .url = request.source_text,
-                    .language = cfg_parsed.value.language_code,
-                } },
-            );
+            const transcribe_request = transcribing.Request{
+                .url = request.source_text,
+                .language = cfg_parsed.value.language_code,
+            };
+            var result = if (local.transcribe_audio_with_context) |transcribe_audio|
+                try managed_embedder.AntflyProviderBoundary.call(
+                    "transcribe_audio_with_context",
+                    local.boundary_dispatch,
+                    transcribe_audio,
+                    .{ local.ptr, alloc, antfly_model.?, transcribe_request, self.requestContext() },
+                )
+            else if (local.transcribe_audio) |transcribe_audio|
+                try managed_embedder.AntflyProviderBoundary.call(
+                    "transcribe_audio",
+                    local.boundary_dispatch,
+                    transcribe_audio,
+                    .{ local.ptr, alloc, antfly_model.?, transcribe_request },
+                )
+            else
+                return error.UnsupportedTranscriberProvider;
             defer transcribing.deinitResponse(alloc, &result);
 
             if (isJsonContentType(request.content_type)) {
@@ -2108,12 +2348,13 @@ pub const Runtime = struct {
         const capability_auth_headers = capability_auth_storage[0..capability_auth_count];
         if (cfg_parsed.value.provider == .antfly) {
             const endpoint = cfg_parsed.value.resolvedUrl() orelse return error.InvalidTranscribingConfig;
-            const lease = try self.capabilityCache().getOrDiscoverLease(
+            const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
                 self.http,
                 endpoint,
                 antfly_model.?,
                 .transcribe,
                 capability_auth_headers,
+                self.execution.waitContext(),
             );
             if (lease.capabilities) |capabilities| try capabilities.validateInvocation(.transcribe, .{
                 .item_count = 1,
@@ -2130,7 +2371,14 @@ pub const Runtime = struct {
             self.http,
             cfg_parsed.value,
             .{ .url = request.source_text },
-            .{ .source_table = self.execution.routing.source_table },
+            .{
+                .source_table = self.execution.routing.source_table,
+                .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
+                .cancellation = httpx.CancellationToken.fromCallback(
+                    self.execution.cancellation.ptr,
+                    self.execution.cancellation.is_cancelled_fn,
+                ),
+            },
         ) catch |err| {
             if (err == error.InferenceCapabilitiesStale and cfg_parsed.value.provider == .antfly) {
                 const endpoint = cfg_parsed.value.resolvedUrl() orelse return err;
@@ -2188,15 +2436,29 @@ pub const Runtime = struct {
 
         var response = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) blk: {
             const local = self.antfly_provider orelse return error.UnsupportedExtractionProvider;
-            const extract_fn = local.extract orelse return error.UnsupportedExtractionProvider;
-            break :blk try managed_embedder.AntflyProviderBoundary.call(
-                "extract",
-                local.boundary_dispatch,
-                extract_fn,
-                .{ local.ptr, alloc, cfg.model, extract_request },
-            );
+            break :blk if (local.extract_with_context) |extract_fn|
+                try managed_embedder.AntflyProviderBoundary.call(
+                    "extract_with_context",
+                    local.boundary_dispatch,
+                    extract_fn,
+                    .{ local.ptr, alloc, cfg.model, extract_request, self.requestContext() },
+                )
+            else if (local.extract) |extract_fn|
+                try managed_embedder.AntflyProviderBoundary.call(
+                    "extract",
+                    local.boundary_dispatch,
+                    extract_fn,
+                    .{ local.ptr, alloc, cfg.model, extract_request },
+                )
+            else
+                return error.UnsupportedExtractionProvider;
         } else extracting.extractWithConfigAndOptions(alloc, self.http, cfg, extract_request, .{
             .source_table = self.execution.routing.source_table,
+            .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
+            .cancellation = httpx.CancellationToken.fromCallback(
+                self.execution.cancellation.ptr,
+                self.execution.cancellation.is_cancelled_fn,
+            ),
         }) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
                 try self.invalidateExtractorCapabilityLease(alloc, cfg);
@@ -2210,6 +2472,36 @@ pub const Runtime = struct {
         return try alloc.dupe(u8, response.json);
     }
 };
+
+test "asset producer runtime invocation context can only tighten configured controls" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    var configured_canceled = std.atomic.Value(bool).init(false);
+    var invocation_canceled = std.atomic.Value(bool).init(false);
+    var runtime = Runtime.init(alloc, &client);
+    defer runtime.deinit();
+    runtime.execution.deadline_ns = 200;
+    runtime.execution.cancellation = CancellationToken.fromAtomic(&configured_canceled);
+    runtime.execution.max_response_bytes = 1024;
+
+    var cancellation: Runtime.RuntimeInvocationCancellation = undefined;
+    const scoped = Runtime.invocationRuntime(&runtime, .{
+        .deadline_ns = 300,
+        .cancellation = CancellationToken.fromAtomic(&invocation_canceled),
+        .max_response_bytes = 2048,
+    }, &cancellation);
+    try std.testing.expectEqual(@as(?u64, 200), scoped.execution.deadline_ns);
+    try std.testing.expectEqual(@as(?usize, 1024), scoped.execution.max_response_bytes);
+    try std.testing.expect(!scoped.execution.cancellation.isCancelled());
+    invocation_canceled.store(true, .release);
+    try std.testing.expect(scoped.execution.cancellation.isCancelled());
+    invocation_canceled.store(false, .release);
+    configured_canceled.store(true, .release);
+    try std.testing.expect(scoped.execution.cancellation.isCancelled());
+}
 
 const GeneratorToolOutput = enum {
     arguments,

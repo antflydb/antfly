@@ -231,6 +231,71 @@ pub const AntflyProvider = struct {
     /// closed when a public invocation plan depends on this guarantee. Keep new
     /// boundary fields append-only so callback offsets remain stable.
     owns_invocation_admission: bool = false,
+    generate_text_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        roles: []const []const u8,
+        contents: []const []const u8,
+        context: execution_context.RequestContext,
+    ) anyerror![]u8 = null,
+    generate_messages_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        messages: []const inference_types.ChatMessage,
+        context: execution_context.RequestContext,
+    ) anyerror![]u8 = null,
+    generate_messages_with_attachments_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        messages: []const inference_types.ChatMessage,
+        attachments: []const inference_work.Attachment,
+        context: execution_context.RequestContext,
+    ) anyerror![]u8 = null,
+    model_capabilities_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        task: inference_work.Task,
+        context: execution_context.RequestContext,
+    ) anyerror!inference_work.InferenceCapabilities = null,
+    transcribe_audio_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: transcribing.Request,
+        context: execution_context.RequestContext,
+    ) anyerror!transcribing.Response = null,
+    read_images_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: readers.Request,
+        context: execution_context.RequestContext,
+    ) anyerror![]readers.Result = null,
+    read_encoded_images_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: readers.EncodedRequest,
+        context: execution_context.RequestContext,
+    ) anyerror![]readers.Result = null,
+    read_encoded_images_reported_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: readers.EncodedRequest,
+        context: execution_context.RequestContext,
+    ) anyerror!readers.BatchResult = null,
+    extract_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: extracting.Request,
+        context: execution_context.RequestContext,
+    ) anyerror!extracting.Response = null,
 };
 
 pub const ClassificationRequest = struct {

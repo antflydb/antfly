@@ -4984,6 +4984,7 @@ pub fn build(b: *std.Build) void {
             "document extraction generated OCR bypasses unsupported native batch",
             "document extraction generated OCR rejects malformed envelopes before apply",
             "document extraction generated OCR applies unit updates transactionally",
+            "asset batch fallback isolates malformed envelope and preserves typed mixed results",
             "asset batch fallback keeps the logical request retry budget",
             "document-wide OCR resource failure preserves units and marks pending pages",
             "OCR pending metadata construction is allocation-failure safe",

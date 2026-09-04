@@ -2303,6 +2303,44 @@ fn checkProviderInvocation(runtime: *EnrichmentRuntime, foreground_bounded: bool
     if (!foreground_bounded) return error.UnboundedEnrichmentProvider;
 }
 
+const AssetInvocationCancellation = struct {
+    lifecycle: CancellationToken,
+    request: CancellationToken,
+    inherited: CancellationToken,
+
+    fn isCancelled(ptr: *const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        return self.lifecycle.isCancelled() or self.request.isCancelled() or
+            self.inherited.isCancelled();
+    }
+};
+
+fn scopedAssetProducer(
+    runtime: *EnrichmentRuntime,
+    producer: asset_producer_mod.Producer,
+    cancellation: *AssetInvocationCancellation,
+) asset_producer_mod.Producer {
+    const guard = runtime.active_provider_guard;
+    cancellation.* = .{
+        .lifecycle = runtime.config.cancellation,
+        .request = guard.cancellation,
+        .inherited = producer.invocation_context.cancellation,
+    };
+    const deadline_ns = if (producer.invocation_context.deadline_ns) |inherited|
+        if (guard.deadline_ns) |deadline| @min(inherited, deadline) else inherited
+    else
+        guard.deadline_ns;
+    return producer.withInvocationContext(.{
+        .io = producer.invocation_context.io orelse runtime.config.io,
+        .deadline_ns = deadline_ns,
+        .cancellation = .{
+            .ptr = cancellation,
+            .is_cancelled_fn = AssetInvocationCancellation.isCancelled,
+        },
+        .max_response_bytes = producer.invocation_context.max_response_bytes,
+    });
+}
+
 fn checkAssetProviderInvocation(
     runtime: *EnrichmentRuntime,
     producer: asset_producer_mod.Producer,
@@ -2343,7 +2381,9 @@ fn assetProducerBatchModeGuarded(
     requests: []const asset_producer_mod.Request,
 ) !inference_work.BatchMode {
     try checkAssetProviderInvocation(runtime, producer, alloc, requests);
-    const result = producer.batchMode(alloc, requests) catch |err| {
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = scopedAssetProducer(runtime, producer, &cancellation);
+    const result = scoped.batchMode(alloc, requests) catch |err| {
         try checkProviderFailureGuard(runtime);
         return err;
     };
@@ -2358,7 +2398,9 @@ fn assetProducerProduceGuarded(
     request: asset_producer_mod.Request,
 ) ![]u8 {
     try checkAssetProviderInvocation(runtime, producer, alloc, &.{request});
-    const produced = producer.produce(alloc, request) catch |err| {
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = scopedAssetProducer(runtime, producer, &cancellation);
+    const produced = scoped.produce(alloc, request) catch |err| {
         try checkProviderFailureGuard(runtime);
         return err;
     };
@@ -2376,7 +2418,9 @@ fn assetProducerProduceBatchGuarded(
     requests: []const asset_producer_mod.Request,
 ) ![][]u8 {
     try checkAssetProviderInvocation(runtime, producer, alloc, requests);
-    const produced = producer.produceBatch(alloc, requests) catch |err| {
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = scopedAssetProducer(runtime, producer, &cancellation);
+    const produced = scoped.produceBatch(alloc, requests) catch |err| {
         try checkProviderFailureGuard(runtime);
         return err;
     };
@@ -2395,7 +2439,9 @@ fn assetProducerProduceBatchReportedGuarded(
     requests: []const asset_producer_mod.Request,
 ) !asset_producer_mod.ProducedBatch {
     try checkAssetProviderInvocation(runtime, producer, alloc, requests);
-    var produced = producer.produceBatchReported(alloc, requests) catch |err| {
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = scopedAssetProducer(runtime, producer, &cancellation);
+    var produced = scoped.produceBatchReported(alloc, requests) catch |err| {
         try checkProviderFailureGuard(runtime);
         return err;
     };
@@ -5625,7 +5671,7 @@ fn flushAssetProducerBatch(
     if (!can_batch)
         return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
 
-    var produced = assetProducerProduceBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
+    var produced_batch = assetProducerProduceBatchReportedGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
         // Batch execution is an optimization boundary, not a logical repair
         // identity. Fall back immediately so durable retry ownership belongs to
@@ -5633,33 +5679,37 @@ fn flushAssetProducerBatch(
         // fingerprints across worker passes.
         return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
     };
-    if (produced.len != items.items.len) {
-        for (produced) |output| {
-            if (output.len > 0) runtime.alloc.free(output);
-        }
-        runtime.alloc.free(produced);
-        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
-    }
+    defer produced_batch.deinit(runtime.alloc);
 
-    defer runtime.alloc.free(produced);
-    errdefer {
-        for (produced) |output| {
-            if (output.len > 0) runtime.alloc.free(output);
-        }
-    }
+    // A retryable item yields before any successful sibling is applied. This
+    // preserves request atomicity while retaining the provider's retry policy
+    // and, critically, avoids reissuing successful items merely to identify
+    // which member failed.
+    for (items.items, produced_batch.items) |item, produced| switch (produced.result) {
+        .item_error => |failure| if (failure.retryable and shouldYieldRequestError(runtime, failure.cause)) {
+            setActiveFailureFingerprint(runtime, requestFailureFingerprint(item.request));
+            setRetryAfterHint(runtime, failure.retry_after_ms);
+            return failure.cause;
+        },
+        .value => {},
+    };
 
-    for (items.items, produced, 0..) |*item, output, idx| {
+    for (items.items, produced_batch.items) |*item, *produced| {
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-        applyAssetProducerBatchOutput(runtime, item.*, output, window) catch |err| {
-            runtime.alloc.free(output);
-            produced[idx] = "";
-            if (err == error.OutOfMemory) return err;
-            if (shouldYieldRequestError(runtime, err)) return err;
-            try recordIsolatedRequestError(runtime, window, item.request, err);
-            continue;
-        };
-        runtime.alloc.free(output);
-        produced[idx] = "";
+        setActiveFailureFingerprint(runtime, requestFailureFingerprint(item.request));
+        switch (produced.result) {
+            .item_error => |failure| try recordIsolatedRequestError(runtime, window, item.request, failure.cause),
+            .value => |output| {
+                applyAssetProducerBatchOutput(runtime, item.*, output, window) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    if (shouldYieldRequestError(runtime, err)) return err;
+                    try recordIsolatedRequestError(runtime, window, item.request, err);
+                    continue;
+                };
+                runtime.alloc.free(output);
+                produced.result = .{ .value = &.{} };
+            },
+        }
     }
 }
 
@@ -7211,6 +7261,8 @@ fn renderRuntimePdfWindow(
     units: []const document_extraction_mod.Unit,
     start_index: usize,
 ) !RuntimePdfRenderWindow {
+    var invocation_cancellation: AssetInvocationCancellation = undefined;
+    const invocation_producer = scopedAssetProducer(runtime, producer, &invocation_cancellation);
     const max_pages = @max(@as(usize, 1), @min(batch_policy.max_items, generatedOcrBatchMaxItems()));
     var requests = std.ArrayListUnmanaged(document_extraction_mod.PdfPageRenderRequest).empty;
     defer requests.deinit(alloc);
@@ -7278,7 +7330,7 @@ fn renderRuntimePdfWindow(
                 .page_number = units[unit_index].page_number,
                 .media = prototype_media[i .. i + 1],
             };
-            const singleton_memory = try producer.invocationMemoryForRequests(
+            const singleton_memory = try invocation_producer.invocationMemoryForRequests(
                 alloc,
                 prototype_requests[i .. i + 1],
             );
@@ -7295,7 +7347,7 @@ fn renderRuntimePdfWindow(
 
         var planned_count = requests.items.len;
         while (true) {
-            const invocation_memory = try producer.invocationMemoryForRequests(
+            const invocation_memory = try invocation_producer.invocationMemoryForRequests(
                 alloc,
                 prototype_requests[0..planned_count],
             );
@@ -7366,6 +7418,8 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         .transcript => config.transcription_enabled,
     };
     if (!enabled) return;
+    var invocation_cancellation: AssetInvocationCancellation = undefined;
+    const invocation_producer = scopedAssetProducer(runtime, producer, &invocation_cancellation);
 
     var source_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(source_bytes, &source_digest, .{});
@@ -7398,7 +7452,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             .content_type = "image/png",
             .inline_media_trusted = true,
         };
-        if (try producer.capabilitiesForRequests(working_alloc, &.{prototype})) |capabilities| {
+        if (try invocation_producer.capabilitiesForRequests(working_alloc, &.{prototype})) |capabilities| {
             if (!capabilities.supports(.{ .image = true }) or !capabilities.acceptsMimeType("image/png"))
                 return error.UnsupportedInferenceModality;
             admitted_batch_policy.max_items = @min(admitted_batch_policy.max_items, capabilities.batch.max_items);
@@ -7456,7 +7510,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                     pdf_render_window = renderRuntimePdfWindow(
                         runtime,
                         working_alloc,
-                        producer,
+                        invocation_producer,
                         pdf_session.?,
                         config,
                         available_bytes,
@@ -7539,7 +7593,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             continue;
         }
         if (requests.items.len > 0 and (requests.items.len >= admitted_batch_policy.max_items or batch_bytes + request_bytes > admitted_batch_policy.max_bytes)) {
-            try flushRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
+            try flushRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, invocation_producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
             clearRuntimeGeneratedTextBatchMedia(working_alloc, &rendered_values, &media_values);
             requests.clearRetainingCapacity();
             unit_indices.clearRetainingCapacity();
@@ -7559,7 +7613,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         batch_bytes = addUsizeSaturating(batch_bytes, request_bytes);
     }
     if (requests.items.len > 0) {
-        try flushRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
+        try flushRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, invocation_producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
         clearRuntimeGeneratedTextBatchMedia(working_alloc, &rendered_values, &media_values);
     }
 }
@@ -17271,7 +17325,7 @@ test "document extraction missing OCR model is a terminal unit failure" {
     try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "ModelNotFound") != null);
 }
 
-test "generic generated asset batch fallback isolates malformed batch envelope" {
+test "asset batch fallback isolates malformed envelope and preserves typed mixed results" {
     const alloc = std.testing.allocator;
 
     const FallbackProducer = struct {
@@ -17302,6 +17356,51 @@ test "generic generated asset batch fallback isolates malformed batch envelope" 
             errdefer a.free(malformed);
             malformed[0] = try a.dupe(u8, "orphaned-output");
             return malformed;
+        }
+    };
+
+    const MixedResultProducer = struct {
+        batch_count: usize = 0,
+        single_count: usize = 0,
+
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .produce = produce,
+                    .produce_batch_reported = produceBatchReported,
+                    .invocation_memory_for_requests = testInvocationMemoryForRequests,
+                },
+            };
+        }
+
+        fn produce(ptr: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.single_count += 1;
+            return error.TestUnexpectedSequentialFallback;
+        }
+
+        fn produceBatchReported(ptr: *anyopaque, a: Allocator, requests: []const asset_producer_mod.Request) !asset_producer_mod.ProducedBatch {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_count += 1;
+            const produced = try a.alloc(asset_producer_mod.ProducedItem, requests.len);
+            errdefer a.free(produced);
+            produced[0] = .{
+                .identity = .{},
+                .result = .{ .value = try a.dupe(u8, "native:three") },
+            };
+            produced[1] = .{
+                .identity = .{},
+                .result = .{ .item_error = .{
+                    .cause = error.UnsupportedGeneratorProvider,
+                    .code = .invalid_request,
+                    .retryable = false,
+                } },
+            };
+            return .{
+                .items = produced,
+                .execution = inference_work.ExecutionReport.native(requests.len),
+            };
         }
     };
 
@@ -17382,6 +17481,27 @@ test "generic generated asset batch fallback isolates malformed batch envelope" 
     const second = try storeGetAlloc(&runtime, "artifact:two");
     defer alloc.free(second);
     try std.testing.expectEqualStrings("ok:two", second);
+
+    // A valid typed envelope is authoritative. Preserve its successful item
+    // and deterministic failure independently; never discard the success and
+    // rerun the whole partition through singleton callbacks.
+    var mixed = MixedResultProducer{};
+    var failure_capture = TestFailureCapture{};
+    runtime.config.asset_producer = mixed.producer();
+    runtime.failure_ctx = &failure_capture;
+    runtime.failure_fn = TestFailureCapture.record;
+    defer clearIsolatedFailedIndexes(&runtime);
+    try items.append(alloc, try TestItem.make(alloc, "doc:3", "three", "artifact:three", "state:three"));
+    try items.append(alloc, try TestItem.make(alloc, "doc:4", "four", "artifact:four", "state:four"));
+    try flushAssetProducerBatch(&runtime, &items, &window);
+
+    try std.testing.expectEqual(@as(usize, 1), mixed.batch_count);
+    try std.testing.expectEqual(@as(usize, 0), mixed.single_count);
+    try std.testing.expectEqual(@as(usize, 1), failure_capture.count);
+    const third = try storeGetAlloc(&runtime, "artifact:three");
+    defer alloc.free(third);
+    try std.testing.expectEqualStrings("native:three", third);
+    try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, "artifact:four"));
 }
 
 test "asset batch fallback keeps the logical request retry budget" {

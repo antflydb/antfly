@@ -21,6 +21,10 @@ const openai_provider = @import("../inference/openai.zig");
 const antfly_provider = @import("../inference/local.zig");
 const vertex_provider = @import("../inference/vertex.zig");
 const common_secrets = @import("../common/secrets.zig");
+const execution_context = @import("../inference/execution_context.zig");
+const platform_time = @import("antfly_platform").time;
+
+const remote_generate_max_timeout_ms: u64 = 300_000;
 
 pub const Role = lib.Role;
 pub const ContentPart = lib.ContentPart;
@@ -48,6 +52,7 @@ pub const BackendFactory = struct {
     inference_api_key: ?[]const u8 = null,
     max_response_bytes: ?usize = null,
     source_table: []const u8 = "",
+    execution: execution_context.Context = .{},
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -67,6 +72,7 @@ pub const BackendFactory = struct {
         inference_api_key: ?[]const u8 = null,
         max_response_bytes: ?usize = null,
         source_table: []const u8 = "",
+        execution: execution_context.Context = .{},
     };
 
     pub fn initWithOptions(
@@ -74,6 +80,9 @@ pub const BackendFactory = struct {
         http: *httpx.Client,
         options: Options,
     ) BackendFactory {
+        var execution = options.execution;
+        if (execution.routing.source_table.len == 0)
+            execution.routing.source_table = options.source_table;
         return .{
             .alloc = alloc,
             .http = http,
@@ -82,6 +91,7 @@ pub const BackendFactory = struct {
             .inference_api_key = options.inference_api_key,
             .max_response_bytes = options.max_response_bytes,
             .source_table = options.source_table,
+            .execution = execution,
         };
     }
 
@@ -94,17 +104,19 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
-        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.source_table);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution);
     }
 };
 
 const BackendState = struct {
     alloc: std.mem.Allocator,
+    io: ?std.Io = null,
     cfg: GeneratorConfig,
     api_key: ?common_secrets.SecretValue = null,
     auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
     secret_store: ?*common_secrets.FileStore = null,
     max_response_bytes: ?usize = null,
+    execution: execution_context.Context = .{},
     provider: union(enum) {
         openai: openai_provider.Provider,
         remote_antfly: antfly_provider.Provider,
@@ -121,12 +133,13 @@ const BackendState = struct {
         secret_store: ?*common_secrets.FileStore,
         inference_api_key: ?[]const u8,
         max_response_bytes: ?usize,
-        source_table: []const u8,
+        execution: execution_context.Context,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
 
         state.alloc = alloc;
+        state.io = http.io;
         state.cfg = cfg;
         state.api_key = switch (cfg.provider) {
             .antfly => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key orelse inference_api_key, "ANTFLY_INFERENCE_API_KEY"),
@@ -137,6 +150,7 @@ const BackendState = struct {
         state.auth_header_cache = .{};
         state.secret_store = secret_store;
         state.max_response_bytes = max_response_bytes;
+        state.execution = execution;
         state.provider = switch (cfg.provider) {
             .openai, .ollama => blk: {
                 const provider = openai_provider.Provider.init(alloc, http, cfg.url);
@@ -166,7 +180,7 @@ const BackendState = struct {
                 .{ .embedded_antfly = embedded_antfly_provider.? }
             else blk: {
                 var provider = antfly_provider.Provider.init(alloc, http, if (cfg.url.len > 0) cfg.url else "http://127.0.0.1:8082");
-                try provider.setSourceTable(source_table);
+                try provider.setSourceTable(execution.routing.source_table);
                 if (cfg.capability_token) |token| try provider.setCapabilityToken(token);
                 if (cfg.capability_revision) |revision| try provider.setCapabilityRevision(revision);
                 break :blk .{ .remote_antfly = provider };
@@ -222,7 +236,16 @@ const BackendState = struct {
                 }
                 provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
                 provider.setMaxTokens(self.cfg.max_tokens);
-                provider.setMaxResponseBytes(self.max_response_bytes);
+                const response_limit = if (self.execution.max_response_bytes) |execution_limit|
+                    if (self.max_response_bytes) |family_limit| @min(execution_limit, family_limit) else execution_limit
+                else
+                    self.max_response_bytes;
+                provider.setMaxResponseBytes(response_limit);
+                provider.setRequestCancellation(self.execution.cancellation);
+                provider.setRequestTimeoutMs(try self.execution.remainingTimeoutMs(
+                    platform_time.monotonicNs(),
+                    remote_generate_max_timeout_ms,
+                ));
                 provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k, self.cfg.frequency_penalty, self.cfg.presence_penalty);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
@@ -239,6 +262,21 @@ const BackendState = struct {
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .embedded_antfly => |local| blk: {
+                const request_context = self.execution.requestContext(
+                    self.execution.io orelse self.io orelse std.Io.Threaded.global_single_threaded.io(),
+                );
+                if (local.generate_messages_with_context) |generate_messages| {
+                    const content = try managed_embedder.AntflyProviderBoundary.call(
+                        "generate_messages_with_context",
+                        local.boundary_dispatch,
+                        generate_messages,
+                        .{ local.ptr, alloc, model, messages, request_context },
+                    );
+                    break :blk inference.GenerateResult{
+                        .content = content,
+                        .allocator = alloc,
+                    };
+                }
                 if (local.generate_messages) |generate_messages| {
                     const content = try managed_embedder.AntflyProviderBoundary.call(
                         "generate_messages",
@@ -251,7 +289,6 @@ const BackendState = struct {
                         .allocator = alloc,
                     };
                 }
-                const generate_text = local.generate_text orelse return error.UnsupportedGeneratorProvider;
                 const roles = try alloc.alloc([]const u8, messages.len);
                 defer alloc.free(roles);
                 const contents = try alloc.alloc([]const u8, messages.len);
@@ -260,12 +297,22 @@ const BackendState = struct {
                     roles[i] = message.role.toSlice();
                     contents[i] = textContent(message) orelse return error.UnsupportedGeneratorProvider;
                 }
-                const content = try managed_embedder.AntflyProviderBoundary.call(
-                    "generate_text",
-                    local.boundary_dispatch,
-                    generate_text,
-                    .{ local.ptr, alloc, model, roles, contents },
-                );
+                const content = if (local.generate_text_with_context) |generate_text|
+                    try managed_embedder.AntflyProviderBoundary.call(
+                        "generate_text_with_context",
+                        local.boundary_dispatch,
+                        generate_text,
+                        .{ local.ptr, alloc, model, roles, contents, request_context },
+                    )
+                else if (local.generate_text) |generate_text|
+                    try managed_embedder.AntflyProviderBoundary.call(
+                        "generate_text",
+                        local.boundary_dispatch,
+                        generate_text,
+                        .{ local.ptr, alloc, model, roles, contents },
+                    )
+                else
+                    return error.UnsupportedGeneratorProvider;
                 break :blk inference.GenerateResult{
                     .content = content,
                     .allocator = alloc,

@@ -1664,16 +1664,18 @@ type Proxy struct {
 	server       *http.Server
 	logger       *zap.Logger
 
-	defaultPool         RoutePoolTarget
-	listenAddr          string
-	maxRequestBodyBytes int64
-	bodyAdmission       *byteAdmission
-	catalogAdmission    *byteAdmission
-	refreshWake         chan struct{}
-	capabilityLeaseMu   sync.Mutex
-	capabilityLeases    map[string]proxyCapabilityLease
-	capabilityLeaseByID map[[sha256.Size]byte]string
-	verifiedSource      VerifiedSourceResolver
+	defaultPool            RoutePoolTarget
+	listenAddr             string
+	maxRequestBodyBytes    int64
+	maxBatchResponseBytes  int64
+	bodyAdmission          *byteAdmission
+	batchResponseAdmission *byteAdmission
+	catalogAdmission       *byteAdmission
+	refreshWake            chan struct{}
+	capabilityLeaseMu      sync.Mutex
+	capabilityLeases       map[string]proxyCapabilityLease
+	capabilityLeaseByID    map[[sha256.Size]byte]string
+	verifiedSource         VerifiedSourceResolver
 }
 
 // VerifiedSourceResolver authenticates source-scoped routing attributes for an
@@ -1683,6 +1685,8 @@ type VerifiedSourceResolver func(*http.Request) (VerifiedSource, error)
 
 const defaultMaxProxyRequestBodyBytes int64 = 256 << 20
 const defaultMaxProxyRetainedBodyBytes int64 = 768 << 20
+const defaultMaxProxyBatchResponseBytes int64 = 256 << 20
+const defaultMaxProxyRetainedBatchResponseBytes int64 = 1 << 30
 const defaultMaxProxyRetainedCatalogBytes int64 = 256 << 20
 const capabilityLeaseTTL = 5 * time.Minute
 const maxCapabilityLeases = 1024
@@ -1718,17 +1722,19 @@ type Config struct {
 	// DefaultPool is an immutable namespace/pool routing target. Its zero value
 	// disables default-pool fallback. A nonempty Pool with an empty Namespace
 	// explicitly selects globally scoped standalone endpoints.
-	DefaultPool             RoutePoolTarget
-	RefreshInterval         time.Duration
-	EnableRouteWatching     bool                   // Enable watching InferenceProxy CRs
-	RouteWatchNamespace     string                 // Namespace to watch for routes (empty for all)
-	RouteWatchKubeconfig    string                 // Optional kubeconfig path for route watching
-	UpstreamAuthorization   string                 // Optional Authorization header value for upstream refreshes and requests
-	MaxRequestBodyBytes     int64                  // Optional retained request-body ceiling; defaults to 256 MiB
-	MaxRetainedBodyBytes    int64                  // Optional process-wide body+decode working-set ceiling; defaults to 768 MiB
-	MaxRetainedCatalogBytes int64                  // Optional process-wide model-catalog ceiling; defaults to 256 MiB
-	Logger                  *zap.Logger            // Optional logger (defaults to production logger)
-	VerifiedSourceResolver  VerifiedSourceResolver // Optional authenticated source resolver shared by discovery and execution
+	DefaultPool                   RoutePoolTarget
+	RefreshInterval               time.Duration
+	EnableRouteWatching           bool                   // Enable watching InferenceProxy CRs
+	RouteWatchNamespace           string                 // Namespace to watch for routes (empty for all)
+	RouteWatchKubeconfig          string                 // Optional kubeconfig path for route watching
+	UpstreamAuthorization         string                 // Optional Authorization header value for upstream refreshes and requests
+	MaxRequestBodyBytes           int64                  // Optional retained request-body ceiling; defaults to 256 MiB
+	MaxRetainedBodyBytes          int64                  // Optional process-wide body+decode working-set ceiling; defaults to 768 MiB
+	MaxBatchResponseBytes         int64                  // Optional mixed-batch aggregate response ceiling; defaults to 256 MiB
+	MaxRetainedBatchResponseBytes int64                  // Optional process-wide mixed-batch capture+decode ceiling; defaults to 1 GiB
+	MaxRetainedCatalogBytes       int64                  // Optional process-wide model-catalog ceiling; defaults to 256 MiB
+	Logger                        *zap.Logger            // Optional logger (defaults to production logger)
+	VerifiedSourceResolver        VerifiedSourceResolver // Optional authenticated source resolver shared by discovery and execution
 }
 
 // NewProxy creates a new Proxy
@@ -1766,6 +1772,19 @@ func NewProxy(cfg Config) *Proxy {
 		maxRetainedBodyBytes = minimumBodyAdmission
 	}
 	p.bodyAdmission = newByteAdmission(maxRetainedBodyBytes)
+	p.maxBatchResponseBytes = cfg.MaxBatchResponseBytes
+	if p.maxBatchResponseBytes <= 0 {
+		p.maxBatchResponseBytes = defaultMaxProxyBatchResponseBytes
+	}
+	maxRetainedBatchResponseBytes := cfg.MaxRetainedBatchResponseBytes
+	if maxRetainedBatchResponseBytes <= 0 {
+		maxRetainedBatchResponseBytes = defaultMaxProxyRetainedBatchResponseBytes
+	}
+	minimumBatchResponseAdmission := proxyBatchResponseAdmissionBytes(p.maxBatchResponseBytes)
+	if maxRetainedBatchResponseBytes < minimumBatchResponseAdmission {
+		maxRetainedBatchResponseBytes = minimumBatchResponseAdmission
+	}
+	p.batchResponseAdmission = newByteAdmission(maxRetainedBatchResponseBytes)
 	maxRetainedCatalogBytes := cfg.MaxRetainedCatalogBytes
 	if maxRetainedCatalogBytes <= 0 {
 		maxRetainedCatalogBytes = defaultMaxProxyRetainedCatalogBytes
@@ -1896,7 +1915,212 @@ func (p *Proxy) handleRead(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) handleGenerateBatch(w http.ResponseWriter, r *http.Request) {
-	p.proxyRequest(w, r, "generate.batch")
+	p.proxyGenerateBatchRequest(w, r)
+}
+
+type proxyGenerateBatchItem struct {
+	raw      json.RawMessage
+	customID string
+	model    string
+	index    int
+}
+
+type proxyGenerateBatchPlan struct {
+	mode  json.RawMessage
+	items []proxyGenerateBatchItem
+	model string
+	mixed bool
+}
+
+type proxyGenerateBatchResult struct {
+	CustomID string          `json:"custom_id"`
+	Index    int             `json:"index"`
+	Response json.RawMessage `json:"response,omitempty"`
+	Error    json.RawMessage `json:"error,omitempty"`
+}
+
+type proxyGenerateBatchSummary struct {
+	Total     int `json:"total"`
+	Succeeded int `json:"succeeded"`
+	Failed    int `json:"failed"`
+}
+
+type proxyBatchExecutionReport struct {
+	RequestedItems int    `json:"requested_items"`
+	NativeBatches  int    `json:"native_batches"`
+	NativeItems    int    `json:"native_items"`
+	SerialItems    int    `json:"serial_items"`
+	RejectedItems  int    `json:"rejected_items"`
+	FallbackItems  int    `json:"fallback_items"`
+	FallbackReason string `json:"fallback_reason,omitempty"`
+}
+
+type proxyGenerateBatchResponse struct {
+	Object    string                     `json:"object"`
+	Data      []proxyGenerateBatchResult `json:"data"`
+	Summary   proxyGenerateBatchSummary  `json:"summary"`
+	Execution *proxyBatchExecutionReport `json:"execution,omitempty"`
+}
+
+type proxyGenerateBatchGroup struct {
+	model   string
+	indexes []int
+}
+
+// proxyGenerateBatchRequest is the task-neutral coordinator above the model
+// executors. Homogeneous batches retain the streaming proxy fast path. Mixed
+// batches are partitioned deterministically and executed one bounded group at
+// a time, which keeps route state thread-safe and avoids multiplying retained
+// response memory. Results are restored to original request order.
+func (p *Proxy) proxyGenerateBatchRequest(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	routing, err := p.routingContextForRequest(r, start)
+	if err != nil {
+		http.Error(w, "source authentication failed", http.StatusUnauthorized)
+		return
+	}
+
+	if r.ContentLength > p.maxRequestBodyBytes {
+		http.Error(w, "inference request body is too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	retainedBodyBytes := p.maxRequestBodyBytes
+	if r.ContentLength >= 0 {
+		retainedBodyBytes = r.ContentLength
+	}
+	reservedAdmissionBytes := proxyBodyAdmissionBytes(retainedBodyBytes)
+	if err := p.bodyAdmission.Acquire(r.Context(), reservedAdmissionBytes); err != nil {
+		http.Error(w, "request canceled while waiting for inference body admission", http.StatusRequestTimeout)
+		return
+	}
+	defer func() { p.bodyAdmission.Release(reservedAdmissionBytes) }()
+	body, err := readProxyRequestBody(r.Body, r.ContentLength, p.maxRequestBodyBytes)
+	if err != nil {
+		if errors.Is(err, errProxyRequestBodyTooLarge) {
+			http.Error(w, "inference request body is too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "failed to read request", http.StatusBadRequest)
+		return
+	}
+	actualAdmissionBytes := proxyMaterializedBodyAdmissionBytes(int64(len(body)), int64(cap(body)))
+	if actualAdmissionBytes < reservedAdmissionBytes {
+		p.bodyAdmission.Release(reservedAdmissionBytes - actualAdmissionBytes)
+		reservedAdmissionBytes = actualAdmissionBytes
+	}
+
+	plan, err := parseProxyGenerateBatchPlan(body)
+	if err != nil {
+		if errors.Is(err, errProxyGenerateBatchTooLarge) {
+			http.Error(w, "invalid inference request: "+err.Error(), http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid inference request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !plan.mixed {
+		p.proxyRequestWithBody(w, r, "generate.batch", start, routing, body)
+		return
+	}
+	responseAdmissionBytes := proxyBatchResponseAdmissionBytes(p.maxBatchResponseBytes)
+	if err := p.batchResponseAdmission.Acquire(r.Context(), responseAdmissionBytes); err != nil {
+		http.Error(w, "request canceled while waiting for inference response admission", http.StatusRequestTimeout)
+		return
+	}
+	defer p.batchResponseAdmission.Release(responseAdmissionBytes)
+
+	groups := make([]proxyGenerateBatchGroup, 0, len(plan.items))
+	groupByModel := make(map[string]int, len(plan.items))
+	for _, item := range plan.items {
+		groupIndex, ok := groupByModel[item.model]
+		if !ok {
+			groupIndex = len(groups)
+			groupByModel[item.model] = groupIndex
+			groups = append(groups, proxyGenerateBatchGroup{model: item.model})
+		}
+		groups[groupIndex].indexes = append(groups[groupIndex].indexes, item.index)
+	}
+
+	results := make([]proxyGenerateBatchResult, len(plan.items))
+	report := &proxyBatchExecutionReport{}
+	reportComplete := true
+	var retainedResponseBytes int64
+	for _, group := range groups {
+		groupBody, marshalErr := marshalProxyGenerateBatchGroup(plan, group)
+		if marshalErr != nil {
+			writeProxyGenerateBatchGroupFailure(results, report, plan, group, "PROXY_ENCODING_FAILED", "failed to encode routed batch partition", true, 0)
+			continue
+		}
+
+		groupRequest := r.Clone(r.Context())
+		groupRequest.Body = io.NopCloser(bytes.NewReader(groupBody))
+		groupRequest.ContentLength = int64(len(groupBody))
+		groupRequest.Header = r.Header.Clone()
+		// One outer token cannot describe more than one model. The coordinator
+		// owns fresh per-group resolution leases under the current route snapshot.
+		groupRequest.Header.Del(capabilityTokenHeader)
+		groupRequest.Header.Del(capabilityRevisionHeader)
+		groupRouting := routing
+		groupRouting.Headers = requestHeaderMap(groupRequest.Header)
+		groupRouting.Timestamp = time.Now()
+
+		// RawMessage values in accepted partitions retain the captured response
+		// buffers until the outer response is encoded. Bound the aggregate, not
+		// merely each partition, so many routed models cannot multiply memory.
+		capture := newBoundedProxyResponseWriter(p.maxBatchResponseBytes - retainedResponseBytes)
+		p.proxyRequestWithBody(capture, groupRequest, "generate.batch", time.Now(), groupRouting, groupBody)
+		if capture.err != nil {
+			writeProxyGenerateBatchGroupFailure(results, report, plan, group, "UPSTREAM_RESPONSE_TOO_LARGE", "inference batch partition response exceeded the proxy limit", true, 0)
+			continue
+		}
+		if capture.statusCode < 200 || capture.statusCode >= 300 {
+			retryAfterMS := retryAfterMilliseconds(capture.header.Get("Retry-After"))
+			writeProxyGenerateBatchGroupFailure(results, report, plan, group, "ROUTING_OR_UPSTREAM_ERROR", http.StatusText(capture.statusCode), proxyBatchStatusRetryable(capture.statusCode), retryAfterMS)
+			continue
+		}
+		retainedResponseBytes += int64(capture.body.Len())
+
+		var partition proxyGenerateBatchResponse
+		if err := json.Unmarshal(capture.body.Bytes(), &partition); err != nil ||
+			validateProxyGenerateBatchPartition(partition, plan, group) != nil {
+			writeProxyGenerateBatchGroupFailure(results, report, plan, group, "INVALID_UPSTREAM_RESPONSE", "inference batch partition returned an invalid result envelope", true, 0)
+			continue
+		}
+		for localIndex, globalIndex := range group.indexes {
+			item := partition.Data[localIndex]
+			item.Index = globalIndex
+			results[globalIndex] = item
+		}
+		if partition.Execution == nil {
+			reportComplete = false
+		} else {
+			mergeProxyBatchExecution(report, partition.Execution)
+		}
+	}
+
+	succeeded := 0
+	for _, item := range results {
+		if len(item.Response) > 0 && len(item.Error) == 0 {
+			succeeded++
+		}
+	}
+	response := proxyGenerateBatchResponse{
+		Object: "generate.batch",
+		Data:   results,
+		Summary: proxyGenerateBatchSummary{
+			Total:     len(results),
+			Succeeded: succeeded,
+			Failed:    len(results) - succeeded,
+		},
+		Execution: report,
+	}
+	if !reportComplete {
+		response.Execution = nil
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		p.logger.Warn("failed to encode partitioned generation batch response", zap.Error(err))
+	}
 }
 
 func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -3399,7 +3623,14 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		p.bodyAdmission.Release(reservedAdmissionBytes - actualAdmissionBytes)
 		reservedAdmissionBytes = actualAdmissionBytes
 	}
+	p.proxyRequestWithBody(w, r, operation, start, routing, body)
+}
 
+// proxyRequestWithBody owns routing, admission, retries, and forwarding for an
+// already bounded request body. The generate-batch coordinator uses this same
+// path for each homogeneous partition so direct and fan-out execution retain
+// identical route and capability-lease behavior.
+func (p *Proxy) proxyRequestWithBody(w http.ResponseWriter, r *http.Request, operation string, start time.Time, routing RoutingContext, body []byte) {
 	model, err := proxyRequestModel(body, operation)
 	if err != nil {
 		if errors.Is(err, errProxyGenerateBatchTooLarge) {
@@ -3540,6 +3771,20 @@ func proxyBodyAdmissionBytes(bodyBytes int64) int64 {
 	return bodyBytes * 3
 }
 
+// proxyBatchResponseAdmissionBytes covers the captured upstream body, buffer
+// growth, RawMessage copies retained for ordered reassembly, and the final
+// encoded envelope. The logical response limit remains maxBatchResponseBytes;
+// this larger process-wide reservation is the conservative physical peak.
+func proxyBatchResponseAdmissionBytes(responseBytes int64) int64 {
+	if responseBytes <= 0 {
+		return 0
+	}
+	if responseBytes > math.MaxInt64/4 {
+		return math.MaxInt64
+	}
+	return responseBytes * 4
+}
+
 func proxyMaterializedBodyAdmissionBytes(bodyBytes, bodyCapacityBytes int64) int64 {
 	if bodyBytes <= 0 && bodyCapacityBytes <= 0 {
 		return 0
@@ -3651,81 +3896,262 @@ var errProxyGenerateBatchTooLarge = errors.New("generate batch is too large")
 // the request body for bounded retries, but must not materialize a second
 // body-sized []Request merely to choose a route.
 func proxyGenerateBatchModel(body []byte) (string, error) {
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	opening, err := decoder.Token()
+	plan, err := parseProxyGenerateBatchPlan(body)
 	if err != nil {
 		return "", err
 	}
+	if plan.mixed {
+		return "", errors.New("mixed-model batch requires coordinated routing")
+	}
+	return plan.model, nil
+}
+
+func parseProxyGenerateBatchPlan(body []byte) (proxyGenerateBatchPlan, error) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	opening, err := decoder.Token()
+	if err != nil {
+		return proxyGenerateBatchPlan{}, err
+	}
 	if opening != json.Delim('{') {
-		return "", errors.New("batch request must be a JSON object")
+		return proxyGenerateBatchPlan{}, errors.New("batch request must be a JSON object")
 	}
 
+	plan := proxyGenerateBatchPlan{}
 	requestsSeen := false
-	requestCount := 0
-	model := ""
 	for decoder.More() {
 		fieldToken, err := decoder.Token()
 		if err != nil {
-			return "", err
+			return proxyGenerateBatchPlan{}, err
 		}
 		field, ok := fieldToken.(string)
 		if !ok {
-			return "", errors.New("batch request field name must be a string")
+			return proxyGenerateBatchPlan{}, errors.New("batch request field name must be a string")
+		}
+		if field == "mode" {
+			if len(plan.mode) != 0 {
+				return proxyGenerateBatchPlan{}, errors.New("batch request contains duplicate mode fields")
+			}
+			if err := decoder.Decode(&plan.mode); err != nil {
+				return proxyGenerateBatchPlan{}, err
+			}
+			if !bytes.Equal(plan.mode, []byte("null")) {
+				var mode string
+				if err := json.Unmarshal(plan.mode, &mode); err != nil || mode != "sync" {
+					return proxyGenerateBatchPlan{}, errors.New("only mode=sync is supported")
+				}
+			}
+			continue
 		}
 		if field != "requests" {
 			if err := skipProxyJSONValue(decoder); err != nil {
-				return "", err
+				return proxyGenerateBatchPlan{}, err
 			}
 			continue
 		}
 		if requestsSeen {
-			return "", errors.New("batch request contains duplicate requests fields")
+			return proxyGenerateBatchPlan{}, errors.New("batch request contains duplicate requests fields")
 		}
 		requestsSeen = true
 		arrayOpening, err := decoder.Token()
 		if err != nil {
-			return "", err
+			return proxyGenerateBatchPlan{}, err
 		}
 		if arrayOpening != json.Delim('[') {
-			return "", errors.New("batch requests must be an array")
+			return proxyGenerateBatchPlan{}, errors.New("batch requests must be an array")
 		}
 		for decoder.More() {
-			if requestCount == maxProxyGenerateBatchItems {
-				return "", fmt.Errorf("%w: requests must contain at most %d items", errProxyGenerateBatchTooLarge, maxProxyGenerateBatchItems)
+			if len(plan.items) == maxProxyGenerateBatchItems {
+				return proxyGenerateBatchPlan{}, fmt.Errorf("%w: requests must contain at most %d items", errProxyGenerateBatchTooLarge, maxProxyGenerateBatchItems)
 			}
-			var item struct {
-				Body struct {
+			var raw json.RawMessage
+			if err := decoder.Decode(&raw); err != nil {
+				return proxyGenerateBatchPlan{}, err
+			}
+			var decoded struct {
+				CustomID string `json:"custom_id"`
+				Body     struct {
 					Model string `json:"model"`
 				} `json:"body"`
 			}
-			if err := decoder.Decode(&item); err != nil {
-				return "", err
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				return proxyGenerateBatchPlan{}, err
 			}
-			itemModel := strings.TrimSpace(item.Body.Model)
+			itemModel := strings.TrimSpace(decoded.Body.Model)
 			if itemModel == "" {
-				return "", errors.New("batch request model is required")
+				return proxyGenerateBatchPlan{}, errors.New("batch request model is required")
 			}
-			if requestCount == 0 {
-				model = itemModel
-			} else if itemModel != model {
-				return "", errors.New("mixed-model batches must be partitioned before routing")
+			if decoded.CustomID == "" {
+				return proxyGenerateBatchPlan{}, errors.New("batch request custom_id is required")
 			}
-			requestCount++
+			if len(plan.items) == 0 {
+				plan.model = itemModel
+			} else if itemModel != plan.model {
+				plan.mixed = true
+			}
+			plan.items = append(plan.items, proxyGenerateBatchItem{
+				raw:      raw,
+				customID: decoded.CustomID,
+				model:    itemModel,
+				index:    len(plan.items),
+			})
 		}
 		if _, err := decoder.Token(); err != nil {
-			return "", err
+			return proxyGenerateBatchPlan{}, err
 		}
 	}
 	if _, err := decoder.Token(); err != nil {
-		return "", err
+		return proxyGenerateBatchPlan{}, err
 	}
 	if decoder.Decode(&struct{}{}) != io.EOF {
-		return "", errors.New("batch request must contain exactly one JSON value")
+		return proxyGenerateBatchPlan{}, errors.New("batch request must contain exactly one JSON value")
 	}
-	if !requestsSeen || requestCount == 0 {
-		return "", errors.New("batch requests must not be empty")
+	if !requestsSeen || len(plan.items) == 0 {
+		return proxyGenerateBatchPlan{}, errors.New("batch requests must not be empty")
 	}
-	return model, nil
+	return plan, nil
+}
+
+func marshalProxyGenerateBatchGroup(plan proxyGenerateBatchPlan, group proxyGenerateBatchGroup) ([]byte, error) {
+	requests := make([]json.RawMessage, len(group.indexes))
+	for i, index := range group.indexes {
+		requests[i] = plan.items[index].raw
+	}
+	envelope := struct {
+		Mode     json.RawMessage   `json:"mode,omitempty"`
+		Requests []json.RawMessage `json:"requests"`
+	}{
+		Mode:     plan.mode,
+		Requests: requests,
+	}
+	return json.Marshal(envelope)
+}
+
+func mergeProxyBatchExecution(total, partition *proxyBatchExecutionReport) {
+	total.RequestedItems += partition.RequestedItems
+	total.NativeBatches += partition.NativeBatches
+	total.NativeItems += partition.NativeItems
+	total.SerialItems += partition.SerialItems
+	total.RejectedItems += partition.RejectedItems
+	total.FallbackItems += partition.FallbackItems
+	if total.FallbackReason == "" && partition.FallbackReason != "" {
+		total.FallbackReason = partition.FallbackReason
+	}
+}
+
+func validateProxyGenerateBatchPartition(partition proxyGenerateBatchResponse, plan proxyGenerateBatchPlan, group proxyGenerateBatchGroup) error {
+	if partition.Object != "generate.batch" || len(partition.Data) != len(group.indexes) {
+		return errors.New("invalid generation batch envelope")
+	}
+	succeeded := 0
+	for localIndex, globalIndex := range group.indexes {
+		item := partition.Data[localIndex]
+		if item.Index != localIndex || item.CustomID != plan.items[globalIndex].customID ||
+			(len(item.Response) == 0) == (len(item.Error) == 0) {
+			return errors.New("invalid generation batch item identity")
+		}
+		if len(item.Response) != 0 {
+			succeeded++
+		}
+	}
+	if partition.Summary.Total != len(group.indexes) || partition.Summary.Succeeded != succeeded ||
+		partition.Summary.Failed != len(group.indexes)-succeeded {
+		return errors.New("invalid generation batch summary")
+	}
+	if execution := partition.Execution; execution != nil {
+		if execution.RequestedItems < 0 || execution.NativeBatches < 0 || execution.NativeItems < 0 ||
+			execution.SerialItems < 0 || execution.RejectedItems < 0 || execution.FallbackItems < 0 ||
+			execution.RequestedItems != len(group.indexes) || execution.NativeItems > execution.RequestedItems ||
+			execution.SerialItems > execution.RequestedItems || execution.RejectedItems > execution.RequestedItems ||
+			execution.NativeItems+execution.SerialItems+execution.RejectedItems != execution.RequestedItems ||
+			execution.FallbackItems > execution.SerialItems ||
+			(execution.NativeBatches == 0) != (execution.NativeItems == 0) ||
+			execution.NativeBatches > execution.NativeItems ||
+			(execution.FallbackItems == 0 && execution.FallbackReason != "") {
+			return errors.New("invalid generation batch execution report")
+		}
+	}
+	return nil
+}
+
+func writeProxyGenerateBatchGroupFailure(results []proxyGenerateBatchResult, report *proxyBatchExecutionReport, plan proxyGenerateBatchPlan, group proxyGenerateBatchGroup, code, message string, retryable bool, retryAfterMS int64) {
+	type itemError struct {
+		Code         string `json:"code"`
+		Message      string `json:"message"`
+		Retryable    bool   `json:"retryable"`
+		RetryAfterMS int64  `json:"retry_after_ms,omitempty"`
+	}
+	encoded, err := json.Marshal(itemError{
+		Code:         code,
+		Message:      message,
+		Retryable:    retryable,
+		RetryAfterMS: retryAfterMS,
+	})
+	if err != nil {
+		encoded = json.RawMessage(`{"code":"PROXY_ERROR","message":"inference batch partition failed","retryable":true}`)
+	}
+	for _, globalIndex := range group.indexes {
+		results[globalIndex] = proxyGenerateBatchResult{
+			CustomID: plan.items[globalIndex].customID,
+			Index:    globalIndex,
+			Error:    encoded,
+		}
+	}
+	report.RequestedItems += len(group.indexes)
+	report.RejectedItems += len(group.indexes)
+}
+
+func proxyBatchStatusRetryable(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooEarly ||
+		status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+}
+
+func retryAfterMilliseconds(value string) int64 {
+	seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || seconds <= 0 || seconds > math.MaxInt64/1000 {
+		return 0
+	}
+	return seconds * 1000
+}
+
+var errProxyResponseTooLarge = errors.New("inference proxy response is too large")
+
+type boundedProxyResponseWriter struct {
+	header      http.Header
+	statusCode  int
+	wroteHeader bool
+	body        bytes.Buffer
+	maxBytes    int64
+	err         error
+}
+
+func newBoundedProxyResponseWriter(maxBytes int64) *boundedProxyResponseWriter {
+	return &boundedProxyResponseWriter{header: make(http.Header), statusCode: http.StatusOK, maxBytes: maxBytes}
+}
+
+func (w *boundedProxyResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *boundedProxyResponseWriter) WriteHeader(statusCode int) {
+	if w.wroteHeader {
+		return
+	}
+	w.statusCode = statusCode
+	w.wroteHeader = true
+}
+
+func (w *boundedProxyResponseWriter) Write(body []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.err != nil {
+		return 0, w.err
+	}
+	if int64(len(body)) > w.maxBytes-int64(w.body.Len()) {
+		w.err = errProxyResponseTooLarge
+		return 0, w.err
+	}
+	return w.body.Write(body)
 }
 
 // skipProxyJSONValue consumes one value without retaining a RawMessage copy.

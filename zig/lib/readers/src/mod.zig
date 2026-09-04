@@ -369,6 +369,8 @@ fn deinitConfigValue(alloc: Allocator, cfg: Config) void {
 
 pub const RemoteOptions = struct {
     source_table: []const u8 = "",
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
 };
 
 fn initReader(alloc: Allocator, http: *httpx.Client, cfg: Config) !Reader {
@@ -407,6 +409,8 @@ const AntflyReaderState = struct {
     model: []const u8,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Reader {
         const state = try alloc.create(AntflyReaderState);
@@ -436,6 +440,8 @@ const AntflyReaderState = struct {
             .capability_token = capability_token,
             .capability_revision = capability_revision,
             .source_table = source_table,
+            .timeout_ms = options.timeout_ms,
+            .cancellation = options.cancellation,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
@@ -502,7 +508,9 @@ const AntflyReaderState = struct {
         var resp = try self.http.post(url, .{
             .json = body,
             .headers = headers,
+            .timeout_ms = self.timeout_ms,
             .max_response_size = req.max_response_bytes,
+            .cancellation = self.cancellation,
         });
         defer resp.deinit();
         if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));

@@ -14,8 +14,20 @@
 
 const std = @import("std");
 const inference_work = @import("../../../inference/work.zig");
+const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
 
 const Allocator = std.mem.Allocator;
+
+/// Controls owned by the logical invocation rather than by a shared producer.
+/// A producer handle is copied before these controls are installed, so a
+/// foreground deadline can safely overlap the background worker's lifecycle
+/// cancellation without mutating provider-global state.
+pub const InvocationContext = struct {
+    io: ?std.Io = null,
+    deadline_ns: ?u64 = null,
+    cancellation: CancellationToken = .none,
+    max_response_bytes: ?usize = null,
+};
 
 pub const ProducerType = enum {
     copy,
@@ -183,14 +195,20 @@ pub fn producedBatchFromOutputs(
 pub const Producer = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    invocation_context: InvocationContext = .{},
 
     pub const VTable = struct {
         produce: *const fn (ptr: *anyopaque, alloc: Allocator, request: Request) anyerror![]u8,
+        produce_with_context: ?*const fn (ptr: *anyopaque, alloc: Allocator, request: Request, context: InvocationContext) anyerror![]u8 = null,
         produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror![][]u8 = null,
+        produce_batch_with_context: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request, context: InvocationContext) anyerror![][]u8 = null,
         produce_batch_reported: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!ProducedBatch = null,
+        produce_batch_reported_with_context: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request, context: InvocationContext) anyerror!ProducedBatch = null,
         batch_mode: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!inference_work.BatchMode = null,
+        batch_mode_with_context: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request, context: InvocationContext) anyerror!inference_work.BatchMode = null,
         can_produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!bool = null,
         capabilities_for_requests: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!?inference_work.InferenceCapabilities = null,
+        capabilities_for_requests_with_context: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request, context: InvocationContext) anyerror!?inference_work.InferenceCapabilities = null,
         /// Complete peak-memory and result contract for the concrete route
         /// selected by these requests. Implementations that publish this hook
         /// apply it to every invocation, independent of how media is encoded.
@@ -198,6 +216,12 @@ pub const Producer = struct {
             ptr: *anyopaque,
             alloc: Allocator,
             requests: []const Request,
+        ) anyerror!inference_work.InvocationMemoryPlan = null,
+        invocation_memory_for_requests_with_context: ?*const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            requests: []const Request,
+            context: InvocationContext,
         ) anyerror!inference_work.InvocationMemoryPlan = null,
         deinit: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
         /// See embedder.DenseEmbedder.foreground_bounded. This is deliberately
@@ -215,6 +239,12 @@ pub const Producer = struct {
         ) anyerror!bool = null,
     };
 
+    pub fn withInvocationContext(self: Producer, context: InvocationContext) Producer {
+        var scoped = self;
+        scoped.invocation_context = context;
+        return scoped;
+    }
+
     pub fn foregroundBoundedForRequests(self: Producer, alloc: Allocator, requests: []const Request) !bool {
         if (self.vtable.foreground_bounded_for_requests) |foreground_bounded|
             return try foreground_bounded(self.ptr, alloc, requests);
@@ -230,7 +260,7 @@ pub const Producer = struct {
                 try invocationAllocatorLimit(resolved, &requests),
             );
             const bounded_alloc = bounded.allocator();
-            const output = self.vtable.produce(self.ptr, bounded_alloc, request) catch |err| {
+            const output = self.invokeProduce(bounded_alloc, request) catch |err| {
                 if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
                 return err;
             };
@@ -240,6 +270,12 @@ pub const Producer = struct {
             }
             return output;
         }
+        return try self.invokeProduce(alloc, request);
+    }
+
+    fn invokeProduce(self: Producer, alloc: Allocator, request: Request) ![]u8 {
+        if (self.vtable.produce_with_context) |produce_fn|
+            return try produce_fn(self.ptr, alloc, request, self.invocation_context);
         return try self.vtable.produce(self.ptr, alloc, request);
     }
 
@@ -265,8 +301,13 @@ pub const Producer = struct {
     }
 
     fn produceBatchUnchecked(self: Producer, alloc: Allocator, requests: []const Request) ![][]u8 {
-        if (self.vtable.produce_batch_reported) |reported| {
-            var batch = try reported(self.ptr, alloc, requests);
+        if (self.vtable.produce_batch_with_context) |produce_batch|
+            return try produce_batch(self.ptr, alloc, requests, self.invocation_context);
+        if (self.vtable.produce_batch_reported_with_context != null or self.vtable.produce_batch_reported != null) {
+            var batch = if (self.vtable.produce_batch_reported_with_context) |reported|
+                try reported(self.ptr, alloc, requests, self.invocation_context)
+            else
+                try self.vtable.produce_batch_reported.?(self.ptr, alloc, requests);
             defer batch.deinit(alloc);
             return try batch.intoOutputs(alloc);
         }
@@ -281,7 +322,7 @@ pub const Producer = struct {
         }
         for (out) |*item| item.* = "";
         for (requests, 0..) |request, i| {
-            out[i] = try self.vtable.produce(self.ptr, alloc, request);
+            out[i] = try self.invokeProduce(alloc, request);
         }
         return out;
     }
@@ -314,6 +355,12 @@ pub const Producer = struct {
     }
 
     fn produceBatchReportedUnchecked(self: Producer, alloc: Allocator, requests: []const Request) !ProducedBatch {
+        if (self.vtable.produce_batch_reported_with_context) |reported| {
+            var batch = try reported(self.ptr, alloc, requests, self.invocation_context);
+            errdefer batch.deinit(alloc);
+            try batch.validateForRequests(requests);
+            return batch;
+        }
         if (self.vtable.produce_batch_reported) |reported| {
             var batch = try reported(self.ptr, alloc, requests);
             errdefer batch.deinit(alloc);
@@ -330,7 +377,9 @@ pub const Producer = struct {
         requests: []const Request,
     ) !?inference_work.InvocationMemoryPlan {
         if (requests.len == 0) return null;
-        if (self.vtable.invocation_memory_for_requests == null) {
+        if (self.vtable.invocation_memory_for_requests == null and
+            self.vtable.invocation_memory_for_requests_with_context == null)
+        {
             if (requestsRequireInvocationContract(requests))
                 return error.InferenceInvocationMemoryUnavailable;
             return null;
@@ -342,7 +391,10 @@ pub const Producer = struct {
     /// distinction between a fused/native model batch and an API-compatible
     /// serial loop.
     pub fn batchMode(self: Producer, alloc: Allocator, requests: []const Request) !inference_work.BatchMode {
-        if (self.vtable.produce_batch == null and self.vtable.produce_batch_reported == null) return .none;
+        if (self.vtable.produce_batch == null and self.vtable.produce_batch_with_context == null and
+            self.vtable.produce_batch_reported == null and self.vtable.produce_batch_reported_with_context == null) return .none;
+        if (self.vtable.batch_mode_with_context) |batch_mode|
+            return try batch_mode(self.ptr, alloc, requests, self.invocation_context);
         if (self.vtable.batch_mode) |batch_mode|
             return try batch_mode(self.ptr, alloc, requests);
         if (self.vtable.can_produce_batch) |can_produce_batch|
@@ -357,6 +409,11 @@ pub const Producer = struct {
     }
 
     pub fn capabilitiesForRequests(self: Producer, alloc: Allocator, requests: []const Request) !?inference_work.InferenceCapabilities {
+        if (self.vtable.capabilities_for_requests_with_context) |resolve| {
+            const result = try resolve(self.ptr, alloc, requests, self.invocation_context);
+            if (result) |capabilities| try capabilities.validate();
+            return result;
+        }
         const resolve = self.vtable.capabilities_for_requests orelse return null;
         const result = try resolve(self.ptr, alloc, requests);
         if (result) |capabilities| try capabilities.validate();
@@ -368,7 +425,9 @@ pub const Producer = struct {
         alloc: Allocator,
         requests: []const Request,
     ) !inference_work.InvocationMemoryPlan {
-        if (self.vtable.invocation_memory_for_requests == null) {
+        if (self.vtable.invocation_memory_for_requests == null and
+            self.vtable.invocation_memory_for_requests_with_context == null)
+        {
             if (requestsRequireInvocationContract(requests))
                 return error.InferenceInvocationMemoryUnavailable;
             return .{ .attachment_transport = .borrowed_binary, .fixed_bytes = 0 };
@@ -381,12 +440,18 @@ pub const Producer = struct {
         alloc: Allocator,
         requests: []const Request,
     ) !inference_work.InvocationMemoryPlan {
-        const resolve = self.vtable.invocation_memory_for_requests.?;
+        const resolve = self.vtable.invocation_memory_for_requests;
+        const resolve_with_context = self.vtable.invocation_memory_for_requests_with_context;
+        if (resolve == null and resolve_with_context == null)
+            return error.InferenceInvocationMemoryUnavailable;
         var bounded = inference_work.BoundedInvocationAllocator.init(
             alloc,
             try invocationResolutionLimit(requests),
         );
-        const plan = resolve(self.ptr, bounded.allocator(), requests) catch |err| {
+        const plan = (if (resolve_with_context) |contextual|
+            contextual(self.ptr, bounded.allocator(), requests, self.invocation_context)
+        else
+            resolve.?(self.ptr, bounded.allocator(), requests)) catch |err| {
             if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
             return err;
         };
@@ -959,4 +1024,78 @@ test "asset producer destroys returned values when result identity mismatches it
         error.InvalidAssetProducerResponseIdentity,
         producer.produceBatchReported(std.testing.allocator, &requests),
     );
+}
+
+test "asset producer enforces invocation contracts with immutable planning and execution context" {
+    const State = struct {
+        planning_calls: usize = 0,
+        execution_calls: usize = 0,
+
+        fn legacyProduce(_: *anyopaque, _: Allocator, _: Request) anyerror![]u8 {
+            return error.LegacyCallbackInvoked;
+        }
+
+        fn produceWithContext(
+            ptr: *anyopaque,
+            alloc: Allocator,
+            _: Request,
+            context: InvocationContext,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.execution_calls += 1;
+            try std.testing.expectEqual(@as(?u64, 1234), context.deadline_ns);
+            try std.testing.expectEqual(@as(?usize, 2048), context.max_response_bytes);
+            try context.cancellation.check();
+            try std.testing.expect(context.io != null);
+            return try alloc.dupe(u8, "contextual");
+        }
+
+        fn memoryWithContext(
+            ptr: *anyopaque,
+            _: Allocator,
+            _: []const Request,
+            context: InvocationContext,
+        ) anyerror!inference_work.InvocationMemoryPlan {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.planning_calls += 1;
+            try std.testing.expectEqual(@as(?u64, 1234), context.deadline_ns);
+            try std.testing.expectEqual(@as(?usize, 2048), context.max_response_bytes);
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = 4096,
+                .allocator_limit_bytes = 4096,
+                .max_result_bytes_per_item = 1024,
+                .max_result_bytes = 1024,
+            };
+        }
+    };
+
+    var state = State{};
+    const producer = Producer{
+        .ptr = &state,
+        .vtable = &.{
+            .produce = State.legacyProduce,
+            .produce_with_context = State.produceWithContext,
+            .invocation_memory_for_requests_with_context = State.memoryWithContext,
+        },
+    };
+    var canceled = std.atomic.Value(bool).init(false);
+    const scoped = producer.withInvocationContext(.{
+        .io = std.Io.Threaded.global_single_threaded.io(),
+        .deadline_ns = 1234,
+        .cancellation = CancellationToken.fromAtomic(&canceled),
+        .max_response_bytes = 2048,
+    });
+    const result = try scoped.produce(std.testing.allocator, .{
+        .producer_type = .generator,
+        .config_json = "{}",
+        .source_text = "source",
+    });
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expectEqualStrings("contextual", result);
+    try std.testing.expectEqual(@as(usize, 1), state.planning_calls);
+    try std.testing.expectEqual(@as(usize, 1), state.execution_calls);
+    try std.testing.expectEqual(@as(?u64, null), producer.invocation_context.deadline_ns);
+    try std.testing.expectEqual(@as(?usize, null), producer.invocation_context.max_response_bytes);
 }

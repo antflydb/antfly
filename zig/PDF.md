@@ -2106,6 +2106,53 @@ The hardening above follows these long-term rules:
     execution contract. Persistent adapters own any routing strings that
     outlive an invocation, while query adapters hold an inference-lane lifetime
     lease for the complete remote call.
+61. **Implemented after invocation-lifetime review:** asset execution receives
+    an immutable invocation-scoped context instead of mutating a shared
+    producer. Planning, capability discovery, memory resolution, batch-mode
+    selection, and execution observe the same I/O owner, absolute monotonic
+    deadline, cancellation token, and response ceiling. Foreground and
+    background calls may therefore overlap safely with distinct controls.
+    Invocation controls intersect configured runtime controls, so a scoped
+    caller can only tighten a deadline, cancellation condition, or response
+    ceiling and can never erase the runtime's existing safety contract.
+    Remote reader, generator, extractor, and transcriber adapters recompute a
+    residual timeout and pass cancellation into the live HTTP request. The
+    linked provider exposes append-only context-aware generation, reading,
+    extraction, transcription, and capability callbacks; the standalone
+    bridge carries those controls through its existing invocation deadline and
+    borrowed cancellation view. Legacy callbacks remain usable as compatibility
+    execution but cannot claim the foreground-bounded contract.
+62. **Implemented after generic batch-consumption review:** every generated
+    asset consumer uses the authoritative `ProducedBatch` envelope. A valid
+    per-item failure is no longer converted into a request-wide error followed
+    by destructive singleton replay. Retryable items are preflighted before
+    any sibling mutation and retain the provider's `retry_after_ms`; a
+    deterministic item failure is durably isolated while each successful
+    sibling is applied and freed exactly once. Sequential fallback is reserved
+    for unsupported batching, a request-wide execution failure, or a malformed
+    envelope whose results have already been destroyed at the producer
+    boundary.
+63. **Implemented after distributed mixed-batch review:** the proxy accepts the
+    same mixed-model generation batch contract as direct inference nodes. It
+    authenticates and admits the outer body once, stably partitions items by
+    resolved model, and executes one partition at a time by default. Each
+    partition performs ordinary operation-aware routing and admission against
+    a fresh route snapshot; an outer capability token is removed because it
+    cannot fence several model routes. Results and typed failures are validated
+    against partition-local identity, restored to original indexes, and merged
+    into one ordered response. A failed model partition does not discard
+    successful partitions. Retained response bytes are capped in aggregate
+    across all partitions and admitted through a separate process-wide weighted
+    semaphore with allowance for capture growth, JSON decoding, ordered result
+    retention, and final encoding, so neither model fanout nor concurrent mixed
+    requests can multiply memory. Homogeneous batches retain the direct
+    streaming proxy path.
+64. **Implemented after exact-operation lease review:** singleton generation
+    discovers, caches, validates, carries, and invalidates only the `.generate`
+    capability lease it executes. Batch planning continues to use the distinct
+    `.generate_batch` lease. No ignored batch discovery can precede a singleton
+    call, so operation-specific limits, route eligibility, revisions, and stale
+    fencing remain coherent from plan through execution.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

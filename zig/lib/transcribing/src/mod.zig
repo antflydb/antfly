@@ -310,6 +310,8 @@ fn deinitSpeaker(alloc: Allocator, speaker: *Speaker) void {
 
 pub const RemoteOptions = struct {
     source_table: []const u8 = "",
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
 };
 
 fn initTranscriber(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
@@ -347,6 +349,8 @@ const AntflyTranscriberState = struct {
     model: []const u8,
     language_code: ?[]const u8 = null,
     max_response_bytes: ?usize = null,
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Transcriber {
         const configured_model = cfg.model orelse return error.InvalidTranscribingConfig;
@@ -381,6 +385,8 @@ const AntflyTranscriberState = struct {
             .source_table = source_table,
             .language_code = language_code,
             .max_response_bytes = cfg.max_response_bytes,
+            .timeout_ms = options.timeout_ms,
+            .cancellation = options.cancellation,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
@@ -457,7 +463,9 @@ const AntflyTranscriberState = struct {
         var resp = try self.http.post(url, .{
             .json = body,
             .headers = headers,
+            .timeout_ms = self.timeout_ms,
             .max_response_size = self.max_response_bytes,
+            .cancellation = self.cancellation,
         });
         defer resp.deinit();
         if (!resp.ok()) {

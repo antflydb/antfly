@@ -288,6 +288,8 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
 
 pub const RemoteOptions = struct {
     source_table: []const u8 = "",
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
 };
 
 pub fn initExtractor(alloc: Allocator, http: *httpx.Client, cfg: Config) !Extractor {
@@ -337,6 +339,8 @@ const HttpExtractorState = struct {
     http: *httpx.Client,
     cfg: Config,
     source_table: ?[]u8 = null,
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Extractor {
         const state = try alloc.create(HttpExtractorState);
@@ -353,6 +357,8 @@ const HttpExtractorState = struct {
             .http = http,
             .cfg = try cloneConfig(alloc, cfg),
             .source_table = source_table,
+            .timeout_ms = options.timeout_ms,
+            .cancellation = options.cancellation,
         };
         return .{ .ptr = state, .vtable = &.{ .extract = extract, .deinit = deinit } };
     }
@@ -398,7 +404,9 @@ const HttpExtractorState = struct {
         var resp = try self.http.post(url, .{
             .json = body,
             .headers = headers.items,
+            .timeout_ms = self.timeout_ms,
             .max_response_size = req.max_response_bytes,
+            .cancellation = self.cancellation,
         });
         defer resp.deinit();
         if (!resp.ok()) return if (responseCapabilityStale(resp))
