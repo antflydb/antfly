@@ -29,6 +29,7 @@ pub const Chunk = @import("chunking.zig").Chunk;
 pub const RerankingPipeline = @import("reranking.zig").RerankingPipeline;
 pub const RerankingConfig = @import("reranking.zig").RerankingConfig;
 pub const RankedResult = @import("reranking.zig").RankedResult;
+pub const RerankingExecutionControl = @import("reranking.zig").ExecutionControl;
 pub const ClassificationPipeline = @import("classification.zig").ClassificationPipeline;
 pub const ClassificationConfig = @import("classification.zig").ClassificationConfig;
 pub const ClassificationResult = @import("classification.zig").ClassificationResult;

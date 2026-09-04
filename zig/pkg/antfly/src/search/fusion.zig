@@ -278,14 +278,23 @@ pub const Pruner = struct {
     /// Prune hits in-place. Returns the pruned slice (subset of input).
     /// Does NOT free removed hits — caller is responsible for the original allocation.
     pub fn prune(self: Pruner, hits: []FusionHit) []FusionHit {
+        return self.pruneWith(hits, FusionHitPrunerAdapter);
+    }
+
+    /// Apply the same stable pruning policy to another score-bearing hit type.
+    /// The adapter must expose `score(hit) f64` and `indexCount(hit) usize`.
+    /// Keeping the policy generic lets the query coordinator prune provider-
+    /// reranked SearchHits without copying them back into fusion-only values.
+    pub fn pruneWith(self: Pruner, hits: anytype, comptime Adapter: type) @TypeOf(hits) {
+        const Hit = std.meta.Elem(@TypeOf(hits));
         var result = hits;
 
         // 1. Require multi-index
         if (self.require_multi_index) {
             var write: usize = 0;
             for (result, 0..) |h, read_idx| {
-                if (h.index_count >= 2) {
-                    if (write != read_idx) std.mem.swap(FusionHit, &result[write], &result[read_idx]);
+                if (Adapter.indexCount(h) >= 2) {
+                    if (write != read_idx) std.mem.swap(Hit, &result[write], &result[read_idx]);
                     write += 1;
                 }
             }
@@ -298,8 +307,8 @@ pub const Pruner = struct {
         if (self.min_absolute_score > 0) {
             var write: usize = 0;
             for (result, 0..) |h, read_idx| {
-                if (h.score >= self.min_absolute_score) {
-                    if (write != read_idx) std.mem.swap(FusionHit, &result[write], &result[read_idx]);
+                if (Adapter.score(h) >= self.min_absolute_score) {
+                    if (write != read_idx) std.mem.swap(Hit, &result[write], &result[read_idx]);
                     write += 1;
                 }
             }
@@ -310,12 +319,12 @@ pub const Pruner = struct {
 
         // 3. Min score ratio
         if (self.min_score_ratio > 0) {
-            const max_score = result[0].score; // already sorted desc
+            const max_score = Adapter.score(result[0]); // already sorted desc
             const threshold = max_score * self.min_score_ratio;
             var write: usize = 0;
             for (result, 0..) |h, read_idx| {
-                if (h.score >= threshold) {
-                    if (write != read_idx) std.mem.swap(FusionHit, &result[write], &result[read_idx]);
+                if (Adapter.score(h) >= threshold) {
+                    if (write != read_idx) std.mem.swap(Hit, &result[write], &result[read_idx]);
                     write += 1;
                 }
             }
@@ -327,12 +336,12 @@ pub const Pruner = struct {
         // 4. Std-dev threshold (requires 3+ hits)
         if (self.std_dev_threshold > 0 and result.len >= 3) {
             var sum: f64 = 0;
-            for (result) |h| sum += h.score;
+            for (result) |h| sum += Adapter.score(h);
             const mean = sum / @as(f64, @floatFromInt(result.len));
 
             var var_sum: f64 = 0;
             for (result) |h| {
-                const diff = h.score - mean;
+                const diff = Adapter.score(h) - mean;
                 var_sum += diff * diff;
             }
             const std_dev = @sqrt(var_sum / @as(f64, @floatFromInt(result.len)));
@@ -340,8 +349,8 @@ pub const Pruner = struct {
 
             var write: usize = 0;
             for (result, 0..) |h, read_idx| {
-                if (h.score >= cutoff) {
-                    if (write != read_idx) std.mem.swap(FusionHit, &result[write], &result[read_idx]);
+                if (Adapter.score(h) >= cutoff) {
+                    if (write != read_idx) std.mem.swap(Hit, &result[write], &result[read_idx]);
                     write += 1;
                 }
             }
@@ -354,8 +363,8 @@ pub const Pruner = struct {
         if (self.max_score_gap_percent > 0 and result.len >= 2) {
             var keep: usize = 1; // always keep first
             for (1..result.len) |j| {
-                const prev = result[j - 1].score;
-                const curr = result[j].score;
+                const prev = Adapter.score(result[j - 1]);
+                const curr = Adapter.score(result[j]);
                 if (prev > 0) {
                     const drop_pct = (prev - curr) / prev * 100.0;
                     if (drop_pct > self.max_score_gap_percent) break;
@@ -366,6 +375,16 @@ pub const Pruner = struct {
         }
 
         return result;
+    }
+};
+
+const FusionHitPrunerAdapter = struct {
+    fn score(hit: FusionHit) f64 {
+        return hit.score;
+    }
+
+    fn indexCount(hit: FusionHit) usize {
+        return hit.index_count;
     }
 };
 

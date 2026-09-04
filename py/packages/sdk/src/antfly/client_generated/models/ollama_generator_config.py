@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.ollama_generator_config_provider import OllamaGeneratorConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="OllamaGeneratorConfig")
@@ -16,6 +17,7 @@ class OllamaGeneratorConfig:
     """Configuration for the Ollama generative AI provider.
 
     Attributes:
+        provider (OllamaGeneratorConfigProvider):
         model (str): The name of the Ollama model to use. Example: llama3.3:70b.
         url (str | Unset): The URL of the Ollama API endpoint.
         temperature (float | Unset): Controls randomness in generation (0.0-2.0).
@@ -25,6 +27,7 @@ class OllamaGeneratorConfig:
         timeout (int | Unset): HTTP response timeout in seconds for Ollama API calls.
     """
 
+    provider: OllamaGeneratorConfigProvider
     model: str
     url: str | Unset = UNSET
     temperature: float | Unset = UNSET
@@ -35,6 +38,8 @@ class OllamaGeneratorConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         url = self.url
@@ -53,6 +58,7 @@ class OllamaGeneratorConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -74,6 +80,8 @@ class OllamaGeneratorConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = OllamaGeneratorConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         url = d.pop("url", UNSET)
@@ -89,6 +97,7 @@ class OllamaGeneratorConfig:
         timeout = d.pop("timeout", UNSET)
 
         ollama_generator_config = cls(
+            provider=provider,
             model=model,
             url=url,
             temperature=temperature,

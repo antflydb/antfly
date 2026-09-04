@@ -2,7 +2,6 @@ from enum import StrEnum
 
 
 class MergeStrategy(StrEnum):
-    FAILOVER = "failover"
     RRF = "rrf"
     RSF = "rsf"
 

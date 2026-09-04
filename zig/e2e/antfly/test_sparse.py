@@ -806,7 +806,7 @@ def test_sparse_hybrid_query_supports_reranker_and_pruner(
             "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
             "url": inference_reranker,
             "field": "content",
-            "top_n": 2,
+            "candidate_count": 3,
         },
         "profile": True,
         "limit": 2,
@@ -821,7 +821,7 @@ def test_sparse_hybrid_query_supports_reranker_and_pruner(
                 and response["responses"][0]["profile"]["reranker"][
                     "documents_reranked"
                 ]
-                == 2
+                == 3
             )
             else None
         ),
@@ -837,7 +837,7 @@ def test_sparse_hybrid_query_supports_reranker_and_pruner(
 
     profile = responses[0]["profile"]
     assert profile["reranker"]["model"] == "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    assert profile["reranker"]["documents_reranked"] == 2
+    assert profile["reranker"]["documents_reranked"] == 3
 
 
 def test_sparse_hybrid_query_rejects_invalid_reranker_provider(backup_api):
