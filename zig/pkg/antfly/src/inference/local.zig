@@ -178,6 +178,7 @@ pub const Provider = struct {
     http: *httpx.Client,
     base_url: []const u8,
     cancellation: ?CancellationToken = null,
+    request_timeout_ms: ?u64 = null,
     auth_header: ?[2][]const u8 = null,
     source_table: ?[]u8 = null,
     capability_token: ?[]u8 = null,
@@ -192,7 +193,6 @@ pub const Provider = struct {
     frequency_penalty: ?f32 = null,
     presence_penalty: ?f32 = null,
     max_response_bytes: ?usize = null,
-    request_timeout_ms: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -272,6 +272,10 @@ pub const Provider = struct {
         self.cancellation = cancellation;
     }
 
+    pub fn setRequestTimeoutMs(self: *Provider, timeout_ms: ?u64) void {
+        self.request_timeout_ms = timeout_ms;
+    }
+
     pub fn setToolOptions(self: *Provider, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) void {
         self.tools_json = tools_json;
         self.tool_choice_json = tool_choice_json;
@@ -283,10 +287,6 @@ pub const Provider = struct {
 
     pub fn setMaxResponseBytes(self: *Provider, max_response_bytes: ?usize) void {
         self.max_response_bytes = max_response_bytes;
-    }
-
-    pub fn setRequestTimeoutMs(self: *Provider, timeout_ms: ?u64) void {
-        self.request_timeout_ms = timeout_ms;
     }
 
     /// Build the task-neutral controls for every request sent to a distributed

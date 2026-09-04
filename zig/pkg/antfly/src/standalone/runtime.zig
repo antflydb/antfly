@@ -874,6 +874,8 @@ const LocalStandaloneMetadata = struct {
                 .drop_table_exact = dropTableExact,
                 .update_schema = updateSchema,
                 .update_schema_versioned = updateSchemaVersioned,
+                .update_schema_versioned_expected = updateSchemaVersionedExpected,
+                .mutate_schema = mutateSchema,
                 .create_index = createIndex,
                 .drop_index = dropIndex,
                 .put_artifact_enrichment = putArtifactEnrichment,
@@ -1281,19 +1283,53 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn updateSchemaVersioned(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !u32 {
+        var result = try mutateSchema(ptr, alloc, table_name, .replace, schema_json, null);
+        defer result.deinit(alloc);
+        return result.version;
+    }
+
+    fn updateSchemaVersionedExpected(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema_json: []const u8,
+        expected_version: ?u32,
+    ) !u32 {
+        var result = try mutateSchema(ptr, alloc, table_name, .replace, schema_json, expected_version);
+        defer result.deinit(alloc);
+        return result.version;
+    }
+
+    fn mutateSchema(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        mode: antfly.public_api.tables.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !antfly.public_api.tables.SchemaMutationResult {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
-        const updated = try antfly.public_api.tables.applySchemaUpdateRecord(alloc, table, schema_json);
+        if (expected_version) |expected| {
+            if (try antfly.public_api.tables.schemaVersion(table.schema_json) != expected)
+                return error.SchemaVersionChanged;
+        }
+        const updated = try antfly.public_api.tables.applySchemaMutationRecord(alloc, table, mode, body);
         defer antfly.metadata.table_manager.freeTable(alloc, updated);
         const version = try antfly.public_api.tables.schemaVersion(updated.schema_json);
+        var result = antfly.public_api.tables.SchemaMutationResult{
+            .version = version,
+            .schema_json = try alloc.dupe(u8, updated.schema_json),
+        };
+        errdefer result.deinit(alloc);
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try self.manager.upsertTable(updated);
         self.epoch +|= 1;
         try mutation.commit(self);
-        return version;
+        return result;
     }
 
     fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -1822,13 +1858,18 @@ pub fn runFromIterator(
     if (cli.secret_store_paths.items.len > 0) {
         secret_store = try initLayeredSecretStore(alloc, cli.secret_store_paths.items);
         secret_store_initialized = true;
+    } else {
+        const default_secret_store_path = try resolveDefaultSecretStorePathBeforeConfig(alloc, cli);
+        defer alloc.free(default_secret_store_path);
+        secret_store = try antfly.common.secrets.FileStore.init(alloc, default_secret_store_path);
+        secret_store_initialized = true;
     }
 
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |config_path|
         try antfly.common.config.loadFromPathWithSecretsForDeployment(
             alloc,
             config_path,
-            if (secret_store_initialized) &secret_store else null,
+            &secret_store,
             .standalone,
         )
     else
@@ -1852,7 +1893,7 @@ pub fn runFromIterator(
         remote_content_runtime = try antfly.common.remote_content_runtime.Runtime.init(
             alloc,
             config_path,
-            if (secret_store_initialized) &secret_store else null,
+            &secret_store,
             .standalone,
         );
         remote_content_runtime_initialized = true;
@@ -2104,11 +2145,6 @@ pub fn runFromIterator(
         if (loaded_config) |*cfg| cfg else null,
     );
     defer active_audio_runtime.deinit();
-
-    if (!secret_store_initialized) {
-        secret_store = try antfly.common.secrets.FileStore.init(alloc, resolved.secret_store_path);
-        secret_store_initialized = true;
-    }
 
     const internal_service_secret = try secret_store.getOwned(alloc, internal_service_secret_key);
     defer if (internal_service_secret) |value| alloc.free(value);
@@ -2924,6 +2960,7 @@ fn registerLinkedInferenceManifest(
             .post => .POST,
             .put => .PUT,
             .delete => .DELETE,
+            .patch => .PATCH,
         }, entry.path.slice(), linkedInferenceHttpHandler, route);
     }
 }
@@ -2954,6 +2991,7 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
             .POST => .post,
             .PUT => .put,
             .DELETE => .delete,
+            .PATCH => .patch,
             else => return error.MethodNotAllowed,
         },
         .path = runtime_http_abi.Bytes.init(context.request.uri.path),
@@ -4046,6 +4084,57 @@ fn resolveLocalBaseDir(
 ) ![]u8 {
     if (cli.data_dir) |path| return try normalizeResolvedPathAlloc(alloc, path);
     return try antfly.common.config.resolveLocalBaseDir(alloc, cfg);
+}
+
+fn configLocalBaseDirHintFromRaw(alloc: std.mem.Allocator, raw: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    const storage_value = root.get("storage") orelse return null;
+    const storage = switch (storage_value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    const local_value = storage.get("local") orelse return null;
+    const local = switch (local_value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    const base_value = local.get("base_dir") orelse return null;
+    const base_dir = switch (base_value) {
+        .string => |value| value,
+        else => return error.InvalidConfig,
+    };
+    if (antfly.common.secrets.parseSecretReference(base_dir) != null)
+        return error.InvalidConfig;
+    return try alloc.dupe(u8, base_dir);
+}
+
+fn configLocalBaseDirHintFromPath(alloc: std.mem.Allocator, path: []const u8) !?[]u8 {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(16 * 1024 * 1024));
+    defer alloc.free(raw);
+    return try configLocalBaseDirHintFromRaw(alloc, raw);
+}
+
+fn resolveDefaultSecretStorePathBeforeConfig(alloc: std.mem.Allocator, cli: CliConfig) ![]u8 {
+    const raw_base = if (cli.data_dir) |path|
+        try alloc.dupe(u8, path)
+    else if (cli.config_path) |config_path|
+        (try configLocalBaseDirHintFromPath(alloc, config_path)) orelse
+            try antfly.common.config.defaultLocalBaseDir(alloc)
+    else
+        try antfly.common.config.defaultLocalBaseDir(alloc);
+    defer alloc.free(raw_base);
+    const base = try normalizeResolvedPathAlloc(alloc, raw_base);
+    defer alloc.free(base);
+    const joined = try std.fs.path.join(alloc, &.{ base, "secrets.json" });
+    defer alloc.free(joined);
+    return try normalizeResolvedPathAlloc(alloc, joined);
 }
 
 fn resolvePaths(
@@ -5358,14 +5447,14 @@ fn inferenceProviderRerankTextsWithContext(
     model: []const u8,
     query: []const u8,
     documents: []const []const u8,
-    context: antfly.inference.execution_context.RequestContext,
+    context: antfly.inference.RequestContext,
 ) anyerror![]f32 {
     try context.check();
     const result = try invokeInferenceProviderControlled([]f32, alloc, handle, .rerank_texts, .{
         .model = model,
         .query = query,
         .documents = documents,
-    }, context.deadline_ns, context.cancellation);
+    }, context.deadline_ns, context.cancellation orelse .none);
     errdefer alloc.free(result);
     try context.check();
     return result;
@@ -8642,6 +8731,23 @@ test "standalone runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings(expected_secret_store, resolved.secret_store_path);
 }
 
+test "standalone resolves the default secret store before full config parsing" {
+    const alloc = std.testing.allocator;
+    const base_dir = (try configLocalBaseDirHintFromRaw(alloc,
+        \\{"storage":{"local":{"base_dir":"/var/lib/antfly"}},"generators":{"default":{"api_key":"${secret:generator.key}"}}}
+    )).?;
+    defer alloc.free(base_dir);
+    try std.testing.expectEqualStrings("/var/lib/antfly", base_dir);
+
+    try std.testing.expect((try configLocalBaseDirHintFromRaw(alloc, "{}")) == null);
+    try std.testing.expectError(
+        error.InvalidConfig,
+        configLocalBaseDirHintFromRaw(alloc,
+            \\{"storage":{"local":{"base_dir":"${secret:data.dir}"}}}
+        ),
+    );
+}
+
 test "standalone runtime resolves explicit extension package store path" {
     const alloc = std.testing.allocator;
     const resolved = try resolvePaths(alloc, .{ .extension_package_store_dir = "/opt/antfly/extensions" }, null);
@@ -8783,6 +8889,45 @@ test "standalone metadata advertises a linearizable owned snapshot" {
     try std.testing.expectEqual(@as(u64, 7), dropped.table_id);
     try std.testing.expectEqualSlices(u64, &.{7001}, dropped.group_ids);
     try std.testing.expect(metadata.findTableByNameLocked("docs") == null);
+}
+
+test "standalone schema mutation supports atomic merge patch and version CAS" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, catalog_path),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+    try metadata.manager.upsertTable(.{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":0,\"description\":\"before\"}",
+    });
+
+    const source = metadata.statusSource();
+    var result = try source.mutateSchema(alloc, "docs", .merge_patch, "{\"description\":\"after\"}", 0);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), result.version);
+    try std.testing.expect(std.mem.indexOf(u8, result.schema_json, "\"description\":\"after\"") != null);
+    try std.testing.expectError(
+        error.SchemaVersionChanged,
+        source.mutateSchema(alloc, "docs", .replace, "{}", 0),
+    );
 }
 
 test "standalone routing watch does not report absence after one probe" {

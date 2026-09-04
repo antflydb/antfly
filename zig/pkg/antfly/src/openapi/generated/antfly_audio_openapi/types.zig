@@ -245,7 +245,7 @@ pub const STTConfig = struct {
     project_id: ?[]const u8 = null,
     /// Google Cloud location.
     location: ?[]const u8 = null,
-    /// Path to service account JSON key file.
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain.
     credentials_path: ?[]const u8 = null,
     /// Default language code (e.g., 'en-US', 'es-ES').
     language_code: ?[]const u8 = null,
@@ -520,7 +520,7 @@ pub const TTSConfig = struct {
     project_id: ?[]const u8 = null,
     /// Google Cloud location.
     location: ?[]const u8 = null,
-    /// Path to service account JSON key file.
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain.
     credentials_path: ?[]const u8 = null,
     /// Default language code (e.g., 'en-US', 'es-ES').
     language_code: ?[]const u8 = null,
@@ -825,7 +825,7 @@ pub const VertexSTTConfig = struct {
     project_id: ?[]const u8 = null,
     /// Google Cloud location.
     location: ?[]const u8 = null,
-    /// Path to service account JSON key file.
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain.
     credentials_path: ?[]const u8 = null,
     /// Default language code (e.g., 'en-US', 'es-ES').
     language_code: ?[]const u8 = null,
@@ -895,7 +895,7 @@ pub const VertexTTSConfig = struct {
     project_id: ?[]const u8 = null,
     /// Google Cloud location.
     location: ?[]const u8 = null,
-    /// Path to service account JSON key file.
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain.
     credentials_path: ?[]const u8 = null,
     /// Default language code (e.g., 'en-US', 'es-ES').
     language_code: ?[]const u8 = null,

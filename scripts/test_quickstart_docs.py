@@ -109,7 +109,7 @@ def main() -> int:
         "--tasks rerank --variants f32 cross-encoder/ms-marco-MiniLM-L6-v2",
         "full_text_index_v0",
         "antfly index wait --table wikipedia",
-        "--until searchable-artifacts=1",
+        "--until source-covered=10%",
         "physical chunks or vector",
         "## Troubleshooting",
         "standalone inference paths",
@@ -140,17 +140,21 @@ def main() -> int:
         if language in {"bash", "sh", "shell"} and "antfly index wait" in block
     ]
     if len(wait_blocks) < 2 or any(
-        "--until searchable-artifacts=1" not in block for block in wait_blocks
+        "--until source-covered=10%" not in block for block in wait_blocks
     ):
-        fail("every quickstart index wait must require a published searchable artifact")
+        fail("every quickstart index wait must require 10% source coverage")
     if "rg '" in source:
         fail("quickstart troubleshooting must not require undeclared ripgrep tooling")
-    if "--until searchable-artifacts=1" not in quickstart_tape:
-        fail("the quickstart recording must wait for a searchable artifact")
-    if "Wait@1200s /reached searchable-artifacts=1:/" not in quickstart_tape:
-        fail(
-            "the quickstart recording must match the searchable-artifact success message"
-        )
+    if "--until source-covered=10%" not in quickstart_tape:
+        fail("the quickstart recording must wait for 10% source coverage")
+    if "Wait@1200s /reached source-covered=10%:/" not in quickstart_tape:
+        fail("the quickstart recording must match the source-coverage success message")
+    if "--until searchable-artifacts=1" in quickstart_tape:
+        fail("the quickstart recording must not retain the legacy single-artifact wait")
+    if "wiki-articles.jsonl" not in quickstart_tape:
+        fail("the quickstart recording must load the documented JSONL fixture")
+    if "--sync-level full_text" not in quickstart_tape:
+        fail("the quickstart recording must fence full-text visibility before waiting")
     if "Wait@1200s /ready/" in quickstart_tape:
         fail("the quickstart recording must not wait for the complete-only ready state")
 

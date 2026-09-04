@@ -594,7 +594,7 @@ test "exact gelu matches erf reference values" {
     // The f32 polynomial and exp lowering can differ by two ULPs across
     // supported targets; keep this a numerical contract, not a libm-bitwise
     // contract.
-    const tolerance: f32 = 4e-7;
+    const tolerance = 4 * std.math.floatEps(f32);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), data[0], tolerance);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8413447), data[1], tolerance);
     try std.testing.expectApproxEqAbs(@as(f32, -0.15865526), data[2], tolerance);

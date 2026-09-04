@@ -115,6 +115,12 @@ pub const Options = struct {
     location: []const u8 = "us-central1",
     credentials_path: ?[]const u8 = null,
     bearer_token: ?[]const u8 = null,
+    token_source: ?*google_auth.CachedTokenSource = null,
+};
+
+pub const RerankOptions = struct {
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
 };
 
 pub const Provider = struct {
@@ -125,6 +131,7 @@ pub const Provider = struct {
     location: []const u8,
     auth_header: ?[2][]const u8 = null,
     token_source: ?*google_auth.CachedTokenSource = null,
+    owns_token_source: bool = false,
     max_tokens: ?i64 = null,
     temperature: ?f32 = null,
     top_p: ?f32 = null,
@@ -150,8 +157,11 @@ pub const Provider = struct {
 
         if (options.bearer_token) |token| {
             try provider.setBearer(token);
+        } else if (options.token_source) |source| {
+            provider.token_source = source;
         } else {
             provider.token_source = try initVertexTokenSource(allocator, options.credentials_path);
+            provider.owns_token_source = true;
         }
 
         return provider;
@@ -162,9 +172,11 @@ pub const Provider = struct {
         self.allocator.free(self.project_id);
         self.allocator.free(self.location);
         if (self.auth_header) |header| self.allocator.free(header[1]);
-        if (self.token_source) |source| {
-            source.deinit();
-            self.allocator.destroy(source);
+        if (self.owns_token_source) {
+            if (self.token_source) |source| {
+                source.deinit();
+                self.allocator.destroy(source);
+            }
         }
         self.* = undefined;
     }
@@ -182,6 +194,75 @@ pub const Provider = struct {
             .ptr = @ptrCast(self),
             .vtable = &generator_vtable,
         };
+    }
+
+    pub fn rerank(
+        self: *Provider,
+        alloc: Allocator,
+        model: []const u8,
+        query: []const u8,
+        documents: []const []const u8,
+        options: RerankOptions,
+    ) ![]f32 {
+        const Record = struct {
+            id: []const u8,
+            content: []const u8,
+        };
+        const records = try alloc.alloc(Record, documents.len);
+        defer alloc.free(records);
+        var initialized: usize = 0;
+        defer for (records[0..initialized]) |record| alloc.free(record.id);
+        for (documents, 0..) |document, index| {
+            records[index] = .{
+                .id = try std.fmt.allocPrint(alloc, "{d}", .{index}),
+                .content = document,
+            };
+            initialized += 1;
+        }
+
+        const request_body = try std.json.Stringify.valueAlloc(alloc, .{
+            .model = model,
+            .query = query,
+            .records = records,
+            .ignoreRecordDetailsInResponse = true,
+        }, .{});
+        defer alloc.free(request_body);
+        const url = try std.fmt.allocPrint(
+            alloc,
+            "{s}/projects/{s}/locations/global/rankingConfigs/default_ranking_config:rank",
+            .{ self.base_url, self.project_id },
+        );
+        defer alloc.free(url);
+
+        var headers = std.ArrayList([2][]const u8).empty;
+        defer headers.deinit(alloc);
+        var minted_auth: ?[]u8 = null;
+        defer if (minted_auth) |value| alloc.free(value);
+        try self.appendAuthHeaders(alloc, &headers, &minted_auth);
+        try headers.append(alloc, .{ "X-Goog-User-Project", self.project_id });
+
+        var response = try self.http.post(url, .{
+            .json = request_body,
+            .headers = headers.items,
+            .timeout_ms = options.timeout_ms,
+            .cancellation = options.cancellation,
+        });
+        defer response.deinit();
+        if (!response.ok()) return switch (response.status.code) {
+            408, 504 => error.Timeout,
+            429 => error.RerankRateLimited,
+            500...503, 505...599 => error.RerankTransientFailure,
+            else => error.RerankRequestFailed,
+        };
+        const Response = struct {
+            records: []const struct {
+                id: []const u8,
+                score: f32,
+            } = &.{},
+        };
+        var parsed = try std.json.parseFromSlice(Response, alloc, response.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        return try scoresByStringIndexAlloc(alloc, documents.len, parsed.value.records);
     }
 
     pub fn setMaxTokens(self: *Provider, max_tokens: i64) void {
@@ -267,6 +348,34 @@ pub const Provider = struct {
         .generate = &generateImpl,
     };
 };
+
+fn scoresByStringIndexAlloc(alloc: Allocator, count: usize, records: anytype) ![]f32 {
+    const scores = try alloc.alloc(f32, count);
+    errdefer alloc.free(scores);
+    @memset(scores, 0);
+    const seen = try alloc.alloc(bool, count);
+    defer alloc.free(seen);
+    @memset(seen, false);
+    for (records) |record| {
+        const index = std.fmt.parseUnsigned(usize, record.id, 10) catch return error.InvalidRerankerResponse;
+        if (index >= count or seen[index]) return error.InvalidRerankerResponse;
+        scores[index] = record.score;
+        seen[index] = true;
+    }
+    for (seen) |present| if (!present) return error.InvalidRerankerResponse;
+    return scores;
+}
+
+test "reranking runtime maps Vertex record IDs back to input order" {
+    const records = [_]struct { id: []const u8, score: f32 }{
+        .{ .id = "1", .score = 0.85 },
+        .{ .id = "0", .score = 0.2 },
+    };
+    const scores = try scoresByStringIndexAlloc(std.testing.allocator, 2, &records);
+    defer std.testing.allocator.free(scores);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), scores[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.85), scores[1], 0.0001);
+}
 
 fn parseGenerateResponseAlloc(alloc: Allocator, body: []const u8) !inference.GenerateResult {
     const Response = struct {
@@ -459,9 +568,7 @@ pub fn mintAuthorizationValueAlloc(alloc: Allocator, credentials_path: ?[]const 
 
 fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*google_auth.CachedTokenSource {
     var cfg = if (credentials_path) |path| blk: {
-        var service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return error.MissingVertexCredentials;
-        errdefer service_account.deinit(alloc);
-        break :blk google_auth.configFromServiceAccountAlloc(alloc, service_account, vertex_auth_scope) catch return error.MissingVertexCredentials;
+        break :blk google_auth.configFromFileAlloc(alloc, path, vertex_auth_scope) catch return error.MissingVertexCredentials;
     } else google_auth.configFromEnvAlloc(alloc, vertex_auth_scope) catch return error.MissingVertexCredentials;
     errdefer cfg.deinit(alloc);
 
@@ -473,11 +580,9 @@ fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*goog
 
 pub fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]const u8) !?[]u8 {
     if (credentials_path) |path| {
-        var service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return null;
-        defer service_account.deinit(alloc);
-        return if (service_account.project_id) |value| try alloc.dupe(u8, value) else null;
+        return google_auth.projectIdFromFileAlloc(alloc, path) catch null;
     }
-    return try google_auth.serviceAccountEnvProjectIdAlloc(alloc);
+    return try google_auth.projectIdFromDefaultCredentialsAlloc(alloc);
 }
 
 fn appendJsonString(

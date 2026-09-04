@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.vertex_embedder_config_provider import VertexEmbedderConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="VertexEmbedderConfig")
@@ -26,18 +27,20 @@ class VertexEmbedderConfig:
                 central1', 'dimension': 3072}
 
         Attributes:
+            provider (VertexEmbedderConfigProvider):
             model (str): The name of the Vertex AI embedding model to use. Default: 'gemini-embedding-001'. Example: gemini-
                 embedding-001.
             project_id (str | Unset): Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment
                 variable.
             location (str | Unset): Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be
                 set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'. Default: 'us-central1'.
-            credentials_path (str | Unset): Path to service account JSON key file. Alternative to ADC for non-GCP
-                environments.
+            credentials_path (str | Unset): Path to an ADC credential JSON file (service-account, authorized-user, or
+                external-account). Alternative to the default ADC chain.
             dimension (int | Unset): The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001;
                 128-1408 for multimodalembedding). Default: 3072.
     """
 
+    provider: VertexEmbedderConfigProvider
     model: str = "gemini-embedding-001"
     project_id: str | Unset = UNSET
     location: str | Unset = "us-central1"
@@ -46,6 +49,8 @@ class VertexEmbedderConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         project_id = self.project_id
@@ -60,6 +65,7 @@ class VertexEmbedderConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -77,6 +83,8 @@ class VertexEmbedderConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = VertexEmbedderConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         project_id = d.pop("project_id", UNSET)
@@ -88,6 +96,7 @@ class VertexEmbedderConfig:
         dimension = d.pop("dimension", UNSET)
 
         vertex_embedder_config = cls(
+            provider=provider,
             model=model,
             project_id=project_id,
             location=location,

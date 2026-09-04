@@ -376,6 +376,7 @@ pub const ProvisionedGroupStorage = struct {
         // chunking and every other remote family reuse planner/executor leases
         // across documents.
         _ = write_source.withRemoteCapabilityCache(&self.read_cache.remote_capability_cache);
+        read_source.reranker_runtime = try self.read_cache.ensureRerankerRuntime();
         // Resident writer DBs also serve freshness-sensitive reads. Leaving
         // their cache unset makes the LSM backend retain a private decoded
         // index for every run, bypassing both the shared cache bound and the

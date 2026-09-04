@@ -1638,7 +1638,7 @@ fn validateStorageConnection(
     const connection = connections.get(connection_id) orelse return error.InvalidConfig;
     if (connection.kind != .external_io) return error.InvalidConfig;
     const external = connection.external_io orelse return error.InvalidConfig;
-    if (external.protocol != .s3) return error.InvalidConfig;
+    if (external.protocol != .s3 and external.protocol != .gcs) return error.InvalidConfig;
     var authorized = false;
     for (connection.capabilities) |capability| {
         if (std.mem.eql(u8, capability, "storage.primary")) {
@@ -2253,7 +2253,7 @@ test "common config parses provider maps" {
         \\  "shard_cooldown_millis": 90000,
         \\  "min_shard_merge_age_millis": 180000,
         \\  "generators": {
-        \\    "primary": { "provider": "mock" }
+        \\    "primary": { "provider": "antfly", "model": "m1" }
         \\  },
         \\  "embedders": {
         \\    "embedder": { "provider": "antfly" }

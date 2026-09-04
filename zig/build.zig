@@ -1138,6 +1138,7 @@ fn addPublicOpenApiModule(
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
             .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
+            .{ "specs/openapi/antfly/embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
             .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -1310,6 +1311,7 @@ fn addOpenApiRegenStep(
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
             .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
+            .{ "specs/openapi/antfly/embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
             .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -1351,6 +1353,7 @@ fn addOpenApiRegenStep(
             .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
             .{ "indexes.yaml", "antfly_indexes_openapi" },
             .{ "sort.yaml", "antfly_sort_openapi" },
+            .{ "embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "schema.yaml", "antfly_schema_openapi" },
             .{ "generating.yaml", "antfly_generating_api_openapi" },
             .{ "eval.yaml", "antfly_eval_openapi" },
@@ -1577,6 +1580,7 @@ pub fn build(b: *std.Build) void {
     public_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     public_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     public_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
+    public_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     public_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     public_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     public_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -1593,6 +1597,7 @@ pub fn build(b: *std.Build) void {
     metadata_openapi_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
     metadata_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     metadata_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     metadata_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     metadata_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     metadata_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
@@ -3559,6 +3564,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "preload model spec parser categorizes registry variants and backends",
             "inference runtime preload parser preserves registry variants and explicit backends",
+            "inference list accepts models directory before or after flags",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3809,6 +3815,8 @@ pub fn build(b: *std.Build) void {
         "actionable repair remains visible while retained generation stays queryable",
         "serviceable full text replacement remains queryable while rebuilding",
         "progressive embeddings readiness exposes a queryable partial generation",
+        "readiness evaluation cannot complete while convergence work remains",
+        "readiness completion fences include every observation dimension",
         "missing target observation preserves serving snapshot and blocks only completion",
         "create table raw parser merges default full text with quickstart embedding index",
         "create table raw parser accepts its canonical full text output",
@@ -3872,6 +3880,8 @@ pub fn build(b: *std.Build) void {
         "schema rejects sortable non-scalar document field mappings",
         "parse rejects document field mappings incompatible with their schema value domain",
         "write validation rejects values that cannot populate explicit physical mappings",
+        "table schema parses canonical ttl policy and explicit removal",
+        "schema merge patch preserves unrelated fields and removes ttl",
         "runtime schema field capability helpers classify mapped sortability",
         "schema serialization rejects unsorted or duplicate exact fields",
         "sorted exact fields resolve before wildcard templates and find subfields without allocation",
@@ -3969,11 +3979,20 @@ pub fn build(b: *std.Build) void {
         "annotate tree document prefers graph path branch metadata",
         "retrieval agent isolates query predicates while applying accumulated filters",
         "retrieval agent installs canonical mandatory predicates once",
+        "retrieval agent generation uses the canonical generator and chain contract",
+        "retrieval agent generation preserves canonical chain order and retry policy",
+        "retrieval agent generation requires a canonical generator when the step is present",
         "retrieval agent authenticated row filter conjoins generated filter",
         "query builder infers graph multi hop pattern from intent",
         "query builder maps canonical graph queries and ignores legacy expansion",
         "retrieval root scan pushes row inclusion and exclusion predicates into one filter",
         "retrieval contains filter treats wildcard operators as literals",
+        "distributed reranking widens retrieval and stays coordinator owned",
+        "reranker candidate and output windows have distinct bounds",
+        "reranker admission precedes candidate rendering",
+        "reranker component paging includes the post-rerank offset",
+        "reranker paging preserves the underlying retrieval total",
+        "query dependency errors expose a stable JSON retry contract",
         "wildcard matching distinguishes operators from escaped literals",
         "wildcard literal escaping round trips metacharacters",
         "wildcard search plans preserve escaped exact literals and prefixes",
@@ -4169,6 +4188,8 @@ pub fn build(b: *std.Build) void {
         "api http client round-trips public status and internal capability routes",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",
+        "api http query budget rejection response exposes stable sort reason",
+        "api query contract enforces provider-specific reranker candidate limits",
         "api query contract targets named full text retrieval without changing primary filters",
         "metadata.query routing validates named full text retrieval and keeps schema filters separate",
         "encode query request preserves the singular named full text selector across shard forwarding",
@@ -4220,7 +4241,9 @@ pub fn build(b: *std.Build) void {
         "internal transaction HTTP responses prove not-proposed only before decision",
         "internal transaction ingress establishes and validates pre-decision deadline",
         "request admission bounds positive capacity and preserves unlimited mode",
+        "request admission lease releases exactly once",
         "request admission metrics use the shared admission namespace",
+        "gzip request completes with combined encoded and decoded budget",
         "shared application admission covers MCP query and write operations",
         "API kernel ABI rejects mismatched context and function-table prefixes",
         "runtime HTTP values retain C layout",
@@ -4307,9 +4330,10 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        // Mach-O debug codegen retained 10.3 GiB for this intentionally broad
-        // command root. Linux remains within the aggregate's 7 GiB claim.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        // Mach-O debug codegen currently peaks a little above 12 GiB for this
+        // intentionally broad command root. Linux remains within the
+        // aggregate's 7 GiB claim.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
     });
     const run_cmd_tests = addFilteredTestRunArtifact(b, cmd_tests);
     const cmd_test_step = b.step("cmd-test", "Run Antfly command and client CLI tests");
@@ -4722,6 +4746,10 @@ pub fn build(b: *std.Build) void {
         "data runtime repair failures preserve durable backoff and increase retry delay",
         "index repair fallback backoff never blocks an exact durable wake",
         "data runtime preserves tagged aggregate index repair wake semantics",
+        "index repair no-op audit stays below operator log level",
+        "index repair terminal operator events are transition based",
+        "repair activity without a final audit cannot clear terminal log state",
+        "index repair terminal log state survives metadata churn for local groups",
         "data runtime exact repair requeue is allocation-free and failed new enqueue is atomic",
         "data runtime repair queue links and removes debt in constant time",
         "data runtime startup catch-up parks scheduler when only quarantined debt remains",
@@ -5104,6 +5132,8 @@ pub fn build(b: *std.Build) void {
     lib_db_enrichment_merge_cutover_reopen_step.dependOn(&run_lib_db_enrichment_merge_cutover_reopen_tests.step);
 
     const lib_db_query_default_filters = [_][]const u8{
+        "composed fusion preserves the coordinator reranker window",
+        "fuseNamedSets applies offset after fusion and pruning",
         "grouped candidate budget parses disabled and fallback values",
         "adaptive candidate window covers requested offset page and grows bounded",
         "grouped result page satisfaction treats nested match count as a maximum",
@@ -5519,6 +5549,7 @@ pub fn build(b: *std.Build) void {
         "api http server serves table query response envelope",
         "api http server executes public Query filter roots and compositions",
         "public table query handler preserves structured filter and hierarchy diagnostics",
+        "query dependency errors expose a stable JSON retry contract",
         "api http server serves retrieval agent response envelope",
         "api http server serves table batch writes",
         "api http server routes table batches through the batch commit hook",
@@ -5635,6 +5666,11 @@ pub fn build(b: *std.Build) void {
         "encode query request rejects invalid public phrase geo and ip values",
         "optional pure should preserves zero baseline and text scores",
         "remote query preserves optional should and named filter bindings",
+        "distributed reranking widens retrieval and stays coordinator owned",
+        "reranker candidate and output windows have distinct bounds",
+        "reranker admission precedes candidate rendering",
+        "reranker component paging includes the post-rerank offset",
+        "reranker paging preserves the underlying retrieval total",
         "distributed join context forwards one absolute deadline to every query callback",
         "distributed join search hit JSON normalizes non-finite scores",
         "distributed join unmatched worker returns only unmatched synthetic hits",
@@ -6368,7 +6404,7 @@ pub fn build(b: *std.Build) void {
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache blocks same-root generation replacement while stale lease stays live",
             "provisioned transition writer fences exact supplied table metadata",
-            "provisioned create index updates cached writer in place",
+            "provisioned create index enqueues target-fenced cached-writer activation",
             "write cache metadata refresh preserves inactive adoptable seed",
             "write cache adopts active just-created db across generation bump",
             "write cache local mutation reuses live stale-generation writer",
@@ -6396,7 +6432,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source drop table waits for active read cache lease",
             "provisioned table write source drop table closes schema-bearing cached writer once",
             "provisioned table write source backup releases read cache exclusive before native snapshot copy",
-            "live managed repair upgrades broad recovery alongside status before bounded index repair",
+            "live managed repair leaves resident replay and status reads nonblocking",
             "managed startup catch-up open constructs bounded enrichment runtime without workers",
             "provisioned group storage wires remote content to writer caches",
             "startup runtime status snapshot publishes live db when active cache is empty",
@@ -6417,7 +6453,7 @@ pub fn build(b: *std.Build) void {
             "provisioned owner publication advances exact index replay target",
             "provisioned owner publication fills cold dense visibility",
             "provisioned owner publication clears ambiguous replay-only backfill",
-            "provisioned owner publication preserves non-replay backfill",
+            "provisioned owner publication replaces stale cached backfill",
             "managed source status-only open drains stale pending close before retry",
             "hosted status-only open drains stale pending close before retry",
             "write cache HA gate clear drains inactive pending closes before returning",
@@ -6431,6 +6467,10 @@ pub fn build(b: *std.Build) void {
     const api_table_reads_docid_tests = b.addTest(.{
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
+            "distributed reranking widens retrieval and stays coordinator owned",
+            "reranker candidate and output windows have distinct bounds",
+            "reranker paging preserves the underlying retrieval total",
+            "coordinator prunes the final score domain before paging",
             "profiled composed dense query preserves exact route telemetry",
             "aggregation completeness requires exact total relation",
             "aggregation context rejects non-current identity generation",
@@ -6523,6 +6563,7 @@ pub fn build(b: *std.Build) void {
             "public create index exposes unsupported deployment capability",
             "public create index returns normalized created resource",
             "public table query handler maps doc identity unavailable errors",
+            "public table query reports the selected reranker candidate ceiling",
             "public table query handler maps exact graph execution failures",
             "graph path weight error body fails closed without its diagnostic",
             "public table query handler preserves structured filter and hierarchy diagnostics",
@@ -6625,6 +6666,10 @@ pub fn build(b: *std.Build) void {
             "dense publication target requires every expected shard observation",
             "derived coverage aggregation rejects mixed config observations",
             "derived coverage embedding activity aggregation is order independent and phase authoritative",
+            "derived coverage ready full text status reports complete progress",
+            "readiness observation completion requires convergence and full topology",
+            "readiness evaluation cannot complete while convergence work remains",
+            "readiness completion fences include every observation dimension",
             "chunked dense completion follows the physical publication target",
             "runtime status best effort overlay cannot clear readiness under apply contention",
             "index status exposes compact repair state without internal diagnostics",
@@ -7302,6 +7347,7 @@ pub fn build(b: *std.Build) void {
         "derived backlog tracker fails closed when sequence accounting allocation fails",
         "derived backlog tracker bounds sequence-only admission drain window",
         "hbc shared cache namespaces entries",
+        "hbc index reports shared cache ownership",
         "hbc shared cache evicts across namespaces under one resource budget",
         "hbc shared cache CLOCK refreshes recency on borrowed vector hits",
         "hbc shared vector replacement cannot return an older external value",
@@ -7720,6 +7766,7 @@ pub fn build(b: *std.Build) void {
             "standalone linked inference ABI validates the supported function-table prefix",
             "linked inference ABI rejects mismatched context and function-table prefixes",
             "standalone local inference lifetime distinguishes deadline from upstream cancellation",
+            "standalone resolves the default secret store before full config parsing",
             "embedded provider lifetime rejects new calls and joins admitted calls",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
@@ -7728,6 +7775,7 @@ pub fn build(b: *std.Build) void {
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
             "standalone metadata advertises a linearizable owned snapshot",
+            "standalone schema mutation supports atomic merge patch and version CAS",
             "standalone routing watch does not report absence after one probe",
             "standalone metadata catalog source provides compact routing",
             "standalone metadata rejects corrupt catalog without double-freeing owned paths",

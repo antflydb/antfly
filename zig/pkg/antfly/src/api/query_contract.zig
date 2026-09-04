@@ -279,6 +279,7 @@ pub fn queryHitsTotalValueToU32(total: metadata_openapi.QueryHitsTotal) !u32 {
 
 pub const QueryResponseMeta = struct {
     pub const RerankerProfile = struct {
+        provider: reranking_mod.Provider,
         model: []const u8 = "",
         documents_reranked: u32 = 0,
         duration_ms: i64 = 0,
@@ -2243,10 +2244,18 @@ fn applyCommonSearchRequestOptions(
             error.InvalidRerankerConfig => return error.InvalidQueryRequest,
             else => return err,
         };
+        reranking_mod.validateQueryWindow(req.reranker.?, req.offset, req.limit) catch |err| switch (err) {
+            error.InvalidRerankerConfig => return error.InvalidQueryRequest,
+            else => return err,
+        };
     }
 
     const has_semantic = request.semantic_search != null or request.embeddings != null;
-    if (has_semantic and req.offset > 0) return error.UnsupportedQueryRequest;
+    // Approximate vector sources cannot page independently by offset. A
+    // coordinator-owned reranker is different: component and shard retrieval
+    // are widened to the bounded candidate window, then offset/limit are
+    // applied once after global scoring.
+    if (has_semantic and req.offset > 0 and req.reranker == null) return error.UnsupportedQueryRequest;
     if (has_semantic and req.order_by.len > 0) {
         return unsupportedExactSort(approximateSemanticSortField(req.order_by), "approximate_candidate_source", "approximate_candidate_source");
     }
@@ -2834,6 +2843,7 @@ pub fn isPublicQueryValidationError(err: anyerror) bool {
         error.InvalidExclusionQueryRequest,
         error.UnsupportedFilterQueryRequest,
         error.UnsupportedExclusionQueryRequest,
+        error.RerankerCandidateLimitExceeded,
         => true,
         else => false,
     };
@@ -7255,6 +7265,7 @@ fn buildProfileValue(
             .failed = 0,
         },
         .reranker = if (meta.reranker) |reranker| .{
+            .provider = reranker.provider,
             .model = if (reranker.model.len > 0) reranker.model else null,
             .documents_reranked = reranker.documents_reranked,
             .duration_ms = reranker.duration_ms,
@@ -7388,7 +7399,6 @@ fn parseMergeConfig(alloc: std.mem.Allocator, generated: indexes_openapi.MergeCo
         config.strategy = switch (strategy) {
             .rrf => .rrf,
             .rsf => .rsf,
-            .failover => return error.UnsupportedQueryRequest,
         };
     }
     if (generated.rank_constant) |rank_constant| config.rank_constant = rank_constant;
@@ -9375,13 +9385,6 @@ fn parseGeneratedBleveQueryBoost(query: query_openapi.Query) !f32 {
 }
 
 fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.Query) anyerror!db_mod.types.TextQuery {
-    const query_string_has_default_operator = comptime blk: {
-        const QueryStringType = @TypeOf((@as(query_openapi.Query, undefined)).query_string_query);
-        break :blk switch (@typeInfo(QueryStringType)) {
-            .pointer => |pointer| @hasField(pointer.child, "default_operator"),
-            else => @hasField(QueryStringType, "default_operator"),
-        };
-    };
     const query_boost = try parseGeneratedBleveQueryBoost(query);
 
     return switch (query) {
@@ -9391,10 +9394,6 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             alloc,
             query_string.query,
             query_boost,
-            if (query_string_has_default_operator)
-                try normalizeQueryStringDefaultOperator(query_string.default_operator)
-            else
-                null,
         ),
         .term_query => |term| .{ .term = .{
             .field = try alloc.dupe(u8, term.field orelse return error.UnsupportedQueryRequest),
@@ -9830,34 +9829,10 @@ fn parseQueryStringTextQuery(
     alloc: std.mem.Allocator,
     input: []const u8,
     boost: f32,
-    default_operator: ?[]const u8,
 ) !db_mod.types.TextQuery {
-    const parsed_default_operator = if (default_operator) |value|
-        if (std.ascii.eqlIgnoreCase(value, "or"))
-            public_query_string_mod.ParseOptions{ .default_operator = .or_ }
-        else if (std.ascii.eqlIgnoreCase(value, "and"))
-            public_query_string_mod.ParseOptions{ .default_operator = .and_ }
-        else
-            return error.UnsupportedQueryRequest
-    else
-        public_query_string_mod.ParseOptions{};
-
-    var owned = try public_query_string_mod.parseFilterAllocWithOptions(alloc, input, parsed_default_operator);
+    var owned = try public_query_string_mod.parseFilterAllocWithOptions(alloc, input, .{});
     defer owned.deinit(alloc);
     return try public_query_string_mod.filterToStatefulTextQueryAlloc(alloc, owned.filter, boost);
-}
-
-fn normalizeQueryStringDefaultOperator(value: anytype) !?[]const u8 {
-    const T = @TypeOf(value);
-    return switch (@typeInfo(T)) {
-        .optional => if (value) |inner| try normalizeQueryStringDefaultOperator(inner) else null,
-        .pointer => |pointer| switch (pointer.size) {
-            .slice => value,
-            else => error.UnsupportedQueryRequest,
-        },
-        .@"enum" => @tagName(value),
-        else => error.UnsupportedQueryRequest,
-    };
 }
 
 const ParsedFuzziness = struct {
@@ -9947,10 +9922,16 @@ fn buildSemanticVectorQueries(
         }
         if (request.semantic_search) |semantic_search| {
             const resolver = semantic_resolver orelse return error.UnsupportedQueryRequest;
+            const query = try resolver.resolveDenseQuery(alloc, table_name, index_name, semantic_search, request.embedding_template, limit);
+            errdefer alloc.free(query.vector);
+            const name = try alloc.dupe(u8, index_name);
+            errdefer alloc.free(name);
+            const owned_index_name = try alloc.dupe(u8, index_name);
+            errdefer alloc.free(owned_index_name);
             try dense_queries.append(alloc, .{
-                .name = try alloc.dupe(u8, index_name),
-                .index_name = try alloc.dupe(u8, index_name),
-                .query = try resolver.resolveDenseQuery(alloc, table_name, index_name, semantic_search, request.embedding_template, limit),
+                .name = name,
+                .index_name = owned_index_name,
+                .query = query,
             });
             continue;
         }
@@ -15521,6 +15502,7 @@ test "api query contract classifies typed filter errors as validation errors" {
         error.InvalidExclusionQueryRequest,
         error.UnsupportedFilterQueryRequest,
         error.UnsupportedExclusionQueryRequest,
+        error.RerankerCandidateLimitExceeded,
     }) |err| {
         try std.testing.expect(isPublicQueryValidationError(err));
     }
@@ -15741,6 +15723,82 @@ test "api query contract preflight rejects count with reranker" {
     defer parsed.deinit();
 
     try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
+}
+
+test "api query contract enforces provider-specific reranker candidate limits" {
+    const vertex_body =
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "limit": 201,
+        \\  "reranker": {"provider":"vertex","model":"semantic-ranker-default@latest","field":"body"}
+        \\}
+    ;
+    try std.testing.expectError(
+        error.RerankerCandidateLimitExceeded,
+        parsePublicQueryRequest(std.testing.allocator, null, "docs", vertex_body),
+    );
+
+    const cohere_body =
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "limit": 201,
+        \\  "reranker": {"provider":"cohere","model":"rerank-v4.0-pro","field":"body"}
+        \\}
+    ;
+    var cohere = try parsePublicQueryRequest(std.testing.allocator, null, "docs", cohere_body);
+    cohere.deinit(std.testing.allocator);
+}
+
+test "api query contract permits semantic offset only with coordinator reranking" {
+    const alloc = std.testing.allocator;
+    const FakeResolver = struct {
+        fn resolve(
+            _: *anyopaque,
+            resolver_alloc: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            limit: u32,
+        ) !db_mod.types.DenseKnnQuery {
+            return .{
+                .vector = try resolver_alloc.dupe(f32, &.{ 1.0, 0.0 }),
+                .k = limit,
+            };
+        }
+    };
+    var resolver_context: u8 = 0;
+    const resolver = SemanticResolver{
+        .ptr = &resolver_context,
+        .vtable = &.{ .resolve_dense_query = FakeResolver.resolve },
+    };
+    const reranked_body =
+        \\{
+        \\  "semantic_search": "raft consensus",
+        \\  "indexes": ["semantic"],
+        \\  "offset": 5,
+        \\  "limit": 10,
+        \\  "reranker": {"provider":"antfly","field":"body","candidate_count":50}
+        \\}
+    ;
+    var reranked = try parseQueryRequest(alloc, resolver, "docs", reranked_body);
+    defer reranked.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 5), reranked.req.offset);
+    try std.testing.expectEqual(@as(u32, 10), reranked.req.limit);
+    try std.testing.expectEqual(@as(?u32, 50), reranked.req.reranker.?.candidate_count);
+
+    const approximate_only_body =
+        \\{
+        \\  "semantic_search": "raft consensus",
+        \\  "indexes": ["semantic"],
+        \\  "offset": 5,
+        \\  "limit": 10
+        \\}
+    ;
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        parseQueryRequest(alloc, resolver, "docs", approximate_only_body),
+    );
 }
 
 test "api query contract rejects count with stored sort" {

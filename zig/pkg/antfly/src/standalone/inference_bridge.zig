@@ -210,8 +210,9 @@ pub const ProviderInvokeContext = extern struct {
     binary_payloads_len: usize = 0,
     attachment_refs: ?[*]const ProviderAttachmentRef = null,
     attachment_refs_len: usize = 0,
-    /// Borrowed invocation cancellation. Appended so the versioned ABI rejects
-    /// older layouts instead of silently dropping caller control.
+    /// Borrowed invocation cancellation follows the operation-neutral binary
+    /// attachment fields. ABI v24's strict size/version gate rejects older
+    /// layouts rather than silently losing media or cooperative cancellation.
     cancellation: http_abi.CancellationView = .{},
 };
 

@@ -4672,6 +4672,7 @@ test "api http client round-trips public table management routes" {
                     .create_table = createTable,
                     .drop_table = dropTable,
                     .update_schema = updateSchema,
+                    .mutate_schema = mutateSchema,
                     .replace_table_definition = replaceTableDefinition,
                     .drop_index = dropIndex,
                 },
@@ -4739,6 +4740,34 @@ test "api http client round-trips public table management routes" {
                 self.indexes_json = updated.indexes_json;
                 self.owns_created_table = true;
             }
+        }
+
+        fn mutateSchema(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            mode: tables_api.SchemaMutationMode,
+            body: []const u8,
+            expected_version: ?u32,
+        ) !tables_api.SchemaMutationResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const current = self.created_table orelse return error.TableNotFound;
+            if (expected_version) |expected| {
+                if (try tables_api.schemaVersion(current.schema_json) != expected)
+                    return error.SchemaVersionChanged;
+            }
+            const updated = try tables_api.applySchemaMutationRecord(alloc, &current, mode, body);
+            const version = try tables_api.schemaVersion(updated.schema_json);
+            const response_schema = try alloc.dupe(u8, updated.schema_json);
+            errdefer alloc.free(response_schema);
+            if (self.owns_created_table) metadata_table_manager.freeTable(alloc, current);
+            self.created_table = updated;
+            self.indexes_json = updated.indexes_json;
+            self.owns_created_table = true;
+            return .{
+                .version = version,
+                .schema_json = response_schema,
+            };
         }
 
         fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index_name: []const u8, index_json: []const u8) !void {

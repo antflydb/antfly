@@ -25,6 +25,7 @@ pub const local = @import("local.zig");
 pub const openai = @import("openai.zig");
 pub const vertex = @import("vertex.zig");
 pub const managed_embedder = @import("managed_embedder.zig");
+pub const request_context = @import("request_context.zig");
 pub const list_models = @import("list_models.zig");
 pub const query_embedding_cache = @import("query_embedding_cache.zig");
 pub const work = @import("work.zig");
@@ -41,6 +42,7 @@ pub const RerankResult = types.RerankResult;
 pub const ChatMessage = types.ChatMessage;
 pub const Role = types.Role;
 pub const ContentPart = types.ContentPart;
+pub const RequestContext = request_context.RequestContext;
 
 test "inference module compiles" {
     _ = types;
@@ -49,6 +51,7 @@ test "inference module compiles" {
     _ = openai;
     _ = vertex;
     _ = managed_embedder;
+    _ = request_context;
     _ = list_models;
     _ = query_embedding_cache;
     _ = work;

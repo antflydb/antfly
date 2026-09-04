@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.vertex_generator_config_provider import VertexGeneratorConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="VertexGeneratorConfig")
@@ -16,6 +17,7 @@ class VertexGeneratorConfig:
     """Configuration for Google Cloud Vertex AI generative models.
 
     Attributes:
+        provider (VertexGeneratorConfigProvider):
         model (str): The name of the Vertex AI model to use. Default: 'gemini-2.5-flash'. Example: gemini-2.5-flash.
         project_id (str | Unset): Google Cloud project ID.
         location (str | Unset): Google Cloud region for Vertex AI API. Default: 'us-central1'.
@@ -26,6 +28,7 @@ class VertexGeneratorConfig:
         top_k (int | Unset): Top-k sampling parameter.
     """
 
+    provider: VertexGeneratorConfigProvider
     model: str = "gemini-2.5-flash"
     project_id: str | Unset = UNSET
     location: str | Unset = "us-central1"
@@ -37,6 +40,8 @@ class VertexGeneratorConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         project_id = self.project_id
@@ -57,6 +62,7 @@ class VertexGeneratorConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -80,6 +86,8 @@ class VertexGeneratorConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = VertexGeneratorConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         project_id = d.pop("project_id", UNSET)
@@ -97,6 +105,7 @@ class VertexGeneratorConfig:
         top_k = d.pop("top_k", UNSET)
 
         vertex_generator_config = cls(
+            provider=provider,
             model=model,
             project_id=project_id,
             location=location,

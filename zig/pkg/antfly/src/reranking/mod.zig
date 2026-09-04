@@ -17,16 +17,185 @@ const platform_time = @import("antfly_platform").time;
 const httpx = @import("httpx");
 const lib = @import("antfly_reranking");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const inference_request_context = @import("../inference/request_context.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const antfly_provider = @import("../inference/local.zig");
 const remote_capabilities = @import("../inference/remote_capabilities.zig");
-const common_secrets = @import("../common/secrets.zig");
 const execution_context = @import("../inference/execution_context.zig");
 const runtime_error_abi = @import("../runtime_error_abi.zig");
 const runtime_native_abi = @import("../runtime_native_abi.zig");
+const vertex_provider = @import("../inference/vertex.zig");
+const common_secrets = @import("../common/secrets.zig");
+const request_admission = @import("../common/request_admission.zig");
+const common_cancellation = @import("../common/cancellation.zig");
+const google_auth = @import("antfly_google").auth;
 
 pub const Config = lib.Config;
 pub const Provider = lib.Provider;
+pub const ProviderCapabilities = lib.ProviderCapabilities;
+pub const providerCapabilities = lib.providerCapabilities;
+pub const max_candidate_count = lib.max_candidate_count;
+
+/// Long-lived resources shared by reranking requests. This keeps HTTP
+/// connections warm and lets ADC refresh single-flight per credential/scope.
+pub const Runtime = struct {
+    io: std.Io,
+    http: httpx.Client,
+    credentials: google_auth.CredentialManager,
+    admission: request_admission.RequestAdmission = request_admission.RequestAdmission.init(16),
+
+    pub fn init(alloc: std.mem.Allocator, io: std.Io) Runtime {
+        return .{
+            .io = io,
+            .http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = true }),
+            .credentials = google_auth.CredentialManager.init(alloc, io),
+        };
+    }
+
+    /// Runs one batched provider call through the process-level pool. The
+    /// concurrency gate protects provider sockets and credential refresh from
+    /// request fan-in while preserving I/O cancellation.
+    pub fn rerank(
+        self: *Runtime,
+        alloc: std.mem.Allocator,
+        cfg: Config,
+        dependencies: Options,
+        query: []const u8,
+        documents: []const []const u8,
+    ) ![]f32 {
+        var lease = try self.acquire(dependencies.execution_context);
+        defer lease.release();
+        return try self.rerankAdmitted(alloc, cfg, dependencies, query, documents);
+    }
+
+    /// Admits the complete reranking phase, including document rendering that
+    /// callers may need to perform before invoking the provider.
+    pub fn acquire(
+        self: *Runtime,
+        request_ctx: ?inference_request_context.RequestContext,
+    ) !AdmissionLease {
+        if (request_ctx) |context| try context.check();
+        // Provider work is deliberately fail-fast rather than queued. The
+        // parent query already owns admission and a deadline; another hidden
+        // queue only consumes that budget and amplifies tail latency.
+        return self.admission.tryAcquireLease() orelse error.RerankRateLimited;
+    }
+
+    /// Executes provider work for a caller that already owns an admission
+    /// lease. Keeping this separate prevents a second admission attempt after
+    /// the caller has rendered the candidate documents.
+    pub fn rerankAdmitted(
+        self: *Runtime,
+        alloc: std.mem.Allocator,
+        cfg: Config,
+        dependencies: Options,
+        query: []const u8,
+        documents: []const []const u8,
+    ) ![]f32 {
+        if (dependencies.execution_context) |context| try context.check();
+        var options = dependencies;
+        options.runtime = self;
+        return try rerankDocumentsWithOptions(
+            alloc,
+            &self.http,
+            cfg,
+            options,
+            query,
+            documents,
+        );
+    }
+
+    pub fn deinit(self: *Runtime) void {
+        self.credentials.deinit();
+        self.http.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const AdmissionLease = request_admission.RequestAdmission.Lease;
+
+/// Collapses provider and transport failures into the stable query-layer
+/// taxonomy shared by table, global, and retrieval-agent queries.
+pub fn normalizeOperationalError(err: anyerror) anyerror {
+    return switch (err) {
+        error.RerankRateLimited,
+        error.RerankTransientFailure,
+        error.RerankUpstreamFailure,
+        error.Timeout,
+        => err,
+        // httpx spells transport cancellation `Canceled`; collapse both
+        // spellings to the process-wide semantic cancellation before this
+        // error crosses into query dependency classification.
+        error.Canceled,
+        error.Cancelled,
+        => error.Cancelled,
+        error.QueueFull => error.RerankRateLimited,
+        error.RerankRequestFailed,
+        error.EmptyResponse,
+        error.InvalidRerankerResponse,
+        error.InvalidResponse,
+        => error.RerankUpstreamFailure,
+        error.ConnectionTimedOut => error.Timeout,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        => error.RerankTransientFailure,
+        else => err,
+    };
+}
+
+pub fn statusError(status: u16) anyerror {
+    return switch (status) {
+        408, 504 => error.Timeout,
+        429 => error.RerankRateLimited,
+        500...503, 505...599 => error.RerankTransientFailure,
+        else => error.RerankRequestFailed,
+    };
+}
+
+test "reranking runtime failures use stable query dependency classes" {
+    try std.testing.expectEqual(error.RerankRateLimited, statusError(429));
+    try std.testing.expectEqual(error.RerankTransientFailure, statusError(503));
+    try std.testing.expectEqual(error.Timeout, statusError(504));
+    try std.testing.expectEqual(error.RerankRequestFailed, statusError(401));
+    try std.testing.expectEqual(error.RerankUpstreamFailure, normalizeOperationalError(error.InvalidRerankerResponse));
+    try std.testing.expectEqual(error.RerankTransientFailure, normalizeOperationalError(error.ConnectionRefused));
+    try std.testing.expectEqual(error.Timeout, normalizeOperationalError(error.ConnectionTimedOut));
+    try std.testing.expectEqual(error.Cancelled, normalizeOperationalError(error.Canceled));
+    try std.testing.expectEqual(error.Cancelled, normalizeOperationalError(error.Cancelled));
+    try std.testing.expectEqual(error.RerankRateLimited, normalizeOperationalError(error.QueueFull));
+    try std.testing.expectEqual(error.RerankRateLimited, normalizeOperationalError(error.RerankRateLimited));
+    try std.testing.expectEqual(error.RerankTransientFailure, normalizeOperationalError(error.RerankTransientFailure));
+    try std.testing.expectEqual(error.RerankUpstreamFailure, normalizeOperationalError(error.RerankUpstreamFailure));
+    try std.testing.expectEqual(error.Timeout, normalizeOperationalError(error.Timeout));
+}
+
+test "reranking runtime rejects saturation and expired work before provider dispatch" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var runtime = Runtime.init(alloc, io_impl.io());
+    defer runtime.deinit();
+    runtime.admission = request_admission.RequestAdmission.init(1);
+    try std.testing.expect(runtime.admission.tryAcquire());
+    defer runtime.admission.release();
+
+    const cfg = Config{ .provider = .antfly, .field = "body" };
+    try std.testing.expectError(
+        error.RerankRateLimited,
+        runtime.rerank(alloc, cfg, .{}, "query", &.{"document"}),
+    );
+    try std.testing.expectError(
+        error.Timeout,
+        runtime.rerank(alloc, cfg, .{ .execution_context = .{
+            .io = io_impl.io(),
+            .deadline_ns = 0,
+        } }, "query", &.{"document"}),
+    );
+}
 
 pub fn rerankDocuments(
     alloc: std.mem.Allocator,
@@ -54,6 +223,8 @@ pub const Options = struct {
     secret_store: ?*common_secrets.FileStore = null,
     capability_cache: ?*remote_capabilities.Cache = null,
     execution: execution_context.Context = .{},
+    runtime: ?*Runtime = null,
+    execution_context: ?inference_request_context.RequestContext = null,
 };
 
 const remote_rerank_max_response_bytes: usize = 4 << 20;
@@ -68,7 +239,21 @@ pub fn rerankDocumentsWithOptions(
     documents: []const []const u8,
 ) ![]f32 {
     try cfg.validate();
-    const api_key = if (try common_secrets.SecretValue.initConfig(alloc, cfg.api_key)) |secret_value| blk: {
+    const request_context = options.execution_context orelse inference_request_context.RequestContext{
+        .io = options.execution.io orelse http.io,
+        .deadline_ns = options.execution.deadline_ns,
+        .cancellation = if (options.execution.cancellation.ptr != null and options.execution.cancellation.is_cancelled_fn != null)
+            options.execution.cancellation
+        else
+            null,
+    };
+    try request_context.check();
+    const capabilities = providerCapabilities(cfg.provider);
+    const configured_secret = switch (capabilities.credential_kind) {
+        .api_key => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, "COHERE_API_KEY"),
+        .none, .google_adc => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
+    };
+    const api_key = if (configured_secret) |secret_value| blk: {
         var owned_secret = secret_value;
         defer owned_secret.deinit(alloc);
         break :blk try owned_secret.resolveOwned(alloc, options.secret_store);
@@ -86,8 +271,6 @@ pub fn rerankDocumentsWithOptions(
             );
             if (resolved_endpoint == null and (linked_context_reranker != null or linked_reranker != null)) {
                 const local = options.antfly_provider.?;
-                const io = options.execution.io orelse http.io;
-                const request_context = options.execution.requestContext(io);
                 try request_context.check();
                 const scores = if (linked_context_reranker) |rerank|
                     try managed_embedder.AntflyProviderBoundary.call(
@@ -111,7 +294,8 @@ pub fn rerankDocumentsWithOptions(
             var provider = antfly_provider.Provider.init(alloc, http, endpoint);
             defer provider.deinit();
             try provider.setSourceTable(options.execution.routing.source_table);
-            provider.setRequestCancellation(options.execution.cancellation);
+            if (request_context.cancellation) |cancellation|
+                provider.setRequestCancellation(cancellation);
             provider.setMaxResponseBytes(options.execution.boundedResponseBytes(
                 remote_rerank_max_response_bytes,
             ));
@@ -137,43 +321,80 @@ pub fn rerankDocumentsWithOptions(
                 fallback_cache = remote_capabilities.Cache.init(alloc, http.io);
                 capability_cache = &fallback_cache.?;
             }
-            const capability_lease = try capability_cache.?.getOrDiscoverLeaseWithContext(
-                http,
-                endpoint,
-                cfg.model,
-                .rerank,
-                headers,
-                options.execution.waitContext(),
-            );
-            if (capability_lease.capabilities) |capabilities| {
-                try capabilities.validateInvocation(.rerank, .{
-                    .item_count = 1,
-                    .modalities = .{ .text = true },
-                    .text_bytes = query.len +| documentBytes(documents),
-                    .max_text_bytes_per_item = query.len +| maximumDocumentBytes(documents),
-                    .max_candidates_per_request = documents.len,
-                });
+            if (cfg.model.len > 0) {
+                const capability_lease = try capability_cache.?.getOrDiscoverLeaseWithContext(
+                    http,
+                    endpoint,
+                    cfg.model,
+                    .rerank,
+                    headers,
+                    .{
+                        .deadline_ns = request_context.deadline_ns,
+                        .cancellation = request_context.cancellation orelse .none,
+                    },
+                );
+                if (capability_lease.capabilities) |discovered| {
+                    try discovered.validateInvocation(.rerank, .{
+                        .item_count = 1,
+                        .modalities = .{ .text = true },
+                        .text_bytes = query.len +| documentBytes(documents),
+                        .max_text_bytes_per_item = query.len +| maximumDocumentBytes(documents),
+                        .max_candidates_per_request = documents.len,
+                    });
+                }
+                if (capability_lease.routing_token) |token|
+                    try provider.setCapabilityToken(token.slice());
+                if (capability_lease.descriptor_revision) |revision|
+                    try provider.setCapabilityRevision(revision.slice());
             }
-            if (capability_lease.routing_token) |token|
-                try provider.setCapabilityToken(token.slice());
-            if (capability_lease.descriptor_revision) |revision|
-                try provider.setCapabilityRevision(revision.slice());
             // Discovery and execution share one absolute deadline. Recompute
             // the transport duration only after discovery so catalog latency
             // cannot extend the owning query.
-            provider.setRequestTimeoutMs(try options.execution.remainingTimeoutMs(
-                platform_time.monotonicNs(),
-                remote_rerank_max_timeout_ms,
-            ));
+            const remaining_timeout_ms = try request_context.remainingTimeoutMs();
+            provider.setRequestTimeoutMs(if (remaining_timeout_ms) |timeout_ms|
+                @min(timeout_ms, remote_rerank_max_timeout_ms)
+            else
+                remote_rerank_max_timeout_ms);
             var result = provider.reranker().rerank(alloc, cfg.model, query, documents) catch |err| {
-                if (err == error.InferenceCapabilitiesStale)
+                if (err == error.InferenceCapabilitiesStale and cfg.model.len > 0)
                     try capability_cache.?.invalidate(endpoint, cfg.model, .rerank, headers);
                 return err;
             };
             defer result.deinit();
+            try request_context.check();
             return try alloc.dupe(f32, result.scores);
         },
-        else => return error.UnsupportedRerankerProvider,
+        .cohere => {
+            const token = api_key orelse return error.InvalidRerankerConfig;
+            const scores = try rerankCohere(alloc, http, cfg, token, request_context, query, documents);
+            errdefer alloc.free(scores);
+            try request_context.check();
+            return scores;
+        },
+        .vertex => {
+            const token_source = if (api_key == null and options.runtime != null)
+                options.runtime.?.credentials.tokenSource(
+                    if (cfg.credentials_path.len > 0) cfg.credentials_path else null,
+                    "https://www.googleapis.com/auth/cloud-platform",
+                ) catch return error.InvalidRerankerConfig
+            else
+                null;
+            var provider = try vertex_provider.Provider.init(alloc, http, .{
+                .base_url = cfg.defaultedUrl(),
+                .project_id = if (cfg.project_id.len > 0) cfg.project_id else null,
+                .credentials_path = if (cfg.credentials_path.len > 0) cfg.credentials_path else null,
+                .bearer_token = api_key,
+                .token_source = token_source,
+            });
+            defer provider.deinit();
+            const scores = try provider.rerank(alloc, cfg.model, query, documents, .{
+                .timeout_ms = try request_context.remainingTimeoutMs(),
+                .cancellation = httpCancellation(request_context.cancellation),
+            });
+            errdefer alloc.free(scores);
+            try request_context.check();
+            return scores;
+        },
     }
 }
 
@@ -192,6 +413,109 @@ fn maximumDocumentBytes(documents: []const []const u8) usize {
 fn expectRerankerAuthorization(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqualStrings("Bearer test-token", req.header("Authorization") orelse "");
     try std.testing.expectEqualStrings("docs", req.header("X-Antfly-Source-Table") orelse "");
+}
+
+fn rerankCohere(
+    alloc: std.mem.Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    api_key: []const u8,
+    request_ctx: ?inference_request_context.RequestContext,
+    query: []const u8,
+    documents: []const []const u8,
+) ![]f32 {
+    const body = try std.json.Stringify.valueAlloc(alloc, .{
+        .model = cfg.model,
+        .query = query,
+        .documents = documents,
+    }, .{});
+    defer alloc.free(body);
+    const url = try std.fmt.allocPrint(
+        alloc,
+        "{s}/v2/rerank",
+        .{cfg.defaultedUrl()},
+    );
+    defer alloc.free(url);
+    const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{api_key});
+    defer alloc.free(authorization);
+    const headers = [_][2][]const u8{.{ "Authorization", authorization }};
+    var response = try http.post(url, .{
+        .json = body,
+        .headers = &headers,
+        .timeout_ms = if (request_ctx) |context| try context.remainingTimeoutMs() else null,
+        .cancellation = httpCancellation(if (request_ctx) |context| context.cancellation else null),
+    });
+    defer response.deinit();
+    if (!response.ok()) return statusError(response.status.code);
+    const Response = struct {
+        results: []const struct {
+            index: usize,
+            relevance_score: f32,
+        } = &.{},
+    };
+    var parsed = try std.json.parseFromSlice(Response, alloc, response.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return try scoresByIndexAlloc(alloc, documents.len, parsed.value.results);
+}
+
+fn httpCancellation(cancellation: ?common_cancellation.CancellationToken) ?httpx.CancellationToken {
+    const token = cancellation orelse return null;
+    return httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn);
+}
+
+fn scoresByIndexAlloc(alloc: std.mem.Allocator, count: usize, results: anytype) ![]f32 {
+    const scores = try alloc.alloc(f32, count);
+    errdefer alloc.free(scores);
+    @memset(scores, 0);
+    const seen = try alloc.alloc(bool, count);
+    defer alloc.free(seen);
+    @memset(seen, false);
+    for (results) |result| {
+        if (result.index >= count or seen[result.index]) return error.InvalidRerankerResponse;
+        scores[result.index] = result.relevance_score;
+        seen[result.index] = true;
+    }
+    for (seen) |present| if (!present) return error.InvalidRerankerResponse;
+    return scores;
+}
+
+test "reranking runtime maps Cohere scores back to input order" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = try httpx.TestServer.start(alloc, io, &.{.{
+        .method = .POST,
+        .path = "/v2/rerank",
+        .respond = .{ .body = "{\"results\":[{\"index\":1,\"relevance_score\":0.9},{\"index\":0,\"relevance_score\":0.25}]}" },
+    }});
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var scores: ?[]f32 = null;
+    defer if (scores) |value| alloc.free(value);
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(a: std.mem.Allocator, test_client: *httpx.Client, base_url: []const u8, out: *?[]f32, err_out: *?anyerror) std.Io.Cancelable!void {
+            out.* = rerankDocuments(a, test_client, .{
+                .provider = .cohere,
+                .model = "rerank-v4.0-pro",
+                .url = base_url,
+                .api_key = "test-token",
+                .field = "body",
+            }, "query", &.{ "first", "second" }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ alloc, &client, server.baseUrl(), &scores, &run_err }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), scores.?[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), scores.?[1], 0.0001);
 }
 
 test "reranking runtime delegates to antfly provider" {
@@ -285,7 +609,7 @@ test "reranking runtime routes antfly provider to local antfly" {
             return error.TestUnexpectedResult;
         }
 
-        fn rerankWithContext(ptr: *anyopaque, a: std.mem.Allocator, model: []const u8, query: []const u8, documents: []const []const u8, context: execution_context.RequestContext) anyerror![]f32 {
+        fn rerankWithContext(ptr: *anyopaque, a: std.mem.Allocator, model: []const u8, query: []const u8, documents: []const []const u8, context: inference_request_context.RequestContext) anyerror![]f32 {
             const state: *@This() = @ptrCast(@alignCast(ptr));
             try context.check();
             try std.testing.expect(context.deadline_ns != null);
@@ -348,7 +672,7 @@ test "reranking runtime routes antfly provider to local antfly" {
     try std.testing.expectEqual(@as(usize, 1), state.context_calls);
 
     var canceled = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.Canceled, rerankDocumentsWithOptions(alloc, &client, cfg, .{
+    try std.testing.expectError(error.Cancelled, rerankDocumentsWithOptions(alloc, &client, cfg, .{
         .antfly_provider = local,
         .execution = .{ .cancellation = .fromAtomic(&canceled) },
     }, "query", &.{ "doc1", "doc2" }));
