@@ -6817,6 +6817,31 @@ fn clearRuntimeGeneratedTextBatchMedia(
     media_values.clearRetainingCapacity();
 }
 
+fn malformedGeneratedTextBatchAllowsSequentialIsolation(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidExecutionReport,
+        error.InvalidProducedBatchCardinality,
+        => true,
+        else => false,
+    };
+}
+
+fn runtimeGeneratedTextBatchIdentitiesMatch(
+    items: []const asset_producer_mod.ProducedItem,
+    requests: []const asset_producer_mod.Request,
+) bool {
+    if (items.len != requests.len) return false;
+    for (items, requests) |item, request| {
+        const expected_identity = inference_work.WorkIdentity{
+            .item_id = request.item_id,
+            .source_fingerprint = request.source_fingerprint,
+            .page_number = request.page_number,
+        };
+        if (!item.identity.eql(expected_identity)) return false;
+    }
+    return true;
+}
+
 fn flushRuntimeGeneratedTextBatch(
     runtime: *EnrichmentRuntime,
     alloc: Allocator,
@@ -6852,14 +6877,25 @@ fn flushRuntimeGeneratedTextBatch(
             clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
             return;
         }
-        if (shouldYieldRequestError(runtime, err)) return err;
+        if (!malformedGeneratedTextBatchAllowsSequentialIsolation(err) and
+            shouldYieldRequestError(runtime, err)) return err;
         for (unit_indices) |unit_idx| try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
         return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, @errorName(err));
     };
-    defer produced_batch.deinit(working_alloc);
-    if (produced_batch.items.len != requests.len) {
-        logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", "response_count_mismatch", started_ns);
-        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, "response_count_mismatch");
+    var produced_batch_owned = true;
+    defer if (produced_batch_owned) produced_batch.deinit(working_alloc);
+    if (!runtimeGeneratedTextBatchIdentitiesMatch(produced_batch.items, requests)) {
+        const fallback_reason = if (produced_batch.items.len != requests.len)
+            "response_count_mismatch"
+        else
+            "response_identity_mismatch";
+        logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", fallback_reason, started_ns);
+        // Do not retain rejected provider outputs while admitting the
+        // singleton fallback, and do not apply any item before the complete
+        // response envelope has been validated.
+        produced_batch.deinit(working_alloc);
+        produced_batch_owned = false;
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, fallback_reason);
     }
     const execution = if (produced_batch.execution.fallback_items > 0)
         "serial_fallback"
@@ -6873,13 +6909,7 @@ fn flushRuntimeGeneratedTextBatch(
         null;
     logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, execution, fallback_reason, started_ns);
 
-    for (produced_batch.items, requests, unit_indices) |*item, request, unit_idx| {
-        const expected_identity = inference_work.WorkIdentity{
-            .item_id = request.item_id,
-            .source_fingerprint = request.source_fingerprint,
-            .page_number = request.page_number,
-        };
-        if (!item.identity.eql(expected_identity)) return error.InvalidAssetProducerResponseIdentity;
+    for (produced_batch.items, unit_indices) |*item, unit_idx| {
         switch (item.result) {
             .item_error => |failure| {
                 if (failure.retryable and shouldYieldRequestError(runtime, failure.cause)) {
@@ -15645,6 +15675,60 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
 // Tests
 // ============================================================================
 
+fn testInvocationMemoryForRequests(
+    _: *anyopaque,
+    _: Allocator,
+    requests: []const asset_producer_mod.Request,
+) !inference_work.InvocationMemoryPlan {
+    const result_bytes = std.math.mul(usize, @max(requests.len, 1), 1024) catch
+        return error.InferenceEncodedBytesExceeded;
+    return .{
+        .attachment_transport = .borrowed_binary,
+        .fixed_bytes = result_bytes,
+        .allocator_limit_bytes = result_bytes,
+        .max_result_bytes_per_item = 1024,
+        .max_result_bytes = result_bytes,
+    };
+}
+
+test "generated text batch validation rejects malformed envelopes before apply" {
+    const requests = [_]asset_producer_mod.Request{
+        .{
+            .producer_type = .reader,
+            .config_json = "{}",
+            .source_text = "source-1",
+            .source_fingerprint = "document",
+            .item_id = "item-1",
+            .page_number = 1,
+        },
+        .{
+            .producer_type = .reader,
+            .config_json = "{}",
+            .source_text = "source-2",
+            .source_fingerprint = "document",
+            .item_id = "item-2",
+            .page_number = 2,
+        },
+    };
+    var items = [_]asset_producer_mod.ProducedItem{
+        .{
+            .identity = .{ .item_id = "item-1", .source_fingerprint = "document", .page_number = 1 },
+            .result = .{ .value = &.{} },
+        },
+        .{
+            .identity = .{ .item_id = "item-2", .source_fingerprint = "document", .page_number = 2 },
+            .result = .{ .value = &.{} },
+        },
+    };
+
+    try std.testing.expect(runtimeGeneratedTextBatchIdentitiesMatch(&items, &requests));
+    items[1].identity.item_id = "wrong-item";
+    try std.testing.expect(!runtimeGeneratedTextBatchIdentitiesMatch(&items, &requests));
+    try std.testing.expect(malformedGeneratedTextBatchAllowsSequentialIsolation(error.InvalidExecutionReport));
+    try std.testing.expect(malformedGeneratedTextBatchAllowsSequentialIsolation(error.InvalidProducedBatchCardinality));
+    try std.testing.expect(!malformedGeneratedTextBatchAllowsSequentialIsolation(error.InferenceProviderFailure));
+}
+
 test "synchronous document extraction OCR batches honor request execution item cap" {
     const alloc = std.testing.allocator;
 
@@ -15658,6 +15742,7 @@ test "synchronous document extraction OCR batches honor request execution item c
                 .vtable = &.{
                     .produce = produce,
                     .produce_batch = produceBatch,
+                    .invocation_memory_for_requests = testInvocationMemoryForRequests,
                 },
             };
         }
@@ -15840,6 +15925,7 @@ test "document extraction rejects and records Florence prompt echoes" {
                 .vtable = &.{
                     .produce = produce,
                     .produce_batch = produceBatch,
+                    .invocation_memory_for_requests = testInvocationMemoryForRequests,
                 },
             };
         }
@@ -15918,7 +16004,14 @@ test "document extraction missing OCR model is a terminal unit failure" {
 
     const MissingModelProducer = struct {
         fn producer(self: *@This()) asset_producer_mod.Producer {
-            return .{ .ptr = self, .vtable = &.{ .produce = produce, .produce_batch = produceBatch } };
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .produce = produce,
+                    .produce_batch = produceBatch,
+                    .invocation_memory_for_requests = testInvocationMemoryForRequests,
+                },
+            };
         }
 
         fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
@@ -15994,6 +16087,7 @@ test "generic generated asset batch fallback isolates malformed batch envelope" 
                 .vtable = &.{
                     .produce = produce,
                     .produce_batch = produceBatch,
+                    .invocation_memory_for_requests = testInvocationMemoryForRequests,
                 },
             };
         }
@@ -16342,6 +16436,7 @@ test "document extraction generated OCR batch fallback isolates malformed batch 
                 .vtable = &.{
                     .produce = produce,
                     .produce_batch = produceBatch,
+                    .invocation_memory_for_requests = testInvocationMemoryForRequests,
                 },
             };
         }
