@@ -3368,7 +3368,10 @@ pub const AntflyApiHandler = struct {
             }
         else
             null;
-        const page = try self.api_server.listAuthorizedTransactionSessionsPage(authenticated_identity, after, limit);
+        const page = self.api_server.listAuthorizedTransactionSessionsPage(authenticated_identity, after, limit) catch |err| switch (err) {
+            error.StaleSessionListCursor => return jsonErrorResponse(ctx, 400, "transaction session cursor is stale; restart the inventory traversal"),
+            else => return err,
+        };
         defer alloc.free(page.sessions);
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();

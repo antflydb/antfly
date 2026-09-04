@@ -666,7 +666,7 @@ pub fn parseCommitTransactionBody(allocator: std.mem.Allocator, body: []const u8
 pub const ListTransactionSessionInventoryParams = struct {
     /// Maximum number of authorized sessions returned by this page. Source scanning is independently bounded; rolling-upgrade compatibility pages may be empty while still returning a cursor until the durable legacy principal projection is complete.
     limit: ?[]const u8 = null,
-    /// Opaque cursor returned by the previous page. Continue while present even when the previous sessions array was empty. Cursor versions preserve in-progress canonical compatibility traversals while newly started traversals use the durable principal-scoped legacy projection after migration.
+    /// Opaque cursor returned by the previous page. Continue while present even when the previous sessions array was empty. Cursor versions preserve in-progress canonical compatibility traversals while newly started traversals use the durable principal-scoped legacy projection after migration. A principal-scoped legacy cursor is bound to its writer-fence generation and returns 400 when that generation is no longer current or its completion proof is invalid; restart the traversal without a cursor.
     cursor: ?[]const u8 = null,
 };
 

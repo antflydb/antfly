@@ -661,6 +661,9 @@ pub const SessionListCursor = struct {
     phase: SessionListCursorPhase = .inventory,
     kind: SessionKind,
     txn_id: db_mod.types.TxnId,
+    /// Legacy-index cursors are valid only while the exact interactive writer
+    /// fence that materialized that projection remains active.
+    inventory_generation: ?u64 = null,
     /// The legacy phase needs one cursor value that means "before the first
     /// canonical row". Keeping that state inside the opaque token avoids
     /// reserving a transaction id that a valid writer could theoretically
@@ -1533,8 +1536,17 @@ pub const DurableSessionStore = struct {
     pub const LegacySessionAuditPage = struct {
         recovery_ids: []db_mod.types.TxnId,
         session_ids: []db_mod.types.TxnId,
-        next_after: ?db_mod.types.TxnId,
+        /// Exact backend key, rather than a decoded transaction id. Audit
+        /// progress must be able to advance past malformed reserved keys.
+        next_after: ?[]u8,
         unresolved_records: usize,
+
+        pub fn deinit(self: *LegacySessionAuditPage, alloc: std.mem.Allocator) void {
+            alloc.free(self.recovery_ids);
+            alloc.free(self.session_ids);
+            if (self.next_after) |key| alloc.free(key);
+            self.* = undefined;
+        }
     };
 
     /// Reads only compact recovery-index keys. The cursor is exclusive and a
@@ -1581,7 +1593,7 @@ pub const DurableSessionStore = struct {
         self: *DurableSessionStore,
         alloc: std.mem.Allocator,
         kind: SessionKind,
-        after: ?db_mod.types.TxnId,
+        after: ?[]const u8,
         scan_limit: usize,
     ) !LegacySessionAuditPage {
         var recovery_ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
@@ -1599,29 +1611,35 @@ pub const DurableSessionStore = struct {
             };
         }
         const prefix = sessionPrefix(kind);
-        const start_key = if (after) |txn_id| try makeSessionKeyForKind(alloc, txn_id, kind) else null;
-        defer if (start_key) |key| alloc.free(key);
+        var last_key = std.ArrayListUnmanaged(u8).empty;
+        defer last_key.deinit(alloc);
         const Scan = struct {
             allocator: std.mem.Allocator,
             kind: SessionKind,
             prefix: []const u8,
             scan_limit: usize,
             scanned: usize = 0,
-            last_txn_id: ?db_mod.types.TxnId = null,
+            last_key: *std.ArrayListUnmanaged(u8),
             unresolved_records: usize = 0,
             recovery_ids: *std.ArrayListUnmanaged(db_mod.types.TxnId),
             session_ids: *std.ArrayListUnmanaged(db_mod.types.TxnId),
 
             fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
                 const scan: *@This() = @ptrCast(@alignCast(raw));
-                // A malformed key cannot be represented by the typed audit
-                // cursor. Fail closed instead of scanning an unbounded number
-                // of keys or publishing completion past hidden data.
-                if (key.len <= scan.prefix.len) return error.InvalidTransactionSessionRecord;
-                const txn_id = distributed_txn.parseTxnIdHex(key[scan.prefix.len..]) catch
-                    return error.InvalidTransactionSessionRecord;
                 scan.scanned += 1;
-                scan.last_txn_id = txn_id;
+                scan.last_key.clearRetainingCapacity();
+                try scan.last_key.appendSlice(scan.allocator, key);
+                // Corrupt reserved keys are durable migration debt, but they
+                // must not prevent the same bounded pass from finding and
+                // replaying unrelated valid recovery work.
+                if (key.len <= scan.prefix.len) {
+                    scan.unresolved_records += 1;
+                    return scan.scanned < scan.scan_limit;
+                }
+                const txn_id = distributed_txn.parseTxnIdHex(key[scan.prefix.len..]) catch {
+                    scan.unresolved_records += 1;
+                    return scan.scanned < scan.scan_limit;
+                };
                 var session = decodeSessionRecord(scan.allocator, txn_id, value) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => {
@@ -1644,11 +1662,16 @@ pub const DurableSessionStore = struct {
             .kind = kind,
             .prefix = prefix,
             .scan_limit = scan_limit,
+            .last_key = &last_key,
             .recovery_ids = &recovery_ids,
             .session_ids = &session_ids,
         };
-        try self.scanPrefixFromWithContext(prefix, start_key, &scan, Scan.visit);
-        const next_after = if (scan.scanned == scan_limit) scan.last_txn_id else null;
+        try self.scanPrefixFromWithContext(prefix, after, &scan, Scan.visit);
+        const next_after = if (scan.scanned == scan_limit)
+            try last_key.toOwnedSlice(alloc)
+        else
+            null;
+        errdefer if (next_after) |key| alloc.free(key);
         const owned_recovery_ids = try recovery_ids.toOwnedSlice(alloc);
         errdefer alloc.free(owned_recovery_ids);
         return .{
@@ -1867,6 +1890,46 @@ pub const DurableSessionStore = struct {
                     error.NotFound => {},
                     else => return err,
                 };
+                try txn.commit();
+            },
+        }
+    }
+
+    /// An index-aware process operating without an active deployment fence
+    /// invalidates the previous proof. This makes disabling and later
+    /// re-enabling the same configured generation safe whenever the new
+    /// runtime participates in the unfenced interval; pre-feature processes
+    /// still require the deployment coordinator described by the config.
+    pub fn invalidateLegacySessionInventoryCompletion(
+        self: *DurableSessionStore,
+        kind: SessionKind,
+    ) !void {
+        const key = sessionLegacyInventoryCompleteKey(kind);
+        switch (self.backend) {
+            .docstore => |store| {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                _ = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => {
+                        txn.abort();
+                        return;
+                    },
+                    else => return err,
+                };
+                try txn.delete(key);
+                try txn.commit();
+            },
+            .runtime => |store| {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                _ = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => {
+                        txn.abort();
+                        return;
+                    },
+                    else => return err,
+                };
+                try txn.delete(key);
                 try txn.commit();
             },
         }
@@ -2274,6 +2337,7 @@ pub const DurableSessionStore = struct {
                     .phase = .legacy_index,
                     .kind = kind,
                     .txn_id = ids.items[ids.items.len - 1],
+                    .inventory_generation = after.inventory_generation,
                 };
                 break;
             }
@@ -2288,6 +2352,7 @@ pub const DurableSessionStore = struct {
                 .phase = .legacy_index,
                 .kind = sessionKind(last),
                 .txn_id = last.txn_id,
+                .inventory_generation = after.inventory_generation,
             };
         } else if (bounded_continuation) |cursor| {
             next_cursor = cursor;
@@ -2313,8 +2378,15 @@ pub const DurableSessionStore = struct {
         if (after) |cursor| {
             if (cursor.phase == .legacy)
                 return try self.scanLegacyUnindexedSessionPage(alloc, principal, cursor, limit);
-            if (cursor.phase == .legacy_index)
+            if (cursor.phase == .legacy_index) {
+                const cursor_generation = cursor.inventory_generation orelse
+                    return error.StaleSessionListCursor;
+                if (interactive_writer_fence_generation == null or
+                    interactive_writer_fence_generation.? != cursor_generation or
+                    !try self.legacySessionInventoryComplete(cursor_generation))
+                    return error.StaleSessionListCursor;
                 return try self.scanLegacyIndexedSessionPage(alloc, principal, cursor, limit);
+            }
         }
         var sessions = std.ArrayListUnmanaged(Session).empty;
         errdefer {
@@ -2404,6 +2476,7 @@ pub const DurableSessionStore = struct {
                     .phase = .legacy_index,
                     .kind = .interactive,
                     .txn_id = undefined,
+                    .inventory_generation = interactive_writer_fence_generation.?,
                     .legacy_start = true,
                 }
             else
@@ -2631,6 +2704,10 @@ pub const SessionRegistry = struct {
     const session_lock_count = 64;
 
     mutex: AtomicMutex = .{},
+    /// Recovery scans retain owned opaque backend cursors and perform durable
+    /// repair I/O. Serialize that state without holding the general registry
+    /// mutex across storage calls.
+    recovery_scan_mutex: AtomicMutex = .{},
     session_locks: [session_lock_count]AtomicMutex = [_]AtomicMutex{.{}} ** session_lock_count,
     sessions: std.AutoHashMapUnmanaged(db_mod.types.TxnId, Session) = .empty,
     lease_renewal_candidates: std.AutoHashMapUnmanaged(db_mod.types.TxnId, SessionKind) = .empty,
@@ -2655,7 +2732,7 @@ pub const SessionRegistry = struct {
     pending_session_publications: u32 = 0,
     pending_lease_publications: u32 = 0,
     recovery_index_cursors: [2]?db_mod.types.TxnId = .{ null, null },
-    recovery_audit_cursors: [2]?db_mod.types.TxnId = .{ null, null },
+    recovery_audit_cursors: [2]?[]u8 = .{ null, null },
     recovery_audit_unresolved: [2]usize = .{ 0, 0 },
     recovery_namespace_cursor: SessionKind = .interactive,
     expiry_cleanup_cursors: [2]?SessionExpiryCursor = .{ null, null },
@@ -2712,6 +2789,10 @@ pub const SessionRegistry = struct {
         while (it.next()) |entry| entry.value_ptr.deinit(alloc);
         self.sessions.deinit(alloc);
         self.lease_renewal_candidates.deinit(alloc);
+        if (self.durable) |durable| for (&self.recovery_audit_cursors) |*cursor| {
+            if (cursor.*) |key| durable.alloc.free(key);
+            cursor.* = null;
+        };
         self.* = .{};
     }
 
@@ -3472,6 +3553,8 @@ pub const SessionRegistry = struct {
         if (limit == 0) return try pending.toOwnedSlice(alloc);
 
         if (self.durable) |durable| {
+            self.recovery_scan_mutex.lock();
+            defer self.recovery_scan_mutex.unlock();
             self.mutex.lock();
             const index_after = self.recovery_index_cursors;
             const audit_after = self.recovery_audit_cursors;
@@ -3480,7 +3563,13 @@ pub const SessionRegistry = struct {
             self.mutex.unlock();
 
             var next_index_after = index_after;
-            var next_audit_after = audit_after;
+            var next_audit_after: [2]?[]u8 = .{ null, null };
+            var next_audit_after_set: [2]bool = .{ false, false };
+            defer {
+                for (&next_audit_after, next_audit_after_set) |*cursor, set| if (set) {
+                    if (cursor.*) |key| durable.alloc.free(key);
+                };
+            }
             var next_audit_unresolved = audit_unresolved;
             var kind = first_kind;
             for (0..2) |_| {
@@ -3500,14 +3589,15 @@ pub const SessionRegistry = struct {
                     .interactive => self.inventory_writer_fence_generation,
                     .idempotent_receipt => receipt_inventory_writer_fence_generation,
                 };
-                const audited = durable.scanLegacyRecoveryIds(alloc, kind, audit_after[kind_index], audit_budget) catch |err| {
-                    if (err == error.InvalidTransactionSessionRecord)
-                        try durable.recordLegacySessionInventoryDebt(kind, writer_fence_generation, 1);
-                    return err;
-                };
-                defer alloc.free(audited.recovery_ids);
-                defer alloc.free(audited.session_ids);
-                next_audit_after[kind_index] = audited.next_after;
+                if (kind == .interactive and writer_fence_generation == null)
+                    try durable.invalidateLegacySessionInventoryCompletion(kind);
+                var audited = try durable.scanLegacyRecoveryIds(alloc, kind, audit_after[kind_index], audit_budget);
+                defer audited.deinit(alloc);
+                next_audit_after[kind_index] = if (audited.next_after) |raw|
+                    try durable.alloc.dupe(u8, raw)
+                else
+                    null;
+                next_audit_after_set[kind_index] = true;
                 next_audit_unresolved[kind_index] = audit_unresolved[kind_index] +| audited.unresolved_records;
                 if (audited.unresolved_records > 0)
                     try durable.recordLegacySessionInventoryDebt(
@@ -3550,7 +3640,13 @@ pub const SessionRegistry = struct {
 
             self.mutex.lock();
             self.recovery_index_cursors = next_index_after;
-            self.recovery_audit_cursors = next_audit_after;
+            for (&self.recovery_audit_cursors, &next_audit_after, &next_audit_after_set) |*current, *next, *set| {
+                std.debug.assert(set.*);
+                if (current.*) |key| durable.alloc.free(key);
+                current.* = next.*;
+                next.* = null;
+                set.* = false;
+            }
             self.recovery_audit_unresolved = next_audit_unresolved;
             self.recovery_namespace_cursor = nextSessionKind(first_kind);
             self.mutex.unlock();
@@ -6409,10 +6505,11 @@ fn sessionListCursorLessThan(_: void, a: SessionListCursor, b: SessionListCursor
 
 pub fn encodeSessionListCursor(alloc: std.mem.Allocator, cursor: SessionListCursor) ![]u8 {
     if (cursor.phase == .legacy_index) {
+        const generation = cursor.inventory_generation orelse return error.InvalidSessionListCursor;
         const kind: u8 = if (cursor.kind == .interactive) 'i' else 'r';
-        if (cursor.legacy_start) return try std.fmt.allocPrint(alloc, "v3:x:{c}:start", .{kind});
+        if (cursor.legacy_start) return try std.fmt.allocPrint(alloc, "v4:x:{d}:{c}:start", .{ generation, kind });
         const txn_hex = distributed_txn.encodeTxnIdHex(cursor.txn_id);
-        return try std.fmt.allocPrint(alloc, "v3:x:{c}:{s}", .{ kind, &txn_hex });
+        return try std.fmt.allocPrint(alloc, "v4:x:{d}:{c}:{s}", .{ generation, kind, &txn_hex });
     }
     if (cursor.phase == .legacy) {
         const kind: u8 = if (cursor.kind == .interactive) 'i' else 'r';
@@ -6426,23 +6523,36 @@ pub fn encodeSessionListCursor(alloc: std.mem.Allocator, cursor: SessionListCurs
 }
 
 pub fn decodeSessionListCursor(encoded: []const u8) !SessionListCursor {
-    if (std.mem.startsWith(u8, encoded, "v3:x:") and encoded.len >= 12 and encoded[6] == ':') {
-        const kind: SessionKind = switch (encoded[5]) {
+    if (std.mem.startsWith(u8, encoded, "v4:x:")) {
+        var parts = std.mem.splitScalar(u8, encoded, ':');
+        if (!std.mem.eql(u8, parts.next() orelse return error.InvalidSessionListCursor, "v4") or
+            !std.mem.eql(u8, parts.next() orelse return error.InvalidSessionListCursor, "x"))
+            return error.InvalidSessionListCursor;
+        const generation = std.fmt.parseUnsigned(u64, parts.next() orelse return error.InvalidSessionListCursor, 10) catch
+            return error.InvalidSessionListCursor;
+        if (generation == 0) return error.InvalidSessionListCursor;
+        const encoded_kind = parts.next() orelse return error.InvalidSessionListCursor;
+        if (encoded_kind.len != 1) return error.InvalidSessionListCursor;
+        const kind: SessionKind = switch (encoded_kind[0]) {
             'i' => .interactive,
             'r' => .idempotent_receipt,
             else => return error.InvalidSessionListCursor,
         };
-        if (std.mem.eql(u8, encoded[7..], "start")) return .{
+        const position = parts.next() orelse return error.InvalidSessionListCursor;
+        if (parts.next() != null) return error.InvalidSessionListCursor;
+        if (std.mem.eql(u8, position, "start")) return .{
             .phase = .legacy_index,
             .kind = kind,
             .txn_id = undefined,
+            .inventory_generation = generation,
             .legacy_start = true,
         };
-        if (encoded.len != 39) return error.InvalidSessionListCursor;
+        if (position.len != 32) return error.InvalidSessionListCursor;
         return .{
             .phase = .legacy_index,
             .kind = kind,
-            .txn_id = distributed_txn.parseTxnIdHex(encoded[7..]) catch return error.InvalidSessionListCursor,
+            .txn_id = distributed_txn.parseTxnIdHex(position) catch return error.InvalidSessionListCursor,
+            .inventory_generation = generation,
         };
     }
     if (std.mem.startsWith(u8, encoded, "v2:l:") and encoded.len >= 12 and encoded[6] == ':') {
@@ -9059,7 +9169,38 @@ test "transaction inventory requires a new writer fence after a legacy writer re
     defer fenced_page.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), fenced_page.sessions.len);
     try std.testing.expectEqual(SessionListCursorPhase.legacy_index, fenced_page.next_cursor.?.phase);
-    var migrated_page = try registry.listDetailsPageForPrincipal(alloc, "alice", fenced_page.next_cursor, 4);
+    try std.testing.expectEqual(@as(?u64, 4), fenced_page.next_cursor.?.inventory_generation);
+
+    // An unfenced new runtime invalidates the durable proof. A cursor minted
+    // under that proof cannot bypass the restored canonical compatibility
+    // scan, even if the operator re-enables the same configured number before
+    // a fresh audit republishes its completion proof.
+    const fenced_cursor = fenced_page.next_cursor.?;
+    registry.inventory_writer_fence_generation = null;
+    const unfenced_audit = try registry.listPendingRecoveryIds(alloc, 8);
+    alloc.free(unfenced_audit);
+    try std.testing.expect(!try durable.legacySessionInventoryComplete(4));
+    try std.testing.expectError(
+        error.StaleSessionListCursor,
+        registry.listDetailsPageForPrincipal(alloc, "alice", fenced_cursor, 4),
+    );
+    registry.inventory_writer_fence_generation = 4;
+    try std.testing.expectError(
+        error.StaleSessionListCursor,
+        registry.listDetailsPageForPrincipal(alloc, "alice", fenced_cursor, 4),
+    );
+
+    const refreshed_audit = try registry.listPendingRecoveryIds(alloc, 8);
+    alloc.free(refreshed_audit);
+    try std.testing.expect(try durable.legacySessionInventoryComplete(4));
+    var refreshed_page = try registry.listDetailsPageForPrincipal(alloc, "alice", null, 4);
+    defer refreshed_page.deinit(alloc);
+    try std.testing.expectEqual(SessionListCursorPhase.legacy_index, refreshed_page.next_cursor.?.phase);
+    const encoded_cursor = try encodeSessionListCursor(alloc, refreshed_page.next_cursor.?);
+    defer alloc.free(encoded_cursor);
+    const decoded_cursor = try decodeSessionListCursor(encoded_cursor);
+    try std.testing.expectEqual(@as(?u64, 4), decoded_cursor.inventory_generation);
+    var migrated_page = try registry.listDetailsPageForPrincipal(alloc, "alice", decoded_cursor, 4);
     defer migrated_page.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), migrated_page.sessions.len);
     try std.testing.expectEqualSlices(u8, &late.txn_id, &migrated_page.sessions[0].status.txn_id);
@@ -9122,16 +9263,36 @@ test "transaction inventory completion retains corruption debt across audit page
     try std.testing.expect(try durable.legacySessionInventoryKindComplete(.interactive, 7));
     try std.testing.expectError(error.NotFound, store.get(alloc, debt_key));
 
-    // Malformed keys cannot be represented by the typed cursor and therefore
-    // fail closed instead of being skipped or causing an unbounded audit.
+    const recovery = try registry.beginForPrincipal(alloc, .{ .sync_level = .write }, 7, "alice");
+    var recovery_request = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:recover":{"value":1}}}}}
+    );
+    defer recovery_request.deinit(alloc);
+    var sealed = (try registry.cloneCommitRequest(alloc, recovery.txn_id, &recovery_request)) orelse
+        return error.TestExpectedEqual;
+    sealed.deinit(alloc);
+    _ = (try registry.markCommitExecutionStarted(alloc, recovery.txn_id)) orelse
+        return error.TestExpectedEqual;
+
+    // A malformed reserved key consumes bounded audit work and persists debt,
+    // but the opaque raw-key cursor advances past it and unrelated indexed
+    // recovery remains live.
     {
         var malformed_txn = try store.beginWriteTxn();
         errdefer malformed_txn.abort();
         try malformed_txn.put(session_prefix ++ "!not-a-transaction-id", "{}");
         try malformed_txn.commit();
     }
+    if (registry.recovery_audit_cursors[sessionKindIndex(.interactive)]) |cursor|
+        durable.alloc.free(cursor);
     registry.recovery_audit_cursors[sessionKindIndex(.interactive)] = null;
-    try std.testing.expectError(error.InvalidTransactionSessionRecord, registry.listPendingRecoveryIds(alloc, 8));
+    const malformed_pending = try registry.listPendingRecoveryIds(alloc, 8);
+    defer alloc.free(malformed_pending);
+    try std.testing.expectEqual(@as(usize, 1), malformed_pending.len);
+    try std.testing.expectEqualSlices(u8, &recovery.txn_id, &malformed_pending[0]);
+    const tail_pending = try registry.listPendingRecoveryIds(alloc, 8);
+    defer alloc.free(tail_pending);
+    try std.testing.expect(registry.recovery_audit_cursors[sessionKindIndex(.interactive)] == null);
     try std.testing.expect(!try durable.legacySessionInventoryKindComplete(.interactive, 7));
     const malformed_debt = try store.get(alloc, debt_key);
     alloc.free(malformed_debt);

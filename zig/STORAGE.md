@@ -485,8 +485,15 @@ Maintenance publishes a generation-qualified durable completion marker only
 after a complete audit has observed no malformed or unprojectable canonical
 records. Discovering either persists migration debt and atomically invalidates
 any earlier completion marker; a later wholly clean audit clears that debt as
-it republishes completion. New inventory traversals can then read both
-principal projections;
+it republishes completion. Audit progress uses the exact backend key, so a
+malformed reserved key consumes bounded work and records debt without wedging
+unrelated durable transaction recovery. A new runtime operating with the fence
+unset also removes any old completion proof before continuing its audit.
+
+New inventory traversals can then read both
+principal projections. Principal-scoped legacy cursors carry the exact writer
+fence generation and are rejected after the proof is disabled, changed, or
+invalidated, requiring the client to restart the traversal;
 cursors issued before completion retain their bounded canonical compatibility
 phase. Without a valid marker, canonical compatibility remains active and
 continues to surface corrupt records rather than silently hiding them.

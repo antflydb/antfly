@@ -2641,7 +2641,9 @@ paths:
           description: Opaque cursor returned by the previous page. Continue while present even when the
             previous sessions array was empty. Cursor versions preserve in-progress canonical compatibility
             traversals while newly started traversals use the durable principal-scoped legacy projection
-            after migration.
+            after migration. A principal-scoped legacy cursor is bound to its writer-fence generation
+            and returns 400 when that generation is no longer current or its completion proof is invalid;
+            restart the traversal without a cursor.
           schema:
             type: string
       responses:
