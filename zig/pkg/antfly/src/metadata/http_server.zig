@@ -3262,6 +3262,9 @@ const ParsedRuntimeIndexStatus = struct {
     edge_count: ?u64 = null,
     node_count: ?u64 = null,
     root_node: ?u64 = null,
+    publication_target_count: ?u64 = null,
+    publication_target_ready: ?bool = null,
+    serving_snapshot_ready: ?bool = null,
     coverage_produced_count: ?u64 = null,
     coverage_skipped_count: ?u64 = null,
     coverage_terminal_failed_count: ?u64 = null,
@@ -3276,9 +3279,23 @@ const ParsedRuntimeIndexStatus = struct {
     replay_catch_up_required: ?bool = null,
     dense_vector_projection_pending: ?bool = null,
     dense_native_storage_phase: ?metadata_table_manager.DenseNativeStoragePhase = null,
+    embedding_activity_observed: ?bool = null,
+    embedding_activity: ?ParsedRuntimeEmbeddingActivityStatus = null,
     source_replay: ?[]ParsedRuntimeIndexSourceReplayStatus = null,
+    lifecycle_work_class: ?metadata_table_manager.IndexLifecycleWorkClass = null,
     repair_status: ?metadata_table_manager.IndexRepairStatus = null,
     repair_active_generation_serviceable: ?bool = null,
+};
+
+const ParsedRuntimeEmbeddingActivityStatus = struct {
+    epoch: ?u64 = null,
+    sample_sequence: ?u64 = null,
+    phase: ?metadata_table_manager.RuntimeEmbeddingActivityStatusReport.Phase = null,
+    chunks_created: ?u64 = null,
+    embedding_batches_completed: ?u64 = null,
+    embeddings_computed: ?u64 = null,
+    active_batch_size: ?u64 = null,
+    last_progress_at_ms: ?u64 = null,
 };
 
 const ParsedRuntimeIndexSourceReplayStatus = struct {
@@ -3300,6 +3317,8 @@ const ParsedRuntimeGroupStatus = struct {
     topology_generation: ?u64 = null,
     lsm_root_generation: ?u64 = null,
     status_generation: ?u64 = null,
+    target_observation_revision: ?u64 = null,
+    target_observation_complete: ?bool = null,
     doc_count: ?u64 = null,
     disk_bytes: ?u64 = null,
     disk_bytes_known: ?bool = null,
@@ -3458,6 +3477,8 @@ fn parseStoreStatusReport(alloc: std.mem.Allocator, body: []const u8) !metadata_
 fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []const u8, default_store_id: ?u64) !metadata_table_manager.StoreStatusReport {
     const Parsed = struct {
         store_id: ?u64 = null,
+        embedding_activity_protocol_version: ?u16 = null,
+        embedding_activity_sequence: ?u64 = null,
         reporter_incarnation: ?u64 = null,
         status_generation: ?u64 = null,
         artifact_sources_protocol_version: ?u16 = null,
@@ -3481,6 +3502,11 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.status_generation orelse 0,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.embeddingActivityReportValid(
+        parsed.value.reporter_incarnation orelse 0,
+        parsed.value.embedding_activity_protocol_version orelse 0,
+        parsed.value.embedding_activity_sequence orelse 0,
+    )) return error.InvalidStoreReporterFence;
     if (!metadata_table_manager.artifactSourcesProtocolValid(
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.artifact_sources_protocol_version orelse 0,
@@ -3493,10 +3519,16 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
     errdefer metadata_table_manager.freeGroupStatuses(alloc, group_statuses);
     const runtime_statuses = try cloneParsedRuntimeGroupStatuses(alloc, parsed.value.runtime_statuses orelse &.{});
     errdefer metadata_table_manager.freeRuntimeGroupStatusReports(alloc, runtime_statuses);
+    if (!metadata_table_manager.embeddingActivitySamplesValid(
+        parsed.value.embedding_activity_protocol_version orelse 0,
+        runtime_statuses,
+    )) return error.InvalidStoreReporterFence;
     const store_id = parsed.value.store_id orelse default_store_id orelse return error.MissingStoreID;
     if (store_id == 0) return error.InvalidNodeID;
     return .{
         .store_id = store_id,
+        .embedding_activity_protocol_version = parsed.value.embedding_activity_protocol_version orelse 0,
+        .embedding_activity_sequence = parsed.value.embedding_activity_sequence orelse 0,
         .reporter_incarnation = parsed.value.reporter_incarnation orelse 0,
         .status_generation = parsed.value.status_generation orelse 0,
         .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
@@ -3600,6 +3632,11 @@ fn cloneParsedRuntimeGroupStatus(
         .topology_generation = parsed.topology_generation orelse 0,
         .lsm_root_generation = parsed.lsm_root_generation orelse 0,
         .status_generation = parsed.status_generation orelse 0,
+        .target_observation_revision = parsed.target_observation_revision orelse 0,
+        // v0.2.0 reporters predate this field and their v12 profile carries
+        // the historical converged interpretation. Current reporters send an
+        // explicit false whenever the commit watermark is pending.
+        .target_observation_complete = parsed.target_observation_complete orelse true,
         .doc_count = parsed.doc_count orelse 0,
         .disk_bytes = parsed.disk_bytes orelse 0,
         .disk_bytes_known = parsed.disk_bytes_known orelse false,
@@ -3637,6 +3674,9 @@ fn cloneParsedRuntimeIndexStatus(
     alloc: std.mem.Allocator,
     parsed: ParsedRuntimeIndexStatus,
 ) !metadata_table_manager.RuntimeIndexStatusReport {
+    const lifecycle_work_class = parsed.lifecycle_work_class orelse .none;
+    if ((parsed.repair_status != null) != (lifecycle_work_class == .repair))
+        return error.InvalidRuntimeStatus;
     const name = try alloc.dupe(u8, parsed.name orelse "");
     errdefer alloc.free(name);
     const kind = try alloc.dupe(u8, parsed.kind orelse "");
@@ -3670,6 +3710,9 @@ fn cloneParsedRuntimeIndexStatus(
         .edge_count = parsed.edge_count orelse 0,
         .node_count = parsed.node_count orelse 0,
         .root_node = parsed.root_node orelse 0,
+        .publication_target_count = parsed.publication_target_count orelse 0,
+        .publication_target_ready = parsed.publication_target_ready orelse false,
+        .serving_snapshot_ready = parsed.serving_snapshot_ready orelse false,
         .coverage_produced_count = parsed.coverage_produced_count orelse 0,
         .coverage_skipped_count = parsed.coverage_skipped_count orelse 0,
         .coverage_terminal_failed_count = parsed.coverage_terminal_failed_count orelse 0,
@@ -3684,7 +3727,19 @@ fn cloneParsedRuntimeIndexStatus(
         .replay_catch_up_required = parsed.replay_catch_up_required orelse false,
         .dense_vector_projection_pending = parsed.dense_vector_projection_pending orelse false,
         .dense_native_storage_phase = parsed.dense_native_storage_phase orelse .legacy,
+        .embedding_activity_observed = parsed.embedding_activity_observed orelse false,
+        .embedding_activity = if (parsed.embedding_activity) |activity| .{
+            .epoch = activity.epoch orelse 0,
+            .sample_sequence = activity.sample_sequence orelse 0,
+            .phase = activity.phase orelse .idle,
+            .chunks_created = activity.chunks_created orelse 0,
+            .embedding_batches_completed = activity.embedding_batches_completed orelse 0,
+            .embeddings_computed = activity.embeddings_computed orelse 0,
+            .active_batch_size = activity.active_batch_size orelse 0,
+            .last_progress_at_ms = activity.last_progress_at_ms orelse 0,
+        } else .{},
         .source_replay = source_replay,
+        .lifecycle_work_class = lifecycle_work_class,
         .repair_status = parsed.repair_status,
         .repair_active_generation_serviceable = parsed.repair_status != null and
             (parsed.repair_active_generation_serviceable orelse false),
@@ -3694,7 +3749,7 @@ fn cloneParsedRuntimeIndexStatus(
 test "metadata status JSON preserves compact managed index admission state" {
     const alloc = std.testing.allocator;
     const report = try parseStoreStatusReport(alloc,
-        \\{"store_id":20,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","repair_status":"waiting","repair_active_generation_serviceable":true,"dense_vector_projection_pending":true,"dense_native_storage_phase":"native_validating"},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
+        \\{"store_id":20,"reporter_incarnation":77,"embedding_activity_protocol_version":2,"embedding_activity_sequence":3,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","publication_target_count":2500,"publication_target_ready":true,"serving_snapshot_ready":true,"embedding_activity_observed":true,"embedding_activity":{"epoch":7,"sample_sequence":2,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"lifecycle_work_class":"repair","repair_status":"waiting","repair_active_generation_serviceable":true,"dense_vector_projection_pending":true,"dense_native_storage_phase":"native_validating"},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
     );
     defer freeStoreStatusReport(alloc, report);
 
@@ -3705,6 +3760,14 @@ test "metadata status JSON preserves compact managed index admission state" {
     try std.testing.expect(indexes[0].repair_active_generation_serviceable);
     try std.testing.expect(indexes[0].dense_vector_projection_pending);
     try std.testing.expectEqual(metadata_table_manager.DenseNativeStoragePhase.native_validating, indexes[0].dense_native_storage_phase);
+    try std.testing.expect(indexes[0].publication_target_ready);
+    try std.testing.expectEqual(@as(u64, 2500), indexes[0].publication_target_count);
+    try std.testing.expect(indexes[0].serving_snapshot_ready);
+    try std.testing.expect(indexes[0].embedding_activity_observed);
+    try std.testing.expectEqual(@as(u64, 7), indexes[0].embedding_activity.epoch);
+    try std.testing.expectEqual(@as(u64, 2), indexes[0].embedding_activity.sample_sequence);
+    try std.testing.expectEqual(@as(u64, 8), indexes[0].embedding_activity.embeddings_computed);
+    try std.testing.expectEqual(metadata_table_manager.RuntimeEmbeddingActivityStatusReport.Phase.waiting_retry, indexes[0].embedding_activity.phase);
     // Proof without a repair lifecycle is not actionable and must not survive
     // normalization from a malformed or mixed-version producer.
     try std.testing.expect(indexes[1].repair_status == null);

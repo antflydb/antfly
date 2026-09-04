@@ -159,6 +159,7 @@ from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentRes
 from .dense_native_storage_phase import DenseNativeStoragePhase
 from .dense_repair_backpressure_error import DenseRepairBackpressureError
 from .dense_repair_backpressure_error_code import DenseRepairBackpressureErrorCode
+from .dense_vector_publication_status import DenseVectorPublicationStatus
 from .derived_coverage_observation_incomplete_reason import DerivedCoverageObservationIncompleteReason
 from .derived_coverage_policy import DerivedCoveragePolicy
 from .derived_coverage_status import DerivedCoverageStatus
@@ -205,6 +206,9 @@ from .edge_type_config_topology import EdgeTypeConfigTopology
 from .edges_response import EdgesResponse
 from .embedder_config import EmbedderConfig
 from .embedder_provider import EmbedderProvider
+from .embedding_index_activity import EmbeddingIndexActivity
+from .embedding_index_activity_phase import EmbeddingIndexActivityPhase
+from .embedding_source_coverage_status import EmbeddingSourceCoverageStatus
 from .embedding_type_1 import EmbeddingType1
 from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
@@ -478,6 +482,8 @@ from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
 from .index_execution_config import IndexExecutionConfig
+from .index_milestone_status import IndexMilestoneStatus
+from .index_milestones import IndexMilestones
 from .index_mutation_service_unavailable_error import IndexMutationServiceUnavailableError
 from .index_mutation_service_unavailable_error_error import IndexMutationServiceUnavailableErrorError
 from .index_publication_policy import IndexPublicationPolicy
@@ -1137,6 +1143,7 @@ __all__ = (
     "DenseNativeStoragePhase",
     "DenseRepairBackpressureError",
     "DenseRepairBackpressureErrorCode",
+    "DenseVectorPublicationStatus",
     "DerivedCoverageObservationIncompleteReason",
     "DerivedCoveragePolicy",
     "DerivedCoverageStatus",
@@ -1181,6 +1188,8 @@ __all__ = (
     "EdgeTypeConfigTopology",
     "EmbedderConfig",
     "EmbedderProvider",
+    "EmbeddingIndexActivity",
+    "EmbeddingIndexActivityPhase",
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
     "EmbeddingsIndexStatsAsyncIndexing",
@@ -1189,6 +1198,7 @@ __all__ = (
     "EmbeddingsIndexStatsIndexType",
     "EmbeddingsIndexStatsPromotion",
     "EmbeddingsIndexStatsResolution",
+    "EmbeddingSourceCoverageStatus",
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
@@ -1454,6 +1464,8 @@ __all__ = (
     "IncompleteDetails",
     "IncompleteDetailsReason",
     "IndexExecutionConfig",
+    "IndexMilestones",
+    "IndexMilestoneStatus",
     "IndexMutationServiceUnavailableError",
     "IndexMutationServiceUnavailableErrorError",
     "IndexPublicationPolicy",

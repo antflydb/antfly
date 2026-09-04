@@ -4501,7 +4501,7 @@ pub const ApiHttpServer = struct {
         snapshot: ?*const metadata_api.AdminSnapshot,
         snapshot_index: ?*const RuntimeStatusSnapshotIndex,
         target_index: ?IndexRuntimeTarget,
-        force_write_refresh: bool,
+        include_write_owner_snapshot: bool,
     ) !?runtime_status.LocalTableRuntimeStatuses {
         var items = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
         var item_indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
@@ -4511,7 +4511,7 @@ pub const ApiHttpServer = struct {
             items.deinit(self.alloc);
         }
 
-        var read_needs_refresh = false;
+        var read_needs_owner_snapshot = false;
         var read_statuses_present = false;
         if (self.table_reads) |source| {
             if (try source.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
@@ -4521,10 +4521,10 @@ pub const ApiHttpServer = struct {
                 } else {
                     read_statuses_present = true;
                     errdefer owned.deinit(self.alloc);
-                    read_needs_refresh = if (target_index) |target|
-                        runtimeStatusesNeedWriterRefreshForIndex(owned.items, target)
+                    read_needs_owner_snapshot = if (target_index) |target|
+                        runtimeStatusesNeedOwnerSnapshotForIndex(owned.items, target)
                     else
-                        runtimeStatusesNeedWriterRefresh(owned.items);
+                        runtimeStatusesNeedOwnerSnapshot(owned.items);
                     try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, target_index, &items, &item_indexes, &owned);
                 }
             }
@@ -4536,21 +4536,21 @@ pub const ApiHttpServer = struct {
                 try self.appendRemoteRuntimeStatusesFromSnapshot(&items, &item_indexes, table_name, admin_snapshot, target_index);
             }
         }
-        const should_query_writes = force_write_refresh or if (snapshot == null)
-            self.table_reads == null or !read_statuses_present or read_needs_refresh
+        const should_read_owner_snapshot = include_write_owner_snapshot or if (snapshot == null)
+            self.table_reads == null or !read_statuses_present or read_needs_owner_snapshot
         else
-            items.items.len == 0 or !read_statuses_present or read_needs_refresh;
-        if (should_query_writes and self.table_writes != null) {
-            // Local write-source statuses are a best-effort refresh: a shard
-            // that is not hosted locally must not fail the status request.
-            const write_statuses = self.table_writes.?.localRuntimeStatuses(self.alloc, table_name) catch |err| blk: {
+            items.items.len == 0 or !read_statuses_present or read_needs_owner_snapshot;
+        if (should_read_owner_snapshot and self.table_writes != null) {
+            // Local write-owner statuses are best-effort immutable snapshots:
+            // a shard that is not hosted locally must not fail the request.
+            const owner_statuses = self.table_writes.?.localRuntimeStatuses(self.alloc, table_name) catch |err| blk: {
                 std.log.warn("index status local write-source runtime statuses unavailable table={s} err={s}", .{ table_name, @errorName(err) });
                 break :blk null;
             };
-            if (write_statuses) |statuses| {
+            if (owner_statuses) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
-                if (force_write_refresh) {
+                if (include_write_owner_snapshot) {
                     // Lifecycle classification needs the writer observation in
                     // addition to the best read/remote observation. A read DB
                     // can legitimately be fresh for its retained generation
@@ -4587,41 +4587,41 @@ pub const ApiHttpServer = struct {
         return false;
     }
 
-    fn runtimeStatusNeedsWriterRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
+    fn runtimeStatusNeedsOwnerSnapshot(status: runtime_status.LocalTableRuntimeStatus) bool {
         if (runtimeStatusNeedsDenseVisibilityRefresh(status)) return true;
         if (runtime_status.statusHasRuntimeFacts(status)) return false;
         if (status.metadata.source == .live_writer_publish) return false;
         return status.stats.indexes.len != 0;
     }
 
-    fn runtimeStatusesNeedWriterRefresh(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
+    fn runtimeStatusesNeedOwnerSnapshot(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
         for (statuses) |status| {
-            if (runtimeStatusNeedsWriterRefresh(status)) return true;
+            if (runtimeStatusNeedsOwnerSnapshot(status)) return true;
         }
         return false;
     }
 
-    fn runtimeStatusesNeedWriterRefreshForIndex(
+    fn runtimeStatusesNeedOwnerSnapshotForIndex(
         statuses: []const runtime_status.LocalTableRuntimeStatus,
         target: IndexRuntimeTarget,
     ) bool {
         for (statuses) |status| {
-            if (runtimeStatusTargetNeedsWriterRefresh(status, target)) return true;
+            if (runtimeStatusTargetNeedsOwnerSnapshot(status, target)) return true;
         }
         return false;
     }
 
-    fn runtimeStatusTargetNeedsWriterRefresh(
+    fn runtimeStatusTargetNeedsOwnerSnapshot(
         status: runtime_status.LocalTableRuntimeStatus,
         target: IndexRuntimeTarget,
     ) bool {
-        if (runtimeStatusNeedsWriterRefresh(status)) return true;
+        if (runtimeStatusNeedsOwnerSnapshot(status)) return true;
         // A read snapshot can be fresh for its retained index generation
         // while the live writer is admitting or advancing a newer index.
         if (runtimeStatusTargetRank(status, target) < 2) return true;
         // The read cache's freshness describes the observation it retained;
         // it does not make an incomplete lifecycle observation terminal. Only
-        // the requested index detail path pays for this writer refresh, and it
+        // the requested index detail path reads the owner snapshot, and it
         // stops doing so as soon as the cached proof is complete.
         for (status.stats.indexes) |index| {
             if (!std.mem.eql(u8, index.name, target.name)) continue;
@@ -4817,13 +4817,13 @@ pub const ApiHttpServer = struct {
                 const existing_rank = runtimeStatusTargetRank(existing.*, index_target);
                 if (candidate_rank != existing_rank) break :blk candidate_rank > existing_rank;
                 // Once an incomplete cached observation caused a targeted
-                // writer refresh, the live writer is the authoritative view
+                // owner-snapshot lookup, the live writer is authoritative
                 // for that same incarnation even if its freshness is still
                 // catching_up. Otherwise the cached value can win forever.
                 const candidate_is_writer = status.metadata.source == .live_writer_publish;
                 const existing_is_writer = existing.metadata.source == .live_writer_publish;
                 if (candidate_is_writer != existing_is_writer and
-                    runtimeStatusTargetNeedsWriterRefresh(existing.*, index_target))
+                    runtimeStatusTargetNeedsOwnerSnapshot(existing.*, index_target))
                 {
                     break :blk candidate_is_writer;
                 }
@@ -4979,6 +4979,9 @@ pub const ApiHttpServer = struct {
                 .edge_count = index.edge_count,
                 .node_count = index.node_count,
                 .root_node = index.root_node,
+                .publication_target_count = index.publication_target_count,
+                .publication_target_ready = index.publication_target_ready,
+                .serving_snapshot_ready = index.serving_snapshot_ready,
                 .coverage_produced_count = index.coverage_produced_count,
                 .coverage_skipped_count = index.coverage_skipped_count,
                 .coverage_terminal_failed_count = index.coverage_terminal_failed_count,
@@ -4993,7 +4996,35 @@ pub const ApiHttpServer = struct {
                 .replay_catch_up_required = index.replay_catch_up_required,
                 .dense_vector_projection_pending = index.dense_vector_projection_pending,
                 .dense_native_storage_phase = index.dense_native_storage_phase,
+                // Metadata already applied its incarnation-scoped TTL cache
+                // before producing this report. Preserve the observation bit
+                // and ordering token together; dropping either makes the API
+                // alternate between valid activity and `unavailable` as it
+                // switches between local-writer and projected-store status.
+                .embedding_activity_observed = index.embedding_activity_observed,
+                .embedding_activity = .{
+                    .epoch = index.embedding_activity.epoch,
+                    .sample_sequence = index.embedding_activity.sample_sequence,
+                    .reported_phase = switch (index.embedding_activity.phase) {
+                        .idle => .idle,
+                        .preparing => .preparing,
+                        .embedding => .embedding,
+                        .publishing => .publishing,
+                        .waiting_retry => .waiting_retry,
+                    },
+                    .index_generation = index.coverage_generation,
+                    .chunks_created = index.embedding_activity.chunks_created,
+                    .embedding_batches_completed = index.embedding_activity.embedding_batches_completed,
+                    .embeddings_computed = index.embedding_activity.embeddings_computed,
+                    .active_batch_size = index.embedding_activity.active_batch_size,
+                    .last_progress_at_ms = index.embedding_activity.last_progress_at_ms,
+                },
                 .source_replay = source_replay,
+                .index_lifecycle_work_class = switch (index.lifecycle_work_class) {
+                    .none => .none,
+                    .initial_build => .initial_build,
+                    .repair => .repair,
+                },
                 .index_repair_status = index.repair_status,
                 .index_repair_active_generation_serviceable = index.repair_active_generation_serviceable,
                 .catch_up_active = dense_catch_up_active,
@@ -5015,6 +5046,8 @@ pub const ApiHttpServer = struct {
                 .topology_generation = report.topology_generation,
                 .lsm_root_generation = report.lsm_root_generation,
                 .status_generation = report.status_generation,
+                .target_observation_revision = report.target_observation_revision,
+                .target_observation_complete = report.target_observation_complete,
                 .store_id = report.store_id,
                 .node_id = report.node_id,
             },
@@ -8179,7 +8212,11 @@ pub const ApiHttpServer = struct {
             backup_location,
             backup_id,
             operation_control.token(),
-        ) catch |err| return operation_control.normalizeInterruption(err)) {
+        ) catch |err| {
+            const normalized_err = operation_control.normalizeInterruption(err);
+            std.log.warn("table backup preflight failed phase=manifest_lookup class={s}", .{@errorName(normalized_err)});
+            return normalized_err;
+        }) {
             if (writer_lease_role.ownsCommittedRetirement()) {
                 self.scheduleTableBackupAttemptCleanup(
                     location_uri,
@@ -8328,7 +8365,11 @@ pub const ApiHttpServer = struct {
                     };
                     return error.BackupOutcomeAmbiguous;
                 },
-                else => return operation_control.normalizeInterruption(err),
+                else => {
+                    const normalized_err = operation_control.normalizeInterruption(err);
+                    std.log.warn("table backup preflight failed phase=reservation_admission class={s}", .{@errorName(normalized_err)});
+                    return normalized_err;
+                },
             };
             break :reservation_admission;
         }
@@ -8350,6 +8391,7 @@ pub const ApiHttpServer = struct {
                 operation_control.token(),
             ) catch |err| {
                 const normalized_err = operation_control.normalizeInterruption(err);
+                std.log.warn("table backup preflight failed phase=writer_lease_admission class={s}", .{@errorName(normalized_err)});
                 // A known precondition failure did not create this lease. It
                 // nevertheless proves another same-generation writer may be
                 // live, so retain both fences and require reconciliation.
@@ -8415,6 +8457,7 @@ pub const ApiHttpServer = struct {
             artifact_backup_id,
             operation_control.token(),
         ) catch |err| {
+            std.log.warn("table backup preflight failed phase=reservation_ownership_read class={s}", .{@errorName(err)});
             return self.rollbackFailedTableBackupAttempt(
                 io,
                 backup_location,
@@ -8618,17 +8661,51 @@ pub const ApiHttpServer = struct {
             .remote => self.destroyBackupStagingRoot(local_backup_root),
         };
 
-        const local_shards = table_writes_source.backupTable(self.alloc, table_name, .{
-            .backup_root = local_backup_root,
-            .backup_id = artifact_backup_id,
-            .format = format,
-            .io = io,
-            .fence = fence,
-            .cancellation = operation_control.token(),
-            .deadline_ns = operation_control.deadline_ns,
-        }) catch |err| {
-            if (err == error.BackupOutcomeAmbiguous) cleanup_safe.* = false;
-            return err;
+        var quiescence_attempt: u8 = 0;
+        const local_shards = while (true) {
+            try writer_lease.ensureOwned();
+            try operation_control.ensureActive();
+            const maybe_shards = table_writes_source.backupTable(self.alloc, table_name, .{
+                .backup_root = local_backup_root,
+                .backup_id = artifact_backup_id,
+                .format = format,
+                .io = io,
+                .fence = fence,
+                .cancellation = operation_control.token(),
+                .deadline_ns = operation_control.deadline_ns,
+            }) catch |err| switch (err) {
+                error.NativeBackupRepairStateNotQuiescent,
+                error.NativeBackupProjectionNotQuiescent,
+                => {
+                    // Each callback attempt owns and releases the provisioned
+                    // group-operation lease. Wait only at this coordinator
+                    // layer so the resident repair/publication owner can make
+                    // the exact transition the native snapshot requires.
+                    try operation_control.ensureActive();
+                    const now_ns = platform_time.monotonicNs();
+                    if (now_ns >= operation_control.deadline_ns) return error.Timeout;
+                    const delay_ns = @min(
+                        nativeBackupQuiescenceRetryDelayNs(quiescence_attempt),
+                        operation_control.deadline_ns - now_ns,
+                    );
+                    io.sleep(std.Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch |sleep_err|
+                        return operation_control.normalizeInterruption(sleep_err);
+                    quiescence_attempt +|= 1;
+                    continue;
+                },
+                error.BackupOutcomeAmbiguous => {
+                    cleanup_safe.* = false;
+                    return err;
+                },
+                else => {
+                    std.log.warn(
+                        "table backup shard capture failed table={s} format={s} class={s}",
+                        .{ table_name, @tagName(format), @errorName(err) },
+                    );
+                    return err;
+                },
+            };
+            break maybe_shards;
         };
         const shards = local_shards orelse return error.TableNotFound;
         defer freeBackupShards(self.alloc, shards);
@@ -8674,6 +8751,10 @@ pub const ApiHttpServer = struct {
             operation_control.token(),
         ) catch |err| {
             const normalized_err = operation_control.normalizeInterruption(err);
+            std.log.warn(
+                "table backup manifest publication failed table={s} format={s} class={s}",
+                .{ table_name, @tagName(format), @errorName(normalized_err) },
+            );
             cleanup_safe.* = switch (normalized_err) {
                 error.BackupAlreadyExists, error.BackupManifestTooLarge => true,
                 error.Canceled, error.Cancelled, error.Timeout => !remote_repository,
@@ -10252,6 +10333,12 @@ pub const ApiHttpServer = struct {
             error.TextMergeRuntimeShutdown,
             => return error.Backpressured,
             error.DenseRepairBackpressure => return error.DenseRepairBackpressure,
+            // Index definitions commit before their physical activation job.
+            // A full-index batch that reaches an older resident writer has
+            // not committed, so expose bounded retryable unavailability while
+            // the exact catalog incarnation is installed instead of leaking a
+            // storage-layer IndexNotFound as an internal 500.
+            error.IndexNotFound => return error.WriteUnavailable,
             error.LeaderUnavailable => return error.WriteUnavailable,
             error.HASyncCommitWouldBlock,
             error.HASyncCommitWaitLimitExceeded,
@@ -10944,7 +11031,7 @@ pub const ApiHttpServer = struct {
         try ensureRequestDeadline(request_deadline_ns);
         const requested_left_fields = contract_request.value.fields orelse &.{};
         if (contract_request.value.count == true) return error.InvalidQueryRequest;
-        const rewrite = try distributed_join.rewriteJoinedBaseQueryBodyAlloc(alloc, contract_request.value, join.left_field);
+        const rewrite = try distributed_join.rewriteJoinedBaseQueryBodyAlloc(alloc, body, join.left_field);
         const appended_left_field = rewrite.appended_left_field;
         const primary_body = rewrite.body;
         defer alloc.free(primary_body);
@@ -12360,11 +12447,11 @@ pub const ApiHttpServer = struct {
                 std.log.warn("public create index committed; metadata projection deferred to reconciliation table={s} index={s} err={}", .{ table_name, index_name, err });
                 break :projection false;
             };
-            // Install the local write capability before the create request
-            // returns. Provisioned sources make this an O(groups) online-DDL
-            // barrier; embedded sources preserve their synchronous contract.
-            // Generic reconciliation is separate because the same queue also
-            // repairs index deletion.
+            // Ask the local owner to activate the committed definition.
+            // Embedded sources preserve synchronous installation; provisioned
+            // sources acknowledge the durable target-fenced activation job and
+            // let their dedicated control-plane executor converge it. The HTTP
+            // request must never join an in-flight native inference kernel.
             var local_installation_complete = false;
             if (projection_ready) {
                 const installed = install: {
@@ -12380,14 +12467,21 @@ pub const ApiHttpServer = struct {
                 };
                 local_installation_complete = installed != null;
             }
-            // Consensus is the request's commit boundary. Queue insertion is
-            // an idempotent repair accelerator, so queue pressure after commit
-            // must not turn a created resource into a false HTTP failure that
-            // invites ambiguous client retries.
-            const reconcile_requested = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| requested: {
-                std.log.warn("public create index structural reconcile enqueue deferred table={s} index={s} err={}", .{ table_name, index_name, err });
-                break :requested null;
-            };
+            // A successful create callback is already the activation owner's
+            // acknowledgement: embedded sources installed synchronously and
+            // provisioned sources durably queued their target. Enqueuing the
+            // same target again after that acknowledgement creates a second
+            // status fence after the first one has handed off, briefly
+            // withdrawing the exact incarnation we just made observable.
+            // Reconciliation is the fallback only when projection prevented
+            // local installation or the callback could not accept ownership.
+            var reconcile_requested: ?void = {};
+            if (!local_installation_complete) {
+                reconcile_requested = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| requested: {
+                    std.log.warn("public create index structural reconcile enqueue deferred table={s} index={s} err={}", .{ table_name, index_name, err });
+                    break :requested null;
+                };
+            }
             if (!local_installation_complete and reconcile_requested == null) {
                 const scheduled = if (prepared_installation) |*prepared|
                     if (!prepared.owns_payload)
@@ -16870,6 +16964,20 @@ fn sleepNs(duration_ns: u64) void {
         .INTR => continue,
         else => return,
     };
+}
+
+const native_backup_quiescence_retry_base_ns: u64 = 10 * std.time.ns_per_ms;
+const native_backup_quiescence_retry_max_ns: u64 = 100 * std.time.ns_per_ms;
+
+fn nativeBackupQuiescenceRetryDelayNs(attempt: u8) u64 {
+    const shift: u6 = @intCast(@min(attempt, 4));
+    return @min(native_backup_quiescence_retry_base_ns << shift, native_backup_quiescence_retry_max_ns);
+}
+
+test "native backup coordinator quiescence retry is bounded" {
+    try std.testing.expectEqual(10 * std.time.ns_per_ms, nativeBackupQuiescenceRetryDelayNs(0));
+    try std.testing.expectEqual(20 * std.time.ns_per_ms, nativeBackupQuiescenceRetryDelayNs(1));
+    try std.testing.expectEqual(native_backup_quiescence_retry_max_ns, nativeBackupQuiescenceRetryDelayNs(20));
 }
 
 fn retryDeadlineExpired(deadline_ns: ?u64, now_ns: u64) bool {
@@ -22431,6 +22539,7 @@ test "api http missing index classification requires active rebuild evidence" {
         .kind = .dense_vector,
         .repair_degraded = true,
         .index_repair_id = 42,
+        .index_lifecycle_work_class = .repair,
         .index_repair_phase = "terminal",
         .index_repair_status = .failed,
         .index_repair_action_required = true,
@@ -22449,6 +22558,7 @@ test "api http missing index classification requires active rebuild evidence" {
         .name = "semantic_idx",
         .kind = .dense_vector,
         .index_repair_id = 42,
+        .index_lifecycle_work_class = .repair,
         .index_repair_phase = "building",
         .index_repair_automation = "paused",
         .index_repair_status = .paused,
@@ -22470,6 +22580,7 @@ test "api http missing index classification requires active rebuild evidence" {
         .load_error = "CandidateManifestInvalid",
         .repair_degraded = true,
         .index_repair_id = 45,
+        .index_lifecycle_work_class = .repair,
         .index_repair_phase = "terminal",
         .index_repair_status = .failed,
         .index_repair_action_required = true,
@@ -22520,6 +22631,7 @@ test "api http missing index classification requires active rebuild evidence" {
             .kind = .dense_vector,
             .repair_degraded = true,
             .index_repair_id = 44,
+            .index_lifecycle_work_class = .repair,
             .index_repair_phase = "terminal",
             .index_repair_status = .failed,
             .index_repair_action_required = true,
@@ -34816,7 +34928,7 @@ test "api http server create index installs exact visible config and defers lagg
     defer retry_lookup.deinit();
     try std.testing.expectEqual(first_incarnation, coverage_policy.incarnation(retry_lookup.config).?);
     try std.testing.expectEqual(@as(usize, 2), writes.create_calls);
-    try std.testing.expectEqual(@as(usize, 2), writes.enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 0), writes.enqueue_calls);
 
     // Metadata is already committed when local capacity rejects the barrier.
     // Return the created resource and hand convergence to reconciliation;
@@ -34831,11 +34943,11 @@ test "api http server create index installs exact visible config and defers lagg
     defer locally_deferred_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), locally_deferred_resp.status);
     try std.testing.expectEqual(@as(usize, 3), writes.create_calls);
-    try std.testing.expectEqual(@as(usize, 3), writes.enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 1), writes.enqueue_calls);
 
-    // Queue pressure after the local capability barrier is not a false create
-    // failure: durable state and foreground write admission have both won.
-    writes.create_error = null;
+    // Queue pressure after the metadata commit is not a false create failure
+    // when local activation also cannot accept ownership.
+    writes.create_error = error.ResourceBudgetExceeded;
     writes.enqueue_error = error.ResourceBudgetExceeded;
     var enqueue_deferred_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -34845,7 +34957,8 @@ test "api http server create index installs exact visible config and defers lagg
     });
     defer enqueue_deferred_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), enqueue_deferred_resp.status);
-    try std.testing.expectEqual(@as(usize, 4), writes.enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 5), writes.create_calls);
+    try std.testing.expectEqual(@as(usize, 2), writes.enqueue_calls);
 
     // A committed proposal whose read projection is not visible yet returns
     // immediately and relies on the targeted reconciler. In particular, it
@@ -34862,8 +34975,8 @@ test "api http server create index installs exact visible config and defers lagg
     });
     defer lagging_projection_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), lagging_projection_resp.status);
-    try std.testing.expectEqual(@as(usize, 4), writes.create_calls);
-    try std.testing.expectEqual(@as(usize, 5), writes.enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 5), writes.create_calls);
+    try std.testing.expectEqual(@as(usize, 3), writes.enqueue_calls);
 
     // Hosted sources historically exposed create_index without either
     // structural-reconcile callback. A lagging projection must still install
@@ -37139,7 +37252,7 @@ test "api index status refreshes synthetic configured index status from write so
             .indexes = @constCast(synthetic_indexes[0..]),
         },
     }};
-    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefresh(synthetic_statuses[0..]));
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshot(synthetic_statuses[0..]));
 
     const live_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "search",
@@ -37153,7 +37266,7 @@ test "api index status refreshes synthetic configured index status from write so
             .indexes = @constCast(live_indexes[0..]),
         },
     }};
-    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefresh(live_statuses[0..]));
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedOwnerSnapshot(live_statuses[0..]));
 }
 
 test "api index status refreshes writer when read snapshot omits requested index" {
@@ -37172,11 +37285,11 @@ test "api index status refreshes writer when read snapshot omits requested index
         },
     }};
 
-    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(statuses[0..], .{
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(statuses[0..], .{
         .name = "older_idx",
         .identity = null,
     }));
-    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(statuses[0..], .{
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(statuses[0..], .{
         .name = "newer_idx",
         .identity = null,
     }));
@@ -37194,11 +37307,11 @@ test "api index status refreshes writer when read snapshot omits requested index
             .indexes = @constCast((&[_]db_mod.types.DBIndexStats{current})[0..]),
         },
     }};
-    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(current_statuses[0..], .{
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(current_statuses[0..], .{
         .name = "older_idx",
         .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
-    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(current_statuses[0..], .{
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(current_statuses[0..], .{
         .name = "older_idx",
         .identity = .{ .incarnation = 42, .config_hash = 99 },
     }));
@@ -37214,7 +37327,7 @@ test "api index status refreshes writer when read snapshot omits requested index
             .repair_degraded = true,
         },
     }};
-    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(unrelated_incomplete_statuses[0..], .{
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(unrelated_incomplete_statuses[0..], .{
         .name = "older_idx",
         .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
@@ -37234,14 +37347,14 @@ test "api index status refreshes writer when read snapshot omits requested index
             .repair_degraded = true,
         },
     }};
-    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(incomplete_statuses[0..], .{
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(incomplete_statuses[0..], .{
         .name = "older_idx",
         .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
 
     var retained_live_incomplete = incomplete_statuses[0];
     retained_live_incomplete.metadata.source = .live_writer_publish;
-    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(&.{retained_live_incomplete}, .{
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(&.{retained_live_incomplete}, .{
         .name = "older_idx",
         .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
@@ -37259,7 +37372,7 @@ test "api index status refreshes writer when read snapshot omits requested index
             .repair_issue_count = 1,
         },
     }};
-    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(terminal_statuses[0..], .{
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(terminal_statuses[0..], .{
         .name = "older_idx",
         .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
@@ -37276,7 +37389,7 @@ test "api index status refreshes writer when read snapshot omits requested index
             .repair_degraded = true,
         },
     }};
-    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(terminal_phase_statuses[0..], .{
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(terminal_phase_statuses[0..], .{
         .name = "older_idx",
         .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
@@ -37737,9 +37850,17 @@ test "remote runtime status reports replay debt separately from active catch-up"
             .replay_applied_sequence = 225,
             .replay_target_sequence = 300,
             .replay_catch_up_required = true,
+            .lifecycle_work_class = .repair,
             .repair_status = .waiting,
             .repair_active_generation_serviceable = false,
             .dense_vector_projection_pending = true,
+            .embedding_activity_observed = true,
+            .embedding_activity = .{
+                .epoch = 7,
+                .sample_sequence = 11,
+                .phase = .preparing,
+                .chunks_created = 123,
+            },
         }})[0..]),
     };
 
@@ -37762,6 +37883,11 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(@as(u64, 2), index.coverage_terminal_failed_count);
     try std.testing.expectEqual(@as(u64, 0x1234), index.coverage_config_hash);
     try std.testing.expect(index.coverage_summary_ready);
+    try std.testing.expect(index.embedding_activity_observed);
+    try std.testing.expectEqual(@as(u64, 7), index.embedding_activity.epoch);
+    try std.testing.expectEqual(@as(u64, 11), index.embedding_activity.sample_sequence);
+    try std.testing.expectEqual(db_mod.types.EmbeddingActivityPhase.preparing, index.embedding_activity.effectivePhase());
+    try std.testing.expectEqual(@as(u64, 123), index.embedding_activity.chunks_created);
     try std.testing.expectEqual(@as(u64, 40), status.stats.source_doc_count);
     try std.testing.expectEqual(@as(u64, 1), status.stats.doc_identity.namespace_table_id);
     try std.testing.expectEqual(@as(u64, 10), status.stats.doc_identity.namespace_shard_id);

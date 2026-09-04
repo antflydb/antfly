@@ -2626,6 +2626,14 @@ spec:
                               properties:
                                 accelerator:
                                   type: string
+                                inferenceBackend:
+                                  default: auto
+                                  enum:
+                                  - auto
+                                  - cpu
+                                  - cuda
+                                  - pjrt
+                                  type: string
                                 machineType:
                                   type: string
                                 spot:
@@ -2777,6 +2785,20 @@ spec:
                                   format: int32
                                   maximum: 100
                                   minimum: 0
+                                  type: integer
+                              type: object
+                            scaleToZero:
+                              properties:
+                                activationTimeout:
+                                  type: string
+                                enabled:
+                                  default: false
+                                  type: boolean
+                                idleTimeout:
+                                  type: string
+                                wakeReplicas:
+                                  format: int32
+                                  minimum: 1
                                   type: integer
                               type: object
                             tolerations:

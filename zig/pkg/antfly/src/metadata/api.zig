@@ -52,8 +52,8 @@ pub const MetadataStatus = struct {
     /// metadata incarnation. Zero means activation has not committed yet.
     runtime_status_protocol_activated_version: u16 = 0,
     /// Highest version the current metadata membership can safely commit now.
-    /// This may lead activation by one command and lets rolling reporters
-    /// establish their incarnation without speculative registration churn.
+    /// This may lead activation by one command and can be lower than this
+    /// process's current codec during a rolling upgrade.
     runtime_status_protocol_ready_version: u16 = 0,
     /// Highest dense-native storage protocol durably activated by the
     /// metadata state machine after every table-serving store advertised it.

@@ -112,6 +112,7 @@ pub fn applyObservationsOwnedWithRepairStatus(
         const next_group_statuses = try table_manager.cloneGroupStatuses(alloc, observation.group_statuses);
         errdefer table_manager.freeGroupStatuses(alloc, next_group_statuses);
         const next_runtime_statuses = try table_manager.cloneRuntimeGroupStatusReports(alloc, observation.runtime_statuses);
+        stripVolatileEmbeddingActivity(next_runtime_statuses);
         if (!include_repair_status) {
             preserveCommittedRuntimeRepairStatus(records[index].runtime_statuses, next_runtime_statuses);
         }
@@ -135,10 +136,12 @@ fn preserveCommittedRuntimeRepairStatus(
     for (next) |*next_runtime| {
         const prior_runtime = findRuntimeRepairIdentity(existing, next_runtime.*);
         for (next_runtime.indexes) |*next_index| {
+            next_index.lifecycle_work_class = .none;
             next_index.repair_status = null;
             next_index.repair_active_generation_serviceable = false;
             const prior = prior_runtime orelse continue;
             const prior_index = findRuntimeIndexRepairIdentity(prior.indexes, next_index.*) orelse continue;
+            next_index.lifecycle_work_class = prior_index.lifecycle_work_class;
             next_index.repair_status = prior_index.repair_status;
             next_index.repair_active_generation_serviceable =
                 prior_index.repair_status != null and prior_index.repair_active_generation_serviceable;
@@ -215,7 +218,7 @@ pub fn observationChangesRecordWithRepairStatus(
         return false;
     }
 
-    // Until the v13 codec is activated, absence or an incomplete replacement
+    // Until the current profile is activated, absence or an incomplete replacement
     // identity is not authoritative for an already-committed repair identity.
     // A legacy or transient heartbeat can omit an index (or its whole runtime
     // group), and replacing the owned snapshot in that case would erase the
@@ -420,6 +423,30 @@ fn runtimeStatusesEqual(
     return true;
 }
 
+/// Compare the durable projection carried by two reports. Volatile embedding
+/// activity, its protocol version, and the report generation itself are
+/// intentionally excluded; callers use this result to decide whether a new
+/// durable generation is warranted.
+pub fn reportsDurablyEqual(
+    lhs: table_manager.StoreStatusReport,
+    rhs: table_manager.StoreStatusReport,
+) bool {
+    return lhs.store_id == rhs.store_id and
+        lhs.reporter_incarnation == rhs.reporter_incarnation and
+        lhs.artifact_sources_protocol_version == rhs.artifact_sources_protocol_version and
+        lhs.live == rhs.live and
+        std.mem.eql(u8, lhs.health_class, rhs.health_class) and
+        lhs.capacity_bytes == rhs.capacity_bytes and
+        lhs.available_bytes == rhs.available_bytes and
+        lhs.lease_pressure == rhs.lease_pressure and
+        lhs.read_load == rhs.read_load and
+        lhs.write_load == rhs.write_load and
+        lhs.active_backfills == rhs.active_backfills and
+        lhs.backfill_progress_millis == rhs.backfill_progress_millis and
+        groupStatusesEqual(lhs.group_statuses, rhs.group_statuses) and
+        runtimeStatusesEqual(lhs.runtime_statuses, rhs.runtime_statuses, true);
+}
+
 fn runtimeStatusEqual(
     lhs: table_manager.RuntimeGroupStatusReport,
     rhs: table_manager.RuntimeGroupStatusReport,
@@ -436,6 +463,8 @@ fn runtimeStatusEqual(
         lhs.topology_generation != rhs.topology_generation or
         lhs.lsm_root_generation != rhs.lsm_root_generation or
         lhs.status_generation != rhs.status_generation or
+        lhs.target_observation_revision != rhs.target_observation_revision or
+        lhs.target_observation_complete != rhs.target_observation_complete or
         lhs.doc_count != rhs.doc_count or
         lhs.disk_bytes != rhs.disk_bytes or
         lhs.disk_bytes_known != rhs.disk_bytes_known or
@@ -459,6 +488,9 @@ fn runtimeStatusEqual(
             left.edge_count != right.edge_count or
             left.node_count != right.node_count or
             left.root_node != right.root_node or
+            left.publication_target_count != right.publication_target_count or
+            left.publication_target_ready != right.publication_target_ready or
+            left.serving_snapshot_ready != right.serving_snapshot_ready or
             left.coverage_produced_count != right.coverage_produced_count or
             left.coverage_skipped_count != right.coverage_skipped_count or
             left.coverage_terminal_failed_count != right.coverage_terminal_failed_count or
@@ -474,13 +506,23 @@ fn runtimeStatusEqual(
             left.dense_vector_projection_pending != right.dense_vector_projection_pending or
             left.dense_native_storage_phase != right.dense_native_storage_phase or
             !runtimeIndexSourceReplayEqual(left.source_replay, right.source_replay) or
-            (include_repair_status and (left.repair_status != right.repair_status or
+            (include_repair_status and (left.lifecycle_work_class != right.lifecycle_work_class or
+                left.repair_status != right.repair_status or
                 left.repair_active_generation_serviceable != right.repair_active_generation_serviceable)))
         {
             return false;
         }
     }
     return true;
+}
+
+fn stripVolatileEmbeddingActivity(statuses: []table_manager.RuntimeGroupStatusReport) void {
+    for (statuses) |*status| {
+        for (status.indexes) |*index| {
+            index.embedding_activity_observed = false;
+            index.embedding_activity = .{};
+        }
+    }
 }
 
 fn runtimeIndexSourceReplayEqual(
@@ -760,6 +802,7 @@ test "store observer can ignore unactivated repair fields without hiding other c
         .doc_count = 10,
     }};
     var observed_indexes = existing_indexes;
+    observed_indexes[0].lifecycle_work_class = .repair;
     observed_indexes[0].repair_status = .rebuilding;
     observed_indexes[0].repair_active_generation_serviceable = true;
     var existing_runtime = [_]table_manager.RuntimeGroupStatusReport{.{
@@ -819,6 +862,51 @@ test "store observer publishes projection-only readiness transitions" {
     try std.testing.expect(observationChangesRecord(existing, observation));
 }
 
+test "store observer durable report equality excludes only volatile activity" {
+    var previous_indexes = [_]table_manager.RuntimeIndexStatusReport{.{
+        .name = "semantic",
+        .kind = "dense_vector",
+        .doc_count = 12,
+        .coverage_generation = 7,
+        .coverage_config_hash = 9,
+        .embedding_activity_observed = true,
+        .embedding_activity = .{
+            .epoch = 3,
+            .sample_sequence = 4,
+            .phase = .embedding,
+            .embeddings_computed = 10,
+        },
+    }};
+    var current_indexes = previous_indexes;
+    current_indexes[0].embedding_activity.sample_sequence = 5;
+    current_indexes[0].embedding_activity.embeddings_computed = 20;
+    var previous_runtime = [_]table_manager.RuntimeGroupStatusReport{.{
+        .group_id = 2,
+        .indexes = previous_indexes[0..],
+    }};
+    var current_runtime = previous_runtime;
+    current_runtime[0].indexes = current_indexes[0..];
+    const previous: table_manager.StoreStatusReport = .{
+        .store_id = 3,
+        .reporter_incarnation = 4,
+        .status_generation = 10,
+        .embedding_activity_protocol_version = table_manager.embedding_activity_protocol_version,
+        .embedding_activity_sequence = 8,
+        .runtime_statuses = previous_runtime[0..],
+    };
+    var current = previous;
+    current.status_generation = 11;
+    current.embedding_activity_sequence = 9;
+    current.runtime_statuses = current_runtime[0..];
+
+    try std.testing.expect(reportsDurablyEqual(previous, current));
+    current_indexes[0].embedding_activity_observed = false;
+    current_indexes[0].embedding_activity = .{};
+    try std.testing.expect(reportsDurablyEqual(previous, current));
+    current_indexes[0].doc_count += 1;
+    try std.testing.expect(!reportsDurablyEqual(previous, current));
+}
+
 test "store observer fences repair transitions by registered reporter incarnation and generation" {
     var existing_indexes = [_]table_manager.RuntimeIndexStatusReport{.{
         .name = "visual_idx",
@@ -826,6 +914,7 @@ test "store observer fences repair transitions by registered reporter incarnatio
         .coverage_generation = 7,
         .coverage_config_hash = 8,
         .coverage_identity_ready = true,
+        .lifecycle_work_class = .repair,
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
     }};
@@ -892,6 +981,7 @@ test "store observer preserves committed repair facts while capability is unknow
         .coverage_generation = 7,
         .coverage_config_hash = 8,
         .coverage_identity_ready = true,
+        .lifecycle_work_class = .repair,
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
     }};
@@ -916,6 +1006,7 @@ test "store observer preserves committed repair facts while capability is unknow
 
     var observed_indexes = existing_indexes;
     observed_indexes[0].doc_count = 11;
+    observed_indexes[0].lifecycle_work_class = .repair;
     observed_indexes[0].repair_status = .failed;
     observed_indexes[0].repair_active_generation_serviceable = false;
     var observed_runtime = existing_runtime;
