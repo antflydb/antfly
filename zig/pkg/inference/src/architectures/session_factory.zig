@@ -3976,6 +3976,7 @@ test "Metal JIT scope discovers quantized weights in a secondary GGUF store" {
             .loadTensorRef = @ptrCast(&loadTensorRefImpl),
             .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
             .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
+            .preserveFileCacheOnDeinit = @ptrCast(&preserveFileCacheOnDeinitImpl),
             .ggufFile = @ptrCast(&ggufFileImpl),
             .deinit = @ptrCast(&deinitSelf),
         };
@@ -4026,6 +4027,8 @@ test "Metal JIT scope discovers quantized weights in a secondary GGUF store" {
         }
 
         fn discardTensorFileCacheImpl(_: *@This(), _: []const u8) void {}
+
+        fn preserveFileCacheOnDeinitImpl(_: *@This()) void {}
 
         fn ggufFileImpl(self: *@This()) ?*const gguf_mod.format.File {
             return &self.encoder_file;
