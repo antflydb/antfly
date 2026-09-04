@@ -2613,6 +2613,7 @@ const ExperimentalPostingReadState = struct {
     segments: []vectorindex_posting_segment.VerifiedReader,
     vector_directory: ?vectorindex_hbc_vector_directory.Reader = null,
     quantized_directory: ?vectorindex_quantized_directory.VerifiedReader = null,
+    scan_admission: vectorindex_quantized_directory.AdmissionStats = .{},
     // Full WAL records borrow directly from this one retained buffer. Only
     // decoded replacement patches allocate individual owned values, avoiding
     // a second full copy of the bounded WAL tail after restart.
@@ -2741,6 +2742,44 @@ const ExperimentalPostingReadState = struct {
         const view = (try directory.get(posting_id)) orelse return null;
         if (view.member_ids.len != view.count) return null;
         return view;
+    }
+
+    fn rebuildScanAdmission(self: *ExperimentalPostingReadState, dims: usize) !void {
+        var admission = if (self.quantized_directory) |*directory|
+            directory.admissionStats()
+        else
+            vectorindex_quantized_directory.AdmissionStats{};
+
+        // Immutable delta indexes and the recovered WAL are already resident.
+        // Resolve only leaf bodies that can shadow the complete base; never
+        // walk or checksum unrelated vector metadata payloads on restart.
+        var changed = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer changed.deinit(self.alloc);
+        for (self.segments[1..]) |*segment| {
+            var keys = segment.keys();
+            while (try keys.next()) |key| switch (key.kind) {
+                .base, .base_patch, .base_tombstone => try changed.put(self.alloc, key.id, {}),
+                else => {},
+            };
+        }
+        var materialized = self.materialized.keyIterator();
+        while (materialized.next()) |key| {
+            if (@as(u8, @truncate(key.*)) == @intFromEnum(vectorindex_posting_wal.RecordKind.base)) {
+                try changed.put(self.alloc, experimentalPostingValueKeyId(key.*), {});
+            }
+        }
+        var ids = changed.keyIterator();
+        while (ids.next()) |posting_id| {
+            const packed_node = self.value(posting_id.*, .base) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            } orelse continue;
+            const node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
+            if (!node.header.is_leaf) continue;
+            if (node.ids_bytes.len % @sizeOf(u64) != 0) return error.Corrupted;
+            admission.observeFallbackLeaf(node.ids_bytes.len / @sizeOf(u64), dims);
+        }
+        self.scan_admission = admission;
     }
 
     fn patchCacheShard(key: u128) usize {
@@ -3020,6 +3059,7 @@ const ExperimentalPostingReadGeneration = struct {
     /// derived batches may commit at the same source sequence.
     wal_generation: std.atomic.Value(u64),
     wal_committed_bytes: std.atomic.Value(u64),
+    scan_admission: vectorindex_quantized_directory.AdmissionStats = .{},
     root: ?*ExperimentalPostingReadState = null,
     parent: ?*ExperimentalPostingReadGeneration = null,
     values: std.AutoHashMapUnmanaged(u128, ?[]u8) = .empty,
@@ -3031,6 +3071,7 @@ const ExperimentalPostingReadGeneration = struct {
             .covered_source_sequence = .init(state.covered_source_sequence),
             .wal_generation = .init(state.wal_generation),
             .wal_committed_bytes = .init(state.wal_committed_bytes),
+            .scan_admission = state.scan_admission,
             .root = state,
         };
         return generation;
@@ -3050,6 +3091,7 @@ const ExperimentalPostingReadGeneration = struct {
             .covered_source_sequence = .init(covered_source_sequence),
             .wal_generation = .init(wal_generation),
             .wal_committed_bytes = .init(wal_committed_bytes),
+            .scan_admission = parent.scan_admission,
             .parent = parent,
         };
         parent.retain();
@@ -3113,6 +3155,17 @@ const ExperimentalPostingReadGeneration = struct {
         const result = try self.values.getOrPut(self.alloc, experimentalPostingValueKey(posting_id, kind));
         std.debug.assert(!result.found_existing);
         result.value_ptr.* = owned;
+    }
+
+    fn observeChangedLeafAdmission(self: *ExperimentalPostingReadGeneration, posting_id: u64, dims: usize) !void {
+        const packed_node = self.value(posting_id, .base) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        } orelse return;
+        const node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
+        if (!node.header.is_leaf) return;
+        if (node.ids_bytes.len % @sizeOf(u64) != 0) return error.Corrupted;
+        self.scan_admission.observeFallbackLeaf(node.ids_bytes.len / @sizeOf(u64), dims);
     }
 
     fn value(self: *ExperimentalPostingReadGeneration, posting_id: u64, kind: vectorindex_posting_wal.RecordKind) !?[]const u8 {
@@ -3932,6 +3985,9 @@ pub const HBCIndex = struct {
     dense_search_scan_vectors_per_leaf_high_water: AtomicU64 = .init(0),
     dense_search_scan_bytes_per_leaf_ewma: AtomicU64 = .init(0),
     dense_search_scan_bytes_per_leaf_high_water: AtomicU64 = .init(0),
+    dense_search_scan_vectors_per_leaf_floor: AtomicU64 = .init(0),
+    dense_search_unfiltered_bytes_per_leaf_floor: AtomicU64 = .init(0),
+    dense_search_filtered_bytes_per_leaf_floor: AtomicU64 = .init(0),
     write_profile: WriteProfile = .{},
     external_vector_ctx: ?*anyopaque = null,
     external_vector_loader: ?ExternalVectorLoader = null,
@@ -4089,8 +4145,9 @@ pub const HBCIndex = struct {
         exact_observations: u64 = 0,
         hbc_observations: u64 = 0,
         /// Adaptive layout feedback for node-wide search admission.
-        /// The high water reacts immediately to skew and decays slowly after
-        /// compaction repairs oversized postings.
+        /// The observed high water is monotonic for the process lifetime.
+        /// Durable generation floors, rather than this telemetry, govern
+        /// native serving admission and are restored independently on reopen.
         scan_vectors_per_leaf_ewma: u64 = 0,
         scan_vectors_per_leaf_high_water: u64 = 0,
         scan_bytes_per_leaf_ewma: u64 = 0,
@@ -6828,11 +6885,35 @@ pub const HBCIndex = struct {
         if (old) |generation| generation.release();
     }
 
+    fn raiseAtomicFloor(slot: *AtomicU64, value: u64) void {
+        var current = slot.load(.acquire);
+        while (value > current) {
+            if (slot.cmpxchgWeak(current, value, .release, .acquire)) |observed|
+                current = observed
+            else
+                return;
+        }
+    }
+
+    fn publishDenseScanAdmissionFloor(
+        self: *HBCIndex,
+        admission: vectorindex_quantized_directory.AdmissionStats,
+    ) void {
+        // Serving admission precedes generation acquisition. Floors therefore
+        // remain monotonic for this process so a query admitted against an old
+        // leased generation cannot race a lower replacement. Restart restores
+        // the exact current-generation floor from its authenticated header.
+        raiseAtomicFloor(&self.dense_search_scan_vectors_per_leaf_floor, admission.max_leaf_vectors);
+        raiseAtomicFloor(&self.dense_search_unfiltered_bytes_per_leaf_floor, admission.max_unfiltered_scan_bytes);
+        raiseAtomicFloor(&self.dense_search_filtered_bytes_per_leaf_floor, admission.max_filtered_scan_bytes);
+    }
+
     fn installExperimentalPostingReadGeneration(
         self: *HBCIndex,
         generation: *ExperimentalPostingReadGeneration,
     ) void {
         lockAtomic(&self.experimental_posting_read_generation_mu);
+        self.publishDenseScanAdmissionFloor(generation.scan_admission);
         const old = self.experimental_posting_read_generation;
         self.experimental_posting_read_generation = generation;
         self.experimental_posting_reads_enabled.store(true, .release);
@@ -7149,6 +7230,7 @@ pub const HBCIndex = struct {
             source.wal_committed_bytes.load(.acquire),
         );
         errdefer collapsed.release();
+        collapsed.scan_admission = source.scan_admission;
         try collapsed.values.ensureTotalCapacity(self.alloc, latest.count());
         var it = latest.iterator();
         while (it.next()) |entry| {
@@ -7274,6 +7356,15 @@ pub const HBCIndex = struct {
                         result.value_ptr.* = captured.*;
                         captured.* = null;
                     }
+                    for (touched_keys) |key| {
+                        if (try experimentalPostingValueKeyKind(key) == .base) {
+                            try current.observeChangedLeafAdmission(
+                                experimentalPostingValueKeyId(key),
+                                self.metadata.dims,
+                            );
+                        }
+                    }
+                    self.publishDenseScanAdmissionFloor(current.scan_admission);
                     current.advanceDurableBoundary(
                         covered_source_sequence,
                         durable_wal_generation,
@@ -7307,6 +7398,14 @@ pub const HBCIndex = struct {
             // of briefly holding a second full posting copy at publication.
             result.value_ptr.* = captured.*;
             captured.* = null;
+        }
+        for (touched_keys) |key| {
+            if (try experimentalPostingValueKeyKind(key) == .base) {
+                try generation.observeChangedLeafAdmission(
+                    experimentalPostingValueKeyId(key),
+                    self.metadata.dims,
+                );
+            }
         }
         self.installExperimentalPostingReadGeneration(generation);
     }
@@ -8746,6 +8845,7 @@ pub const HBCIndex = struct {
             if (try experimentalPostingCheckpointValue(&latest, root, node_id, .posting_state)) |posting_state| {
                 try writer.appendValueBorrowedAt(node_id, .posting_state, covered_source_sequence, posting_state);
             }
+            var quantized_directory_entry_written = false;
             if (try experimentalPostingCheckpointValue(&latest, root, node_id, .quantized_checkpoint)) |quantized| {
                 if (node_id == metadata.root_node) {
                     try writer.appendValueBorrowedAt(node_id, .quantized_checkpoint, covered_source_sequence, quantized);
@@ -8761,6 +8861,7 @@ pub const HBCIndex = struct {
                         if (decoded_node.header.is_leaf) decoded_node.ids_bytes else &.{},
                         leaf_projections,
                     );
+                    quantized_directory_entry_written = true;
                 }
             } else if (node_id != metadata.root_node) {
                 if (try generation.quantizedViewIfUnmodified(node_id)) |view| {
@@ -8771,7 +8872,11 @@ pub const HBCIndex = struct {
                         if (decoded_node.header.is_leaf) decoded_node.ids_bytes else &.{},
                         leaf_projections,
                     );
+                    quantized_directory_entry_written = true;
                 }
+            }
+            if (decoded_node.header.is_leaf and decoded_node.ids_bytes.len != 0 and !quantized_directory_entry_written) {
+                quantized_directory.observeFallbackLeaf(decoded_node.ids_bytes.len / @sizeOf(u64));
             }
         }
 
@@ -9047,6 +9152,7 @@ pub const HBCIndex = struct {
                 )
             else
                 &.{};
+            var quantized_directory_entry_written = false;
             if (try experimentalPostingStreamingCheckpointValue(
                 alloc,
                 &latest,
@@ -9070,6 +9176,7 @@ pub const HBCIndex = struct {
                     if (decoded_node.header.is_leaf) decoded_node.ids_bytes else &.{},
                     leaf_projections,
                 );
+                quantized_directory_entry_written = true;
                 base_reclaimer.observe(quantized);
             } else if (cold_base_reader != null and
                 quantized_file_offset != null and
@@ -9091,6 +9198,7 @@ pub const HBCIndex = struct {
                     if (decoded_node.header.is_leaf) decoded_node.ids_bytes else &.{},
                     leaf_projections,
                 );
+                quantized_directory_entry_written = true;
             } else if (try generation.quantizedViewIfUnmodified(node_id)) |view| {
                 const borrowed_quantized = view.asProto();
                 try quantized_directory.appendWithLeafPlanes(
@@ -9100,7 +9208,11 @@ pub const HBCIndex = struct {
                     if (decoded_node.header.is_leaf) decoded_node.ids_bytes else &.{},
                     leaf_projections,
                 );
+                quantized_directory_entry_written = true;
                 base_reclaimer.observeQuantizedView(view);
+            }
+            if (decoded_node.header.is_leaf and decoded_node.ids_bytes.len != 0 and !quantized_directory_entry_written) {
+                quantized_directory.observeFallbackLeaf(decoded_node.ids_bytes.len / @sizeOf(u64));
             }
             base_reclaimer.observe(packed_node);
         }
@@ -9768,6 +9880,7 @@ pub const HBCIndex = struct {
         var state_initialized = true;
         errdefer if (state_initialized) state.deinit();
         try state.materializeWal(&wal);
+        try state.rebuildScanAdmission(self.metadata.dims);
         // Materialized full values borrow from the recovered byte buffer; the
         // replay frame index itself is no longer needed after activation.
         state.wal_bytes = wal.bytes;
@@ -14809,15 +14922,19 @@ pub const HBCIndex = struct {
             std.math.divCeil(u64, node_count - 1, branching_factor) catch unreachable;
         const estimated_leaf_count = @max(node_count -| estimated_internal_nodes, 1);
         const mean_leaf_occupancy = std.math.divCeil(u64, active_count, estimated_leaf_count) catch unreachable;
-        const learned_occupancy = @max(
-            self.dense_search_scan_vectors_per_leaf_high_water.load(.acquire),
-            self.dense_search_scan_vectors_per_leaf_ewma.load(.acquire),
-        );
-        // `leaf_size` protects the first query after open; observed high-water
-        // corrects layouts containing overflow or otherwise skewed postings.
+        const persisted_occupancy = self.dense_search_scan_vectors_per_leaf_floor.load(.acquire);
+        const learned_occupancy = if (persisted_occupancy == 0)
+            @max(
+                self.dense_search_scan_vectors_per_leaf_high_water.load(.acquire),
+                self.dense_search_scan_vectors_per_leaf_ewma.load(.acquire),
+            )
+        else
+            0;
+        // `leaf_size` protects legacy/empty indexes. Native generations restore
+        // their authenticated maximum before they become query-visible.
         const admitted_leaf_occupancy = @max(
             mean_leaf_occupancy,
-            @max(@as(u64, self.config.leaf_size), learned_occupancy),
+            @max(@as(u64, self.config.leaf_size), @max(persisted_occupancy, learned_occupancy)),
         );
         const candidate_count = @min(active_count, search_width *| admitted_leaf_occupancy);
         const dimensions: u64 = @intCast(@max(self.config.dims, 1));
@@ -14830,14 +14947,24 @@ pub const HBCIndex = struct {
         else
             dimensions *| @sizeOf(f32);
         const baseline_scan_bytes = candidate_count *| bytes_per_candidate;
-        const learned_leaf_bytes = @max(
-            self.dense_search_scan_bytes_per_leaf_high_water.load(.acquire),
-            self.dense_search_scan_bytes_per_leaf_ewma.load(.acquire),
-        );
-        const learned_scan_bytes = search_width *| learned_leaf_bytes;
+        const needs_projection_scan = req.filter_prefix.len != 0 or
+            req.filter_ids.len != 0 or req.exclude_ids.len != 0 or
+            req.distance_over != null or req.distance_under != null;
+        const persisted_leaf_bytes = if (needs_projection_scan)
+            self.dense_search_filtered_bytes_per_leaf_floor.load(.acquire)
+        else
+            self.dense_search_unfiltered_bytes_per_leaf_floor.load(.acquire);
+        const learned_leaf_bytes = if (persisted_leaf_bytes == 0)
+            @max(
+                self.dense_search_scan_bytes_per_leaf_high_water.load(.acquire),
+                self.dense_search_scan_bytes_per_leaf_ewma.load(.acquire),
+            )
+        else
+            0;
+        const layout_scan_bytes = search_width *| @max(persisted_leaf_bytes, learned_leaf_bytes);
         const max_possible_scan_bytes = active_count *| dimensions *| @sizeOf(f32);
         const estimated_scan_bytes = @max(
-            @min(@max(baseline_scan_bytes, learned_scan_bytes), max_possible_scan_bytes),
+            @min(@max(baseline_scan_bytes, layout_scan_bytes), max_possible_scan_bytes),
             1,
         );
         const cancellation: ?resource_manager_mod.DenseSearchCancellation = if (req.cancellation) |token|
@@ -14938,11 +15065,7 @@ pub const HBCIndex = struct {
                 state.scan_vectors_per_leaf_ewma,
                 sample,
             );
-            const previous_high_water = state.scan_vectors_per_leaf_high_water;
-            state.scan_vectors_per_leaf_high_water = if (sample >= previous_high_water)
-                sample
-            else
-                @max(sample, previous_high_water -| @max(previous_high_water / 64, 1));
+            state.scan_vectors_per_leaf_high_water = @max(state.scan_vectors_per_leaf_high_water, sample);
         }
         if (profile.max_leaf_scan_bytes > 0) {
             const sample = profile.max_leaf_scan_bytes;
@@ -14950,11 +15073,7 @@ pub const HBCIndex = struct {
                 state.scan_bytes_per_leaf_ewma,
                 sample,
             );
-            const previous_high_water = state.scan_bytes_per_leaf_high_water;
-            state.scan_bytes_per_leaf_high_water = if (sample >= previous_high_water)
-                sample
-            else
-                @max(sample, previous_high_water -| @max(previous_high_water / 64, 1));
+            state.scan_bytes_per_leaf_high_water = @max(state.scan_bytes_per_leaf_high_water, sample);
         }
         // Serving admission reads lock-free snapshots; serialized route-model
         // updates publish all four values only after completing the sample.
@@ -20323,6 +20442,21 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
         try reopened.activateExperimentalPostingReads(3);
         try std.testing.expect(reopened.experimentalPostingReadsEnabled());
         try std.testing.expect(reopened.experimental_posting_read_generation.?.root.?.retained_segments[0].isMapped());
+        // The compact directory header restores conservative query admission
+        // immediately on reopen. Root-only trees use the float32 fallback
+        // bound because they have no posting-local projection plane.
+        try std.testing.expectEqual(
+            @as(u64, 2),
+            reopened.dense_search_scan_vectors_per_leaf_floor.load(.acquire),
+        );
+        try std.testing.expectEqual(
+            @as(u64, 16),
+            reopened.dense_search_unfiltered_bytes_per_leaf_floor.load(.acquire),
+        );
+        try std.testing.expectEqual(
+            @as(u64, 16),
+            reopened.dense_search_filtered_bytes_per_leaf_floor.load(.acquire),
+        );
 
         var results = try reopened.search(&[_]f32{ 1.0, 0.0 }, 1);
         defer results.deinit();

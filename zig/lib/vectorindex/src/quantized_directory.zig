@@ -25,9 +25,10 @@ const hbc_runtime = @import("hbc_runtime.zig");
 
 const Allocator = std.mem.Allocator;
 const magic: [4]u8 = "AFQD".*;
-const version: u16 = 5;
+const version: u16 = 6;
 const min_supported_version: u16 = 1;
 const header_size: usize = 32;
+const current_header_size: usize = 64;
 const entry_header_size: usize = 32;
 const index_entry_size: usize = 20;
 const entry_alignment: usize = 64;
@@ -35,6 +36,52 @@ const entry_flag_member_ids: u32 = 1 << 0;
 const entry_flag_projection_plane: u32 = 1 << 1;
 const entry_flag_residual_locations: u32 = 1 << 2;
 const known_entry_flags: u32 = entry_flag_member_ids | entry_flag_projection_plane | entry_flag_residual_locations;
+
+/// Conservative per-generation serving costs. These are authenticated in the
+/// compact directory header, so restart can restore admission without touching
+/// one payload page per leaf. Online overlays may only raise these values until
+/// the next complete generation is published.
+pub const AdmissionStats = struct {
+    max_leaf_vectors: u64 = 0,
+    max_unfiltered_scan_bytes: u64 = 0,
+    max_filtered_scan_bytes: u64 = 0,
+
+    pub fn merge(self: *AdmissionStats, other: AdmissionStats) void {
+        self.max_leaf_vectors = @max(self.max_leaf_vectors, other.max_leaf_vectors);
+        self.max_unfiltered_scan_bytes = @max(self.max_unfiltered_scan_bytes, other.max_unfiltered_scan_bytes);
+        self.max_filtered_scan_bytes = @max(self.max_filtered_scan_bytes, other.max_filtered_scan_bytes);
+    }
+
+    pub fn observeFallbackLeaf(self: *AdmissionStats, count: usize, dims: usize) void {
+        const vectors: u64 = @intCast(count);
+        const scan_bytes = vectors *| @as(u64, @intCast(dims)) *| @sizeOf(f32);
+        self.max_leaf_vectors = @max(self.max_leaf_vectors, vectors);
+        self.max_unfiltered_scan_bytes = @max(self.max_unfiltered_scan_bytes, scan_bytes);
+        self.max_filtered_scan_bytes = @max(self.max_filtered_scan_bytes, scan_bytes);
+    }
+};
+
+fn encodeAdmissionStats(header: *[current_header_size]u8, stats: AdmissionStats) void {
+    writeU64(header, 32, stats.max_leaf_vectors);
+    writeU64(header, 40, stats.max_unfiltered_scan_bytes);
+    writeU64(header, 48, stats.max_filtered_scan_bytes);
+    writeU32(header, 56, std.hash.Crc32.hash(header[0..56]));
+    writeU32(header, 60, 0);
+}
+
+fn decodeAdmissionStats(data: []const u8, encoded_version: u16) !AdmissionStats {
+    if (encoded_version < 6) return .{};
+    if (data.len < current_header_size or readU32(data, 60) != 0 or
+        readU32(data, 56) != std.hash.Crc32.hash(data[0..56]))
+    {
+        return error.QuantizedDirectoryAdmissionChecksumMismatch;
+    }
+    return .{
+        .max_leaf_vectors = readU64(data, 32),
+        .max_unfiltered_scan_bytes = readU64(data, 40),
+        .max_filtered_scan_bytes = readU64(data, 48),
+    };
+}
 
 fn appendZeros(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), count: usize) !void {
     try out.appendNTimes(alloc, 0, count);
@@ -96,13 +143,14 @@ pub const Writer = struct {
     out: std.ArrayListUnmanaged(u8) = .empty,
     posting_ids: std.ArrayListUnmanaged(u64) = .empty,
     offsets: std.ArrayListUnmanaged(u64) = .empty,
+    admission_stats: AdmissionStats = .{},
     finished: bool = false,
 
     pub fn init(alloc: Allocator, dims: usize, metric: u8) !Writer {
         if (dims == 0 or dims > std.math.maxInt(u32)) return error.InvalidQuantizedDirectoryConfig;
         var self: Writer = .{ .alloc = alloc, .dims = dims, .metric = metric };
         errdefer self.deinit();
-        try appendZeros(alloc, &self.out, header_size);
+        try appendZeros(alloc, &self.out, current_header_size);
         return self;
     }
 
@@ -185,6 +233,20 @@ pub const Writer = struct {
             if (posting_id <= previous) return error.UnsortedQuantizedDirectory;
         }
 
+        if (member_id_bytes.len != 0) {
+            const vectors: u64 = @intCast(count);
+            const quantized_bytes = vectors *| @as(u64, @intCast(width)) *| @sizeOf(u64);
+            const filtered_bytes = if (projections.len != 0)
+                vectors *| @as(u64, @intCast(self.dims)) *| @sizeOf(f16)
+            else
+                quantized_bytes;
+            self.admission_stats.merge(.{
+                .max_leaf_vectors = vectors,
+                .max_unfiltered_scan_bytes = quantized_bytes,
+                .max_filtered_scan_bytes = filtered_bytes,
+            });
+        }
+
         try alignOutput(self.alloc, &self.out, entry_alignment);
         const entry_offset = self.out.items.len;
         try self.posting_ids.append(self.alloc, posting_id);
@@ -243,6 +305,10 @@ pub const Writer = struct {
         }
     }
 
+    pub fn observeFallbackLeaf(self: *Writer, count: usize) void {
+        self.admission_stats.observeFallbackLeaf(count, self.dims);
+    }
+
     pub fn build(self: *Writer) ![]u8 {
         if (self.finished) return error.QuantizedDirectoryWriterFinished;
         self.finished = true;
@@ -265,6 +331,7 @@ pub const Writer = struct {
         writeU32(self.out.items, 12, std.hash.Crc32.hash(self.out.items[index_offset..]));
         writeU64(self.out.items, 16, @intCast(self.posting_ids.items.len));
         writeU64(self.out.items, 24, @intCast(index_offset));
+        encodeAdmissionStats(self.out.items[0..current_header_size], self.admission_stats);
         const owned = try self.out.toOwnedSlice(self.alloc);
         self.out = .empty;
         return owned;
@@ -283,6 +350,7 @@ pub const StreamingWriter = struct {
     posting_ids: std.ArrayListUnmanaged(u64) = .empty,
     offsets: std.ArrayListUnmanaged(u64) = .empty,
     checksums: std.ArrayListUnmanaged(u32) = .empty,
+    admission_stats: AdmissionStats = .{},
     active_crc: ?std.hash.Crc32 = null,
     finished: bool = false,
 
@@ -298,7 +366,7 @@ pub const StreamingWriter = struct {
     pub fn init(alloc: Allocator, sink: anytype, dims: usize, metric: u8) !StreamingWriter {
         if (dims == 0 or dims > std.math.maxInt(u32)) return error.InvalidQuantizedDirectoryConfig;
         const base_offset = sink.len();
-        var zeros: [header_size]u8 = @splat(0);
+        var zeros: [current_header_size]u8 = @splat(0);
         try sink.appendSlice(&zeros);
         return .{
             .alloc = alloc,
@@ -371,6 +439,20 @@ pub const StreamingWriter = struct {
             if (posting_id <= previous) return error.UnsortedQuantizedDirectory;
         }
 
+        if (member_id_bytes.len != 0) {
+            const vectors: u64 = @intCast(count);
+            const quantized_bytes = vectors *| @as(u64, @intCast(width)) *| @sizeOf(u64);
+            const filtered_bytes = if (projections.len != 0)
+                vectors *| @as(u64, @intCast(self.dims)) *| @sizeOf(f16)
+            else
+                quantized_bytes;
+            self.admission_stats.merge(.{
+                .max_leaf_vectors = vectors,
+                .max_unfiltered_scan_bytes = quantized_bytes,
+                .max_filtered_scan_bytes = filtered_bytes,
+            });
+        }
+
         try self.beginEntry(sink, posting_id);
         var header: [entry_header_size]u8 = @splat(0);
         writeU64(&header, 0, posting_id);
@@ -419,6 +501,10 @@ pub const StreamingWriter = struct {
         }
     }
 
+    pub fn observeFallbackLeaf(self: *StreamingWriter, count: usize) void {
+        self.admission_stats.observeFallbackLeaf(count, self.dims);
+    }
+
     pub fn finish(self: *StreamingWriter, sink: anytype) !Finish {
         if (self.finished) return error.QuantizedDirectoryWriterFinished;
         self.finished = true;
@@ -433,7 +519,7 @@ pub const StreamingWriter = struct {
             try sink.appendSlice(&encoded);
             index_crc.update(&encoded);
         }
-        var header: [header_size]u8 = @splat(0);
+        var header: [current_header_size]u8 = @splat(0);
         @memcpy(header[0..4], &magic);
         writeU16(&header, 4, version);
         header[6] = self.metric;
@@ -441,6 +527,7 @@ pub const StreamingWriter = struct {
         writeU32(&header, 12, index_crc.final());
         writeU64(&header, 16, @intCast(self.posting_ids.items.len));
         writeU64(&header, 24, @intCast(index_offset));
+        encodeAdmissionStats(&header, self.admission_stats);
         try sink.writeAt(self.base_offset, &header);
         return .{
             .offset = self.base_offset,
@@ -546,6 +633,7 @@ pub const Reader = struct {
     metric: u8,
     posting_count: usize,
     index_offset: usize,
+    admission_stats: AdmissionStats,
 
     pub fn init(data: []const u8) !Reader {
         if (data.len < header_size or !std.mem.eql(u8, data[0..4], &magic)) return error.InvalidQuantizedDirectory;
@@ -557,7 +645,8 @@ pub const Reader = struct {
         const posting_count = std.math.cast(usize, readU64(data, 16)) orelse return error.QuantizedDirectoryTooLarge;
         const index_offset = std.math.cast(usize, readU64(data, 24)) orelse return error.QuantizedDirectoryTooLarge;
         const index_bytes = std.math.mul(usize, posting_count, index_entry_size) catch return error.InvalidQuantizedDirectory;
-        if (dims == 0 or index_offset < header_size or index_offset > data.len or index_bytes != data.len - index_offset) {
+        const required_header_size: usize = if (encoded_version >= 6) current_header_size else header_size;
+        if (dims == 0 or index_offset < required_header_size or index_offset > data.len or index_bytes != data.len - index_offset) {
             return error.InvalidQuantizedDirectory;
         }
         if (std.hash.Crc32.hash(data[index_offset..]) != readU32(data, 12)) {
@@ -585,7 +674,12 @@ pub const Reader = struct {
             .metric = data[6],
             .posting_count = posting_count,
             .index_offset = index_offset,
+            .admission_stats = try decodeAdmissionStats(data, encoded_version),
         };
+    }
+
+    pub fn admissionStats(self: Reader) AdmissionStats {
+        return self.admission_stats;
     }
 
     fn indexId(self: Reader, index: usize) u64 {
@@ -798,6 +892,10 @@ pub const VerifiedReader = struct {
         return self.reader.data;
     }
 
+    pub fn admissionStats(self: *const VerifiedReader) AdmissionStats {
+        return self.reader.admissionStats();
+    }
+
     /// Returns the exact independently checksummed entry range. Maintenance
     /// can use this with a private cold reader instead of faulting a complete
     /// corpus-sized query mmap while rewriting a generation.
@@ -968,6 +1066,11 @@ test "streaming quantized directory is byte-compatible with buffered writer" {
 
     var verified = try VerifiedReader.init(alloc, sink.out.items);
     defer verified.deinit();
+    try std.testing.expectEqual(AdmissionStats{
+        .max_leaf_vectors = 2,
+        .max_unfiltered_scan_bytes = 16,
+        .max_filtered_scan_bytes = 12,
+    }, verified.admissionStats());
     const view = (try verified.get(7)).?;
     try std.testing.expectEqualSlices(u64, &member_ids, view.member_ids);
     const locations = view.projections.?.residual_locations.?;
@@ -984,6 +1087,27 @@ test "streaming quantized directory is byte-compatible with buffered writer" {
     try std.testing.expectEqualSlices(u64, &member_ids, owned.view.member_ids);
     try std.testing.expectEqualSlices(f16, &first, owned.view.projections.?.values[0..first.len]);
     try std.testing.expectEqual(first_location, owned.view.projections.?.residual_locations.?.at(0).?);
+}
+
+test "quantized directory persists conservative fallback admission" {
+    const alloc = std.testing.allocator;
+    var writer = try Writer.init(alloc, 3, 0);
+    defer writer.deinit();
+    writer.observeFallbackLeaf(9);
+    const encoded = try writer.build();
+    defer alloc.free(encoded);
+
+    const reader = try Reader.init(encoded);
+    try std.testing.expectEqual(AdmissionStats{
+        .max_leaf_vectors = 9,
+        .max_unfiltered_scan_bytes = 108,
+        .max_filtered_scan_bytes = 108,
+    }, reader.admissionStats());
+
+    var corrupted = try alloc.dupe(u8, encoded);
+    defer alloc.free(corrupted);
+    corrupted[40] ^= 1;
+    try std.testing.expectError(error.QuantizedDirectoryAdmissionChecksumMismatch, Reader.init(corrupted));
 }
 
 test "quantized directory round trips borrowed aligned views" {

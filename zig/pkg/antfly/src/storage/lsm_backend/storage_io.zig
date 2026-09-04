@@ -172,6 +172,23 @@ test "Linux write cache advice preserves the fadvise ABI" {
 /// A file lease for one-pass maintenance reads. Native implementations use a
 /// descriptor distinct from the shared foreground FD cache, so cache policy
 /// cannot leak across concurrent query reads.
+pub const ColdReadRange = struct {
+    offset: u64,
+    destination: []u8,
+};
+
+pub const ColdReadStats = struct {
+    logical_bytes: u64 = 0,
+    physical_bytes: u64 = 0,
+    physical_reads: u64 = 0,
+
+    pub fn add(self: *ColdReadStats, other: ColdReadStats) void {
+        self.logical_bytes +|= other.logical_bytes;
+        self.physical_bytes +|= other.physical_bytes;
+        self.physical_reads +|= other.physical_reads;
+    }
+};
+
 pub const ColdSequentialReader = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -179,6 +196,8 @@ pub const ColdSequentialReader = struct {
     pub const VTable = struct {
         read_range_alloc: *const fn (*anyopaque, Allocator, u64, usize) anyerror![]u8,
         read_range_into: *const fn (*anyopaque, u64, []u8) anyerror!void,
+        read_ranges_into: *const fn (*anyopaque, []const ColdReadRange) anyerror!ColdReadStats,
+        release_scratch: *const fn (*anyopaque) void,
         deinit: *const fn (*anyopaque) void,
     };
 
@@ -188,6 +207,19 @@ pub const ColdSequentialReader = struct {
 
     pub fn readRangeInto(self: *ColdSequentialReader, offset: u64, out: []u8) !void {
         return try self.vtable.read_range_into(self.ptr, offset, out);
+    }
+
+    /// Reads ranges ordered by ascending file offset. Implementations may
+    /// coalesce neighboring requests, but every destination remains independently
+    /// owned by the caller for the duration of this synchronous operation.
+    pub fn readRangesInto(self: *ColdSequentialReader, ranges: []const ColdReadRange) !ColdReadStats {
+        return try self.vtable.read_ranges_into(self.ptr, ranges);
+    }
+
+    /// Releases implementation-private bounce buffers after a large batch.
+    /// The descriptor and its cold-cache policy remain valid for later reads.
+    pub fn releaseScratch(self: *ColdSequentialReader) void {
+        self.vtable.release_scratch(self.ptr);
     }
 
     pub fn deinit(self: *ColdSequentialReader) void {
@@ -753,6 +785,8 @@ const GenericColdSequentialReader = struct {
     const vtable: ColdSequentialReader.VTable = .{
         .read_range_alloc = readRangeAlloc,
         .read_range_into = readRangeInto,
+        .read_ranges_into = readRangesInto,
+        .release_scratch = releaseScratch,
         .deinit = deinitErased,
     };
 
@@ -779,6 +813,19 @@ const GenericColdSequentialReader = struct {
         if (bytes.len != out.len) return error.EndOfStream;
         @memcpy(out, bytes);
     }
+
+    fn readRangesInto(ptr: *anyopaque, ranges: []const ColdReadRange) !ColdReadStats {
+        var stats: ColdReadStats = .{};
+        for (ranges) |range| {
+            try readRangeInto(ptr, range.offset, range.destination);
+            stats.logical_bytes +|= range.destination.len;
+            stats.physical_bytes +|= range.destination.len;
+            stats.physical_reads +|= @intFromBool(range.destination.len != 0);
+        }
+        return stats;
+    }
+
+    fn releaseScratch(_: *anyopaque) void {}
 
     fn deinitErased(ptr: *anyopaque) void {
         const self: *GenericColdSequentialReader = @ptrCast(@alignCast(ptr));
@@ -2841,6 +2888,17 @@ fn readAtMostAtOffset(fd: std.posix.fd_t, bytes: []u8, offset: u64) !usize {
     return read_len;
 }
 
+fn readOnceAtOffset(fd: std.posix.fd_t, bytes: []u8, offset: u64) !usize {
+    while (true) {
+        const rc = std.posix.system.pread(fd, bytes.ptr, bytes.len, @intCast(offset));
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => |err| return posixReadError(err),
+        }
+    }
+}
+
 fn writeAllAtOffset(fd: std.posix.fd_t, bytes: []const u8, offset: u64) !void {
     var written: usize = 0;
     while (written < bytes.len) {
@@ -3068,6 +3126,8 @@ fn nativeColdSequentialReaderCapacity(state: *const NativeStorageState) usize {
 
 const NativeColdSequentialReader = struct {
     const direct_alignment: usize = 4096;
+    const max_coalesced_gap: usize = 4096;
+    const max_coalesced_bytes: usize = 1024 * 1024;
 
     allocator: Allocator,
     fd_permit: NativeFdPermit,
@@ -3079,6 +3139,8 @@ const NativeColdSequentialReader = struct {
     const vtable: ColdSequentialReader.VTable = .{
         .read_range_alloc = readRangeAlloc,
         .read_range_into = readRangeInto,
+        .read_ranges_into = readRangesInto,
+        .release_scratch = releaseScratch,
         .deinit = deinitErased,
     };
 
@@ -3162,45 +3224,117 @@ const NativeColdSequentialReader = struct {
     }
 
     fn readInto(self: *NativeColdSequentialReader, offset: u64, out: []u8) !void {
-        if (!self.direct_io.load(.acquire)) return try readAllAtOffset(self.fd, out, offset);
         if (out.len == 0) return;
+        // Buffered scalar reads can fill the caller's destination directly.
+        // Batch coalescing still uses the private scatter extent below.
+        if (!self.direct_io.load(.acquire)) return try readAllAtOffset(self.fd, out, offset);
+        const ranges = [1]ColdReadRange{.{ .offset = offset, .destination = out }};
+        _ = try self.readRanges(&ranges);
+    }
 
-        // O_DIRECT requires aligned offsets, lengths, and destination buffers.
-        // One reusable window per descriptor keeps sparse projection reads out
-        // of the page cache without allocating per vector. Calls sharing a
-        // shard descriptor serialize only while copying through that window;
-        // distinct shards remain fully parallel.
+    fn readRangesInto(ptr: *anyopaque, ranges: []const ColdReadRange) !ColdReadStats {
+        const self: *NativeColdSequentialReader = @ptrCast(@alignCast(ptr));
+        return try self.readRanges(ranges);
+    }
+
+    fn releaseScratch(ptr: *anyopaque) void {
+        const self: *NativeColdSequentialReader = @ptrCast(@alignCast(ptr));
         const locked = lockAtomic(&self.direct_mutex);
         defer if (locked) self.direct_mutex.unlock();
-        if (!self.direct_io.load(.acquire)) return try readAllAtOffset(self.fd, out, offset);
-        const aligned_offset = offset - (offset % direct_alignment);
-        const prefix: usize = @intCast(offset - aligned_offset);
-        const required = std.math.add(usize, prefix, out.len) catch return error.OutOfMemory;
-        const padded_required = std.math.add(usize, required, direct_alignment - 1) catch return error.OutOfMemory;
-        const aligned_len = padded_required & ~(direct_alignment - 1);
-        if (self.direct_scratch == null or self.direct_scratch.?.len < aligned_len) {
+        if (self.direct_scratch) |scratch| self.allocator.free(scratch);
+        self.direct_scratch = null;
+    }
+
+    fn ensureScratch(self: *NativeColdSequentialReader, required: usize) ![]align(direct_alignment) u8 {
+        if (self.direct_scratch == null or self.direct_scratch.?.len < required) {
             const replacement = try self.allocator.alignedAlloc(
                 u8,
                 .fromByteUnits(direct_alignment),
-                aligned_len,
+                required,
             );
             if (self.direct_scratch) |scratch| self.allocator.free(scratch);
             self.direct_scratch = replacement;
         }
-        const scratch = self.direct_scratch.?[0..aligned_len];
-        const read_len = readAtMostAtOffset(self.fd, scratch, aligned_offset) catch |err| switch (err) {
-            error.InvalidArgument => {
-                // A filesystem may accept O_DIRECT at open but impose a larger
-                // per-inode alignment. Disable it atomically for this private
-                // descriptor and retain the one-shot buffered fallback.
-                try self.disableDirectIo();
-                self.direct_io.store(false, .release);
-                return try readAllAtOffset(self.fd, out, offset);
-            },
-            else => return err,
-        };
-        if (read_len < required) return error.EndOfStream;
-        @memcpy(out, scratch[prefix..required]);
+        return self.direct_scratch.?[0..required];
+    }
+
+    fn readRanges(self: *NativeColdSequentialReader, ranges: []const ColdReadRange) !ColdReadStats {
+        var stats: ColdReadStats = .{};
+        for (ranges) |range| stats.logical_bytes +|= range.destination.len;
+        if (ranges.len == 0) return stats;
+
+        // O_DIRECT requires aligned offsets, lengths, and destination buffers.
+        // One reusable extent per descriptor coalesces the already sorted
+        // projection stream. This avoids issuing and serializing one aligned
+        // read for every small vector while retaining bounded scratch memory.
+        const locked = lockAtomic(&self.direct_mutex);
+        defer if (locked) self.direct_mutex.unlock();
+
+        var start: usize = 0;
+        while (start < ranges.len) {
+            while (start < ranges.len and ranges[start].destination.len == 0) : (start += 1) {}
+            if (start == ranges.len) break;
+            const first_end = std.math.add(u64, ranges[start].offset, ranges[start].destination.len) catch
+                return error.OutOfMemory;
+            const logical_start = ranges[start].offset;
+            var logical_end = first_end;
+            var end = start + 1;
+            while (end < ranges.len) : (end += 1) {
+                const next = ranges[end];
+                if (next.destination.len == 0) continue;
+                if (next.offset < logical_start) return error.UnsortedColdReadRanges;
+                const next_end = std.math.add(u64, next.offset, next.destination.len) catch return error.OutOfMemory;
+                const permitted_end = std.math.add(u64, logical_end, max_coalesced_gap) catch std.math.maxInt(u64);
+                const extent_bytes = next_end -| logical_start;
+                if (next.offset > permitted_end or extent_bytes > max_coalesced_bytes) break;
+                logical_end = @max(logical_end, next_end);
+            }
+
+            var read_start = logical_start;
+            var read_end = logical_end;
+            const direct = self.direct_io.load(.acquire);
+            if (direct) {
+                read_start -= read_start % direct_alignment;
+                const padded_end = std.math.add(u64, read_end, direct_alignment - 1) catch return error.OutOfMemory;
+                read_end = padded_end & ~@as(u64, direct_alignment - 1);
+            }
+            const read_len = std.math.cast(usize, read_end - read_start) orelse return error.OutOfMemory;
+            const scratch = try self.ensureScratch(read_len);
+            if (direct) {
+                const actual = readOnceAtOffset(self.fd, scratch, read_start) catch |err| switch (err) {
+                    error.InvalidArgument => blk: {
+                        // A filesystem may accept O_DIRECT at open but impose a
+                        // larger per-inode alignment. Keep the same coalesced
+                        // logical extent when switching to the buffered
+                        // fallback. Do not require alignment padding past EOF
+                        // once the descriptor is buffered.
+                        try self.disableDirectIo();
+                        self.direct_io.store(false, .release);
+                        const buffered_len = std.math.cast(usize, logical_end - read_start) orelse
+                            return error.OutOfMemory;
+                        try readAllAtOffset(self.fd, scratch[0..buffered_len], read_start);
+                        break :blk buffered_len;
+                    },
+                    else => return err,
+                };
+                if (actual < logical_end - read_start) return error.EndOfStream;
+                stats.physical_bytes +|= actual;
+            } else {
+                try readAllAtOffset(self.fd, scratch, read_start);
+                stats.physical_bytes +|= read_len;
+            }
+            stats.physical_reads +|= 1;
+
+            for (ranges[start..end]) |range| {
+                if (range.destination.len == 0) continue;
+                const relative = std.math.cast(usize, range.offset - read_start) orelse return error.OutOfMemory;
+                const relative_end = std.math.add(usize, relative, range.destination.len) catch return error.OutOfMemory;
+                if (relative_end > scratch.len) return error.EndOfStream;
+                @memcpy(range.destination, scratch[relative..relative_end]);
+            }
+            start = end;
+        }
+        return stats;
     }
 
     fn disableDirectIo(self: *NativeColdSequentialReader) !void {
@@ -3968,6 +4102,20 @@ test "cold sequential reader is isolated from foreground descriptor cache" {
     var random_buf: [3]u8 = undefined;
     try random_reader.readRangeInto(4, &random_buf);
     try std.testing.expectEqualStrings("efg", &random_buf);
+    var first: [2]u8 = undefined;
+    var second: [3]u8 = undefined;
+    const batch_stats = try random_reader.readRangesInto(&.{
+        .{ .offset = 0, .destination = &first },
+        .{ .offset = 4, .destination = &second },
+    });
+    try std.testing.expectEqualStrings("ab", &first);
+    try std.testing.expectEqualStrings("efg", &second);
+    try std.testing.expectEqual(@as(u64, 5), batch_stats.logical_bytes);
+    try std.testing.expectEqual(@as(u64, 1), batch_stats.physical_reads);
+    try std.testing.expect(batch_stats.physical_bytes >= batch_stats.logical_bytes);
+    random_reader.releaseScratch();
+    try random_reader.readRangeInto(0, &first);
+    try std.testing.expectEqualStrings("ab", &first);
     random_reader.deinit();
     try std.testing.expectEqual(before, native.snapshotStats().fd_admitted_descriptors);
 }

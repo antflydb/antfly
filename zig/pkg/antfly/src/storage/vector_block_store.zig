@@ -1421,9 +1421,23 @@ pub const Opened = struct {
     /// faults the query mmap nor changes its FD cache policy. The existing FD
     /// governor bounds the complete set and preserves its reserved headroom.
     pub const ColdProjectionSession = struct {
+        const OrderedProjection = struct {
+            reader_index: usize,
+            request_index: usize,
+            offset: u64,
+
+            fn lessThan(_: void, lhs: OrderedProjection, rhs: OrderedProjection) bool {
+                if (lhs.reader_index != rhs.reader_index) return lhs.reader_index < rhs.reader_index;
+                if (lhs.offset != rhs.offset) return lhs.offset < rhs.offset;
+                return lhs.request_index < rhs.request_index;
+            }
+        };
+
         opened: *const Opened,
         readers: []lsm_backend.storage_io.ColdSequentialReader,
         opened_readers: usize = 0,
+        ordered: std.ArrayListUnmanaged(OrderedProjection) = .empty,
+        ranges: std.ArrayListUnmanaged(lsm_backend.storage_io.ColdReadRange) = .empty,
 
         fn init(opened: *const Opened) !ColdProjectionSession {
             if (opened.blocks.len > opened.store.storage.coldSequentialReaderCapacity())
@@ -1442,6 +1456,8 @@ pub const Opened = struct {
 
         pub fn deinit(self: *ColdProjectionSession) void {
             for (self.readers[0..self.opened_readers]) |*reader| reader.deinit();
+            self.ordered.deinit(self.opened.store.alloc);
+            self.ranges.deinit(self.opened.store.alloc);
             self.opened.store.alloc.free(self.readers);
             self.* = undefined;
         }
@@ -1471,25 +1487,74 @@ pub const Opened = struct {
         }
 
         pub fn readProjectionsIntoBatch(
-            self: *const ColdProjectionSession,
-            io: ?std.Io,
+            self: *ColdProjectionSession,
+            _: ?std.Io,
             requests: []ProjectionReadRequest,
         ) !ReadBatchStats {
-            try runPositionalReadBatch(
-                ProjectionReadRequest,
-                self,
-                io,
-                requests,
-                ColdProjectionSession.runProjectionRead,
-            );
+            self.ordered.clearRetainingCapacity();
+            self.ranges.clearRetainingCapacity();
+            try self.ordered.ensureTotalCapacity(self.opened.store.alloc, requests.len);
+            try self.ranges.ensureTotalCapacity(self.opened.store.alloc, requests.len);
+            for (requests, 0..) |*request, request_index| {
+                request.value = null;
+                request.err = null;
+                switch (request.located) {
+                    .wal => |value| request.value = value,
+                    .block => |block| {
+                        _ = try self.opened.readerForLocated(block.reader_index, block.reader_generation, block.reader_shard_id);
+                        if (request.scratch.len < block.location.vector_len) {
+                            request.err = error.BufferTooSmall;
+                            continue;
+                        }
+                        self.ordered.appendAssumeCapacity(.{
+                            .reader_index = block.reader_index,
+                            .request_index = request_index,
+                            .offset = @intCast(block.location.vector_offset),
+                        });
+                    },
+                }
+            }
+            std.mem.sort(OrderedProjection, self.ordered.items, {}, OrderedProjection.lessThan);
+
             var stats: ReadBatchStats = .{};
-            for (requests) |request| switch (request.located) {
-                .wal => {},
-                .block => |block| {
-                    stats.physical_reads += 1;
-                    stats.physical_bytes +|= block.location.vector_len;
-                },
-            };
+            var start: usize = 0;
+            while (start < self.ordered.items.len) {
+                const reader_index = self.ordered.items[start].reader_index;
+                var end = start + 1;
+                while (end < self.ordered.items.len and self.ordered.items[end].reader_index == reader_index) : (end += 1) {}
+                self.ranges.clearRetainingCapacity();
+                for (self.ordered.items[start..end]) |ordered| {
+                    const request = &requests[ordered.request_index];
+                    const block = request.located.block;
+                    self.ranges.appendAssumeCapacity(.{
+                        .offset = ordered.offset,
+                        .destination = request.scratch[0..block.location.vector_len],
+                    });
+                }
+                const read_result = self.readers[reader_index].readRangesInto(self.ranges.items);
+                // Groups are processed serially in physical order. Keeping the
+                // descriptor but dropping its bounce extent bounds publication
+                // scratch to one group instead of one maximum extent per shard.
+                self.readers[reader_index].releaseScratch();
+                const read_stats = read_result catch |err| {
+                    for (self.ordered.items[start..end]) |ordered| requests[ordered.request_index].err = err;
+                    start = end;
+                    continue;
+                };
+                stats.physical_reads +|= read_stats.physical_reads;
+                stats.physical_bytes +|= read_stats.physical_bytes;
+                for (self.ordered.items[start..end]) |ordered| {
+                    const request = &requests[ordered.request_index];
+                    const block = request.located.block;
+                    request.value = block.location.projectionValueFromPayload(
+                        request.scratch[0..block.location.vector_len],
+                    ) catch |err| {
+                        request.err = err;
+                        continue;
+                    };
+                }
+                start = end;
+            }
             return stats;
         }
     };
@@ -3385,8 +3450,9 @@ test "vector block positional lookup reads mmap payload through retained descrip
         cold_requests[i] = .{ .located = request.located, .scratch = &cold_scratch[i] };
     }
     const cold_stats = try cold_session.readProjectionsIntoBatch(io_impl.io(), &cold_requests);
-    try std.testing.expectEqual(projection_read_stats.physical_reads, cold_stats.physical_reads);
-    try std.testing.expectEqual(projection_read_stats.physical_bytes, cold_stats.physical_bytes);
+    try std.testing.expectEqual(@as(u64, 1), cold_stats.physical_reads);
+    try std.testing.expect(cold_stats.physical_reads < projection_read_stats.physical_reads);
+    try std.testing.expect(cold_stats.physical_bytes >= projection_read_stats.physical_bytes);
     for (cold_requests, projection_requests) |cold, ordinary| {
         try std.testing.expect(cold.err == null);
         try std.testing.expectEqualSlices(u8, ordinary.value.?.bytes, cold.value.?.bytes);

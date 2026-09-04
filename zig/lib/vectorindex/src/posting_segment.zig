@@ -672,6 +672,13 @@ pub const VerifiedReader = struct {
         return .{ .reader = self };
     }
 
+    /// Iterates the eagerly authenticated fixed-size index without touching
+    /// payload pages. Restart-time planners use this to find only the small set
+    /// of posting bodies shadowed by immutable deltas.
+    pub fn keys(self: *VerifiedReader) EntryKeyIterator {
+        return .{ .reader = self };
+    }
+
     /// Complete opaque payload region, excluding the hot authenticated index
     /// and footer. Generation owners may use this range to release clean mmap
     /// residency after a one-pass compaction scan without making subsequent
@@ -736,6 +743,24 @@ pub const VerifiedEntryIterator = struct {
             .sequence = entry.sequence,
             .value = try self.reader.verifiedValue(index, entry),
         };
+    }
+};
+
+pub const EntryKeyView = struct {
+    id: PostingId,
+    kind: EntryKind,
+    sequence: u64,
+};
+
+pub const EntryKeyIterator = struct {
+    reader: *VerifiedReader,
+    index: usize = 0,
+
+    pub fn next(self: *EntryKeyIterator) !?EntryKeyView {
+        if (self.index >= self.reader.reader.entry_count) return null;
+        const entry = try self.reader.reader.indexEntry(self.index);
+        self.index += 1;
+        return .{ .id = entry.posting_id, .kind = entry.kind, .sequence = entry.sequence };
     }
 };
 
@@ -975,9 +1000,17 @@ pub fn testVerifiedReaderMemoizesPayloadStatus() !void {
     corrupt_bytes[0] ^= 1;
     var corrupt_reader = try VerifiedReader.init(alloc, corrupt_bytes);
     defer corrupt_reader.deinit();
-    try std.testing.expectError(error.PostingSegmentChecksumMismatch, corrupt_reader.getBase(1));
-    try std.testing.expectError(error.PostingSegmentChecksumMismatch, corrupt_reader.getBase(1));
+    var keys = corrupt_reader.keys();
+    try std.testing.expectEqual(EntryKeyView{
+        .id = 1,
+        .kind = .base,
+        .sequence = 0,
+    }, (try keys.next()).?);
+    try std.testing.expect((try keys.next()) == null);
     const corrupt_index = (try corrupt_reader.reader.latestIndex(1, .base)).?;
+    try std.testing.expectEqual(VerifiedReader.unknown, corrupt_reader.verification[corrupt_index].load(.acquire));
+    try std.testing.expectError(error.PostingSegmentChecksumMismatch, corrupt_reader.getBase(1));
+    try std.testing.expectError(error.PostingSegmentChecksumMismatch, corrupt_reader.getBase(1));
     try std.testing.expectEqual(VerifiedReader.corrupt, corrupt_reader.verification[corrupt_index].load(.acquire));
 }
 
