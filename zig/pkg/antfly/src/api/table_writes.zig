@@ -37397,12 +37397,19 @@ test "failed full index enrichment does not make resident reads unavailable" {
 
     var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer backend_runtime.deinit();
-    var write_cache = ProvisionedTableWriteCache.init(alloc);
-    defer write_cache.deinit();
-
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
     defer source.deinit();
     source.backend_runtime = backend_runtime.ptr();
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer {
+        // Stop source-owned admission first, then close the DBs that may still
+        // hold copied visibility callbacks while their callback target is
+        // alive. `source.deinit` runs after this block and may safely poison
+        // the borrowed callback target.
+        source.quiesce();
+        write_cache.deinit();
+    }
     source.write_cache = &write_cache;
 
     _ = try source.source().batch(alloc, "stable", .{
