@@ -18,7 +18,9 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def normalize(input_path: Path, output_path: Path, manifest_path: Path, text_field: str) -> dict:
+def normalize(
+    input_path: Path, output_path: Path, manifest_path: Path, text_field: str
+) -> dict:
     if input_path.resolve() == output_path.resolve():
         raise ValueError("input and output paths must differ")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -47,10 +49,15 @@ def normalize(input_path: Path, output_path: Path, manifest_path: Path, text_fie
                 raise ValueError(f"{input_path}:{line_number}: expected a JSON object")
             text = value.get(text_field)
             if not isinstance(text, str):
-                raise ValueError(f"{input_path}:{line_number}: field {text_field!r} is not a string")
+                raise ValueError(
+                    f"{input_path}:{line_number}: field {text_field!r} is not a string"
+                )
             if not text:
                 empty_text_documents += 1
-            encoded = (json.dumps({"text": text}, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+            encoded = (
+                json.dumps({"text": text}, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8")
             destination.write(encoded)
             normalized_hash.update(encoded)
             normalized_bytes += len(encoded)
@@ -75,7 +82,9 @@ def normalize(input_path: Path, output_path: Path, manifest_path: Path, text_fie
             "ordinal_assignment": "zero_based_normalized_input_order_u32",
         },
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return manifest
 
 

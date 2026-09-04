@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ListRestoreJobsPhase(str, Enum):
+class ListRestoreJobsPhase(StrEnum):
     CANCELLED = "cancelled"
     FAILED = "failed"
     QUEUED = "queued"

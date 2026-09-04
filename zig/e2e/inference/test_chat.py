@@ -69,11 +69,15 @@ def test_chat_streaming(api):
     body = r.text
     r.close()
 
-    data_lines = [line[len("data: "):] for line in body.splitlines() if line.startswith("data: ")]
+    data_lines = [
+        line[len("data: ") :] for line in body.splitlines() if line.startswith("data: ")
+    ]
     assert data_lines and data_lines[-1] == "[DONE]", body
 
     events = [json.loads(line) for line in data_lines[:-1]]
-    assert events[0].get("choices", [{}])[0].get("delta", {}).get("role") == "assistant", events[0]
+    assert (
+        events[0].get("choices", [{}])[0].get("delta", {}).get("role") == "assistant"
+    ), events[0]
     content = "".join(
         event.get("choices", [{}])[0].get("delta", {}).get("content") or ""
         for event in events[1:]

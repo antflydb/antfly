@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class SerperSearchConfigTimePeriod(str, Enum):
+class SerperSearchConfigTimePeriod(StrEnum):
     D = "d"
     M = "m"
     W = "w"

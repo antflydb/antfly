@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class RouteType(str, Enum):
+class RouteType(StrEnum):
     QUESTION = "question"
     SEARCH = "search"
 

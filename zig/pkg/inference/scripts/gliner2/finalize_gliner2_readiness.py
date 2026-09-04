@@ -75,7 +75,9 @@ def build_summary(
         and default_summary.get("precision_consistent") is True
     )
     if default_rc == 0 and not default_ready:
-        integrity_errors.append("deterministic parity/performance command returned success without a current passing summary")
+        integrity_errors.append(
+            "deterministic parity/performance command returned success without a current passing summary"
+        )
 
     oracle = object_field(default_summary, "oracle")
     oracle_ready = bool(
@@ -92,14 +94,20 @@ def build_summary(
         and isinstance(quality_report, dict)
         and quality_report.get("contract") == EVALUATION_CONTRACT
         and quality_report.get("pass") is True
-        and object_field(quality_report, "inference").get("normalization") == CANONICAL_NORMALIZATION
-        and object_field(quality_report, "inference").get("unicode_version") == CANONICAL_UNICODE_VERSION
+        and object_field(quality_report, "inference").get("normalization")
+        == CANONICAL_NORMALIZATION
+        and object_field(quality_report, "inference").get("unicode_version")
+        == CANONICAL_UNICODE_VERSION
         and object_field(quality_report, "oracle").get("commit") == UPSTREAM_COMMIT
-        and object_field(quality_report, "oracle").get("gliner2_version") == CANONICAL_GLINER2_VERSION
-        and object_field(quality_report, "oracle").get("package_versions") == CANONICAL_ORACLE_PACKAGE_VERSIONS
+        and object_field(quality_report, "oracle").get("gliner2_version")
+        == CANONICAL_GLINER2_VERSION
+        and object_field(quality_report, "oracle").get("package_versions")
+        == CANONICAL_ORACLE_PACKAGE_VERSIONS
     )
     if quality_rc == 0 and not quality_ready:
-        integrity_errors.append("Python-oracle held-out command returned success without a pinned, normalized passing report")
+        integrity_errors.append(
+            "Python-oracle held-out command returned success without a pinned, normalized passing report"
+        )
 
     native_ready = bool(
         native_rc == 0
@@ -109,7 +117,9 @@ def build_summary(
         and native_report.get("normalization") == CANONICAL_NORMALIZATION
     )
     if native_rc == 0 and not native_ready:
-        integrity_errors.append("Zig held-out command returned success without the canonical-normalization passing report")
+        integrity_errors.append(
+            "Zig held-out command returned success without the canonical-normalization passing report"
+        )
 
     convergence_ready = bool(
         isinstance(convergence_report, dict)
@@ -120,21 +130,29 @@ def build_summary(
         and convergence_report.get("pass") is True
         and convergence_report.get("seed_count") == 5
         and object_field(convergence_report, "oracle").get("commit") == UPSTREAM_COMMIT
-        and object_field(convergence_report, "oracle").get("checkout") == oracle.get("checkout")
-        and object_field(convergence_report, "oracle").get("gliner2_version") == CANONICAL_GLINER2_VERSION
-        and object_field(convergence_report, "oracle").get("package_versions") == CANONICAL_ORACLE_PACKAGE_VERSIONS
+        and object_field(convergence_report, "oracle").get("checkout")
+        == oracle.get("checkout")
+        and object_field(convergence_report, "oracle").get("gliner2_version")
+        == CANONICAL_GLINER2_VERSION
+        and object_field(convergence_report, "oracle").get("package_versions")
+        == CANONICAL_ORACLE_PACKAGE_VERSIONS
         and convergence_report.get("normalization") == CANONICAL_NORMALIZATION
         and convergence_report.get("unicode_version") == CANONICAL_UNICODE_VERSION
-        and convergence_report.get("training_policy") == STOCK_STOCHASTIC_TRAINING_POLICY
+        and convergence_report.get("training_policy")
+        == STOCK_STOCHASTIC_TRAINING_POLICY
         and convergence_report.get("accelerator_backend") == backend
         and convergence_report.get("training_precision") == "fp32"
-        and convergence_report.get("thresholds") == {
+        and convergence_report.get("thresholds")
+        == {
             "max_mean_deficit": 0.02,
             "max_paired_deficit": 0.05,
         }
         and isinstance(convergence_report.get("runs"), list)
         and len(convergence_report["runs"]) == 5
-        and all(isinstance(run, dict) and run.get("pass") is True for run in convergence_report["runs"])
+        and all(
+            isinstance(run, dict) and run.get("pass") is True
+            for run in convergence_report["runs"]
+        )
         and isinstance(convergence_report.get("metrics"), dict)
         and set(convergence_report["metrics"]) == set(REQUIRED_MINIMA)
         and all(
@@ -143,8 +161,16 @@ def build_summary(
         )
     )
 
-    perf_model = default_summary.get("model_fingerprint_sha256") if isinstance(default_summary, dict) else None
-    perf_train = default_summary.get("training_data_fingerprint_sha256") if isinstance(default_summary, dict) else None
+    perf_model = (
+        default_summary.get("model_fingerprint_sha256")
+        if isinstance(default_summary, dict)
+        else None
+    )
+    perf_train = (
+        default_summary.get("training_data_fingerprint_sha256")
+        if isinstance(default_summary, dict)
+        else None
+    )
     quality_artifacts = object_field(quality_report, "artifacts")
     native_artifacts = object_field(native_report, "artifacts")
     convergence_fingerprints = object_field(convergence_report, "fingerprints")
@@ -153,13 +179,17 @@ def build_summary(
         and is_sha256(perf_train)
         and is_sha256(release_adapter_fingerprint)
         and quality_artifacts.get("base_model_fingerprint_sha256") == perf_model
-        and quality_artifacts.get("adapter_bundle_fingerprint_sha256") == release_adapter_fingerprint
+        and quality_artifacts.get("adapter_bundle_fingerprint_sha256")
+        == release_adapter_fingerprint
         and native_artifacts.get("base_model_fingerprint_sha256") == perf_model
-        and native_artifacts.get("adapter_bundle_fingerprint_sha256") == release_adapter_fingerprint
-        and native_artifacts.get("eval_data_fingerprint_sha256") == quality_artifacts.get("eval_data_fingerprint_sha256")
+        and native_artifacts.get("adapter_bundle_fingerprint_sha256")
+        == release_adapter_fingerprint
+        and native_artifacts.get("eval_data_fingerprint_sha256")
+        == quality_artifacts.get("eval_data_fingerprint_sha256")
         and convergence_fingerprints.get("base_model") == perf_model
         and convergence_fingerprints.get("train_data") == perf_train
-        and convergence_fingerprints.get("eval_data") == quality_artifacts.get("eval_data_fingerprint_sha256")
+        and convergence_fingerprints.get("eval_data")
+        == quality_artifacts.get("eval_data_fingerprint_sha256")
     )
 
     release_adapter_ready = bool(
@@ -190,27 +220,41 @@ def build_summary(
     head_ready = (
         None
         if skip_head_opt_in
-        else head_rc == 0 and isinstance(head_summary, dict) and head_summary.get("pass") is True
+        else head_rc == 0
+        and isinstance(head_summary, dict)
+        and head_summary.get("pass") is True
     )
     head_required_ready = not require_head_opt_in or head_ready is True
     if not skip_head_opt_in and head_rc == 0 and head_ready is not True:
-        integrity_errors.append("head opt-in command returned success without a current passing summary")
+        integrity_errors.append(
+            "head opt-in command returned success without a current passing summary"
+        )
 
     blockers: list[str] = []
     if not default_ready:
         blockers.append("deterministic cross-runtime parity/performance gate failed")
     if not oracle_ready:
-        blockers.append("Python oracle checkout/import/runtime dependencies were not pinned in every comparison run")
+        blockers.append(
+            "Python oracle checkout/import/runtime dependencies were not pinned in every comparison run"
+        )
     if not quality_ready:
         blockers.append("Python-oracle held-out quality gate failed or did not run")
     if not native_ready:
-        blockers.append("Zig held-out full-task quality gate failed or used a different normalization contract")
+        blockers.append(
+            "Zig held-out full-task quality gate failed or used a different normalization contract"
+        )
     if not convergence_ready:
-        blockers.append("five-seed Python/Zig held-out convergence gate failed or is missing")
+        blockers.append(
+            "five-seed Python/Zig held-out convergence gate failed or is missing"
+        )
     if not fingerprints_ready:
-        blockers.append("model/train/eval/release-adapter fingerprints do not bind all readiness evidence to the same artifacts")
+        blockers.append(
+            "model/train/eval/release-adapter fingerprints do not bind all readiness evidence to the same artifacts"
+        )
     if not hardware_ready:
-        blockers.append("current FP32 CUDA sanitizer/parity qualification is missing for L4, A100, or H100")
+        blockers.append(
+            "current FP32 CUDA sanitizer/parity qualification is missing for L4, A100, or H100"
+        )
     if not head_required_ready:
         blockers.append("required head opt-in gate failed")
     blockers.extend(integrity_errors)
@@ -291,7 +335,9 @@ def main() -> int:
     parser.add_argument("--quality-rc", type=int, required=True)
     parser.add_argument("--native-rc", type=int, required=True)
     parser.add_argument("--skip-head-opt-in", type=int, choices=(0, 1), required=True)
-    parser.add_argument("--require-head-opt-in", type=int, choices=(0, 1), required=True)
+    parser.add_argument(
+        "--require-head-opt-in", type=int, choices=(0, 1), required=True
+    )
     args = parser.parse_args()
     out_dir = args.out_dir.expanduser().resolve()
     default_path = out_dir / "default" / "perf_summary.json"
@@ -327,9 +373,13 @@ def main() -> int:
     if args.backend == "cuda" and isinstance(hardware_qualification, dict):
         from summarize_gliner2_cuda_hardware import verify_summary
 
-        hardware_qualification_errors = verify_summary(hardware_qualification, Path(__file__).resolve().parents[2])
+        hardware_qualification_errors = verify_summary(
+            hardware_qualification, Path(__file__).resolve().parents[2]
+        )
     elif args.backend == "cuda":
-        hardware_qualification_errors = ["CUDA hardware qualification matrix is missing"]
+        hardware_qualification_errors = [
+            "CUDA hardware qualification matrix is missing"
+        ]
     else:
         hardware_qualification_errors = []
     try:
@@ -345,8 +395,12 @@ def main() -> int:
         native_rc=args.native_rc,
         skip_head_opt_in=bool(args.skip_head_opt_in),
         require_head_opt_in=bool(args.require_head_opt_in),
-        default_summary=load(default_path, summary=True) if args.default_rc == 0 else None,
-        head_summary=load(head_path, summary=True) if not args.skip_head_opt_in and args.head_rc == 0 else None,
+        default_summary=load(default_path, summary=True)
+        if args.default_rc == 0
+        else None,
+        head_summary=load(head_path, summary=True)
+        if not args.skip_head_opt_in and args.head_rc == 0
+        else None,
         quality_report=load(quality_path) if args.quality_rc == 0 else None,
         native_report=load(native_path) if args.native_rc == 0 else None,
         convergence_report=convergence_report,

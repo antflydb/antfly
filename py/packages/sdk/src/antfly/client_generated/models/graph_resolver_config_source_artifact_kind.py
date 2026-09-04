@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphResolverConfigSourceArtifactKind(str, Enum):
+class GraphResolverConfigSourceArtifactKind(StrEnum):
     ANY = "any"
     ASSET = "asset"
     CHUNK = "chunk"

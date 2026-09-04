@@ -100,7 +100,9 @@ def url_to_local_path(thumb_url: str) -> str:
     return "/".join(safe_parts)
 
 
-def download_image(thumb_url: str, local_path: str, max_retries: int = 5) -> tuple[bool, int]:
+def download_image(
+    thumb_url: str, local_path: str, max_retries: int = 5
+) -> tuple[bool, int]:
     """Download a thumbnail image to a local path.
 
     Returns (success, retry_after) where retry_after is the seconds
@@ -124,7 +126,9 @@ def download_image(thumb_url: str, local_path: str, max_retries: int = 5) -> tup
         except urllib.error.HTTPError as e:
             if e.code == 429 and attempt < max_retries - 1:
                 last_retry_after = int(e.headers.get("Retry-After", 10))
-                print(f"    Rate limited, waiting {last_retry_after}s... ({thumb_url[:60]})")
+                print(
+                    f"    Rate limited, waiting {last_retry_after}s... ({thumb_url[:60]})"
+                )
                 time.sleep(last_retry_after)
             elif e.code == 404:
                 return False, 0
@@ -169,7 +173,9 @@ def main():
 
             batch_num = i // BATCH_SIZE + 1
             total_batches = (len(all_titles) + BATCH_SIZE - 1) // BATCH_SIZE
-            print(f"  Batch {batch_num}/{total_batches}: {len(batch_thumbnails)}/{len(batch)} have thumbnails")
+            print(
+                f"  Batch {batch_num}/{total_batches}: {len(batch_thumbnails)}/{len(batch)} have thumbnails"
+            )
 
             # Be polite to Wikipedia API
             if i + BATCH_SIZE < len(all_titles):
@@ -182,8 +188,11 @@ def main():
 
     # Download thumbnail images
     # Count how many are already cached
-    cached = sum(1 for thumb_url in thumbnails.values()
-                 if os.path.exists(os.path.join(IMAGES_DIR, url_to_local_path(thumb_url))))
+    cached = sum(
+        1
+        for thumb_url in thumbnails.values()
+        if os.path.exists(os.path.join(IMAGES_DIR, url_to_local_path(thumb_url)))
+    )
     to_download = len(thumbnails) - cached
     print(f"\nDownloading {to_download} thumbnail images ({cached} already cached)...")
 
@@ -199,7 +208,9 @@ def main():
         if not os.path.exists(os.path.join(IMAGES_DIR, local_path)):
             to_fetch.append((title, thumb_url, local_path))
 
-    print(f"  {len(to_fetch)} images to download, {len(thumbnails) - len(to_fetch)} already cached")
+    print(
+        f"  {len(to_fetch)} images to download, {len(thumbnails) - len(to_fetch)} already cached"
+    )
 
     downloaded = 0
     failed = 0
@@ -214,7 +225,9 @@ def main():
             thumbnails[title] = None
 
         if (i + 1) % 100 == 0:
-            print(f"  {i + 1}/{len(to_fetch)} downloaded ({downloaded} ok, {failed} failed, delay={delay:.0f}s)")
+            print(
+                f"  {i + 1}/{len(to_fetch)} downloaded ({downloaded} ok, {failed} failed, delay={delay:.0f}s)"
+            )
 
         # Skip sleep for cache hits (retry_after == 0 and file already existed)
         if retry_after < 0:
@@ -251,7 +264,9 @@ def main():
             f.write(json.dumps(article, ensure_ascii=False) + "\n")
 
     print(f"\nWrote {OUTPUT_FILE}")
-    print(f"  {with_thumb} articles with thumbnails ({with_thumb * 100 // len(articles)}%)")
+    print(
+        f"  {with_thumb} articles with thumbnails ({with_thumb * 100 // len(articles)}%)"
+    )
     print(f"  {without_thumb} articles without thumbnails")
 
     size_mb = os.path.getsize(OUTPUT_FILE) / (1024 * 1024)
@@ -264,7 +279,9 @@ def main():
         for fname in files:
             total_image_bytes += os.path.getsize(os.path.join(root, fname))
             image_count += 1
-    print(f"\nImages: {image_count} files, {total_image_bytes / (1024 * 1024):.1f} MB in {IMAGES_DIR}/")
+    print(
+        f"\nImages: {image_count} files, {total_image_bytes / (1024 * 1024):.1f} MB in {IMAGES_DIR}/"
+    )
 
 
 if __name__ == "__main__":

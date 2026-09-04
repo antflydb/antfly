@@ -35,6 +35,7 @@ def add_unified_auth_responses(path_item: dict, error_schema_ref: str) -> dict:
     only set if the operation does not already define one, and an existing
     503 keeps its description with the auth clause appended.
     """
+
     def auth_error_content() -> dict:
         return {
             "application/json": {
@@ -61,7 +62,9 @@ def add_unified_auth_responses(path_item: dict, error_schema_ref: str) -> dict:
         )
         unavailable = responses.get("503")
         if isinstance(unavailable, dict):
-            description = unavailable.get("description", "Inference service unavailable").rstrip(".")
+            description = unavailable.get(
+                "description", "Inference service unavailable"
+            ).rstrip(".")
             unavailable["description"] = f"{description}. {auth_not_ready}"
         else:
             responses["503"] = {

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferencePromptCacheConfigMode(str, Enum):
+class InferencePromptCacheConfigMode(StrEnum):
     BLOCK_HASH = "block_hash"
     RADIX = "radix"
     SIMPLE = "simple"

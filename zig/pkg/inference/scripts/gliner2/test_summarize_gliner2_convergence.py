@@ -6,7 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from compare_gliner2_lora_python_zig import COMPARISON_CONTRACT, UPSTREAM_SAMPLING_DEFAULTS
+from compare_gliner2_lora_python_zig import (
+    COMPARISON_CONTRACT,
+    UPSTREAM_SAMPLING_DEFAULTS,
+)
 from evaluate_gliner2_full_task import EVALUATION_CONTRACT, REQUIRED_MINIMA
 from gliner2_release_contract import (
     CANONICAL_GLINER2_VERSION,
@@ -24,7 +27,10 @@ from summarize_gliner2_convergence import (
     stochastic_comparison_errors,
     summarize,
 )
-from validate_gliner2_release_data import adapter_bundle_fingerprint, peft_adapter_fingerprint
+from validate_gliner2_release_data import (
+    adapter_bundle_fingerprint,
+    peft_adapter_fingerprint,
+)
 
 
 SHA_MODEL = "sha256:" + "1" * 64
@@ -68,27 +74,50 @@ def passing_payload() -> dict:
         "normalization": CANONICAL_NORMALIZATION,
         "unicode_version": CANONICAL_UNICODE_VERSION,
         "training_policy": STOCK_STOCHASTIC_TRAINING_POLICY,
-        "fingerprints": {"base_model": SHA_MODEL, "train_data": SHA_TRAIN, "eval_data": SHA_EVAL},
-        "artifact_paths": {"base_model": "/model", "train_data": "/train", "eval_data": "/eval"},
+        "fingerprints": {
+            "base_model": SHA_MODEL,
+            "train_data": SHA_TRAIN,
+            "eval_data": SHA_EVAL,
+        },
+        "artifact_paths": {
+            "base_model": "/model",
+            "train_data": "/train",
+            "eval_data": "/eval",
+        },
         "minimums": {key: 0.7 for key in REQUIRED_MINIMA},
         "runs": [
             {
                 "seed": seed,
-                "comparison_report": {"path": f"/run-{seed}/comparison_report.json", "sha256": SHA_REPORT},
+                "comparison_report": {
+                    "path": f"/run-{seed}/comparison_report.json",
+                    "sha256": SHA_REPORT,
+                },
                 "python": {
                     "metrics": metrics(0.82),
                     "optimizer_steps": 2,
                     "losses": [2.0, 1.0],
                     "oracle": oracle(),
-                    "adapter": {"path": f"/run-{seed}/python/final", "fingerprint": "sha256:" + "5" * 64},
-                    "evaluation_report": {"path": f"/run-{seed}/python-eval.json", "sha256": SHA_REPORT},
+                    "adapter": {
+                        "path": f"/run-{seed}/python/final",
+                        "fingerprint": "sha256:" + "5" * 64,
+                    },
+                    "evaluation_report": {
+                        "path": f"/run-{seed}/python-eval.json",
+                        "sha256": SHA_REPORT,
+                    },
                 },
                 "zig": {
                     "metrics": metrics(0.81),
                     "optimizer_steps": 2,
                     "losses": [2.0, 1.1],
-                    "adapter": {"path": f"/run-{seed}/zig", "fingerprint": "sha256:" + "6" * 64},
-                    "evaluation_report": {"path": f"/run-{seed}/zig-eval.json", "sha256": SHA_REPORT},
+                    "adapter": {
+                        "path": f"/run-{seed}/zig",
+                        "fingerprint": "sha256:" + "6" * 64,
+                    },
+                    "evaluation_report": {
+                        "path": f"/run-{seed}/zig-eval.json",
+                        "sha256": SHA_REPORT,
+                    },
                 },
             }
             for seed in range(5)
@@ -97,7 +126,9 @@ def passing_payload() -> dict:
 
 
 class ConvergenceSummaryTest(unittest.TestCase):
-    def test_stock_stochastic_gate_rejects_disabled_sampling_or_runtime_checks(self) -> None:
+    def test_stock_stochastic_gate_rejects_disabled_sampling_or_runtime_checks(
+        self,
+    ) -> None:
         config = {
             "deterministic": False,
             "python_sampling_policy": "upstream-default",
@@ -120,56 +151,92 @@ class ConvergenceSummaryTest(unittest.TestCase):
             "metal_interpreter_fallbacks_within_threshold": True,
         }
         summary = {"strict_mode": True, "strict_checks": strict_checks}
-        python_result = {"metrics": {
-            "sampling_policy": "upstream-default",
-            "sampling_config": UPSTREAM_SAMPLING_DEFAULTS,
-            "schema_conditioning_policy": "upstream-training-default",
-            "training_deterministic": False,
-            "train_shuffle": True,
-            "configured_dropout_modules": 3,
-            "disabled_dropout_modules": 0,
-        }}
-        zig_result = {"training_manifest": {
-            "deterministic": False,
-            "sampling_config": "disabled",
-            "schema_conditioning_policy": "deterministic-eval-form",
-            "model_dropout": "disabled",
-            "train_shuffle": True,
-            "lora_dropout": 0.0,
-            "span_negative_mask_rate": 0.5,
-        }}
-        self.assertEqual([], stochastic_comparison_errors(config, summary, python_result, zig_result))
+        python_result = {
+            "metrics": {
+                "sampling_policy": "upstream-default",
+                "sampling_config": UPSTREAM_SAMPLING_DEFAULTS,
+                "schema_conditioning_policy": "upstream-training-default",
+                "training_deterministic": False,
+                "train_shuffle": True,
+                "configured_dropout_modules": 3,
+                "disabled_dropout_modules": 0,
+            }
+        }
+        zig_result = {
+            "training_manifest": {
+                "deterministic": False,
+                "sampling_config": "disabled",
+                "schema_conditioning_policy": "deterministic-eval-form",
+                "model_dropout": "disabled",
+                "train_shuffle": True,
+                "lora_dropout": 0.0,
+                "span_negative_mask_rate": 0.5,
+            }
+        }
+        self.assertEqual(
+            [], stochastic_comparison_errors(config, summary, python_result, zig_result)
+        )
 
         disabled = copy.deepcopy(python_result)
         disabled["metrics"]["sampling_policy"] = "disabled"
-        self.assertIn("sampling policy", " ".join(
-            stochastic_comparison_errors(config, summary, disabled, zig_result)
-        ))
+        self.assertIn(
+            "sampling policy",
+            " ".join(
+                stochastic_comparison_errors(config, summary, disabled, zig_result)
+            ),
+        )
         mistyped_sampling = copy.deepcopy(python_result)
         mistyped_sampling["metrics"]["sampling_config"]["remove_entities_prob"] = False
-        self.assertIn("SamplingConfig differs", " ".join(
-            stochastic_comparison_errors(config, summary, mistyped_sampling, zig_result)
-        ))
+        self.assertIn(
+            "SamplingConfig differs",
+            " ".join(
+                stochastic_comparison_errors(
+                    config, summary, mistyped_sampling, zig_result
+                )
+            ),
+        )
         mistyped_config = copy.deepcopy(config)
         mistyped_config["lora_dropout"] = False
-        self.assertIn("LoRA dropout", " ".join(
-            stochastic_comparison_errors(mistyped_config, summary, python_result, zig_result)
-        ))
+        self.assertIn(
+            "LoRA dropout",
+            " ".join(
+                stochastic_comparison_errors(
+                    mistyped_config, summary, python_result, zig_result
+                )
+            ),
+        )
         pinned_conditioning = copy.deepcopy(python_result)
-        pinned_conditioning["metrics"]["schema_conditioning_policy"] = "deterministic-eval-form"
-        self.assertIn("schema conditioning", " ".join(
-            stochastic_comparison_errors(config, summary, pinned_conditioning, zig_result)
-        ))
+        pinned_conditioning["metrics"]["schema_conditioning_policy"] = (
+            "deterministic-eval-form"
+        )
+        self.assertIn(
+            "schema conditioning",
+            " ".join(
+                stochastic_comparison_errors(
+                    config, summary, pinned_conditioning, zig_result
+                )
+            ),
+        )
         weakened_zig = copy.deepcopy(zig_result)
         weakened_zig["training_manifest"]["span_negative_mask_rate"] = 0.0
-        self.assertIn("span_negative_mask_rate", " ".join(
-            stochastic_comparison_errors(config, summary, python_result, weakened_zig)
-        ))
+        self.assertIn(
+            "span_negative_mask_rate",
+            " ".join(
+                stochastic_comparison_errors(
+                    config, summary, python_result, weakened_zig
+                )
+            ),
+        )
         failed_runtime = copy.deepcopy(summary)
         failed_runtime["strict_checks"]["metal_device_resident_transfers_zero"] = False
-        self.assertIn("metal_device_resident_transfers_zero", " ".join(
-            stochastic_comparison_errors(config, failed_runtime, python_result, zig_result)
-        ))
+        self.assertIn(
+            "metal_device_resident_transfers_zero",
+            " ".join(
+                stochastic_comparison_errors(
+                    config, failed_runtime, python_result, zig_result
+                )
+            ),
+        )
 
         cuda_summary = copy.deepcopy(summary)
         cuda_summary["strict_checks"] = {
@@ -198,18 +265,28 @@ class ConvergenceSummaryTest(unittest.TestCase):
         }
         self.assertEqual(
             [],
-            stochastic_comparison_errors(config, cuda_summary, python_result, zig_result, "cuda"),
+            stochastic_comparison_errors(
+                config, cuda_summary, python_result, zig_result, "cuda"
+            ),
         )
         del cuda_summary["strict_checks"]["cuda_graph_executor_dispatches_nonzero"]
         self.assertIn(
             "cuda_graph_executor_dispatches_nonzero",
-            " ".join(stochastic_comparison_errors(config, cuda_summary, python_result, zig_result, "cuda")),
+            " ".join(
+                stochastic_comparison_errors(
+                    config, cuda_summary, python_result, zig_result, "cuda"
+                )
+            ),
         )
         cuda_summary["strict_checks"]["cuda_graph_executor_dispatches_nonzero"] = True
         cuda_summary["strict_checks"]["cuda_optimizer_backend_is_cuda"] = False
         self.assertIn(
             "cuda_optimizer_backend_is_cuda",
-            " ".join(stochastic_comparison_errors(config, cuda_summary, python_result, zig_result, "cuda")),
+            " ".join(
+                stochastic_comparison_errors(
+                    config, cuda_summary, python_result, zig_result, "cuda"
+                )
+            ),
         )
 
     def test_five_seed_quality_and_optimizer_contract_passes(self) -> None:
@@ -257,7 +334,9 @@ class ConvergenceSummaryTest(unittest.TestCase):
         self.assertFalse(result["pass"])
         self.assertIn("invalid minimum", " ".join(result["failures"]))
 
-    def test_manifest_derives_all_values_from_generated_reports_and_adapters(self) -> None:
+    def test_manifest_derives_all_values_from_generated_reports_and_adapters(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             model_dir = root / "model"
@@ -267,7 +346,11 @@ class ConvergenceSummaryTest(unittest.TestCase):
             train_data.write_text("{}\n", encoding="utf-8")
             eval_data.write_text("{}\n", encoding="utf-8")
             minimums = {key: 0.7 for key in REQUIRED_MINIMA}
-            fingerprints = {"base_model": SHA_MODEL, "train_data": SHA_TRAIN, "eval_data": SHA_EVAL}
+            fingerprints = {
+                "base_model": SHA_MODEL,
+                "train_data": SHA_TRAIN,
+                "eval_data": SHA_EVAL,
+            }
             verified = {"commit": UPSTREAM_COMMIT, "checkout": "/oracle"}
             manifest_runs: list[dict] = []
             first_python_adapter: Path | None = None
@@ -275,9 +358,14 @@ class ConvergenceSummaryTest(unittest.TestCase):
                 run_dir = root / f"seed-{seed}"
                 python_adapter = run_dir / "python" / "final"
                 zig_adapter = run_dir / "zig"
-                for adapter, prefix in ((python_adapter, b"python"), (zig_adapter, b"zig")):
+                for adapter, prefix in (
+                    (python_adapter, b"python"),
+                    (zig_adapter, b"zig"),
+                ):
                     adapter.mkdir(parents=True)
-                    (adapter / "adapter_model.safetensors").write_bytes(prefix + b"-weights")
+                    (adapter / "adapter_model.safetensors").write_bytes(
+                        prefix + b"-weights"
+                    )
                     (adapter / "adapter_config.json").write_bytes(prefix + b"-config")
                     (adapter / "task_head.safetensors").write_bytes(prefix + b"-head")
                 if first_python_adapter is None:
@@ -367,34 +455,49 @@ class ConvergenceSummaryTest(unittest.TestCase):
                     ("zig", zig_adapter, 0.81),
                 ):
                     eval_path = run_dir / f"{side}-evaluation.json"
-                    eval_path.write_text(json.dumps({
-                        "contract": EVALUATION_CONTRACT,
-                        "pass": True,
-                        "minimums": minimums,
-                        "model_dir": str(model_dir),
-                        "adapter_dir": str(adapter),
-                        "eval_data": str(eval_data),
-                        "inference": {
-                            "normalization": CANONICAL_NORMALIZATION,
-                            "unicode_version": CANONICAL_UNICODE_VERSION,
-                        },
-                        "oracle": oracle(),
-                        "artifacts": {
-                            "base_model_fingerprint_sha256": SHA_MODEL,
-                            "adapter_bundle_fingerprint_sha256": adapter_bundle_fingerprint(adapter),
-                            "peft_adapter_fingerprint_sha256": peft_adapter_fingerprint(adapter),
-                            "eval_data_fingerprint_sha256": SHA_EVAL,
-                        },
-                        "metrics": metrics(value),
-                    }), encoding="utf-8")
+                    eval_path.write_text(
+                        json.dumps(
+                            {
+                                "contract": EVALUATION_CONTRACT,
+                                "pass": True,
+                                "minimums": minimums,
+                                "model_dir": str(model_dir),
+                                "adapter_dir": str(adapter),
+                                "eval_data": str(eval_data),
+                                "inference": {
+                                    "normalization": CANONICAL_NORMALIZATION,
+                                    "unicode_version": CANONICAL_UNICODE_VERSION,
+                                },
+                                "oracle": oracle(),
+                                "artifacts": {
+                                    "base_model_fingerprint_sha256": SHA_MODEL,
+                                    "adapter_bundle_fingerprint_sha256": adapter_bundle_fingerprint(
+                                        adapter
+                                    ),
+                                    "peft_adapter_fingerprint_sha256": peft_adapter_fingerprint(
+                                        adapter
+                                    ),
+                                    "eval_data_fingerprint_sha256": SHA_EVAL,
+                                },
+                                "metrics": metrics(value),
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
                     eval_paths[side] = eval_path
-                manifest_runs.append({
-                    "seed": seed,
-                    "comparison_report": str(comparison_path),
-                    "python_evaluation_report": str(eval_paths["python"]),
-                    "zig_evaluation_report": str(eval_paths["zig"]),
-                })
-            manifest = {"contract": INPUT_CONTRACT, "minimums": minimums, "runs": manifest_runs}
+                manifest_runs.append(
+                    {
+                        "seed": seed,
+                        "comparison_report": str(comparison_path),
+                        "python_evaluation_report": str(eval_paths["python"]),
+                        "zig_evaluation_report": str(eval_paths["zig"]),
+                    }
+                )
+            manifest = {
+                "contract": INPUT_CONTRACT,
+                "minimums": minimums,
+                "runs": manifest_runs,
+            }
             derived = materialize_study(
                 manifest,
                 manifest_dir=root,
@@ -406,7 +509,9 @@ class ConvergenceSummaryTest(unittest.TestCase):
             )
             result = summarize(derived)
             self.assertTrue(result["pass"], result["failures"])
-            self.assertEqual(0.82, result["runs"][0]["python"]["metrics"]["entities.micro_f1"])
+            self.assertEqual(
+                0.82, result["runs"][0]["python"]["metrics"]["entities.micro_f1"]
+            )
 
             inline = copy.deepcopy(manifest)
             inline["metrics"] = metrics(1.0)

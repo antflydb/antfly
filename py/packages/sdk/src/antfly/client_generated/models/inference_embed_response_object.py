@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceEmbedResponseObject(str, Enum):
+class InferenceEmbedResponseObject(StrEnum):
     LIST = "list"
 
     def __str__(self) -> str:
