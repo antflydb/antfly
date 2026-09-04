@@ -211,6 +211,25 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertNotIn("id-token: write", release_build_workflow)
         self.assertNotIn("environment:", release_build_workflow)
         self.assertNotIn("publish_objectstorage.py", release_build_workflow)
+        for field in ("release_line:", "source_ref:", "source_ref_head:"):
+            self.assertIn(field, artifact_build_workflow)
+            self.assertIn(field, build_controller_workflow)
+        self.assertIn(
+            "python scripts/release/release_lines.py resolve",
+            build_controller_workflow,
+        )
+        self.assertIn(
+            'git merge-base --is-ancestor "$source_commit" "$source_ref_head"',
+            build_controller_workflow,
+        )
+        self.assertNotIn(
+            'test "$source_commit" = "$source_ref_head"',
+            build_controller_workflow,
+        )
+        self.assertIn(
+            "release-line policy changed after this controller was queued",
+            build_controller_workflow,
+        )
         self.assertIn("permissions:\n  contents: read", artifact_build_workflow)
         self.assertNotIn("contents: write", artifact_build_workflow)
         self.assertNotIn("id-token: write", artifact_build_workflow)
