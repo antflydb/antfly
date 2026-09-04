@@ -109,12 +109,19 @@ pub fn pageRankAlloc(alloc: Allocator, node_count: usize, edges: []const Edge, o
     if (node_count == 0) return .{ .scores = scores, .iterations_completed = 0, .converged = true, .delta = 0 };
     var next = try alloc.alloc(f64, node_count);
     defer alloc.free(next);
-    const out_degree = try alloc.alloc(u64, node_count);
-    defer alloc.free(out_degree);
-    @memset(out_degree, 0);
+    // Reuse one dense vector for the damped reciprocal out-degree. This moves
+    // division out of the O(E * iterations) edge loop without increasing peak
+    // memory over the previous degree vector.
+    const source_scale = try alloc.alloc(f64, node_count);
+    defer alloc.free(source_scale);
+    @memset(source_scale, 0);
     for (edges, 0..) |edge, i| {
         if (i % 4096 == 0) try options.cancellation.check();
-        out_degree[edge.source] += 1;
+        source_scale[edge.source] += 1;
+    }
+    for (source_scale, 0..) |*scale, i| {
+        if (i % 4096 == 0) try options.cancellation.check();
+        if (scale.* != 0) scale.* = options.damping / scale.*;
     }
     const count: f64 = @floatFromInt(node_count);
     @memset(scores, 1.0 / count);
@@ -125,15 +132,15 @@ pub fn pageRankAlloc(alloc: Allocator, node_count: usize, edges: []const Edge, o
         try options.cancellation.check();
         iteration += 1;
         var sink_mass: f64 = 0;
-        for (scores, out_degree, 0..) |score, degree, i| {
+        for (scores, source_scale, 0..) |score, scale, i| {
             if (i % 4096 == 0) try options.cancellation.check();
-            if (degree == 0) sink_mass += score;
+            if (scale == 0) sink_mass += score;
         }
         const base = (1.0 - options.damping + options.damping * sink_mass) / count;
         @memset(next, base);
         for (edges, 0..) |edge, i| {
             if (i % 4096 == 0) try options.cancellation.check();
-            next[edge.target] += options.damping * scores[edge.source] / @as(f64, @floatFromInt(out_degree[edge.source]));
+            next[edge.target] += scores[edge.source] * source_scale[edge.source];
         }
         delta = try swapAndDelta(&scores, &next, options.cancellation);
         if (!std.math.isFinite(delta)) return error.InvalidGraphMetricScore;

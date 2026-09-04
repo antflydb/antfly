@@ -18,14 +18,14 @@ import type {
   ConjunctionQuery,
   CreateIndexRequest,
   DisjunctionQuery,
-  GraphIndexStats,
-  GraphMetricBuildPageStatus,
-  GraphMetricQuery,
-  GraphMetricRuntimeStats,
   GraphAggregatesResult,
   GraphBindingsResult,
   GraphDocumentFilter,
+  GraphIndexStats,
   GraphMatchQuery,
+  GraphMetricBuildPageStatus,
+  GraphMetricQuery,
+  GraphMetricRuntimeStats,
   GraphNodesResult,
   IndexRuntimeCapabilities,
   LegacyGraphSearchResult,
@@ -568,9 +568,7 @@ describe("Antfly Query Type Integration", () => {
 
       expect(stats.graph_metric_runtime?.role).toBe("worker_pool");
       expect(stats.graph_metric_runtime?.owner_id_hash).toBe(17);
-      expectTypeOf(stats.graph_metric_runtime).toMatchTypeOf<
-        GraphMetricRuntimeStats | undefined
-      >();
+      expectTypeOf(stats.graph_metric_runtime).toMatchTypeOf<GraphMetricRuntimeStats | undefined>();
     });
   });
 

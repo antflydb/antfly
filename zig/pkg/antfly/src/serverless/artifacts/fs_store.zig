@@ -25,6 +25,23 @@ pub const FsStore = struct {
         inode: std.Io.File.INode,
         byte_len: u64,
         mtime_ns: i128,
+        ctime_ns: i128,
+
+        fn fromStat(file_stat: std.Io.File.Stat) VerifiedFile {
+            return .{
+                .inode = file_stat.inode,
+                .byte_len = file_stat.size,
+                .mtime_ns = file_stat.mtime.toNanoseconds(),
+                .ctime_ns = file_stat.ctime.toNanoseconds(),
+            };
+        }
+
+        fn matchesStat(self: VerifiedFile, file_stat: std.Io.File.Stat) bool {
+            return self.inode == file_stat.inode and
+                self.byte_len == file_stat.size and
+                self.mtime_ns == file_stat.mtime.toNanoseconds() and
+                self.ctime_ns == file_stat.ctime.toNanoseconds();
+        }
     };
 
     alloc: Allocator,
@@ -157,15 +174,11 @@ pub const FsStore = struct {
         defer file.close(io);
         const before = try file.stat(io);
         if (before.size != expected_byte_len) return error.ArtifactIntegrityMismatch;
-        const verified = VerifiedFile{
-            .inode = before.inode,
-            .byte_len = before.size,
-            .mtime_ns = before.mtime.toNanoseconds(),
-        };
+        const verified = VerifiedFile.fromStat(before);
         if (!self.isVerifiedFile(artifact_id, verified)) {
             try verifyOpenFileContent(file, io, expected_byte_len, expected_checksum, cancellation);
             const after = try file.stat(io);
-            if (after.inode != before.inode or after.size != before.size or !std.meta.eql(after.mtime, before.mtime)) {
+            if (!verified.matchesStat(after)) {
                 return error.ArtifactIntegrityMismatch;
             }
             try self.rememberVerifiedFile(artifact_id, verified);
@@ -173,7 +186,7 @@ pub const FsStore = struct {
         const payload = try readOpenFileRangeAllocWithCancellation(alloc, file, io, offset, len, cancellation);
         errdefer alloc.free(payload);
         const after_read = try file.stat(io);
-        if (after_read.inode != before.inode or after_read.size != before.size or !std.meta.eql(after_read.mtime, before.mtime)) {
+        if (!verified.matchesStat(after_read)) {
             self.forgetVerifiedFile(artifact_id);
             return error.ArtifactIntegrityMismatch;
         }
@@ -223,11 +236,7 @@ pub const FsStore = struct {
         defer io_impl.deinit();
         const before = try std.Io.Dir.cwd().statFile(io_impl.io(), path, .{});
         if (before.size != expected_byte_len) return error.ArtifactIntegrityMismatch;
-        const verified = VerifiedFile{
-            .inode = before.inode,
-            .byte_len = before.size,
-            .mtime_ns = before.mtime.toNanoseconds(),
-        };
+        const verified = VerifiedFile.fromStat(before);
         lockAtomic(&self.verified_mu);
         if (self.verified_files.get(artifact_id)) |cached| {
             if (std.meta.eql(cached, verified)) {
@@ -239,7 +248,7 @@ pub const FsStore = struct {
 
         try verifyPathContent(path, expected_byte_len, expected_checksum, cancellation);
         const after = try std.Io.Dir.cwd().statFile(io_impl.io(), path, .{});
-        if (after.inode != before.inode or after.size != before.size or !std.meta.eql(after.mtime, before.mtime)) return error.ArtifactIntegrityMismatch;
+        if (!verified.matchesStat(after)) return error.ArtifactIntegrityMismatch;
         try self.rememberVerifiedFile(artifact_id, verified);
     }
 
@@ -671,6 +680,52 @@ test "serverless fs artifact store detects and repairs same-length content corru
     const payload = try store.getAlloc(alloc, repaired.artifact_id);
     defer alloc.free(payload);
     try std.testing.expectEqualStrings("alpha", payload);
+}
+
+test "serverless fs artifact verification cache detects in-place mutation with restored mtime" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const root = tmpPath(&path_buf, "cached-in-place-corruption");
+    defer cleanupTmp(root);
+
+    var store = try FsStore.init(alloc, std.mem.span(root));
+    defer store.deinit();
+    var meta = try store.put(alloc, "alpha");
+    defer meta.deinit(alloc);
+    const path = try pathForArtifactAlloc(alloc, store.root_dir, meta.checksum);
+    defer alloc.free(path);
+
+    var iface = store.artifactStore();
+    try iface.verifyContentWithCancellationUsingAllocator(alloc, meta.artifact_id, meta.byte_len, meta.checksum, .none);
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const before = try std.Io.Dir.cwd().statFile(io, path, .{});
+    {
+        var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [32]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll("omega");
+        try writer.end();
+    }
+    try std.Io.Dir.cwd().setTimestamps(io, path, .{ .modify_timestamp = .{ .new = before.mtime } });
+    const after = try std.Io.Dir.cwd().statFile(io, path, .{});
+    try std.testing.expectEqual(before.inode, after.inode);
+    try std.testing.expectEqual(before.size, after.size);
+    try std.testing.expect(std.meta.eql(before.mtime, after.mtime));
+    try std.testing.expect(!std.meta.eql(before.ctime, after.ctime));
+
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, iface.getVerifiedRangeAllocWithCancellationUsingAllocator(
+        alloc,
+        meta.artifact_id,
+        meta.byte_len,
+        meta.checksum,
+        0,
+        5,
+        .none,
+    ));
 }
 
 test "fs artifact store rejects malformed content addresses before lookup" {

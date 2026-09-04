@@ -14,7 +14,10 @@ const bounded_decode = @import("../bounded_decode.zig");
 
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.
-pub const materializer_epoch: u32 = 1;
+// Epoch 2 adds decode-overlap admission and the reusable compiled-topology
+// projection path. Bump so manifests built under the older memory/work model
+// are not silently reused after rollout.
+pub const materializer_epoch: u32 = 2;
 const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {
@@ -29,6 +32,10 @@ pub const Limits = struct {
     max_total_graph_payload_bytes: usize = 512 * 1024 * 1024,
     max_metric_payload_bytes: usize = 256 * 1024 * 1024,
     max_total_metric_payload_bytes: usize = 512 * 1024 * 1024,
+    // Bounds the decoded topology, compiled projection, dense kernel vectors,
+    // sortable score ownership, and encoded output that may coexist for one
+    // materialization. Work and payload limits alone do not bound this peak.
+    max_peak_memory_bytes: usize = 1024 * 1024 * 1024,
     max_nodes: usize = 1_000_000,
     max_edges: usize = 10_000_000,
     max_work_items: u64 = 500_000_000,
@@ -101,6 +108,7 @@ pub fn validateLimits(limits: Limits) !void {
         limits.max_total_graph_payload_bytes == 0 or
         limits.max_metric_payload_bytes == 0 or
         limits.max_total_metric_payload_bytes == 0 or
+        limits.max_peak_memory_bytes == 0 or
         limits.max_nodes == 0 or
         limits.max_edges == 0 or
         limits.max_work_items == 0 or

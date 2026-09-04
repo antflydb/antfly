@@ -204,8 +204,7 @@ export type GraphMetricOrder = components["schemas"]["GraphMetricOrder"];
 export type GraphMetricProfile = components["schemas"]["GraphMetricProfile"];
 export type GraphMetricQuery = components["schemas"]["GraphMetricQuery"];
 export type GraphMetricRerank = components["schemas"]["GraphMetricRerank"];
-export type GraphMetricRerankScoreDetails =
-  components["schemas"]["GraphMetricRerankScoreDetails"];
+export type GraphMetricRerankScoreDetails = components["schemas"]["GraphMetricRerankScoreDetails"];
 export type GraphMetricResult = components["schemas"]["GraphMetricResult"];
 export type GraphMetricRuntimeStats = components["schemas"]["GraphMetricRuntimeStats"];
 export type GraphMetricScore = components["schemas"]["GraphMetricScore"];

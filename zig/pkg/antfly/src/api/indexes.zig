@@ -2488,7 +2488,6 @@ fn aggregateIndexStatusIndexed(
             }
         }
         if (index_observation_fresh) {
-            aggregate.table_doc_count +|= runtime.stats.source_doc_count;
             // Graph-metric maintenance is a runtime-wide observation, not an
             // index-incarnation artifact. Preserve fresh ownership and worker
             // progress even while this index's replacement materialization is
