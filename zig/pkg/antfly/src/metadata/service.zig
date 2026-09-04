@@ -12677,7 +12677,11 @@ pub fn refreshStoreStatusBackfillMarkerCacheNowWithIo(
 }
 
 fn monotonicMs() u64 {
-    return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    // Cache timestamps are compared with the borrowed I/O clock. Keep test
+    // fixtures in that same clock domain too: on platforms where `.awake`
+    // includes suspend time, POSIX CLOCK_MONOTONIC can otherwise make a fresh
+    // cache entry appear immediately expired after the machine has slept.
+    return monotonicMsWithIo(std.Options.debug_io);
 }
 
 fn monotonicMsWithIo(io: std.Io) u64 {

@@ -788,10 +788,77 @@ fn groupAwait(userdata: ?*anyopaque, group: *std.Io.Group, token: *anyopaque) st
 
 fn groupCancel(userdata: ?*anyopaque, group: *std.Io.Group, token: *anyopaque) void {
     const self = state(userdata);
-    self.tasks.groupCancel(group, token) catch {
-        self.latch(.group_cancel);
-        group.token.store(null, .release);
+    self.tasks.groupCancel(group, token) catch |err| switch (err) {
+        error.VoprIoAwaitOutsideTask => drainCanceledGroupFromRoot(self, group, token) catch |drain_err| {
+            self.latch(.group_cancel);
+            std.debug.panic("VoprIo could not synchronously cancel task group: {s}", .{@errorName(drain_err)});
+        },
+        else => {
+            self.latch(.group_cancel);
+            std.debug.panic("VoprIo rejected task group cancellation: {s}", .{@errorName(err)});
+        },
     };
+}
+
+fn drainCanceledGroupFromRoot(
+    self: *VoprIo,
+    group: *std.Io.Group,
+    token: *anyopaque,
+) !void {
+    var enabled: transition.List = .{};
+    defer enabled.deinit(self.tasks.allocator);
+    var sink: event.Sink = .{};
+    defer sink.deinit(self.tasks.allocator);
+    var last_task_actor: ?ids.StableId = null;
+    var task_resume_streak: usize = 0;
+    const max_task_resume_streak = 16;
+    var transitions_executed: usize = 0;
+    const transition_budget = @max(self.tasks.config.max_tasks *| 64, 4096);
+
+    while (try self.tasks.groupHasPending(group, token)) {
+        if (transitions_executed == transition_budget)
+            return error.VoprIoGroupCancelTransitionBudgetExceeded;
+        enabled.items.clearRetainingCapacity();
+        sink.deinit(self.tasks.allocator);
+        sink = .{};
+        try enumerateReady(self, &enabled, self.tasks.allocator);
+        try enabled.canonicalize();
+        if (enabled.items.items.len == 0) return error.VoprIoGroupCancelStalled;
+
+        // The caller is outside the modeled fibers and cannot park. Use the
+        // same stable round-robin cleanup policy as history teardown so that
+        // cancellation defers and their dependencies all make progress.
+        var first_task: ?transition.Transition = null;
+        var next_task: ?transition.Transition = null;
+        var first_non_task: ?transition.Transition = null;
+        for (enabled.items.items) |candidate| {
+            if (std.mem.eql(u8, candidate.name, "vopr-io.task_resume")) {
+                const actor_id = candidate.actor_id orelse continue;
+                if (first_task == null or actor_id < first_task.?.actor_id.?)
+                    first_task = candidate;
+                if (last_task_actor) |last| {
+                    if (actor_id > last and
+                        (next_task == null or actor_id < next_task.?.actor_id.?))
+                        next_task = candidate;
+                }
+            } else if (first_non_task == null) {
+                first_non_task = candidate;
+            }
+        }
+        const selected = if (task_resume_streak >= max_task_resume_streak and first_non_task != null)
+            first_non_task.?
+        else
+            next_task orelse first_task orelse first_non_task.?;
+        if (std.mem.eql(u8, selected.name, "vopr-io.task_resume")) {
+            last_task_actor = selected.actor_id.?;
+            task_resume_streak +|= 1;
+        } else {
+            task_resume_streak = 0;
+        }
+        try executeReady(self, selected.id, &sink, self.tasks.allocator);
+        transitions_executed += 1;
+    }
+    try self.tasks.finishRootGroupCancel(group, token);
 }
 
 fn recancel(userdata: ?*anyopaque) void {
@@ -1999,6 +2066,55 @@ test "VoprIo groups and futex wake ordering remain scheduler visible" {
     }
     try std.testing.expect(saw_choice);
     try std.testing.expectEqual(@as(u32, 2), shared.completed);
+    try sim.ensureNoCapabilityViolation();
+}
+
+test "VoprIo root group cancellation discards queued work and drains entered work" {
+    const Shared = struct {
+        io: std.Io,
+        queued_ran: bool = false,
+        entered: bool = false,
+        cleaned: bool = false,
+
+        fn queued(self: *@This()) std.Io.Cancelable!void {
+            self.queued_ran = true;
+        }
+
+        fn worker(self: *@This()) std.Io.Cancelable!void {
+            defer self.cleaned = true;
+            self.entered = true;
+            const forever: std.Io.Timeout = .none;
+            try forever.sleep(self.io);
+        }
+    };
+
+    var sim = try VoprIo.init(.{
+        .required = .of(&.{ .task_scheduling, .sleep }),
+    });
+    defer sim.deinit();
+    var shared = Shared{ .io = sim.io() };
+
+    var queued_group: std.Io.Group = .init;
+    queued_group.async(shared.io, Shared.queued, .{&shared});
+    queued_group.cancel(shared.io);
+    try std.testing.expect(!shared.queued_ran);
+    try std.testing.expect(sim.scheduler().quiescent());
+
+    var entered_group: std.Io.Group = .init;
+    entered_group.async(shared.io, Shared.worker, .{&shared});
+    var enabled: transition.List = .{};
+    defer enabled.deinit(std.testing.allocator);
+    var sink: event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+    try sim.scheduler().enumerateReady(&enabled, std.testing.allocator);
+    try enabled.canonicalize();
+    try sim.scheduler().executeReady(enabled.items.items[0].id, &sink, std.testing.allocator);
+    try std.testing.expect(shared.entered);
+    try std.testing.expect(!shared.cleaned);
+
+    entered_group.cancel(shared.io);
+    try std.testing.expect(shared.cleaned);
+    try std.testing.expect(sim.scheduler().quiescent());
     try sim.ensureNoCapabilityViolation();
 }
 

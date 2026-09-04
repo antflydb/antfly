@@ -107,6 +107,11 @@ const Task = struct {
     result_offset: usize,
     result_len: usize,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    /// False until the fiber has entered its user callback. A group canceled
+    /// from the harness may discard members which never started, matching the
+    /// synchronous `std.Io.Group.cancel` contract without running canceled
+    /// work merely to tear its fiber down.
+    started: bool = false,
     status: Status = .runnable,
     awaiter: ?*Task = null,
     waiting_on_future: ?*Task = null,
@@ -191,6 +196,7 @@ const Entry = struct {
     fn call(entry_context: *Entry, _: *const std.Io.fiber.Switch) callconv(.withStackAlign(.c, stack_alignment)) noreturn {
         const task = entry_context.task;
         task.kernel.setCurrent(task);
+        task.started = true;
         task.start(task.contextBytes().ptr, task.resultBytes().ptr);
         task.kernel.finishCurrent(task);
     }
@@ -455,6 +461,7 @@ pub const Kernel = struct {
         const group: *GroupState = @ptrCast(@alignCast(token));
         if (group.public != public_group) return error.InvalidVoprIoGroup;
         self.cancelGroupTasks(group);
+        self.discardUnstartedGroupTasks(group);
         while (group.tasks.items.len != 0) {
             const awaiter = self.currentTask() orelse return error.VoprIoAwaitOutsideTask;
             if (group.awaiter != null) return error.InvalidVoprIoGroup;
@@ -465,6 +472,31 @@ pub const Kernel = struct {
             awaiter.waiting_on_group = null;
             group.awaiter = null;
         }
+        self.destroyGroup(group);
+    }
+
+    /// Whether a root-side group cancellation still has entered fibers to
+    /// unwind. The VoprIo shell uses this to honor Group.cancel's synchronous
+    /// contract when no modeled task exists to park as the awaiter.
+    pub fn groupHasPending(
+        self: *Kernel,
+        public_group: *std.Io.Group,
+        token: *anyopaque,
+    ) !bool {
+        _ = self;
+        const group: *GroupState = @ptrCast(@alignCast(token));
+        if (group.public != public_group) return error.InvalidVoprIoGroup;
+        return group.tasks.items.len != 0;
+    }
+
+    pub fn finishRootGroupCancel(
+        self: *Kernel,
+        public_group: *std.Io.Group,
+        token: *anyopaque,
+    ) !void {
+        const group: *GroupState = @ptrCast(@alignCast(token));
+        if (group.public != public_group or group.tasks.items.len != 0)
+            return error.InvalidVoprIoGroup;
         self.destroyGroup(group);
     }
 
@@ -960,6 +992,17 @@ pub const Kernel = struct {
         _ = self;
         group.cancel_requested = true;
         for (group.tasks.items) |task| task.requestCancel();
+    }
+
+    fn discardUnstartedGroupTasks(self: *Kernel, group: *GroupState) void {
+        var index = group.tasks.items.len;
+        while (index != 0) {
+            index -= 1;
+            const task = group.tasks.items[index];
+            if (task.started) continue;
+            _ = group.tasks.orderedRemove(index);
+            self.removeAndDestroyTask(task);
+        }
     }
 
     fn hasFutexWaiter(self: *const Kernel, ptr: *const u32) bool {
