@@ -1971,10 +1971,21 @@ fn countParsedDenseEmbedTextTokens(
     io: ?std.Io,
     tokenizer: anytype,
     inputs: *const ParsedDenseEmbedInputs,
+    text_prefix: []const u8,
 ) usize {
     var total: usize = 0;
     for (inputs.texts.items) |item| {
-        total += countTokenizerTokens(allocator, io, tokenizer, item.text) catch estimateTextTokens(item.text);
+        if (text_prefix.len == 0) {
+            total +|= countTokenizerTokens(allocator, io, tokenizer, item.text) catch estimateTextTokens(item.text);
+            continue;
+        }
+
+        const rendered = std.fmt.allocPrint(allocator, "{s}{s}", .{ text_prefix, item.text }) catch {
+            total +|= estimateTextTokens(text_prefix) +| estimateTextTokens(item.text);
+            continue;
+        };
+        defer allocator.free(rendered);
+        total +|= countTokenizerTokens(allocator, io, tokenizer, rendered) catch estimateTextTokens(rendered);
     }
     return total;
 }
@@ -2034,6 +2045,46 @@ test "token counting uses the attached std.Io tokenizer path" {
     );
     try std.testing.expectEqual(@as(usize, 1), parallel_calls);
     try std.testing.expectEqual(@as(usize, 1), serial_calls);
+}
+
+test "dense embedding token usage includes the applied text prefix" {
+    const ByteTokenizer = struct {
+        pub fn encodeInto(
+            _: @This(),
+            allocator: std.mem.Allocator,
+            text: []const u8,
+            ids: *std.ArrayListUnmanaged(i32),
+        ) !void {
+            try ids.appendNTimes(allocator, 1, text.len);
+        }
+
+        pub fn encodeIntoParallel(
+            self: @This(),
+            _: std.Io,
+            allocator: std.mem.Allocator,
+            text: []const u8,
+            ids: *std.ArrayListUnmanaged(i32),
+            _: usize,
+        ) !void {
+            try self.encodeInto(allocator, text, ids);
+        }
+    };
+
+    var inputs: ParsedDenseEmbedInputs = .{};
+    defer inputs.deinit(std.testing.allocator);
+    try inputs.texts.append(std.testing.allocator, .{ .index = 0, .text = "body" });
+    inputs.total_count = 1;
+
+    try std.testing.expectEqual(
+        @as(usize, "query: body".len),
+        countParsedDenseEmbedTextTokens(
+            std.testing.allocator,
+            null,
+            ByteTokenizer{},
+            &inputs,
+            "query: ",
+        ),
+    );
 }
 
 fn estimateParsedDenseEmbedPromptTokens(inputs: *const ParsedDenseEmbedInputs) usize {
@@ -6015,6 +6066,12 @@ pub const Node = struct {
         defer admission_manifest.deinit();
 
         if (admission_manifest.hasCapability("sparse")) {
+            validateSparseEmbeddingRequestOptions(request) catch |err| {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = embedRequestOptionErrorMessage(err),
+                });
+            };
             const sparse_texts = parseSparseEmbedInputs(ctx.allocator, request.input) catch {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
@@ -6150,7 +6207,13 @@ pub const Node = struct {
                 );
                 defer if (owned_request_prefix) |prefix| attempt.allocator.free(prefix);
                 attempt.prompt_tokens = if (attempt.inputs.texts.items.len > 0)
-                    countParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.inputs)
+                    countParsedDenseEmbedTextTokens(
+                        attempt.allocator,
+                        attempt.io,
+                        model.getTokenizer(),
+                        attempt.inputs,
+                        pipeline.config.text_prefix,
+                    )
                 else
                     estimateParsedDenseEmbedPromptTokens(attempt.inputs);
 
@@ -17982,9 +18045,9 @@ fn applyDenseEmbeddingRequestOptions(
 
     const task_type = request.task_type orelse EmbeddingTaskType.RETRIEVAL_DOCUMENT;
     const query_side = switch (style) {
-        // Qwen3-Embedding instructs every non-document task (matches the
-        // model card's MTEB usage: classification/clustering/STS inputs all
-        // carry a task instruction).
+        // Qwen3-Embedding supports every non-document task through its
+        // instruction wrapper, but only retrieval queries have a model-owned
+        // default instruction.
         .qwen3_embedding => !task_type.usesDocumentPrefix(),
         else => task_type.usesQueryPrefix(),
     };
@@ -18004,6 +18067,9 @@ fn applyDenseEmbeddingRequestOptions(
             pipeline.config.text_prefix = owned;
             return owned;
         }
+        if (style == .qwen3_embedding and task_type != .RETRIEVAL_QUERY) {
+            return error.InstructionRequiredForEmbeddingTask;
+        }
         pipeline.config.text_prefix = manifest.embedding_profile.query.prefix;
         return null;
     }
@@ -18019,6 +18085,7 @@ fn isEmbedRequestOptionError(err: anyerror) bool {
     return switch (err) {
         error.UnsupportedEmbeddingTaskType,
         error.InstructionNotSupportedForModel,
+        error.InstructionRequiredForEmbeddingTask,
         error.InstructionRequiresQueryTask,
         => true,
         else => false,
@@ -18029,9 +18096,29 @@ fn embedRequestOptionErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.UnsupportedEmbeddingTaskType => "task_type must be a query/document retrieval task for this embedding model",
         error.InstructionNotSupportedForModel => "instruction is only supported for instruction-aware embedding models",
+        error.InstructionRequiredForEmbeddingTask => "instruction is required for this embedding task_type because the model has no task-specific default",
         error.InstructionRequiresQueryTask => "instruction requires a query-side task_type (documents are embedded without instructions)",
         else => "invalid embedding options",
     };
+}
+
+fn validateSparseEmbeddingRequestOptions(request: ParsedEmbedRequest) !void {
+    if (request.instruction != null) return error.InstructionNotSupportedForModel;
+}
+
+test "sparse embedding request options reject instructions" {
+    const request = ParsedEmbedRequest{
+        .model = "sparse-model",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task_type = .RETRIEVAL_QUERY,
+        .instruction = "Retrieve relevant passages",
+    };
+    try std.testing.expectError(
+        error.InstructionNotSupportedForModel,
+        validateSparseEmbeddingRequestOptions(request),
+    );
 }
 
 fn parseSparseEmbedInputs(
@@ -19192,8 +19279,8 @@ test "qwen3 embedding request options wrap queries with instructions" {
     try applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, document_request);
     try std.testing.expectEqualStrings("", pipeline.config.text_prefix);
 
-    // Non-retrieval task types are instruction-side for Qwen3-Embedding
-    // (unlike Jina, which rejects them).
+    // Non-retrieval task types require an explicit task instruction. Reusing
+    // the web-retrieval default would silently produce the wrong embeddings.
     const clustering_request = ParsedEmbedRequest{
         .model = "qwen3-embedding",
         .input = .{ .string = "hello" },
@@ -19201,9 +19288,28 @@ test "qwen3 embedding request options wrap queries with instructions" {
         .dimensions = null,
         .task_type = .CLUSTERING,
     };
-    try applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, clustering_request);
+    try std.testing.expectError(
+        error.InstructionRequiredForEmbeddingTask,
+        applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, clustering_request),
+    );
+
+    const instructed_clustering_request = ParsedEmbedRequest{
+        .model = "qwen3-embedding",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task_type = .CLUSTERING,
+        .instruction = "Group texts by their primary topic",
+    };
+    const clustering_prefix = try applyDenseEmbeddingRequestOptions(
+        allocator,
+        &pipeline,
+        &manifest,
+        instructed_clustering_request,
+    );
+    defer if (clustering_prefix) |prefix| allocator.free(prefix);
     try std.testing.expectEqualStrings(
-        manifest_mod.qwen3_embedding_default_query_prefix,
+        "Instruct: Group texts by their primary topic\nQuery:",
         pipeline.config.text_prefix,
     );
 

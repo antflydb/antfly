@@ -1,10 +1,10 @@
 {
   "args": {
-    "antfly_build_file": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/zig-out/bin/antfly-inference",
+    "antfly_build_file": "<workdir>/zig-out/bin/antfly-inference",
     "antfly_build_id": "d90bd83a+dirty-metal-3a0e8f0e",
-    "antfly_model_file": "/Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
+    "antfly_model_file": "~/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
     "antfly_reported_token_offset": -1,
-    "antfly_server_args": "run --host 127.0.0.1 --port 18099 --models-dir /Users/timkaye/.antfly/inference/models --max-loaded-models 1 --max-concurrent-requests 1 --preload-model embedder:metal:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
+    "antfly_server_args": "run --host 127.0.0.1 --port 18099 --models-dir ~/.antfly/inference/models --max-loaded-models 1 --max-concurrent-requests 1 --preload-model embedder:metal:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
     "antfly_server_pid": 76848,
     "batch_sizes": [
       1
@@ -23,9 +23,9 @@
     "reference_build_file": "/opt/homebrew/bin/llama-server",
     "reference_build_id": "b8990-660b1b4bd",
     "reference_model": "qwen3-embedding-reference",
-    "reference_model_file": "/Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
+    "reference_model_file": "~/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
     "reference_reported_token_offset": 0,
-    "reference_server_args": "-m /Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf --alias qwen3-embedding-reference --embeddings --pooling last -c 4096 -b 4096 -ub 4096 --flash-attn on --cache-ram 0 --parallel 1 --host 127.0.0.1 --port 8080",
+    "reference_server_args": "-m ~/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf --alias qwen3-embedding-reference --embeddings --pooling last -c 4096 -b 4096 -ub 4096 --flash-attn on --cache-ram 0 --parallel 1 --host 127.0.0.1 --port 8080",
     "reference_server_pid": 76861,
     "reference_url": "http://127.0.0.1:8080/v1/embeddings",
     "require_comparable": true,
@@ -48,7 +48,7 @@
           "--port",
           "18099",
           "--models-dir",
-          "/Users/timkaye/.antfly/inference/models",
+          "~/.antfly/inference/models",
           "--max-loaded-models",
           "1",
           "--max-concurrent-requests",
@@ -56,15 +56,15 @@
           "--preload-model",
           "embedder:metal:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
         ],
-        "command": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/zig-out/bin/antfly-inference run --host 127.0.0.1 --port 18099 --models-dir /Users/timkaye/.antfly/inference/models --max-loaded-models 1 --max-concurrent-requests 1 --preload-model embedder:metal:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
-        "executable": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/zig-out/bin/antfly-inference",
+        "command": "<workdir>/zig-out/bin/antfly-inference run --host 127.0.0.1 --port 18099 --models-dir ~/.antfly/inference/models --max-loaded-models 1 --max-concurrent-requests 1 --preload-model embedder:metal:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
+        "executable": "<workdir>/zig-out/bin/antfly-inference",
         "executable_sha256": "06b0824cd0dfc10e3736d3f3f30af4df2c183728707b358e12a91efdd130afdb",
         "pid": 76848
       },
       "reference": {
         "argv": [
           "-m",
-          "/Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
+          "~/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
           "--alias",
           "qwen3-embedding-reference",
           "--embeddings",
@@ -87,7 +87,7 @@
           "--port",
           "8080"
         ],
-        "command": "/opt/homebrew/bin/llama-server -m /Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf --alias qwen3-embedding-reference --embeddings --pooling last -c 4096 -b 4096 -ub 4096 --flash-attn on --cache-ram 0 --parallel 1 --host 127.0.0.1 --port 8080",
+        "command": "/opt/homebrew/bin/llama-server -m ~/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf --alias qwen3-embedding-reference --embeddings --pooling last -c 4096 -b 4096 -ub 4096 --flash-attn on --cache-ram 0 --parallel 1 --host 127.0.0.1 --port 8080",
         "executable": "/opt/homebrew/Cellar/llama.cpp/8990/bin/llama-server",
         "executable_sha256": "8eee1b1fa1c65d919c94116dd286134a4a9498059c21c1ee448c45fb87f2c590",
         "pid": 76861
@@ -95,19 +95,19 @@
     },
     "model_files": {
       "antfly": {
-        "path": "/Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
+        "path": "~/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
         "sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439"
       },
       "identical": true,
       "reference": {
-        "path": "/Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
+        "path": "~/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf",
         "sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439"
       }
     },
     "sample_order": "alternating AB/BA",
     "server_args": {
-      "antfly": "run --host 127.0.0.1 --port 18099 --models-dir /Users/timkaye/.antfly/inference/models --max-loaded-models 1 --max-concurrent-requests 1 --preload-model embedder:metal:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
-      "reference": "-m /Users/timkaye/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf --alias qwen3-embedding-reference --embeddings --pooling last -c 4096 -b 4096 -ub 4096 --flash-attn on --cache-ram 0 --parallel 1 --host 127.0.0.1 --port 8080"
+      "antfly": "run --host 127.0.0.1 --port 18099 --models-dir ~/.antfly/inference/models --max-loaded-models 1 --max-concurrent-requests 1 --preload-model embedder:metal:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
+      "reference": "-m ~/.antfly/inference/models/Qwen/Qwen3-Embedding-0.6B-GGUF--antfly-e460675e6641920f/Qwen3-Embedding-0.6B-Q8_0.gguf --alias qwen3-embedding-reference --embeddings --pooling last -c 4096 -b 4096 -ub 4096 --flash-attn on --cache-ram 0 --parallel 1 --host 127.0.0.1 --port 8080"
     },
     "strict": true,
     "thermal_preconditioning": {

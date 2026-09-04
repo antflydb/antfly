@@ -1065,16 +1065,6 @@ pub fn localAntflyDirectDenseParts(
     return out;
 }
 
-fn localAntflyEmbedDensePartsWithContext(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    parts: []const antfly.template.ContentPart,
-    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
-) anyerror![][]f32 {
-    return try localAntflyEmbedDensePartsWithExecutionContext(ptr, alloc, model, parts, context.io, context.deadline_ns);
-}
-
 fn localAntflyEmbedSparseTexts(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,

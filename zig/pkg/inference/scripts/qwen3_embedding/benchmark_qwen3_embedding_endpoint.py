@@ -31,6 +31,29 @@ FIXTURE_SCHEMA = "antfly.qwen3_embedding.benchmark_fixture.v2"
 LEGACY_FIXTURE_SCHEMA = "antfly.qwen3_embedding.benchmark_fixture.v1"
 REPORT_SCHEMA = "antfly.qwen3_embedding.endpoint_benchmark.v2"
 
+
+def portable_report(report: Any, *, workdir: Path, home: Path) -> Any:
+    """Replace machine-specific paths before persisting a benchmark report."""
+    replacements = sorted(
+        ((str(workdir.resolve()), "<workdir>"), (str(home.resolve()), "~")),
+        key=lambda replacement: len(replacement[0]),
+        reverse=True,
+    )
+
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, str):
+            for local_path, portable_path in replacements:
+                value = value.replace(local_path, portable_path)
+            return value
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        if isinstance(value, dict):
+            return {key: sanitize(item) for key, item in value.items()}
+        return value
+
+    return sanitize(report)
+
+
 VOCABULARY = [
     "ant",
     "colony",
@@ -163,6 +186,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="shell-quoted live argv after the reference executable; strict mode matches it exactly",
     )
     parser.add_argument("--output", type=Path, help="write results JSON to this path")
+    parser.add_argument(
+        "--include-local-paths",
+        action="store_true",
+        help="preserve absolute local paths in the persisted report",
+    )
     args = parser.parse_args(argv)
     args.batch_sizes = [
         int(value) for value in args.batch_sizes.split(",") if value.strip()
@@ -977,8 +1005,14 @@ def main(argv: list[str] | None = None) -> int:
                 failed = True
     report["pass"] = not failed
     if args.output:
+        persisted_report = (
+            report
+            if args.include_local_paths
+            else portable_report(report, workdir=Path.cwd(), home=Path.home())
+        )
         args.output.write_text(
-            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            json.dumps(persisted_report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
         print(f"wrote {args.output}")
     return 1 if failed else 0

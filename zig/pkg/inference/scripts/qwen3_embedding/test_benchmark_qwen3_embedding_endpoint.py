@@ -66,6 +66,33 @@ class CorpusTests(unittest.TestCase):
         )
 
 
+class ReportPortabilityTests(unittest.TestCase):
+    def test_portable_report_redacts_workdir_and_home_recursively(self) -> None:
+        report = {
+            "model": "/Users/alice/src/antfly/models/model.gguf",
+            "servers": [
+                {
+                    "argv": "/Users/alice/src/antfly/zig-out/bin/antfly",
+                    "cache": "/Users/alice/.antfly/models",
+                    "system": "/opt/homebrew/bin/llama-server",
+                }
+            ],
+        }
+
+        portable = benchmark.portable_report(
+            report,
+            workdir=Path("/Users/alice/src/antfly"),
+            home=Path("/Users/alice"),
+        )
+
+        self.assertEqual("<workdir>/models/model.gguf", portable["model"])
+        self.assertEqual("<workdir>/zig-out/bin/antfly", portable["servers"][0]["argv"])
+        self.assertEqual("~/.antfly/models", portable["servers"][0]["cache"])
+        self.assertEqual(
+            "/opt/homebrew/bin/llama-server", portable["servers"][0]["system"]
+        )
+
+
 class StatsTests(unittest.TestCase):
     def test_percentile_ranks(self) -> None:
         samples = [float(value) for value in range(1, 101)]
