@@ -40,6 +40,14 @@ const receipt_capacity_key = "\x00\x00__api_idempotent_receipt_capacity_v1__";
 // out of storage keys; the canonical session remains authoritative.
 const interactive_inventory_prefix = "\x00\x00__api_txn_session_inventory_v1__:";
 const receipt_inventory_prefix = "\x00\x00__api_idempotent_receipt_inventory_v1__:";
+// Pre-index rows retain immutable membership in a separate compatibility
+// projection. Once its durable migration marker is published, inventories can
+// read both generations through principal-scoped keys without revisiting the
+// global canonical namespaces on every traversal.
+const interactive_legacy_inventory_prefix = "\x00\x00__api_txn_session_legacy_inventory_v1__:";
+const receipt_legacy_inventory_prefix = "\x00\x00__api_idempotent_receipt_legacy_inventory_v1__:";
+const interactive_legacy_inventory_complete_key = "\x00\x00__api_txn_session_legacy_inventory_complete_v1__";
+const receipt_legacy_inventory_complete_key = "\x00\x00__api_idempotent_receipt_legacy_inventory_complete_v1__";
 var txn_id_nonce: std.atomic.Value(u64) = .init(0);
 var owner_incarnation_nonce: std.atomic.Value(u64) = .init(1);
 
@@ -638,6 +646,7 @@ pub const SessionListResponse = struct {
 pub const SessionListCursorPhase = enum {
     inventory,
     legacy,
+    legacy_index,
 };
 
 pub const SessionListCursor = struct {
@@ -1467,6 +1476,12 @@ pub const DurableSessionStore = struct {
                 error.NotFound => {},
                 else => return err,
             };
+            const legacy_inventory_key = try makeSessionLegacyInventoryKey(self.alloc, kind, previous.principal, txn_id);
+            defer self.alloc.free(legacy_inventory_key);
+            txn.delete(legacy_inventory_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
         }
         txn.delete(key) catch |err| switch (err) {
             error.NotFound => {},
@@ -1659,6 +1674,149 @@ pub const DurableSessionStore = struct {
         }
     }
 
+    fn repairLegacySessionInventoryForPrincipal(
+        self: *DurableSessionStore,
+        txn_id: db_mod.types.TxnId,
+        kind: SessionKind,
+        indexed_principal: ?[]const u8,
+    ) !void {
+        const stale_key = try makeSessionLegacyInventoryKey(self.alloc, kind, indexed_principal, txn_id);
+        defer self.alloc.free(stale_key);
+        switch (self.backend) {
+            .docstore => |store| {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                txn.delete(stale_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                try txn.commit();
+            },
+            .runtime => |store| {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                txn.delete(stale_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                try txn.commit();
+            },
+        }
+    }
+
+    fn refreshLegacySessionInventoryTxn(
+        self: *DurableSessionStore,
+        txn: anytype,
+        txn_id: db_mod.types.TxnId,
+        kind: SessionKind,
+    ) !void {
+        const session_key = try makeSessionKeyForKind(self.alloc, txn_id, kind);
+        defer self.alloc.free(session_key);
+        const raw = txn.get(session_key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        var session = try decodeSessionRecord(self.alloc, txn_id, raw);
+        defer session.deinit(self.alloc);
+        if (sessionKind(session) != kind) return error.InvalidTransactionSessionRecord;
+
+        const current_key = try makeSessionInventoryKey(self.alloc, kind, session.principal, txn_id);
+        defer self.alloc.free(current_key);
+        const legacy_key = try makeSessionLegacyInventoryKey(self.alloc, kind, session.principal, txn_id);
+        defer self.alloc.free(legacy_key);
+        const current_exists = txn.get(current_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (current_exists != null) {
+            txn.delete(legacy_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        } else {
+            try txn.put(legacy_key, &.{});
+        }
+    }
+
+    /// Materializes immutable pre-index membership into its own principal
+    /// projection. It never inserts into the current-writer index, so a row
+    /// cannot move between phases of an in-progress inventory traversal.
+    pub fn refreshLegacySessionInventory(
+        self: *DurableSessionStore,
+        txn_id: db_mod.types.TxnId,
+        kind: SessionKind,
+    ) !void {
+        // The audit is continuous so it can observe a lagging rolling-upgrade
+        // writer even after the first migration pass. Keep steady-state work
+        // read-only: only a genuinely unprojected legacy row opens a write
+        // transaction.
+        var session = (try self.loadForKind(txn_id, kind)) orelse return;
+        defer session.deinit(self.alloc);
+        if (try self.hasSessionInventoryEntry(kind, session.principal, txn_id)) return;
+        if (try self.hasLegacySessionInventoryEntry(kind, session.principal, txn_id)) return;
+        switch (self.backend) {
+            .docstore => |store| {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                try self.refreshLegacySessionInventoryTxn(&txn, txn_id, kind);
+                try txn.commit();
+            },
+            .runtime => |store| {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                try self.refreshLegacySessionInventoryTxn(&txn, txn_id, kind);
+                try txn.commit();
+            },
+        }
+    }
+
+    pub fn markLegacySessionInventoryComplete(self: *DurableSessionStore, kind: SessionKind) !void {
+        if (try self.legacySessionInventoryKindComplete(kind)) return;
+        const key = sessionLegacyInventoryCompleteKey(kind);
+        switch (self.backend) {
+            .docstore => |store| {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                try txn.put(key, "1");
+                try txn.commit();
+            },
+            .runtime => |store| {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                try txn.put(key, "1");
+                try txn.commit();
+            },
+        }
+    }
+
+    fn legacySessionInventoryKindComplete(self: *DurableSessionStore, kind: SessionKind) !bool {
+        const key = sessionLegacyInventoryCompleteKey(kind);
+        return switch (self.backend) {
+            .docstore => |store| blk: {
+                const raw = store.get(self.alloc, key) catch |err| switch (err) {
+                    error.NotFound => break :blk false,
+                    else => return err,
+                };
+                defer self.alloc.free(raw);
+                break :blk true;
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                _ = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => break :blk false,
+                    else => return err,
+                };
+                break :blk true;
+            },
+        };
+    }
+
+    fn legacySessionInventoryComplete(self: *DurableSessionStore) !bool {
+        return try self.legacySessionInventoryKindComplete(.interactive) and
+            try self.legacySessionInventoryKindComplete(.idempotent_receipt);
+    }
+
     /// Rechecks the current durable row under a write transaction before
     /// backfilling its index entry, avoiding stale audit results.
     pub fn refreshRecoveryIndex(self: *DurableSessionStore, txn_id: db_mod.types.TxnId, kind: SessionKind) !void {
@@ -1803,6 +1961,35 @@ pub const DurableSessionStore = struct {
         };
     }
 
+    fn hasLegacySessionInventoryEntry(
+        self: *DurableSessionStore,
+        kind: SessionKind,
+        principal: ?[]const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !bool {
+        const key = try makeSessionLegacyInventoryKey(self.alloc, kind, principal, txn_id);
+        defer self.alloc.free(key);
+        return switch (self.backend) {
+            .docstore => |store| blk: {
+                const raw = store.get(self.alloc, key) catch |err| switch (err) {
+                    error.NotFound => break :blk false,
+                    else => return err,
+                };
+                defer self.alloc.free(raw);
+                break :blk true;
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                _ = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => break :blk false,
+                    else => return err,
+                };
+                break :blk true;
+            },
+        };
+    }
+
     /// Compatibility phase for sessions written by a binary that predates
     /// the principal inventory index. The canonical namespace is scanned with
     /// a bounded raw-record budget and only rows absent from the new index are
@@ -1908,6 +2095,106 @@ pub const DurableSessionStore = struct {
         };
     }
 
+    /// Reads the fully materialized pre-index generation through its own
+    /// principal projection. Membership in this generation is immutable, so
+    /// background repair cannot move a row behind either phase cursor.
+    fn scanLegacyIndexedSessionPage(
+        self: *DurableSessionStore,
+        alloc: std.mem.Allocator,
+        principal: ?[]const u8,
+        after: SessionListCursor,
+        limit: usize,
+    ) !SessionPage {
+        std.debug.assert(after.phase == .legacy_index);
+        var sessions = std.ArrayListUnmanaged(Session).empty;
+        errdefer {
+            for (sessions.items) |*session| session.deinit(alloc);
+            sessions.deinit(alloc);
+        }
+        if (limit == 0) return .{ .sessions = try sessions.toOwnedSlice(alloc) };
+
+        const kinds = [_]SessionKind{ .interactive, .idempotent_receipt };
+        var bounded_continuation: ?SessionListCursor = null;
+        for (kinds) |kind| {
+            if (sessionKindIndex(kind) < sessionKindIndex(after.kind)) continue;
+            const prefix = try makeSessionLegacyInventoryPrefix(alloc, kind, principal);
+            defer alloc.free(prefix);
+            const start_key = if (kind == after.kind and !after.legacy_start)
+                try makeSessionLegacyInventoryKey(alloc, kind, principal, after.txn_id)
+            else
+                null;
+            defer if (start_key) |key| alloc.free(key);
+            var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
+            defer ids.deinit(alloc);
+            const Scan = struct {
+                allocator: std.mem.Allocator,
+                prefix: []const u8,
+                target: usize,
+                ids: *std.ArrayListUnmanaged(db_mod.types.TxnId),
+                candidate_scan_count: *usize,
+
+                fn visit(raw: *anyopaque, key: []const u8, _: []const u8) anyerror!bool {
+                    const scan: *@This() = @ptrCast(@alignCast(raw));
+                    if (key.len <= scan.prefix.len) return error.InvalidTransactionSessionRecord;
+                    const txn_id = distributed_txn.parseTxnIdHex(key[scan.prefix.len..]) catch
+                        return error.InvalidTransactionSessionRecord;
+                    if (comptime @import("builtin").is_test) scan.candidate_scan_count.* += 1;
+                    try scan.ids.append(scan.allocator, txn_id);
+                    return scan.ids.items.len < scan.target;
+                }
+            };
+            var id_scan = Scan{
+                .allocator = alloc,
+                .prefix = prefix,
+                .target = limit + 1 - sessions.items.len,
+                .ids = &ids,
+                .candidate_scan_count = &self.inventory_candidate_scan_count_for_test,
+            };
+            try self.scanPrefixFromWithContext(prefix, start_key, &id_scan, Scan.visit);
+            for (ids.items) |txn_id| {
+                var persisted = (try self.loadForKind(txn_id, kind)) orelse {
+                    try self.repairLegacySessionInventoryForPrincipal(txn_id, kind, principal);
+                    continue;
+                };
+                defer persisted.deinit(self.alloc);
+                if (!principalsEqual(persisted.principal, principal) or
+                    try self.hasSessionInventoryEntry(kind, persisted.principal, txn_id))
+                {
+                    try self.repairLegacySessionInventoryForPrincipal(txn_id, kind, principal);
+                    continue;
+                }
+                try sessions.append(alloc, try persisted.clone(alloc));
+            }
+            if (sessions.items.len > limit) break;
+            if (ids.items.len == id_scan.target and ids.items.len > 0) {
+                bounded_continuation = .{
+                    .phase = .legacy_index,
+                    .kind = kind,
+                    .txn_id = ids.items[ids.items.len - 1],
+                };
+                break;
+            }
+        }
+
+        var next_cursor: ?SessionListCursor = null;
+        if (sessions.items.len > limit) {
+            var lookahead = sessions.pop().?;
+            lookahead.deinit(alloc);
+            const last = sessions.items[sessions.items.len - 1];
+            next_cursor = .{
+                .phase = .legacy_index,
+                .kind = sessionKind(last),
+                .txn_id = last.txn_id,
+            };
+        } else if (bounded_continuation) |cursor| {
+            next_cursor = cursor;
+        }
+        return .{
+            .sessions = try sessions.toOwnedSlice(alloc),
+            .next_cursor = next_cursor,
+        };
+    }
+
     /// Reads a stable, bounded inventory page through principal-scoped
     /// secondary indexes. Canonical session rows remain authoritative and are
     /// revalidated after every index lookup, so stale index entries cannot
@@ -1922,6 +2209,8 @@ pub const DurableSessionStore = struct {
         if (after) |cursor| {
             if (cursor.phase == .legacy)
                 return try self.scanLegacyUnindexedSessionPage(alloc, principal, cursor, limit);
+            if (cursor.phase == .legacy_index)
+                return try self.scanLegacyIndexedSessionPage(alloc, principal, cursor, limit);
         }
         var sessions = std.ArrayListUnmanaged(Session).empty;
         errdefer {
@@ -2006,12 +2295,20 @@ pub const DurableSessionStore = struct {
             // older rolling-upgrade writer left no canonical-only sessions.
             // The opaque cursor therefore enters a bounded compatibility
             // phase before it can ever report traversal completion.
-            next_cursor = .{
-                .phase = .legacy,
-                .kind = .interactive,
-                .txn_id = undefined,
-                .legacy_start = true,
-            };
+            next_cursor = if (try self.legacySessionInventoryComplete())
+                .{
+                    .phase = .legacy_index,
+                    .kind = .interactive,
+                    .txn_id = undefined,
+                    .legacy_start = true,
+                }
+            else
+                .{
+                    .phase = .legacy,
+                    .kind = .interactive,
+                    .txn_id = undefined,
+                    .legacy_start = true,
+                };
         }
         return .{
             .sessions = try sessions.toOwnedSlice(alloc),
@@ -3091,10 +3388,16 @@ pub const SessionRegistry = struct {
                 defer alloc.free(audited.recovery_ids);
                 defer alloc.free(audited.session_ids);
                 next_audit_after[kind_index] = audited.next_after;
-                // Principal inventory compatibility is served directly from
-                // canonical rows after the indexed phase. Do not backfill an
-                // entry here: publishing it between a client's two cursor
-                // phases could make that session disappear from both phases.
+                // Pre-index rows have a distinct immutable inventory
+                // generation. Backfill that generation without moving rows
+                // into the current-writer index; once this namespace reaches
+                // EOF, a durable marker lets new traversals remain entirely
+                // principal scoped. Existing v2 cursors keep scanning the
+                // canonical namespace and remain valid during migration.
+                for (audited.session_ids) |txn_id|
+                    try durable.refreshLegacySessionInventory(txn_id, kind);
+                if (audited.next_after == null)
+                    try durable.markLegacySessionInventoryComplete(kind);
                 for (audited.recovery_ids) |txn_id| {
                     try durable.refreshRecoveryIndex(txn_id, kind);
                     if (pending.items.len >= limit) continue;
@@ -5963,6 +6266,12 @@ fn sessionListCursorLessThan(_: void, a: SessionListCursor, b: SessionListCursor
 }
 
 pub fn encodeSessionListCursor(alloc: std.mem.Allocator, cursor: SessionListCursor) ![]u8 {
+    if (cursor.phase == .legacy_index) {
+        const kind: u8 = if (cursor.kind == .interactive) 'i' else 'r';
+        if (cursor.legacy_start) return try std.fmt.allocPrint(alloc, "v3:x:{c}:start", .{kind});
+        const txn_hex = distributed_txn.encodeTxnIdHex(cursor.txn_id);
+        return try std.fmt.allocPrint(alloc, "v3:x:{c}:{s}", .{ kind, &txn_hex });
+    }
     if (cursor.phase == .legacy) {
         const kind: u8 = if (cursor.kind == .interactive) 'i' else 'r';
         if (cursor.legacy_start) return try std.fmt.allocPrint(alloc, "v2:l:{c}:start", .{kind});
@@ -5975,6 +6284,25 @@ pub fn encodeSessionListCursor(alloc: std.mem.Allocator, cursor: SessionListCurs
 }
 
 pub fn decodeSessionListCursor(encoded: []const u8) !SessionListCursor {
+    if (std.mem.startsWith(u8, encoded, "v3:x:") and encoded.len >= 12 and encoded[6] == ':') {
+        const kind: SessionKind = switch (encoded[5]) {
+            'i' => .interactive,
+            'r' => .idempotent_receipt,
+            else => return error.InvalidSessionListCursor,
+        };
+        if (std.mem.eql(u8, encoded[7..], "start")) return .{
+            .phase = .legacy_index,
+            .kind = kind,
+            .txn_id = undefined,
+            .legacy_start = true,
+        };
+        if (encoded.len != 39) return error.InvalidSessionListCursor;
+        return .{
+            .phase = .legacy_index,
+            .kind = kind,
+            .txn_id = distributed_txn.parseTxnIdHex(encoded[7..]) catch return error.InvalidSessionListCursor,
+        };
+    }
     if (std.mem.startsWith(u8, encoded, "v2:l:") and encoded.len >= 12 and encoded[6] == ':') {
         const kind: SessionKind = switch (encoded[5]) {
             'i' => .interactive,
@@ -6199,6 +6527,50 @@ fn sessionInventoryPrefix(kind: SessionKind) []const u8 {
         .interactive => interactive_inventory_prefix,
         .idempotent_receipt => receipt_inventory_prefix,
     };
+}
+
+fn sessionLegacyInventoryPrefix(kind: SessionKind) []const u8 {
+    return switch (kind) {
+        .interactive => interactive_legacy_inventory_prefix,
+        .idempotent_receipt => receipt_legacy_inventory_prefix,
+    };
+}
+
+fn sessionLegacyInventoryCompleteKey(kind: SessionKind) []const u8 {
+    return switch (kind) {
+        .interactive => interactive_legacy_inventory_complete_key,
+        .idempotent_receipt => receipt_legacy_inventory_complete_key,
+    };
+}
+
+fn sessionLegacyInventoryPrincipalDigest(kind: SessionKind, principal: ?[]const u8) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(switch (kind) {
+        .interactive => "antfly:interactive-session-legacy-inventory:v1",
+        .idempotent_receipt => "antfly:idempotent-receipt-legacy-inventory:v1",
+    });
+    hasher.update(if (principal == null) "\x00" else "\x01");
+    hashIdentityComponent(&hasher, principal orelse "");
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn makeSessionLegacyInventoryPrefix(alloc: std.mem.Allocator, kind: SessionKind, principal: ?[]const u8) ![]u8 {
+    const digest_hex = std.fmt.bytesToHex(sessionLegacyInventoryPrincipalDigest(kind, principal), .lower);
+    return try std.fmt.allocPrint(alloc, "{s}{s}:", .{ sessionLegacyInventoryPrefix(kind), &digest_hex });
+}
+
+fn makeSessionLegacyInventoryKey(
+    alloc: std.mem.Allocator,
+    kind: SessionKind,
+    principal: ?[]const u8,
+    txn_id: db_mod.types.TxnId,
+) ![]u8 {
+    const prefix = try makeSessionLegacyInventoryPrefix(alloc, kind, principal);
+    defer alloc.free(prefix);
+    const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, &txn_hex });
 }
 
 fn makeSessionInventoryPrefix(alloc: std.mem.Allocator, kind: SessionKind, principal: ?[]const u8) ![]u8 {
@@ -8377,9 +8749,16 @@ test "transaction inventory is principal bounded and legacy rows remain exhausti
     }
 
     try std.testing.expectError(error.NotFound, store.get(alloc, legacy_inventory_key));
+    try std.testing.expect(try durable.legacySessionInventoryComplete());
+    const migrated_legacy_key = try makeSessionLegacyInventoryKey(alloc, .interactive, "alice", alice_first.txn_id);
+    defer alloc.free(migrated_legacy_key);
+    const migrated_legacy_raw = try store.get(alloc, migrated_legacy_key);
+    defer alloc.free(migrated_legacy_raw);
+    durable.inventory_candidate_scan_count_for_test = 0;
     var cursor: ?SessionListCursor = null;
     var saw_first = false;
     var saw_second = false;
+    var saw_indexed_compatibility = false;
     var page_count: usize = 0;
     while (page_count < 64) : (page_count += 1) {
         var page = try registry.listDetailsPageForPrincipal(alloc, "alice", cursor, 4);
@@ -8394,11 +8773,22 @@ test "transaction inventory is principal bounded and legacy rows remain exhausti
             }
         }
         cursor = page.next_cursor;
+        if (cursor) |next| if (next.phase == .legacy_index) {
+            saw_indexed_compatibility = true;
+            const encoded_cursor = try encodeSessionListCursor(alloc, next);
+            defer alloc.free(encoded_cursor);
+            const decoded_cursor = try decodeSessionListCursor(encoded_cursor);
+            try std.testing.expectEqual(SessionListCursorPhase.legacy_index, decoded_cursor.phase);
+        };
         if (cursor == null) break;
     }
     try std.testing.expect(cursor == null);
     try std.testing.expect(saw_first);
     try std.testing.expect(saw_second);
+    try std.testing.expect(saw_indexed_compatibility);
+    // The completed migration reads only Alice's current and legacy index
+    // entries; Bob's 64 canonical rows do not add candidate work.
+    try std.testing.expect(durable.inventory_candidate_scan_count_for_test <= 3);
 
     try std.testing.expectEqual(SessionRegistry.AbortInteractiveResult.removed, try registry.abortInteractive(alloc, alice_first.txn_id));
     try std.testing.expectError(error.NotFound, store.get(alloc, legacy_inventory_key));
@@ -8429,6 +8819,9 @@ test "transaction inventory preserves canonical-only sessions across restart" {
         errdefer txn.abort();
         try txn.delete(inventory_key);
         try txn.commit();
+        const audited = try writer.listPendingRecoveryIds(alloc, 8);
+        alloc.free(audited);
+        try std.testing.expect(try durable.legacySessionInventoryComplete());
     }
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -8439,6 +8832,7 @@ test "transaction inventory preserves canonical-only sessions across restart" {
     var cursor: ?SessionListCursor = null;
     var legacy_seen: usize = 0;
     var indexed_seen: usize = 0;
+    var used_persisted_legacy_index = false;
     for (0..8) |_| {
         var page = try reader.listDetailsPageForPrincipal(alloc, "alice", cursor, 1);
         defer page.deinit(alloc);
@@ -8447,11 +8841,15 @@ test "transaction inventory preserves canonical-only sessions across restart" {
             if (std.mem.eql(u8, &detail.status.txn_id, &indexed_id)) indexed_seen += 1;
         }
         cursor = page.next_cursor;
+        if (cursor) |next| {
+            if (next.phase == .legacy_index) used_persisted_legacy_index = true;
+        }
         if (cursor == null) break;
     }
     try std.testing.expect(cursor == null);
     try std.testing.expectEqual(@as(usize, 1), legacy_seen);
     try std.testing.expectEqual(@as(usize, 1), indexed_seen);
+    try std.testing.expect(used_persisted_legacy_index);
 }
 
 test "session cleanup response encodes removed count and cutoff" {

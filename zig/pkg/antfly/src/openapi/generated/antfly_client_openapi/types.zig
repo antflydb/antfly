@@ -31252,7 +31252,7 @@ pub const TransactionSessionListResponse = struct {
     lease_held_count: ?i64 = null,
     lease_expired_count: ?i64 = null,
     sessions: ?[]const TransactionSessionStatus = null,
-    /// Opaque cursor for the next bounded inventory page. Clients must continue while it is non-null, including after an empty compatibility page during a rolling upgrade.
+    /// Opaque cursor for the next bounded inventory page. Clients must continue while it is non-null, including after an empty compatibility page while the rolling-upgrade legacy projection is still being built.
     next_cursor: OpenApiOptionalNullable([]const u8) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

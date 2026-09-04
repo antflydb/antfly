@@ -470,6 +470,15 @@ session unchanged. Mutations are serialized by a bounded set of per-session
 locks; unrelated sessions do not hold the registry lock while cloning,
 renewing leases, encoding, or waiting for durable I/O.
 
+Session inventory has two immutable principal-scoped generations: records
+created by index-aware writers and a separately backfilled legacy projection.
+Maintenance publishes a durable completion marker for each canonical
+namespace after its bounded audit reaches the end. New inventory traversals
+then read both principal projections; cursors issued before completion retain
+their bounded canonical compatibility phase. Maintenance continues auditing
+for lagging rolling-upgrade writers, but steady-state indexed rows require only
+bounded reads and do not produce index writes.
+
 ## Validation and safety invariants
 
 - `lite` is valid only with `standalone` or `embedded`.

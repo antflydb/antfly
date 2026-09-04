@@ -5557,7 +5557,7 @@ export interface components {
             lease_held_count?: number;
             lease_expired_count?: number;
             sessions?: components["schemas"]["TransactionSessionStatus"][];
-            /** @description Opaque cursor for the next bounded inventory page. Clients must continue while it is non-null, including after an empty compatibility page during a rolling upgrade. */
+            /** @description Opaque cursor for the next bounded inventory page. Clients must continue while it is non-null, including after an empty compatibility page while the rolling-upgrade legacy projection is still being built. */
             next_cursor?: string | null;
         };
         TransactionSessionCleanupResponse: {
@@ -15757,9 +15757,9 @@ export interface operations {
     listTransactionSessionInventory: {
         parameters: {
             query?: {
-                /** @description Maximum number of authorized sessions returned by this page. Source scanning is independently bounded; rolling-upgrade compatibility pages may be empty while still returning a cursor. */
+                /** @description Maximum number of authorized sessions returned by this page. Source scanning is independently bounded; rolling-upgrade compatibility pages may be empty while still returning a cursor until the durable legacy principal projection is complete. */
                 limit?: number;
-                /** @description Opaque cursor returned by the previous page. Continue while present even when the previous sessions array was empty. */
+                /** @description Opaque cursor returned by the previous page. Continue while present even when the previous sessions array was empty. Cursor versions preserve in-progress canonical compatibility traversals while newly started traversals use the durable principal-scoped legacy projection after migration. */
                 cursor?: string;
             };
             header?: never;
