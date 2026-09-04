@@ -101,9 +101,9 @@ pub const CleanupTransactionSessionsParams = struct {
 };
 
 pub const ListTransactionSessionInventoryParams = struct {
-    /// Maximum number of principal-owned session records scanned for this page.
+    /// Maximum number of authorized sessions returned by this page. Source scanning is independently bounded; rolling-upgrade compatibility pages may be empty while still returning a cursor.
     limit: ?[]const u8 = null,
-    /// Opaque cursor returned by the previous page.
+    /// Opaque cursor returned by the previous page. Continue while present even when the previous sessions array was empty.
     cursor: ?[]const u8 = null,
 };
 

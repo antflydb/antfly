@@ -5557,7 +5557,7 @@ export interface components {
             lease_held_count?: number;
             lease_expired_count?: number;
             sessions?: components["schemas"]["TransactionSessionStatus"][];
-            /** @description Opaque cursor for the next bounded inventory page, if one exists. */
+            /** @description Opaque cursor for the next bounded inventory page. Clients must continue while it is non-null, including after an empty compatibility page during a rolling upgrade. */
             next_cursor?: string | null;
         };
         TransactionSessionCleanupResponse: {
@@ -15757,9 +15757,9 @@ export interface operations {
     listTransactionSessionInventory: {
         parameters: {
             query?: {
-                /** @description Maximum number of principal-owned session records scanned for this page. */
+                /** @description Maximum number of authorized sessions returned by this page. Source scanning is independently bounded; rolling-upgrade compatibility pages may be empty while still returning a cursor. */
                 limit?: number;
-                /** @description Opaque cursor returned by the previous page. */
+                /** @description Opaque cursor returned by the previous page. Continue while present even when the previous sessions array was empty. */
                 cursor?: string;
             };
             header?: never;

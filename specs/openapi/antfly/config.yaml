@@ -1058,7 +1058,7 @@ components:
           minimum: 1
           maximum: 1000
           default: 25
-          description: Monotonic wall-time budget for one capacity-admission cleanup pass.
+          description: Maximum monotonic time each capacity-rejected request waits for the server-owned cleanup generation before retrying admission.
         max_count:
           type: integer
           minimum: 1

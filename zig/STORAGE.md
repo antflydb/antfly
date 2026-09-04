@@ -441,8 +441,10 @@ have independent, bounded retention and capacity. Defaults are one hour for
 both retention windows, cleanup every minute with at most 4,096 records per
 pass, 1,024 interactive sessions, 65,536 receipts / 512 MiB of aggregate
 receipt storage, a 16 MiB encoded record, and 64 savepoints. Capacity admission
-also coalesces concurrent callers behind one cleanup pass limited to 32 records
-and 25 ms before retrying the atomic admission check once:
+also coalesces concurrent callers behind one server-owned cleanup job limited
+to 32 records. Each request waits at most 25 ms for that generation before
+retrying the atomic admission check once; slow storage work can continue in the
+background and is drained before the server releases session storage:
 
 ```json
 {

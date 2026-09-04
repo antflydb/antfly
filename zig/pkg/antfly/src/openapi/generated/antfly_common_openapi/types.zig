@@ -1715,7 +1715,7 @@ pub const TransactionSessionConfig = struct {
     cleanup_max_records: ?i64 = null,
     /// Maximum expired idempotency receipts considered by one capacity-admission cleanup pass.
     admission_cleanup_max_records: ?i64 = null,
-    /// Monotonic wall-time budget for one capacity-admission cleanup pass.
+    /// Maximum monotonic time each capacity-rejected request waits for the server-owned cleanup generation before retrying admission.
     admission_cleanup_budget_ms: ?i64 = null,
     max_count: ?i64 = null,
     /// Independent count budget for pending and retained idempotency receipts.

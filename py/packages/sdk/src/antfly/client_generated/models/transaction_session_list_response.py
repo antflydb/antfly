@@ -23,7 +23,8 @@ class TransactionSessionListResponse:
         lease_held_count (int | Unset):
         lease_expired_count (int | Unset):
         sessions (list[TransactionSessionStatus] | Unset):
-        next_cursor (None | str | Unset): Opaque cursor for the next bounded inventory page, if one exists.
+        next_cursor (None | str | Unset): Opaque cursor for the next bounded inventory page. Clients must continue while
+            it is non-null, including after an empty compatibility page during a rolling upgrade.
     """
 
     session_count: int | Unset = UNSET

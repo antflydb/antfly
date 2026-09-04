@@ -2666,8 +2666,14 @@ pub const ApiHttpServer = struct {
     owned_foreign_registry: ?*foreign_mod.Registry = null,
     txn_sessions: transactions_api.SessionRegistry = .{},
     last_session_cleanup_ns: std.atomic.Value(u64) = .init(0),
-    receipt_admission_cleanup_mutex: std.atomic.Mutex = .unlocked,
+    receipt_admission_cleanup_owner_id: u64 = 0,
+    receipt_admission_cleanup_in_flight: std.atomic.Value(bool) = .init(false),
+    receipt_admission_cleanup_closing: std.atomic.Value(bool) = .init(false),
     receipt_admission_cleanup_generation: std.atomic.Value(u32) = .init(0),
+    receipt_admission_cleanup_removed: std.atomic.Value(usize) = .init(0),
+    receipt_admission_cleanup_pause_for_test: std.atomic.Value(bool) = .init(false),
+    receipt_admission_cleanup_entered_for_test: std.Io.Event = .unset,
+    receipt_admission_cleanup_release_for_test: std.Io.Event = .unset,
     last_session_lease_renew_ns: std.atomic.Value(u64) = .init(0),
     last_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
     created_at_ns: u64 = 0,
@@ -2740,6 +2746,7 @@ pub const ApiHttpServer = struct {
         restore: u64 = 0,
         session_maintenance: u64 = 0,
         session_lease_renewal: u64 = 0,
+        receipt_admission_cleanup: u64 = 0,
         backup_maintenance: u64 = 0,
         index_installation: u64 = 0,
         incoming_graph_routes: u64 = 0,
@@ -2753,6 +2760,7 @@ pub const ApiHttpServer = struct {
             if (ids.restore != 0) active.durable_jobs.closeOwner(ids.restore);
             if (ids.session_maintenance != 0) active.durable_jobs.closeOwner(ids.session_maintenance);
             if (ids.session_lease_renewal != 0) active.durable_jobs.closeOwner(ids.session_lease_renewal);
+            if (ids.receipt_admission_cleanup != 0) active.durable_jobs.closeOwner(ids.receipt_admission_cleanup);
             if (ids.backup_maintenance != 0) active.durable_jobs.closeOwner(ids.backup_maintenance);
             if (ids.index_installation != 0) active.durable_jobs.closeOwner(ids.index_installation);
         }
@@ -2760,6 +2768,7 @@ pub const ApiHttpServer = struct {
         ids.restore = try active.allocOwnerId();
         ids.session_maintenance = try active.allocOwnerId();
         ids.session_lease_renewal = try active.allocOwnerId();
+        ids.receipt_admission_cleanup = try active.allocOwnerId();
         ids.backup_maintenance = try active.allocOwnerId();
         ids.index_installation = try active.allocOwnerId();
         ids.incoming_graph_routes = try active.allocOwnerId();
@@ -2918,6 +2927,7 @@ pub const ApiHttpServer = struct {
             .restore_job_owner_id = .init(owner_ids.restore),
             .session_maintenance_owner_id = owner_ids.session_maintenance,
             .session_lease_renewal_owner_id = owner_ids.session_lease_renewal,
+            .receipt_admission_cleanup_owner_id = owner_ids.receipt_admission_cleanup,
             .backup_maintenance_owner_id = owner_ids.backup_maintenance,
             .index_installation_owner_id = owner_ids.index_installation,
             .connections_cache = connections_api.Cache.init(owner_alloc),
@@ -3180,6 +3190,7 @@ pub const ApiHttpServer = struct {
                 if (owner_ids.restore != 0) runtime.durable_jobs.closeOwner(owner_ids.restore);
                 if (owner_ids.session_maintenance != 0) runtime.durable_jobs.closeOwner(owner_ids.session_maintenance);
                 if (owner_ids.session_lease_renewal != 0) runtime.durable_jobs.closeOwner(owner_ids.session_lease_renewal);
+                if (owner_ids.receipt_admission_cleanup != 0) runtime.durable_jobs.closeOwner(owner_ids.receipt_admission_cleanup);
                 if (owner_ids.backup_maintenance != 0) runtime.durable_jobs.closeOwner(owner_ids.backup_maintenance);
                 if (owner_ids.index_installation != 0) runtime.durable_jobs.closeOwner(owner_ids.index_installation);
             }
@@ -3291,12 +3302,14 @@ pub const ApiHttpServer = struct {
         self.signalRestoreBackoffWaiters();
         self.backup_maintenance_closing.store(true, .release);
         self.index_installation_closing.store(true, .release);
+        self.receipt_admission_cleanup_closing.store(true, .release);
         if (self.cfg.backend_runtime) |runtime| {
             if (self.repair_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.repair_job_owner_id);
             const restore_owner_id = self.restore_job_owner_id.load(.acquire);
             if (restore_owner_id != 0) runtime.durable_jobs.closeOwner(restore_owner_id);
             if (self.session_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_maintenance_owner_id);
             if (self.session_lease_renewal_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_lease_renewal_owner_id);
+            if (self.receipt_admission_cleanup_owner_id != 0) runtime.durable_jobs.closeOwner(self.receipt_admission_cleanup_owner_id);
             if (self.backup_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.backup_maintenance_owner_id);
             if (self.index_installation_owner_id != 0) runtime.durable_jobs.closeOwner(self.index_installation_owner_id);
         }
@@ -6872,53 +6885,90 @@ pub const ApiHttpServer = struct {
         );
     }
 
-    /// Capacity rejection is often caused by receipts that have already
-    /// crossed their retention boundary but have not reached the periodic
-    /// reaper yet. Concurrent callers coalesce behind one short, bounded pass;
-    /// followers wait for that pass and retry admission without repeating the
-    /// same storage scan.
-    pub fn reclaimExpiredReceiptCapacity(self: *ApiHttpServer, io: std.Io) !usize {
-        const budget_ns = self.cfg.session_admission_cleanup_budget_ns;
-        const deadline_ns = platform_time.monotonicNs() +| budget_ns;
-        const observed_generation = self.receipt_admission_cleanup_generation.load(.acquire);
-        if (!self.receipt_admission_cleanup_mutex.tryLock()) {
-            // Wait only for the pass that was in flight when this caller
-            // arrived. The generation closes the lost-wakeup race, while the
-            // Io futex preserves cancellation and the same admission budget
-            // bounds every follower independently.
-            if (self.receipt_admission_cleanup_generation.load(.acquire) == observed_generation) {
-                try io.futexWaitTimeout(
-                    u32,
-                    &self.receipt_admission_cleanup_generation.raw,
-                    observed_generation,
-                    .{ .duration = .{
-                        .clock = .awake,
-                        .raw = std.Io.Duration.fromNanoseconds(budget_ns),
-                    } },
-                );
-            }
-            return 0;
-        }
-        defer {
-            self.receipt_admission_cleanup_mutex.unlock();
-            _ = self.receipt_admission_cleanup_generation.fetchAdd(1, .release);
-            io.futexWake(
-                u32,
-                &self.receipt_admission_cleanup_generation.raw,
-                std.math.maxInt(u32),
+    const ReceiptAdmissionCleanupWork = struct {
+        server: *ApiHttpServer,
+
+        fn run(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const server = self.server;
+            if (comptime builtin.is_test) if (server.receipt_admission_cleanup_pause_for_test.load(.acquire)) {
+                const io = server.sharedApiIo() orelse std.testing.io;
+                server.receipt_admission_cleanup_entered_for_test.set(io);
+                server.receipt_admission_cleanup_release_for_test.waitUncancelable(io);
+            };
+            if (server.receipt_admission_cleanup_closing.load(.acquire)) return;
+            server.receipt_admission_cleanup_removed.store(0, .release);
+            const ttl_ns = server.cfg.session_ttl_ns orelse return;
+            const receipt_ttl_ns = server.cfg.session_receipt_ttl_ns orelse ttl_ns;
+            const now_ns = platform_time.realtimeNs();
+            const removed = try server.txn_sessions.cleanupExpiredWithCutoffsLimit(
+                server.alloc,
+                0,
+                now_ns -| receipt_ttl_ns,
+                server.cfg.session_admission_cleanup_max_records,
             );
+            server.receipt_admission_cleanup_removed.store(removed, .release);
         }
 
-        const ttl_ns = self.cfg.session_ttl_ns orelse return 0;
-        const receipt_ttl_ns = self.cfg.session_receipt_ttl_ns orelse ttl_ns;
-        const now_ns = platform_time.realtimeNs();
-        return try self.txn_sessions.cleanupExpiredWithCutoffsBudget(
-            self.alloc,
-            0,
-            now_ns -| receipt_ttl_ns,
-            self.cfg.session_admission_cleanup_max_records,
-            deadline_ns,
-        );
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const server = self.server;
+            server.receipt_admission_cleanup_in_flight.store(false, .release);
+            _ = server.receipt_admission_cleanup_generation.fetchAdd(1, .release);
+            const io = server.sharedApiIo() orelse std.Io.Threaded.global_single_threaded.io();
+            io.futexWake(
+                u32,
+                &server.receipt_admission_cleanup_generation.raw,
+                std.math.maxInt(u32),
+            );
+            server.alloc.destroy(self);
+        }
+    };
+
+    /// Starts or joins the server-owned cleanup generation. The durable job
+    /// owner is drained before session storage during server teardown, so no
+    /// detached work can retain the server or its store.
+    fn scheduleReceiptAdmissionCleanup(self: *ApiHttpServer) !bool {
+        if (self.receipt_admission_cleanup_closing.load(.acquire)) return false;
+        const runtime = self.cfg.backend_runtime orelse return false;
+        if (runtime.threaded_jobs == null or self.receipt_admission_cleanup_owner_id == 0) return false;
+        if (self.receipt_admission_cleanup_in_flight.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+            return true;
+        errdefer self.receipt_admission_cleanup_in_flight.store(false, .release);
+        const work = try self.alloc.create(ReceiptAdmissionCleanupWork);
+        errdefer self.alloc.destroy(work);
+        work.* = .{ .server = self };
+        try runtime.durable_jobs.submit(.{
+            .owner_id = self.receipt_admission_cleanup_owner_id,
+            .class = .cleanup,
+            .ptr = work,
+            .run = ReceiptAdmissionCleanupWork.run,
+            .deinit = ReceiptAdmissionCleanupWork.deinit,
+        });
+        return true;
+    }
+
+    /// Capacity rejection is often caused by receipts that have already
+    /// crossed their retention boundary but have not reached the periodic
+    /// reaper yet. The request only schedules server-owned work and waits for
+    /// its generation through std.Io; neither the trigger nor its followers
+    /// execute storage operations inside the admission budget.
+    pub fn reclaimExpiredReceiptCapacity(self: *ApiHttpServer, io: std.Io) !usize {
+        const observed_generation = self.receipt_admission_cleanup_generation.load(.acquire);
+        if (!(try self.scheduleReceiptAdmissionCleanup())) return 0;
+        if (self.receipt_admission_cleanup_generation.load(.acquire) == observed_generation) {
+            try io.futexWaitTimeout(
+                u32,
+                &self.receipt_admission_cleanup_generation.raw,
+                observed_generation,
+                .{ .duration = .{
+                    .clock = .awake,
+                    .raw = std.Io.Duration.fromNanoseconds(self.cfg.session_admission_cleanup_budget_ns),
+                } },
+            );
+        }
+        if (self.receipt_admission_cleanup_generation.load(.acquire) == observed_generation) return 0;
+        return self.receipt_admission_cleanup_removed.load(.acquire);
     }
 
     fn routeInternalGroupQueryToReadSchema(ptr: *anyopaque, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
@@ -32893,7 +32943,7 @@ test "api http server paginates transaction session inventory" {
     }
 }
 
-test "receipt admission cleanup followers honor the cleanup budget" {
+test "receipt admission cleanup trigger honors the cleanup budget" {
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
             return .{ .ptr = undefined, .vtable = &.{ .status = status } };
@@ -32904,20 +32954,26 @@ test "receipt admission cleanup followers honor the cleanup budget" {
         }
     };
 
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{
+        .backend_runtime = &runtime,
+        .session_ttl_ns = std.time.ns_per_s,
         .session_admission_cleanup_budget_ns = 2 * std.time.ns_per_ms,
     }, source.iface(), null, null);
     defer server.deinit();
+    server.receipt_admission_cleanup_pause_for_test.store(true, .release);
+    defer server.receipt_admission_cleanup_release_for_test.set(runtime.apiIoImpl().?.io());
 
-    try std.testing.expect(server.receipt_admission_cleanup_mutex.tryLock());
-    defer server.receipt_admission_cleanup_mutex.unlock();
     const started_ns = platform_time.monotonicNs();
     try std.testing.expectEqual(@as(usize, 0), try server.reclaimExpiredReceiptCapacity(std.testing.io));
     const elapsed_ns = platform_time.monotonicNs() -| started_ns;
-    // A stalled leader must not turn the opportunistic admission pass into an
-    // unbounded request queue. Leave ample sanitizer/CI scheduling headroom.
+    // Even the caller that creates the cleanup generation only waits for its
+    // own budget. The storage worker remains server-owned until released.
     try std.testing.expect(elapsed_ns < 250 * std.time.ns_per_ms);
+    try std.testing.expect(server.receipt_admission_cleanup_in_flight.load(.acquire));
 }
 
 test "api http server reloads durable transaction sessions after restart" {

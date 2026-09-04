@@ -2627,7 +2627,9 @@ paths:
         - name: limit
           in: query
           required: false
-          description: Maximum number of principal-owned session records scanned for this page.
+          description: Maximum number of authorized sessions returned by this page. Source scanning is
+            independently bounded; rolling-upgrade compatibility pages may be empty while still returning
+            a cursor.
           schema:
             type: integer
             minimum: 1
@@ -2636,7 +2638,8 @@ paths:
         - name: cursor
           in: query
           required: false
-          description: Opaque cursor returned by the previous page.
+          description: Opaque cursor returned by the previous page. Continue while present even when the
+            previous sessions array was empty.
           schema:
             type: string
       responses:
@@ -12709,7 +12712,8 @@ components:
         next_cursor:
           type: string
           nullable: true
-          description: Opaque cursor for the next bounded inventory page, if one exists.
+          description: Opaque cursor for the next bounded inventory page. Clients must continue while
+            it is non-null, including after an empty compatibility page during a rolling upgrade.
     TransactionSessionCleanupResponse:
       type: object
       properties:
