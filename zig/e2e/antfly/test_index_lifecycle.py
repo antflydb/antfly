@@ -21,9 +21,9 @@ import json
 import struct
 import time
 from urllib.parse import quote
+
 import pytest
 import requests
-
 from conftest import IndexReadinessProtocolError, ready_index_status
 from helpers import assert_created_index, json_doc, upsert, wait_until
 
@@ -168,7 +168,7 @@ def _ready_index(
         index_info = stateful_api.get_index(table_name, index_name)
     except Exception:
         return None
-    stats = ready_index_status(index_info, require_query_fresh=True)
+    stats = ready_index_status(index_info, until="complete", require_query_fresh=True)
     if stats is None:
         return None
     total_indexed = stats.get("total_indexed", stats.get("doc_count", 0))
@@ -184,7 +184,7 @@ def _ready_algebraic_index(
         index_info = stateful_api.get_index(table_name, index_name)
     except Exception:
         return None
-    return ready_index_status(index_info, require_query_fresh=True)
+    return ready_index_status(index_info, until="complete", require_query_fresh=True)
 
 
 def _algebraic_aggregations(stateful_api, table_name: str) -> dict:
@@ -203,63 +203,96 @@ def _algebraic_aggregations(stateful_api, table_name: str) -> dict:
     return responses[0].get("aggregations", {})
 
 
-def test_ready_index_status_requires_current_coverage_observation():
+def test_ready_index_status_uses_current_milestones_and_v020_fallback():
     ready_status = {
         "status": {
             "rebuilding": False,
             "dense_publish_pending": False,
             "replay_catch_up_required": False,
             "catch_up_active": False,
+            "readiness": {
+                "state": "queryable_partial",
+                "queryable": True,
+                "complete": False,
+                "pending_reasons": ["coverage"],
+            },
+            "milestones": {
+                "queryable": {"reached": True, "blockers": []},
+                "complete": {"reached": False, "blockers": ["source_coverage"]},
+            },
             "coverage": {
                 "observation_complete": True,
                 "config_mismatch_group_count": 0,
             },
         }
     }
-    assert ready_index_status(ready_status) is ready_status["status"]
+    # Current queryability remains authoritative while later work is active.
+    ready_status["status"]["rebuilding"] = True
+    ready_status["status"]["dense_publish_pending"] = True
+    ready_status["status"]["replay_catch_up_required"] = True
+    ready_status["status"]["catch_up_active"] = True
+    assert ready_index_status(ready_status, until="queryable") is ready_status["status"]
+    assert ready_index_status(ready_status, until="complete") is None
 
-    canonical_ready = json.loads(json.dumps(ready_status))
-    canonical_ready["status"]["backfill_state"] = "ready"
-    canonical_ready["status"]["readiness"] = {
-        "state": "ready",
-        "queryable": True,
-        "complete": True,
-        "incarnation": "g-0000000000000001",
-        "published_revision": 12,
-        "target_revision": 12,
-        "pending_reasons": [],
+    serviceable_repair = json.loads(json.dumps(ready_status))
+    serviceable_repair["status"]["repair"] = {
+        "state": "rebuilding",
+        "action_required": False,
+        "blocks_queryable": False,
+        "blocks_complete": True,
     }
-    assert ready_index_status(canonical_ready) is canonical_ready["status"]
-
-    canonical_without_receipt = json.loads(json.dumps(canonical_ready))
-    canonical_without_receipt["status"]["readiness"].pop("published_revision")
-    canonical_without_receipt["status"]["readiness"].pop("target_revision")
     assert (
-        ready_index_status(canonical_without_receipt)
+        ready_index_status(serviceable_repair, until="queryable")
+        is serviceable_repair["status"]
+    )
+
+    failed_current = json.loads(json.dumps(ready_status))
+    failed_current["status"]["readiness"]["state"] = "failed"
+    assert ready_index_status(failed_current, until="queryable") is None
+
+    complete_status = json.loads(json.dumps(ready_status))
+    complete_status["status"]["rebuilding"] = False
+    complete_status["status"]["dense_publish_pending"] = False
+    complete_status["status"]["replay_catch_up_required"] = False
+    complete_status["status"]["catch_up_active"] = False
+    complete_status["status"]["readiness"]["state"] = "ready"
+    complete_status["status"]["readiness"]["complete"] = True
+    complete_status["status"]["milestones"]["complete"] = {
+        "reached": True,
+        "blockers": [],
+    }
+    assert (
+        ready_index_status(complete_status, until="complete")
+        is complete_status["status"]
+    )
+
+    canonical_without_receipt = json.loads(json.dumps(complete_status))
+    assert (
+        ready_index_status(canonical_without_receipt, until="complete")
         is canonical_without_receipt["status"]
     )
 
-    for state, queryable in (
-        ("pending", False),
-        ("queryable_partial", True),
-        ("failed", False),
-    ):
-        incomplete = json.loads(json.dumps(canonical_ready))
-        incomplete["status"]["readiness"].update(
-            state=state, queryable=queryable, complete=False
-        )
-        assert ready_index_status(incomplete) is None
+    canonical_with_receipt = json.loads(json.dumps(complete_status))
+    canonical_with_receipt["status"]["readiness"].update(
+        incarnation="g-0000000000000001",
+        published_revision=12,
+        target_revision=12,
+        pending_reasons=[],
+    )
+    assert (
+        ready_index_status(canonical_with_receipt, until="complete")
+        is canonical_with_receipt["status"]
+    )
 
-    stale_receipt = json.loads(json.dumps(canonical_ready))
+    stale_receipt = json.loads(json.dumps(canonical_with_receipt))
     stale_receipt["status"]["readiness"]["published_revision"] = 11
-    assert ready_index_status(stale_receipt) is None
+    assert ready_index_status(stale_receipt, until="complete") is None
 
     for malformed in (None, "ready", [], True):
-        invalid = json.loads(json.dumps(ready_status))
-        invalid["status"]["backfill_state"] = "ready"
+        invalid = json.loads(json.dumps(complete_status))
         invalid["status"]["readiness"] = malformed
         with pytest.raises(IndexReadinessProtocolError, match="status.readiness"):
-            ready_index_status(invalid)
+            ready_index_status(invalid, until="complete")
 
     for field, value in (
         ("state", "future_state"),
@@ -269,34 +302,47 @@ def test_ready_index_status_requires_current_coverage_observation():
         ("published_revision", True),
         ("target_revision", "12"),
     ):
-        invalid = json.loads(json.dumps(canonical_ready))
+        invalid = json.loads(json.dumps(canonical_with_receipt))
         invalid["status"]["readiness"][field] = value
         with pytest.raises(IndexReadinessProtocolError, match=field):
-            ready_index_status(invalid)
+            ready_index_status(invalid, until="complete")
 
     for missing_field in ("published_revision", "target_revision"):
-        invalid = json.loads(json.dumps(canonical_ready))
+        invalid = json.loads(json.dumps(canonical_with_receipt))
         invalid["status"]["readiness"].pop(missing_field)
         with pytest.raises(IndexReadinessProtocolError, match="provided together"):
-            ready_index_status(invalid)
+            ready_index_status(invalid, until="complete")
 
-    stale_incarnation = json.loads(json.dumps(ready_status))
+    legacy_ready = json.loads(json.dumps(complete_status))
+    del legacy_ready["status"]["milestones"]
+    assert ready_index_status(legacy_ready, until="complete") is legacy_ready["status"]
+    assert ready_index_status(legacy_ready, until="queryable") is legacy_ready["status"]
+    v020_ready = json.loads(json.dumps(legacy_ready))
+    del v020_ready["status"]["readiness"]
+    v020_ready["status"]["backfill_state"] = "ready"
+    assert ready_index_status(v020_ready, until="complete") is v020_ready["status"]
+    assert ready_index_status(v020_ready, until="queryable") is v020_ready["status"]
+    legacy_not_queryable = json.loads(json.dumps(legacy_ready))
+    legacy_not_queryable["status"]["readiness"]["queryable"] = False
+    assert ready_index_status(legacy_not_queryable, until="queryable") is None
+
+    stale_incarnation = json.loads(json.dumps(legacy_ready))
     stale_incarnation["status"]["coverage"]["observation_complete"] = False
     stale_incarnation["status"]["coverage"]["config_mismatch_group_count"] = 1
-    assert ready_index_status(stale_incarnation) is None
+    assert ready_index_status(stale_incarnation, until="complete") is None
 
-    rebuilding = json.loads(json.dumps(ready_status))
+    rebuilding = json.loads(json.dumps(legacy_ready))
     rebuilding["status"]["repair"] = {"state": "rebuilding", "action_required": False}
-    assert ready_index_status(rebuilding) is None
+    assert ready_index_status(rebuilding, until="complete") is None
 
     for backfill_state in ("running", "retrying", "degraded", "failed"):
-        incomplete = json.loads(json.dumps(ready_status))
+        incomplete = json.loads(json.dumps(legacy_ready))
         incomplete["status"]["backfill_state"] = backfill_state
-        assert ready_index_status(incomplete) is None
+        assert ready_index_status(incomplete, until="complete") is None
 
-    complete = json.loads(json.dumps(ready_status))
+    complete = json.loads(json.dumps(legacy_ready))
     complete["status"]["backfill_state"] = "ready"
-    assert ready_index_status(complete) is complete["status"]
+    assert ready_index_status(complete, until="complete") is complete["status"]
 
     for field, value in (
         ("error", "load failed: UnsupportedVersion"),
@@ -307,9 +353,9 @@ def test_ready_index_status_requires_current_coverage_observation():
         ("repair_summary_ready", False),
         ("repair_issue_count", 1),
     ):
-        terminal = json.loads(json.dumps(ready_status))
+        terminal = json.loads(json.dumps(legacy_ready))
         terminal["status"][field] = value
-        assert ready_index_status(terminal) is None
+        assert ready_index_status(terminal, until="complete") is None
 
 
 def _retrying_partial_index(
@@ -493,7 +539,7 @@ def test_stateful_managed_algebraic_generation_rebuild_catches_up_and_reopens(
         stateful_api.get_index(table_name, index_name),
         indent=2,
         sort_keys=True,
-    )
+    ) + "\nserver logs:\n" + stateful_api.debug_logs()
     aggregations = _algebraic_aggregations(stateful_api, table_name)
     assert aggregations["amount_sum"]["value"] == 15
     assert {
@@ -962,12 +1008,14 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
         indexed = int(
             latest_status.get("total_indexed", latest_status.get("doc_count", 0))
         )
+        source_coverage = latest_status.get("source_coverage") or {}
         if (
             indexed < 6
             or applied < target
             or latest_status.get("replay_catch_up_required") is not False
             or latest_status.get("catch_up_active") is not False
             or latest_status.get("catch_up_phase") != "idle"
+            or source_coverage.get("observation_complete") is not True
         ):
             return None
         return latest_status
@@ -978,17 +1026,17 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
     # The default strict policy reports the three field-less documents as
     # settled but uncovered. It must not rewrite the authoritative replay
     # ledger into fake pending work or imply that a worker is still active.
-    coverage = converged["coverage"]
-    assert coverage["policy"] == "strict"
-    assert coverage["complete"] is False
-    assert coverage["source_total"] == 9
-    assert coverage["produced"] == 6
-    assert coverage["skipped"] == 3
-    assert coverage["settled"] == 9
-    assert coverage["uncovered"] == 3
-    assert coverage["pending"] == 0
-    assert coverage["healthy"] is False
-    assert coverage["degraded"] is True
+    source_coverage = converged["source_coverage"]
+    assert source_coverage["policy"] == "strict"
+    assert source_coverage["observation_complete"] is True
+    assert source_coverage["complete"] is False
+    assert source_coverage["total"] == 9
+    assert source_coverage["covered"] == 6
+    assert source_coverage["skipped"] == 3
+    assert source_coverage["failed"] == 0
+    assert source_coverage["pending"] == 0
+    assert source_coverage["healthy"] is False
+    assert source_coverage["degraded"] is True
     assert converged["backfill_active"] is False
     assert converged["rebuilding"] is False
     assert converged["backfill_progress"] == pytest.approx(1.0)
@@ -1537,7 +1585,7 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
     assert enrichment["fatal_error_count"] == 0
     assert enrichment["worker_failed"] is False
 
-    assert ready_index_status({"status": partial}) is None
+    assert ready_index_status({"status": partial}, until="complete") is None
 
     rate_limited_openai_embedder.allow_all_requests()
 
@@ -1654,6 +1702,7 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
         assert wait_until(
             lambda table_name=table_name: ready_index_status(
                 stateful_api.get_index(table_name, index_name),
+                until="complete",
                 require_query_fresh=True,
             ),
             timeout_s=30.0,
@@ -2574,9 +2623,12 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
         reason=f"serverless republish did not reach head version {target_head_version}",
     )
 
-    serverless_api.wait_index_ready(table_name, "semantic_b")
-    serverless_api.wait_index_ready(table_name, "sparse_a")
-    serverless_api.wait_index_ready(table_name, "sparse_b")
+    semantic_b = serverless_api.get_index(table_name, "semantic_b")
+    sparse_a = serverless_api.get_index(table_name, "sparse_a")
+    sparse_b = serverless_api.get_index(table_name, "sparse_b")
+    assert ready_index_status(semantic_b, until="complete") is not None
+    assert ready_index_status(sparse_a, until="complete") is not None
+    assert ready_index_status(sparse_b, until="complete") is not None
 
 
 def test_serverless_same_name_dense_index_update_republishes_head(serverless_api):
@@ -2704,7 +2756,7 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
 
     detail = serverless_api.get_index(table_name, "semantic_idx")
     assert detail["status"]["head_publication_action"] == "rebuild"
-    serverless_api.wait_index_ready(table_name, "semantic_idx")
+    assert ready_index_status(detail, until="complete") is not None
 
 
 def test_serverless_build_status_reports_head_actions_for_text_only_updates(
@@ -2962,5 +3014,5 @@ def test_serverless_schema_migration_republishes_versioned_full_text_indexes(
     next_index = serverless_api.get_index(table_name, "full_text_index_v1")
     assert active_index["status"]["head_publication_action"] == "reuse"
     assert next_index["status"]["head_publication_action"] == "rebuild"
-    serverless_api.wait_index_ready(table_name, "full_text_index_v0")
-    serverless_api.wait_index_ready(table_name, "full_text_index_v1")
+    assert ready_index_status(active_index, until="complete") is not None
+    assert ready_index_status(next_index, until="complete") is not None
