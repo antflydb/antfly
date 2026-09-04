@@ -2701,12 +2701,20 @@ pub const OwnedSplitReservation = struct {
         self.reservation.release();
     }
 
-    /// Hand the secondary credit to the allocator that owns both transient
-    /// provider buffers and retained document state. The ResourceManager total
-    /// is unchanged; only reservation ownership moves.
+    /// Hand secondary credit to an allocator using its normal idle-credit
+    /// reclamation policy. The ResourceManager total is unchanged; only
+    /// reservation ownership moves.
     pub fn transferSecondaryTo(self: *OwnedSplitReservation, destination: *BudgetedAllocator) !void {
         if (self.secondary_bytes == 0) return;
         try destination.adoptReservationCredit(&self.reservation, self.secondary_bytes);
+        self.secondary_bytes = 0;
+    }
+
+    /// Transfer a credit that must remain available across several bounded
+    /// allocation windows. The destination releases it only at deinit.
+    pub fn transferSecondaryToPinned(self: *OwnedSplitReservation, destination: *BudgetedAllocator) !void {
+        if (self.secondary_bytes == 0) return;
+        try destination.adoptPinnedReservationCredit(&self.reservation, self.secondary_bytes);
         self.secondary_bytes = 0;
     }
 };
@@ -2719,6 +2727,7 @@ pub const BudgetedAllocator = struct {
     reservation: Reservation,
     max_hard_limit_multiple: u64,
     live_bytes: u64 = 0,
+    pinned_bytes: u64 = 0,
     credit_quantum: u64,
     budget_denied: bool = false,
 
@@ -2771,6 +2780,15 @@ pub const BudgetedAllocator = struct {
         try source.transferCreditTo(&self.reservation, bytes);
     }
 
+    /// Adopt operation-lifetime credit. Ordinary frees may return any growth
+    /// above this floor, but cannot discard the next window's admission.
+    pub fn adoptPinnedReservationCredit(self: *BudgetedAllocator, source: *Reservation, bytes: u64) !void {
+        const pinned = std.math.add(u64, self.pinned_bytes, bytes) catch
+            return error.ResourceBudgetExceeded;
+        try source.transferCreditTo(&self.reservation, bytes);
+        self.pinned_bytes = pinned;
+    }
+
     fn reserveGrowth(self: *BudgetedAllocator, bytes: usize) bool {
         const amount = std.math.cast(u64, bytes) orelse {
             self.budget_denied = true;
@@ -2800,13 +2818,13 @@ pub const BudgetedAllocator = struct {
         const amount = std.math.cast(u64, bytes) orelse std.math.maxInt(u64);
         self.live_bytes -|= amount;
         if (self.live_bytes == 0) {
-            self.reservation.shrink(self.reservation.bytes);
+            self.reservation.shrink(self.reservation.bytes -| self.pinned_bytes);
             return;
         }
         const spare = self.reservation.bytes -| self.live_bytes;
         if (spare < self.credit_quantum *| 2) return;
         const retained_spare = @min(self.credit_quantum, self.reservation.bytes);
-        const target = self.live_bytes +| retained_spare;
+        const target = @max(self.pinned_bytes, self.live_bytes +| retained_spare);
         if (self.reservation.bytes > target)
             self.reservation.shrink(self.reservation.bytes - target);
     }
@@ -3474,6 +3492,33 @@ test "owned split secondary credit transfers into a budgeted allocator" {
     split.release();
     try std.testing.expectEqual(@as(u64, 30), manager.sliceStats(.document_extraction_working_set).used_bytes);
     retained_alloc.free(value);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
+}
+
+test "pinned split credit survives idle allocation windows" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+
+    var split = try manager.reserveOwnedSplitAtMost(.document_extraction_working_set, 70, 30);
+    defer split.release();
+    var invocation = BudgetedAllocator.init(
+        &manager,
+        .document_extraction_working_set,
+        std.testing.allocator,
+        1,
+    );
+    try split.transferSecondaryToPinned(&invocation);
+    const invocation_alloc = invocation.allocator();
+    const first_window = try invocation_alloc.alloc(u8, 30);
+    invocation_alloc.free(first_window);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    const second_window = try invocation_alloc.alloc(u8, 30);
+    invocation_alloc.free(second_window);
+    split.release();
+    try std.testing.expectEqual(@as(u64, 30), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    invocation.deinit();
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
 }
 

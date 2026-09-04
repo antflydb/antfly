@@ -34523,6 +34523,13 @@ fn computeDocumentExtractionAssetRequestDerived(
     var pdf_operation_reservation: ?resource_manager_mod.OwnedSplitReservation = null;
     defer if (pdf_operation_reservation) |*reservation| reservation.release();
     const source_is_pdf = document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data);
+    var pdf_output_budgeted: ?resource_manager_mod.BudgetedAllocator = if (source_is_pdf and extraction_resource_manager != null)
+        resource_manager_mod.BudgetedAllocator.init(extraction_resource_manager.?, .document_extraction_working_set, alloc, 1)
+    else
+        null;
+    defer if (pdf_output_budgeted) |*budgeted| budgeted.deinit();
+    const pdf_output_alloc = if (pdf_output_budgeted) |*budgeted| budgeted.allocator() else alloc;
+    var pdf_output_bytes: ?usize = null;
     var pdf_inspection_bytes: usize = if (source_is_pdf) config.pdf_decode_limits.max_working_set_bytes else 0;
     if (source_is_pdf) {
         if (extraction_resource_manager) |manager| {
@@ -34531,7 +34538,19 @@ fn computeDocumentExtractionAssetRequestDerived(
             const requested_native_bytes = std.math.add(usize, requested_inspection_bytes, requested_render_bytes) catch
                 return error.DocumentExtractionWorkingSetTooLarge;
             const requested_native_bytes_u64: u64 = @intCast(requested_native_bytes);
-            const tracked_headroom: u64 = @intCast(enrichment_runtime_mod.documentExtractionPdfTrackedHeadroomBytes(alloc, request));
+            const output_reservation_bytes = if (db.enrichment_runtime) |runtime|
+                try enrichment_runtime_mod.documentExtractionPdfOutputReservationBytes(
+                    runtime,
+                    alloc,
+                    request,
+                    config,
+                    if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type,
+                )
+            else if (document_extraction_mod.ocrEnabledForRoute(config, "pdf"))
+                return error.MissingAssetProducer
+            else
+                0;
+            const tracked_headroom: u64 = @intCast(output_reservation_bytes);
             pdf_operation_reservation = manager.reserveOwnedSplitAtMost(
                 .document_extraction_working_set,
                 requested_native_bytes_u64,
@@ -34548,7 +34567,9 @@ fn computeDocumentExtractionAssetRequestDerived(
                 requested_render_bytes,
             );
             pdf_inspection_bytes = partition.inspection_bytes;
-            try pdf_operation_reservation.?.transferSecondaryTo(&extraction_budgeted.?);
+            pdf_output_bytes = std.math.cast(usize, pdf_operation_reservation.?.secondary_bytes) orelse
+                return error.DocumentExtractionWorkingSetTooLarge;
+            try pdf_operation_reservation.?.transferSecondaryToPinned(&pdf_output_budgeted.?);
             config.pdf_render_max_inflight_bytes = partition.render_bytes;
             config.pdf_decode_limits.max_working_set_bytes = @min(config.pdf_decode_limits.max_working_set_bytes, config.pdf_render_max_inflight_bytes);
             config.pdf_decode_limits.max_decoded_stream_bytes = @min(config.pdf_decode_limits.max_decoded_stream_bytes, config.pdf_decode_limits.max_working_set_bytes);
@@ -34585,11 +34606,16 @@ fn computeDocumentExtractionAssetRequestDerived(
             &extraction,
             .{
                 .native_backing_alloc = alloc,
-                .working_alloc = if (extraction_budgeted != null) extraction_alloc else null,
+                .working_alloc = if (pdf_output_bytes != null and pdf_output_bytes.? > 0) pdf_output_alloc else null,
+                .output_bytes = pdf_output_bytes,
             },
         );
     } else if (document_extraction_mod.ocrEnabledForRoute(config, extraction.route_type) or config.transcription_enabled) {
         return error.MissingAssetProducer;
+    }
+    if (pdf_output_budgeted) |*budgeted| {
+        budgeted.deinit();
+        pdf_output_budgeted = null;
     }
     document_extraction_mod.rebaseUnitCharOffsets(extraction.units);
 

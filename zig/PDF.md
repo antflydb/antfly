@@ -1620,6 +1620,24 @@ document. They are architectural requirements, not Florence-specific cleanup:
     does not reveal whether the model ran. If any partition has unknown
     execution state, the coordinator still returns typed per-item failures but
     omits the aggregate execution report instead of manufacturing telemetry.
+181. **PDF OCR reserved logical media bytes instead of the physical invocation
+    peak.** A 64 MiB PNG window can require substantially more retained memory
+    when a distributed route builds a base64 body or a reader adapter builds
+    data URIs, and request/response parsing has its own bounded allocator peak.
+    PDF OCR now resolves the concrete producer route before admission and
+    atomically reserves the transport-specific media peak plus the invocation
+    plan's allocator limit beside native parser/render memory.
+182. **A stale base64 precheck overruled route-specific admission.** The OCR
+    loop rejected raw PNGs using base64 expansion even when the resolved linked
+    route borrowed binary attachments, while still failing to describe the
+    complete peak of remote routes. The generic invocation plan is now the
+    sole transport authority; logical request bytes remain checked separately.
+183. **OCR staging capacity followed an operator ceiling instead of pending
+    work.** A tiny document, including a transcription-only unit, could reserve
+    media arrays for an arbitrarily large configured batch. The scheduler now
+    caps its control-plane batch at 128 items and allocates PDF media staging
+    only for `min(pending_pages, admitted_batch_items)`; non-media tasks do not
+    allocate those arrays.
 
 ### Post-review implementation contract
 
@@ -2189,6 +2207,24 @@ The hardening above follows these long-term rules:
     oversize, and malformed-envelope failures make aggregate execution state
     unknowable, so the ordered response preserves typed item failures while
     omitting its execution report.
+68. **Implemented after PDF invocation-admission review:** OCR pre-admission
+    builds a bounded representative page batch for the resolved reader,
+    generator, or extractor route and uses its attachment transport and
+    allocator ceiling to calculate conservative physical output credit without
+    requiring remote discovery before PDF inspection. Execution subsequently
+    applies model capabilities. Native renderer scratch and allocator-owned
+    invocation memory remain independent owners, so one is never numerically
+    subtracted from the other.
+69. **Implemented after allocator-lifetime review:** retained document state
+    and transient PDF invocation memory have distinct BudgetedAllocators. The
+    atomically reserved secondary credit transfers only to the transient
+    allocator, is reusable after every window, and is released as soon as OCR
+    finishes; completed text is admitted independently and cannot consume the
+    next window's guarantee.
+70. **Implemented after transport and staging review:** the legacy unconditional
+    base64 gate is removed. Exact logical request limits and the resolved
+    transport planner govern admission, while PDF-only staging arrays are
+    sized from actual pending work under a process-wide control-item ceiling.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -2309,11 +2345,12 @@ Antfly now has a bounded document-scoped render and OCR pipeline:
   required.
   Concurrent documents cannot steal the output credit after admission, and a
   full request gets normal cache reclamation before partial native fallback.
-  The output credit is atomically transferred into the `BudgetedAllocator`
-  that owns streaming retained state and transient provider buffers (and the
-  synchronous path's downloaded source and provider buffers). Native credit
-  is partitioned after admission into non-overlapping inspection and render
-  ceilings. After the render session is prepared, its remaining credit must
+  The output credit is atomically transferred into a dedicated, pinned
+  `BudgetedAllocator` that owns only rendered media and transient provider
+  buffers. Retained streaming state and the synchronous download remain in
+  independently admitted allocators. Native credit is partitioned after
+  admission into non-overlapping inspection and render ceilings. After the
+  render session is prepared, its remaining credit must
   still fit a minimum raster; otherwise the operation fails before launching a
   worker. Decode limits and render geometry shrink to a smaller partial grant
   instead of admitting a mathematically impossible worker. The available worker
@@ -2536,14 +2573,16 @@ Parallel rendering uses two levels of admission in the current runtime:
   thread group.
 
 The resource-manager admission is one owned split reservation. With the
-defaults, an OCR operation must own the 64 MiB transient-output credit and may
-own the requested inspection-plus-render native capacity. Page-image embedding
-uses the same mechanism with a render-only native side and a model-batch output
-side. A partial OCR native grant is divided proportionally into non-overlapping
-inspection and render ceilings; both must remain nonzero when both phases are
-requested. Another operation cannot consume either operation's already-owned
-scratch or output side. An unusable native partition or unavailable required
-output credit fails before coordinator parsing or worker creation.
+defaults, an OCR operation must own the physical peak implied by its 64 MiB
+logical media window, resolved attachment transport, and bounded invocation
+allocator; it may also own the requested inspection-plus-render native
+capacity. Page-image embedding uses the same mechanism with a render-only
+native side and a model-batch output side. A partial OCR native grant is divided
+proportionally into non-overlapping inspection and render ceilings; both must
+remain nonzero when both phases are requested. Another operation cannot consume
+either operation's already-owned scratch or output side. An unusable native
+partition or unavailable required output credit fails before coordinator
+parsing or worker creation.
 
 A separate process-wide CPU permit pool remains an optional follow-up if
 operational measurements show that the bounded enrichment lanes are too coarse.
@@ -2934,10 +2973,10 @@ report model qualification after running only the fake providers.
 - Actual live memory remains below the combined declared caps.
 - The native reservation preserves the configured tracked-output headroom
   as an owned credit under competing slice owners.
-- The owned output credit transfers atomically into the allocator that owns
-  both retained OCR state and transient provider buffers; manager usage does
-  not change during the transfer and exact live-byte accounting resumes as
-  buffers are released.
+- The owned output credit transfers atomically into a dedicated pinned
+  invocation allocator; manager usage does not change during the transfer,
+  idle windows retain their guarantee, and the credit is released at operation
+  teardown. Retained OCR state is admitted through a different allocator.
 - Partial native grants reserve a viable minimum raster after persistent parse
   state and a bounded decode workspace. Page geometry is derived from the
   remaining byte grant before worker admission.
@@ -2951,12 +2990,13 @@ report model qualification after running only the fake providers.
 - Streaming text inspection, its borrowed callback unit, the persistent render
   coordinator, and render forks are simultaneously covered by distinct hard
   ceilings whose sum is the one native reservation.
-- In the streaming path, provider request construction, returned transient
-  buffers, and persistent OCR text use the same tracked allocator, so a full
-  split reservation cannot starve the retained-state copy it was intended to
-  protect. The synchronous path keeps extracted and replacement unit state
-  under its inspection ceiling until teardown while its output allocator owns
-  provider buffers.
+- In the streaming path, provider request construction and returned transient
+  buffers use a dedicated allocator holding the transport-aware output credit;
+  persistent OCR text uses the independently admitted collection allocator.
+  The synchronous path likewise keeps extracted and replacement unit state
+  under its inspection ceiling while a separate output allocator owns rendered
+  media and provider buffers. Thus retained results cannot consume the next
+  window's guaranteed invocation headroom.
 - Source-session cache growth between windows reduces the next window's
   computed worker allowance.
 - Underestimated pages are stopped by the budgeted allocator.
@@ -3059,9 +3099,10 @@ byte admission. Parallelism defaults to one and is operator-capped at eight.
   wave-local cancellation with the external deadline, and report measured
   rather than planned concurrency.
 - Reserve native and transient output memory as one owned split, reclaim before
-  partial fallback, atomically transfer output credit to the live allocator,
-  partition partial native grants into persistent/decode/raster budgets, and
-  recompute available render bytes before each window.
+  partial fallback, atomically transfer output credit to a dedicated
+  operation-pinned invocation allocator, partition partial native grants into
+  persistent/decode/raster budgets, and recompute available render bytes before
+  each window.
 - Downsize encoded output within each worker before retaining a completed page.
 
 ### Phase 4: Binary local media handoff
