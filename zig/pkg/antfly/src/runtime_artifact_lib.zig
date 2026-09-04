@@ -96,6 +96,9 @@ else
 // user-manager adapter likewise imports its storage types through this root.
 pub const aggregation = @import("search/aggregation.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
+pub const backup_bundle = @import("storage/backup_bundle.zig");
+pub const backup_bundle_io = @import("storage/backup_bundle_io.zig");
+pub const backup_repository = @import("storage/backup_repository.zig");
 pub const common_config = @import("common/config.zig");
 pub const common_secrets = @import("common/secrets.zig");
 pub const data_snapshot = @import("data/storage/shard_state_store.zig");

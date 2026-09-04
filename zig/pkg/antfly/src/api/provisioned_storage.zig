@@ -363,6 +363,18 @@ pub const ProvisionedGroupStorage = struct {
         self.* = undefined;
     }
 
+    /// Join every cached writer DB before an externally owned provider is
+    /// destroyed. Sources and request runtimes must already be quiescent, so
+    /// no new cache lease can appear while this barrier holds the shared state
+    /// mutex. The cache containers remain valid for the ordinary final deinit.
+    pub fn quiesceExternalProviderUsers(self: *ProvisionedGroupStorage) !void {
+        if (comptime storage_kernel_experiment) return;
+        lockAtomic(&self.write_cache_state_mutex);
+        defer self.write_cache_state_mutex.unlock();
+        try self.startup_write_cache.closeAllDbsLocked();
+        try self.write_cache.closeAllDbsLocked();
+    }
+
     /// Break every cache-to-source callback edge while both owners are still
     /// alive. Call this after attached write sources are quiescent and before
     /// either the sources or this storage are destroyed.

@@ -15,6 +15,7 @@
 const std = @import("std");
 
 pub const artifact_sources_protocol_version: u16 = 1;
+pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
@@ -785,6 +786,13 @@ pub fn voterSetFingerprint(node_ids: []const u64, required_node_id: ?u64) VoterS
 
 pub const StoreStatusReport = struct {
     store_id: u64,
+    /// Version of the volatile owner-activity projection carried by this
+    /// heartbeat. Zero means absent/legacy; version 2 is the current schema.
+    /// This is intentionally not copied into StoreRecord or Raft state.
+    embedding_activity_protocol_version: u16 = 0,
+    /// Monotonic volatile report order within `reporter_incarnation`. This is
+    /// independent from `status_generation` and never reaches StoreRecord.
+    embedding_activity_sequence: u64 = 0,
     /// Must match the incarnation established by store registration. Zero is
     /// reserved for rolling-upgrade compatibility with legacy reporters.
     reporter_incarnation: u64 = 0,
@@ -808,6 +816,43 @@ pub const StoreStatusReport = struct {
 /// never exist without the process incarnation that gives it meaning.
 pub fn reporterFenceValid(reporter_incarnation: u64, status_generation: u64) bool {
     return reporter_incarnation != 0 or status_generation == 0;
+}
+
+pub fn embeddingActivityProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
+    return (protocol_version == 0 or protocol_version == embedding_activity_protocol_version) and
+        (protocol_version == 0 or reporter_incarnation != 0);
+}
+
+/// Sequenced activity is all-or-nothing: legacy reports omit both fields,
+/// while the current protocol requires a process incarnation and report order.
+pub fn embeddingActivityReportValid(
+    reporter_incarnation: u64,
+    protocol_version: u16,
+    activity_sequence: u64,
+) bool {
+    if (!embeddingActivityProtocolValid(reporter_incarnation, protocol_version)) return false;
+    return if (protocol_version == 0)
+        activity_sequence == 0
+    else
+        activity_sequence != 0;
+}
+
+/// Activity observation validity is explicit per index. Legacy reports cannot
+/// smuggle volatile samples into the current cache, and current observations
+/// must carry both incarnation and sample ordering fences.
+pub fn embeddingActivitySamplesValid(
+    protocol_version: u16,
+    runtime_statuses: []const RuntimeGroupStatusReport,
+) bool {
+    for (runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (!index_status.embedding_activity_observed) continue;
+            if (protocol_version != embedding_activity_protocol_version or
+                index_status.embedding_activity.epoch == 0 or
+                index_status.embedding_activity.sample_sequence == 0) return false;
+        }
+    }
+    return true;
 }
 
 pub fn artifactSourcesProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
@@ -839,6 +884,28 @@ test "artifact source protocol support fails closed and includes custom placemen
     try std.testing.expect(storeServesTableData("hot"));
     try std.testing.expect(storeServesTableData("cold"));
     try std.testing.expect(!storeServesTableData("metadata"));
+}
+
+test "embedding activity protocol requires an incarnation fence" {
+    try std.testing.expect(embeddingActivityProtocolValid(0, 0));
+    try std.testing.expect(!embeddingActivityProtocolValid(0, embedding_activity_protocol_version));
+    try std.testing.expect(embeddingActivityProtocolValid(7, embedding_activity_protocol_version));
+    try std.testing.expect(!embeddingActivityProtocolValid(7, embedding_activity_protocol_version - 1));
+    try std.testing.expect(!embeddingActivityProtocolValid(7, embedding_activity_protocol_version + 1));
+    try std.testing.expect(embeddingActivityReportValid(0, 0, 0));
+    try std.testing.expect(!embeddingActivityReportValid(7, 0, 1));
+    try std.testing.expect(!embeddingActivityReportValid(7, embedding_activity_protocol_version, 0));
+    try std.testing.expect(embeddingActivityReportValid(7, embedding_activity_protocol_version, 1));
+
+    var indexes = [_]RuntimeIndexStatusReport{.{
+        .embedding_activity_observed = true,
+        .embedding_activity = .{ .epoch = 3, .sample_sequence = 4 },
+    }};
+    const groups = [_]RuntimeGroupStatusReport{.{ .indexes = indexes[0..] }};
+    try std.testing.expect(embeddingActivitySamplesValid(embedding_activity_protocol_version, &groups));
+    try std.testing.expect(!embeddingActivitySamplesValid(0, &groups));
+    indexes[0].embedding_activity.sample_sequence = 0;
+    try std.testing.expect(!embeddingActivitySamplesValid(embedding_activity_protocol_version, &groups));
 }
 
 pub const RuntimeEnrichmentStatusReport = struct {
@@ -903,6 +970,13 @@ pub const RuntimeGroupStatusReport = struct {
     topology_generation: u64 = 0,
     lsm_root_generation: u64 = 0,
     status_generation: u64 = 0,
+    /// Opaque monotonic watermark captured before the owner sampled this
+    /// group. It is ordered only within one reporter incarnation.
+    target_observation_revision: u64 = 0,
+    /// True only when this immutable owner observation includes the latest
+    /// accepted replay target for the group. Heartbeat/activity freshness is
+    /// intentionally independent from this convergence proof.
+    target_observation_complete: bool = true,
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
     disk_bytes_known: bool = false,
@@ -982,6 +1056,36 @@ pub const RuntimeDocSetPlanningStatusReport = struct {
     stale_identity_generation_rejection_count: u64 = 0,
 };
 
+pub const RuntimeEmbeddingActivityStatusReport = struct {
+    pub const Phase = enum {
+        idle,
+        preparing,
+        embedding,
+        publishing,
+        waiting_retry,
+    };
+
+    epoch: u64 = 0,
+    /// Monotonic sample order within `epoch`. Activity-only heartbeats reuse the
+    /// durable store generation and are ordered exclusively by this sequence.
+    sample_sequence: u64 = 0,
+    phase: Phase = .idle,
+    chunks_created: u64 = 0,
+    embedding_batches_completed: u64 = 0,
+    embeddings_computed: u64 = 0,
+    active_batch_size: u64 = 0,
+    last_progress_at_ms: u64 = 0,
+};
+
+/// Exact scheduler meaning for an incarnation-scoped lifecycle record. This
+/// travels with V15 repair state so readers never infer corruption from the
+/// implementation lane used to build a new index.
+pub const IndexLifecycleWorkClass = enum(u8) {
+    none = 0,
+    initial_build = 1,
+    repair = 2,
+};
+
 pub const RuntimeIndexStatusReport = struct {
     name: []const u8 = "",
     kind: []const u8 = "",
@@ -994,6 +1098,15 @@ pub const RuntimeIndexStatusReport = struct {
     edge_count: u64 = 0,
     node_count: u64 = 0,
     root_node: u64 = 0,
+    /// Exact physical artifact cardinality for the reported incarnation.
+    /// Missing proof is deliberately false so current readers fail closed.
+    publication_target_count: u64 = 0,
+    publication_target_ready: bool = false,
+    /// Exact owner-side proof that the current incarnation has an installed
+    /// snapshot which passes the same resident admission gate as search. This
+    /// is independent of cardinality: a published empty snapshot is ready.
+    /// Missing proof fails closed on mixed-version readers.
+    serving_snapshot_ready: bool = false,
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
@@ -1006,13 +1119,46 @@ pub const RuntimeIndexStatusReport = struct {
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
+    /// True when the owner observed `embedding_activity` at a stable lifecycle
+    /// boundary. False means unavailable for this heartbeat, not idle.
+    embedding_activity_observed: bool = false,
+    embedding_activity: RuntimeEmbeddingActivityStatusReport = .{},
     source_replay: []RuntimeIndexSourceReplayStatusReport = &.{},
+    lifecycle_work_class: IndexLifecycleWorkClass = .none,
     repair_status: ?IndexRepairStatus = null,
     /// This proof is meaningful only while repair_status is non-null. It means
     /// the active generation is safe to query, not necessarily complete.
     /// Missing proof is deliberately false so mixed-version reports fail closed.
     repair_active_generation_serviceable: bool = false,
 };
+
+/// V15 is one atomic runtime-status profile. Keep profile selection next to the
+/// domain record so transport negotiation and durable encoding cannot evolve
+/// separate lists of current-only facts.
+pub fn runtimeIndexRequiresCurrentProfile(record: RuntimeIndexStatusReport) bool {
+    return record.publication_target_ready or
+        record.serving_snapshot_ready or
+        record.lifecycle_work_class != .none or
+        record.repair_status != null or
+        record.source_replay.len != 0;
+}
+
+pub fn storeRequiresCurrentRuntimeStatusProfile(record: StoreRecord) bool {
+    if (record.native_generation_restore_version != 0 or
+        record.artifact_sources_protocol_version != 0 or
+        record.reporter_incarnation != 0 or
+        record.status_generation != 0)
+    {
+        return true;
+    }
+    for (record.runtime_statuses) |runtime_status| {
+        if (!runtime_status.target_observation_complete) return true;
+        for (runtime_status.indexes) |index_status| {
+            if (runtimeIndexRequiresCurrentProfile(index_status)) return true;
+        }
+    }
+    return false;
+}
 
 pub const RuntimeIndexSourceReplayStatusReport = struct {
     artifact_name: []const u8 = "",
@@ -2405,6 +2551,8 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .topology_generation = record.topology_generation,
         .lsm_root_generation = record.lsm_root_generation,
         .status_generation = record.status_generation,
+        .target_observation_revision = record.target_observation_revision,
+        .target_observation_complete = record.target_observation_complete,
         .doc_count = record.doc_count,
         .disk_bytes = record.disk_bytes,
         .disk_bytes_known = record.disk_bytes_known,
@@ -2481,6 +2629,9 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .edge_count = record.edge_count,
         .node_count = record.node_count,
         .root_node = record.root_node,
+        .publication_target_count = record.publication_target_count,
+        .publication_target_ready = record.publication_target_ready,
+        .serving_snapshot_ready = record.serving_snapshot_ready,
         .coverage_produced_count = record.coverage_produced_count,
         .coverage_skipped_count = record.coverage_skipped_count,
         .coverage_terminal_failed_count = record.coverage_terminal_failed_count,
@@ -2493,7 +2644,10 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .replay_applied_sequence = record.replay_applied_sequence,
         .replay_target_sequence = record.replay_target_sequence,
         .replay_catch_up_required = record.replay_catch_up_required,
+        .embedding_activity_observed = record.embedding_activity_observed,
+        .embedding_activity = record.embedding_activity,
         .source_replay = source_replay,
+        .lifecycle_work_class = record.lifecycle_work_class,
         .repair_status = record.repair_status,
         .repair_active_generation_serviceable = record.repair_active_generation_serviceable,
     };

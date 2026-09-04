@@ -1125,23 +1125,28 @@ def test_artifact_backed_embedding_table_provisions_atomically(
         )
         is not None
     )
+
+    def ready_embedding_status():
+        current = stateful_api.get_index(table_name, "document_vectors")
+        status = current.get("status", {})
+        index_coverage = status.get("coverage", {})
+        enrichment_runtime = status.get("enrichment_runtime", {})
+        if (
+            index_coverage.get("source_total") == 2
+            and index_coverage.get("produced") == 2
+            and index_coverage.get("covered") == 2
+            and index_coverage.get("observation_complete") is True
+            and index_coverage.get("complete") is True
+            and index_coverage.get("healthy") is True
+            and enrichment_runtime.get("enabled") is True
+            and enrichment_runtime.get("worker_started") is True
+            and enrichment_runtime.get("embed_batches_completed", 0) > 0
+        ):
+            return current
+        return None
+
     coverage = wait_until(
-        lambda: (
-            status
-            if (
-                (status := stateful_api.get_index(table_name, "document_vectors"))
-                .get("status", {})
-                .get("coverage", {})
-                .get("source_total")
-                == 2
-                and status["status"]["coverage"].get("produced") == 2
-                and status["status"]["coverage"].get("covered") == 2
-                and status["status"]["coverage"].get("observation_complete") is True
-                and status["status"]["coverage"].get("complete") is True
-                and status["status"]["coverage"].get("healthy") is True
-            )
-            else None
-        ),
+        ready_embedding_status,
         timeout_s=60.0,
         interval_s=0.5,
     )
