@@ -15,6 +15,7 @@
 const std = @import("std");
 const ant_json = @import("antfly-json");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const RequestContext = @import("request_context.zig").RequestContext;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const httpx = @import("httpx");
@@ -48,6 +49,7 @@ const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const enrichment_types = @import("../storage/db/enrichment/enrichment_types.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
+const shared_vector = @import("antfly_vector").vector;
 
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
@@ -61,17 +63,7 @@ pub const ProviderKind = enum {
     antfly,
 };
 
-pub const EmbeddingRequestContext = struct {
-    io: std.Io,
-    deadline_ns: ?u64,
-    cancellation: ?CancellationToken = null,
-
-    pub fn check(self: EmbeddingRequestContext) !void {
-        if (self.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
-        const deadline = self.deadline_ns orelse return;
-        if (monotonicNowNs() >= deadline) return error.Timeout;
-    }
-};
+pub const EmbeddingRequestContext = RequestContext;
 
 pub const AntflyProvider = struct {
     ptr: *anyopaque,
@@ -114,6 +106,14 @@ pub const AntflyProvider = struct {
         model: []const u8,
         query: []const u8,
         documents: []const []const u8,
+    ) anyerror![]f32 = null,
+    rerank_texts_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        query: []const u8,
+        documents: []const []const u8,
+        context: RequestContext,
     ) anyerror![]f32 = null,
     generate_text: ?*const fn (
         ptr: *anyopaque,
@@ -1717,7 +1717,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         return try out.toOwnedSlice(alloc);
     }
 
-    const metric = if (cfg.distance_metric) |distance_metric| @tagName(distance_metric) else "cosine";
+    const metric = if (cfg.distance_metric) |distance_metric| @tagName(distance_metric) else @tagName(shared_vector.default_distance_metric);
 
     const embedder_value = root.get("embedder");
     const embedder_json = if (embedder_value) |embedder| blk: {
@@ -3342,11 +3342,14 @@ fn resolveDeclaredEmbeddingDimensions(cfg: indexes_openapi.EmbeddingsIndexConfig
         return std.math.cast(u32, dimension) orelse error.InvalidCreateTableRequest;
     }
     if (cfg.embedder) |embedder| {
-        if (embedder.dimension) |dimension| {
+        const declared = switch (embedder) {
+            .ollama_embedder_config => null,
+            .open_ai_embedder_config => |value| value.dimensions,
+            .bedrock_embedder_config => |value| value.dimension orelse value.dimensions,
+            .antfly_embedder_config => null,
+        };
+        if (declared) |dimension| {
             return std.math.cast(u32, dimension) orelse error.InvalidCreateTableRequest;
-        }
-        if (embedder.dimensions) |dimensions| {
-            return std.math.cast(u32, dimensions) orelse error.InvalidCreateTableRequest;
         }
     }
     return null;
@@ -4956,7 +4959,7 @@ test "managed embedder preserves coverage policy in storage config" {
 
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        \\{"field":"body","dims":384,"embedding_name":"thumbnail","coverage_policy":"partial"}
+        \\{"field":"body","dims":384,"metric":"l2_squared","embedding_name":"thumbnail","coverage_policy":"partial"}
     ,
         config_json,
     );

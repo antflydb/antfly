@@ -6,8 +6,11 @@ from .client import (
     AntflyClient,
     CreatedIndex,
     CreateIndexRequest,
+    EmbedderConfig,
+    EmbedderProvider,
     GraphQueriesInput,
     GraphQueryInput,
+    IndexEmbedderConfig,
     IndexOperations,
     antfly_embedder,
 )
@@ -26,8 +29,6 @@ from .client_generated.models import (
     CreateGraphIndexRequestType,
     DerivedCoveragePolicy,
     DistanceMetric,
-    EmbedderConfig,
-    EmbedderProvider,
 )
 from .client_generated.models.embedding_type_1 import EmbeddingType1 as SparseEmbedding
 from .client_generated.models.embedding_type_3 import EmbeddingType3 as PackedSparseEmbedding
@@ -91,6 +92,7 @@ __all__ = [
     "DerivedCoveragePolicy",
     "DistanceMetric",
     "EmbedderConfig",
+    "IndexEmbedderConfig",
     "EmbedderProvider",
     "antfly_embedder",
     "AntflyException",

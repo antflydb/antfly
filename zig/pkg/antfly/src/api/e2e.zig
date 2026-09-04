@@ -3349,11 +3349,7 @@ test "public api e2e supports managed semantic search and sparse embeddings" {
         "semantic_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         null,
     );
     defer std.testing.allocator.free(semantic_index_body);
@@ -3495,11 +3491,7 @@ test "public api e2e adds managed embeddings indexes to existing tables" {
         "semantic_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         null,
     );
     defer std.testing.allocator.free(semantic_index_body);
@@ -3640,11 +3632,7 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
         "semantic_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         null,
     );
     defer std.testing.allocator.free(semantic_index_body);
@@ -3796,11 +3784,7 @@ test "public api e2e restores managed embeddings from table backup" {
         "semantic_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         null,
     );
     defer std.testing.allocator.free(semantic_index_body);
@@ -4095,11 +4079,7 @@ test "public api e2e supports hybrid query pruner and reranker" {
         "semantic_idx",
         "body",
         3,
-        .{
-            .provider = .antfly,
-            .model = "antfly-embed-v1",
-            .api_url = antfly_base_uri,
-        },
+        test_contract_helpers.antflyIndexEmbedder("antfly-embed-v1", antfly_base_uri, false),
         null,
     );
     defer std.testing.allocator.free(dense_index_body);
@@ -5733,12 +5713,7 @@ test "public api e2e supports embedding_template remote media helper" {
         "semantic_idx",
         "body",
         3,
-        .{
-            .provider = .antfly,
-            .model = "antfly-clip-v1",
-            .api_url = antfly_base_uri,
-            .multimodal = true,
-        },
+        test_contract_helpers.antflyIndexEmbedder("antfly-clip-v1", antfly_base_uri, true),
         null,
     );
     defer std.testing.allocator.free(semantic_index_body);
@@ -5912,11 +5887,7 @@ test "public api e2e supports template chunked remote text enrichment and query 
         "semantic_template_chunked_idx",
         "{{title}} {{remoteText url=transcript}}",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         .{
             .provider = .antfly,
             .model = "fixed-bert-tokenizer",
@@ -6164,11 +6135,7 @@ test "public api e2e supports fixed and antfly chunked semantic search" {
         "semantic_fixed_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = openai_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", openai_base_uri),
         .{
             .provider = .antfly,
             .model = "fixed-bert-tokenizer",
@@ -6185,11 +6152,7 @@ test "public api e2e supports fixed and antfly chunked semantic search" {
         "semantic_antfly_idx",
         "body",
         3,
-        .{
-            .provider = .antfly,
-            .model = "antfly-embed-v1",
-            .api_url = antfly_base_uri,
-        },
+        test_contract_helpers.antflyIndexEmbedder("antfly-embed-v1", antfly_base_uri, false),
         .{
             .provider = .antfly,
             .api_url = antfly_chunk_api,
@@ -6344,11 +6307,7 @@ test "public api e2e restores chunked managed embeddings from table backup" {
         "semantic_fixed_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = openai_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", openai_base_uri),
         .{
             .provider = .antfly,
             .model = "fixed-bert-tokenizer",

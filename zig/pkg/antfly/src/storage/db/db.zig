@@ -44983,30 +44983,41 @@ fn replayPendingDerivedBatches(
             const hbc_slice: resource_manager_mod.SliceStats = if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] else .{ .name = "hbc_node_metadata_cache" };
             const dense_apply_slice: resource_manager_mod.SliceStats = if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)] else .{ .name = "dense_apply_working_set" };
 
-            std.log.warn(
-                "dense catch-up watchdog progress index={s} sequence={} target={} scanned={} applied={} delta_applied={} local_cache_gates={{nodes={},vectors={}}} shared_hbc={{target={},used={},peak={},soft={},hard={},node_protected={},quantized_protected={},vector_protected={},metadata_protected={},reclaim_requests={},reclaimed_bytes={}}}",
-                .{
-                    replay.index_name,
-                    progress.sequence,
-                    replay.persist.target_sequence,
-                    progress.scanned_entries,
-                    progress.applied_entries,
-                    progress.applied_entries -| replay.last_applied_entries,
-                    dense_entry.index.config.max_cached_nodes,
-                    dense_entry.index.config.max_cached_vectors,
-                    hbc_policy.target_bytes,
-                    hbc_slice.used_bytes,
-                    hbc_slice.peak_bytes,
-                    hbc_slice.soft_limit_bytes,
-                    hbc_slice.hard_limit_bytes,
-                    hbc_policy.node_protected_bytes,
-                    hbc_policy.quantized_protected_bytes,
-                    hbc_policy.vector_protected_bytes,
-                    hbc_policy.metadata_protected_bytes,
-                    if (resource_snapshot) |stats| stats.reclaim_requests else 0,
-                    if (resource_snapshot) |stats| stats.reclaimed_bytes else 0,
-                },
-            );
+            const common_progress_args = .{
+                replay.index_name,
+                progress.sequence,
+                replay.persist.target_sequence,
+                progress.scanned_entries,
+                progress.applied_entries,
+                progress.applied_entries -| replay.last_applied_entries,
+            };
+            const shared_cache_args = .{
+                hbc_policy.target_bytes,
+                hbc_slice.used_bytes,
+                hbc_slice.peak_bytes,
+                hbc_slice.soft_limit_bytes,
+                hbc_slice.hard_limit_bytes,
+                hbc_policy.node_protected_bytes,
+                hbc_policy.quantized_protected_bytes,
+                hbc_policy.vector_protected_bytes,
+                hbc_policy.metadata_protected_bytes,
+                if (resource_snapshot) |stats| stats.reclaim_requests else 0,
+                if (resource_snapshot) |stats| stats.reclaimed_bytes else 0,
+            };
+            if (dense_entry.index.usesSharedCache()) {
+                std.log.warn(
+                    "dense catch-up watchdog progress index={s} sequence={} target={} scanned={} applied={} delta_applied={} cache_mode=shared_clock shared_hbc={{target_bytes={},used_bytes={},peak_bytes={},soft_limit_bytes={},hard_limit_bytes={},node_protected_bytes={},quantized_protected_bytes={},vector_protected_bytes={},metadata_protected_bytes={},reclaim_requests={},reclaimed_bytes={}}}",
+                    common_progress_args ++ shared_cache_args,
+                );
+            } else {
+                std.log.warn(
+                    "dense catch-up watchdog progress index={s} sequence={} target={} scanned={} applied={} delta_applied={} cache_mode=local local_cache_capacity={{nodes={},vectors={}}} resource_hbc={{target_bytes={},used_bytes={},peak_bytes={},soft_limit_bytes={},hard_limit_bytes={},node_protected_bytes={},quantized_protected_bytes={},vector_protected_bytes={},metadata_protected_bytes={},reclaim_requests={},reclaimed_bytes={}}}",
+                    common_progress_args ++ .{
+                        dense_entry.index.config.max_cached_nodes,
+                        dense_entry.index.config.max_cached_vectors,
+                    } ++ shared_cache_args,
+                );
+            }
             std.log.warn(
                 "dense catch-up watchdog resources index={s} namespace_hbc={{total={},accounted={},node_used={},quantized_used={},vector_used={},vector_peak={},vector_evictions={},metadata_used={}}} rm={{lsm_cache={},dense_search={},dense_apply_used={},dense_apply_peak={},replay_window={},full_text_pending={},full_text_build={}}} retries={{total={},not_found={}}} profile={{find_leaf_ns={},mutate_leaf_ns={},store_vector_ns={},quantized_vector_load_ns={}}}",
                 .{

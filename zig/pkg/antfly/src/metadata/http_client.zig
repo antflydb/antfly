@@ -942,6 +942,64 @@ pub const MetadataHttpClient = struct {
         try self.requestWithBody(base_uri, .PUT, path, schema_json, error.InvalidSchemaUpdateRequest, error.TableNotFound, error.TableTransitionActive);
     }
 
+    pub fn mutateSchema(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        mode: tables_api.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !tables_api.SchemaMutationResult {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.internal_tables_prefix,
+            table_name,
+            routes.Routes.internal_table_schema_mutation_suffix,
+        });
+        defer self.alloc.free(path);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var expected_buf: [16]u8 = undefined;
+        const expected_text = if (expected_version) |version|
+            try std.fmt.bufPrint(&expected_buf, "{d}", .{version})
+        else
+            null;
+        var headers_buf: [2]http_common.RequestHeader = undefined;
+        var header_count: usize = 1;
+        headers_buf[0] = .{
+            .name = "X-Antfly-Schema-Mutation-Mode",
+            .value = if (mode == .replace) "replace" else "merge-patch",
+        };
+        if (expected_text) |value| {
+            headers_buf[1] = .{ .name = "X-Antfly-Expected-Schema-Version", .value = value };
+            header_count = 2;
+        }
+
+        var resp = self.executeWithRetryPolicy(.{
+            .method = .POST,
+            .uri = uri,
+            .headers = headers_buf[0..header_count],
+            .body = body,
+            .content_type = if (mode == .merge_patch) "application/merge-patch+json" else "application/json",
+            .timeout_ms = default_request_timeout_ms,
+        }, null, .at_most_once) catch |err| switch (err) {
+            error.ReallocationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+        defer resp.deinit(self.alloc);
+        mapResponseStatus(resp, error.InvalidSchemaUpdateRequest, error.TableNotFound, error.SchemaVersionChanged) catch |err| switch (err) {
+            error.UnexpectedHttpStatus => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+        const WireResult = struct { version: u32, schema_json: []const u8 };
+        var parsed = try parseJson(WireResult, self.alloc, resp.body);
+        defer parsed.deinit();
+        return .{
+            .version = parsed.value.version,
+            .schema_json = try self.alloc.dupe(u8, parsed.value.schema_json),
+        };
+    }
+
     pub fn replaceTableDefinition(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -1860,6 +1918,45 @@ test "metadata http client does not replay reallocation after ambiguous transpor
         );
         try std.testing.expectEqual(@as(usize, 1), executor.attempts);
     }
+}
+
+test "metadata http client does not replay schema mutations after ambiguous transport failures" {
+    const AmbiguousExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(
+                u8,
+                req.uri,
+                "/internal/v1/tables/docs/schema:mutate",
+            ));
+            self.attempts += 1;
+            return error.ConnectionResetByPeer;
+        }
+    };
+
+    var executor = AmbiguousExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        client.mutateSchema(
+            "http://127.0.0.1:9000",
+            "docs",
+            .merge_patch,
+            "{\"description\":\"patched\"}",
+            1,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), executor.attempts);
 }
 
 test "metadata http client retries reallocation only before connection admission" {

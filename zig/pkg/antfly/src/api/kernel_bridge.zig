@@ -413,6 +413,7 @@ const OpaqueHttpxHandler = struct {
                 .post => .POST,
                 .put => .PUT,
                 .delete => .DELETE,
+                .patch => .PATCH,
             }, path, runtimeApiHttpHandler, route);
         }
     }
@@ -464,6 +465,7 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
             .POST => .post,
             .PUT => .put,
             .DELETE => .delete,
+            .PATCH => .patch,
             else => return error.MethodNotAllowed,
         },
         .path = abi.Bytes.init(context.request.uri.path),
