@@ -3928,6 +3928,10 @@ pub const HBCIndex = struct {
     flat_centroid_accounting_mu: std.atomic.Mutex = .unlocked,
     dense_route_cost_mu: std.atomic.Mutex = .unlocked,
     dense_route_cost: DenseRouteCostSnapshot = .{},
+    dense_search_scan_vectors_per_leaf_ewma: AtomicU64 = .init(0),
+    dense_search_scan_vectors_per_leaf_high_water: AtomicU64 = .init(0),
+    dense_search_scan_bytes_per_leaf_ewma: AtomicU64 = .init(0),
+    dense_search_scan_bytes_per_leaf_high_water: AtomicU64 = .init(0),
     write_profile: WriteProfile = .{},
     external_vector_ctx: ?*anyopaque = null,
     external_vector_loader: ?ExternalVectorLoader = null,
@@ -14805,10 +14809,9 @@ pub const HBCIndex = struct {
             std.math.divCeil(u64, node_count - 1, branching_factor) catch unreachable;
         const estimated_leaf_count = @max(node_count -| estimated_internal_nodes, 1);
         const mean_leaf_occupancy = std.math.divCeil(u64, active_count, estimated_leaf_count) catch unreachable;
-        const route_cost = self.denseRouteCostSnapshot();
         const learned_occupancy = @max(
-            route_cost.scan_vectors_per_leaf_high_water,
-            route_cost.scan_vectors_per_leaf_ewma,
+            self.dense_search_scan_vectors_per_leaf_high_water.load(.acquire),
+            self.dense_search_scan_vectors_per_leaf_ewma.load(.acquire),
         );
         // `leaf_size` protects the first query after open; observed high-water
         // corrects layouts containing overflow or otherwise skewed postings.
@@ -14828,8 +14831,8 @@ pub const HBCIndex = struct {
             dimensions *| @sizeOf(f32);
         const baseline_scan_bytes = candidate_count *| bytes_per_candidate;
         const learned_leaf_bytes = @max(
-            route_cost.scan_bytes_per_leaf_high_water,
-            route_cost.scan_bytes_per_leaf_ewma,
+            self.dense_search_scan_bytes_per_leaf_high_water.load(.acquire),
+            self.dense_search_scan_bytes_per_leaf_ewma.load(.acquire),
         );
         const learned_scan_bytes = search_width *| learned_leaf_bytes;
         const max_possible_scan_bytes = active_count *| dimensions *| @sizeOf(f32);
@@ -14953,6 +14956,12 @@ pub const HBCIndex = struct {
             else
                 @max(sample, previous_high_water -| @max(previous_high_water / 64, 1));
         }
+        // Serving admission reads lock-free snapshots; serialized route-model
+        // updates publish all four values only after completing the sample.
+        self.dense_search_scan_vectors_per_leaf_ewma.store(state.scan_vectors_per_leaf_ewma, .release);
+        self.dense_search_scan_vectors_per_leaf_high_water.store(state.scan_vectors_per_leaf_high_water, .release);
+        self.dense_search_scan_bytes_per_leaf_ewma.store(state.scan_bytes_per_leaf_ewma, .release);
+        self.dense_search_scan_bytes_per_leaf_high_water.store(state.scan_bytes_per_leaf_high_water, .release);
         state.filter_scan_ns_per_candidate = routeRateEwma(
             state.filter_scan_ns_per_candidate,
             perUnit(profile.filter_metadata_batch_ns, profile.filter_candidates),

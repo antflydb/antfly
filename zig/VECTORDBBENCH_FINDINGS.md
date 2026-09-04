@@ -4472,7 +4472,9 @@ observed high water. It records both posting occupancy and actual per-leaf scan
 bytes, so stale-payload float32 fallback cannot be charged as RaBitQ merely
 because the index is normally quantized. The observation runs after the query
 has released its MVCC transaction and request scratch and affects only later
-permits, so it never introduces a wait while those resources are held.
+permits, so it never introduces a wait while those resources are held. Query
+admission reads lock-free atomic snapshots of the model; concurrent serving
+does not contend on the route-observation mutex.
 
 Candidate work and exact completion stayed unchanged at 239,918 approximate
 and 146.6 exact vectors/query. The admission gain is not a recall, routing, or
