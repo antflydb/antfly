@@ -1268,9 +1268,16 @@ def test_stateful_drop_tables_with_pending_enrichment_preserves_unrelated_owner(
                 hot_tables
             ):
                 return None
-            if not all(
-                int(detail.get("status", {}).get("coverage", {}).get("pending", 0)) > 0
+            # Coverage counters are nullable until the runtime has published
+            # convergence authority. Treat that transitional state as "keep
+            # waiting"; it is not a zero count and must not abort the poll.
+            pending_counts = [
+                detail.get("status", {}).get("coverage", {}).get("pending")
                 for detail in pending_statuses.values()
+            ]
+            if not all(
+                isinstance(pending, int) and not isinstance(pending, bool) and pending > 0
+                for pending in pending_counts
             ):
                 return None
             return {"embedder": stats, "indexes": pending_statuses.copy()}
