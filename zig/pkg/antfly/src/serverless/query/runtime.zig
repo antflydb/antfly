@@ -51,6 +51,77 @@ pub const NamespaceQueryExecutionMetrics = struct {
 
 pub const AuthenticatedSubrange = cache_mod.AuthenticatedSubrange;
 
+pub const GraphMetricReadLimits = struct {
+    /// Shared by every graph-metric surface in one pinned request. These are
+    /// deliberately aggregate limits, not per metric.
+    max_range_requests: u64 = 128,
+    max_range_bytes: u64 = 256 * 1024 * 1024,
+    max_decoded_blocks: u64 = 16 * 1024,
+    max_work_items: u64 = 32 * 1024 * 1024,
+    max_retained_bytes: u64 = 128 * 1024 * 1024,
+};
+
+pub const GraphMetricReadBudget = struct {
+    limits: GraphMetricReadLimits = .{},
+    range_requests: u64 = 0,
+    range_bytes: u64 = 0,
+    decoded_blocks: u64 = 0,
+    work_items: u64 = 0,
+    retained_bytes: u64 = 0,
+
+    fn checkedCharge(current: u64, amount: u64, limit: u64) !u64 {
+        const next = std.math.add(u64, current, amount) catch return error.GraphMetricQueryBudgetExceeded;
+        if (next > limit) return error.GraphMetricQueryBudgetExceeded;
+        return next;
+    }
+
+    pub fn chargeRange(self: *@This(), bytes: usize) !void {
+        const next_requests = try checkedCharge(self.range_requests, 1, self.limits.max_range_requests);
+        const next_bytes = try checkedCharge(self.range_bytes, @intCast(bytes), self.limits.max_range_bytes);
+        self.range_requests = next_requests;
+        self.range_bytes = next_bytes;
+    }
+
+    pub fn chargeDecode(self: *@This(), blocks: usize, work_items: usize) !void {
+        const next_blocks = try checkedCharge(self.decoded_blocks, @intCast(blocks), self.limits.max_decoded_blocks);
+        const next_items = try checkedCharge(self.work_items, @intCast(work_items), self.limits.max_work_items);
+        self.decoded_blocks = next_blocks;
+        self.work_items = next_items;
+    }
+
+    pub fn chargeRetained(self: *@This(), bytes: usize) !void {
+        self.retained_bytes = try checkedCharge(self.retained_bytes, @intCast(bytes), self.limits.max_retained_bytes);
+    }
+};
+
+test "serverless graph metric request budget composes reads and rejects charges atomically" {
+    var budget = GraphMetricReadBudget{ .limits = .{
+        .max_range_requests = 2,
+        .max_range_bytes = 10,
+        .max_decoded_blocks = 2,
+        .max_work_items = 10,
+        .max_retained_bytes = 10,
+    } };
+
+    try budget.chargeRange(6);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeRange(5));
+    try std.testing.expectEqual(@as(u64, 1), budget.range_requests);
+    try std.testing.expectEqual(@as(u64, 6), budget.range_bytes);
+    try budget.chargeRange(4);
+
+    try budget.chargeDecode(1, 6);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeDecode(2, 1));
+    try std.testing.expectEqual(@as(u64, 1), budget.decoded_blocks);
+    try std.testing.expectEqual(@as(u64, 6), budget.work_items);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeDecode(1, 5));
+    try std.testing.expectEqual(@as(u64, 1), budget.decoded_blocks);
+    try std.testing.expectEqual(@as(u64, 6), budget.work_items);
+
+    try budget.chargeRetained(10);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeRetained(1));
+    try std.testing.expectEqual(@as(u64, 10), budget.retained_bytes);
+}
+
 pub const QueryRuntime = struct {
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
@@ -171,6 +242,7 @@ pub const QuerySession = struct {
     cancellation: CancellationToken = .none,
     diagnostics: ?*operation.RequestDiagnostics = null,
     graph_metric_specs: ?[]graph_metric_config.IndexSpec = null,
+    graph_metric_read_budget: GraphMetricReadBudget = .{},
 
     pub fn deinit(self: *QuerySession) void {
         self.clearGraphMetricSpecs();
@@ -233,6 +305,18 @@ pub const QuerySession = struct {
 
     pub fn checkCancellation(self: *const QuerySession) !void {
         return self.cancellation.check();
+    }
+
+    pub fn chargeGraphMetricRange(self: *QuerySession, bytes: usize) !void {
+        return self.graph_metric_read_budget.chargeRange(bytes);
+    }
+
+    pub fn chargeGraphMetricDecode(self: *QuerySession, blocks: usize, work_items: usize) !void {
+        return self.graph_metric_read_budget.chargeDecode(blocks, work_items);
+    }
+
+    pub fn chargeGraphMetricRetained(self: *QuerySession, bytes: usize) !void {
+        return self.graph_metric_read_budget.chargeRetained(bytes);
     }
 
     pub fn findArtifactIndex(self: *const QuerySession, kind: manifest_mod.ArtifactKind) ?usize {

@@ -10412,6 +10412,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
             error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+            error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation => return error.GraphMinWeightDomainViolation,
@@ -10592,6 +10593,7 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
                 error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+                error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
                 error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
                 error.HierarchyCursorStale => return error.HierarchyCursorStale,
@@ -10656,6 +10658,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
             error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+            error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphWorkBudgetExceeded,
@@ -10749,6 +10752,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
             error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+            error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.TableNotFound => return error.NotFound,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
@@ -14584,6 +14588,11 @@ pub const ApiHttpServer = struct {
             error.GraphMetricMaterializationRejected => contextual_operations.jsonWithStatus(
                 422,
                 try public_table_http.graphMetricMaterializationRejectedBody(self.alloc),
+                false,
+            ),
+            error.GraphMetricQueryBudgetExceeded => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphMetricQueryBudgetExceededBody(self.alloc),
                 false,
             ),
             error.UnsupportedQueryRequest => if (queryBodyHasSortPageControls(self.alloc, body))

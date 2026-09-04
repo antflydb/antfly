@@ -148,6 +148,7 @@ pub const TableApi = struct {
         GraphMetricGlobalMaterializationRequired,
         GraphMetricFeatureNotEnabled,
         GraphMetricMaterializationRejected,
+        GraphMetricQueryBudgetExceeded,
         QueryCandidateBudgetExceeded,
         GraphWorkBudgetExceeded,
         GraphMinWeightDomainViolation,
@@ -1101,6 +1102,16 @@ pub fn graphWorkBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
+pub fn graphMetricQueryBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = @as(u16, 422),
+        .@"error" = "graph_metric_query_budget_exceeded",
+        .message = "graph metric reads exceeded the request-wide I/O or memory budget",
+        .retryable = false,
+        .remediation = "request fewer graph metrics or candidates, reduce graph result breadth, or split the query",
+    }, .{});
+}
+
 pub fn graphPathWeightDomainErrorBody(alloc: std.mem.Allocator) ![]u8 {
     const diagnostic = graph_path_weight_diagnostic.take() orelse
         return error.MissingGraphPathWeightDiagnostic;
@@ -1652,6 +1663,10 @@ pub fn handleTableQueryRequest(
             error.QueryCandidateBudgetExceeded => {
                 std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
                 return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc), .json = true };
+            },
+            error.GraphMetricQueryBudgetExceeded => {
+                std.log.warn("public table graph metric request budget exceeded table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphMetricQueryBudgetExceededBody(alloc), .json = true };
             },
             error.GraphWorkBudgetExceeded => {
                 std.log.warn("public table graph work budget exceeded table={s}", .{table_name});
@@ -4158,6 +4173,60 @@ test "public table query handler maps candidate budget exhaustion" {
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_reason);
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_detail);
     try std.testing.expectEqualStrings("full_text_index_v0", parsed.value.sort_rejection_field);
+}
+
+test "serverless public table query handler maps aggregate graph metric budget exhaustion" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteQueryError![]u8 {
+            return error.GraphMetricQueryBudgetExceeded;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank"}}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expect(resp.json);
+    const parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        retryable: bool,
+        remediation: []const u8,
+    }, std.testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("graph_metric_query_budget_exceeded", parsed.value.@"error");
+    try std.testing.expect(parsed.value.message.len > 0);
+    try std.testing.expect(!parsed.value.retryable);
+    try std.testing.expect(parsed.value.remediation.len > 0);
 }
 
 test "public table query handler maps exact graph execution failures" {

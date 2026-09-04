@@ -981,12 +981,9 @@ pub const GraphQueryEngine = struct {
         };
     }
 
-    fn graphMetricDependencyIndex(
-        metric_dependencies: []const GraphMetricDependency,
-        name: []const u8,
-    ) ?usize {
-        for (metric_dependencies, 0..) |dependency, i| {
-            if (std.mem.eql(u8, dependency.read.name, name)) return i;
+    fn metricColumnNameIndex(dependency_names: []const []const u8, name: []const u8) ?usize {
+        for (dependency_names, 0..) |dependency_name, i| {
+            if (std.mem.eql(u8, dependency_name, name)) return i;
         }
         return null;
     }
@@ -1004,36 +1001,46 @@ pub const GraphQueryEngine = struct {
         return true;
     }
 
-    /// Keep metric scores columnar through filtering, ordering, and limiting.
-    /// Per-node public metric objects are created only for the surviving result
-    /// page, avoiding candidate-count heap fragmentation and needless copies.
-    fn applyMetricDependenciesColumnar(
-        self: *GraphQueryEngine,
-        graph_index: *graph_mod.GraphIndex,
-        metric_dependencies: []const GraphMetricDependency,
+    /// Storage-independent graph-metric post-processing. Callers retain score
+    /// columns in their native storage representation until this routine has
+    /// filtered and selected the externally visible prefix. Metric objects are
+    /// allocated only for surviving rows.
+    pub fn applyLoadedMetricColumns(
+        alloc: Allocator,
+        dependency_names: []const []const u8,
+        metric_value_names: []const []const u8,
+        score_columns: []const []?f64,
         query: GraphQuery,
         apply_result_limit: bool,
-        result: *GraphQueryResult,
+        nodes: *[]GraphResultNode,
     ) !void {
-        var workspace = try self.loadMetricColumns(graph_index, metric_dependencies, result.nodes);
-        defer workspace.deinit(self.alloc);
+        try validateGraphMetricQueryShape(query);
+        if (dependency_names.len != score_columns.len or metric_value_names.len != score_columns.len)
+            return error.InvalidQueryRequest;
+        for (score_columns, dependency_names, metric_value_names, 0..) |column, dependency_name, metric_value_name, i| {
+            if (column.len != nodes.*.len or !std.mem.eql(u8, dependency_name, metric_value_name))
+                return error.InvalidQueryRequest;
+            for (dependency_names[0..i]) |prior_name| {
+                if (std.mem.eql(u8, prior_name, dependency_name)) return error.InvalidQueryRequest;
+            }
+        }
 
         var filter_index_buffer: [graph_metric_filter_limit]usize = undefined;
         const filter_metric_indexes = filter_index_buffer[0..query.where_metric.len];
         for (query.where_metric, 0..) |filter, i| {
-            filter_metric_indexes[i] = graphMetricDependencyIndex(metric_dependencies, filter.name) orelse
+            filter_metric_indexes[i] = metricColumnNameIndex(dependency_names, filter.name) orelse
                 return error.InvalidQueryRequest;
         }
 
-        const candidate_indexes = try self.alloc.alloc(usize, result.nodes.len);
-        defer self.alloc.free(candidate_indexes);
+        const candidate_indexes = try alloc.alloc(usize, nodes.*.len);
+        defer alloc.free(candidate_indexes);
         var candidate_count: usize = 0;
-        for (result.nodes, 0..) |_, original_index| {
+        for (nodes.*, 0..) |_, original_index| {
             if (!metricCandidatePassesFilters(
                 original_index,
                 query.where_metric,
                 filter_metric_indexes,
-                workspace.score_columns,
+                score_columns,
             )) continue;
             candidate_indexes[candidate_count] = original_index;
             candidate_count += 1;
@@ -1048,13 +1055,13 @@ pub const GraphQueryEngine = struct {
             var order_index_buffer: [graph_metric_order_limit]usize = undefined;
             const order_metric_indexes = order_index_buffer[0..query.order_by.len];
             for (query.order_by, 0..) |order, i| {
-                order_metric_indexes[i] = graphMetricDependencyIndex(metric_dependencies, order.name) orelse
+                order_metric_indexes[i] = metricColumnNameIndex(dependency_names, order.name) orelse
                     return error.InvalidQueryRequest;
             }
             selected = retainOrderedMetricCandidatePrefix(selected, requested_limit, .{
                 .orders = query.order_by,
                 .metric_indexes = order_metric_indexes,
-                .score_columns = workspace.score_columns,
+                .score_columns = score_columns,
             });
         } else if (selected.len > requested_limit) {
             selected = selected[0..requested_limit];
@@ -1063,48 +1070,79 @@ pub const GraphQueryEngine = struct {
         var projection_index_buffer: [graph_metric_projection_limit]usize = undefined;
         const projection_metric_indexes = projection_index_buffer[0..query.metrics.len];
         for (query.metrics, 0..) |metric, i| {
-            projection_metric_indexes[i] = graphMetricDependencyIndex(metric_dependencies, metric.name) orelse
+            projection_metric_indexes[i] = metricColumnNameIndex(dependency_names, metric.name) orelse
                 return error.InvalidQueryRequest;
         }
 
-        const metric_rows = try self.alloc.alloc([]GraphMetricValue, selected.len);
+        const metric_rows = try alloc.alloc([]GraphMetricValue, selected.len);
         defer {
             for (metric_rows) |row| {
-                for (row) |*metric| metric.deinit(self.alloc);
-                if (row.len > 0) self.alloc.free(row);
+                for (row) |*metric| metric.deinit(alloc);
+                if (row.len > 0) alloc.free(row);
             }
-            self.alloc.free(metric_rows);
+            alloc.free(metric_rows);
         }
         @memset(metric_rows, @constCast((&[_]GraphMetricValue{})[0..]));
         for (metric_rows, selected) |*row, source_index| {
             if (query.metrics.len == 0) continue;
-            row.* = try self.alloc.alloc(GraphMetricValue, query.metrics.len);
+            row.* = try alloc.alloc(GraphMetricValue, query.metrics.len);
             for (row.*, projection_metric_indexes) |*value, metric_index| {
                 value.* = .{
-                    .name = workspace.statuses[metric_index].name,
-                    .score = workspace.score_columns[metric_index][source_index],
+                    .name = metric_value_names[metric_index],
+                    .score = score_columns[metric_index][source_index],
                     .name_owned = false,
                 };
             }
         }
 
-        const selected_mask = try self.alloc.alloc(bool, result.nodes.len);
-        defer self.alloc.free(selected_mask);
+        const selected_mask = try alloc.alloc(bool, nodes.*.len);
+        defer alloc.free(selected_mask);
         @memset(selected_mask, false);
         for (selected) |source_index| selected_mask[source_index] = true;
 
-        const final_nodes = try self.alloc.alloc(GraphResultNode, selected.len);
+        const final_nodes = try alloc.alloc(GraphResultNode, selected.len);
         for (selected, 0..) |source_index, out_index| {
-            var node = result.nodes[source_index];
-            for (node.metrics) |*metric| metric.deinit(self.alloc);
-            if (node.metrics.len > 0) self.alloc.free(node.metrics);
+            var node = nodes.*[source_index];
+            for (node.metrics) |*metric| metric.deinit(alloc);
+            if (node.metrics.len > 0) alloc.free(node.metrics);
             node.metrics = metric_rows[out_index];
             metric_rows[out_index] = @constCast((&[_]GraphMetricValue{})[0..]);
             final_nodes[out_index] = node;
         }
-        for (result.nodes, selected_mask) |*node, keep| if (!keep) node.deinit(self.alloc);
-        self.alloc.free(result.nodes);
-        result.nodes = final_nodes;
+        for (nodes.*, selected_mask) |*node, keep| if (!keep) node.deinit(alloc);
+        alloc.free(nodes.*);
+        nodes.* = final_nodes;
+    }
+
+    /// Keep metric scores columnar through filtering, ordering, and limiting.
+    /// Per-node public metric objects are created only for the surviving result
+    /// page, avoiding candidate-count heap fragmentation and needless copies.
+    fn applyMetricDependenciesColumnar(
+        self: *GraphQueryEngine,
+        graph_index: *graph_mod.GraphIndex,
+        metric_dependencies: []const GraphMetricDependency,
+        query: GraphQuery,
+        apply_result_limit: bool,
+        result: *GraphQueryResult,
+    ) !void {
+        var workspace = try self.loadMetricColumns(graph_index, metric_dependencies, result.nodes);
+        defer workspace.deinit(self.alloc);
+
+        var dependency_names: [graph_metric_dependency_limit][]const u8 = undefined;
+        var metric_value_names: [graph_metric_dependency_limit][]const u8 = undefined;
+        for (metric_dependencies, workspace.statuses, 0..) |dependency, status, i| {
+            dependency_names[i] = dependency.read.name;
+            metric_value_names[i] = status.name;
+        }
+        try applyLoadedMetricColumns(
+            self.alloc,
+            dependency_names[0..metric_dependencies.len],
+            metric_value_names[0..metric_dependencies.len],
+            workspace.score_columns,
+            query,
+            apply_result_limit,
+            &result.nodes,
+        );
 
         for (result.metric_status) |*status| status.deinit(self.alloc);
         if (result.metric_status.len > 0) self.alloc.free(result.metric_status);
@@ -3556,6 +3594,50 @@ test "graph metric column selection retains deterministic bounded top k" {
         },
     );
     try std.testing.expectEqualSlices(usize, &.{ 1, 5 }, ascending);
+}
+
+test "graph metric shared column application is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var nodes = try alloc.alloc(GraphResultNode, 3);
+            var initialized: usize = 0;
+            defer {
+                for (nodes[0..initialized]) |*node| node.deinit(alloc);
+                alloc.free(nodes);
+            }
+            for (&[_][]const u8{ "a", "b", "c" }, 0..) |key, i| {
+                nodes[i] = .{ .key = try alloc.dupe(u8, key), .depth = 1, .distance = 1 };
+                initialized += 1;
+            }
+
+            var scores = [_]?f64{ 0.1, 0.9, 0.5 };
+            const columns = [_][]?f64{&scores};
+            const names = [_][]const u8{"rank"};
+            const reads = [_]GraphMetricRead{.{ .name = "rank" }};
+            const orders = [_]GraphMetricOrder{.{ .name = "rank", .direction = .desc }};
+            try GraphQueryEngine.applyLoadedMetricColumns(
+                alloc,
+                &names,
+                &names,
+                &columns,
+                .{
+                    .query_type = .neighbors,
+                    .index_name = "g",
+                    .start_nodes = .{ .keys = &.{"root"} },
+                    .params = .{ .max_results = 2 },
+                    .metrics = &reads,
+                    .order_by = &orders,
+                },
+                true,
+                &nodes,
+            );
+            initialized = nodes.len;
+            try std.testing.expectEqual(@as(usize, 2), nodes.len);
+            try std.testing.expectEqualStrings("b", nodes[0].key);
+            try std.testing.expectEqual(@as(?f64, 0.9), nodes[0].metrics[0].score);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "graph metric order and filter dependencies attach status without projection" {

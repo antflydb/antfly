@@ -494,9 +494,31 @@ graph projections resolve candidate columns through stable read snapshots and
 reuse a key buffer across candidates. Graph filtering, ordering, and limiting
 then stay columnar: clause names are resolved once, bounded result pages use
 `O(N log K)` selection, and per-node metric objects are allocated only for
-surviving projected rows. External serverless reconciliation accepts the same
-caller-owned compute runtime as ordinary lake builds, keeping CPU fanout under
-one operator-visible limit.
+surviving projected rows. Native and serverless execution call the same
+storage-independent selector, so ordering, null placement, filtering, limits,
+and deterministic tie-breaking cannot drift between deployments.
+
+Serverless point, projection, rerank, and direct top-k reads share one budget
+ledger on the pinned request session. The ledger composes authenticated range
+operations, transferred bytes, decoded blocks/work, and retained result-column
+memory across every named operation and metric dependency. This closes the
+per-metric-limit loophole where a valid request could multiply the allowed I/O
+by its dependency count. Exhaustion fails before the next backend range read
+and is returned as an actionable, non-retryable HTTP 422. Current v5/v6
+artifacts continue to use authenticated routed blocks and the persisted bounded
+top tier; v1-v3 compatibility reads are charged for their full artifact before
+materialization.
+
+External serverless reconciliation accepts the same caller-owned compute
+runtime as ordinary lake builds, keeping CPU fanout under one operator-visible
+limit. A future physical-format migration may share an ordinal dictionary only
+within an exact `(source graph artifact, edge-filter projection)` identity;
+graph-wide ordinals are not interchangeable because filters change the active
+node set. Likewise, native attempt pages may move to blob records only with a
+durable target aggregation/index layer that preserves bounded adoption and
+reclaimed-attempt delta replacement. These are versioned storage migrations,
+not query-path shortcuts: existing artifacts and in-flight attempts must remain
+readable throughout rolling upgrades.
 
 ## Query Integration
 
