@@ -49,6 +49,7 @@ const ChunkInputWithContextFn = *const fn (
 ) anyerror![]inference_chunker.Chunk;
 const ChunkProviderVTable = struct {
     chunk_input: ?ChunkInputFn = null,
+    chunk_input_with_context: ?ChunkInputWithContextFn = null,
 };
 const ChunkProviderBoundary = runtime_callback_abi.Boundary(ChunkProviderVTable);
 
