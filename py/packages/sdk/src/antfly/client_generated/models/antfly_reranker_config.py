@@ -21,13 +21,14 @@ class AntflyRerankerConfig:
 
     Attributes:
         provider (AntflyRerankerConfigProvider):
-        model (str): The name of the reranking model (e.g., cross-encoder model name).
+        model (str | Unset): Optional reranking model name. When omitted, the Antfly inference service selects its
+            configured default reranker.
         url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment
             variable.
     """
 
     provider: AntflyRerankerConfigProvider
-    model: str
+    model: str | Unset = UNSET
     url: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -43,9 +44,10 @@ class AntflyRerankerConfig:
         field_dict.update(
             {
                 "provider": provider,
-                "model": model,
             }
         )
+        if model is not UNSET:
+            field_dict["model"] = model
         if url is not UNSET:
             field_dict["url"] = url
 
@@ -56,7 +58,7 @@ class AntflyRerankerConfig:
         d = dict(src_dict)
         provider = AntflyRerankerConfigProvider(d.pop("provider"))
 
-        model = d.pop("model")
+        model = d.pop("model", UNSET)
 
         url = d.pop("url", UNSET)
 

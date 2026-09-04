@@ -2250,7 +2250,11 @@ fn applyCommonSearchRequestOptions(
     }
 
     const has_semantic = request.semantic_search != null or request.embeddings != null;
-    if (has_semantic and req.offset > 0) return error.UnsupportedQueryRequest;
+    // Approximate vector sources cannot page independently by offset. A
+    // coordinator-owned reranker is different: component and shard retrieval
+    // are widened to the bounded candidate window, then offset/limit are
+    // applied once after global scoring.
+    if (has_semantic and req.offset > 0 and req.reranker == null) return error.UnsupportedQueryRequest;
     if (has_semantic and req.order_by.len > 0) {
         return unsupportedExactSort(approximateSemanticSortField(req.order_by), "approximate_candidate_source", "approximate_candidate_source");
     }
@@ -15741,6 +15745,58 @@ test "api query contract enforces provider-specific reranker candidate limits" {
     ;
     var cohere = try parsePublicQueryRequest(std.testing.allocator, null, "docs", cohere_body);
     cohere.deinit(std.testing.allocator);
+}
+
+test "api query contract permits semantic offset only with coordinator reranking" {
+    const alloc = std.testing.allocator;
+    const FakeResolver = struct {
+        fn resolve(
+            _: *anyopaque,
+            resolver_alloc: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            limit: u32,
+        ) !db_mod.types.DenseKnnQuery {
+            return .{
+                .vector = try resolver_alloc.dupe(f32, &.{ 1.0, 0.0 }),
+                .k = limit,
+            };
+        }
+    };
+    var resolver_context: u8 = 0;
+    const resolver = SemanticResolver{
+        .ptr = &resolver_context,
+        .vtable = &.{ .resolve_dense_query = FakeResolver.resolve },
+    };
+    const reranked_body =
+        \\{
+        \\  "semantic_search": "raft consensus",
+        \\  "indexes": ["semantic"],
+        \\  "offset": 5,
+        \\  "limit": 10,
+        \\  "reranker": {"provider":"antfly","field":"body","candidate_count":50}
+        \\}
+    ;
+    var reranked = try parseQueryRequest(alloc, resolver, "docs", reranked_body);
+    defer reranked.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 5), reranked.req.offset);
+    try std.testing.expectEqual(@as(u32, 10), reranked.req.limit);
+    try std.testing.expectEqual(@as(?u32, 50), reranked.req.reranker.?.candidate_count);
+
+    const approximate_only_body =
+        \\{
+        \\  "semantic_search": "raft consensus",
+        \\  "indexes": ["semantic"],
+        \\  "offset": 5,
+        \\  "limit": 10
+        \\}
+    ;
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        parseQueryRequest(alloc, resolver, "docs", approximate_only_body),
+    );
 }
 
 test "api query contract rejects count with stored sort" {

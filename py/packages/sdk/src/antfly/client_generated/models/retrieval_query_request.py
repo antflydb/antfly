@@ -228,8 +228,10 @@ class RetrievalQueryRequest:
                 and a groups-times-matches execution budget of 1,000.
                  Example: 20.
             offset (int | Unset): Number of results to skip for pagination. Supported for text-backed,
-                match_all, and filter-only requests. Not supported for semantic_search
-                due to vector index limitations.
+                match_all, and filter-only requests. Approximate semantic requests do
+                not support offset on their own. Semantic and hybrid requests support
+                it when a reranker is configured: Antfly retrieves a bounded candidate
+                window and applies offset after coordinator-owned reranking.
             timeout_ms (int | Unset): Optional query execution deadline in milliseconds. The server applies this as a
                 cooperative deadline across query planning, search execution, aggregation reruns,
                 sorting, and response post-processing. If the deadline expires before the query

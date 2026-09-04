@@ -7153,8 +7153,10 @@ export interface components {
             limit?: number;
             /**
              * @description Number of results to skip for pagination. Supported for text-backed,
-             *     match_all, and filter-only requests. Not supported for semantic_search
-             *     due to vector index limitations.
+             *     match_all, and filter-only requests. Approximate semantic requests do
+             *     not support offset on their own. Semantic and hybrid requests support
+             *     it when a reranker is configured: Antfly retrieves a bounded candidate
+             *     window and applies offset after coordinator-owned reranking.
              * @example 0
              */
             offset?: number;
@@ -12326,8 +12328,8 @@ export interface components {
         AntflyRerankerConfig: {
             /** @enum {string} */
             provider: "antfly";
-            /** @description The name of the reranking model (e.g., cross-encoder model name). */
-            model: string;
+            /** @description Optional reranking model name. When omitted, the Antfly inference service selects its configured default reranker. */
+            model?: string;
             /**
              * Format: uri
              * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
@@ -12407,7 +12409,7 @@ export interface components {
             field?: string;
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
-            /** @description Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit, which must also be at most 1000. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency, and external API cost. Providers may impose a lower ceiling; Vertex currently accepts at most 200. Antfly rejects a provider-specific overflow before retrieval fan-out and returns reranker_candidate_limit_exceeded with the selected provider and its exact maximum. */
+            /** @description Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit and, when supplied explicitly, must be at least that page boundary. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency, and external API cost. The effective window must be at most 1000, and providers may impose a lower ceiling; Vertex currently accepts at most 200. Antfly rejects invalid or provider-specific windows before retrieval fan-out. */
             candidate_count?: number;
             /**
              * @deprecated

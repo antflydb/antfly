@@ -162,7 +162,13 @@ pub const Config = struct {
 pub fn validateQueryWindow(cfg: Config, offset: u32, limit: u32) !void {
     try cfg.validate();
     const output_limit = cfg.top_n orelse limit;
-    const effective_candidates = cfg.candidate_count orelse offset +| output_limit;
+    const page_end = offset +| output_limit;
+    if (cfg.candidate_count) |candidate_count| {
+        // An explicit cost window must still contain the requested page. Fail
+        // before retrieval instead of returning a misleading short page.
+        if (candidate_count < page_end) return error.InvalidRerankerConfig;
+    }
+    const effective_candidates = cfg.candidate_count orelse page_end;
     if (effective_candidates > maxCandidateCountForProvider(cfg.provider))
         return candidateLimitExceeded(cfg.provider);
 }
@@ -265,6 +271,19 @@ test "reranker work is bounded with and without an explicit candidate count" {
     try validateQueryWindow(base, 0, max_candidate_count);
 }
 
+test "reranker candidate window must contain the requested page" {
+    const cfg = Config{
+        .provider = .antfly,
+        .field = "body",
+        .candidate_count = 14,
+    };
+    try std.testing.expectError(error.InvalidRerankerConfig, validateQueryWindow(cfg, 5, 10));
+
+    var exact = cfg;
+    exact.candidate_count = 15;
+    try validateQueryWindow(exact, 5, 10);
+}
+
 test "reranker candidate limits follow provider request capabilities" {
     const vertex = Config{
         .provider = .vertex,
@@ -330,4 +349,14 @@ test "reranker config requires field or template" {
         error.InvalidRerankerConfig,
         parseConfigFromSlice(alloc, "{\"provider\":\"antfly\"}"),
     );
+}
+
+test "antfly reranker config permits the inference default model" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseConfigFromSlice(alloc, "{\"provider\":\"antfly\",\"field\":\"body\"}");
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqual(Provider.antfly, cfg.provider);
+    try std.testing.expectEqualStrings("", cfg.model);
+    try std.testing.expectEqualStrings("body", cfg.field);
 }

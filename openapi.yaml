@@ -949,8 +949,8 @@ tags:
         "semantic_search": "gaming laptops",
         "limit": 100,
         "reranker": {
-          "provider": "ollama",
-          "model": "dengcao/Qwen3-Reranker-0.6B:F16",
+          "provider": "antfly",
+          "model": "mixedbread-ai/mxbai-rerank-base-v1",
           "field": "description"
         }
       }
@@ -1134,8 +1134,6 @@ tags:
 
       - `dimension`: Optional for dense indexes; inferred from the embedder if omitted
 
-      - `summarizer`: Vision/multimodal model for processing images/audio/video
-
       - `mem_only`: Store index in memory only
 
 
@@ -1193,7 +1191,25 @@ tags:
       ## Embedder Providers
 
 
-      Antfly supports multiple embedding providers via the `embedder` configuration:
+      Managed index creation supports `antfly`, `ollama`, `openai`, and `bedrock`
+
+      through the purpose-specific `IndexEmbedderConfig`. Other providers in the
+
+      broader `EmbedderConfig` are available only on surfaces whose runtime can
+
+      execute them.
+
+
+      ### Antfly Inference
+
+      ```json
+
+      {
+        "provider": "antfly",
+        "model": "BAAI/bge-small-en-v1.5"
+      }
+
+      ```
 
 
       ### Ollama (Local Models)
@@ -1227,23 +1243,6 @@ tags:
       (1536d)
 
 
-      ### Google Gemini
-
-      ```json
-
-      {
-        "provider": "gemini",
-        "model": "text-embedding-004",
-        "project_id": "my-project",
-        "location": "us-central1",
-        "dimension": 768
-      }
-
-      ```
-
-      Supports multimodal embeddings (text + images).
-
-
       ### AWS Bedrock
 
       ```json
@@ -1262,101 +1261,15 @@ tags:
       ## Multimodal Indexing
 
 
-      Vector indexes can process images, audio, and video using vision/multimodal models.
+      `EmbeddingsIndexConfig` does not accept a `summarizer`. For two-stage
 
+      multimodal indexing, generate a textual description into a document field
 
-      ### With Summarizer (Two-Stage)
+      before indexing and configure the managed index against that field. If the
 
-      Use a vision model to generate text descriptions, then embed the descriptions:
+      application already owns the final vectors, use an `external: true` index
 
-
-      ```json
-
-      {
-        "type": "embeddings",
-        "dimension": 384,
-        "embedder": {
-          "provider": "ollama",
-          "model": "all-minilm"
-        },
-        "summarizer": {
-          "provider": "ollama",
-          "model": "llava"
-        }
-      }
-
-      ```
-
-
-      **How it works**: Vision model (`llava`) generates text description → Embedder (`all-minilm`) creates
-      vector
-
-
-      **Supported Vision Models**:
-
-      - **Ollama**: `llava`, `llava-phi3`, `bakllava`, `llava-llama3`
-
-      - **OpenAI**: `gpt-4o`, `gpt-4-turbo`, `gpt-4o-mini`
-
-      - **Gemini**: `gemini-2.0-flash-exp`, `gemini-1.5-pro`, `gemini-1.5-flash`
-
-      - **Anthropic**: `claude-3-5-sonnet-20241022`, `claude-3-opus-20240229`
-
-      - **Bedrock**: `anthropic.claude-3-5-sonnet-20241022-v2:0`
-
-
-      ### Native Multimodal (Single-Stage)
-
-      Some models support direct multimodal embeddings:
-
-
-      ```json
-
-      {
-        "type": "embeddings",
-        "dimension": 1024,
-        "embedder": {
-          "provider": "gemini",
-          "model": "text-embedding-004",
-          "project_id": "my-project"
-        }
-      }
-
-      ```
-
-
-      Gemini's embedding models can directly process text and images without a separate vision model.
-
-
-      ## Supported Media Formats
-
-
-      When using multimodal indexes, documents can reference media in multiple ways:
-
-
-      ### Images
-
-      - **Base64 encoded (data URI)**: `data:image/jpeg;base64,<base64>`, `data:image/png;base64,<base64>`,
-      `data:image/webp;base64,<base64>`
-
-      - **URLs**: `http://`, `https://`, `s3://`, `file://`
-
-
-      ### Audio & Video
-
-      - **URLs**: `http://`, `https://`, `s3://`, `file://`
-
-
-      Example document with image:
-
-      ```json
-
-      {
-        "title": "Product Photo",
-        "image": "data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUgA..."
-      }
-
-      ```
+      and write them through `_embeddings`.
 
 
       ## Template-Based Prompts
@@ -1535,22 +1448,17 @@ tags:
       Note: `dimension` is omitted and will be inferred from the `all-minilm` model (384).
 
 
-      ### Multimodal with Custom Template
+      ### Text Embedding with Custom Template
 
       ```json
 
       {
         "type": "embeddings",
-        "dimension": 768,
+        "dimension": 1536,
         "template": "{{title}}: {{description}}",
         "embedder": {
-          "provider": "gemini",
-          "model": "text-embedding-004",
-          "dimension": 768
-        },
-        "summarizer": {
-          "provider": "gemini",
-          "model": "gemini-1.5-flash"
+          "provider": "openai",
+          "model": "text-embedding-3-small"
         }
       }
 
@@ -1581,9 +1489,6 @@ tags:
       - **Choose dimension wisely**: Higher dimensions improve accuracy but increase storage/compute costs
 
       - **Use templates for structured data**: Combine multiple fields into meaningful prompts
-
-      - **Multimodal strategy**: Use two-stage (summarizer + embedder) for flexibility, single-stage for
-      simplicity
 
       - **Local vs Cloud**: Ollama for development/privacy, cloud providers for production/scale
 
@@ -15357,9 +15262,13 @@ components:
           description: >
             Number of results to skip for pagination. Supported for text-backed,
 
-            match_all, and filter-only requests. Not supported for semantic_search
+            match_all, and filter-only requests. Approximate semantic requests do
 
-            due to vector index limitations.
+            not support offset on their own. Semantic and hybrid requests support
+
+            it when a reranker is configured: Antfly retrieves a bounded candidate
+
+            window and applies offset after coordinator-owned reranking.
           example: 0
         timeout_ms:
           type: integer
@@ -23590,7 +23499,8 @@ components:
             - antfly
         model:
           type: string
-          description: The name of the reranking model (e.g., cross-encoder model name).
+          description: Optional reranking model name. When omitted, the Antfly inference service selects
+            its configured default reranker.
         url:
           type: string
           format: uri
@@ -23598,7 +23508,6 @@ components:
             environment variable.
       required:
         - provider
-        - model
       example:
         provider: antfly
         model: mixedbread-ai/mxbai-rerank-base-v1
@@ -23700,19 +23609,21 @@ components:
               type: string
               description: Handlebars template to render document text for reranking.
             candidate_count:
+              x-go-type-skip-optional-pointer: false
               type: integer
               minimum: 1
               maximum: 1000
               description: Maximum number of globally highest-ranked retrieval candidates to send to the
                 reranker. In distributed deployments each shard retrieves at most this many candidates,
                 the coordinator retains the global window, and the provider is called once. Defaults to
-                offset plus the effective final result limit, which must also be at most 1000. Candidates
-                outside this window are not returned, but hits.total continues to describe the underlying
-                retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency,
-                and external API cost. Providers may impose a lower ceiling; Vertex currently accepts
-                at most 200. Antfly rejects a provider-specific overflow before retrieval fan-out and
-                returns reranker_candidate_limit_exceeded with the selected provider and its exact maximum.
+                offset plus the effective final result limit and, when supplied explicitly, must be at
+                least that page boundary. Candidates outside this window are not returned, but hits.total
+                continues to describe the underlying retrieval match count. The ceiling bounds retrieval
+                fan-out, memory, provider latency, and external API cost. The effective window must be
+                at most 1000, and providers may impose a lower ceiling; Vertex currently accepts at most
+                200. Antfly rejects invalid or provider-specific windows before retrieval fan-out.
             top_n:
+              x-go-type-skip-optional-pointer: false
               type: integer
               minimum: 1
               maximum: 1000
