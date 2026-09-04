@@ -1,7 +1,7 @@
 ---
 title: "Route Tickets with Retrieval"
-description: "Stream tickets from PostgreSQL with built-in CDC and classify them against resolved history"
-order: 2.4
+description: "New tickets stream out of PostgreSQL and get assigned a team by the resolved tickets that look most like them"
+order: 4
 ---
 
 <Questions>
@@ -11,17 +11,76 @@ order: 2.4
 - How do I keep PostgreSQL as the system of record while adding retrieval?
 </Questions>
 
-## The Pattern
+By the end of this guide, every ticket written to your Postgres `tickets` table arrives in Antfly on its own, and one call returns the team that should own it, chosen from the resolved tickets that look most like it. Postgres stays the system of record. Nothing migrates and nothing gets exported. You need Antfly running, a Postgres with `wal_level = logical`, and its connection string stored as a secret:
 
-A ticket-routing pipeline retrieves similar past tickets and acts on what it finds: it assigns a team, sets a priority, maybe fires an escalation. No human sits between the retrieval and the routing decision, so a misroute is usually a retrieval failure, not a model failure. The ticket landed somewhere wrong because the wrong history reached the classifier.
+```bash
+curl -X PUT http://localhost:8080/db/v1/secrets/pg_dsn \
+  -u admin:admin \
+  -H "Content-Type: application/json" \
+  -d '{"value": "postgres://antfly:secret@db.internal:5432/support?sslmode=require"}'
+```
 
-The good news: your routing signal already exists. Every resolved ticket is a labeled example. This guide streams tickets out of the Postgres you already run, retrieves the most similar resolved tickets, and classifies against them.
+Here is the call you'll be making by the end:
 
-Postgres stays the system of record throughout. Nothing migrates.
+```bash
+curl -X POST http://localhost:8080/db/v1/agents/retrieval \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "Checkout fails with a 502 after entering card details",
+    "queries": [{
+      "table": "tickets",
+      "full_text_search": {"query": "status:resolved"},
+      "semantic_search": "Checkout fails with a 502 after entering card details",
+      "indexes": ["subject_body"],
+      "fields": ["subject", "team", "resolution"],
+      "limit": 20,
+      "reranker": {
+        "provider": "antfly",
+        "model": "mixedbread-ai/mxbai-rerank-base-v1",
+        "field": "body"
+      },
+      "pruner": {"min_score_ratio": 0.6}
+    }],
+    "generator": {"provider": "ollama", "model": "gemma3:4b"},
+    "max_context_tokens": 512,
+    "steps": {
+      "generation": {
+        "enabled": true,
+        "system_prompt": "You route support tickets. Given a new ticket and similar resolved tickets, respond with only the team name that should own it, chosen from the teams in the retrieved tickets."
+      }
+    }
+  }'
+```
+
+```json
+{
+  "generation": "payments",
+  "hits": [
+    {
+      "_id": "8812",
+      "_source": {
+        "subject": "502 on checkout submit",
+        "team": "payments",
+        "resolution": "Gateway timeout raised to 30s"
+      }
+    },
+    {
+      "_id": "7905",
+      "_source": {
+        "subject": "Card form errors after submit",
+        "team": "payments",
+        "resolution": "Retry on 5xx from processor"
+      }
+    }
+  ]
+}
+```
+
+Four steps get you there.
 
 ## 1. Stream Tickets from PostgreSQL
 
-Antfly has built-in Change Data Capture: add a `replication_sources` block when creating the table and changes stream in via logical replication, no sync daemon required. Add a semantic index in the same call so every ticket is retrievable the moment it lands:
+Antfly has built-in change data capture. A `replication_sources` block on the table subscribes it to Postgres logical replication, and a semantic index in the same call makes every ticket retrievable the moment it lands:
 
 ```bash
 curl -X POST http://localhost:8080/db/v1/tables/tickets \
@@ -49,15 +108,17 @@ curl -X POST http://localhost:8080/db/v1/tables/tickets \
   }'
 ```
 
-Every `INSERT` and `UPDATE` on the Postgres `tickets` table now flows into Antfly automatically, resolved tickets included, with their `team` and `resolution` columns intact.
+Every `INSERT` and `UPDATE` on the Postgres table now flows in, resolved tickets included, with their `team` and `resolution` columns intact. Confirm the stream is live:
 
-<Callout type="info">
-Setup details for Cloud SQL, Supabase, Neon, RDS, and self-hosted Postgres (plus `wal_level`, publications, and secrets) are in the [PostgreSQL Replication guide](/docs/guides/cdc-replication).
-</Callout>
+```bash
+antfly query --table tickets --full-text-search 'status:resolved' --fields subject,team --limit 3
+```
+
+Cloud SQL, Supabase, Neon, RDS, and self-hosted Postgres each need a small amount of setup on the database side (publications, replication slots, `wal_level`). [Stream PostgreSQL into Antfly](/docs/guides/cdc-replication) has each one.
 
 ## 2. Retrieve Similar Resolved Tickets
 
-When a new ticket arrives, retrieve its nearest neighbors among tickets that already have a routing outcome:
+When a new ticket arrives, find its nearest neighbors among tickets that already have an outcome:
 
 ```bash
 curl -X POST http://localhost:8080/db/v1/query \
@@ -78,60 +139,23 @@ curl -X POST http://localhost:8080/db/v1/query \
   }'
 ```
 
-The keyword side filters to resolved tickets; the semantic side finds the ones that look like this one. The pruner matters for the same reason it does in any agent: whatever survives this query is what the routing decision is made from.
+The keyword side restricts the pool to resolved tickets. The semantic side finds the ones that read like this one. The reranker orders them by how well the full body matches, and the pruner drops the ones that only loosely do. Whatever survives is the evidence the routing decision rests on.
 
 ## 3. Classify the Ticket
 
-The surviving neighbors carry the routing signal directly: each one has a `team`. The simplest
-classifier is a majority vote over that field in your pipeline code — transparent, fast, and easy
-to audit when a route is questioned.
+Every surviving neighbor carries a `team`. The simplest classifier is a majority vote over that field in your pipeline code: transparent, fast, and easy to explain when someone asks why a ticket landed where it did.
 
-For messier cases, let the retrieval agent produce the decision in the same call. Give the
-generation step a system prompt that asks for a team instead of a prose answer:
-
-```bash
-curl -X POST http://localhost:8080/db/v1/agents/retrieval \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "Checkout fails with a 502 after entering card details",
-    "queries": [{
-      "table": "tickets",
-      "full_text_search": {"query": "status:resolved"},
-      "semantic_search": "Checkout fails with a 502 after entering card details",
-      "indexes": ["subject_body"],
-      "fields": ["subject", "team", "resolution"],
-      "limit": 20,
-      "reranker": {
-        "provider": "antfly",
-        "model": "mixedbread-ai/mxbai-rerank-base-v1",
-        "field": "body"
-      },
-      "pruner": {"min_score_ratio": 0.6}
-    }],
-    "generator": {
-      "provider": "ollama",
-      "model": "gemma3:4b"
-    },
-    "max_context_tokens": 512,
-    "steps": {
-      "generation": {
-        "enabled": true,
-        "system_prompt": "You route support tickets. Given a new ticket and similar resolved tickets, respond with only the team name that should own it, chosen from the teams in the retrieved tickets."
-      }
-    }
-  }'
-```
-
-Your pipeline reads the decision and the retrieved neighbors (the evidence), then writes the
-routing decision back to Postgres like any other update.
+When the neighbors disagree, let the retrieval agent make the call in the same request. The `system_prompt` on the generation step asks for a team name instead of a prose answer, which is the call shown at the top of this page. Your pipeline reads `generation` for the decision and `hits` for the evidence, then writes the team back to Postgres like any other update.
 
 ## 4. Close the Loop
 
-Because Postgres is the source and CDC is always streaming, the loop closes itself: when an agent or a human corrects a route and the row updates, the corrected ticket flows back into Antfly and becomes evidence for the next decision. Routing accuracy compounds as resolved history grows, with no retraining step and no export job.
+Because Postgres is the source and replication is always on, the loop closes itself. When a person corrects a route and the row updates, the corrected ticket flows back into Antfly and becomes evidence for the next decision. Routing accuracy improves as resolved history grows, with no retraining step and no export job.
 
-<Callout type="tip">
-Keep a confidence floor. If the pruner leaves too few neighbors or the classification comes back uncertain, route to a human triage queue. An agent that knows when it has weak evidence is an agent you can trust with the strong cases.
-</Callout>
+## Why the Pruner Decides Who Gets a Human
+
+A misrouted ticket is almost always a retrieval failure: the wrong history reached the classifier. The pruner is where you set how much evidence a decision needs. With `min_score_ratio: 0.6`, a ticket unlike anything resolved before comes back with few or no neighbors, and that is the signal to send it to a triage queue instead of guessing.
+
+Keep that floor. An agent that routes only when it has strong evidence is one you can trust with the easy cases, which are most of them. Tighten the ratio if you see confident misroutes; loosen it if too much lands in triage while good neighbors are being cut.
 
 ## Let Your Agent Drive
 
@@ -142,10 +166,10 @@ so a coding agent can execute this guide for you:
 npx skills add antflydb/antfly-skills
 ```
 
-Then prompt it with the outcome — e.g. "Stream my Postgres tickets table into Antfly with CDC and route new tickets against resolved history" — and use this page to judge the result.
+Then prompt it with the outcome, for example "Stream my Postgres tickets table into Antfly with CDC and route new tickets against resolved history", and use this page to judge the result.
 
 ## Next Steps
 
-- [PostgreSQL Replication](/docs/guides/cdc-replication): cloud provider setup, key templates, transforms, and troubleshooting
-- [Build a Support Answer Agent](/docs/guides/support-answer-agent): answer the ticket instead of just routing it
-- [Hybrid Search](/docs/guides/hybrid-search): tuning fusion, reranking, and pruning
+- [Stream PostgreSQL into Antfly](/docs/guides/cdc-replication): provider setup, key templates, column transforms, and what to do when the slot falls behind
+- [Build a Support Answer Agent](/docs/guides/support-answer-agent): answer the ticket instead of routing it
+- [Tune Hybrid Search](/docs/guides/hybrid-search): what the reranker and pruner are doing under the routing query

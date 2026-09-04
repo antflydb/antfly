@@ -1,6 +1,8 @@
 ---
 title: Artifact-Backed Indexes
-description: Build full-text, vector, and graph indexes over one or more generated artifact streams
+order: 2
+sidebar: concepts
+description: How one full-text, vector, or graph index unions the records that enrichments generate, and how to tell when it is ready
 ---
 
 <Questions>
@@ -10,28 +12,19 @@ description: Build full-text, vector, and graph indexes over one or more generat
 - Which request forms are canonical, alternative, legacy, or deprecated?
 </Questions>
 
-## Overview
+An artifact-backed index consumes the records that named enrichments produce, rather than the source documents themselves. Its `sources` array unions up to 64 streams into one full-text, embeddings, or graph index, and each member keeps the stable identity `(artifact, key)`, so records from different streams never collide even when their keys match. The decision this page is read for: when to search whole documents and their extracted chunks as one index, and how to know when that index is actually serving all of them.
 
-An artifact-backed index consumes records produced by named enrichments. The
-canonical `sources` array can union up to 64 streams in one full-text, embeddings,
-or graph index. Each source member has the stable identity `(artifact, key)`, so
-records from different streams cannot collide even when their keys match.
-
-Check deployment support before offering this workflow:
+Confirm the deployment supports it first:
 
 ```bash
 curl http://localhost:8080/db/v1/status
 ```
 
-`index_capabilities.artifact_sources` must be `true`. Embedded, standalone, and
-distributed deployments support artifact sources. Serverless rejects them and
-does not emulate older artifact-index behavior.
+`index_capabilities.artifact_sources` must be `true`. Embedded, standalone, and distributed deployments support artifact sources. Serverless rejects them and does not emulate older artifact-index behavior.
 
-## Document And Chunk Vectors In One Index
+## Document and Chunk Vectors in One Index
 
-This pattern closes the gap between one document-level semantic field and the
-more precise chunks produced by document extraction. Both embedding enrichments
-must have compatible dimensions and semantic vector spaces.
+One document-level embedding captures the whole; the chunks that document extraction produces are more precise. Indexing both as members of one embeddings index closes that gap. Both embedding enrichments must share compatible dimensions and a compatible vector space.
 
 ```json
 {
@@ -67,22 +60,13 @@ must have compatible dimensions and semantic vector spaces.
 }
 ```
 
-Create it at `POST /db/v1/tables/{table}/indexes/document_vectors`. The
-`vector_space` value is an application-owned compatibility identifier. Every
-source in a multi-source index must either use the same explicit identifier or
-use semantically identical producer configurations; explicit and implicit modes
-cannot be mixed.
+Create it at `POST /db/v1/tables/{table}/indexes/document_vectors`. `vector_space` is an application-owned compatibility identifier: every source in a multi-source index must either use the same explicit identifier or use semantically identical producer configurations, and explicit and implicit modes cannot be mixed.
 
-Query `document_vectors` through the normal semantic search API. Raw member
-results retain artifact identity. Use hierarchy grouping when the UI needs one
-source document with matching chunks nested beneath it; request the documented
-top-level field projection when grouping.
+Query `document_vectors` through the normal semantic search API. Raw member results keep their artifact identity. When the UI needs one source document with its matching chunks nested beneath it, use hierarchy grouping and request the documented top-level field projection.
 
 ## Full-Text Sources With Different Shapes
 
-A shared top-level `field` is inherited by every source that does not override
-it. A source-local field supports unions whose artifact records use different
-JSON shapes:
+A top-level `field` is inherited by every source that does not override it. A source-local `field` lets one index union artifact records with different JSON shapes:
 
 ```json
 {
@@ -95,12 +79,9 @@ JSON shapes:
 }
 ```
 
-Here `document_units_v1` indexes `summary`, while `document_chunks_v1` inherits
-`text`. If neither level specifies a field, Antfly uses the default text
-projection. Missing, null, and non-text values add no postings.
+`document_units_v1` indexes `summary`; `document_chunks_v1` inherits `text`. If neither level names a field, Antfly uses the default text projection. Missing, null, and non-text values add no postings.
 
-To query a named full-text index, set `full_text_index` together with
-`full_text_search` or a scoring text clause in the recursive `query` AST:
+To query a named full-text index, set `full_text_index` together with `full_text_search` or a scoring text clause in the recursive `query` AST:
 
 ```json
 {
@@ -110,59 +91,39 @@ To query a named full-text index, set `full_text_index` together with
 }
 ```
 
-Filter-only and exclusion-only query trees are not scoring text queries and
-receive HTTP 422 when combined with `full_text_index`.
+Filter-only and exclusion-only query trees are not scoring text queries and receive HTTP 422 when combined with `full_text_index`.
 
-## Graph Sources
+## Graph Sources and Edge Ownership
 
-Graph `sources` are ordered. When two sources materialize the same edge identity,
-the earlier source wins. Mapping (`path`, `format`, `nodes`, `edge`, and
-`context`) belongs on each source because streams can use different record
-shapes. The optional `source` object is the one-source convenience form and is
-mutually exclusive with `sources`.
+Graph `sources` are ordered. When two sources materialize the same edge identity, the earlier source wins. Mapping (`path`, `format`, `nodes`, `edge`, and `context`) belongs on each source, because streams can use different record shapes. The optional `source` object is the one-source convenience form and is mutually exclusive with `sources`.
 
-Artifact-backed edges are owned by the source document key; `nodes.target`
-maps the other endpoint. Source ownership is intentionally not configurable,
-so replay, deletion, routing, and range splits share one identity contract.
-Outgoing traversal routes directly to that source owner. Incoming and
-bidirectional traversal use an exact, bounded coordinator route directory
-fenced by the table topology and per-shard read generations. A cold or
-generation-mismatched entry falls back to compact, bounded reverse-index probes
-and records the proven source shards; expansion is then sent only to those
-shards. This preserves exact cross-range paths without synchronous cross-shard
-dual writes, while repeated traversals avoid cluster-wide probe fanout.
+Artifact-backed edges are owned by the source document key; `nodes.target` maps the other endpoint. Source ownership is not configurable, so replay, deletion, routing, and range splits share one identity contract. Outgoing traversal routes directly to that source owner. Incoming and bidirectional traversal use an exact, bounded coordinator route directory fenced by the table topology and per-shard read generations. A cold or generation-mismatched entry falls back to compact, bounded reverse-index probes and records the proven source shards; expansion then goes only to those shards. Cross-range paths stay exact without synchronous cross-shard dual writes, and repeated traversals avoid cluster-wide probe fanout.
 
-## Readiness And Operations
+## Readiness Is Two Flags, Not One
 
-Creation starts materialization and replay; it does not imply complete coverage.
-Poll `GET /db/v1/tables/{table}/indexes/{index}` and use
-`readiness.queryable` for serving eligibility and `readiness.complete` for full
-coverage. `pending_reasons` provides typed aggregate blockers or failure reasons.
-Artifact-backed indexes also return `readiness.sources` in configuration order.
-Each entry identifies the artifact stream and reports its state, completeness,
-and typed blockers, so operators can distinguish (for example) document-vector
-lag from chunk-vector lag without inspecting internal replay state. Internal
-replay watermarks remain diagnostics; use `queryable` and `complete` as the
-serving and convergence authorities.
+Creation starts materialization and replay; it does not mean coverage is complete. Poll `GET /db/v1/tables/{table}/indexes/{index}`:
 
-Changing source membership, projection fields, analyzer semantics, embedding
-space, or graph mapping changes index semantics and requires a new materialized
-generation. Execution batching fields tune work but do not change artifact
-identity.
+- `readiness.queryable` is the serving authority: the index can answer queries.
+- `readiness.complete` is the convergence authority: every source is fully covered.
+- `pending_reasons` gives typed aggregate blockers or failure reasons.
+- `readiness.sources` lists each artifact stream in configuration order with its state, completeness, and typed blockers, so document-vector lag and chunk-vector lag show up separately.
 
-## API Names And Compatibility
+Internal replay watermarks are diagnostics only.
 
-`sources` is the canonical multi-source API. The following are supported
-one-source alternatives, not deprecated aliases: full-text `artifact_name`,
-embeddings `embedding_name`, and graph `source`. Normalized responses expose
-canonical `sources` where the released contract requires it.
+Changing source membership, projection fields, analyzer semantics, embedding space, or graph mapping changes what the index means and requires a new materialized generation. Execution batching fields tune work without changing artifact identity.
 
-The released v0.2 embeddings fields remain supported for v0.2 compatibility;
-no removal release is currently scheduled. `source_artifact_name` is descriptive
-when paired with `embedding_name`; the matching enrichment is authoritative.
-Internal graph manifest and edge materialization fields are engine-owned, not
-alternate public APIs. No graph status aliases were released, and the unreleased
-Go v0.2 SDK surface does not create an additional compatibility obligation.
+## Canonical, Alternative, and Compatibility Forms
+
+`sources` is the canonical multi-source API. Three one-source alternatives are supported and not deprecated: full-text `artifact_name`, embeddings `embedding_name`, and graph `source`. Normalized responses expose canonical `sources` where the released contract requires it.
+
+The released v0.2 embeddings fields remain supported for v0.2 compatibility, with no removal release scheduled. `source_artifact_name` is descriptive when paired with `embedding_name`; the matching enrichment is authoritative. Internal graph manifest and edge materialization fields are engine-owned, not alternate public APIs. No graph status aliases were released, and the unreleased Go v0.2 SDK surface creates no additional compatibility obligation.
+
+## When to Reach for One
+
+- Search should land on the precise passage but return the document it came from: union document and chunk vectors, then group by hierarchy.
+- Two enrichments write different JSON shapes into one searchable text index: use source-local `field` overrides.
+- Relationships come from more than one extractor: order the graph `sources` so the extractor you trust more wins on shared edges.
+- Serving before the backfill finishes is acceptable: watch `readiness.queryable`; treating results as complete needs `readiness.complete`.
 
 ## Let Your Agent Drive
 
@@ -173,4 +134,10 @@ so a coding agent can execute this guide for you:
 npx skills add antflydb/antfly-skills
 ```
 
-Then prompt it with the outcome — e.g. "Create an artifact-backed index over my docs table's generated chunks" — and use this page to judge the result.
+Then prompt it with the outcome, for example "Create an artifact-backed embeddings index over my docs table that unions document-level and chunk-level vectors", and use this page to judge the result.
+
+## Next Steps
+
+- [Document Engine](/docs/guides/document-engine): how the planner composes full-text, vector, filter, and graph inputs over any index
+- [Search Images by What's in Them](/docs/guides/multimodal): a single-source embeddings index over remote media
+- [Tune Hybrid Search](/docs/guides/hybrid-search): fusion, reranking, and pruning over the results

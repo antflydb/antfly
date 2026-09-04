@@ -62,8 +62,8 @@ That is the whole loop. The [Quickstart](/docs/guides/quickstart) does it with 1
 ## What Antfly is
 
 - **One engine, several indexes.** `full_text` (BM25), `embeddings` (vector, RaBitQ-compressed), and `graph` (traversal and pathfinding) are index types on the same table and are fused in one query plan. See the [Document Engine guide](/docs/guides/document-engine) for how mappings, search modes, filters, sorting, and pagination compose.
-- **Inference inside the engine.** Chunking, embedding, reranking, summarization, and entity extraction run as background enrichers and query processors using [Antfly Inference](/docs/guides/inference), which ships quantized models in the binary. External providers (Ollama, OpenAI, Bedrock, Gemini, Anthropic) plug in the same way.
-- **Any shape of data.** Text, PDFs (with local OCR when needed), images, audio, and video, referenced by URL or inserted directly. See [Multimodal Embeddings](/docs/guides/multimodal).
+- **Inference inside the engine.** Chunking, embedding, reranking, summarization, and entity extraction run as background enrichers and query processors using [Antfly Inference](/docs/guides/inference), which ships quantized models in the binary. External providers (Ollama, OpenAI, Bedrock, Gemini) plug in through the same configuration.
+- **Any shape of data.** Text, PDFs (with local OCR when needed), images, audio, and video, referenced by URL or inserted directly. See [Search Images by What's in Them](/docs/guides/multimodal).
 - **Built for agents.** Streaming RAG, retrieval and query-builder agents, evaluation metrics, and an MCP surface. See [RAG in the Quickstart](/docs/guides/quickstart#rag-retrieval-augmented-generation).
 - **Distributed by design.** Multi-Raft consensus, horizontal sharding with online splitting, cross-shard write transactions, and a Kubernetes [operator](/docs/operator) with autoscaling. [Architecture](/docs/architecture) explains how it fits together.
 - **Local-first too.** [Antfly Lite](/docs/guides/lite) embeds the engine in a single `.aflite` file for desktop and edge applications.
@@ -71,7 +71,8 @@ That is the whole loop. The [Quickstart](/docs/guides/quickstart) does it with 1
 ## Where to go next
 
 - [Quickstart](/docs/guides/quickstart), with every step in the CLI, cURL, TypeScript, Python, Go, and Rust
-- [Guides](/docs/guides) for hybrid search, multimodal, inference, Lite, and replication
+- [Guides](/docs/guides) that each end in one working thing: a support answer agent, site search with an answer box, ticket routing from Postgres, a copilot's retrieval, and more
+- Concept pages on the [document engine](/docs/guides/document-engine), [Antfly Inference](/docs/guides/inference), and [Antfly Lite](/docs/guides/lite)
 - [API reference](/docs/api) for the CLI and REST surface
 - [Downloads](/docs/downloads) for every platform, checksums, and Docker Compose
 - [Antfly Cloud](/docs/cloud) for the hosted version

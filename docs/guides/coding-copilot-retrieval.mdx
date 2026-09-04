@@ -1,7 +1,7 @@
 ---
 title: "Power a Coding Copilot's Retrieval"
-description: "Hybrid retrieval over a codebase: exact symbol matches plus semantic intent, sized to a context budget"
-order: 2.5
+description: "A repo index that answers both exact symbol lookups and intent questions, returned as a context block sized to your model's budget"
+order: 5
 ---
 
 <Questions>
@@ -11,15 +11,63 @@ order: 2.5
 - Why does my coding assistant miss relevant files?
 </Questions>
 
-## The Pattern
+By the end of this guide, your copilot asks Antfly for context and gets back the files that matter, whether it asked by symbol name (`parseConfig`) or by intent ("where are configuration defaults applied?"), already trimmed to fit its context window. You need Antfly running in standalone mode, which the [Quickstart](/docs/guides/quickstart) leaves you with:
 
-A coding copilot edits code based on what it retrieved. There is no human checkpoint between retrieval and the edit, and the copilot can't know what it failed to retrieve: if the function that already solves the problem never reaches the context, the copilot reinvents it, badly, and the failure looks like bad model output.
+```bash
+curl -s http://localhost:8080/db/v1/status | head -c 200
+```
 
-Code retrieval has a particular shape. Sometimes the query is exact (`parseConfig`, an error string, a flag name), and keyword matching wins. Sometimes it's intent ("where are configuration defaults applied?"), and only semantic search finds it. A copilot needs both at once, which is what hybrid retrieval is for.
+Here is the call your copilot will make by the end:
+
+```bash
+curl -X POST http://localhost:8080/db/v1/agents/retrieval \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "where configuration defaults are applied",
+    "queries": [{
+      "table": "repo",
+      "full_text_search": {"query": "body:parseConfig"},
+      "semantic_search": "where configuration defaults are applied",
+      "indexes": ["code"],
+      "fields": ["path", "body"],
+      "limit": 30,
+      "reranker": {
+        "provider": "antfly",
+        "model": "mixedbread-ai/mxbai-rerank-base-v1",
+        "field": "body"
+      },
+      "pruner": {"min_score_ratio": 0.5}
+    }],
+    "max_context_tokens": 2048
+  }'
+```
+
+```json
+{
+  "hits": [
+    {
+      "_id": "internal/config/defaults.go",
+      "_source": {
+        "path": "internal/config/defaults.go",
+        "body": "package config\n\n// applyDefaults fills unset fields..."
+      }
+    },
+    {
+      "_id": "internal/config/parse.go",
+      "_source": {
+        "path": "internal/config/parse.go",
+        "body": "package config\n\nfunc parseConfig(raw []byte) (*Config, error) {...}"
+      }
+    }
+  ]
+}
+```
+
+Four steps get you there.
 
 ## 1. Index the Repo
 
-Create a table with a semantic index over file contents. Code benefits from smaller chunks than prose:
+One embeddings index over file contents. Code wants smaller chunks than prose, so a function does not get split from its signature:
 
 ```bash
 curl -X POST http://localhost:8080/db/v1/tables/repo \
@@ -45,7 +93,7 @@ curl -X POST http://localhost:8080/db/v1/tables/repo \
   }'
 ```
 
-Then insert files, one document per file, with the path as the key:
+Insert one document per file, keyed by path:
 
 ```bash
 curl -X POST http://localhost:8080/db/v1/tables/repo/batch \
@@ -64,11 +112,11 @@ curl -X POST http://localhost:8080/db/v1/tables/repo/batch \
   }'
 ```
 
-In a real pipeline, walk the repo and batch files a few hundred at a time. Re-insert a file on change; the index updates in place.
+In a real pipeline, walk the tree and batch a few hundred files per request. Re-insert a file when it changes and the index updates in place.
 
 ## 2. Query Both Ways at Once
 
-A hybrid query runs BM25 and vector search in parallel and fuses the results. Exact symbols come from the keyword side, intent matches from the semantic side:
+Exact symbols come from the keyword side. Intent comes from the semantic side. One query runs both and fuses the ranked lists:
 
 ```bash
 antfly query --table repo \
@@ -79,28 +127,11 @@ antfly query --table repo \
   --limit 30
 ```
 
-The same query over REST:
-
-```bash
-curl -X POST http://localhost:8080/db/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "table": "repo",
-    "full_text_search": {"query": "body:parseConfig"},
-    "semantic_search": "where configuration defaults are applied",
-    "indexes": ["code"],
-    "fields": ["path", "body"],
-    "limit": 30
-  }'
-```
-
-<Callout type="tip">
-Build the keyword side from the literal tokens in the user's request (identifiers, error strings, file names) and the semantic side from the task description. They catch different misses.
-</Callout>
+Build the keyword side from the literal tokens in the copilot's request (identifiers, error strings, file names) and the semantic side from its description of the task. They catch different misses.
 
 ## 3. Rerank Against the Task
 
-Fusion gets the right candidates into the pool; a cross-encoder reranker orders them by what the copilot is actually trying to do. Rerank against the task description, not the raw keyword:
+Fusion gets the right candidates into the pool. A cross-encoder reranker orders them by how well each one serves what the copilot is trying to do, so rerank against the task description rather than the symbol:
 
 ```bash
 antfly query --table repo \
@@ -119,32 +150,13 @@ antfly query --table repo \
 
 ## 4. Fit the Context Budget
 
-A copilot's context window is a budget, and retrieval decides how it gets spent. The retrieval agent endpoint handles the budgeting for you: it assembles reranked, pruned results up to a token limit, so the most relevant code is what makes the cut:
+The retrieval agent does the budgeting. Give it the same query plus `max_context_tokens`, and it assembles the reranked, pruned results up to that limit, most relevant first. That is the call at the top of this page. With no `steps.generation` block it returns context and sources, not an answer, which is what your copilot's model wants to be handed.
 
-```bash
-curl -X POST http://localhost:8080/db/v1/agents/retrieval \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "where configuration defaults are applied",
-    "queries": [{
-      "table": "repo",
-      "full_text_search": {"query": "body:parseConfig"},
-      "semantic_search": "where configuration defaults are applied",
-      "indexes": ["code"],
-      "fields": ["path", "body"],
-      "limit": 30,
-      "reranker": {
-        "provider": "antfly",
-        "model": "mixedbread-ai/mxbai-rerank-base-v1",
-        "field": "body"
-      },
-      "pruner": {"min_score_ratio": 0.5}
-    }],
-    "max_context_tokens": 2048
-  }'
-```
+## Why More Context Is Not the Goal
 
-Without a `steps.generation` block, the agent returns the assembled context and sources instead of an answer: exactly what you feed your copilot's model. More context is not the goal; a bigger haystack is not a sharper needle. The goal is that the function the copilot needs is in the window, and the noise is not.
+A copilot can't know what it failed to retrieve. If the function that already solves the problem never reaches its context, it reinvents that function, and the failure looks like a bad model rather than a bad lookup. The fix is not a bigger window. A bigger window filled with near-misses buries the one file that mattered and spends tokens doing it.
+
+The budget is what makes retrieval choosy. `max_context_tokens: 2048` is a good starting point for a copilot that also carries the user's open file; raise it for a model with a large window, lower it when the copilot's own prompt is already long. Watch what gets cut on real tasks. If the right file is being dropped, the pruner is too tight, not the budget.
 
 ## Let Your Agent Drive
 
@@ -155,10 +167,9 @@ so a coding agent can execute this guide for you:
 npx skills add antflydb/antfly-skills
 ```
 
-Then prompt it with the outcome — e.g. "Index this repository into Antfly and wire up hybrid retrieval with reranking and a 2k-token context budget" — and use this page to judge the result.
+Then prompt it with the outcome, for example "Index this repository into Antfly and wire up hybrid retrieval with reranking and a 2k-token context budget", and use this page to judge the result.
 
 ## Next Steps
 
-- [Hybrid Search](/docs/guides/hybrid-search): merge strategies, reranking, and pruning in depth
-- [Quickstart](/docs/guides/quickstart): SDK examples in TypeScript, Python, Go, and Rust
-- **MemoryAF**: give your copilot persistent memory across sessions, built on the same retrieval
+- [Tune Hybrid Search](/docs/guides/hybrid-search): fusion weights, reranking, and pruning in depth
+- [Quickstart](/docs/guides/quickstart): the same queries in the TypeScript, Python, Go, and Rust SDKs
