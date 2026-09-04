@@ -27,6 +27,9 @@ from pathlib import Path
 from typing import Any
 
 
+INFERENCE_ROOT = Path(__file__).resolve().parents[3]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -36,7 +39,7 @@ def parse_args() -> argparse.Namespace:
         command.add_argument("--model-name", default="nomic-ai/nomic-embed-text-v1.5")
         command.add_argument(
             "--fixture",
-            default="src/bench/testdata/nomic_v15_tokens.json",
+            default=str(INFERENCE_ROOT / "src/bench/testdata/nomic_v15_tokens.json"),
             help="shared pretokenized direct-benchmark fixture",
         )
         command.add_argument("--python-path", action="append", default=[])

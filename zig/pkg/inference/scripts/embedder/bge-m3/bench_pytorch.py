@@ -29,6 +29,7 @@ VOCAB_SIZE = 250002
 PAD_TOKEN_ID = 1
 ALLOWED_BATCHES = {1, 2, 4}
 ALLOWED_LENGTHS = {16, 128}
+INFERENCE_ROOT = Path(__file__).resolve().parents[3]
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,7 +41,7 @@ def parse_args() -> argparse.Namespace:
         command.add_argument("--model-name", default=MODEL_NAME)
         command.add_argument(
             "--fixture",
-            default="src/bench/testdata/bge_m3_tokens.json",
+            default=str(INFERENCE_ROOT / "src/bench/testdata/bge_m3_tokens.json"),
         )
         command.add_argument("--device", choices=("cpu", "mps"), required=True)
         command.add_argument("--batches", default="1,2,4")

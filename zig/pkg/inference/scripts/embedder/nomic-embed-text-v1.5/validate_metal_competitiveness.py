@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pytorch-direct", required=True)
     parser.add_argument("--native-http", required=True)
     parser.add_argument("--pytorch-http", required=True)
-    parser.add_argument("--parity", help="compact six-cell output from bench_nomic_pytorch_mps.py parity")
+    parser.add_argument("--parity", help="compact six-cell output from bench_pytorch_mps.py parity")
     parser.add_argument("--ffn-fusion-disabled")
     parser.add_argument("--pool-normalize-disabled")
     parser.add_argument("--q8-sdpa-disabled")
