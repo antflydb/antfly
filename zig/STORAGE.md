@@ -485,7 +485,11 @@ Maintenance publishes a generation-qualified durable completion marker only
 after a complete audit has observed no malformed or unprojectable canonical
 records. Discovering either persists migration debt and atomically invalidates
 any earlier completion marker; a later wholly clean audit clears that debt as
-it republishes completion. Audit progress uses the exact backend key, so a
+it republishes completion. A durable per-namespace audit epoch advances with
+every debt observation and completion invalidation. Each full pass captures the
+epoch before scanning and compares it in the transaction that republishes
+completion, so a stale audit in another process cannot erase newer debt. Audit
+progress uses the exact backend key, so a
 malformed reserved key consumes bounded work and records debt without wedging
 unrelated durable transaction recovery. A new runtime operating with the fence
 unset also removes any old completion proof before continuing its audit.

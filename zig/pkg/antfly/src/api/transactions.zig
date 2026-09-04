@@ -50,6 +50,11 @@ const interactive_legacy_inventory_complete_key = "\x00\x00__api_txn_session_leg
 const receipt_legacy_inventory_complete_key = "\x00\x00__api_idempotent_receipt_legacy_inventory_complete_v1__";
 const interactive_legacy_inventory_debt_key = "\x00\x00__api_txn_session_legacy_inventory_debt_v1__";
 const receipt_legacy_inventory_debt_key = "\x00\x00__api_idempotent_receipt_legacy_inventory_debt_v1__";
+// This epoch survives completion/debt transitions. Auditors capture it before
+// starting a full pass, and completion compares it transactionally so a stale
+// process cannot erase debt discovered by a concurrent process.
+const interactive_legacy_inventory_audit_epoch_key = "\x00\x00__api_txn_session_legacy_inventory_audit_epoch_v1__";
+const receipt_legacy_inventory_audit_epoch_key = "\x00\x00__api_idempotent_receipt_legacy_inventory_audit_epoch_v1__";
 // Receipt writers are intrinsically fenced by their versioned canonical
 // namespace: a pre-feature binary cannot create a receipt row. Interactive
 // sessions share their canonical namespace with older binaries and require an
@@ -1822,16 +1827,22 @@ pub const DurableSessionStore = struct {
         self: *DurableSessionStore,
         kind: SessionKind,
         writer_fence_generation: u64,
-    ) !void {
-        if (try self.legacySessionInventoryKindComplete(kind, writer_fence_generation)) return;
+        expected_audit_epoch: u64,
+    ) !bool {
+        if (try self.legacySessionInventoryKindComplete(kind, writer_fence_generation)) return true;
         const key = sessionLegacyInventoryCompleteKey(kind);
         const debt_key = sessionLegacyInventoryDebtKey(kind);
+        const epoch_key = sessionLegacyInventoryAuditEpochKey(kind);
         var marker_buffer: [64]u8 = undefined;
         const marker = try std.fmt.bufPrint(&marker_buffer, "v2:{d}", .{writer_fence_generation});
         switch (self.backend) {
             .docstore => |store| {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
+                if (try legacySessionInventoryAuditEpochTxn(&txn, epoch_key) != expected_audit_epoch) {
+                    txn.abort();
+                    return false;
+                }
                 try txn.put(key, marker);
                 txn.delete(debt_key) catch |err| switch (err) {
                     error.NotFound => {},
@@ -1842,6 +1853,10 @@ pub const DurableSessionStore = struct {
             .runtime => |store| {
                 var txn = try store.beginWrite();
                 errdefer txn.abort();
+                if (try legacySessionInventoryAuditEpochTxn(&txn, epoch_key) != expected_audit_epoch) {
+                    txn.abort();
+                    return false;
+                }
                 try txn.put(key, marker);
                 txn.delete(debt_key) catch |err| switch (err) {
                     error.NotFound => {},
@@ -1850,6 +1865,26 @@ pub const DurableSessionStore = struct {
                 try txn.commit();
             },
         }
+        return true;
+    }
+
+    pub fn legacySessionInventoryAuditEpoch(
+        self: *DurableSessionStore,
+        kind: SessionKind,
+    ) !u64 {
+        const key = sessionLegacyInventoryAuditEpochKey(kind);
+        return switch (self.backend) {
+            .docstore => |store| blk: {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                break :blk try legacySessionInventoryAuditEpochTxn(&txn, key);
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                break :blk try legacySessionInventoryAuditEpochTxn(&txn, key);
+            },
+        };
     }
 
     /// Persists migration debt and invalidates any completion proof in the
@@ -1865,6 +1900,7 @@ pub const DurableSessionStore = struct {
         std.debug.assert(unresolved_records > 0);
         const complete_key = sessionLegacyInventoryCompleteKey(kind);
         const debt_key = sessionLegacyInventoryDebtKey(kind);
+        const epoch_key = sessionLegacyInventoryAuditEpochKey(kind);
         var debt_buffer: [96]u8 = undefined;
         const debt = try std.fmt.bufPrint(
             &debt_buffer,
@@ -1875,6 +1911,7 @@ pub const DurableSessionStore = struct {
             .docstore => |store| {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
+                try advanceLegacySessionInventoryAuditEpochTxn(&txn, epoch_key);
                 try txn.put(debt_key, debt);
                 txn.delete(complete_key) catch |err| switch (err) {
                     error.NotFound => {},
@@ -1885,6 +1922,7 @@ pub const DurableSessionStore = struct {
             .runtime => |store| {
                 var txn = try store.beginWrite();
                 errdefer txn.abort();
+                try advanceLegacySessionInventoryAuditEpochTxn(&txn, epoch_key);
                 try txn.put(debt_key, debt);
                 txn.delete(complete_key) catch |err| switch (err) {
                     error.NotFound => {},
@@ -1905,6 +1943,7 @@ pub const DurableSessionStore = struct {
         kind: SessionKind,
     ) !void {
         const key = sessionLegacyInventoryCompleteKey(kind);
+        const epoch_key = sessionLegacyInventoryAuditEpochKey(kind);
         switch (self.backend) {
             .docstore => |store| {
                 var txn = try store.beginWriteTxn();
@@ -1916,6 +1955,7 @@ pub const DurableSessionStore = struct {
                     },
                     else => return err,
                 };
+                try advanceLegacySessionInventoryAuditEpochTxn(&txn, epoch_key);
                 try txn.delete(key);
                 try txn.commit();
             },
@@ -1929,6 +1969,7 @@ pub const DurableSessionStore = struct {
                     },
                     else => return err,
                 };
+                try advanceLegacySessionInventoryAuditEpochTxn(&txn, epoch_key);
                 try txn.delete(key);
                 try txn.commit();
             },
@@ -2734,6 +2775,7 @@ pub const SessionRegistry = struct {
     recovery_index_cursors: [2]?db_mod.types.TxnId = .{ null, null },
     recovery_audit_cursors: [2]?[]u8 = .{ null, null },
     recovery_audit_unresolved: [2]usize = .{ 0, 0 },
+    recovery_audit_epochs: [2]?u64 = .{ null, null },
     recovery_namespace_cursor: SessionKind = .interactive,
     expiry_cleanup_cursors: [2]?SessionExpiryCursor = .{ null, null },
     expiry_namespace_cursor: SessionKind = .interactive,
@@ -3559,6 +3601,7 @@ pub const SessionRegistry = struct {
             const index_after = self.recovery_index_cursors;
             const audit_after = self.recovery_audit_cursors;
             const audit_unresolved = self.recovery_audit_unresolved;
+            const audit_epochs = self.recovery_audit_epochs;
             const first_kind = self.recovery_namespace_cursor;
             self.mutex.unlock();
 
@@ -3571,6 +3614,7 @@ pub const SessionRegistry = struct {
                 };
             }
             var next_audit_unresolved = audit_unresolved;
+            var next_audit_epochs = audit_epochs;
             var kind = first_kind;
             for (0..2) |_| {
                 const kind_index = sessionKindIndex(kind);
@@ -3591,6 +3635,8 @@ pub const SessionRegistry = struct {
                 };
                 if (kind == .interactive and writer_fence_generation == null)
                     try durable.invalidateLegacySessionInventoryCompletion(kind);
+                if (audit_after[kind_index] == null)
+                    next_audit_epochs[kind_index] = try durable.legacySessionInventoryAuditEpoch(kind);
                 var audited = try durable.scanLegacyRecoveryIds(alloc, kind, audit_after[kind_index], audit_budget);
                 defer audited.deinit(alloc);
                 next_audit_after[kind_index] = if (audited.next_after) |raw|
@@ -3616,12 +3662,17 @@ pub const SessionRegistry = struct {
                 if (audited.next_after == null) {
                     if (next_audit_unresolved[kind_index] == 0) {
                         if (writer_fence_generation) |generation|
-                            try durable.markLegacySessionInventoryComplete(kind, generation);
+                            _ = try durable.markLegacySessionInventoryComplete(
+                                kind,
+                                generation,
+                                next_audit_epochs[kind_index].?,
+                            );
                     }
                     // EOF begins a new independent audit. Repaired corruption
                     // may clear the debt on that next pass; a clean tail page
                     // can never erase debt seen earlier in this pass.
                     next_audit_unresolved[kind_index] = 0;
+                    next_audit_epochs[kind_index] = null;
                 }
                 for (audited.recovery_ids) |txn_id| {
                     try durable.refreshRecoveryIndex(txn_id, kind);
@@ -3648,6 +3699,7 @@ pub const SessionRegistry = struct {
                 set.* = false;
             }
             self.recovery_audit_unresolved = next_audit_unresolved;
+            self.recovery_audit_epochs = next_audit_epochs;
             self.recovery_namespace_cursor = nextSessionKind(first_kind);
             self.mutex.unlock();
         } else {
@@ -6802,6 +6854,32 @@ fn sessionLegacyInventoryDebtKey(kind: SessionKind) []const u8 {
     };
 }
 
+fn sessionLegacyInventoryAuditEpochKey(kind: SessionKind) []const u8 {
+    return switch (kind) {
+        .interactive => interactive_legacy_inventory_audit_epoch_key,
+        .idempotent_receipt => receipt_legacy_inventory_audit_epoch_key,
+    };
+}
+
+fn legacySessionInventoryAuditEpochTxn(txn: anytype, key: []const u8) !u64 {
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    if (!std.mem.startsWith(u8, raw, "v1:")) return error.InvalidTransactionSessionRecord;
+    return std.fmt.parseUnsigned(u64, raw[3..], 10) catch
+        return error.InvalidTransactionSessionRecord;
+}
+
+fn advanceLegacySessionInventoryAuditEpochTxn(txn: anytype, key: []const u8) !void {
+    const current = try legacySessionInventoryAuditEpochTxn(txn, key);
+    const next = std.math.add(u64, current, 1) catch
+        return error.InvalidTransactionSessionRecord;
+    var buffer: [64]u8 = undefined;
+    const encoded = try std.fmt.bufPrint(&buffer, "v1:{d}", .{next});
+    try txn.put(key, encoded);
+}
+
 fn sessionLegacyInventoryPrincipalDigest(kind: SessionKind, principal: ?[]const u8) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(switch (kind) {
@@ -9132,8 +9210,12 @@ test "transaction inventory requires a new writer fence after a legacy writer re
     // Generation 3 represents a completed rollout. A rollback disables the
     // fence, and a pre-index writer is modeled by removing the index entry it
     // would never have created.
-    try durable.markLegacySessionInventoryComplete(.interactive, 3);
-    try durable.markLegacySessionInventoryComplete(.idempotent_receipt, receipt_inventory_writer_fence_generation);
+    try std.testing.expect(try durable.markLegacySessionInventoryComplete(.interactive, 3, 0));
+    try std.testing.expect(try durable.markLegacySessionInventoryComplete(
+        .idempotent_receipt,
+        receipt_inventory_writer_fence_generation,
+        0,
+    ));
     registry.inventory_writer_fence_generation = null;
     const late = try registry.beginForPrincipal(alloc, .{ .sync_level = .write }, 7, "alice");
     const current_key = try makeSessionInventoryKey(alloc, .interactive, "alice", late.txn_id);
@@ -9296,6 +9378,72 @@ test "transaction inventory completion retains corruption debt across audit page
     try std.testing.expect(!try durable.legacySessionInventoryKindComplete(.interactive, 7));
     const malformed_debt = try store.get(alloc, debt_key);
     alloc.free(malformed_debt);
+}
+
+test "stale concurrent inventory audit cannot clear newer corruption debt" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-inventory-concurrent-debt", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable_a = DurableSessionStore.init(alloc, &store);
+    var durable_b = DurableSessionStore.init(alloc, &store);
+    var registry_a = SessionRegistry.init(&durable_a);
+    registry_a.inventory_writer_fence_generation = 7;
+    defer registry_a.deinit(alloc);
+    var registry_b = SessionRegistry.init(&durable_b);
+    registry_b.inventory_writer_fence_generation = 7;
+    defer registry_b.deinit(alloc);
+
+    var ids: [9]db_mod.types.TxnId = undefined;
+    for (&ids) |*txn_id| txn_id.* = (try registry_a.beginForPrincipal(alloc, .{ .sync_level = .write }, 7, "alice")).txn_id;
+
+    // Registry A begins a clean two-page pass and advances beyond the row that
+    // will subsequently become corrupt.
+    const first_a = try registry_a.listPendingRecoveryIds(alloc, 8);
+    alloc.free(first_a);
+    const interactive_index = sessionKindIndex(.interactive);
+    try std.testing.expect(registry_a.recovery_audit_cursors[interactive_index] != null);
+    try std.testing.expectEqual(@as(?u64, 0), registry_a.recovery_audit_epochs[interactive_index]);
+
+    var corrupt_id = ids[0];
+    for (ids[1..]) |txn_id| if (std.mem.order(u8, &txn_id, &corrupt_id) == .lt) {
+        corrupt_id = txn_id;
+    };
+    const corrupt_key = try makeSessionKeyForKind(alloc, corrupt_id, .interactive);
+    defer alloc.free(corrupt_key);
+    {
+        var corrupt_txn = try store.beginWriteTxn();
+        errdefer corrupt_txn.abort();
+        try corrupt_txn.put(corrupt_key, "{}");
+        try corrupt_txn.commit();
+    }
+
+    // Registry B observes the corruption after A passed that position. Its
+    // debt write advances the durable epoch while atomically removing proof.
+    const first_b = try registry_b.listPendingRecoveryIds(alloc, 8);
+    alloc.free(first_b);
+    try std.testing.expectEqual(@as(u64, 1), try durable_b.legacySessionInventoryAuditEpoch(.interactive));
+    const debt_key = sessionLegacyInventoryDebtKey(.interactive);
+    const debt_before_a_finishes = try store.get(alloc, debt_key);
+    alloc.free(debt_before_a_finishes);
+
+    // A's clean tail has an older epoch and therefore cannot republish
+    // completion or delete B's newer debt.
+    const tail_a = try registry_a.listPendingRecoveryIds(alloc, 8);
+    alloc.free(tail_a);
+    try std.testing.expect(!try durable_a.legacySessionInventoryKindComplete(.interactive, 7));
+    const debt_after_a_finishes = try store.get(alloc, debt_key);
+    alloc.free(debt_after_a_finishes);
+    try std.testing.expectError(
+        error.NotFound,
+        store.get(alloc, sessionLegacyInventoryCompleteKey(.interactive)),
+    );
 }
 
 test "session cleanup response encodes removed count and cutoff" {
