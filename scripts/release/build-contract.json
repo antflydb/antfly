@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "required_source_paths": [
-    "build.zig",
+    "zig/build.zig",
     "scripts/install.sh",
     "scripts/packaging/build_zig_release_archive.sh",
     "scripts/packaging/package_cli_release.py",
