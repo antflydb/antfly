@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceEmbeddingItemErrorStage(str, Enum):
+class InferenceEmbeddingItemErrorStage(StrEnum):
     AUDIO_DECODE = "audio_decode"
     AUDIO_INFERENCE = "audio_inference"
     FETCH = "fetch"

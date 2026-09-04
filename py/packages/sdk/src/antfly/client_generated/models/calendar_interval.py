@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class CalendarInterval(str, Enum):
+class CalendarInterval(StrEnum):
     DAY = "day"
     HOUR = "hour"
     MINUTE = "minute"

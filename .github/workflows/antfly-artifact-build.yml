@@ -25,10 +25,6 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  ZIG_VERSION: 0.16.0
-  NIXPKGS_REV: c5c4a43b0e8056328ec4529f735cabdb8f1942bb
-  MACOS_SDK_VERSION: "15.5"
-  MACOS_SDK_SHA256: c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
 
 jobs:
   release-plan:
@@ -38,6 +34,13 @@ jobs:
       matrix: ${{ steps.platforms.outputs.matrix }}
       channel: ${{ steps.channel.outputs.channel }}
       build_controller_commit: ${{ steps.controller.outputs.commit }}
+      python_build: ${{ steps.toolchain.outputs.python_build }}
+      zig_version: ${{ steps.toolchain.outputs.zig_version }}
+      zig_nix_attribute: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+      zig_nixpkgs_revision: ${{ steps.toolchain.outputs.zig_nixpkgs_revision }}
+      zig_x86_64_linux_sha256: ${{ steps.toolchain.outputs.zig_x86_64_linux_sha256 }}
+      macos_cross_sdk_version: ${{ steps.toolchain.outputs.macos_cross_sdk_version }}
+      macos_cross_sdk_sha256: ${{ steps.toolchain.outputs.macos_cross_sdk_sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -54,6 +57,9 @@ jobs:
           test "$(git rev-parse HEAD)" = "$BUILD_CONTROLLER_COMMIT"
           test "$WORKFLOW_COMMIT" = "$BUILD_CONTROLLER_COMMIT"
           echo "commit=$BUILD_CONTROLLER_COMMIT" >> "$GITHUB_OUTPUT"
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
       - name: Require compatible immutable default-branch source
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
@@ -103,12 +109,15 @@ jobs:
         if: ${{ matrix.os == 'linux' }}
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
-          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ env.NIXPKGS_REV }}.tar.gz
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ needs.release-plan.outputs.zig_nixpkgs_revision }}.tar.gz
 
       - name: Install glibc-linked Zig
         if: ${{ matrix.os == 'linux' }}
+        env:
+          ZIG_VERSION: ${{ needs.release-plan.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ needs.release-plan.outputs.zig_nix_attribute }}
         run: |
-          zig_path="$(nix-build '<nixpkgs>' -A zig_0_16 --no-out-link)"
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
           test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
           compiler_description="$(file "$zig_path/bin/zig")"
           echo "$compiler_description"
@@ -117,6 +126,9 @@ jobs:
 
       - name: Install pinned macOS cross-compilation SDK
         if: ${{ matrix.macos_sdk == 'true' }}
+        env:
+          MACOS_SDK_VERSION: ${{ needs.release-plan.outputs.macos_cross_sdk_version }}
+          MACOS_SDK_SHA256: ${{ needs.release-plan.outputs.macos_cross_sdk_sha256 }}
         run: |
           set -euo pipefail
           sdk_archive="$RUNNER_TEMP/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"
@@ -171,6 +183,9 @@ jobs:
     with:
       version: ${{ inputs.tag_name }}
       source_commit: ${{ inputs.source_commit }}
+      python_build: ${{ needs.release-plan.outputs.python_build }}
+      zig_version: ${{ needs.release-plan.outputs.zig_version }}
+      zig_x86_64_linux_sha256: ${{ needs.release-plan.outputs.zig_x86_64_linux_sha256 }}
 
   package-release-source:
     name: Stage commit-bound release support files

@@ -46,7 +46,9 @@ def assert_openai_list_response(resp: dict, expected_len: int | None = None) -> 
     assert isinstance(usage["prompt_tokens"], int), resp
     assert isinstance(usage["completion_tokens"], int), resp
     assert isinstance(usage["total_tokens"], int), resp
-    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"], resp
+    assert (
+        usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+    ), resp
 
 
 def assert_extraction_response(resp: dict, expected_len: int | None = None) -> None:
@@ -65,7 +67,9 @@ TINY_PNG_B64 = (
     "/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
 )
 TINY_PNG_URI = f"data:image/png;base64,{TINY_PNG_B64}"
-_GO_ANTFLY_INFERENCE_E2E_DIR = Path(__file__).resolve().parents[2] / "antfly" / "antfly" / "e2e" / "testdata"
+_GO_ANTFLY_INFERENCE_E2E_DIR = (
+    Path(__file__).resolve().parents[2] / "antfly" / "antfly" / "e2e" / "testdata"
+)
 
 
 _FONT_5X7 = {
@@ -434,6 +438,7 @@ _FONT_5X7 = {
 
 def make_solid_png_uri(r: int, g: int, b: int, size: int = 8) -> str:
     """Generate a small solid-color PNG as a data URI without extra dependencies."""
+
     def chunk(tag: bytes, data: bytes) -> bytes:
         return (
             struct.pack(">I", len(data))
@@ -445,12 +450,14 @@ def make_solid_png_uri(r: int, g: int, b: int, size: int = 8) -> str:
     row = b"\x00" + bytes([r, g, b]) * size
     raw = row * size
     ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
-    png = b"".join([
-        b"\x89PNG\r\n\x1a\n",
-        chunk(b"IHDR", ihdr),
-        chunk(b"IDAT", zlib.compress(raw)),
-        chunk(b"IEND", b""),
-    ])
+    png = b"".join(
+        [
+            b"\x89PNG\r\n\x1a\n",
+            chunk(b"IHDR", ihdr),
+            chunk(b"IDAT", zlib.compress(raw)),
+            chunk(b"IEND", b""),
+        ]
+    )
     return f"data:image/png;base64,{base64.b64encode(png).decode()}"
 
 
@@ -465,7 +472,7 @@ def make_shape_png_uri(shape: str, color: tuple[int, int, int], size: int = 128)
 
     def inside(x: int, y: int) -> bool:
         if shape == "circle":
-            return (x - center) ** 2 + (y - center) ** 2 <= radius ** 2
+            return (x - center) ** 2 + (y - center) ** 2 <= radius**2
         if shape == "square":
             return margin <= x < size - margin and margin <= y < size - margin
         if not (margin <= y < size - margin):
@@ -477,7 +484,7 @@ def make_shape_png_uri(shape: str, color: tuple[int, int, int], size: int = 128)
         for x in range(size):
             if inside(x, y):
                 idx = (y * size + x) * 3
-                canvas[idx:idx + 3] = bytes(color)
+                canvas[idx : idx + 3] = bytes(color)
 
     def chunk(tag: bytes, data: bytes) -> bytes:
         return (
@@ -489,16 +496,17 @@ def make_shape_png_uri(shape: str, color: tuple[int, int, int], size: int = 128)
 
     stride = size * 3
     raw = b"".join(
-        b"\x00" + bytes(canvas[y * stride:(y + 1) * stride])
-        for y in range(size)
+        b"\x00" + bytes(canvas[y * stride : (y + 1) * stride]) for y in range(size)
     )
     ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
-    png = b"".join([
-        b"\x89PNG\r\n\x1a\n",
-        chunk(b"IHDR", ihdr),
-        chunk(b"IDAT", zlib.compress(raw)),
-        chunk(b"IEND", b""),
-    ])
+    png = b"".join(
+        [
+            b"\x89PNG\r\n\x1a\n",
+            chunk(b"IHDR", ihdr),
+            chunk(b"IDAT", zlib.compress(raw)),
+            chunk(b"IEND", b""),
+        ]
+    )
     return f"data:image/png;base64,{base64.b64encode(png).decode()}"
 
 
@@ -512,12 +520,12 @@ def make_clip_contract_png_uri() -> str:
         for x in range(width):
             idx = (y * width + x) * 3
             if x < 48:
-                canvas[idx:idx + 3] = bytes((240, y, 12))
+                canvas[idx : idx + 3] = bytes((240, y, 12))
             elif x >= 272:
-                canvas[idx:idx + 3] = bytes((20, 240, 255 - y))
+                canvas[idx : idx + 3] = bytes((20, 240, 255 - y))
             else:
                 cx = x - 48
-                canvas[idx:idx + 3] = bytes((cx, (y * 2) % 256, 255 - cx))
+                canvas[idx : idx + 3] = bytes((cx, (y * 2) % 256, 255 - cx))
 
     def chunk(tag: bytes, data: bytes) -> bytes:
         return (
@@ -530,19 +538,23 @@ def make_clip_contract_png_uri() -> str:
     raw_rows = []
     stride = width * 3
     for y in range(height):
-        raw_rows.append(b"\x00" + bytes(canvas[y * stride:(y + 1) * stride]))
+        raw_rows.append(b"\x00" + bytes(canvas[y * stride : (y + 1) * stride]))
     raw = b"".join(raw_rows)
     ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    png = b"".join([
-        b"\x89PNG\r\n\x1a\n",
-        chunk(b"IHDR", ihdr),
-        chunk(b"IDAT", zlib.compress(raw)),
-        chunk(b"IEND", b""),
-    ])
+    png = b"".join(
+        [
+            b"\x89PNG\r\n\x1a\n",
+            chunk(b"IHDR", ihdr),
+            chunk(b"IDAT", zlib.compress(raw)),
+            chunk(b"IEND", b""),
+        ]
+    )
     return f"data:image/png;base64,{base64.b64encode(png).decode()}"
 
 
-def make_text_png_uri(lines: list[str], scale: int = 6, padding: int = 12, line_gap: int = 8) -> str:
+def make_text_png_uri(
+    lines: list[str], scale: int = 6, padding: int = 12, line_gap: int = 8
+) -> str:
     """Generate a simple black-on-white bitmap text PNG as a data URI."""
     rows_per_char = 7
     cols_per_char = 5
@@ -551,13 +563,17 @@ def make_text_png_uri(lines: list[str], scale: int = 6, padding: int = 12, line_
     normalized = [line.upper() for line in lines]
     max_chars = max((len(line) for line in normalized), default=1)
     width = padding * 2 + max_chars * (cols_per_char + char_gap) * scale
-    height = padding * 2 + len(normalized) * rows_per_char * scale + max(0, len(normalized) - 1) * line_gap
+    height = (
+        padding * 2
+        + len(normalized) * rows_per_char * scale
+        + max(0, len(normalized) - 1) * line_gap
+    )
 
     canvas = bytearray([255] * (width * height * 3))
 
     def put_pixel(x: int, y: int, value: int):
         idx = (y * width + x) * 3
-        canvas[idx:idx + 3] = bytes((value, value, value))
+        canvas[idx : idx + 3] = bytes((value, value, value))
 
     for line_idx, line in enumerate(normalized):
         y0 = padding + line_idx * (rows_per_char * scale + line_gap)
@@ -583,15 +599,17 @@ def make_text_png_uri(lines: list[str], scale: int = 6, padding: int = 12, line_
     raw_rows = []
     stride = width * 3
     for y in range(height):
-        raw_rows.append(b"\x00" + bytes(canvas[y * stride:(y + 1) * stride]))
+        raw_rows.append(b"\x00" + bytes(canvas[y * stride : (y + 1) * stride]))
     raw = b"".join(raw_rows)
     ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    png = b"".join([
-        b"\x89PNG\r\n\x1a\n",
-        chunk(b"IHDR", ihdr),
-        chunk(b"IDAT", zlib.compress(raw)),
-        chunk(b"IEND", b""),
-    ])
+    png = b"".join(
+        [
+            b"\x89PNG\r\n\x1a\n",
+            chunk(b"IHDR", ihdr),
+            chunk(b"IDAT", zlib.compress(raw)),
+            chunk(b"IEND", b""),
+        ]
+    )
     return f"data:image/png;base64,{base64.b64encode(png).decode()}"
 
 
@@ -656,7 +674,17 @@ def make_spoken_wav_uri(text: str, sample_rate: int = 48000) -> str:
             stderr=subprocess.DEVNULL,
         )
         subprocess.run(
-            ["afconvert", "-f", "WAVE", "-d", f"LEI16@{sample_rate}", "-c", "1", aiff_path, wav_path],
+            [
+                "afconvert",
+                "-f",
+                "WAVE",
+                "-d",
+                f"LEI16@{sample_rate}",
+                "-c",
+                "1",
+                aiff_path,
+                wav_path,
+            ],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

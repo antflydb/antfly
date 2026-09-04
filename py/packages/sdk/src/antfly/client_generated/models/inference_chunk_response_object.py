@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceChunkResponseObject(str, Enum):
+class InferenceChunkResponseObject(StrEnum):
     LIST = "list"
 
     def __str__(self) -> str:

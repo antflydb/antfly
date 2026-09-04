@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InvokeInferenceConnectionOperation(str, Enum):
+class InvokeInferenceConnectionOperation(StrEnum):
     CHUNK = "chunk"
     EMBED = "embed"
     EXTRACT = "extract"

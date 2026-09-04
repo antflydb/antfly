@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphBindingsResultKind(str, Enum):
+class GraphBindingsResultKind(StrEnum):
     BINDINGS = "bindings"
 
     def __str__(self) -> str:
