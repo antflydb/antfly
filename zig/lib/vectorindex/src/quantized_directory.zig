@@ -30,7 +30,10 @@ const magic: [4]u8 = "AFQD".*;
 const version: u16 = 1;
 const header_size: usize = 64;
 const entry_header_size: usize = 32;
-const index_entry_size: usize = 20;
+// The compact index is authenticated eagerly and remains resident. Keep the
+// two serving costs here so routing can charge exactly the selected postings
+// without touching one large payload page per leaf.
+const index_entry_size: usize = 36;
 const entry_alignment: usize = 64;
 const entry_flag_member_ids: u32 = 1 << 0;
 const entry_flag_projection_plane: u32 = 1 << 1;
@@ -55,11 +58,39 @@ pub const AdmissionStats = struct {
     pub fn observeFallbackLeaf(self: *AdmissionStats, count: usize, dims: usize) void {
         const vectors: u64 = @intCast(count);
         const scan_bytes = vectors *| @as(u64, @intCast(dims)) *| @sizeOf(f32);
-        self.max_leaf_vectors = @max(self.max_leaf_vectors, vectors);
-        self.max_unfiltered_scan_bytes = @max(self.max_unfiltered_scan_bytes, scan_bytes);
-        self.max_filtered_scan_bytes = @max(self.max_filtered_scan_bytes, scan_bytes);
+        self.observeLeaf(count, .{ .unfiltered = scan_bytes, .filtered = scan_bytes });
+    }
+
+    pub fn observeLeaf(self: *AdmissionStats, count: usize, scan_bytes: ScanBytes) void {
+        self.max_leaf_vectors = @max(self.max_leaf_vectors, @as(u64, @intCast(count)));
+        self.max_unfiltered_scan_bytes = @max(self.max_unfiltered_scan_bytes, scan_bytes.unfiltered);
+        self.max_filtered_scan_bytes = @max(self.max_filtered_scan_bytes, scan_bytes.filtered);
     }
 };
+
+pub const ScanBytes = struct {
+    unfiltered: u64 = 0,
+    filtered: u64 = 0,
+};
+
+fn leafScanBytes(
+    count: usize,
+    width: usize,
+    dims: usize,
+    has_members: bool,
+    has_projections: bool,
+) ScanBytes {
+    if (!has_members) return .{};
+    const vectors: u64 = @intCast(count);
+    const quantized = vectors *| @as(u64, @intCast(width)) *| @sizeOf(u64);
+    return .{
+        .unfiltered = quantized,
+        .filtered = if (has_projections)
+            vectors *| @as(u64, @intCast(dims)) *| @sizeOf(f16)
+        else
+            quantized,
+    };
+}
 
 fn encodeAdmissionStats(header: *[header_size]u8, stats: AdmissionStats) void {
     writeU64(header, 32, stats.max_leaf_vectors);
@@ -142,6 +173,7 @@ pub const Writer = struct {
     out: std.ArrayListUnmanaged(u8) = .empty,
     posting_ids: std.ArrayListUnmanaged(u64) = .empty,
     offsets: std.ArrayListUnmanaged(u64) = .empty,
+    scan_bytes: std.ArrayListUnmanaged(ScanBytes) = .empty,
     admission_stats: AdmissionStats = .{},
     finished: bool = false,
 
@@ -157,6 +189,7 @@ pub const Writer = struct {
         self.out.deinit(self.alloc);
         self.posting_ids.deinit(self.alloc);
         self.offsets.deinit(self.alloc);
+        self.scan_bytes.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -232,17 +265,19 @@ pub const Writer = struct {
             if (posting_id <= previous) return error.UnsortedQuantizedDirectory;
         }
 
+        const serving_bytes = leafScanBytes(
+            count,
+            width,
+            self.dims,
+            member_id_bytes.len != 0,
+            projections.len != 0,
+        );
         if (member_id_bytes.len != 0) {
             const vectors: u64 = @intCast(count);
-            const quantized_bytes = vectors *| @as(u64, @intCast(width)) *| @sizeOf(u64);
-            const filtered_bytes = if (projections.len != 0)
-                vectors *| @as(u64, @intCast(self.dims)) *| @sizeOf(f16)
-            else
-                quantized_bytes;
             self.admission_stats.merge(.{
                 .max_leaf_vectors = vectors,
-                .max_unfiltered_scan_bytes = quantized_bytes,
-                .max_filtered_scan_bytes = filtered_bytes,
+                .max_unfiltered_scan_bytes = serving_bytes.unfiltered,
+                .max_filtered_scan_bytes = serving_bytes.filtered,
             });
         }
 
@@ -252,6 +287,8 @@ pub const Writer = struct {
         errdefer _ = self.posting_ids.pop();
         try self.offsets.append(self.alloc, @intCast(entry_offset));
         errdefer _ = self.offsets.pop();
+        try self.scan_bytes.append(self.alloc, serving_bytes);
+        errdefer _ = self.scan_bytes.pop();
         try appendZeros(self.alloc, &self.out, entry_header_size);
         writeU64(self.out.items, entry_offset, posting_id);
         writeU32(self.out.items, entry_offset + 8, @intCast(count));
@@ -313,7 +350,7 @@ pub const Writer = struct {
         self.finished = true;
         try alignOutput(self.alloc, &self.out, entry_alignment);
         const index_offset = self.out.items.len;
-        for (self.posting_ids.items, self.offsets.items, 0..) |posting_id, offset, index| {
+        for (self.posting_ids.items, self.offsets.items, self.scan_bytes.items, 0..) |posting_id, offset, serving_bytes, index| {
             const end = if (index + 1 < self.offsets.items.len) self.offsets.items[index + 1] else @as(u64, @intCast(index_offset));
             const start_usize: usize = @intCast(offset);
             const end_usize: usize = @intCast(end);
@@ -322,6 +359,8 @@ pub const Writer = struct {
             writeU64(self.out.items, start, posting_id);
             writeU64(self.out.items, start + 8, offset);
             writeU32(self.out.items, start + 16, std.hash.Crc32.hash(self.out.items[start_usize..end_usize]));
+            writeU64(self.out.items, start + 20, serving_bytes.unfiltered);
+            writeU64(self.out.items, start + 28, serving_bytes.filtered);
         }
         @memcpy(self.out.items[0..4], &magic);
         writeU16(self.out.items, 4, version);
@@ -349,6 +388,7 @@ pub const StreamingWriter = struct {
     posting_ids: std.ArrayListUnmanaged(u64) = .empty,
     offsets: std.ArrayListUnmanaged(u64) = .empty,
     checksums: std.ArrayListUnmanaged(u32) = .empty,
+    scan_bytes: std.ArrayListUnmanaged(ScanBytes) = .empty,
     admission_stats: AdmissionStats = .{},
     active_crc: ?std.hash.Crc32 = null,
     finished: bool = false,
@@ -379,6 +419,7 @@ pub const StreamingWriter = struct {
         self.posting_ids.deinit(self.alloc);
         self.offsets.deinit(self.alloc);
         self.checksums.deinit(self.alloc);
+        self.scan_bytes.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -438,20 +479,24 @@ pub const StreamingWriter = struct {
             if (posting_id <= previous) return error.UnsortedQuantizedDirectory;
         }
 
+        const serving_bytes = leafScanBytes(
+            count,
+            width,
+            self.dims,
+            member_id_bytes.len != 0,
+            projections.len != 0,
+        );
         if (member_id_bytes.len != 0) {
             const vectors: u64 = @intCast(count);
-            const quantized_bytes = vectors *| @as(u64, @intCast(width)) *| @sizeOf(u64);
-            const filtered_bytes = if (projections.len != 0)
-                vectors *| @as(u64, @intCast(self.dims)) *| @sizeOf(f16)
-            else
-                quantized_bytes;
             self.admission_stats.merge(.{
                 .max_leaf_vectors = vectors,
-                .max_unfiltered_scan_bytes = quantized_bytes,
-                .max_filtered_scan_bytes = filtered_bytes,
+                .max_unfiltered_scan_bytes = serving_bytes.unfiltered,
+                .max_filtered_scan_bytes = serving_bytes.filtered,
             });
         }
 
+        try self.scan_bytes.append(self.alloc, serving_bytes);
+        errdefer _ = self.scan_bytes.pop();
         try self.beginEntry(sink, posting_id);
         var header: [entry_header_size]u8 = @splat(0);
         writeU64(&header, 0, posting_id);
@@ -510,11 +555,13 @@ pub const StreamingWriter = struct {
         try self.finishActiveEntry(sink);
         const index_offset = sink.len() - self.base_offset;
         var index_crc = std.hash.Crc32.init();
-        for (self.posting_ids.items, self.offsets.items, self.checksums.items) |posting_id, offset, checksum| {
+        for (self.posting_ids.items, self.offsets.items, self.checksums.items, self.scan_bytes.items) |posting_id, offset, checksum, serving_bytes| {
             var encoded: [index_entry_size]u8 = undefined;
             writeU64(&encoded, 0, posting_id);
             writeU64(&encoded, 8, offset);
             writeU32(&encoded, 16, checksum);
+            writeU64(&encoded, 20, serving_bytes.unfiltered);
+            writeU64(&encoded, 28, serving_bytes.filtered);
             try sink.appendSlice(&encoded);
             index_crc.update(&encoded);
         }
@@ -690,6 +737,14 @@ pub const Reader = struct {
         return readU32(self.data, self.index_offset + index * index_entry_size + 16);
     }
 
+    fn indexScanBytes(self: Reader, index: usize) ScanBytes {
+        const cursor = self.index_offset + index * index_entry_size;
+        return .{
+            .unfiltered = readU64(self.data, cursor + 20),
+            .filtered = readU64(self.data, cursor + 28),
+        };
+    }
+
     fn findIndex(self: Reader, posting_id: u64) ?usize {
         var low: usize = 0;
         var high = self.posting_count;
@@ -713,6 +768,15 @@ pub const Reader = struct {
     pub fn get(self: Reader, posting_id: u64) !?View {
         const index = self.findIndex(posting_id) orelse return null;
         return try self.viewAt(index);
+    }
+
+    /// Exact authenticated bandwidth charge for one immutable leaf. This
+    /// consults only the eagerly verified compact index and therefore does not
+    /// fault, checksum, or decode the posting payload before admission.
+    pub fn scanBytes(self: Reader, posting_id: u64, filtered: bool) ?u64 {
+        const index = self.findIndex(posting_id) orelse return null;
+        const bytes = self.indexScanBytes(index);
+        return if (filtered) bytes.filtered else bytes.unfiltered;
     }
 
     fn viewAt(self: Reader, index: usize) !View {
@@ -890,6 +954,10 @@ pub const VerifiedReader = struct {
         return self.reader.admissionStats();
     }
 
+    pub fn scanBytes(self: *const VerifiedReader, posting_id: u64, filtered: bool) ?u64 {
+        return self.reader.scanBytes(posting_id, filtered);
+    }
+
     /// Returns the exact independently checksummed entry range. Maintenance
     /// can use this with a private cold reader instead of faulting a complete
     /// corpus-sized query mmap while rewriting a generation.
@@ -959,6 +1027,9 @@ pub const VerifiedReader = struct {
         writeU64(encoded, index_offset, posting_id);
         writeU64(encoded, index_offset + 8, @intCast(entry_offset));
         writeU32(encoded, index_offset + 16, self.reader.indexChecksum(index));
+        const serving_bytes = self.reader.indexScanBytes(index);
+        writeU64(encoded, index_offset + 20, serving_bytes.unfiltered);
+        writeU64(encoded, index_offset + 28, serving_bytes.filtered);
         writeU32(encoded, 12, std.hash.Crc32.hash(encoded[index_offset..]));
         encodeAdmissionStats(encoded[0..header_size], self.reader.admission_stats);
 
@@ -1066,6 +1137,10 @@ test "streaming quantized directory is byte-compatible with buffered writer" {
         .max_unfiltered_scan_bytes = 16,
         .max_filtered_scan_bytes = 12,
     }, verified.admissionStats());
+    try std.testing.expectEqual(@as(?u64, 16), verified.scanBytes(7, false));
+    try std.testing.expectEqual(@as(?u64, 12), verified.scanBytes(7, true));
+    try std.testing.expectEqual(@as(?u64, 0), verified.scanBytes(11, false));
+    try std.testing.expectEqual(@as(?u64, null), verified.scanBytes(99, false));
     const view = (try verified.get(7)).?;
     try std.testing.expectEqualSlices(u64, &member_ids, view.member_ids);
     const locations = view.projections.?.residual_locations.?;

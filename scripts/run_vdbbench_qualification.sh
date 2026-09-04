@@ -14,6 +14,10 @@ usage() {
   echo "  --query-seconds N        Seconds per query concurrency" >&2
   echo "  --memory-budget-mb N     Explicit Antfly process envelope" >&2
   echo "  --profile-count N        Detailed public-API query count" >&2
+  echo "  --mixed-seconds N        Concurrent public query/update duration (0 disables)" >&2
+  echo "  --mixed-query-workers N  Public query workers during mixed qualification" >&2
+  echo "  --mixed-write-workers N  Public batch writers during mixed qualification" >&2
+  echo "  --mixed-write-batch N    Same-vector update rows per public batch" >&2
   echo "  --profile-dataset PATH   Dataset directory for detailed profiling" >&2
   echo "  --search-effort FLOAT    Public ANN effort in the inclusive range 0..1" >&2
   echo "  --native-hbc             Enable the HBC native posting WAL/segment store" >&2
@@ -42,6 +46,7 @@ usage() {
   echo "  VDBBENCH_QUERY_SECONDS Seconds per concurrency (default: 30)" >&2
   echo "  VDBBENCH_PROCESS_MEMORY_BUDGET_MB Explicit Antfly process envelope (default: auto)" >&2
   echo "  VDBBENCH_PROFILE_COUNT Detailed public-API queries after the warm run (default: 1000; 0 disables)" >&2
+  echo "  VDBBENCH_MIXED_SECONDS Concurrent query/update qualification duration (default: 0)" >&2
   echo "  VDBBENCH_PROFILE_DATASET Dataset directory for detailed profiling (default: inferred from case)" >&2
   echo "  VDBBENCH_VECTOR_BLOCKS Build/use the shared mmap exact-vector projection (default: 0)" >&2
   echo "  VDBBENCH_VECTOR_BLOCK_ENCODING Exact projection encoding (default: float16)" >&2
@@ -72,6 +77,10 @@ query_concurrency=${VDBBENCH_CONCURRENCY:-1,5,10,20,30}
 query_seconds=${VDBBENCH_QUERY_SECONDS:-30}
 process_memory_budget_mb=${VDBBENCH_PROCESS_MEMORY_BUDGET_MB:-}
 profile_count=${VDBBENCH_PROFILE_COUNT:-1000}
+mixed_seconds=${VDBBENCH_MIXED_SECONDS:-0}
+mixed_query_workers=${VDBBENCH_MIXED_QUERY_WORKERS:-10}
+mixed_write_workers=${VDBBENCH_MIXED_WRITE_WORKERS:-4}
+mixed_write_batch=${VDBBENCH_MIXED_WRITE_BATCH:-100}
 dataset_root=${DATASET_LOCAL_DIR:-/private/tmp/vdbbench-dataset}
 profile_dataset=${VDBBENCH_PROFILE_DATASET:-}
 search_effort=${VDBBENCH_SEARCH_EFFORT:-}
@@ -103,6 +112,10 @@ while [[ $# -gt 0 ]]; do
     --query-seconds) [[ $# -ge 2 ]] || usage; query_seconds=$2; shift 2 ;;
     --memory-budget-mb) [[ $# -ge 2 ]] || usage; process_memory_budget_mb=$2; shift 2 ;;
     --profile-count) [[ $# -ge 2 ]] || usage; profile_count=$2; shift 2 ;;
+    --mixed-seconds) [[ $# -ge 2 ]] || usage; mixed_seconds=$2; shift 2 ;;
+    --mixed-query-workers) [[ $# -ge 2 ]] || usage; mixed_query_workers=$2; shift 2 ;;
+    --mixed-write-workers) [[ $# -ge 2 ]] || usage; mixed_write_workers=$2; shift 2 ;;
+    --mixed-write-batch) [[ $# -ge 2 ]] || usage; mixed_write_batch=$2; shift 2 ;;
     --profile-dataset) [[ $# -ge 2 ]] || usage; profile_dataset=$2; shift 2 ;;
     --search-effort) [[ $# -ge 2 ]] || usage; search_effort=$2; shift 2 ;;
     --native-hbc) native_hbc=1; shift ;;
@@ -191,6 +204,16 @@ if [[ ! "$profile_count" =~ ^[0-9]+$ ]]; then
   echo "VDBBENCH_PROFILE_COUNT must be a non-negative integer" >&2
   exit 2
 fi
+if [[ ! "$mixed_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "VDBBENCH_MIXED_SECONDS must be a non-negative number" >&2
+  exit 2
+fi
+for positive_mixed_value in "$mixed_query_workers" "$mixed_write_workers" "$mixed_write_batch"; do
+  if [[ ! "$positive_mixed_value" =~ ^[1-9][0-9]*$ ]]; then
+    echo "mixed worker counts and batch size must be positive integers" >&2
+    exit 2
+  fi
+done
 if [[ -n "$search_effort" ]] && ! python3 - "$search_effort" <<'PY'
 import math
 import sys
@@ -624,6 +647,30 @@ run_public_profile() {
   mark_phase "public_profile${suffix}_end"
 }
 
+run_mixed_profile() {
+  local suffix=$1
+  if [[ "$mixed_seconds" == "0" || "$mixed_seconds" == "0.0" ]]; then
+    return
+  fi
+  if [[ ! -f "$profile_dataset/test.parquet" ||
+        ! -f "$profile_dataset/neighbors.parquet" ||
+        ! -f "$profile_dataset/shuffle_train.parquet" ]]; then
+    echo "mixed profile dataset is incomplete: $profile_dataset" >&2
+    exit 2
+  fi
+  mark_phase "mixed_profile${suffix}_start"
+  "$vdbbench_python" "$script_dir/profile_vdbbench_mixed_public_workload.py" \
+    --dataset "$profile_dataset" \
+    --port "$port" \
+    --seconds "$mixed_seconds" \
+    --query-workers "$mixed_query_workers" \
+    --write-workers "$mixed_write_workers" \
+    --write-batch "$mixed_write_batch" \
+    --output "$run_root/public-mixed-profile${suffix}.json" \
+    >"$run_root/public-mixed-profile${suffix}.log" 2>&1
+  mark_phase "mixed_profile${suffix}_end"
+}
+
 capture_footprint_once() {
   local out=$1
   local timeline=$2
@@ -783,6 +830,7 @@ if [[ "$resume_after_live" == "1" ]]; then
       mark_phase reopened_concurrent_query_end
     fi
   fi
+  run_mixed_profile "$label_suffix"
   run_public_profile "$label_suffix"
   curl -fsS "http://127.0.0.1:$health_port/metrics" >"$run_root/metrics-after-restart${label_suffix}.txt"
   curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench/indexes/vec" >"$run_root/index-after-restart${label_suffix}.json"
@@ -810,6 +858,7 @@ run_vdbbench "$live_label" --drop-old --load --search-concurrent --search-serial
   >"$run_root/vdbbench-live.log" 2>&1
 validate_vdbbench_result "$live_label" "$expected_docs" 1
 mark_phase live_load_and_query_end
+run_mixed_profile ""
 curl -fsS "http://127.0.0.1:$health_port/metrics" >"$run_root/metrics-before-restart.txt"
 curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench" >"$run_root/table-before-restart.json"
 curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench/indexes/vec" >"$run_root/index-before-restart.json"

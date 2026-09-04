@@ -4541,45 +4541,192 @@ is now version 1; numeric revisions 1--5 from earlier commits on this unreleased
 branch are intentionally unsupported, while released legacy-index migration
 remains governed by the separate public index lifecycle.
 
+#### Search-view/MVCC qualification and mixed-workload baseline
+
+The long-term publication work now gives every search a single immutable view
+of the posting generation, publication identity, routing identity, and
+storage/WAL bounds. Posting mutations publish append-only MVCC delta
+generations; unchanged posting blobs and unchanged exact centroid-directory
+blocks are retained rather than copied. Consolidation is bounded by delta
+depth and bytes, and can collapse reader-free generations without duplicating
+their payloads. Empty native generations bypass scan admission. Checkpoint
+workers and their lifecycle tests use `std.Io`, with index shutdown ordered
+before runtime shutdown and bounded observation deadlines.
+
+The public API now also returns the source request identity captured under the
+database search lease. Adapters no longer sample that identity independently
+before entering the database, eliminating false retries when publication
+advances between the two samples. This is part of the query linearization
+contract rather than a benchmark accommodation.
+
+The final fresh 50K qualification reached ready in 29.9782 seconds (19.6440
+seconds insert plus 10.3342 seconds catch-up), with 0.9856 official recall and
+239.9/986.6/1080.8/1147.1 QPS at concurrency 1/10/20/30. Corresponding p95
+latencies were 4.77/17.85/41.64/67.91 ms. A detailed 1,000-query warm profile
+reported 3.176-ms mean server latency, 23,959 approximate scores and 137.4
+authoritative completions per query. Read-only cache-inclusive peak RSS was
+1.733 GB and restart RSS was 337 MB.
+
+This 50K result is in the desired 30-second load class and improves all four
+throughput points over the immediately preceding governed sample
+(225/930/1017/1029 QPS). It is not a new absolute serving or RSS record: the
+best earlier samples reached approximately 294/1080/1192/1319 QPS with a
+1.52-GB live RSS peak, while the lowest recent governed RSS sample was 1.103
+GB. The current result therefore qualifies the correctness architecture and
+load target, but does not supersede every isolated 50K high-water mark.
+
+The final fresh 1M qualification reached ready in 767.8569 seconds (699.0891
+seconds insert plus 68.7678 seconds catch-up) and retained 0.9902 official
+recall. Its first live concurrency curve was invalid for performance comparison
+because two unrelated Zig compiler processes each consumed roughly one CPU and
+4.5 GB of RSS. After those processes exited, a restarted concurrency-only
+repeat produced 59.0/596.1/642.4/577.2 QPS. A separate detailed warm profile
+reported 9.733-ms mean server latency, 240,404 approximate scores and 146.5
+authoritative completions per query, with 0.9927 recall. Read-only
+cache-inclusive peak RSS was 5.064 GB; a repeated restart peaked at 2.245 GB.
+
+The 1M result is only partially on par with the best experiments. Relative to
+the best post-r126 result, readiness is 24.4 percent slower (767.9 versus 617.4
+seconds), concurrency-20/30 throughput is approximately 19/30 percent lower
+(642/577 versus 794/828 QPS), and mean warm server time is 9.8 percent higher
+(9.73 versus 8.86 ms). It is close to r126 at concurrency 1 and 10 and preserves
+recall parity, while improving read-only peak RSS by 11.7 percent from r126's
+5.73 GB and by 28.2 percent from the post-r126 7.05-GB sample. This is a
+memory/correctness win, not yet the overall performance winner.
+
+Admission telemetry explains much of the high-concurrency gap. Concurrency 10
+incurred no admission waits and reached 596 QPS. At concurrency 20 and 30, the
+402.65-MB node budget admitted at most 12 searches and queued as many as 18.
+The current conservative estimate charges roughly 33.5 MB per request by
+multiplying the generation-wide maximum leaf size across the search width,
+although the measured mean query scans about 240K candidates (roughly 23 MB of
+RaBitQ codes). The next durable step is two-stage admission: acquire a small
+routing permit, retain a compact immutable search-view token plus selected leaf
+IDs, calculate the exact selected scan bytes, then acquire a scan permit before
+allocating large scratch or entering the scan. Allocation capacity and memory-
+bandwidth concurrency should be governed separately. This preserves the
+worst-case memory invariant without throttling balanced generations according
+to an impossible maximum-leaf-times-all-leaves product.
+
+The new mixed public workload rewrites existing vectors under stable document
+IDs while query workers run, so exact ground truth remains valid. At 50K,
+10 query and four write workers sustained 121.8 QPS and 619 rows/s with 0.9740
+recall; the post-write catch-up took 2.52 seconds and mixed peak RSS was 3.552
+GB. At 1M they sustained 63.4 QPS and 330 rows/s with 0.9901 recall; catch-up
+took 101.3 seconds and mixed peak RSS was 5.403 GB. Neither run produced a
+request, capture, publication, or final-readiness error. These mixed RSS values
+are deliberately reported separately from read-only serving RSS and are the
+baseline for future ingest/query improvements, not evidence of a read-only
+regression.
+
+#### Route-first exact admission and dirty-leaf qualification
+
+Native flat search now retains its immutable `SearchView`, routes before it
+acquires scan bandwidth, sums authenticated physical costs for only the
+selected postings, and then admits the candidate scan. The AFQD compact index
+stores filtered and unfiltered costs beside each posting offset and checksum,
+so this accounting does not fault or decode the corpus-sized payload before
+admission. Empty and tree-fallback paths preserve their established behavior.
+
+The first fresh 50K run with this protocol reached ready in 30.9174 seconds
+(20.6682 seconds insert plus 10.2493 seconds catch-up), retained 0.9862 recall,
+and produced 224.9/874.2/954.8/975.8 QPS at concurrency 1/10/20/30. Its p95
+latencies were 5.06/24.23/68.88/82.47 ms. An unrelated Debug aggregate was
+running on the same host, so this curve proves correctness and removal of the
+old admission ceiling rather than establishing a new uncontended high-water
+mark. Detailed warm serving averaged 3.724 ms in the server and completed only
+137.4 authoritative vectors per query.
+
+That run also exposed an MVCC edge: the first dirty posting lacked a compact
+per-leaf cost and therefore inherited the generation-wide maximum. One mixed
+query could be charged 214.70 MB despite touching ordinary leaves. Every
+published delta now carries exact scalar scan costs for each changed leaf;
+activation reconstructs the same map from immutable segments and the committed
+WAL. Overlay consolidation merges those scalars newest-first without copying
+posting payloads. The global maximum remains only a fail-safe for missing or
+corrupt metadata.
+
+On the already-dirty 50K corpus, the corrected run admitted all ten query
+workers in 67.09 MB with zero waits. Relative to the faulty run, mixed server
+p95 fell from 80.63 to 39.72 ms and successful write throughput rose from
+568.1 to 1,057.2 rows/s; recall remained within normal mixed-update variance
+(0.9739 versus 0.9768). This directly qualifies dirty-leaf accounting rather
+than merely the immutable base.
+
+A fresh 1M lifecycle preserved insertion time at 697.44 seconds and reached
+ready in 800.21 seconds, with 0.9922 recall. It produced
+83.1/557.7/602.3/609.4 QPS and 14.67/29.91/74.61/92.59-ms p95 at concurrency
+1/10/20/30 on the still-contended host. Exact routing admitted up to 17
+simultaneous scans, versus 12 under maximum-leaf accounting, and charged
+395.34 MB of the 402.65-MB node budget at peak. The 6.33-GB cache-inclusive
+RSS maximum occurred during final publication, about 71 seconds before query
+serving began, so it is a publication/primary-store target rather than query
+scratch demand.
+
+The 1M mixed phase is not qualified. Both the initial process and a clean
+restart reproduced four synchronized 30-second public write timeouts. On the
+restart, all ten queries fit in 234.02 MB with zero admission waits and dense
+catch-up finished each publication in at most 354 ms, yet cache-inclusive RSS
+rose to 6.27 GB. Successful traffic reached 99.3 query QPS at 0.9899 recall and
+363.9 write rows/s, with 29.19-ms mean and 37.84-ms p95 server query latency.
+This isolates a separate primary-store/request scheduling or residency problem;
+it must not be hidden by increasing the client timeout or described as an
+admission failure.
+
 ## Next checks
 
-1. Narrow broad persisted L0 source ranges with adaptive, workload-independent
+1. Diagnose the reproducible 1M mixed-write timeout below the public request
+   boundary. Attribute time and retained pages across the primary write/WAL,
+   source mutation capture, centroid refresh, and request executor. Preserve
+   the now-qualified exact admission accounting; do not raise timeouts or scan
+   capacity to obscure the stall.
+2. Separate allocation-byte admission from memory-bandwidth task admission.
+   Exact selected-block bandwidth is now implemented for clean and dirty native
+   generations. Add an independently measured scratch/allocation permit and
+   tune task concurrency from globally observed service time/queue pressure so
+   high-concurrency throughput cannot buy an unbounded RSS increase.
+3. Profile the 1M insertion delta versus r126, including source LSM pressure,
+   posting drain cadence, WAL fsync, staged-generation writes, and final
+   publication. One full checkpoint first returned `Unsupported` at sequence
+   7975 and succeeded at sequence 8073; reject unsupported work before staging
+   it so retries cannot consume load-path bandwidth.
+4. Narrow broad persisted L0 source ranges with adaptive, workload-independent
    range slices, then pair them with a lower soft compaction-input budget.
    Merely splitting leveled output files does not split the fixed-point overlap
    closure. Preserve the oversized progress escape for a minimum indivisible
    closure and verify that the extra L0 runs do not amplify write pressure.
-2. Design bounded or incrementally publishable HBC leaf normalization inside a
+5. Design bounded or incrementally publishable HBC leaf normalization inside a
    single replay transaction. Smaller replay windows and naïve internal apply
    chunks both regressed 50K throughput, so preserve source-write ordering,
    rollback semantics, and replay amortization.
-3. Focus remaining snapshot-copy work on current scans, which accounted for
+6. Focus remaining snapshot-copy work on current scans, which accounted for
    127.6 MB of the 150.7 MB live aggregate in the external-admission run;
    bound-read copies were 23.1 MB. Do not replace multi-operation snapshots
    with unsafe live probes merely to improve a cumulative counter.
-4. Repeat the final 128-shard/64-KiB-buffer float16 50K and 1M lifecycle three
+7. Repeat the final 128-shard/64-KiB-buffer float16 50K and 1M lifecycle three
    times through the post-phase-sampled, read-only-restart harness on a
    controlled host and publish mean plus range. The uninterrupted r125 result
    now qualifies correctness and the 3.860 GB RSS bound; repetition is for
    variance and precise throughput attribution, not to complete the lifecycle.
-5. Add deterministic fault injection at every posting-WAL append, fsync,
+8. Add deterministic fault injection at every posting-WAL append, fsync,
    checkpoint staging, `CURRENT` replacement, overlay allocation, and applied
    watermark boundary. The production ordering and fail-closed recovery paths
    now exist; exhaustive crash-matrix automation remains the release gate.
-6. Add the public catalog/API lifecycle for promoting index-managed immutable
+9. Add the public catalog/API lifecycle for promoting index-managed immutable
    source artifacts to shared artifacts, with generation-fenced references,
    compatibility validation, and deletion-safe reference accounting. Do not
    share index-specific HBC topology/posting generations.
-7. Reduce the remaining primary document/artifact contention. The final 1M
+10. Reduce the remaining primary document/artifact contention. The final 1M
    load still accumulated 3.565 GB of mutable snapshot copies and 1.936 GB of
    read-snapshot rotations. Attribute those copies by reader class and compare
    four public workers against a current serial control before changing the
    benchmark's concurrency.
-8. Reduce the native posting chain's 448 MB disk footprint and query-time mmap
+11. Reduce the native posting chain's 448 MB disk footprint and query-time mmap
    residency without weakening `covered_source_sequence`, atomic CURRENT
    publication, generation leases, or boundary rerank. Prefer indexed
    patch-native/chunked-copy-on-write deltas and measure recovery time as well
    as bytes.
-9. Optimize the exact flat centroid scan itself—SIMD/block layout, cache
+12. Optimize the exact flat centroid scan itself—SIMD/block layout, cache
    residency, and bounded parallel scoring—while keeping the demonstrated
    0.990 recall. RaBitQ routing's 1.55-percentage-point loss is outside the
    parity budget and must not become the default merely for latency.

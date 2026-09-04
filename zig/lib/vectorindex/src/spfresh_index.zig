@@ -73,6 +73,30 @@ pub const FlatCentroidBackingLease = struct {
     }
 };
 
+const RetainedFlatCentroidDirectory = struct {
+    alloc: std.mem.Allocator,
+    directory: *FlatCentroidDirectory,
+
+    fn releaseOpaque(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const alloc = self.alloc;
+        self.directory.release(alloc);
+        alloc.destroy(self);
+    }
+};
+
+/// Retains an immutable directory as backing for a newer layered directory.
+/// Ownership of the returned lease transfers to the caller.
+pub fn retainFlatCentroidDirectoryBacking(
+    alloc: std.mem.Allocator,
+    directory: *FlatCentroidDirectory,
+) !FlatCentroidBackingLease {
+    const backing = try alloc.create(RetainedFlatCentroidDirectory);
+    directory.retain();
+    backing.* = .{ .alloc = alloc, .directory = directory };
+    return .{ .ptr = backing, .release_fn = RetainedFlatCentroidDirectory.releaseOpaque };
+}
+
 pub const FlatCentroidDirectory = struct {
     blocks: []FlatCentroidBlock = &.{},
     ref_count: std.atomic.Value(u32) = .init(1),
@@ -294,6 +318,95 @@ pub fn layeredExactFlatCentroidDirectoryFromReader(
     };
 }
 
+/// Layers current-generation centroid replacements over an already-built
+/// immutable parent directory. The parent remains zero-copy and retained;
+/// only changed centroids, block descriptors, and compact shadow masks are
+/// allocated. This is the online MVCC path between full native checkpoints.
+pub fn layeredExactFlatCentroidDirectoryFromDirectory(
+    alloc: std.mem.Allocator,
+    parent: *FlatCentroidDirectory,
+    overlay_value: OwnedExactCentroidOverlay,
+    shadowed_posting_ids: []u64,
+    root_node: u64,
+    node_count: u64,
+    publish_generation: u64,
+) !FlatCentroidDirectory {
+    var overlay = overlay_value;
+    var overlay_owned = true;
+    errdefer if (overlay_owned) overlay.deinit(alloc);
+    defer alloc.free(shadowed_posting_ids);
+    const dims = if (overlay.posting_ids.len == 0)
+        0
+    else
+        overlay.vectors.len / overlay.posting_ids.len;
+    if (overlay.posting_ids.len != overlay.covering_radii.len or
+        overlay.posting_ids.len != overlay.measures.len or
+        (overlay.posting_ids.len != 0 and
+            (dims == 0 or overlay.vectors.len != overlay.posting_ids.len * dims)))
+    {
+        return error.InvalidCentroidDirectory;
+    }
+
+    const bit_words_u64 = std.math.add(u64, node_count, 64) catch return error.OutOfMemory;
+    const bit_words = std.math.cast(usize, bit_words_u64 / 64) orelse return error.OutOfMemory;
+    const mask_words = std.math.mul(usize, bit_words, parent.blocks.len) catch return error.OutOfMemory;
+    const shadowed_masks = try alloc.alloc(u64, mask_words);
+    errdefer alloc.free(shadowed_masks);
+    @memset(shadowed_masks, 0);
+
+    const overlay_blocks: usize = @intFromBool(overlay.posting_ids.len != 0);
+    const blocks = try alloc.alloc(FlatCentroidBlock, parent.blocks.len + overlay_blocks);
+    errdefer alloc.free(blocks);
+    var block_index: usize = 0;
+    if (overlay.posting_ids.len != 0) {
+        blocks[0] = .{
+            .posting_ids = overlay.posting_ids,
+            .covering_radii = overlay.covering_radii,
+            .encoding = .{ .exact = .{
+                .vectors = overlay.vectors,
+                .measures = overlay.measures,
+            } },
+        };
+        overlay_owned = false;
+        block_index = 1;
+    } else {
+        overlay.deinit(alloc);
+        overlay_owned = false;
+    }
+
+    var visible_parent_postings: usize = 0;
+    for (parent.blocks, 0..) |parent_block, parent_index| {
+        const mask = shadowed_masks[parent_index * bit_words ..][0..bit_words];
+        if (parent_block.shadowed_posting_bits.len != 0) {
+            @memcpy(mask[0..@min(mask.len, parent_block.shadowed_posting_bits.len)], parent_block.shadowed_posting_bits[0..@min(mask.len, parent_block.shadowed_posting_bits.len)]);
+        }
+        for (shadowed_posting_ids) |posting_id| {
+            const word = std.math.cast(usize, posting_id / 64) orelse continue;
+            if (word < mask.len) mask[word] |= @as(u64, 1) << @intCast(posting_id % 64);
+        }
+        for (parent_block.posting_ids) |posting_id| {
+            visible_parent_postings += @intFromBool(!postingBitIsSet(mask, posting_id));
+        }
+        blocks[block_index] = parent_block;
+        blocks[block_index].owned = false;
+        blocks[block_index].shadowed_posting_bits = mask;
+        block_index += 1;
+    }
+
+    const backing = try retainFlatCentroidDirectoryBacking(alloc, parent);
+    return .{
+        .blocks = blocks,
+        .root_node_snapshot = root_node,
+        .node_count_snapshot = node_count,
+        .publish_generation_snapshot = publish_generation,
+        .posting_count = visible_parent_postings + overlay.posting_ids.len,
+        .owned_shadowed_posting_bits = shadowed_masks,
+        .backing = backing,
+        .missing_node_count = parent.missing_node_count,
+        .invalid_posting_count = parent.invalid_posting_count,
+    };
+}
+
 pub const FlatCentroidSelection = struct {
     /// Borrowed from the request scratch and valid until that handle is
     /// released. Keeping ownership with the governed scratch avoids an
@@ -317,6 +430,51 @@ test "approximate flat routing bounds request scratch while complete coverage re
     try std.testing.expectEqual(@as(usize, 2_064), flatSelectionLimit(.best_effort, 2_064, 8_878));
     try std.testing.expectEqual(@as(usize, 8_878), flatSelectionLimit(.complete_snapshot, 2_064, 8_878));
     try std.testing.expectEqual(@as(usize, 64), flatSelectionLimit(.best_effort, 2_064, 64));
+}
+
+test "exact flat routing layers changed centroids over a retained MVCC parent" {
+    const alloc = std.testing.allocator;
+    const parent = try alloc.create(FlatCentroidDirectory);
+    parent.* = .{
+        .blocks = try alloc.alloc(FlatCentroidBlock, 1),
+        .root_node_snapshot = 1,
+        .node_count_snapshot = 3,
+        .publish_generation_snapshot = 2,
+        .posting_count = 2,
+    };
+    parent.blocks[0] = .{
+        .posting_ids = try alloc.dupe(u64, &.{ 1, 2 }),
+        .covering_radii = try alloc.dupe(f32, &.{ 0.1, 0.2 }),
+        .encoding = .{ .exact = .{
+            .vectors = try alloc.dupe(f32, &.{ 1, 2 }),
+            .measures = try alloc.dupe(f32, &.{ 1, 4 }),
+        } },
+    };
+    defer parent.release(alloc);
+
+    var layered = try layeredExactFlatCentroidDirectoryFromDirectory(
+        alloc,
+        parent,
+        .{
+            .posting_ids = try alloc.dupe(u64, &.{ 2, 3 }),
+            .covering_radii = try alloc.dupe(f32, &.{ 0.25, 0.3 }),
+            .measures = try alloc.dupe(f32, &.{ 6.25, 9 }),
+            .vectors = try alloc.dupe(f32, &.{ 2.5, 3 }),
+        },
+        try alloc.dupe(u64, &.{2}),
+        1,
+        3,
+        4,
+    );
+    defer layered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), parent.ref_count.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), layered.blocks.len);
+    try std.testing.expectEqual(@as(usize, 3), layered.posting_count);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 3 }, layered.blocks[0].posting_ids);
+    try std.testing.expect(!postingBitIsSet(layered.blocks[1].shadowed_posting_bits, 1));
+    try std.testing.expect(postingBitIsSet(layered.blocks[1].shadowed_posting_bits, 2));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, layered.blocks[1].encoding.exact.vectors);
 }
 
 fn checkedAddMul(total: *u64, count: u64, element_size: u64) !void {
@@ -1164,23 +1322,41 @@ fn acquireFlatCentroidDirectory(
 ) !*FlatCentroidDirectory {
     const Index = comptime @TypeOf(self.*);
     while (true) {
-        // Complete callers retain the generation-bound transaction supplied by
-        // their snapshot. Best-effort callers open a fresh runtime transaction
-        // for the elected build owner below.
+        // Generation-bound callers retain the transaction supplied by their
+        // snapshot. Legacy callers without an immutable serving generation
+        // open a fresh runtime transaction for the elected build owner below.
         const snapshot = expected_snapshot orelse try loadStablePublishedSnapshot(self, cancellation);
+        const snapshot_is_current = expected_snapshot == null or snapshotStillPublished(self, snapshot);
+        const generation_cache = expected_snapshot != null and
+            comptime @hasDecl(Index, "acquireFlatCentroidDirectoryForTxn") and
+                @hasDecl(Index, "cacheFlatCentroidDirectoryForTxn");
+
+        if (generation_cache) {
+            if (self.acquireFlatCentroidDirectoryForTxn(
+                txn,
+                snapshot.root_node,
+                snapshot.node_count,
+                snapshot.publish_generation,
+            )) |directory| return directory;
+        }
 
         var stale: ?*FlatCentroidDirectory = null;
-        lockAtomicMutex(&self.flat_centroid_mu);
-        if (self.flat_centroid_directory) |directory| {
-            if (directoryMatches(directory, snapshot.root_node, snapshot.node_count, snapshot.publish_generation)) {
-                directory.retain();
-                self.flat_centroid_mu.unlock();
-                return directory;
+        if (!generation_cache) {
+            lockAtomicMutex(&self.flat_centroid_mu);
+            if (self.flat_centroid_directory) |directory| {
+                if (directoryMatches(directory, snapshot.root_node, snapshot.node_count, snapshot.publish_generation)) {
+                    directory.retain();
+                    self.flat_centroid_mu.unlock();
+                    return directory;
+                }
             }
+            self.flat_centroid_mu.unlock();
         }
-        self.flat_centroid_mu.unlock();
 
-        if (comptime @hasDecl(Index, "beginFlatCentroidDirectoryBuild")) {
+        // Publication epochs uniquely identify immutable native generations.
+        // Their generation-owned cache remains valid after CURRENT advances,
+        // so old and current queries can share the same build flight safely.
+        if ((snapshot_is_current or generation_cache) and comptime @hasDecl(Index, "beginFlatCentroidDirectoryBuild")) {
             switch (try self.beginFlatCentroidDirectoryBuild(snapshot.publish_generation, cancellation)) {
                 .owner => {},
                 .retry => continue,
@@ -1197,7 +1373,7 @@ fn acquireFlatCentroidDirectory(
                 },
             }
         }
-        var build_flight_open = comptime @hasDecl(Index, "finishFlatCentroidDirectoryBuild");
+        var build_flight_open = (snapshot_is_current or generation_cache) and comptime @hasDecl(Index, "finishFlatCentroidDirectoryBuild");
         var build_outcome: FlatCentroidBuildOutcome = .retry;
         defer if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, build_outcome);
         errdefer |err| build_outcome = flatCentroidBuildFailureOutcome(err);
@@ -1221,7 +1397,7 @@ fn acquireFlatCentroidDirectory(
         const built = try self.alloc.create(FlatCentroidDirectory);
         errdefer self.alloc.destroy(built);
         if (expected_snapshot != null) {
-            built.* = try buildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation, cancellation);
+            built.* = try loadOrBuildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation);
         } else if (comptime @hasDecl(Index, "beginRuntimeSearchTxn")) {
             var build_txn = try self.beginRuntimeSearchTxn();
             defer build_txn.abort();
@@ -1238,6 +1414,13 @@ fn acquireFlatCentroidDirectory(
                 self.releaseFlatCentroidDirectoryBuildBytes(build_reservation);
                 build_reservation_open = false;
             }
+        }
+
+        if (generation_cache) {
+            const cached = self.cacheFlatCentroidDirectoryForTxn(txn, built);
+            if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, .{ .ready = cached });
+            build_flight_open = false;
+            return cached;
         }
 
         if (expected_snapshot == null) {

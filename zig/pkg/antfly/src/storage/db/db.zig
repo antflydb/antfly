@@ -248,8 +248,19 @@ const db_query_result_shape = @import("query/result_shape.zig");
 const db_query_search = @import("query/search_exec.zig");
 
 pub const SearchWithDenseProfileResult = struct {
+    request: types.SearchRequest,
     result: types.SearchResult,
     dense_profile: ?db_query_search.DenseSearchProfile = null,
+};
+
+pub const SearchWithCapturedRequestResult = struct {
+    request: types.SearchRequest,
+    result: types.SearchResult,
+};
+
+pub const ProfiledDenseSearchWithCapturedRequestResult = struct {
+    request: types.SearchRequest,
+    profiled: db_query_search.ProfiledDenseSearchResult,
 };
 const dense_exact = @import("dense_exact.zig");
 const search_mod = @import("../../search/search.zig");
@@ -29195,9 +29206,22 @@ pub const DB = struct {
         var dense_profile: db_query_search.DenseSearchProfile = .{};
         const result = try self.searchLockedWithExecutionContextImpl(alloc, snapshot_req, .{}, true, &dense_profile);
         return .{
+            .request = snapshot_req,
             .result = result,
             .dense_profile = if (dense_profile.search_route.len > 0) dense_profile else null,
         };
+    }
+
+    /// Returns the identity generation captured after entering the DB search
+    /// lease together with the result produced under that lease. Public read
+    /// adapters must use this operation instead of sampling the generation and
+    /// then calling `search`, which leaves a writer race between the two calls.
+    pub fn searchWithCapturedRequest(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+    ) !SearchWithCapturedRequestResult {
+        return try self.searchWithCapturedRequestAndExecutionContext(alloc, req, .{});
     }
 
     pub fn searchWithExecutionContext(
@@ -29206,6 +29230,15 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
+        return (try self.searchWithCapturedRequestAndExecutionContext(alloc, req, exec_ctx)).result;
+    }
+
+    fn searchWithCapturedRequestAndExecutionContext(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        exec_ctx: types.ExecutionContext,
+    ) !SearchWithCapturedRequestResult {
         if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
         defer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
         const bench_profile = benchQueryProfileEnabled();
@@ -29229,7 +29262,7 @@ pub const DB = struct {
                 .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, search_access == .published },
             );
         }
-        return result;
+        return .{ .request = snapshot_req, .result = result };
     }
 
     fn searchLocked(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
@@ -30724,10 +30757,25 @@ pub const DB = struct {
     }
 
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
+        return (try self.searchDenseProfiledWithCapturedRequest(alloc, req, dense)).profiled;
+    }
+
+    /// Profiled counterpart to `searchWithCapturedRequest`; the request token
+    /// and dense result are created under one DB search lease.
+    pub fn searchDenseProfiledWithCapturedRequest(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        dense: types.DenseKnnQuery,
+    ) !ProfiledDenseSearchWithCapturedRequestResult {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         const search_access = self.beginDenseSearchAccess(req);
         defer self.endDenseSearchAccess(search_access);
-        return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
+        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+        return .{
+            .request = snapshot_req,
+            .profiled = try self.searchDenseProfiledAtSnapshot(alloc, snapshot_req, dense),
+        };
     }
 
     fn searchDenseProfiledAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
@@ -58393,6 +58441,14 @@ test "db search requests default to current identity generation snapshot" {
     const current_generation = db.core.nextDerivedSequence();
     const current = try db.searchRequestAtCurrentIdentityGeneration(.{});
     try std.testing.expectEqual(@as(?u64, db.core.nextDerivedSequence()), current.identity_read_generation);
+
+    var captured = try db.searchWithCapturedRequest(alloc, .{ .limit = 1 });
+    defer captured.result.deinit();
+    try std.testing.expectEqual(
+        @as(?u64, current_generation),
+        captured.request.identity_read_generation,
+    );
+    try std.testing.expectEqual(@as(u32, 1), captured.result.total_hits);
 
     const explicit = try db.searchRequestAtCurrentIdentityGeneration(.{ .identity_read_generation = current_generation });
     try std.testing.expectEqual(@as(?u64, current_generation), explicit.identity_read_generation);

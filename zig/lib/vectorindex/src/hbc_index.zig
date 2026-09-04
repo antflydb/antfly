@@ -2377,7 +2377,7 @@ pub fn searchProfiledRequest(
     elapsed_fn_u64: fn (u64) u64,
 ) !search_types.ProfiledSearchResults {
     if (!search_types.requiresExhaustiveCoverage(req)) {
-        return try searchProfiledRequestAttempt(self, req, null, false, null, now_fn_u64, elapsed_fn_u64);
+        return try searchProfiledRequestAttempt(self, req, null, false, null, null, now_fn_u64, elapsed_fn_u64);
     }
 
     const Index = comptime childType(@TypeOf(self));
@@ -2397,6 +2397,7 @@ pub fn searchProfiledRequest(
                 null,
                 true,
                 &durable_generation,
+                null,
                 now_fn_u64,
                 elapsed_fn_u64,
             ) catch |err| {
@@ -2413,12 +2414,14 @@ pub fn searchProfiledRequest(
             .mutation_epoch = publishedMutationEpoch(self),
         };
 
+        var native_search_view_bound = false;
         const profiled = searchProfiledRequestAttempt(
             self,
             req,
             token.snapshot,
             false,
             null,
+            &native_search_view_bound,
             now_fn_u64,
             elapsed_fn_u64,
         ) catch |err| {
@@ -2440,7 +2443,13 @@ pub fn searchProfiledRequest(
             return err;
         };
 
-        if (completeSnapshotAttemptStillCurrent(self, token)) return profiled;
+        // A native generation lease is already a complete MVCC snapshot. Its
+        // query remains valid when a later writer toggles the broader cache /
+        // publication epoch; retrying would discard useful work and can
+        // starve reads under sustained ingestion. Legacy storage still needs
+        // the broad-epoch validation because its topology and values are
+        // captured independently.
+        if (native_search_view_bound or completeSnapshotAttemptStillCurrent(self, token)) return profiled;
 
         var stale = profiled;
         stale.results.deinit();
@@ -2471,9 +2480,11 @@ fn searchProfiledRequestAttempt(
     expected_snapshot: ?SearchPublishedSnapshot,
     comptime capture_durable_snapshot: bool,
     captured_generation_out: ?*?u64,
+    native_search_view_bound_out: ?*bool,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) anyerror!search_types.ProfiledSearchResults {
+    if (native_search_view_bound_out) |out| out.* = false;
     var profile = search_types.SearchProfile{};
     const Index = comptime childType(@TypeOf(self));
     defer if (!capture_durable_snapshot and comptime @hasDecl(Index, "observeSearchCacheBenefit")) {
@@ -2494,27 +2505,69 @@ fn searchProfiledRequestAttempt(
         try loadStableSearchPublishedSnapshot(self, req.cancellation)
     else
         expected_snapshot orelse try loadStableSearchPublishedSnapshot(self, req.cancellation);
+    // A stable empty generation performs no scan and must never queue behind
+    // unrelated dense bandwidth. Its immutable snapshot is the query's
+    // linearization point. Complete-coverage callers retry only when that
+    // snapshot was invalidated before the empty result could be returned.
+    while (published_snapshot.active_count == 0) {
+        if (captured_generation_out) |out| out.* = published_snapshot.publish_generation;
+        if (snapshot_fence_held) {
+            self.endCompleteSnapshotRead();
+            snapshot_fence_held = false;
+        } else if (exhaustive_coverage and !publishedSnapshotStillCurrent(self, published_snapshot)) {
+            published_snapshot = try loadStableSearchPublishedSnapshot(self, req.cancellation);
+            continue;
+        }
+        var empty = search_results.SearchResults.init(self.alloc, req.k);
+        empty.candidate_coverage = .exhausted;
+        profile.total_ns = elapsed_fn_u64(total_start);
+        return .{
+            .results = empty,
+            .profile = profile,
+        };
+    }
+    // Legacy/tree admission obtains its conservative scan permit here before
+    // retaining a transaction or request workspace. Native flat admission
+    // instead pins one immutable SearchView now and defers its scan permit
+    // until routing has identified the exact posting set.
+    try search_types.checkCancelled(req);
+    var search_admission = if (comptime @hasDecl(Index, "acquireSearchAdmission"))
+        try self.acquireSearchAdmission(published_snapshot.active_count, published_snapshot.node_count, req)
+    else {};
+    defer if (comptime @hasDecl(Index, "releaseSearchAdmission")) {
+        self.releaseSearchAdmission(&search_admission);
+    };
+    // Native storage binds query topology and posting contents in one
+    // immutable serving generation. Admission may have waited across one or
+    // more publications, so replace the earlier lock-free estimate with the
+    // topology owned by the generation that the transaction will consume.
+    var search_view_bound = false;
+    if (comptime @hasDecl(Index, "searchViewFromAdmission")) {
+        if (self.searchViewFromAdmission(&search_admission)) |view| {
+            published_snapshot.root_node = view.root_node;
+            published_snapshot.active_count = view.active_count;
+            published_snapshot.node_count = view.node_count;
+            published_snapshot.publish_generation = view.publish_generation;
+            published_snapshot.routing_generation = view.routing_generation;
+            search_view_bound = true;
+            if (native_search_view_bound_out) |out| out.* = true;
+        }
+    }
     if (captured_generation_out) |out| out.* = published_snapshot.publish_generation;
     if (published_snapshot.active_count == 0) {
         if (snapshot_fence_held) {
             self.endCompleteSnapshotRead();
             snapshot_fence_held = false;
-            const empty = search_results.SearchResults.init(self.alloc, req.k);
-            profile.total_ns = elapsed_fn_u64(total_start);
-            var exhausted = empty;
-            exhausted.candidate_coverage = .exhausted;
-            return .{ .results = exhausted, .profile = profile };
+        } else if (exhaustive_coverage and !search_view_bound and !publishedSnapshotStillCurrent(self, published_snapshot)) {
+            return error.StalePublishedSnapshot;
         }
-        if (!exhaustive_coverage or publishedSnapshotStillCurrent(self, published_snapshot)) {
-            var empty = search_results.SearchResults.init(self.alloc, req.k);
-            empty.candidate_coverage = .exhausted;
-            profile.total_ns = elapsed_fn_u64(total_start);
-            return .{
-                .results = empty,
-                .profile = profile,
-            };
-        }
-        published_snapshot = try loadStableSearchPublishedSnapshot(self, req.cancellation);
+        var empty = search_results.SearchResults.init(self.alloc, req.k);
+        empty.candidate_coverage = .exhausted;
+        profile.total_ns = elapsed_fn_u64(total_start);
+        return .{
+            .results = empty,
+            .profile = profile,
+        };
     }
     var coverage_tracker = CompleteCoverageTracker.init(
         .{ .enabled = false, .held = false },
@@ -2539,18 +2592,8 @@ fn searchProfiledRequestAttempt(
             published_snapshot.active_count,
         );
     }
-    // A waiter may have spent time behind the generation validator. Do not
-    // retain an MVCC snapshot or request workspace while waiting, and honor a
-    // disconnect before acquiring either resource.
-    try search_types.checkCancelled(req);
-    var search_admission = if (comptime @hasDecl(Index, "acquireSearchAdmission"))
-        try self.acquireSearchAdmission(published_snapshot.active_count, published_snapshot.node_count, req)
-    else {};
-    defer if (comptime @hasDecl(Index, "releaseSearchAdmission")) {
-        self.releaseSearchAdmission(&search_admission);
-    };
-    // Admission can wait behind other bandwidth-heavy scans. It deliberately
-    // happens before the MVCC transaction and request workspace are acquired.
+    // The admission lease either already owns bandwidth (legacy/tree) or owns
+    // the native generation whose exact flat-route cost will be admitted below.
     try search_types.checkCancelled(req);
     const setup_start = total_start;
     const txn_start = now_fn_u64();
@@ -2561,7 +2604,7 @@ fn searchProfiledRequestAttempt(
     else
         try self.beginRuntimeSearchTxn();
     defer txn.abort();
-    if (!capture_durable_snapshot and exhaustive_coverage and !publishedSnapshotStillCurrent(self, published_snapshot)) {
+    if (!capture_durable_snapshot and exhaustive_coverage and !search_view_bound and !publishedSnapshotStillCurrent(self, published_snapshot)) {
         return error.StalePublishedSnapshot;
     }
     if (snapshot_fence_held) {
@@ -2583,15 +2626,8 @@ fn searchProfiledRequestAttempt(
             published_snapshot.active_count,
         );
     }
-    hbc_runtime.beginSearchEpoch(self);
-    defer hbc_runtime.endSearchEpoch(self);
     const use_search_cache = !capture_durable_snapshot;
     profile.runtime_txn_ns += elapsed_fn_u64(txn_start);
-    if (use_search_cache and comptime @hasDecl(Index, "pinUpperTreeCache")) {
-        try self.pinUpperTreeCache(&txn);
-    }
-    var filter_state = try search_types.RequestFilterState.init(self.alloc, req);
-    defer filter_state.deinit(self.alloc);
     const scratch_start = now_fn_u64();
     var scratch_handle = try self.acquireSearchScratch();
     profile.scratch_acquire_ns += elapsed_fn_u64(scratch_start);
@@ -2622,6 +2658,10 @@ fn searchProfiledRequestAttempt(
     const candidate_capacity: usize = search_mod.candidateCapacity(search_width, self.metadata.branching_factor);
     const root_node_id = published_snapshot.root_node;
 
+    // Complete-snapshot validation has index-sized workspace. Admit it before
+    // route scratch can grow so a rejected exhaustive request leaves no new
+    // retained buffers behind. Ordinary ANN skips this block and preserves
+    // the compact route-then-scan admission shape.
     const previous_accounted_bytes = scratch_handle.accounted_bytes;
     if (exhaustive_coverage) {
         if (comptime @hasDecl(Index, "reserveSearchScratchBytes")) {
@@ -2644,6 +2684,49 @@ fn searchProfiledRequestAttempt(
     try coverage_tracker.prepare(self, scratch);
     if (exhaustive_coverage) try scratch.resetCoverageVisited(self.alloc, published_snapshot.node_count);
 
+    // Native flat routing is the bounded first admission phase. It reads only
+    // the compact generation-owned centroid directory. Once the immutable
+    // frontier is known, the adapter sums its authenticated per-posting costs
+    // and obtains scan bandwidth before any candidate payload is touched.
+    var prepared_flat_selection: ?spfresh_index.FlatCentroidSelection = null;
+    if (spfresh_index.usesFlatCentroidDirectory(self)) {
+        const search_width_usize: usize = @intCast(search_width);
+        const missing_posting_slack = @max(@as(usize, 16), search_width_usize / 100);
+        prepared_flat_selection = try spfresh_index.selectFlatPostingsAlloc(
+            self,
+            &txn,
+            transformed_query,
+            search_width_usize +| missing_posting_slack,
+            &scratch_handle,
+            &profile,
+            coverage_policy,
+            if (exhaustive_coverage or search_view_bound) .{
+                .root_node = published_snapshot.root_node,
+                .node_count = published_snapshot.node_count,
+                .publish_generation = published_snapshot.routing_generation,
+            } else null,
+            req.cancellation,
+            now_fn_u64,
+            elapsed_fn_u64,
+        );
+        if (comptime @hasDecl(Index, "finalizeFlatSearchAdmission")) {
+            try self.finalizeFlatSearchAdmission(
+                &search_admission,
+                &txn,
+                prepared_flat_selection.?.probes,
+                req,
+            );
+        }
+    }
+
+    hbc_runtime.beginSearchEpoch(self);
+    defer hbc_runtime.endSearchEpoch(self);
+    if (use_search_cache and comptime @hasDecl(Index, "pinUpperTreeCache")) {
+        try self.pinUpperTreeCache(&txn);
+    }
+    var filter_state = try search_types.RequestFilterState.init(self.alloc, req);
+    defer filter_state.deinit(self.alloc);
+
     var approx_results = try search_results.ApproxSearchResults.initCapacity(self.alloc, req.k, candidate_limit, candidate_limit);
     errdefer approx_results.deinit();
     profile.setup_ns += elapsed_fn_u64(setup_start);
@@ -2661,7 +2744,7 @@ fn searchProfiledRequestAttempt(
         // contract.
         const search_width_usize: usize = @intCast(search_width);
         const missing_posting_slack = @max(@as(usize, 16), search_width_usize / 100);
-        const selection = try spfresh_index.selectFlatPostingsAlloc(
+        const selection = prepared_flat_selection orelse try spfresh_index.selectFlatPostingsAlloc(
             self,
             &txn,
             transformed_query,
@@ -2669,10 +2752,10 @@ fn searchProfiledRequestAttempt(
             &scratch_handle,
             &profile,
             coverage_policy,
-            if (exhaustive_coverage) .{
+            if (exhaustive_coverage or search_view_bound) .{
                 .root_node = published_snapshot.root_node,
                 .node_count = published_snapshot.node_count,
-                .publish_generation = published_snapshot.publish_generation,
+                .publish_generation = published_snapshot.routing_generation,
             } else null,
             req.cancellation,
             now_fn_u64,
@@ -3203,6 +3286,7 @@ const SearchPublishedSnapshot = struct {
     active_count: u64,
     node_count: u64,
     publish_generation: u64,
+    routing_generation: u64,
 };
 
 fn waitForStableSearchPublicationIfSupported(
@@ -3233,6 +3317,7 @@ fn loadStableSearchPublishedSnapshot(
             .active_count = self.metadata.active_count,
             .node_count = self.metadata.node_count,
             .publish_generation = 0,
+            .routing_generation = 0,
         };
     }
 
@@ -3247,6 +3332,7 @@ fn loadStableSearchPublishedSnapshot(
             .active_count = self.publishedActiveCount(),
             .node_count = self.publishedNodeCount(),
             .publish_generation = generation,
+            .routing_generation = generation,
         };
         const generation_after = self.publishedGeneration();
         if (generation == generation_after and (generation_after & 1) == 0) return snapshot;
