@@ -1,0 +1,52 @@
+name: Load Antfly toolchain policy
+description: Export the repository's pinned SDK and release toolchains
+
+outputs:
+  python_minimum:
+    description: Minimum supported Python minor
+    value: ${{ steps.policy.outputs.python_minimum }}
+  python_supported:
+    description: Space-separated supported Python minors
+    value: ${{ steps.policy.outputs.python_supported }}
+  python_build:
+    description: Python minor used for builds and publishing
+    value: ${{ steps.policy.outputs.python_build }}
+  go_version:
+    description: Pinned Go toolchain
+    value: ${{ steps.policy.outputs.go_version }}
+  npm_version:
+    description: Pinned npm client used for trusted publishing
+    value: ${{ steps.policy.outputs.npm_version }}
+  zig_version:
+    description: Pinned Zig toolchain
+    value: ${{ steps.policy.outputs.zig_version }}
+  zig_nix_attribute:
+    description: Nix attribute providing the pinned Zig toolchain
+    value: ${{ steps.policy.outputs.zig_nix_attribute }}
+  zig_nixpkgs_revision:
+    description: Pinned nixpkgs revision providing Zig
+    value: ${{ steps.policy.outputs.zig_nixpkgs_revision }}
+  zig_x86_64_linux_sha256:
+    description: SHA-256 of the pinned x86_64 Linux Zig archive
+    value: ${{ steps.policy.outputs.zig_x86_64_linux_sha256 }}
+  zig_aarch64_linux_sha256:
+    description: SHA-256 of the pinned aarch64 Linux Zig archive
+    value: ${{ steps.policy.outputs.zig_aarch64_linux_sha256 }}
+  macos_cross_sdk_version:
+    description: Pinned macOS cross-compilation SDK
+    value: ${{ steps.policy.outputs.macos_cross_sdk_version }}
+  macos_cross_sdk_sha256:
+    description: SHA-256 of the pinned macOS cross-compilation SDK
+    value: ${{ steps.policy.outputs.macos_cross_sdk_sha256 }}
+  rust_version:
+    description: Pinned Rust toolchain
+    value: ${{ steps.policy.outputs.rust_version }}
+
+runs:
+  using: composite
+  steps:
+    - id: policy
+      shell: bash
+      run: >-
+        python3 "$GITHUB_ACTION_PATH/../../../scripts/ci/check_toolchain_policy.py"
+        --github-output "$GITHUB_OUTPUT"

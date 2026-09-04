@@ -151,8 +151,14 @@
     animation: anty-pixel-blink 3.2s steps(1) infinite;
   }
   @keyframes anty-pixel-blink {
-    0%, 92%, 100% { opacity: 1; }
-    95% { opacity: 0; }
+    0%,
+    92%,
+    100% {
+      opacity: 1;
+    }
+    95% {
+      opacity: 0;
+    }
   }
 
   /* Kicker — pixel-font emphasis overline for loud brand moments.
@@ -197,10 +203,14 @@
     border-right: 2px solid var(--primary);
   }
   @keyframes type-on-reveal {
-    to { width: var(--type-on-target, 100%); }
+    to {
+      width: var(--type-on-target, 100%);
+    }
   }
   @keyframes type-on-caret {
-    50% { border-color: transparent; }
+    50% {
+      border-color: transparent;
+    }
   }
 }
 

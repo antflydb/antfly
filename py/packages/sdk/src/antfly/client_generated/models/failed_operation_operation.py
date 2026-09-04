@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class FailedOperationOperation(str, Enum):
+class FailedOperationOperation(StrEnum):
     DELETE = "delete"
     UPSERT = "upsert"
 

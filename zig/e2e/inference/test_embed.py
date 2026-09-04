@@ -225,7 +225,10 @@ def test_image_embedding(api):
 @pytest.mark.verification
 def test_clipclap_image_embedding_golden_contract(tmp_path):
     """ClipClap image embeddings should match the pinned Q4_K model contract."""
-    if not local_model_exists(CLIPCLAP_MODEL, "embedders") and not inference_download_enabled():
+    if (
+        not local_model_exists(CLIPCLAP_MODEL, "embedders")
+        and not inference_download_enabled()
+    ):
         pytest.skip(f"{CLIPCLAP_MODEL} is not available")
 
     model_dir = ensure_model_by_name(CLIPCLAP_MODEL, "embedders")
@@ -246,11 +249,15 @@ def test_clipclap_image_embedding_golden_contract(tmp_path):
     model_path = model_dir / artifact["name"]
     manifest = json.loads((model_dir / "model_manifest.json").read_text())
     if manifest_files := manifest.get("files"):
-        manifest_file = next(item for item in manifest_files if item["name"] == artifact["name"])
+        manifest_file = next(
+            item for item in manifest_files if item["name"] == artifact["name"]
+        )
         assert manifest_file["digest"] == f"sha256:{artifact['sha256']}"
         assert model_path.stat().st_size == manifest_file["size"]
     with model_path.open("rb") as model_file:
-        assert hashlib.file_digest(model_file, "sha256").hexdigest() == artifact["sha256"]
+        assert (
+            hashlib.file_digest(model_file, "sha256").hexdigest() == artifact["sha256"]
+        )
 
     def run_embedding():
         result = subprocess.run(
@@ -269,7 +276,11 @@ def test_clipclap_image_embedding_golden_contract(tmp_path):
             stderr=subprocess.PIPE,
         )
         combined = [*result.stdout.splitlines(), *result.stderr.splitlines()]
-        response_line = next(line for line in reversed(combined) if line.startswith("{") and "\"embeddings\"" in line)
+        response_line = next(
+            line
+            for line in reversed(combined)
+            if line.startswith("{") and '"embeddings"' in line
+        )
         return json.loads(response_line)["embeddings"][0]
 
     first = run_embedding()
@@ -321,7 +332,9 @@ def test_clip_text_image_alignment(api):
         ],
         model=CLIPCLAP_MODEL,
     )
-    white_text, black_text, white_image, black_image = [item["embedding"] for item in resp["data"]]
+    white_text, black_text, white_image, black_image = [
+        item["embedding"] for item in resp["data"]
+    ]
 
     assert len(white_text) == len(white_image)
     assert len(black_text) == len(black_image)
@@ -338,9 +351,12 @@ def test_clip_text_image_alignment(api):
 
 @pytest.mark.multimodal
 def test_invalid_data_uri_returns_error(api):
-    r = api.post("/embed", json={
-        "input": [{"type": "image_url", "image_url": {"url": "not-a-data-uri"}}],
-    })
+    r = api.post(
+        "/embed",
+        json={
+            "input": [{"type": "image_url", "image_url": {"url": "not-a-data-uri"}}],
+        },
+    )
     assert r.status_code in (400, 500)
     assert "error" in r.json()
 
@@ -374,15 +390,32 @@ def test_clap_spoken_audio_batch_rows_are_distinct(api):
         [
             fox_text,
             moon_text,
-            {"type": "media", "mime_type": "audio/wav", "data": fox_audio.split(",", 1)[1]},
-            {"type": "media", "mime_type": "audio/wav", "data": moon_audio.split(",", 1)[1]},
-            {"type": "media", "mime_type": "audio/wav", "data": silence_audio.split(",", 1)[1]},
+            {
+                "type": "media",
+                "mime_type": "audio/wav",
+                "data": fox_audio.split(",", 1)[1],
+            },
+            {
+                "type": "media",
+                "mime_type": "audio/wav",
+                "data": moon_audio.split(",", 1)[1],
+            },
+            {
+                "type": "media",
+                "mime_type": "audio/wav",
+                "data": silence_audio.split(",", 1)[1],
+            },
         ],
         model=CLIPCLAP_MODEL,
     )
-    fox_text_emb, moon_text_emb, fox_audio_emb, moon_audio_emb, silence_audio_emb = [item["embedding"] for item in resp["data"]]
+    fox_text_emb, moon_text_emb, fox_audio_emb, moon_audio_emb, silence_audio_emb = [
+        item["embedding"] for item in resp["data"]
+    ]
 
-    _assert_clipclap_embeddings([fox_text_emb, moon_text_emb, fox_audio_emb, moon_audio_emb, silence_audio_emb], 5)
+    _assert_clipclap_embeddings(
+        [fox_text_emb, moon_text_emb, fox_audio_emb, moon_audio_emb, silence_audio_emb],
+        5,
+    )
 
     # This is a runtime/e2e regression test, not a speech-recognition quality
     # benchmark. Generated speech can land near CLAP's semantic noise floor, so

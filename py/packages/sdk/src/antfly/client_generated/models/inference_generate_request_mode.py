@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceGenerateRequestMode(str, Enum):
+class InferenceGenerateRequestMode(StrEnum):
     COMPILED = "compiled"
     EAGER = "eager"
 

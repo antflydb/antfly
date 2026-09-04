@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TableMigrationState(str, Enum):
+class TableMigrationState(StrEnum):
     REBUILDING = "rebuilding"
 
     def __str__(self) -> str:

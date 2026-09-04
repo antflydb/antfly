@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class DocumentFieldMappingMissingNullPolicy(str, Enum):
+class DocumentFieldMappingMissingNullPolicy(StrEnum):
     MISSING_REJECTED = "missing_rejected"
 
     def __str__(self) -> str:

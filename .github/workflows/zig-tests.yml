@@ -42,7 +42,6 @@ jobs:
       model_check: ${{ steps.detect.outputs.model_check }}
       trace_validate: ${{ steps.detect.outputs.trace_validate }}
       backup_s3: ${{ steps.detect.outputs.backup_s3 }}
-      release_tooling: ${{ steps.detect.outputs.release_tooling }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,7 +70,6 @@ jobs:
               echo "model_check=true"
               echo "trace_validate=true"
               echo "backup_s3=true"
-              echo "release_tooling=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -84,7 +82,6 @@ jobs:
                 echo "model_check=true"
                 echo "trace_validate=true"
                 echo "backup_s3=false"
-                echo "release_tooling=false"
               } >> "$GITHUB_OUTPUT"
             else
               {
@@ -92,7 +89,6 @@ jobs:
                 echo "model_check=false"
                 echo "trace_validate=false"
                 echo "backup_s3=true"
-                echo "release_tooling=false"
               } >> "$GITHUB_OUTPUT"
             fi
             exit 0
@@ -109,7 +105,6 @@ jobs:
               echo "model_check=true"
               echo "trace_validate=true"
               echo "backup_s3=true"
-              echo "release_tooling=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -117,7 +112,9 @@ jobs:
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
-            ':(glob)scripts/ci/**' \
+            ':(glob)scripts/ci/zig-*.sh' \
+            scripts/ci/toolchain-policy.json \
+            .github/actions/load-toolchain-policy/action.yml \
             scripts/test-backup-s3-integration.sh \
             Makefile \
             .github/workflows/zig-tests.yml \
@@ -131,7 +128,9 @@ jobs:
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
-            ':(glob)scripts/ci/**' \
+            ':(glob)scripts/ci/zig-*.sh' \
+            scripts/ci/toolchain-policy.json \
+            .github/actions/load-toolchain-policy/action.yml \
             scripts/test-backup-s3-integration.sh \
             Makefile \
             .github/workflows/zig-tests.yml \
@@ -185,60 +184,6 @@ jobs:
             echo "trace_validate=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if git diff --quiet "$base" "${{ github.sha }}" -- \
-            ':(glob).github/workflows/*.yml' \
-            ':(glob).github/workflows/*.yaml' \
-            .github/dependabot.yml \
-            scripts/install.sh \
-            scripts/publish-zig-runtime-dev.sh \
-            scripts/test_install_download_markers.sh \
-            scripts/test_quickstart_docs.py \
-            ':(glob)scripts/packaging/**' \
-            ':(glob)scripts/release/**' \
-            py/packages/cli/pyproject.toml \
-            ':(glob)ts/packages/cli*/**' \
-            docs/cli-packaging.md \
-            docs/guides/quickstart.mdx \
-            RELEASE.md \
-            zig/Dockerfile.runtime \
-            zig/cloudbuild.manifest.yaml \
-            zig/cloudbuild.runtime.yaml \
-            .github/workflows/zig-tests.yml
-          then
-            echo "release_tooling=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "release_tooling=true" >> "$GITHUB_OUTPUT"
-          fi
-
-  release-tooling:
-    name: release-tooling
-    needs: changes
-    if: needs.changes.outputs.release_tooling == 'true'
-    runs-on: arc-antfly-standard
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13"
-
-      # setup-zig downloads an .xz archive, and the release suite executes the
-      # real completion generator. Keep both dependencies explicit so a clean
-      # runner behaves the same as a developer machine.
-      - name: Install release test tools
-        run: sudo apt-get update && sudo apt-get install -y xz-utils
-
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
-          use-cache: false
-
-      - name: Test release packaging and scripts
-        run: scripts/release/test.sh
-
   backup-s3-integration:
     name: backup-s3-integration
     needs: changes
@@ -252,13 +197,17 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Run backup listing against MinIO
@@ -283,11 +232,14 @@ jobs:
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 20
     env:
-      ZIG_VERSION: "0.16.0"
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-arm64-codec
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-arm64-codec
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
 
       - name: Verify native Linux ARM64 runner
         run: |
@@ -297,6 +249,9 @@ jobs:
           test "$(uname -m)" = "aarch64"
 
       - name: Install Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_AARCH64_LINUX_SHA256: ${{ steps.toolchain.outputs.zig_aarch64_linux_sha256 }}
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -304,6 +259,7 @@ jobs:
           curl -fsSL \
             "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
             -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "$ZIG_AARCH64_LINUX_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check --strict
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" \
             -C "$RUNNER_TEMP/zig" \
@@ -311,6 +267,8 @@ jobs:
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
       - name: Verify Zig version
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
         run: test "$(zig version)" = "$ZIG_VERSION"
 
       - name: Run StreamVByte codec tests
@@ -338,6 +296,10 @@ jobs:
           fetch-depth: 0
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file
 
@@ -347,7 +309,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC Zig cache dirs
@@ -621,6 +583,10 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
@@ -630,7 +596,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC Zig cache dirs
@@ -819,13 +785,17 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC Zig cache dirs
@@ -877,13 +847,17 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC cache dirs
@@ -989,13 +963,17 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC cache dirs
@@ -1046,6 +1024,10 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
@@ -1073,6 +1055,7 @@ jobs:
         if: matrix.suite == 'antfly'
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: ${{ steps.toolchain.outputs.rust_version }}
           targets: wasm32-wasip2
 
       - name: Build MemoryAF extension package

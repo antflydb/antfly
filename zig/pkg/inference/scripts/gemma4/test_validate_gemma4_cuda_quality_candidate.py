@@ -29,7 +29,9 @@ def custom_spec() -> candidate_validator.CandidateSpec:
             candidate_validator.RouteCounter("candidate_hd512", "candidate HD512"),
         ),
         forbidden_route_counters=(
-            candidate_validator.RouteCounter("candidate_fallbacks", "candidate fallbacks"),
+            candidate_validator.RouteCounter(
+                "candidate_fallbacks", "candidate fallbacks"
+            ),
         ),
         required_baseline_route_counters=(
             candidate_validator.RouteCounter("baseline_route", "baseline route"),
@@ -57,21 +59,25 @@ def splitk_timing(enabled: bool, *, persistent_replays: int = 295) -> dict:
         )
     }
     if enabled:
-        counters.update({
-            item.name: item.exact_count for item in spec.qualification_route_counts
-        })
+        counters.update(
+            {item.name: item.exact_count for item in spec.qualification_route_counts}
+        )
     else:
-        counters.update({
-            "launch_attention_gqa_decode_score_prework": 140,
-            "launch_attention_gqa_decode_score_prework_tiled64_hd256": 112,
-            "launch_attention_gqa_decode_score_prework_tiled64_hd512": 28,
-        })
+        counters.update(
+            {
+                "launch_attention_gqa_decode_score_prework": 140,
+                "launch_attention_gqa_decode_score_prework_tiled64_hd256": 112,
+                "launch_attention_gqa_decode_score_prework_tiled64_hd512": 28,
+            }
+        )
     metadata = candidate_validator.DEFAULT_TIMING_METADATA
-    counters.update({
-        metadata.persistent_replay_counter: persistent_replays,
-        metadata.graph_discard_counter: 0,
-        metadata.graph_capacity_skip_counter: 0,
-    })
+    counters.update(
+        {
+            metadata.persistent_replay_counter: persistent_replays,
+            metadata.graph_discard_counter: 0,
+            metadata.graph_capacity_skip_counter: 0,
+        }
+    )
     return {"cuda": counters}
 
 
@@ -101,7 +107,9 @@ def repetitions(
     return [
         {
             "repetition": index + 1,
-            "execution_order": ["baseline", "candidate"] if index % 2 == 0 else ["candidate", "baseline"],
+            "execution_order": ["baseline", "candidate"]
+            if index % 2 == 0
+            else ["candidate", "baseline"],
             "baseline": sample(baseline_tokens, baseline_text),
             "candidate": sample(candidate_tokens, candidate_text),
         }
@@ -110,7 +118,9 @@ def repetitions(
 
 
 class SuiteTests(unittest.TestCase):
-    def test_default_suite_is_exact_and_all_prompts_are_locked_long_context(self) -> None:
+    def test_default_suite_is_exact_and_all_prompts_are_locked_long_context(
+        self,
+    ) -> None:
         suite = quality.load_suite(SUITE_PATH)
         self.assertEqual(
             quality.REVIEWED_SUITE_SHA256,
@@ -119,7 +129,9 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual("exact-v1", suite.profile_name)
         self.assertFalse(suite.profile["allow_token_divergence"])
         self.assertEqual(4, len(suite.cases))
-        self.assertEqual(1, sum(case.allow_candidate_divergence for case in suite.cases))
+        self.assertEqual(
+            1, sum(case.allow_candidate_divergence for case in suite.cases)
+        )
         for case in suite.cases:
             self.assertEqual(2051, case.prompt_contract["expected_prompt_tokens"])
             self.assertGreaterEqual(len(case.prompt.encode("utf-8")), 2000)
@@ -156,9 +168,15 @@ class SuiteTests(unittest.TestCase):
             root = pathlib.Path(directory)
             path = root / "suite.json"
             path.write_text(json.dumps(raw), encoding="utf-8")
-            fixture = json.loads((SUITE_PATH.parent / "gemma4_long_context_v1.json").read_text())
-            (root / "gemma4_long_context_v1.json").write_text(json.dumps(fixture), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "referenced fixture contracts disagree"):
+            fixture = json.loads(
+                (SUITE_PATH.parent / "gemma4_long_context_v1.json").read_text()
+            )
+            (root / "gemma4_long_context_v1.json").write_text(
+                json.dumps(fixture), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                ValueError, "referenced fixture contracts disagree"
+            ):
                 quality.load_suite(path)
 
     def test_suite_cannot_default_to_bounded_profile(self) -> None:
@@ -191,7 +209,9 @@ class SuiteTests(unittest.TestCase):
             path.write_text(json.dumps(raw), encoding="utf-8")
             fixture = (SUITE_PATH.parent / "gemma4_long_context_v1.json").read_bytes()
             (root / "gemma4_long_context_v1.json").write_bytes(fixture)
-            with self.assertRaisesRegex(ValueError, "reviewed deterministic CUDA contract"):
+            with self.assertRaisesRegex(
+                ValueError, "reviewed deterministic CUDA contract"
+            ):
                 quality.load_suite(path)
 
 
@@ -206,7 +226,9 @@ class OutputTests(unittest.TestCase):
                 "expected_values": {"city": "Oslo", "count": 3},
             },
         }
-        self.assertEqual([], quality.validate_output('{"city":"Oslo","count":3}', contract))
+        self.assertEqual(
+            [], quality.validate_output('{"city":"Oslo","count":3}', contract)
+        )
 
     def test_json_contract_rejects_fence_extra_key_and_wrong_value(self) -> None:
         contract = {
@@ -237,7 +259,12 @@ class OutputTests(unittest.TestCase):
     def test_word_and_byte_bounds(self) -> None:
         errors = quality.validate_output(
             "one two",
-            {"min_utf8_bytes": 20, "max_utf8_bytes": 30, "min_words": 3, "max_words": 5},
+            {
+                "min_utf8_bytes": 20,
+                "max_utf8_bytes": 30,
+                "min_words": 3,
+                "max_words": 5,
+            },
         )
         self.assertEqual(2, len(errors))
 
@@ -288,7 +315,9 @@ class DivergenceTests(unittest.TestCase):
         suite = quality.load_suite(SUITE_PATH)
         metrics = quality.token_divergence(list(range(100)), list(range(99)) + [999])
         errors = quality.divergence_errors(metrics, 1.0, suite.cases[0], suite.profile)
-        self.assertEqual(["selected exact policy forbids generated-token divergence"], errors)
+        self.assertEqual(
+            ["selected exact policy forbids generated-token divergence"], errors
+        )
 
     def test_bounded_policy_accepts_late_small_freeform_divergence(self) -> None:
         suite = quality.load_suite(SUITE_PATH, "bounded-freeform-v1")
@@ -306,7 +335,10 @@ class DivergenceTests(unittest.TestCase):
         candidate = baseline.copy()
         candidate[40] = 999
         errors = quality.divergence_errors(
-            quality.token_divergence(baseline, candidate), 0.95, suite.cases[2], suite.profile
+            quality.token_divergence(baseline, candidate),
+            0.95,
+            suite.cases[2],
+            suite.profile,
         )
         self.assertEqual(
             ["this structured/exact canary forbids generated-token divergence"], errors
@@ -318,7 +350,10 @@ class DivergenceTests(unittest.TestCase):
         candidate = baseline.copy()
         candidate[4] = 999
         errors = quality.divergence_errors(
-            quality.token_divergence(baseline, candidate), 0.4, suite.cases[0], suite.profile
+            quality.token_divergence(baseline, candidate),
+            0.4,
+            suite.cases[0],
+            suite.profile,
         )
         self.assertTrue(any("first divergence index" in error for error in errors))
         self.assertTrue(any("first divergence fraction" in error for error in errors))
@@ -348,7 +383,9 @@ class RouteAndEnvironmentTests(unittest.TestCase):
                 "capture_kv_capacity": 2432,
             },
             {
-                key: quality.candidate_spec_identity(spec)["qualification_workload"][key]
+                key: quality.candidate_spec_identity(spec)["qualification_workload"][
+                    key
+                ]
                 for key in (
                     "benchmark_prompt_tokens",
                     "lengths",
@@ -370,7 +407,9 @@ class RouteAndEnvironmentTests(unittest.TestCase):
                 )
                 self.assertEqual([], errors)
                 self.assertTrue(evidence["persistent_graph_replay"]["required"])
-                self.assertEqual(292, evidence["persistent_graph_replay"]["minimum_replays"])
+                self.assertEqual(
+                    292, evidence["persistent_graph_replay"]["minimum_replays"]
+                )
                 self.assertEqual(
                     295,
                     evidence["counters"][
@@ -382,8 +421,12 @@ class RouteAndEnvironmentTests(unittest.TestCase):
         spec = splitk_spec()
         timing = splitk_timing(True, persistent_replays=291)
         timing["cuda"]["launch_attention_gqa_decode_splitk_online_sm89"] = 139
-        timing["cuda"]["launch_attention_gqa_decode_splitk_online_sm89_symbol_fallbacks"] = 1
-        timing["cuda"][candidate_validator.DEFAULT_TIMING_METADATA.graph_discard_counter] = 1
+        timing["cuda"][
+            "launch_attention_gqa_decode_splitk_online_sm89_symbol_fallbacks"
+        ] = 1
+        timing["cuda"][
+            candidate_validator.DEFAULT_TIMING_METADATA.graph_discard_counter
+        ] = 1
         _, errors = quality.route_evidence(
             timing,
             spec,
@@ -393,7 +436,9 @@ class RouteAndEnvironmentTests(unittest.TestCase):
         )
         self.assertTrue(any("locked count 140" in error for error in errors))
         self.assertTrue(any("forbidden route/fallback" in error for error in errors))
-        self.assertTrue(any("persistent replays 291 below 292" in error for error in errors))
+        self.assertTrue(
+            any("persistent replays 291 below 292" in error for error in errors)
+        )
         self.assertTrue(any("graph capture discards" in error for error in errors))
 
     def test_candidate_route_evidence_is_fail_closed(self) -> None:
@@ -431,8 +476,14 @@ class RouteAndEnvironmentTests(unittest.TestCase):
             }
         }
         _, errors = quality.route_evidence(timing, custom_spec(), False, False)
-        self.assertTrue(any("unexpectedly used candidate route" in error for error in errors))
-        self.assertTrue(any("did not use required route baseline_route" in error for error in errors))
+        self.assertTrue(
+            any("unexpectedly used candidate route" in error for error in errors)
+        )
+        self.assertTrue(
+            any(
+                "did not use required route baseline_route" in error for error in errors
+            )
+        )
 
     def test_runtime_environment_scrubs_unapproved_candidate_inputs(self) -> None:
         parent = {
@@ -477,25 +528,39 @@ class RouteAndEnvironmentTests(unittest.TestCase):
         )
         suite = quality.QualitySuite(
             path=SUITE_PATH,
-            raw={"generation_contract": json.loads(SUITE_PATH.read_text())["generation_contract"]},
+            raw={
+                "generation_contract": json.loads(SUITE_PATH.read_text())[
+                    "generation_contract"
+                ]
+            },
             cases=(case,),
             profile_name="exact-v1",
-            profile=json.loads(SUITE_PATH.read_text())["threshold_profiles"]["exact-v1"],
+            profile=json.loads(SUITE_PATH.read_text())["threshold_profiles"][
+                "exact-v1"
+            ],
         )
 
         def fake_run(command, **kwargs):
             timing_path = pathlib.Path(command[command.index("--json-timing") + 1])
-            candidate = kwargs["env"][custom_spec().environment_variable] == "required-candidate"
-            timing_path.write_text(json.dumps({
-                "decode_tok_per_s": 10.0,
-                "timing_ms": {"generate": 2.0},
-                "cuda": {
-                    "candidate_hd256": 2 if candidate else 0,
-                    "candidate_hd512": 1 if candidate else 0,
-                    "candidate_fallbacks": 0,
-                    "baseline_route": 0 if candidate else 3,
-                },
-            }), encoding="utf-8")
+            candidate = (
+                kwargs["env"][custom_spec().environment_variable]
+                == "required-candidate"
+            )
+            timing_path.write_text(
+                json.dumps(
+                    {
+                        "decode_tok_per_s": 10.0,
+                        "timing_ms": {"generate": 2.0},
+                        "cuda": {
+                            "candidate_hd256": 2 if candidate else 0,
+                            "candidate_hd512": 1 if candidate else 0,
+                            "candidate_fallbacks": 0,
+                            "baseline_route": 0 if candidate else 3,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             stdout = (
                 b"prompt_token_ids: 1 2 3\nhello\n"
                 b"token_ids: 10 11\nfinish_reason=length tokens=2\n"
@@ -532,11 +597,15 @@ class RouteAndEnvironmentTests(unittest.TestCase):
         self.assertTrue(baseline["passed"], baseline["errors"])
         self.assertTrue(candidate["passed"], candidate["errors"])
         self.assertEqual("hello", candidate["generated"]["text"])
-        self.assertEqual("required-candidate", candidate["route_evidence"]["candidate_gate_value"])
+        self.assertEqual(
+            "required-candidate", candidate["route_evidence"]["candidate_gate_value"]
+        )
 
 
 class EvaluationTests(unittest.TestCase):
-    def test_exact_suite_is_quality_qualified_but_has_no_promotion_authority(self) -> None:
+    def test_exact_suite_is_quality_qualified_but_has_no_promotion_authority(
+        self,
+    ) -> None:
         suite = quality.load_suite(SUITE_PATH)
         values = list(range(80))
         by_case = {case.id: repetitions(values, values) for case in suite.cases}
@@ -545,7 +614,9 @@ class EvaluationTests(unittest.TestCase):
         self.assertTrue(result["quality_qualified"])
         self.assertFalse(result["collect_only"])
 
-    def test_bounded_suite_can_pass_diagnostics_but_never_quality_qualifies(self) -> None:
+    def test_bounded_suite_can_pass_diagnostics_but_never_quality_qualifies(
+        self,
+    ) -> None:
         suite = quality.load_suite(SUITE_PATH, "bounded-freeform-v1")
         baseline = list(range(100))
         candidate = baseline.copy()
@@ -594,14 +665,18 @@ class EvaluationTests(unittest.TestCase):
         reps = repetitions(values, values)
         reps[0]["candidate"] = sample(values, "same output text", ["route missing"])
         result = quality.evaluate_case(suite.cases[0], reps, suite.profile)
-        self.assertTrue(any("candidate: route missing" in error for error in result["errors"]))
+        self.assertTrue(
+            any("candidate: route missing" in error for error in result["errors"])
+        )
 
     def test_identical_tokens_with_different_text_fail_closed(self) -> None:
         suite = quality.load_suite(SUITE_PATH)
         values = list(range(80))
         reps = repetitions(values, values, "baseline text", "candidate text")
         result = quality.evaluate_case(suite.cases[0], reps, suite.profile)
-        self.assertTrue(any("decoded to different" in error for error in result["errors"]))
+        self.assertTrue(
+            any("decoded to different" in error for error in result["errors"])
+        )
 
 
 class ProvenanceTests(unittest.TestCase):
@@ -638,7 +713,9 @@ class ProvenanceTests(unittest.TestCase):
 
     def test_logits_remain_explicitly_unavailable(self) -> None:
         self.assertFalse(quality.LOGIT_CAPABILITY["available"])
-        self.assertIn("teacher-forced logits", quality.LOGIT_CAPABILITY["unavailable_observables"])
+        self.assertIn(
+            "teacher-forced logits", quality.LOGIT_CAPABILITY["unavailable_observables"]
+        )
         self.assertIn("production-equivalent", quality.LOGIT_CAPABILITY["consequence"])
 
     def test_only_cataloged_candidates_resolve(self) -> None:

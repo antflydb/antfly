@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class CohereEmbedderConfigTruncate(str, Enum):
+class CohereEmbedderConfigTruncate(StrEnum):
     END = "END"
     NONE = "NONE"
     START = "START"

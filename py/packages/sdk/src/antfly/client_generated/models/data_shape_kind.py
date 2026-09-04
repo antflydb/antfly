@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class DataShapeKind(str, Enum):
+class DataShapeKind(StrEnum):
     DOCUMENT = "document"
     ENDPOINT_SCHEMA = "endpoint_schema"
     EXTENSION_RELATION = "extension_relation"

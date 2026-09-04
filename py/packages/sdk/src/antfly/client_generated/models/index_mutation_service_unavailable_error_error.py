@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class IndexMutationServiceUnavailableErrorError(str, Enum):
+class IndexMutationServiceUnavailableErrorError(StrEnum):
     INDEX_CAPABILITY_UPGRADE_PENDING = "index_capability_upgrade_pending"
     INDEX_PROBE_UNAVAILABLE = "index_probe_unavailable"
 

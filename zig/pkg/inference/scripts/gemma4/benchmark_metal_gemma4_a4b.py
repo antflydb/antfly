@@ -66,9 +66,11 @@ def _write_json(path: Path, value: Any) -> None:
 
 def _git_provenance(repo: Path) -> dict[str, Any]:
     env = {**os.environ, "LC_ALL": "C"}
-    revision = subprocess.check_output(
-        ("git", "-C", str(repo), "rev-parse", "HEAD"), env=env
-    ).decode().strip()
+    revision = (
+        subprocess.check_output(("git", "-C", str(repo), "rev-parse", "HEAD"), env=env)
+        .decode()
+        .strip()
+    )
     status = subprocess.check_output(
         ("git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all"),
         env=env,
@@ -94,7 +96,8 @@ def _resolve_gguf(model: Path, explicit: Path | None) -> Path:
         candidates = [
             path
             for path in model.glob("*.gguf")
-            if "mmproj" not in path.name.lower() and "projector" not in path.name.lower()
+            if "mmproj" not in path.name.lower()
+            and "projector" not in path.name.lower()
         ]
         if not candidates:
             raise BenchmarkContractError(f"no decoder GGUF found under {model}")
@@ -165,7 +168,10 @@ def parse_sample(
     log = log_path.read_text(errors="replace")
     if payload.get("backend") != "metal":
         raise BenchmarkContractError(f"sample did not report Metal: {json_path}")
-    if payload.get("tokens") != expected_output_tokens or payload.get("finish_reason") != "length":
+    if (
+        payload.get("tokens") != expected_output_tokens
+        or payload.get("finish_reason") != "length"
+    ):
         raise BenchmarkContractError(
             f"sample was not exactly {expected_output_tokens} length-limited tokens: {json_path}"
         )
@@ -174,25 +180,35 @@ def parse_sample(
     prompt_text, prompt_ids = _token_line(log, "prompt_token_ids", log_path)
     output_sha = _sha256_text(output_text)
     prompt_sha = _sha256_text(prompt_text)
-    if len(output_ids) != expected_output_tokens or output_sha != expected_output_sha256:
+    if (
+        len(output_ids) != expected_output_tokens
+        or output_sha != expected_output_sha256
+    ):
         raise BenchmarkContractError(
             f"output token contract mismatch count={len(output_ids)} sha={output_sha}: {log_path}"
         )
-    if len(prompt_ids) != expected_prompt_tokens or prompt_sha != expected_prompt_sha256:
+    if (
+        len(prompt_ids) != expected_prompt_tokens
+        or prompt_sha != expected_prompt_sha256
+    ):
         raise BenchmarkContractError(
             f"prompt token contract mismatch count={len(prompt_ids)} sha={prompt_sha}: {log_path}"
         )
     if payload.get("token_ids") is not None and payload["token_ids"] != output_ids:
         raise BenchmarkContractError(f"JSON/log output token IDs differ: {json_path}")
 
-    mode, budget_mb, kv_mb, safety_mb, expert_slots = _last_runtime_marker(log, log_path)
+    mode, budget_mb, kv_mb, safety_mb, expert_slots = _last_runtime_marker(
+        log, log_path
+    )
     if mode != expected_mode or budget_mb != expected_budget_mb:
         raise BenchmarkContractError(
             f"A4B runtime mode/budget={mode}/{budget_mb}, expected "
             f"{expected_mode}/{expected_budget_mb}: {log_path}"
         )
     if kv_mb <= 0 or safety_mb <= 0 or expert_slots < 8:
-        raise BenchmarkContractError(f"invalid A4B bounded runtime geometry: {log_path}")
+        raise BenchmarkContractError(
+            f"invalid A4B bounded runtime geometry: {log_path}"
+        )
 
     metal = _mapping(payload.get("metal"), "metal", json_path)
     if metal.get("device") != expected_device:
@@ -217,7 +233,9 @@ def parse_sample(
         )
     }
     if counters["runtime_mapped_fallbacks"] or counters["runtime_mapped_failures"]:
-        raise BenchmarkContractError(f"mapped expert preparation fallback/failure: {json_path}")
+        raise BenchmarkContractError(
+            f"mapped expert preparation fallback/failure: {json_path}"
+        )
     for prefix in ("a4b_linear", "a4b_pair", "a4b_scatter"):
         attempts = counters[f"{prefix}_attempts"]
         successes = counters[f"{prefix}_successes"]
@@ -229,7 +247,9 @@ def parse_sample(
             )
 
     timing = _mapping(payload.get("timing_ms"), "timing_ms", json_path)
-    total_ms = _positive_finite(float(timing.get("generate") or 0), "generate", json_path)
+    total_ms = _positive_finite(
+        float(timing.get("generate") or 0), "generate", json_path
+    )
     prefill_ms = _positive_finite(
         float(timing.get("prefill_inner") or 0), "prefill_inner", json_path
     )
@@ -324,7 +344,11 @@ def _run_sample(
         )
     )
     if execution_mode == "compiled":
-        command[command.index("--a4b-residency-mode"):command.index("--a4b-residency-mode")] = (
+        command[
+            command.index("--a4b-residency-mode") : command.index(
+                "--a4b-residency-mode"
+            )
+        ] = (
             "--compiled-target",
             "whole-model",
         )
@@ -402,7 +426,9 @@ def build_summary(root: Path) -> dict[str, Any]:
     variant_metrics: dict[str, Any] = {}
     failures: list[str] = []
     for variant in ("baseline", "candidate"):
-        variant_samples = [sample for sample in measured if sample["variant"] == variant]
+        variant_samples = [
+            sample for sample in measured if sample["variant"] == variant
+        ]
         variant_metrics[variant] = {
             metric: _metric_stats([float(sample[metric]) for sample in variant_samples])
             for metric in (
@@ -416,7 +442,9 @@ def build_summary(root: Path) -> dict[str, Any]:
         for metric in ("total_ms", "prefill_ms", "decode_ms", "decode_tok_s"):
             cv = variant_metrics[variant][metric]["cv"]
             if cv > metadata["max_cv"]:
-                failures.append(f"{variant} {metric} CV {cv:.4f} exceeds {metadata['max_cv']:.4f}")
+                failures.append(
+                    f"{variant} {metric} CV {cv:.4f} exceeds {metadata['max_cv']:.4f}"
+                )
 
     ratio_stats = {
         key: _metric_stats([float(pair[key]) for pair in pairs])
@@ -440,7 +468,9 @@ def build_summary(root: Path) -> dict[str, Any]:
         >= metadata["min_target_wins"],
         "cv": not failures,
     }
-    failures.extend(name for name, passed in checks.items() if not passed and name != "cv")
+    failures.extend(
+        name for name, passed in checks.items() if not passed and name != "cv"
+    )
     return {
         "schema": SUMMARY_SCHEMA,
         "experiment_id": metadata["experiment_id"],
@@ -463,7 +493,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     if not 0 < args.max_cv < 1:
         raise BenchmarkContractError("--max-cv must be between zero and one")
     if not 0 <= args.min_target_wins <= args.runs:
-        raise BenchmarkContractError("--min-target-wins must be between zero and --runs")
+        raise BenchmarkContractError(
+            "--min-target-wins must be between zero and --runs"
+        )
     expected_prompt_sha = _validate_sha(
         args.expected_prompt_token_ids_sha256, "--expected-prompt-token-ids-sha256"
     )
@@ -498,7 +530,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             )
             serial += 1
     for pair in range(args.runs):
-        order = ("baseline", "candidate") if pair % 2 == 0 else ("candidate", "baseline")
+        order = (
+            ("baseline", "candidate") if pair % 2 == 0 else ("candidate", "baseline")
+        )
         for variant in order:
             invocations.append(
                 {
@@ -606,10 +640,14 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--expected-prompt-token-ids-sha256", required=True)
     run.add_argument("--output-tokens", type=int, default=128)
     run.add_argument("--expected-output-token-ids-sha256", required=True)
-    run.add_argument("--baseline-mode", choices=("streamed", "resident"), default="streamed")
+    run.add_argument(
+        "--baseline-mode", choices=("streamed", "resident"), default="streamed"
+    )
     run.add_argument("--baseline-budget-mb", type=int, default=2048)
     run.add_argument("--baseline-max-rss-mb", type=float, default=2304)
-    run.add_argument("--candidate-mode", choices=("streamed", "resident"), default="streamed")
+    run.add_argument(
+        "--candidate-mode", choices=("streamed", "resident"), default="streamed"
+    )
     run.add_argument("--candidate-budget-mb", type=int, default=2048)
     run.add_argument("--candidate-max-rss-mb", type=float, default=2304)
     run.add_argument("--runs", type=int, default=6)
@@ -639,7 +677,12 @@ def main() -> None:
         else:
             summary = build_summary(args.out_dir.resolve())
             _write_json(args.out_dir.resolve() / "summary.json", summary)
-    except (BenchmarkContractError, OSError, subprocess.SubprocessError, ValueError) as exc:
+    except (
+        BenchmarkContractError,
+        OSError,
+        subprocess.SubprocessError,
+        ValueError,
+    ) as exc:
         raise SystemExit(str(exc)) from exc
     ratios = summary["paired_ratios"]
     print(

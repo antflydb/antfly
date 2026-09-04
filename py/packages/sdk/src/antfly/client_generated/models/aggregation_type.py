@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class AggregationType(str, Enum):
+class AggregationType(StrEnum):
     AVG = "avg"
     CARDINALITY = "cardinality"
     COUNT = "count"

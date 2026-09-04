@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class EnrichmentKind(str, Enum):
+class EnrichmentKind(StrEnum):
     ASSET = "asset"
     CHUNK = "chunk"
     EMBEDDING = "embedding"

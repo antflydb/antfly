@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ArtifactRepairKind(str, Enum):
+class ArtifactRepairKind(StrEnum):
     ALGEBRAIC = "algebraic"
     ASSET = "asset"
     CHUNK = "chunk"
