@@ -327,6 +327,12 @@ pub const Detail = enum(c_int) {
     native_backup_projection_repair_failed,
     native_backup_projection_repair_paused,
     reranker_candidate_limit_exceeded,
+    // Reranker execution happens behind the independently generated data
+    // runtime boundary. Preserve the public retry/dependency classification
+    // instead of collapsing provider failures into RuntimeBoundaryFailure.
+    rerank_rate_limited,
+    rerank_transient_failure,
+    rerank_upstream_failure,
 };
 
 pub const Status = extern struct {
@@ -506,6 +512,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.NativeBackupProjectionRepairFailed => status(.corrupt, .native_backup_projection_repair_failed),
         error.NativeBackupProjectionRepairPaused => status(.conflict, .native_backup_projection_repair_paused),
         error.RerankerCandidateLimitExceeded => status(.invalid_argument, .reranker_candidate_limit_exceeded),
+        error.RerankRateLimited => status(.retryable, .rerank_rate_limited),
+        error.RerankTransientFailure => status(.retryable, .rerank_transient_failure),
+        error.RerankUpstreamFailure => status(.unavailable, .rerank_upstream_failure),
         error.EnrichmentNotFound => status(.not_found, .enrichment_not_found),
         error.InvalidExtensionEnrichment => status(.invalid_argument, .invalid_extension_enrichment),
         error.ConflictingEnrichmentConfig => status(.invalid_argument, .conflicting_enrichment_config),
@@ -963,6 +972,9 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .native_backup_projection_repair_failed => "NativeBackupProjectionRepairFailed",
         .native_backup_projection_repair_paused => "NativeBackupProjectionRepairPaused",
         .reranker_candidate_limit_exceeded => "RerankerCandidateLimitExceeded",
+        .rerank_rate_limited => "RerankRateLimited",
+        .rerank_transient_failure => "RerankTransientFailure",
+        .rerank_upstream_failure => "RerankUpstreamFailure",
     };
 }
 
@@ -989,6 +1001,9 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.NativeBackupRepairStateNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupRepairStateNotQuiescent)));
     try std.testing.expectEqual(error.NativeBackupProjectionNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupProjectionNotQuiescent)));
     try std.testing.expectEqual(error.RerankerCandidateLimitExceeded, errorFromStatus(statusFromError(error.RerankerCandidateLimitExceeded)));
+    try std.testing.expectEqual(error.RerankRateLimited, errorFromStatus(statusFromError(error.RerankRateLimited)));
+    try std.testing.expectEqual(error.RerankTransientFailure, errorFromStatus(statusFromError(error.RerankTransientFailure)));
+    try std.testing.expectEqual(error.RerankUpstreamFailure, errorFromStatus(statusFromError(error.RerankUpstreamFailure)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));

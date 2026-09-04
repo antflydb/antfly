@@ -1537,7 +1537,7 @@ pub const Client = struct {
         try socket.sendAll(bytes);
         var res = try self.readResponse(socket, req.method, self.responseSizeLimit(req));
         if (keep_alive_out) |out| {
-            out.* = res.headers.isKeepAlive(.HTTP_1_1);
+            out.* = res.headers.isKeepAlive(res.version);
         }
         return res;
     }
@@ -1563,7 +1563,7 @@ pub const Client = struct {
             progress_ctx,
         );
         if (keep_alive_out) |out| {
-            out.* = res.headers.isKeepAlive(.HTTP_1_1);
+            out.* = res.headers.isKeepAlive(res.version);
         }
         return res;
     }
@@ -1578,7 +1578,7 @@ pub const Client = struct {
         try session.flush();
         var res = try self.readResponse(session, req.method, self.responseSizeLimit(req));
         if (keep_alive_out) |out| {
-            out.* = res.headers.isKeepAlive(.HTTP_1_1);
+            out.* = res.headers.isKeepAlive(res.version);
         }
         return res;
     }
@@ -1606,7 +1606,7 @@ pub const Client = struct {
             progress_ctx,
         );
         if (keep_alive_out) |out| {
-            out.* = res.headers.isKeepAlive(.HTTP_1_1);
+            out.* = res.headers.isKeepAlive(res.version);
         }
         return res;
     }
@@ -2661,6 +2661,15 @@ pub const Client = struct {
         try appendDecompressed(allocator, encoded, .raw, output, max_size);
     }
 
+    fn takeParsedResponse(parser: *Parser, code: u16) Response {
+        var res = Response.init(parser.allocator, code);
+        res.version = parser.version;
+        res.headers.deinit();
+        res.headers = parser.headers;
+        parser.headers = Headers.init(parser.allocator);
+        return res;
+    }
+
     /// Builds a Response by streaming the body through an Io.Reader chain.
     /// After headers are parsed, the chain is: leftover bytes → network → framing → decompress → output.
     fn buildStreamingResponse(
@@ -2672,12 +2681,8 @@ pub const Client = struct {
         max_response_size: usize,
     ) !Response {
         const code = parser.status_code orelse return error.InvalidResponse;
-        var res = Response.init(parser.allocator, code);
+        var res = takeParsedResponse(parser, code);
         errdefer res.deinit();
-        // Move headers ownership from parser to response.
-        res.headers.deinit();
-        res.headers = parser.headers;
-        parser.headers = Headers.init(parser.allocator);
 
         // RFC 7230 §3.3: Responses to HEAD and 1xx/204/304 status codes
         // MUST NOT contain a message body regardless of headers.
@@ -2809,11 +2814,8 @@ pub const Client = struct {
         progress_ctx: ?*anyopaque,
     ) !Response {
         const code = parser.status_code orelse return error.InvalidResponse;
-        var res = Response.init(parser.allocator, code);
+        var res = takeParsedResponse(parser, code);
         errdefer res.deinit();
-        res.headers.deinit();
-        res.headers = parser.headers;
-        parser.headers = Headers.init(parser.allocator);
 
         const no_body_status = (code >= 100 and code < 200) or code == 204 or code == 304;
         const has_body = !no_body_status and req_method != .HEAD and
@@ -3343,6 +3345,23 @@ test "Response parsing" {
     const code = parser.status_code orelse return error.InvalidResponse;
     try std.testing.expectEqual(@as(u16, 200), code);
     try std.testing.expectEqualStrings("application/json", parser.headers.get("Content-Type").?);
+}
+
+test "parsed HTTP 1.0 response is not reusable by default" {
+    const allocator = std.testing.allocator;
+    const data = "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n";
+
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
+
+    _ = try parser.feed(data);
+    try std.testing.expect(parser.isComplete());
+
+    var response = Client.takeParsedResponse(&parser, parser.status_code orelse return error.InvalidResponse);
+    defer response.deinit();
+
+    try std.testing.expectEqual(types.Version.HTTP_1_0, response.version);
+    try std.testing.expect(!response.headers.isKeepAlive(response.version));
 }
 
 test "Client stores Set-Cookie headers" {

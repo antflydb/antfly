@@ -17352,6 +17352,10 @@ fn applyReranker(
         error.SecretNotFound,
         => return error.InvalidQueryRequest,
         else => {
+            std.log.debug("reranker provider request failed provider={s} err={s}", .{
+                @tagName(cfg.provider),
+                @errorName(err),
+            });
             const normalized = reranking_runtime.normalizeOperationalError(err);
             return switch (normalized) {
                 error.OutOfMemory,
