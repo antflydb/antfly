@@ -101,6 +101,25 @@ test "friendly alias refs parse as model refs" {
     }
 }
 
+test "gemma4 qat gguf pulls derive the MTP assistant companion ref" {
+    const allocator = std.testing.allocator;
+    const e4b = try ModelRef.parse("google/gemma-4-E4B-it-qat-q4_0-gguf:gguf");
+    const companion = (try ModelRegistry.gemma4MtpAssistantCompanionRefAlloc(allocator, e4b)).?;
+    defer allocator.free(companion);
+    try std.testing.expectEqualStrings(
+        "google/gemma-4-E4B-it-qat-q4_0-unquantized-assistant",
+        companion,
+    );
+    // The companion itself has no companion (no -gguf suffix): pull cannot recurse.
+    const companion_ref = try ModelRef.parse(companion);
+    try std.testing.expect(try ModelRegistry.gemma4MtpAssistantCompanionRefAlloc(allocator, companion_ref) == null);
+    // Non-QAT and non-gemma repos are untouched.
+    const plain = try ModelRef.parse("ggml-org/gemma-4-e2b-it-gguf");
+    try std.testing.expect(try ModelRegistry.gemma4MtpAssistantCompanionRefAlloc(allocator, plain) == null);
+    const other = try ModelRef.parse("qwen/qwen3-8b-qat-q4_0-gguf");
+    try std.testing.expect(try ModelRegistry.gemma4MtpAssistantCompanionRefAlloc(allocator, other) == null);
+}
+
 pub const ModelRef = struct {
     owner: []const u8,
     name: []const u8,
@@ -437,6 +456,50 @@ pub const ModelRegistry = struct {
         try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
         try transaction.commit(io);
+
+        // Gemma4 QAT gguf checkpoints ship a sibling MTP assistant repo that
+        // enables self-speculative decoding; fetch it best-effort so the
+        // drafter is on disk when speculation is enabled. Missing companion
+        // repos must not fail the primary pull. The companion never inherits
+        // the caller's task/capability overrides (it is a drafter, not a
+        // servable generator), and an already-installed companion is not
+        // re-fetched on primary re-pulls.
+        if (try gemma4MtpAssistantCompanionRefAlloc(self.allocator, ref)) |companion_ref| {
+            defer self.allocator.free(companion_ref);
+            const companion_installed = blk: {
+                const companion_parsed = ModelRef.parse(companion_ref) catch break :blk false;
+                const companion_dest = modelInstallDirAlloc(self.allocator, resolved_models_dir, companion_parsed) catch break :blk false;
+                defer self.allocator.free(companion_dest);
+                break :blk isModelDir(io, companion_dest);
+            };
+            if (!companion_installed) {
+                self.pull(io, companion_ref, hub_config, null, null, projector_selection) catch |err| {
+                    std.log.warn(
+                        "optional Gemma4 MTP assistant pull failed for {s}: {s}",
+                        .{ companion_ref, @errorName(err) },
+                    );
+                };
+            }
+        }
+    }
+
+    /// Companion MTP assistant ref for a Gemma4 QAT gguf model
+    /// (`owner/...-qat-q4_0-gguf` -> `owner/...-qat-q4_0-unquantized-assistant`),
+    /// or null when the ref has no known companion. The assistant name never
+    /// ends in `-gguf`, so the companion pull cannot recurse further.
+    fn gemma4MtpAssistantCompanionRefAlloc(
+        allocator: std.mem.Allocator,
+        ref: ModelRef,
+    ) !?[]const u8 {
+        const suffix = "-gguf";
+        if (!std.mem.endsWith(u8, ref.name, suffix)) return null;
+        if (std.ascii.indexOfIgnoreCase(ref.name, "gemma-4-") == null) return null;
+        if (std.ascii.indexOfIgnoreCase(ref.name, "-qat-") == null) return null;
+        return try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}-unquantized-assistant",
+            .{ ref.owner, ref.name[0 .. ref.name.len - suffix.len] },
+        );
     }
 
     fn appendDiscoveredModel(

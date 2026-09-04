@@ -22,6 +22,97 @@ pub const GroupConfig = struct {
     storage: core.Storage,
 };
 
+/// Stable identity of one locally hosted replica. Desired membership is
+/// deliberately absent: voter, learner, and transport topology evolve while
+/// this identity remains installed.
+pub const ReplicaIdentity = struct {
+    group_id: core.types.GroupId,
+    local_node_id: core.types.NodeId,
+};
+
+/// Restart-scoped Raft behavior captured when a live group is admitted.
+/// Bootstrap position, membership, and diagnostic hooks are intentionally not
+/// part of this value: they are either durable observed state or independently
+/// mutable control-plane state.
+pub const ReplicaRuntimePolicy = struct {
+    election_tick: u32,
+    heartbeat_tick: u32,
+    random_seed: ?u64,
+    max_size_per_msg: usize,
+    max_committed_size_per_ready: usize,
+    max_inflight_msgs: u32,
+    max_inflight_bytes: usize,
+    max_uncommitted_entries_size: usize,
+    async_storage_writes: bool,
+    check_quorum: bool,
+    pre_vote: bool,
+    step_down_on_removal: bool,
+    disable_proposal_forwarding: bool,
+    disable_conf_change_validation: bool,
+    read_only_option: core.types.ReadOnlyOption,
+
+    pub fn fromConfig(cfg: core.Config) ReplicaRuntimePolicy {
+        const normalized = cfg.withNormalizedDefaults();
+        return .{
+            .election_tick = normalized.election_tick,
+            .heartbeat_tick = normalized.heartbeat_tick,
+            .random_seed = normalized.random_seed,
+            .max_size_per_msg = normalized.max_size_per_msg,
+            .max_committed_size_per_ready = normalized.max_committed_size_per_ready,
+            .max_inflight_msgs = normalized.max_inflight_msgs,
+            .max_inflight_bytes = normalized.max_inflight_bytes,
+            .max_uncommitted_entries_size = normalized.max_uncommitted_entries_size,
+            .async_storage_writes = normalized.async_storage_writes,
+            .check_quorum = normalized.check_quorum,
+            .pre_vote = normalized.pre_vote,
+            .step_down_on_removal = normalized.step_down_on_removal,
+            .disable_proposal_forwarding = normalized.disable_proposal_forwarding,
+            .disable_conf_change_validation = normalized.disable_conf_change_validation,
+            .read_only_option = normalized.read_only_option,
+        };
+    }
+
+    pub fn firstConflict(
+        self: ReplicaRuntimePolicy,
+        desired: ReplicaRuntimePolicy,
+    ) ?ReplicaRuntimePolicyField {
+        inline for (std.meta.fields(ReplicaRuntimePolicy)) |field| {
+            if (!std.meta.eql(@field(self, field.name), @field(desired, field.name)))
+                return @field(ReplicaRuntimePolicyField, field.name);
+        }
+        return null;
+    }
+
+    pub fn fingerprint(self: ReplicaRuntimePolicy) u64 {
+        var hasher = std.hash.Wyhash.init(0x726166745f706f6c);
+        inline for (std.meta.fields(ReplicaRuntimePolicy)) |field| {
+            std.hash.autoHash(&hasher, @field(self, field.name));
+        }
+        return hasher.final();
+    }
+};
+
+pub const ReplicaRuntimePolicyField = std.meta.FieldEnum(ReplicaRuntimePolicy);
+
+pub const ReplicaAdmissionConflict = union(enum) {
+    local_node_id: struct {
+        installed: core.types.NodeId,
+        desired: core.types.NodeId,
+    },
+    runtime_policy: struct {
+        field: ReplicaRuntimePolicyField,
+        installed_fingerprint: u64,
+        desired_fingerprint: u64,
+    },
+
+    pub fn fieldName(self: ReplicaAdmissionConflict) []const u8 {
+        return switch (self) {
+            .local_node_id => "local_node_id",
+            .runtime_policy => |conflict| @tagName(conflict.field),
+        };
+    }
+};
+
 pub const Group = struct {
     const max_tracked_proposal_receipts: usize = 4096;
 
@@ -40,22 +131,27 @@ pub const Group = struct {
     raw_node: core.RawNode,
     tracked_proposal_receipts: std.AutoHashMapUnmanaged(ProposalReceiptKey, ProposalReceiptProof) = .empty,
 
-    pub fn init(alloc: std.mem.Allocator, cfg: GroupConfig) !Group {
+    pub fn validateConfig(cfg: GroupConfig) !void {
         if (cfg.group_id == 0) return error.InvalidGroupId;
         if (cfg.local_node_id == 0) return error.InvalidLocalNodeId;
         if (cfg.raft_config.group_id != cfg.group_id) return error.GroupIdMismatch;
         if (cfg.raft_config.id != cfg.local_node_id) return error.LocalNodeIdMismatch;
+        try cfg.raft_config.validate();
+    }
 
-        const owned_peers = try alloc.dupe(core.types.NodeId, cfg.raft_config.peers);
-        errdefer alloc.free(owned_peers);
+    pub fn init(alloc: std.mem.Allocator, cfg: GroupConfig) !Group {
+        try validateConfig(cfg);
 
         var owned_cfg = cfg;
+        owned_cfg.raft_config = cfg.raft_config.withNormalizedDefaults();
+        const owned_peers = try alloc.dupe(core.types.NodeId, owned_cfg.raft_config.peers);
+        errdefer alloc.free(owned_peers);
         owned_cfg.raft_config.peers = owned_peers;
 
         return .{
             .alloc = alloc,
             .cfg = owned_cfg,
-            .raw_node = try core.RawNode.init(alloc, cfg.raft_config, cfg.storage),
+            .raw_node = try core.RawNode.init(alloc, owned_cfg.raft_config, cfg.storage),
         };
     }
 
@@ -74,6 +170,38 @@ pub const Group = struct {
         return self.cfg.local_node_id;
     }
 
+    pub fn identity(self: *const Group) ReplicaIdentity {
+        return .{ .group_id = self.cfg.group_id, .local_node_id = self.cfg.local_node_id };
+    }
+
+    pub fn runtimePolicy(self: *const Group) ReplicaRuntimePolicy {
+        return .fromConfig(self.cfg.raft_config);
+    }
+
+    /// Admission idempotence covers stable identity and restart-scoped policy
+    /// only. `raft_config.peers` is a bootstrap/transport reachability input;
+    /// live membership is authoritative in ConfState and changes exclusively
+    /// through committed ConfChange entries.
+    pub fn admissionConflict(self: *const Group, cfg: GroupConfig) ?ReplicaAdmissionConflict {
+        if (self.cfg.local_node_id != cfg.local_node_id) return .{ .local_node_id = .{
+            .installed = self.cfg.local_node_id,
+            .desired = cfg.local_node_id,
+        } };
+        const installed_policy = self.runtimePolicy();
+        const desired_policy = ReplicaRuntimePolicy.fromConfig(cfg.raft_config);
+        if (installed_policy.firstConflict(desired_policy)) |field|
+            return .{ .runtime_policy = .{
+                .field = field,
+                .installed_fingerprint = installed_policy.fingerprint(),
+                .desired_fingerprint = desired_policy.fingerprint(),
+            } };
+        return null;
+    }
+
+    pub fn admissionConfigEql(self: *const Group, cfg: GroupConfig) bool {
+        return self.admissionConflict(cfg) == null;
+    }
+
     pub fn asyncStorageWrites(self: *const Group) bool {
         return self.cfg.raft_config.async_storage_writes;
     }
@@ -84,6 +212,28 @@ pub const Group = struct {
 
     pub fn step(self: *Group, msg: core.Message) !void {
         return try self.raw_node.step(msg);
+    }
+
+    pub fn reportSnapshotFailure(
+        self: *Group,
+        to: core.types.NodeId,
+        leader_term: core.types.Term,
+        snapshot_index: core.types.Index,
+        snapshot_term: core.types.Term,
+        attempt_generation: u64,
+    ) bool {
+        return self.raw_node.reportSnapshotFailure(to, leader_term, snapshot_index, snapshot_term, attempt_generation);
+    }
+
+    pub fn reportSnapshotDelivered(
+        self: *Group,
+        to: core.types.NodeId,
+        leader_term: core.types.Term,
+        snapshot_index: core.types.Index,
+        snapshot_term: core.types.Term,
+        attempt_generation: u64,
+    ) bool {
+        return self.raw_node.reportSnapshotDelivered(to, leader_term, snapshot_index, snapshot_term, attempt_generation);
     }
 
     pub fn campaign(self: *Group) !void {
@@ -105,6 +255,19 @@ pub const Group = struct {
 
     pub fn proposeWithReceipt(self: *Group, data: []const u8, accepted_index: *?core.types.Index) !void {
         return try self.raw_node.proposeWithReceipt(data, accepted_index);
+    }
+
+    pub fn proposeBatchWithReceipt(
+        self: *Group,
+        payloads: []const []const u8,
+        accepted_first_index: *?core.types.Index,
+        accepted_last_index: *?core.types.Index,
+    ) !void {
+        return try self.raw_node.proposeBatchWithReceipt(
+            payloads,
+            accepted_first_index,
+            accepted_last_index,
+        );
     }
 
     /// Reserves the bounded bookkeeping needed before Raft accepts a proposal.

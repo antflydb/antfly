@@ -356,6 +356,11 @@ pub const Font = struct {
                     const escaped = program[i];
                     i += 1;
                     switch (escaped) {
+                        // Obsolete Type 1 `dotsection`. Early Type1C
+                        // producers emitted it in otherwise valid Type 2
+                        // charstrings. It has no effect on modern rasterizers
+                        // and is accepted as a compatibility no-op.
+                        0 => {},
                         3 => try binaryStackOp(alloc, stack, andFloat),
                         4 => try binaryStackOp(alloc, stack, orFloat),
                         5 => try unaryStackOp(stack, notFloat),
@@ -1503,7 +1508,7 @@ test "cff executes local and global subroutines with arithmetic operators" {
     try std.testing.expectApproxEqAbs(@as(f64, 80), points[2].y, 0.001);
 }
 
-test "cff hintmask skips mask bytes and continues outline parsing" {
+test "cff accepts legacy dotsection and continues after hintmask" {
     const alloc = std.testing.allocator;
     const font = Font{
         .bytes = &.{},
@@ -1517,9 +1522,10 @@ test "cff hintmask skips mask bytes and continues outline parsing" {
     const program =
         [_]u8{
             139, 149, 1,
-            19,  0,   139,
-            139, 21,  189,
-            139, 5,   14,
+            19,  0,   12,
+            0,   139, 139,
+            21,  189, 139,
+            5,   14,
         };
 
     var contours = std.ArrayList(GlyphContour).empty;

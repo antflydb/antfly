@@ -1354,6 +1354,19 @@ fn applyGgufTokenizerStopMetadata(view: gguf_metadata.View, config: *Config) voi
         addEosTokenId(config, token_id);
     }
 
+    // Gemma chat templates terminate assistant turns with <end_of_turn>, but
+    // common GGUF exports advertise only <eos> through eos_token_id. The GGUF
+    // tokenizer may store that special token under its directional `<turn|>`
+    // spelling. Treat either exact terminator as an additional EOS so chat
+    // generation cannot continue into another templated turn.
+    if (config.usesGemma4Channels()) {
+        for ([_][]const u8{ "<end_of_turn>", "<turn|>" }) |token| {
+            if (ggufTokenStringId(view, token)) |token_id| {
+                addEosTokenId(config, token_id);
+            }
+        }
+    }
+
     // Some GGUF exports include the special tokens but omit *_token_id
     // metadata. Fall back to exact token names so GGUF-only generators can
     // still stop when the model emits EOS.
@@ -2699,9 +2712,19 @@ test "parse gemma4 multi eos and generation suppress tokens" {
 }
 
 test "parse GGUF tokenizer eos token metadata" {
+    var token_values = [_]gguf_format.MetadataValue{
+        .{ .string = "<pad>" },
+        .{ .string = "<eos>" },
+        .{ .string = "<end_of_turn>" },
+        .{ .string = "<turn|>" },
+    };
     var metadata = [_]gguf_format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "gemma4" } },
         .{ .key = "tokenizer.ggml.eos_token_id", .value = .{ .u32 = 1 } },
+        .{ .key = "tokenizer.ggml.tokens", .value = .{ .array = .{
+            .element_type = .string,
+            .values = token_values[0..],
+        } } },
     };
     var file = gguf_format.File{
         .header = .{ .version = 3, .tensor_count = 0, .metadata_count = metadata.len },
@@ -2715,6 +2738,9 @@ test "parse GGUF tokenizer eos token metadata" {
     try std.testing.expect(config.usesGemma4Channels());
     try std.testing.expectEqual(@as(i32, 1), config.eos_token_id);
     try std.testing.expect(config.isEosToken(1));
+    try std.testing.expect(config.isEosToken(2));
+    try std.testing.expect(config.isEosToken(3));
+    try std.testing.expectEqual(@as(u8, 2), config.extra_eos_token_ids_len);
 }
 
 test "parse GGUF tokenizer eos token from token string fallback" {

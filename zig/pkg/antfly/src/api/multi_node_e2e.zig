@@ -431,10 +431,13 @@ const PublicApiStatusSource = struct {
                 .status = status,
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 .create_table = createTable,
                 .drop_table = dropTable,
                 .update_schema = updateSchema,
-                .create_index = createIndex,
+                .replace_table_definition = replaceTableDefinition,
                 .drop_index = dropIndex,
             },
         };
@@ -495,6 +498,16 @@ const PublicApiStatusSource = struct {
         try self.node.upsertTable(updated);
     }
 
+    fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var snapshot = try self.node.adminSnapshot();
+        defer self.node.freeAdminSnapshot(&snapshot);
+        const current = api_tables.findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
+        if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id)
+            return error.TableGenerationChanged;
+        try self.node.upsertTable(replacement);
+    }
+
     fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var snapshot = try self.node.adminSnapshot();
@@ -517,6 +530,9 @@ const PublicApiCatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
             },
         };
     }

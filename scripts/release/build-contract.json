@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "required_source_paths": [
+    "build.zig",
+    "scripts/install.sh",
+    "scripts/packaging/build_zig_release_archive.sh",
+    "scripts/packaging/package_cli_release.py",
+    "scripts/packaging/test_cabi_packaging.py",
+    "scripts/packaging/test_reproducible_tar.py",
+    "scripts/release/build_cli_snapshot.py",
+    "scripts/release/release_channels.py",
+    "scripts/release/release_platforms.py",
+    "scripts/release/verify_cli_snapshot.py",
+    "scripts/release/platforms.json",
+    "ts/package.json",
+    "ts/packages/cli/package.json",
+    "py/packages/cli/pyproject.toml",
+    "openapi.yaml"
+  ]
+}

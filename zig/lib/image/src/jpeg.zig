@@ -211,6 +211,36 @@ pub const DecodedImage = struct {
     height: u32,
 };
 
+pub const FourComponentMode = enum {
+    /// Adobe CMYK/YCCK samples use the inverted convention expected by
+    /// ordinary standalone JPEG viewers.
+    jpeg_display,
+    /// Apply PDF DeviceCMYK sample polarity after DCT reconstruction. This is
+    /// intentionally opt-in so standalone JPEG callers retain the convention
+    /// used by ordinary image viewers. For YCCK this preserves the resulting
+    /// PDF DeviceCMYK component polarity after the APP14 color transform.
+    pdf_device_cmyk,
+};
+
+pub const DecodeOptions = struct {
+    /// Decode baseline DCT images at the smallest native 1/2, 1/4, or 1/8
+    /// resolution whose long edge is at most this target when possible.
+    max_dimension: ?u32 = null,
+    four_component_mode: FourComponentMode = .jpeg_display,
+};
+
+pub const DecodedDimensions = struct { width: u32, height: u32 };
+
+pub fn plannedDecodeDimensions(jpeg_bytes: []const u8, options: DecodeOptions) !DecodedDimensions {
+    const structure = try parseStructure(jpeg_bytes);
+    const scalable = canPureZigDecodeGrayscaleBaseline(structure) or canPureZigDecodeColorBaseline(structure);
+    const scale = if (scalable) baselineDctScale(structure.info.width, structure.info.height, options.max_dimension) else 1;
+    return .{
+        .width = scaledDimension(structure.info.width, scale),
+        .height = scaledDimension(structure.info.height, scale),
+    };
+}
+
 const SamplePlane = struct {
     width: usize = 0,
     height: usize = 0,
@@ -501,6 +531,13 @@ fn hasCmykComponentIds(info: Info) bool {
         info.components[3].id == 'K';
 }
 
+fn hasSequentialThreeComponentIds(info: Info, first: u8) bool {
+    return info.component_count == 3 and
+        info.components[0].id == first and
+        info.components[1].id == first + 1 and
+        info.components[2].id == first + 2;
+}
+
 fn colorEncodingForStructure(structure: Structure) ?ColorEncoding {
     return switch (structure.info.component_count) {
         3 => if (structure.adobe_transform) |transform|
@@ -509,7 +546,7 @@ fn colorEncodingForStructure(structure: Structure) ?ColorEncoding {
                 1 => .ycbcr,
                 else => null,
             }
-        else if (structure.info.components[0].id == 1 and structure.info.components[1].id == 2 and structure.info.components[2].id == 3)
+        else if (hasSequentialThreeComponentIds(structure.info, 0) or hasSequentialThreeComponentIds(structure.info, 1))
             .ycbcr
         else if (structure.info.components[0].id == 'R' and structure.info.components[1].id == 'G' and structure.info.components[2].id == 'B')
             .rgb
@@ -1221,24 +1258,28 @@ fn applyProgressiveScan(
 }
 
 pub fn decodeRgba(alloc: Allocator, jpeg_bytes: []const u8) !DecodedImage {
+    return decodeRgbaWithOptions(alloc, jpeg_bytes, .{});
+}
+
+pub fn decodeRgbaWithOptions(alloc: Allocator, jpeg_bytes: []const u8, options: DecodeOptions) !DecodedImage {
     const structure = try parseStructure(jpeg_bytes);
     if (supportsPlannedLosslessDecode(structure)) {
         return decodeRgbaPureZigLossless(alloc, jpeg_bytes, structure);
     }
     if (canPureZigDecodeGrayscaleBaseline(structure)) {
-        return decodeRgbaPureZigGrayscaleBaseline(alloc, jpeg_bytes, structure);
+        return decodeRgbaPureZigGrayscaleBaseline(alloc, jpeg_bytes, structure, baselineDctScale(structure.info.width, structure.info.height, options.max_dimension));
     }
     if (canPureZigDecodeColorBaseline(structure)) {
-        return decodeRgbaPureZigColorBaseline(alloc, jpeg_bytes, structure);
+        return decodeRgbaPureZigColorBaseline(alloc, jpeg_bytes, structure, baselineDctScale(structure.info.width, structure.info.height, options.max_dimension), options.four_component_mode);
     }
     if (canPureZigDecodeProgressive(structure)) {
-        return decodeRgbaPureZigProgressive(alloc, jpeg_bytes, structure);
+        return decodeRgbaPureZigProgressive(alloc, jpeg_bytes, structure, options.four_component_mode);
     }
     if (canPureZigDecodeArithmeticProgressive(structure)) {
-        return decodeRgbaPureZigArithmeticProgressive(alloc, jpeg_bytes, structure);
+        return decodeRgbaPureZigArithmeticProgressive(alloc, jpeg_bytes, structure, options.four_component_mode);
     }
     if (supportsPlannedArithmeticDecode(structure)) {
-        return decodeRgbaPureZigArithmeticSequential(alloc, jpeg_bytes, structure);
+        return decodeRgbaPureZigArithmeticSequential(alloc, jpeg_bytes, structure, options.four_component_mode);
     }
 
     return error.JpegDecodeFailed;
@@ -1578,6 +1619,7 @@ fn decodeRgbaPureZigArithmeticProgressive(
     alloc: Allocator,
     jpeg_bytes: []const u8,
     structure: Structure,
+    four_component_mode: FourComponentMode,
 ) !DecodedImage {
     const width = structure.info.width;
     const height = structure.info.height;
@@ -1663,7 +1705,7 @@ fn decodeRgbaPureZigArithmeticProgressive(
             }
         }
 
-        renderColorPlanesToRgba(rgba, width, height, structure.info.bits_per_sample, color_encoding, structure.info.components, progressive.max_h, progressive.max_v, component_planes);
+        renderColorPlanesToRgba(rgba, width, height, structure.info.bits_per_sample, color_encoding, structure.info.components, progressive.max_h, progressive.max_v, component_planes, four_component_mode);
     }
 
     return .{
@@ -2158,6 +2200,7 @@ fn decodeRgbaPureZigArithmeticSequential(
     alloc: Allocator,
     jpeg_bytes: []const u8,
     structure: Structure,
+    four_component_mode: FourComponentMode,
 ) !DecodedImage {
     const width = structure.info.width;
     const height = structure.info.height;
@@ -2291,7 +2334,7 @@ fn decodeRgbaPureZigArithmeticSequential(
             }
         }
 
-        renderColorPlanesToRgba(rgba, width, height, structure.info.bits_per_sample, color_encoding, structure.info.components, max_h, max_v, component_planes);
+        renderColorPlanesToRgba(rgba, width, height, structure.info.bits_per_sample, color_encoding, structure.info.components, max_h, max_v, component_planes, four_component_mode);
     }
 
     return .{
@@ -2504,9 +2547,12 @@ fn decodeRgbaPureZigGrayscaleBaseline(
     alloc: Allocator,
     jpeg_bytes: []const u8,
     structure: Structure,
+    dct_scale: u8,
 ) !DecodedImage {
-    const width = structure.info.width;
-    const height = structure.info.height;
+    const source_width = structure.info.width;
+    const source_height = structure.info.height;
+    const width = scaledDimension(source_width, dct_scale);
+    const height = scaledDimension(source_height, dct_scale);
     const pixel_count = @as(usize, width) * @as(usize, height);
     const rgba = try alloc.alloc(u8, pixel_count * 4);
     errdefer alloc.free(rgba);
@@ -2523,8 +2569,8 @@ fn decodeRgbaPureZigGrayscaleBaseline(
     var dc_predictor: i64 = 0;
     // A one-component scan is non-interleaved, so each MCU contains one
     // 8x8 block even when the frame carries non-unit sampling factors.
-    const blocks_x = @divFloor(@as(usize, width) + 7, 8);
-    const blocks_y = @divFloor(@as(usize, height) + 7, 8);
+    const blocks_x = @divFloor(@as(usize, source_width) + 7, 8);
+    const blocks_y = @divFloor(@as(usize, source_height) + 7, 8);
     const restart_interval = structure.restart_interval orelse 0;
     var restart_index: u8 = 0;
     var mcus_decoded: usize = 0;
@@ -2535,8 +2581,15 @@ fn decodeRgbaPureZigGrayscaleBaseline(
             const block = try decodeBaselineBlock(&reader, dc_table, ac_table, dc_predictor);
             dc_predictor = block.dc_predictor;
 
-            const spatial = dequantizeAndInverseDctWithSamplePrecision(block.coefficients, quant_table, structure.info.bits_per_sample);
-            writeGrayscaleBlockRgba(rgba, width, height, block_x, block_y, spatial);
+            switch (dct_scale) {
+                8 => writeScaledGrayscaleBlockRgba(rgba, width, height, block_x, block_y, 8, dequantizeAndInverseDctScaledNative(block.coefficients, quant_table, structure.info.bits_per_sample, 8), structure.info.bits_per_sample),
+                4 => writeScaledGrayscaleBlockRgba(rgba, width, height, block_x, block_y, 4, dequantizeAndInverseDctScaledNative(block.coefficients, quant_table, structure.info.bits_per_sample, 4), structure.info.bits_per_sample),
+                2 => writeScaledGrayscaleBlockRgba(rgba, width, height, block_x, block_y, 2, dequantizeAndInverseDctScaledNative(block.coefficients, quant_table, structure.info.bits_per_sample, 2), structure.info.bits_per_sample),
+                else => {
+                    const spatial = dequantizeAndInverseDctWithSamplePrecision(block.coefficients, quant_table, structure.info.bits_per_sample);
+                    writeGrayscaleBlockRgba(rgba, width, height, block_x, block_y, spatial);
+                },
+            }
 
             mcus_decoded += 1;
             if (restart_interval != 0 and mcus_decoded < total_mcus and mcus_decoded % restart_interval == 0) {
@@ -2558,9 +2611,13 @@ fn decodeRgbaPureZigColorBaseline(
     alloc: Allocator,
     jpeg_bytes: []const u8,
     structure: Structure,
+    dct_scale: u8,
+    four_component_mode: FourComponentMode,
 ) !DecodedImage {
-    const width = structure.info.width;
-    const height = structure.info.height;
+    const source_width = structure.info.width;
+    const source_height = structure.info.height;
+    const width = scaledDimension(source_width, dct_scale);
+    const height = scaledDimension(source_height, dct_scale);
     const pixel_count = @as(usize, width) * @as(usize, height);
     const rgba = try alloc.alloc(u8, pixel_count * 4);
     errdefer alloc.free(rgba);
@@ -2589,8 +2646,8 @@ fn decodeRgbaPureZigColorBaseline(
         if (component.vertical_sampling > max_v) max_v = component.vertical_sampling;
     }
 
-    const blocks_x = @divFloor(@as(usize, width) + (@as(usize, max_h) * 8 - 1), @as(usize, max_h) * 8);
-    const blocks_y = @divFloor(@as(usize, height) + (@as(usize, max_v) * 8 - 1), @as(usize, max_v) * 8);
+    const blocks_x = @divFloor(@as(usize, source_width) + (@as(usize, max_h) * 8 - 1), @as(usize, max_h) * 8);
+    const blocks_y = @divFloor(@as(usize, source_height) + (@as(usize, max_v) * 8 - 1), @as(usize, max_v) * 8);
     const total_mcus = blocks_x * blocks_y;
     var mcus_decoded: usize = 0;
 
@@ -2618,16 +2675,16 @@ fn decodeRgbaPureZigColorBaseline(
                         dc_predictors[frame_index],
                     ) catch |err| return err;
                     dc_predictors[frame_index] = block.dc_predictor;
-                    const spatial = dequantizeAndInverseDctNativeWithSamplePrecision(
-                        block.coefficients,
-                        component_quant_tables[frame_index],
-                        structure.info.bits_per_sample,
-                    );
                     const block_col = block_index % @as(usize, component.horizontal_sampling);
                     const block_row = block_index / @as(usize, component.horizontal_sampling);
                     const plane_block_x = mcu_x * @as(usize, component.horizontal_sampling) + block_col;
                     const plane_block_y = mcu_y * @as(usize, component.vertical_sampling) + block_row;
-                    writeSpatialBlockToPlane(component_planes[frame_index], plane_block_x, plane_block_y, spatial);
+                    switch (dct_scale) {
+                        8 => writeScaledDctBlockToPlane(component_planes[frame_index], plane_block_x, plane_block_y, 8, dequantizeAndInverseDctScaledNative(block.coefficients, component_quant_tables[frame_index], structure.info.bits_per_sample, 8)),
+                        4 => writeScaledDctBlockToPlane(component_planes[frame_index], plane_block_x, plane_block_y, 4, dequantizeAndInverseDctScaledNative(block.coefficients, component_quant_tables[frame_index], structure.info.bits_per_sample, 4)),
+                        2 => writeScaledDctBlockToPlane(component_planes[frame_index], plane_block_x, plane_block_y, 2, dequantizeAndInverseDctScaledNative(block.coefficients, component_quant_tables[frame_index], structure.info.bits_per_sample, 2)),
+                        else => writeSpatialBlockToPlane(component_planes[frame_index], plane_block_x, plane_block_y, dequantizeAndInverseDctNativeWithSamplePrecision(block.coefficients, component_quant_tables[frame_index], structure.info.bits_per_sample)),
+                    }
                 }
             }
 
@@ -2640,7 +2697,7 @@ fn decodeRgbaPureZigColorBaseline(
         }
     }
 
-    renderColorPlanesToRgba(rgba, width, height, structure.info.bits_per_sample, color_encoding, structure.info.components, max_h, max_v, component_planes);
+    renderColorPlanesToRgba(rgba, width, height, structure.info.bits_per_sample, color_encoding, structure.info.components, max_h, max_v, component_planes, four_component_mode);
 
     return .{
         .rgba = rgba,
@@ -2921,6 +2978,7 @@ fn decodeRgbaPureZigProgressive(
     alloc: Allocator,
     jpeg_bytes: []const u8,
     structure: Structure,
+    four_component_mode: FourComponentMode,
 ) !DecodedImage {
     const width = structure.info.width;
     const height = structure.info.height;
@@ -2991,7 +3049,7 @@ fn decodeRgbaPureZigProgressive(
             }
         }
 
-        renderColorPlanesToRgba(rgba, width, height, structure.info.bits_per_sample, color_encoding, structure.info.components, progressive.max_h, progressive.max_v, component_planes);
+        renderColorPlanesToRgba(rgba, width, height, structure.info.bits_per_sample, color_encoding, structure.info.components, progressive.max_h, progressive.max_v, component_planes, four_component_mode);
     }
 
     return .{
@@ -3392,6 +3450,7 @@ fn renderColorPlanesToRgba(
     max_h: u8,
     max_v: u8,
     planes: [max_components]SamplePlane,
+    four_component_mode: FourComponentMode,
 ) void {
     const width_usize: usize = @intCast(width);
     const height_usize: usize = @intCast(height);
@@ -3438,17 +3497,22 @@ fn renderColorPlanesToRgba(
                     const m = samplePlaneValue(planes[1], components[1], max_h, max_v, bits_per_sample, x, y);
                     const yy = samplePlaneValue(planes[2], components[2], max_h, max_v, bits_per_sample, x, y);
                     const k = samplePlaneValue(planes[3], components[3], max_h, max_v, bits_per_sample, x, y);
-                    break :blk if (bits_per_sample == 8)
-                        invertedCmykToRgb(@intCast(c), @intCast(m), @intCast(yy), @intCast(k))
+                    break :blk if (four_component_mode == .jpeg_display)
+                        if (bits_per_sample == 8)
+                            invertedCmykToRgb(@intCast(c), @intCast(m), @intCast(yy), @intCast(k))
+                        else
+                            invertedCmykToRgbWide(c, m, yy, k, bits_per_sample)
                     else
-                        invertedCmykToRgbWide(c, m, yy, k, bits_per_sample);
+                        cmykToRgbWide(c, m, yy, k, bits_per_sample);
                 },
                 .ycck => blk: {
                     const yy = samplePlaneValue(planes[0], components[0], max_h, max_v, bits_per_sample, x, y);
                     const cb = samplePlaneValue(planes[1], components[1], max_h, max_v, bits_per_sample, x, y);
                     const cr = samplePlaneValue(planes[2], components[2], max_h, max_v, bits_per_sample, x, y);
                     const k = samplePlaneValue(planes[3], components[3], max_h, max_v, bits_per_sample, x, y);
-                    break :blk if (bits_per_sample == 8)
+                    break :blk if (four_component_mode == .pdf_device_cmyk)
+                        ycckToPdfDeviceCmykRgbWide(yy, cb, cr, k, bits_per_sample)
+                    else if (bits_per_sample == 8)
                         ycckToRgb(@intCast(yy), @intCast(cb), @intCast(cr), @intCast(k))
                     else
                         ycckToRgbWide(yy, cb, cr, k, bits_per_sample);
@@ -3593,6 +3657,16 @@ fn clipDctScale(width: u32, height: u32, target_size: u32) u8 {
     if (edgeAtLeastScaledTarget(short_edge, target_size, 8)) return 4;
     if (edgeAtLeastScaledTarget(short_edge, target_size, 4)) return 2;
     return 1;
+}
+
+fn baselineDctScale(width: u32, height: u32, max_dimension: ?u32) u8 {
+    const target = max_dimension orelse return 1;
+    if (target == 0) return 8;
+    const source_max = @max(width, height);
+    if (@as(u64, source_max) <= @as(u64, target)) return 1;
+    if (@as(u64, source_max) <= @as(u64, target) * 2) return 2;
+    if (@as(u64, source_max) <= @as(u64, target) * 4) return 4;
+    return 8;
 }
 
 fn edgeAtLeastScaledTarget(edge: u32, target_size: u32, scale: u32) bool {
@@ -3905,6 +3979,35 @@ fn writeGrayscaleBlockRgba(
     }
 }
 
+fn writeScaledGrayscaleBlockRgba(
+    rgba: []u8,
+    width: u32,
+    height: u32,
+    block_x: usize,
+    block_y: usize,
+    comptime dct_scale: u8,
+    block: [scaledBlockSampleCount(dct_scale)]u16,
+    bits_per_sample: u8,
+) void {
+    const side: comptime_int = 8 / dct_scale;
+    const width_usize: usize = @intCast(width);
+    const height_usize: usize = @intCast(height);
+    for (0..side) |local_y| {
+        const y = block_y * side + local_y;
+        if (y >= height_usize) break;
+        for (0..side) |local_x| {
+            const x = block_x * side + local_x;
+            if (x >= width_usize) break;
+            const gray = scaleSampleToByteWide(block[local_y * side + local_x], bits_per_sample);
+            const pixel_index = (y * width_usize + x) * 4;
+            rgba[pixel_index + 0] = gray;
+            rgba[pixel_index + 1] = gray;
+            rgba[pixel_index + 2] = gray;
+            rgba[pixel_index + 3] = 0xff;
+        }
+    }
+}
+
 fn writeColorMcuRgba(
     rgba: []u8,
     width: u32,
@@ -4160,6 +4263,11 @@ fn invertedCmykToRgb(c: u8, m: u8, y: u8, k: u8) [3]u8 {
     };
 }
 
+fn cmykToRgbWide(c: u16, m: u16, y: u16, k: u16, bits_per_sample: u8) [3]u8 {
+    const sample_max: u16 = @intCast((@as(u32, 1) << @as(u5, @intCast(bits_per_sample))) - 1);
+    return invertedCmykToRgbWide(sample_max - c, sample_max - m, sample_max - y, sample_max - k, bits_per_sample);
+}
+
 fn multiplyAndDivideBySampleMax(lhs: u16, rhs: u16, bits_per_sample: u8) u16 {
     const sample_max: u32 = (@as(u32, 1) << @as(u5, @intCast(bits_per_sample))) - 1;
     const product = @as(u32, lhs) * @as(u32, rhs);
@@ -4194,6 +4302,23 @@ fn ycckToRgbWide(y: u16, cb: u16, cr: u16, k: u16, bits_per_sample: u8) [3]u8 {
         k,
         bits_per_sample,
     );
+}
+
+fn ycckToPdfDeviceCmykRgbWide(y: u16, cb: u16, cr: u16, k: u16, bits_per_sample: u8) [3]u8 {
+    const sample_max: u16 = @intCast((@as(u32, 1) << @as(u5, @intCast(bits_per_sample))) - 1);
+    const inverted_cmy = ycbcrToRgbNative(y, cb, cr, bits_per_sample);
+    return cmykToRgbWide(
+        sample_max - inverted_cmy[0],
+        sample_max - inverted_cmy[1],
+        sample_max - inverted_cmy[2],
+        k,
+        bits_per_sample,
+    );
+}
+
+test "YCCK PDF DeviceCMYK mode preserves non-inverted black samples" {
+    try std.testing.expectEqual([3]u8{ 128, 128, 128 }, ycckToPdfDeviceCmykRgbWide(128, 128, 128, 0, 8));
+    try std.testing.expectEqual([3]u8{ 0, 0, 0 }, ycckToRgb(128, 128, 128, 0));
 }
 
 fn multiplyAndDivideBy255(lhs: u8, rhs: u8) u8 {
@@ -5138,6 +5263,65 @@ test "decode rgba matches manifest-backed adobe cmyk jpeg fixture" {
         0x00, 0x00, 0xff, 0xff,
     };
     try std.testing.expectEqualSlices(u8, &expected_rgba, decoded.rgba);
+}
+
+test "PDF DeviceCMYK honors Adobe inverted CMYK encoding" {
+    const alloc = std.testing.allocator;
+    const manifest = try test_support.loadManifest(alloc, std.testing.io);
+    defer test_support.freeManifest(alloc, manifest);
+    const fixture = test_support.findFixture(manifest, "jpeg/cmyk/adobe-cmyk-3x1.jpg") orelse return error.MissingImageFixture;
+    const fixture_bytes = try test_support.readFixtureAlloc(alloc, std.testing.io, fixture.path);
+    defer alloc.free(fixture_bytes);
+
+    const decoded = try decodeRgbaWithOptions(alloc, fixture_bytes, .{ .four_component_mode = .pdf_device_cmyk });
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(@as(u32, 3), decoded.width);
+    try std.testing.expectEqual(@as(u32, 1), decoded.height);
+    const expected_rgba = [_]u8{
+        0xff, 0x00, 0x00, 0xff,
+        0x00, 0xff, 0x00, 0xff,
+        0x00, 0x00, 0xff, 0xff,
+    };
+    try std.testing.expectEqualSlices(u8, &expected_rgba, decoded.rgba);
+}
+
+test "baseline decode options use bounded native DCT scaling" {
+    const alloc = std.testing.allocator;
+    const manifest = try test_support.loadManifest(alloc, std.testing.io);
+    defer test_support.freeManifest(alloc, manifest);
+    const fixture = test_support.findFixture(manifest, "jpeg/cmyk/adobe-cmyk-3x1.jpg") orelse return error.MissingImageFixture;
+    const fixture_bytes = try test_support.readFixtureAlloc(alloc, std.testing.io, fixture.path);
+    defer alloc.free(fixture_bytes);
+
+    const dimensions = try plannedDecodeDimensions(fixture_bytes, .{ .max_dimension = 1 });
+    try std.testing.expectEqual(@as(u32, 1), dimensions.width);
+    try std.testing.expectEqual(@as(u32, 1), dimensions.height);
+    const decoded = try decodeRgbaWithOptions(alloc, fixture_bytes, .{ .max_dimension = 1 });
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(dimensions.width, decoded.width);
+    try std.testing.expectEqual(dimensions.height, decoded.height);
+}
+
+test "baseline decoder accepts zero-based YCbCr component identifiers" {
+    const alloc = std.testing.allocator;
+    const manifest = try test_support.loadManifest(alloc, std.testing.io);
+    defer test_support.freeManifest(alloc, manifest);
+    const fixture = test_support.findFixture(manifest, "jpeg/baseline/pattern-4x4-444.jpg") orelse return error.MissingImageFixture;
+    const fixture_bytes = try test_support.readFixtureAlloc(alloc, std.testing.io, fixture.path);
+    defer alloc.free(fixture_bytes);
+
+    const expected = try decodeRgba(alloc, fixture_bytes);
+    defer alloc.free(expected.rgba);
+    var structure = try parseStructure(fixture_bytes);
+    structure.adobe_transform = null;
+    for (0..3) |component| {
+        structure.info.components[component].id = @intCast(component);
+        structure.scans[0].components[component].component_selector = @intCast(component);
+    }
+    try std.testing.expectEqual(ColorEncoding.ycbcr, colorEncodingForStructure(structure).?);
+    const decoded = try decodeRgbaPureZigColorBaseline(alloc, fixture_bytes, structure, 1, .jpeg_display);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqualSlices(u8, expected.rgba, decoded.rgba);
 }
 
 test "parse structure captures manifest-backed adobe ycck jpeg metadata" {
@@ -6418,7 +6602,7 @@ test "pure zig progressive decode matches djpeg reference for manifest-backed fi
     const structure = try parseStructure(fixture_bytes);
     try std.testing.expect(canPureZigDecodeProgressive(structure));
 
-    const progressive = try decodeRgbaPureZigProgressive(alloc, fixture_bytes, structure);
+    const progressive = try decodeRgbaPureZigProgressive(alloc, fixture_bytes, structure, .jpeg_display);
     defer alloc.free(progressive.rgba);
 
     try std.testing.expectEqual(fixture.width.?, progressive.width);
@@ -7506,6 +7690,7 @@ test "libjpeg arithmetic coefficient reference reconstructs expected rgba" {
         max_h,
         max_v,
         component_planes,
+        .jpeg_display,
     );
 
     const expected_rgba = [_]u8{

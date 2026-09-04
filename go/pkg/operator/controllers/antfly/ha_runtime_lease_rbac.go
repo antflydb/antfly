@@ -186,10 +186,17 @@ func haRuntimeLeaseWatchdogEnabled(cluster *antflyv1.AntflyCluster) bool {
 	ha := cluster.Spec.HighAvailability
 	if ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled ||
 		ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled ||
-		!haAutomaticFailoverExecutionEnabled(ha) ||
 		ha.AutomaticFailover.FencingAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
-		ha.Runtime == nil || ha.Runtime.Role != antflyv1.HARuntimeRolePrimary ||
+		ha.Runtime == nil ||
+		(ha.Runtime.Role != antflyv1.HARuntimeRolePrimary && ha.Runtime.Role != antflyv1.HARuntimeRoleStandby) ||
 		ha.Runtime.FencingLease == nil {
+		return false
+	}
+	// A standby only observes authority and must do so before it is promotable;
+	// its CR intentionally cannot execute topology actions. A primary, however,
+	// must never arm a fail-closed watchdog unless this controller also owns
+	// Lease renewal.
+	if ha.Runtime.Role == antflyv1.HARuntimeRolePrimary && !haAutomaticFailoverExecutionEnabled(ha) {
 		return false
 	}
 	lease := ha.Runtime.FencingLease

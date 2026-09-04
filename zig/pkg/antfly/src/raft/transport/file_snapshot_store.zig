@@ -16,3 +16,4 @@ const impl = @import("../storage/file_snapshot_store.zig");
 
 pub const FileSnapshotStore = impl.FileSnapshotStore;
 pub const FileSnapshotStoreConfig = impl.FileSnapshotStoreConfig;
+pub const SnapshotArtifactPolicy = impl.SnapshotArtifactPolicy;

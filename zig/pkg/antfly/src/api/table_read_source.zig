@@ -26,6 +26,8 @@ const query_api = @import("query_response.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
+const metadata_api = @import("../metadata/api.zig");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 
 pub const LookupResponse = struct {
     json: []u8,
@@ -165,6 +167,10 @@ pub const TableReadSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    /// Set only by authenticated group-local ingress. When present, dispatch
+    /// must use a routed callback; silently falling back would reintroduce an
+    /// admin-snapshot identity race.
+    route_fence: ?metadata_api.CatalogRouteFence = null,
 
     pub const VTable = struct {
         lookup: *const fn (
@@ -208,9 +214,29 @@ pub const TableReadSource = struct {
             consistency: read_gate.ReadConsistency,
             max_work: u32,
         ) anyerror!?runtime_preflight.RuntimePreflightSummary = null,
+        preflight_query_group_local_routed: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            fence: metadata_api.CatalogRouteFence,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_types.SearchRequest,
+            consistency: read_gate.ReadConsistency,
+            max_work: u32,
+        ) anyerror!?runtime_preflight.RuntimePreflightSummary = null,
         lookup_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            key: []const u8,
+            opts: db_types.LookupOptions,
+            consistency: read_gate.ReadConsistency,
+        ) anyerror!?LookupResponse = null,
+        lookup_group_local_routed: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            fence: metadata_api.CatalogRouteFence,
             group_id: u64,
             table_name: []const u8,
             key: []const u8,
@@ -227,9 +253,29 @@ pub const TableReadSource = struct {
             opts: db_types.ScanOptions,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?ScanResponse = null,
+        scan_group_local_routed: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            fence: metadata_api.CatalogRouteFence,
+            group_id: u64,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_types.ScanOptions,
+            consistency: read_gate.ReadConsistency,
+        ) anyerror!?ScanResponse = null,
         query_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_types.SearchRequest,
+            consistency: read_gate.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse = null,
+        query_group_local_routed: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            fence: metadata_api.CatalogRouteFence,
             group_id: u64,
             table_name: []const u8,
             req: db_types.SearchRequest,
@@ -243,6 +289,15 @@ pub const TableReadSource = struct {
             req: db_types.SearchRequest,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?db_types.SearchResult = null,
+        search_result_group_local_routed: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            fence: metadata_api.CatalogRouteFence,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_types.SearchRequest,
+            consistency: read_gate.ReadConsistency,
+        ) anyerror!?db_types.SearchResult = null,
         text_stats_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -250,6 +305,7 @@ pub const TableReadSource = struct {
             table_name: []const u8,
             body: []const u8,
         ) anyerror!?query_api.QueryResponse = null,
+        text_stats_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8) anyerror!?query_api.QueryResponse = null,
         algebraic_partials_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -257,6 +313,7 @@ pub const TableReadSource = struct {
             table_name: []const u8,
             body: []const u8,
         ) anyerror!?query_api.QueryResponse = null,
+        algebraic_partials_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8) anyerror!?query_api.QueryResponse = null,
         join_partition_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -317,6 +374,10 @@ pub const TableReadSource = struct {
             body: []const u8,
             timeout_ms: ?u32,
         ) anyerror!?query_api.QueryResponse = null,
+        join_partition_group_local_routed_with_timeout: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, ?u32) anyerror!?query_api.QueryResponse = null,
+        join_rows_group_local_routed_with_timeout: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, ?u32) anyerror!?query_api.QueryResponse = null,
+        join_unmatched_group_local_routed_with_timeout: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, ?u32) anyerror!?query_api.QueryResponse = null,
+        join_finalize_group_local_routed_with_timeout: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, ?u32) anyerror!?query_api.QueryResponse = null,
         join_job_state_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -332,6 +393,7 @@ pub const TableReadSource = struct {
             req: distributed_graph.GraphExpandRequest,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?distributed_graph.GraphExpandResponse = null,
+        graph_expand_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, distributed_graph.GraphExpandRequest, read_gate.ReadConsistency) anyerror!?distributed_graph.GraphExpandResponse = null,
         graph_hydrate_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -340,6 +402,7 @@ pub const TableReadSource = struct {
             req: distributed_graph.GraphHydrateRequest,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?distributed_graph.GraphHydrateResponse = null,
+        graph_hydrate_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, distributed_graph.GraphHydrateRequest, read_gate.ReadConsistency) anyerror!?distributed_graph.GraphHydrateResponse = null,
         graph_edges_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -348,6 +411,7 @@ pub const TableReadSource = struct {
             req: distributed_graph.GraphEdgesRequest,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?distributed_graph.GraphEdgesResponse = null,
+        graph_edges_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, distributed_graph.GraphEdgesRequest, read_gate.ReadConsistency) anyerror!?distributed_graph.GraphEdgesResponse = null,
         local_runtime_statuses: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -388,6 +452,7 @@ pub const TableReadSource = struct {
             artifact_name: []const u8,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?db_types.DocumentArtifactManifest = null,
+        document_artifact_manifest_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, []const u8, read_gate.ReadConsistency) anyerror!?db_types.DocumentArtifactManifest = null,
         document_artifact_manifests_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -396,12 +461,32 @@ pub const TableReadSource = struct {
             doc_key: []const u8,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?db_types.DocumentArtifactManifestList = null,
+        document_artifact_manifests_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, read_gate.ReadConsistency) anyerror!?db_types.DocumentArtifactManifestList = null,
         bind_incoming_graph_routes: ?*const fn (
             ptr: *anyopaque,
             cache: *distributed_graph.IncomingSourceGroupCache,
         ) void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn bindCatalogRouteFenceJson(
+        self: *TableReadSource,
+        alloc: std.mem.Allocator,
+        encoded: []const u8,
+        expected_group_id: u64,
+        deadline_ns: ?u64,
+        cancellation: CancellationToken,
+    ) !void {
+        if (encoded.len == 0) return;
+        var parsed = std.json.parseFromSlice(metadata_api.CatalogRouteFence, alloc, encoded, .{ .ignore_unknown_fields = false }) catch
+            return error.InvalidCatalogRouteFence;
+        defer parsed.deinit();
+        try parsed.value.validate();
+        if (parsed.value.route.group_id != expected_group_id) return error.InvalidCatalogRouteFence;
+        parsed.value.admission_deadline_ns = deadline_ns;
+        parsed.value.admission_cancellation = cancellation;
+        self.route_fence = parsed.value;
+    }
 
     pub fn lookup(
         self: TableReadSource,
@@ -502,6 +587,10 @@ pub const TableReadSource = struct {
         artifact_name: []const u8,
         consistency: read_gate.ReadConsistency,
     ) !?db_types.DocumentArtifactManifest {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.document_artifact_manifest_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("document_artifact_manifest_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, doc_key, artifact_name, consistency });
+        }
         const fn_ptr = self.vtable.document_artifact_manifest_group_local orelse return null;
         return try BoundaryAbi.call("document_artifact_manifest_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency });
     }
@@ -525,6 +614,10 @@ pub const TableReadSource = struct {
         doc_key: []const u8,
         consistency: read_gate.ReadConsistency,
     ) !?db_types.DocumentArtifactManifestList {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.document_artifact_manifests_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("document_artifact_manifests_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, doc_key, consistency });
+        }
         const fn_ptr = self.vtable.document_artifact_manifests_group_local orelse return null;
         return try BoundaryAbi.call("document_artifact_manifests_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, doc_key, consistency });
     }
@@ -560,6 +653,10 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
         max_work: u32,
     ) !?runtime_preflight.RuntimePreflightSummary {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.preflight_query_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("preflight_query_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, req, consistency, max_work });
+        }
         const fn_ptr = self.vtable.preflight_query_group_local orelse return null;
         return try BoundaryAbi.call("preflight_query_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, consistency, max_work });
     }
@@ -573,6 +670,10 @@ pub const TableReadSource = struct {
         opts: db_types.LookupOptions,
         consistency: read_gate.ReadConsistency,
     ) !?LookupResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.lookup_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("lookup_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, key, opts, consistency });
+        }
         const fn_ptr = self.vtable.lookup_group_local orelse return null;
         return try BoundaryAbi.call("lookup_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, key, opts, consistency });
     }
@@ -587,6 +688,10 @@ pub const TableReadSource = struct {
         opts: db_types.ScanOptions,
         consistency: read_gate.ReadConsistency,
     ) !?ScanResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.scan_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("scan_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, from_key, to_key, opts, consistency });
+        }
         const fn_ptr = self.vtable.scan_group_local orelse return null;
         return try BoundaryAbi.call("scan_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, from_key, to_key, opts, consistency });
     }
@@ -599,6 +704,10 @@ pub const TableReadSource = struct {
         req: db_types.SearchRequest,
         consistency: read_gate.ReadConsistency,
     ) !?query_api.QueryResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.query_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("query_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, req, consistency });
+        }
         const fn_ptr = self.vtable.query_group_local orelse return null;
         return try BoundaryAbi.call("query_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, consistency });
     }
@@ -611,6 +720,10 @@ pub const TableReadSource = struct {
         req: db_types.SearchRequest,
         consistency: read_gate.ReadConsistency,
     ) !?db_types.SearchResult {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.search_result_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("search_result_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, req, consistency });
+        }
         const fn_ptr = self.vtable.search_result_group_local orelse return null;
         return try BoundaryAbi.call("search_result_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, consistency });
     }
@@ -622,6 +735,10 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         body: []const u8,
     ) !?query_api.QueryResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.text_stats_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("text_stats_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body });
+        }
         const fn_ptr = self.vtable.text_stats_group_local orelse return null;
         return try BoundaryAbi.call("text_stats_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
@@ -633,6 +750,10 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         body: []const u8,
     ) !?query_api.QueryResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.algebraic_partials_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("algebraic_partials_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body });
+        }
         const fn_ptr = self.vtable.algebraic_partials_group_local orelse return null;
         return try BoundaryAbi.call("algebraic_partials_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
@@ -644,6 +765,10 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         body: []const u8,
     ) !?query_api.QueryResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.join_partition_group_local_routed_with_timeout orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("join_partition_group_local_routed_with_timeout", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, null });
+        }
         const fn_ptr = self.vtable.join_partition_group_local orelse return null;
         return try BoundaryAbi.call("join_partition_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
@@ -655,6 +780,10 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         body: []const u8,
     ) !?query_api.QueryResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.join_rows_group_local_routed_with_timeout orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("join_rows_group_local_routed_with_timeout", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, null });
+        }
         const fn_ptr = self.vtable.join_rows_group_local orelse return null;
         return try BoundaryAbi.call("join_rows_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
@@ -666,6 +795,10 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         body: []const u8,
     ) !?query_api.QueryResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.join_unmatched_group_local_routed_with_timeout orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("join_unmatched_group_local_routed_with_timeout", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, null });
+        }
         const fn_ptr = self.vtable.join_unmatched_group_local orelse return null;
         return try BoundaryAbi.call("join_unmatched_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
@@ -677,6 +810,10 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         body: []const u8,
     ) !?query_api.QueryResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.join_finalize_group_local_routed_with_timeout orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("join_finalize_group_local_routed_with_timeout", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, null });
+        }
         const fn_ptr = self.vtable.join_finalize_group_local orelse return null;
         return try BoundaryAbi.call("join_finalize_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
@@ -689,6 +826,10 @@ pub const TableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.join_partition_group_local_routed_with_timeout orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("join_partition_group_local_routed_with_timeout", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, timeout_ms });
+        }
         if (self.vtable.join_partition_group_local_with_timeout) |fn_ptr| {
             return try BoundaryAbi.call("join_partition_group_local_with_timeout", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body, timeout_ms });
         }
@@ -704,6 +845,10 @@ pub const TableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.join_rows_group_local_routed_with_timeout orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("join_rows_group_local_routed_with_timeout", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, timeout_ms });
+        }
         if (self.vtable.join_rows_group_local_with_timeout) |fn_ptr| {
             return try BoundaryAbi.call("join_rows_group_local_with_timeout", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body, timeout_ms });
         }
@@ -719,6 +864,10 @@ pub const TableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.join_unmatched_group_local_routed_with_timeout orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("join_unmatched_group_local_routed_with_timeout", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, timeout_ms });
+        }
         if (self.vtable.join_unmatched_group_local_with_timeout) |fn_ptr| {
             return try BoundaryAbi.call("join_unmatched_group_local_with_timeout", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body, timeout_ms });
         }
@@ -734,6 +883,10 @@ pub const TableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.join_finalize_group_local_routed_with_timeout orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("join_finalize_group_local_routed_with_timeout", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, timeout_ms });
+        }
         if (self.vtable.join_finalize_group_local_with_timeout) |fn_ptr| {
             return try BoundaryAbi.call("join_finalize_group_local_with_timeout", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body, timeout_ms });
         }
@@ -760,6 +913,10 @@ pub const TableReadSource = struct {
         req: distributed_graph.GraphExpandRequest,
         consistency: read_gate.ReadConsistency,
     ) !?distributed_graph.GraphExpandResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.graph_expand_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("graph_expand_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, req, consistency });
+        }
         const fn_ptr = self.vtable.graph_expand_group_local orelse return null;
         return try BoundaryAbi.call("graph_expand_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, consistency });
     }
@@ -772,6 +929,10 @@ pub const TableReadSource = struct {
         req: distributed_graph.GraphHydrateRequest,
         consistency: read_gate.ReadConsistency,
     ) !?distributed_graph.GraphHydrateResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.graph_hydrate_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("graph_hydrate_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, req, consistency });
+        }
         const fn_ptr = self.vtable.graph_hydrate_group_local orelse return null;
         return try BoundaryAbi.call("graph_hydrate_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, consistency });
     }
@@ -784,6 +945,10 @@ pub const TableReadSource = struct {
         req: distributed_graph.GraphEdgesRequest,
         consistency: read_gate.ReadConsistency,
     ) !?distributed_graph.GraphEdgesResponse {
+        if (self.route_fence) |fence| {
+            const routed = self.vtable.graph_edges_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
+            return try BoundaryAbi.call("graph_edges_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, req, consistency });
+        }
         const fn_ptr = self.vtable.graph_edges_group_local orelse return null;
         return try BoundaryAbi.call("graph_edges_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, consistency });
     }
@@ -831,3 +996,141 @@ pub const TableReadSource = struct {
         bind(self.ptr, cache);
     }
 };
+
+test "catalog route fence dispatch is strict and fail closed" {
+    const Fake = struct {
+        legacy_calls: usize = 0,
+        routed_calls: usize = 0,
+        join_legacy_calls: usize = 0,
+        join_routed_calls: usize = 0,
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_types.LookupOptions, _: read_gate.ReadConsistency) !?LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_types.ScanOptions, _: read_gate.ReadConsistency) !?ScanResponse {
+            return null;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_types.SearchRequest, _: read_gate.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn lookupGroupLocal(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: db_types.LookupOptions, _: read_gate.ReadConsistency) !?LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.legacy_calls += 1;
+            return null;
+        }
+
+        fn lookupGroupLocalRouted(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, _: []const u8, _: []const u8, _: db_types.LookupOptions, _: read_gate.ReadConsistency) !?LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(group_id, fence.route.group_id);
+            try std.testing.expectEqual(@as(u64, 17), fence.table_id);
+            self.routed_calls += 1;
+            return null;
+        }
+
+        fn joinLegacy(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: ?u32) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.join_legacy_calls += 1;
+            return null;
+        }
+
+        fn joinRouted(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, _: []const u8, _: []const u8, _: ?u32) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(group_id, fence.route.group_id);
+            self.join_routed_calls += 1;
+            return null;
+        }
+    };
+
+    var wire_cancellation = std.atomic.Value(bool).init(false);
+    var fence = metadata_api.CatalogRouteFence{
+        .metadata_group_id = 3,
+        .catalog_revision = 19,
+        .table_id = 17,
+        .topology_epoch = 23,
+        .route = .{
+            .group_id = 29,
+            .range_id = 31,
+            .identity_namespace = .{ .table_id = 17, .shard_id = 37, .range_id = 31 },
+        },
+    };
+    fence.admission_deadline_ns = 999;
+    fence.admission_cancellation = CancellationToken.fromAtomic(&wire_cancellation);
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, fence, .{});
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "admission_deadline") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "admission_cancellation") == null);
+
+    var fake = Fake{};
+    const legacy_vtable = TableReadSource.VTable{
+        .lookup = Fake.lookup,
+        .scan = Fake.scan,
+        .query = Fake.query,
+        .lookup_group_local = Fake.lookupGroupLocal,
+        .join_partition_group_local_with_timeout = Fake.joinLegacy,
+        .join_rows_group_local_with_timeout = Fake.joinLegacy,
+        .join_unmatched_group_local_with_timeout = Fake.joinLegacy,
+        .join_finalize_group_local_with_timeout = Fake.joinLegacy,
+    };
+    var source = TableReadSource{ .ptr = &fake, .vtable = &legacy_vtable };
+    const ingress_deadline: u64 = 1234;
+    try source.bindCatalogRouteFenceJson(std.testing.allocator, encoded, 29, ingress_deadline, CancellationToken.fromAtomic(&wire_cancellation));
+    try std.testing.expectEqual(@as(?u64, ingress_deadline), source.route_fence.?.admission_deadline_ns);
+    try std.testing.expect(source.route_fence.?.admission_cancellation.ptr == @as(*const anyopaque, @ptrCast(&wire_cancellation)));
+    try std.testing.expectError(
+        error.CatalogRouteFenceUnsupported,
+        source.lookupGroupLocal(std.testing.allocator, 29, "docs", "key", .{}, .stale),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
+    try std.testing.expectError(
+        error.CatalogRouteFenceUnsupported,
+        source.joinPartitionGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10),
+    );
+    try std.testing.expectError(
+        error.CatalogRouteFenceUnsupported,
+        source.joinRowsGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10),
+    );
+    try std.testing.expectError(
+        error.CatalogRouteFenceUnsupported,
+        source.joinUnmatchedGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10),
+    );
+    try std.testing.expectError(
+        error.CatalogRouteFenceUnsupported,
+        source.joinFinalizeGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.join_legacy_calls);
+
+    const routed_vtable = TableReadSource.VTable{
+        .lookup = Fake.lookup,
+        .scan = Fake.scan,
+        .query = Fake.query,
+        .lookup_group_local = Fake.lookupGroupLocal,
+        .lookup_group_local_routed = Fake.lookupGroupLocalRouted,
+        .join_partition_group_local_with_timeout = Fake.joinLegacy,
+        .join_rows_group_local_with_timeout = Fake.joinLegacy,
+        .join_unmatched_group_local_with_timeout = Fake.joinLegacy,
+        .join_finalize_group_local_with_timeout = Fake.joinLegacy,
+        .join_partition_group_local_routed_with_timeout = Fake.joinRouted,
+        .join_rows_group_local_routed_with_timeout = Fake.joinRouted,
+        .join_unmatched_group_local_routed_with_timeout = Fake.joinRouted,
+        .join_finalize_group_local_routed_with_timeout = Fake.joinRouted,
+    };
+    source.vtable = &routed_vtable;
+    try std.testing.expect((try source.lookupGroupLocal(std.testing.allocator, 29, "docs", "key", .{}, .stale)) == null);
+    try std.testing.expectEqual(@as(usize, 1), fake.routed_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
+    try std.testing.expect((try source.joinPartitionGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10)) == null);
+    try std.testing.expect((try source.joinRowsGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10)) == null);
+    try std.testing.expect((try source.joinUnmatchedGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10)) == null);
+    try std.testing.expect((try source.joinFinalizeGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10)) == null);
+    try std.testing.expectEqual(@as(usize, 4), fake.join_routed_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.join_legacy_calls);
+
+    var wrong_group_source = TableReadSource{ .ptr = &fake, .vtable = &routed_vtable };
+    try std.testing.expectError(
+        error.InvalidCatalogRouteFence,
+        wrong_group_source.bindCatalogRouteFenceJson(std.testing.allocator, encoded, 30, null, .none),
+    );
+}

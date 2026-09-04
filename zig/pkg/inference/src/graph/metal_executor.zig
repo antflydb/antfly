@@ -2052,6 +2052,7 @@ fn pipelinedDecodeFrameEnabledForFlags(
 
 fn pipelinedDecodeFrameEnabled(gpt_config: gpt_mod.Config) bool {
     const qualified_a4b = gemma4_runtime.isQualifiedA4bArchitecture(gpt_config);
+    if (!qualified_a4b) return metal_runtime.pipelinedDecodeFrameEnabled();
     return pipelinedDecodeFrameEnabledForFlags(
         platform.env.getenvBool("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"),
         platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"),
@@ -2389,6 +2390,7 @@ fn runtimePrefill(
                 .vocab_size = tail.vocab_size,
                 .eps = tail.norm_eps,
                 .final_logit_softcap = runtime_ctx.gpt_config.final_logit_softcapping,
+                .use_transformed_lm_head = decoder_tail_runtime.repackQualityRawLogitsEnabled(),
                 .greedy_token_id = tail.greedy_token_id,
             } };
         }
@@ -2718,6 +2720,10 @@ test "metal executor only enables split KV policy for mixed local and global Gem
 
     config.family = .llama;
     try std.testing.expect(!config.supportsSplitSwaGlobalKvRing());
+}
+
+test "metal executor pipelined decode frames delegate to the shared policy" {
+    try std.testing.expect(metal_runtime.pipelinedDecodeFrameEnabledForFlags(false, false, true));
 }
 
 test "metal executor keeps speculative decode frames opt in" {

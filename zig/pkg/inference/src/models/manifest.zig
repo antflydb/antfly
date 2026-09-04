@@ -1107,6 +1107,9 @@ fn applyGgufTokenizerMetadata(
 ) !void {
     var region = try c_file.MmapRegion.init(allocator, gguf_path);
     defer region.deinit();
+    // This mapping reads tokenizer/architecture metadata, not model payloads.
+    // Do not issue a whole-file DONTNEED that defeats rolling-worker prefetch.
+    region.preserveFileCacheOnDeinit();
 
     var parsed = try gguf_format.parse(allocator, region.data);
     defer parsed.deinit(allocator);

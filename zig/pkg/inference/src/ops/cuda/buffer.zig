@@ -25,7 +25,15 @@ pub const HostBuffer = struct {
         const alloc_host = ctx.driver.fns.cuMemAllocHost orelse return error.CudaSymbolMissing;
         try ctx.makeCurrent();
         var ptr: ?*anyopaque = null;
-        try ctx.driver.check(alloc_host(&ptr, len));
+        const result = alloc_host(&ptr, len);
+        if (result != driver_mod.CUDA_SUCCESS) {
+            std.log.warn("CUDA pinned-host allocation unavailable: bytes={d} error={s} ({s})", .{
+                len,
+                ctx.driver.errorName(result),
+                ctx.driver.errorString(result),
+            });
+            return error.CudaHostAllocationFailed;
+        }
         return .{ .ptr = ptr, .len = len };
     }
 

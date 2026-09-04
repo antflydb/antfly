@@ -307,9 +307,9 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
   ggml-shaped planner work is mostly kernel quality and larger runtime-owned
   graph/layer submissions rather than frontend cleanup around the active
   single-token layer loop.
-- `ANTFLY_INFERENCE_METAL_TRACE_FRAME=1` now enables a generic debug trace for
+- `TERMITE_METAL_TRACE_FRAME=1` now enables a generic debug trace for
   substantial frames that prints the last frame's `region x source`
-  compute-encoder matrix. `ANTFLY_INFERENCE_METAL_TRACE_FRAME=all` includes small
+  compute-encoder matrix. `TERMITE_METAL_TRACE_FRAME=all` includes small
   prefill/setup frames too. Use it when deciding which layer contract to
   collapse next; source-only counters cannot distinguish, for example, `other`
   encoders in attention setup from `other` encoders in FFN or tail work.
@@ -481,7 +481,7 @@ These are local directional anchors, not absolute device claims.
 
 The current Gemma 4 QAT baseline/no-MTP plan, canonical 2K+300 comparator, and
 promotion gates live in
-[GEMMA4_METAL_PERFORMANCE.md](./GEMMA4_METAL_PERFORMANCE.md). Older anchors
+[GEMMA4_PERF_PLAN.md](./GEMMA4_PERF_PLAN.md). Older anchors
 below remain useful implementation history, but they are not the current
 llama.cpp gap unless rerun under that contract.
 
@@ -493,7 +493,7 @@ llama.cpp gap unless rerun under that contract.
   2026-05-05 reported `prefill=998ms`, `total=998ms`, and token id `10979`.
   This is the right residency milestone, but it is not the same as ggml-class
   throughput.
-- A detailed timing run with `ANTFLY_INFERENCE_DEBUG_METAL_TIMING=1` reported
+- A detailed timing run with `TERMITE_DEBUG_METAL_TIMING=1` reported
   `metal_decoder_frame: begins=1 submits=1 wait_ms=23 gpu_ms=22
   last_compute_encoders=15 total_compute_encoders=942 total_blit_encoders=53`
   for the same short prefill. That means the slow prefill gap is mostly not
@@ -1091,7 +1091,7 @@ fallback.
     queues copied seed tensors for a post-submit flush. Active qLen>1 prefill
     also bypasses the copy-based reserved hidden carrier, so the `hi
     --max-tokens 4` Metal validator anchor remains correct with `token_ids:
-    10979 236888 2088 740` and no `ANTFLY_INFERENCE_METAL_TRACE_FRAME_BLITS=1` frame
+    10979 236888 2088 740` and no `TERMITE_METAL_TRACE_FRAME_BLITS=1` frame
     blit traces. The paged-KV metadata hook now allows raw f32 `MetalKvStorage`
     pages too, and it is per-layer shape aware for mixed KV dimensions, so
     eligible planned attention can consume the same physical page table path as
@@ -1723,7 +1723,7 @@ Success criteria:
   - Assert `interpreter_fallbacks=0` and `host_outputs=0`.
 
 - Performance checks:
-  - Run with `ANTFLY_INFERENCE_GRAPH_EXECUTOR_STATS=1 ANTFLY_INFERENCE_DEBUG_METAL_TIMING=1`.
+  - Run with `ANTFLY_INFERENCE_GRAPH_EXECUTOR_STATS=1 TERMITE_DEBUG_METAL_TIMING=1`.
   - Record `commands`, `planned_commands`, `total_compute_encoders`, `total_blit_encoders`, `prefill`, and `gpu_ms`.
   - Compare against current local baseline: `commands=924`, `planned_commands=176`, `total_compute_encoders=942`, `total_blit_encoders=53`, `prefill≈1194-1331ms`.
 
@@ -1905,4 +1905,4 @@ Reduce Gemma4 partitioned Metal command volume by matching ggml’s execution mo
 - Promote per-region planned scopes into a whole-frame `GraphCommandPlanView` executor for Gemma prefill/decode so compatible attention/FFN/PLE/tail regions share a command buffer and encoder scopes.
 - Use `GraphCommandPlanView.scopes` as the source of truth for grouping; region-local scopes are the fallback, not the destination.
 - Move per-frame quant descriptor/slot preparation out of execution hot paths; execution should reference prepared resident slots/descriptors.
-- Add frame counters for real submitted frame count, empty-frame cancels, planned-scope count, and top frame-break reasons so regressions are visible without verbose `ANTFLY_INFERENCE_METAL_TRACE_FRAME=all`.
+- Add frame counters for real submitted frame count, empty-frame cancels, planned-scope count, and top frame-break reasons so regressions are visible without verbose `TERMITE_METAL_TRACE_FRAME=all`.

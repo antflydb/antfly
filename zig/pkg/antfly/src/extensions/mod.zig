@@ -471,6 +471,50 @@ pub const ExtensionDependency = struct {
     }
 };
 
+pub fn scopesEqual(lhs: ExtensionScope, rhs: ExtensionScope) bool {
+    return lhs.kind == rhs.kind and std.mem.eql(u8, lhs.table_name, rhs.table_name);
+}
+
+pub fn capabilitiesEqual(lhs: []const Capability, rhs: []const Capability) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left.name, right.name) or
+            !std.mem.eql(u8, left.scope, right.scope)) return false;
+    }
+    return true;
+}
+
+pub fn installedExtensionsEqual(lhs: InstalledExtension, rhs: InstalledExtension) bool {
+    return std.mem.eql(u8, lhs.name, rhs.name) and
+        std.mem.eql(u8, lhs.package_name, rhs.package_name) and
+        std.mem.eql(u8, lhs.package_version, rhs.package_version) and
+        std.mem.eql(u8, lhs.package_digest, rhs.package_digest) and
+        scopesEqual(lhs.scope, rhs.scope) and
+        std.mem.eql(u8, lhs.config_json, rhs.config_json) and
+        capabilitiesEqual(lhs.granted_capabilities, rhs.granted_capabilities) and
+        lhs.installed_at_epoch_ms == rhs.installed_at_epoch_ms and
+        lhs.status == rhs.status;
+}
+
+pub fn extensionMembersEqual(lhs: ExtensionMember, rhs: ExtensionMember) bool {
+    return std.mem.eql(u8, lhs.extension_name, rhs.extension_name) and
+        scopesEqual(lhs.scope, rhs.scope) and
+        lhs.object_kind == rhs.object_kind and
+        std.mem.eql(u8, lhs.object_name, rhs.object_name) and
+        std.mem.eql(u8, lhs.table_name, rhs.table_name) and
+        lhs.shape_kind == rhs.shape_kind and
+        std.mem.eql(u8, lhs.shape_name, rhs.shape_name) and
+        std.mem.eql(u8, lhs.shape_version, rhs.shape_version) and
+        std.mem.eql(u8, lhs.owner_metadata_json, rhs.owner_metadata_json);
+}
+
+pub fn extensionDependenciesEqual(lhs: ExtensionDependency, rhs: ExtensionDependency) bool {
+    return std.mem.eql(u8, lhs.extension_name, rhs.extension_name) and
+        std.mem.eql(u8, lhs.required_extension_name, rhs.required_extension_name) and
+        std.mem.eql(u8, lhs.package_name, rhs.package_name) and
+        std.mem.eql(u8, lhs.version_requirement, rhs.version_requirement);
+}
+
 pub const ExtensionCatalog = struct {
     alloc: std.mem.Allocator,
     packages: std.ArrayListUnmanaged(PackageManifest) = .empty,

@@ -27,6 +27,7 @@ const replication_record = @import("replication_record.zig");
 const wal_mod = @import("../wal.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const platform_sync = @import("antfly_platform").sync;
+const platform_time = @import("antfly_platform").time;
 
 const progress_magic = [8]u8{ 'A', 'F', 'H', 'A', 'P', 'R', 'G', '\n' };
 const progress_version: u16 = 1;
@@ -121,6 +122,21 @@ pub const OpenOptions = struct {
 };
 
 pub const ApplyFn = *const fn (ctx: *anyopaque, record: replication_record.RecordView) anyerror!void;
+
+pub const ApplyOptions = struct {
+    /// Zero preserves the historical unbounded behavior. Runtime callers that
+    /// share a control-plane lock must set a finite record limit.
+    max_records: usize = 0,
+    /// Absolute monotonic deadline. Zero disables the elapsed-time limit. The
+    /// deadline is checked after each durable record so every successful call
+    /// makes progress even when one record itself exceeds the target window.
+    deadline_ns: u64 = 0,
+};
+
+fn applyWindowExhausted(applied_count: usize, now_ns: u64, options: ApplyOptions) bool {
+    return (options.max_records != 0 and applied_count >= options.max_records) or
+        (options.deadline_ns != 0 and now_ns >= options.deadline_ns);
+}
 
 pub const Snapshot = struct {
     identity: Identity,
@@ -402,6 +418,34 @@ pub const Standby = struct {
         self.publishState(self.identity_state, next);
     }
 
+    /// Proves that an already-open receive stream was bootstrapped from the
+    /// exact same activated seed generation. LSN comparison alone is
+    /// insufficient: progress from a different materialized snapshot can be
+    /// numerically ahead while referring to data this runtime never opened.
+    pub fn verifyBootstrapCheckpoint(self: *Standby, checkpoint_lsn: u64, payload: []const u8) !void {
+        try self.lockExclusive();
+        defer self.unlockExclusive();
+        if (checkpoint_lsn == 0) return error.InvalidCheckpointLsn;
+        const entry = (try self.receive_log.entryAt(self.alloc, checkpoint_lsn)) orelse
+            return error.StandbyBootstrapCheckpointMissing;
+        defer {
+            var owned = entry;
+            owned.deinit(self.alloc);
+        }
+        const record = entry.record;
+        if (record.kind != .checkpoint or record.payload_codec != .json or
+            record.cluster_id != self.identity_state.cluster_id or
+            record.shard_id != self.identity_state.shard_id or
+            record.table_id != self.identity_state.table_id or
+            record.timeline_id != self.identity_state.timeline_id or
+            record.epoch != self.identity_state.epoch or
+            record.lsn != checkpoint_lsn or record.previous_lsn != checkpoint_lsn - 1 or
+            !std.mem.eql(u8, record.payload, payload))
+        {
+            return error.StandbyBootstrapCheckpointMismatch;
+        }
+    }
+
     pub fn applyAvailable(self: *Standby, ctx: *anyopaque, apply_fn: ApplyFn) !usize {
         try self.lockExclusive();
         defer self.unlockExclusive();
@@ -410,6 +454,18 @@ pub const Standby = struct {
 
     /// The caller must hold the exclusive standby operation lease.
     pub fn applyAvailableLocked(self: *Standby, ctx: *anyopaque, apply_fn: ApplyFn) !usize {
+        return try self.applyAvailableLockedWithOptions(ctx, apply_fn, .{});
+    }
+
+    /// The caller must hold the exclusive standby operation lease. A bounded
+    /// caller can cooperatively release an outer role/control-plane lock
+    /// without weakening per-record durability or promotion exclusion.
+    pub fn applyAvailableLockedWithOptions(
+        self: *Standby,
+        ctx: *anyopaque,
+        apply_fn: ApplyFn,
+        options: ApplyOptions,
+    ) !usize {
         const from_lsn = self.progress_state.applied_lsn + 1;
         const entries = try self.receive_log.iterateFrom(self.alloc, from_lsn);
         defer replication_log.freeEntries(self.alloc, entries);
@@ -434,6 +490,7 @@ pub const Standby = struct {
 
             applied_count += 1;
             expected_lsn += 1;
+            if (applyWindowExhausted(applied_count, platform_time.monotonicNs(), options)) break;
         }
 
         return applied_count;
@@ -959,6 +1016,22 @@ const TimelineSwitchPayload = struct {
     forced: bool,
     data_loss_possible: bool,
 };
+
+test "storage.ha standby apply window has independent work and time bounds" {
+    try std.testing.expect(!applyWindowExhausted(7, 249, .{
+        .max_records = 8,
+        .deadline_ns = 250,
+    }));
+    try std.testing.expect(applyWindowExhausted(8, 249, .{
+        .max_records = 8,
+        .deadline_ns = 250,
+    }));
+    try std.testing.expect(applyWindowExhausted(1, 250, .{
+        .max_records = 8,
+        .deadline_ns = 250,
+    }));
+    try std.testing.expect(!applyWindowExhausted(std.math.maxInt(usize), std.math.maxInt(u64), .{}));
+}
 
 test "storage.ha standby rejects invalid open identity" {
     const alloc = std.testing.allocator;

@@ -240,6 +240,10 @@ pub const ModelOutput = struct {
         vocab_size: usize,
         eps: f32,
         final_logit_softcap: f32 = 0.0,
+        /// Diagnostic-only request used by the fail-closed LM-head repack
+        /// quality campaign. Production outputs leave this false and retain
+        /// checkpoint-format full logits.
+        use_transformed_lm_head: bool = false,
         greedy_token_id: ?i64 = null,
 
         fn logits(self: *PreparedTail) !?contracts.CT {
@@ -259,6 +263,7 @@ pub const ModelOutput = struct {
                     .hidden_size = self.hidden_size,
                     .eps = self.eps,
                     .out_dim = self.vocab_size,
+                    .use_transformed_lm_head = self.use_transformed_lm_head,
                 }),
             };
         }

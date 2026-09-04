@@ -1244,6 +1244,9 @@ fn loadToolTokensFromGguf(allocator: std.mem.Allocator, model_dir: []const u8) !
 
     var region = try c_file.MmapRegion.init(allocator, gguf_path);
     defer region.deinit();
+    // Tool-token discovery reads GGUF metadata only and must not evict model
+    // payload pages prepared for a following or replacement CUDA worker.
+    region.preserveFileCacheOnDeinit();
 
     var parsed = try gguf_format.parse(allocator, region.data);
     defer parsed.deinit(allocator);

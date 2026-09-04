@@ -84,6 +84,8 @@ pub const FenceAcquireRequest = struct {
     promoted_node_id: HANodeID,
     new_timeline_id: i64,
     new_epoch: i64,
+    /// Exact Kubernetes Lease transition generation authorizing this fence.
+    generation: i64,
     required_lsn: i64,
     observed_lsn: i64,
     force: bool,
@@ -96,6 +98,7 @@ pub const FenceAcquireRequest = struct {
         .{ "promoted_node_id", "promoted_node_id", false },
         .{ "new_timeline_id", "new_timeline_id", false },
         .{ "new_epoch", "new_epoch", false },
+        .{ "generation", "generation", false },
         .{ "required_lsn", "required_lsn", false },
         .{ "observed_lsn", "observed_lsn", false },
         .{ "force", "force", false },
@@ -122,6 +125,8 @@ pub const FenceAcquireRequest = struct {
         try jw.write(self.new_timeline_id);
         try jw.objectField("new_epoch");
         try jw.write(self.new_epoch);
+        try jw.objectField("generation");
+        try jw.write(self.generation);
         try jw.objectField("required_lsn");
         try jw.write(self.required_lsn);
         try jw.objectField("observed_lsn");

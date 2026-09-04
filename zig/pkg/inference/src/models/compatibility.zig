@@ -92,6 +92,9 @@ pub fn inspectAlloc(
     var region = c_file.MmapRegion.init(allocator, gguf_path) catch
         return result;
     defer region.deinit();
+    // Compatibility probing is metadata-only; retaining already-warm payload
+    // pages is essential for a following full-residency CUDA admission.
+    region.preserveFileCacheOnDeinit();
     const metadata = gguf_format.readSupportMetadata(region.data) catch return result;
     result.artifact_inspected = true;
     try applyArtifactMetadata(allocator, &result, metadata);
@@ -301,7 +304,7 @@ fn assessGenerator(
         if (qualified_gemma4_a4b) {
             return makeCompatible(
                 architecture,
-                "qualified Gemma 4 26B-A4B Q4_0 Metal runtime",
+                "qualified Gemma 4 26B-A4B Q4_0 runtime (Metal and CUDA SM89)",
             );
         }
         return makeIncompatible(
