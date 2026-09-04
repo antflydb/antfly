@@ -1447,6 +1447,34 @@ pub fn build(b: *std.Build) void {
     const bge_m3_e2e_bench_step = b.step("bench-bge-m3-e2e", "Run pretokenized BGE-M3 encoder E2E benchmarks");
     bge_m3_e2e_bench_step.dependOn(&run_bge_m3_e2e_bench.step);
 
+    const nomic_e2e_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-nomic-e2e-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/nomic_e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    nomic_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
+    nomic_e2e_bench_exe.root_module.addImport("ml", ml_mod);
+    nomic_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
+    nomic_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    nomic_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    nomic_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
+    nomic_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
+    nomic_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
+    nomic_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    nomic_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    // inference_internal already owns the Metal source and frameworks.
+    configureNativeTool(b, nomic_e2e_bench_exe, target, enable_system_blas, blas_root, false);
+    configureOnnxRuntime(b, nomic_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    const run_nomic_e2e_bench = b.addRunArtifact(nomic_e2e_bench_exe);
+    if (b.args) |args| {
+        run_nomic_e2e_bench.addArgs(args);
+    }
+    const nomic_e2e_bench_step = b.step("bench-nomic-e2e", "Run pretokenized Nomic v1.5 encoder E2E benchmarks");
+    nomic_e2e_bench_step.dependOn(&run_nomic_e2e_bench.step);
+
     const reranker_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-reranker-e2e-bench",
         .root_module = b.createModule(.{
