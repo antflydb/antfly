@@ -1599,6 +1599,27 @@ document. They are architectural requirements, not Florence-specific cleanup:
     stable producer identity while a distributed inference catalog is briefly
     unavailable; authoritative rejection and malformed capability contracts
     still fail closed.
+178. **Proxy construction enlarged explicit process memory ceilings.** The
+    retained-body and retained-batch-response settings are authoritative
+    process limits, not hints or requested minima. The proxy now intersects
+    each logical per-request ceiling with the largest conservative physical
+    reservation that fits its configured process admission. A conflicting
+    configuration therefore lowers the effective request limit and emits a
+    diagnostic; it never silently increases the operator's memory boundary.
+179. **A discarded partition consumed the mixed-batch response budget.** The
+    coordinator previously charged any bounded 2xx body before proving that it
+    was a valid, identity-preserving batch envelope. Malformed and otherwise
+    rejected responses are now released without entering retained-result
+    accounting, so an untrusted partition cannot deny budget to a later valid
+    sibling. Only validated partitions whose raw results remain referenced
+    until ordered reassembly count against the aggregate logical limit.
+180. **The proxy reported unknown upstream failures as pre-execution
+    rejection.** `rejected_items` is reserved for work that is provably stopped
+    before model execution. Encoding and local preflight failures may increment
+    it; an upstream non-2xx, oversized response, or malformed success envelope
+    does not reveal whether the model ran. If any partition has unknown
+    execution state, the coordinator still returns typed per-item failures but
+    omits the aggregate execution report instead of manufacturing telemetry.
 
 ### Post-review implementation contract
 
@@ -2153,6 +2174,21 @@ The hardening above follows these long-term rules:
     `.generate_batch` lease. No ignored batch discovery can precede a singleton
     call, so operation-specific limits, route eligibility, revisions, and stale
     fencing remain coherent from plan through execution.
+65. **Implemented after process-admission review:** explicit retained request
+    and mixed-batch response limits remain authoritative. Their logical
+    per-request limits are reduced to the greatest values whose conservative
+    three-copy request or four-copy response reservations fit, with a startup
+    diagnostic identifying the configured and effective limits.
+66. **Implemented after retained-result review:** mixed-model response bytes
+    become retained only after JSON, cardinality, identity, summary, and
+    execution-envelope validation succeeds. A discarded partition releases its
+    capture and cannot consume the logical aggregate budget needed by a valid
+    later partition.
+67. **Implemented after execution-telemetry review:** the proxy counts only
+    provable local pre-execution failures as rejected items. Upstream status,
+    oversize, and malformed-envelope failures make aggregate execution state
+    unknowable, so the ordered response preserves typed item failures while
+    omitting its execution report.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

@@ -2316,6 +2316,87 @@ func TestProxyMixedModelGenerateBatchIsolatesPartitionFailure(t *testing.T) {
 	if itemError.Code != "ROUTING_OR_UPSTREAM_ERROR" || !itemError.Retryable || itemError.RetryAfterMS != 2000 {
 		t.Fatalf("partition error = %#v", itemError)
 	}
+	if response.Execution != nil {
+		t.Fatalf("execution = %#v, want omitted when upstream execution is unknown", response.Execution)
+	}
+}
+
+func TestProxyMixedModelGenerateBatchDiscardsInvalidPartitionBeforeAccounting(t *testing.T) {
+	t.Parallel()
+
+	validPartition, err := json.Marshal(proxyGenerateBatchResponse{
+		Object: "generate.batch",
+		Data: []proxyGenerateBatchResult{{
+			CustomID: "b",
+			Index:    0,
+			Response: json.RawMessage(`{"text":"ok"}`),
+		}},
+		Summary: proxyGenerateBatchSummary{Total: 1, Succeeded: 1},
+		Execution: &proxyBatchExecutionReport{
+			RequestedItems: 1,
+			SerialItems:    1,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logicalResponseLimit := int64(len(validPartition) + 8)
+	invalidPartition := strings.Repeat("x", int(logicalResponseLimit-4))
+
+	p := NewProxy(Config{
+		DefaultPool:                   RoutePoolTarget{Pool: "primary"},
+		RefreshInterval:               time.Minute,
+		MaxBatchResponseBytes:         logicalResponseLimit,
+		MaxRetainedBatchResponseBytes: proxyBatchResponseAdmissionBytes(logicalResponseLimit),
+		Logger:                        zap.NewNop(),
+	})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, readErr := io.ReadAll(req.Body)
+		if readErr != nil {
+			return nil, readErr
+		}
+		plan, parseErr := parseProxyGenerateBatchPlan(body)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		responseBody := validPartition
+		if plan.model == "model-a" {
+			responseBody = []byte(invalidPartition)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewReader(responseBody)),
+			Request:    req,
+		}, nil
+	})}
+	p.RegisterEndpoint("http://a.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://a.internal", map[string]map[OperationType]bool{"model-a": {"generate.batch": true}})
+	p.RegisterEndpoint("http://b.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://b.internal", map[string]map[OperationType]bool{"model-b": {"generate.batch": true}})
+
+	body := `{"requests":[{"custom_id":"a","body":{"model":"model-a"}},{"custom_id":"b","body":{"model":"model-b"}}]}`
+	recorder := httptest.NewRecorder()
+	p.handleGenerateBatch(recorder, httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", strings.NewReader(body)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	var response proxyGenerateBatchResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Summary != (proxyGenerateBatchSummary{Total: 2, Succeeded: 1, Failed: 1}) {
+		t.Fatalf("summary = %#v", response.Summary)
+	}
+	if len(response.Data[0].Error) == 0 {
+		t.Fatalf("invalid partition result = %#v, want typed error", response.Data[0])
+	}
+	if len(response.Data[1].Response) == 0 || len(response.Data[1].Error) != 0 {
+		t.Fatalf("valid sibling result = %#v, want success", response.Data[1])
+	}
+	if response.Execution != nil {
+		t.Fatalf("execution = %#v, want omitted when one partition is untrusted", response.Execution)
+	}
 }
 
 func TestValidateProxyGenerateBatchPartitionRejectsUntrustedEnvelopeFields(t *testing.T) {
@@ -4072,6 +4153,9 @@ func TestProxyBodyAdmissionAccountsForDecodeAndExactRetention(t *testing.T) {
 	if got := proxyBodyAdmissionBytes(int64(len(body))); got != int64(3*len(body)) {
 		t.Fatalf("admission = %d, want %d", got, 3*len(body))
 	}
+	if got := proxyBodyBytesForAdmission(98); got != 32 {
+		t.Fatalf("effective body limit = %d, want 32", got)
+	}
 	unknown, err := readProxyRequestBody(strings.NewReader(body), -1, 1<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -4099,13 +4183,31 @@ func TestProxyBatchResponseAdmissionAccountsForCaptureAndReassembly(t *testing.T
 	if got := proxyBatchResponseAdmissionBytes(math.MaxInt64); got != math.MaxInt64 {
 		t.Fatalf("saturated batch response admission = %d", got)
 	}
+	if got := proxyBatchResponseBytesForAdmission(4095); got != 1023 {
+		t.Fatalf("effective batch response limit = %d, want 1023", got)
+	}
 	p := NewProxy(Config{
 		MaxBatchResponseBytes:         1024,
-		MaxRetainedBatchResponseBytes: 1,
+		MaxRetainedBatchResponseBytes: 100,
 		Logger:                        zap.NewNop(),
 	})
-	if got := p.batchResponseAdmission.Limit(); got != 4096 {
-		t.Fatalf("minimum batch response admission = %d, want 4096", got)
+	if got := p.batchResponseAdmission.Limit(); got != 100 {
+		t.Fatalf("batch response admission limit = %d, want configured process ceiling 100", got)
+	}
+	if got := p.maxBatchResponseBytes; got != 25 {
+		t.Fatalf("effective batch response limit = %d, want 25", got)
+	}
+
+	p = NewProxy(Config{
+		MaxRequestBodyBytes:  1024,
+		MaxRetainedBodyBytes: 99,
+		Logger:               zap.NewNop(),
+	})
+	if got := p.bodyAdmission.Limit(); got != 99 {
+		t.Fatalf("body admission limit = %d, want configured process ceiling 99", got)
+	}
+	if got := p.maxRequestBodyBytes; got != 33 {
+		t.Fatalf("effective request body limit = %d, want 33", got)
 	}
 }
 

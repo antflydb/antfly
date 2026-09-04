@@ -1688,6 +1688,8 @@ const defaultMaxProxyRetainedBodyBytes int64 = 768 << 20
 const defaultMaxProxyBatchResponseBytes int64 = 256 << 20
 const defaultMaxProxyRetainedBatchResponseBytes int64 = 1 << 30
 const defaultMaxProxyRetainedCatalogBytes int64 = 256 << 20
+const proxyBodyAdmissionMultiplier int64 = 3
+const proxyBatchResponseAdmissionMultiplier int64 = 4
 const capabilityLeaseTTL = 5 * time.Minute
 const maxCapabilityLeases = 1024
 const capabilityTokenHeader = "X-Antfly-Capability-Token"
@@ -1728,10 +1730,10 @@ type Config struct {
 	RouteWatchNamespace           string                 // Namespace to watch for routes (empty for all)
 	RouteWatchKubeconfig          string                 // Optional kubeconfig path for route watching
 	UpstreamAuthorization         string                 // Optional Authorization header value for upstream refreshes and requests
-	MaxRequestBodyBytes           int64                  // Optional retained request-body ceiling; defaults to 256 MiB
-	MaxRetainedBodyBytes          int64                  // Optional process-wide body+decode working-set ceiling; defaults to 768 MiB
-	MaxBatchResponseBytes         int64                  // Optional mixed-batch aggregate response ceiling; defaults to 256 MiB
-	MaxRetainedBatchResponseBytes int64                  // Optional process-wide mixed-batch capture+decode ceiling; defaults to 1 GiB
+	MaxRequestBodyBytes           int64                  // Optional retained request-body ceiling; defaults to 256 MiB and is reduced when required to fit MaxRetainedBodyBytes
+	MaxRetainedBodyBytes          int64                  // Optional authoritative process-wide body+decode working-set ceiling; defaults to 768 MiB
+	MaxBatchResponseBytes         int64                  // Optional mixed-batch aggregate response ceiling; defaults to 256 MiB and is reduced when required to fit MaxRetainedBatchResponseBytes
+	MaxRetainedBatchResponseBytes int64                  // Optional authoritative process-wide mixed-batch capture+decode ceiling; defaults to 1 GiB
 	MaxRetainedCatalogBytes       int64                  // Optional process-wide model-catalog ceiling; defaults to 256 MiB
 	Logger                        *zap.Logger            // Optional logger (defaults to production logger)
 	VerifiedSourceResolver        VerifiedSourceResolver // Optional authenticated source resolver shared by discovery and execution
@@ -1767,9 +1769,12 @@ func NewProxy(cfg Config) *Proxy {
 	if maxRetainedBodyBytes <= 0 {
 		maxRetainedBodyBytes = defaultMaxProxyRetainedBodyBytes
 	}
-	minimumBodyAdmission := proxyBodyAdmissionBytes(p.maxRequestBodyBytes)
-	if maxRetainedBodyBytes < minimumBodyAdmission {
-		maxRetainedBodyBytes = minimumBodyAdmission
+	if effective := proxyBodyBytesForAdmission(maxRetainedBodyBytes); p.maxRequestBodyBytes > effective {
+		logger.Warn("reducing inference request body limit to fit process-wide retained-body ceiling",
+			zap.Int64("configured_request_body_bytes", p.maxRequestBodyBytes),
+			zap.Int64("effective_request_body_bytes", effective),
+			zap.Int64("retained_body_bytes", maxRetainedBodyBytes))
+		p.maxRequestBodyBytes = effective
 	}
 	p.bodyAdmission = newByteAdmission(maxRetainedBodyBytes)
 	p.maxBatchResponseBytes = cfg.MaxBatchResponseBytes
@@ -1780,9 +1785,12 @@ func NewProxy(cfg Config) *Proxy {
 	if maxRetainedBatchResponseBytes <= 0 {
 		maxRetainedBatchResponseBytes = defaultMaxProxyRetainedBatchResponseBytes
 	}
-	minimumBatchResponseAdmission := proxyBatchResponseAdmissionBytes(p.maxBatchResponseBytes)
-	if maxRetainedBatchResponseBytes < minimumBatchResponseAdmission {
-		maxRetainedBatchResponseBytes = minimumBatchResponseAdmission
+	if effective := proxyBatchResponseBytesForAdmission(maxRetainedBatchResponseBytes); p.maxBatchResponseBytes > effective {
+		logger.Warn("reducing inference batch response limit to fit process-wide retained-response ceiling",
+			zap.Int64("configured_batch_response_bytes", p.maxBatchResponseBytes),
+			zap.Int64("effective_batch_response_bytes", effective),
+			zap.Int64("retained_batch_response_bytes", maxRetainedBatchResponseBytes))
+		p.maxBatchResponseBytes = effective
 	}
 	p.batchResponseAdmission = newByteAdmission(maxRetainedBatchResponseBytes)
 	maxRetainedCatalogBytes := cfg.MaxRetainedCatalogBytes
@@ -2048,7 +2056,9 @@ func (p *Proxy) proxyGenerateBatchRequest(w http.ResponseWriter, r *http.Request
 	for _, group := range groups {
 		groupBody, marshalErr := marshalProxyGenerateBatchGroup(plan, group)
 		if marshalErr != nil {
-			writeProxyGenerateBatchGroupFailure(results, report, plan, group, "PROXY_ENCODING_FAILED", "failed to encode routed batch partition", true, 0)
+			writeProxyGenerateBatchGroupFailure(results, plan, group, "PROXY_ENCODING_FAILED", "failed to encode routed batch partition", true, 0)
+			report.RequestedItems += len(group.indexes)
+			report.RejectedItems += len(group.indexes)
 			continue
 		}
 
@@ -2070,22 +2080,25 @@ func (p *Proxy) proxyGenerateBatchRequest(w http.ResponseWriter, r *http.Request
 		capture := newBoundedProxyResponseWriter(p.maxBatchResponseBytes - retainedResponseBytes)
 		p.proxyRequestWithBody(capture, groupRequest, "generate.batch", time.Now(), groupRouting, groupBody)
 		if capture.err != nil {
-			writeProxyGenerateBatchGroupFailure(results, report, plan, group, "UPSTREAM_RESPONSE_TOO_LARGE", "inference batch partition response exceeded the proxy limit", true, 0)
+			writeProxyGenerateBatchGroupFailure(results, plan, group, "UPSTREAM_RESPONSE_TOO_LARGE", "inference batch partition response exceeded the proxy limit", true, 0)
+			reportComplete = false
 			continue
 		}
 		if capture.statusCode < 200 || capture.statusCode >= 300 {
 			retryAfterMS := retryAfterMilliseconds(capture.header.Get("Retry-After"))
-			writeProxyGenerateBatchGroupFailure(results, report, plan, group, "ROUTING_OR_UPSTREAM_ERROR", http.StatusText(capture.statusCode), proxyBatchStatusRetryable(capture.statusCode), retryAfterMS)
+			writeProxyGenerateBatchGroupFailure(results, plan, group, "ROUTING_OR_UPSTREAM_ERROR", http.StatusText(capture.statusCode), proxyBatchStatusRetryable(capture.statusCode), retryAfterMS)
+			reportComplete = false
 			continue
 		}
-		retainedResponseBytes += int64(capture.body.Len())
 
 		var partition proxyGenerateBatchResponse
 		if err := json.Unmarshal(capture.body.Bytes(), &partition); err != nil ||
 			validateProxyGenerateBatchPartition(partition, plan, group) != nil {
-			writeProxyGenerateBatchGroupFailure(results, report, plan, group, "INVALID_UPSTREAM_RESPONSE", "inference batch partition returned an invalid result envelope", true, 0)
+			writeProxyGenerateBatchGroupFailure(results, plan, group, "INVALID_UPSTREAM_RESPONSE", "inference batch partition returned an invalid result envelope", true, 0)
+			reportComplete = false
 			continue
 		}
+		retainedResponseBytes += int64(capture.body.Len())
 		for localIndex, globalIndex := range group.indexes {
 			item := partition.Data[localIndex]
 			item.Index = globalIndex
@@ -3765,10 +3778,19 @@ func proxyBodyAdmissionBytes(bodyBytes int64) int64 {
 	if bodyBytes <= 0 {
 		return 0
 	}
-	if bodyBytes > math.MaxInt64/3 {
+	if bodyBytes > math.MaxInt64/proxyBodyAdmissionMultiplier {
 		return math.MaxInt64
 	}
-	return bodyBytes * 3
+	return bodyBytes * proxyBodyAdmissionMultiplier
+}
+
+// proxyBodyBytesForAdmission returns the largest logical request body whose
+// conservative physical reservation fits the authoritative process ceiling.
+func proxyBodyBytesForAdmission(admissionBytes int64) int64 {
+	if admissionBytes <= 0 {
+		return 0
+	}
+	return admissionBytes / proxyBodyAdmissionMultiplier
 }
 
 // proxyBatchResponseAdmissionBytes covers the captured upstream body, buffer
@@ -3779,10 +3801,20 @@ func proxyBatchResponseAdmissionBytes(responseBytes int64) int64 {
 	if responseBytes <= 0 {
 		return 0
 	}
-	if responseBytes > math.MaxInt64/4 {
+	if responseBytes > math.MaxInt64/proxyBatchResponseAdmissionMultiplier {
 		return math.MaxInt64
 	}
-	return responseBytes * 4
+	return responseBytes * proxyBatchResponseAdmissionMultiplier
+}
+
+// proxyBatchResponseBytesForAdmission returns the largest logical aggregate
+// response whose capture, decode, reassembly, and encoding reservation fits
+// the authoritative process ceiling.
+func proxyBatchResponseBytesForAdmission(admissionBytes int64) int64 {
+	if admissionBytes <= 0 {
+		return 0
+	}
+	return admissionBytes / proxyBatchResponseAdmissionMultiplier
 }
 
 func proxyMaterializedBodyAdmissionBytes(bodyBytes, bodyCapacityBytes int64) int64 {
@@ -4073,7 +4105,7 @@ func validateProxyGenerateBatchPartition(partition proxyGenerateBatchResponse, p
 	return nil
 }
 
-func writeProxyGenerateBatchGroupFailure(results []proxyGenerateBatchResult, report *proxyBatchExecutionReport, plan proxyGenerateBatchPlan, group proxyGenerateBatchGroup, code, message string, retryable bool, retryAfterMS int64) {
+func writeProxyGenerateBatchGroupFailure(results []proxyGenerateBatchResult, plan proxyGenerateBatchPlan, group proxyGenerateBatchGroup, code, message string, retryable bool, retryAfterMS int64) {
 	type itemError struct {
 		Code         string `json:"code"`
 		Message      string `json:"message"`
@@ -4096,8 +4128,6 @@ func writeProxyGenerateBatchGroupFailure(results []proxyGenerateBatchResult, rep
 			Error:    encoded,
 		}
 	}
-	report.RequestedItems += len(group.indexes)
-	report.RejectedItems += len(group.indexes)
 }
 
 func proxyBatchStatusRetryable(status int) bool {
