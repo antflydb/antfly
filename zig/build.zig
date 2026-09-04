@@ -6574,6 +6574,7 @@ pub fn build(b: *std.Build) void {
             "target authority settles only after every group acknowledges the exact incarnation",
             "targeted publication rejects a completed stale incarnation until structural acknowledgement",
             "settled target authority preserves the accepted incarnation against late publishers",
+            "accepted authority requires identity containment not equal cardinality",
             "targeted authority binding is monotonic under reversed publication order",
             "wholly stale targeted publication cannot bind unknown authority",
             "targeted deletion hands off only after authoritative absence",

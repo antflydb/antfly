@@ -1917,30 +1917,26 @@ fn targetAuthorityAcceptsIdentity(
 /// fresh observation which omits the replacement index entirely (or reports a
 /// different kind under the reused name). Once exact authority has handed off,
 /// replacing the whole group with that observation would erase the only safe
-/// serving snapshot. Reject that structurally stale group as a unit. This walks
-/// only indexes in both group observations and performs O(1) authority lookups;
-/// it is independent of historical mutation/tombstone count.
+/// serving snapshot. Reject that structurally stale group as a unit. Authority
+/// is an identity-set containment contract, not a cardinality contract: an
+/// observation containing accepted B cannot replace one containing accepted A
+/// merely because both sets have one member. The scan is allocation-free and
+/// bounded by the live indexes in the two group observations; it is independent
+/// of historical mutation/tombstone count.
 fn observationWouldWithdrawAcceptedIndexAuthority(
     previous: LocalTableRuntimeStatus,
     incoming: LocalTableRuntimeStatus,
     index_authorities: *const std.StringHashMapUnmanaged(TargetedIndexAuthority),
 ) bool {
     if (index_authorities.count() == 0) return false;
-    var accepted_cached: usize = 0;
     for (previous.stats.indexes) |cached| {
         const authority = index_authorities.get(cached.name) orelse continue;
         if (authority.transition_active and !authority.target_authority_handed_off) continue;
         if (!targetAuthorityAcceptsIdentity(authority, cached)) continue;
-        accepted_cached += 1;
+        const candidate = findIndexStatusByName(incoming.stats.indexes, cached.name) orelse return true;
+        if (!targetAuthorityAcceptsIdentity(authority, candidate)) return true;
     }
-    if (accepted_cached == 0) return false;
-    var accepted_incoming: usize = 0;
-    for (incoming.stats.indexes) |candidate| {
-        const authority = index_authorities.get(candidate.name) orelse continue;
-        if (authority.transition_active and !authority.target_authority_handed_off) continue;
-        if (targetAuthorityAcceptsIdentity(authority, candidate)) accepted_incoming += 1;
-    }
-    return accepted_incoming < accepted_cached;
+    return false;
 }
 
 fn targetedIndexExpectationForPublishableGroups(
@@ -4210,6 +4206,90 @@ test "settled target authority preserves the accepted incarnation against late p
     try std.testing.expectEqual(@as(u64, 4), observed.stats.source_doc_count);
     try std.testing.expect(!current.runtime_observation_stale);
     try std.testing.expect(current.runtime_observation_serviceable);
+}
+
+test "accepted authority requires identity containment not equal cardinality" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var cached_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("accepted_a"),
+        .kind = .dense_vector,
+        .doc_count = 7,
+        .serving_snapshot_ready = true,
+        .coverage_generation = 11,
+        .coverage_config_hash = 101,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(initial, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .doc_count = 7, .index_count = 1, .indexes = cached_indexes[0..] },
+        }),
+    );
+
+    // Model two persistent catalog authorities on a newly repopulated group:
+    // the cached owner observed only A and a partial incoming owner observes
+    // only B. Cache teardown owns and frees these authority names.
+    const state = cache.tables.getPtr("docs").?;
+    {
+        const owned_name = try alloc.dupe(u8, "accepted_a");
+        errdefer alloc.free(owned_name);
+        try state.index_authorities.put(alloc, owned_name, .{
+            .transition_revision = 1,
+            .transition_active = false,
+            .accept_target_after_observation_generation = 1,
+            .expectation = .{ .exact = .{
+                .kind = .dense_vector,
+                .incarnation = 11,
+                .config_hash = 101,
+            } },
+        });
+    }
+    {
+        const owned_name = try alloc.dupe(u8, "accepted_b");
+        errdefer alloc.free(owned_name);
+        try state.index_authorities.put(alloc, owned_name, .{
+            .transition_revision = 2,
+            .transition_active = false,
+            .accept_target_after_observation_generation = 1,
+            .expectation = .{ .exact = .{
+                .kind = .sparse_vector,
+                .incarnation = 22,
+                .config_hash = 202,
+            } },
+        });
+    }
+
+    var incoming_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("accepted_b"),
+        .kind = .sparse_vector,
+        .coverage_generation = 22,
+        .coverage_config_hash = 202,
+        .coverage_identity_ready = true,
+    }};
+    const disjoint = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.stale_observation,
+        try cache.publishGroup(disjoint, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .doc_count = 22, .index_count = 1, .indexes = incoming_indexes[0..] },
+        }),
+    );
+
+    var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer observed.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 7), observed.stats.doc_count);
+    try std.testing.expect(findIndexStatusByName(observed.stats.indexes, "accepted_b") == null);
+    const retained = findIndexStatusByName(observed.stats.indexes, "accepted_a").?;
+    try std.testing.expectEqual(@as(u64, 11), retained.coverage_generation);
+    try std.testing.expectEqual(@as(u64, 7), retained.doc_count);
 }
 
 test "targeted authority binding is monotonic under reversed publication order" {
