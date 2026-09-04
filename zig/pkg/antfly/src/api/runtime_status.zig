@@ -1662,12 +1662,15 @@ fn preserveArtifactVisibilityOnReplayRegression(
             accepted_authority_continuity;
         dst.runtime_observation_serviceable = serviceable_continuity;
         dst.runtime_observation_targeted_sibling = targeted_sibling_continuity;
+        // Exact incarnation authority admits this observation; it does not
+        // make the cached artifact state newer than legitimate progress from
+        // that same incarnation.
+        if (accepted_authority_continuity) dst.runtime_observation_stale = false;
         const visibility_regressed_without_newer_replay = serviceable_continuity and
             target_not_older and
             !indexHasPublishedGenerationVisibility(dst.*) and
             dst.replay_applied_sequence <= cached.replay_applied_sequence;
         if (!targeted_sibling_continuity and
-            !accepted_authority_continuity and
             !serving_visibility_regressed and
             !applied_regressed and
             !projection_regressed and
@@ -1675,12 +1678,10 @@ fn preserveArtifactVisibilityOnReplayRegression(
 
         preserveIndexArtifactVisibility(dst, cached);
         if (targeted_sibling_continuity or
-            accepted_authority_continuity or
             projection_regressed or
             visibility_regressed_without_newer_replay or
             (same_accepted_source_target and serving_cardinality_regressed))
             try preserveIndexProjectionLifecycle(alloc, dst, cached);
-        if (accepted_authority_continuity) dst.runtime_observation_stale = false;
         dst.replay_applied_sequence = @max(dst.replay_applied_sequence, cached.replay_applied_sequence);
         dst.replay_target_sequence = @max(dst.replay_target_sequence, cached.replay_target_sequence);
         dst.catch_up_applied_sequence = @max(dst.catch_up_applied_sequence, cached.catch_up_applied_sequence);
@@ -4137,6 +4138,32 @@ test "settled target authority preserves the accepted incarnation against late p
     );
     try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?.transition_active);
 
+    // Persistent identity authority rejects superseded incarnations, but it
+    // must not freeze ordinary publication progress from the accepted one.
+    var progressed_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 4,
+        .serving_snapshot_ready = true,
+        .serving_snapshot_revision = 2,
+        .coverage_produced_count = 4,
+        .coverage_generation = 13,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .replay_applied_sequence = 4,
+        .replay_target_sequence = 4,
+    }};
+    const progress = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(progress, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .source_doc_count = 4, .doc_count = 4, .index_count = 1, .indexes = progressed_indexes[0..] },
+        }),
+    );
+
     // The retiring owner's structurally stale group is rejected as a unit. It
     // cannot erase the accepted row or replace fresh sibling/table facts.
     const late = try cache.capturePublicationToken("docs");
@@ -4177,8 +4204,10 @@ test "settled target authority preserves the accepted incarnation against late p
     defer observed.deinit(alloc);
     const current = findIndexStatusByName(observed.stats.indexes, "semantic_idx").?;
     try std.testing.expectEqual(@as(u64, 13), current.coverage_generation);
-    try std.testing.expectEqual(@as(u64, 1), current.doc_count);
-    try std.testing.expectEqual(@as(u64, 3), observed.stats.source_doc_count);
+    try std.testing.expectEqual(@as(u64, 4), current.doc_count);
+    try std.testing.expectEqual(@as(u64, 4), current.coverage_produced_count);
+    try std.testing.expectEqual(@as(u64, 4), current.replay_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 4), observed.stats.source_doc_count);
     try std.testing.expect(!current.runtime_observation_stale);
     try std.testing.expect(current.runtime_observation_serviceable);
 }
