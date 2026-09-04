@@ -195,7 +195,10 @@ fn gunzipRequestBodyAlloc(ctx: ?*httpx.Context, alloc: std.mem.Allocator, encode
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var decompressor = std.compress.flate.Decompress.init(&encoded_reader, .gzip, &window);
     var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
+    errdefer {
+        if (ctx) |request_ctx| request_ctx.releaseRequestBodyBuffer(out.capacity);
+        out.deinit(alloc);
+    }
     var buf: [16 * 1024]u8 = undefined;
     while (true) {
         const count = decompressor.reader.readSliceShort(&buf) catch |err| {
@@ -249,6 +252,22 @@ test "gzip request bodies reserve expanded capacity from the shared server budge
     );
     try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
     try std.testing.expectEqual(@as(u64, 1), budget.stats().rejected_total);
+}
+
+test "invalid gzip releases partially expanded body capacity" {
+    const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0 };
+    var budget = httpx.SharedBodyBudget.init(32 * 1024);
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/");
+    defer request.deinit();
+    request.body_budget = &budget;
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    try std.testing.expectError(
+        error.InvalidCompressedBody,
+        gunzipRequestBodyAlloc(&ctx, std.testing.allocator, encoded[0 .. encoded.len - 4], 1024),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
 }
 
 test "gzip request body reservation follows the owned decoded buffer lifetime" {

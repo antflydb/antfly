@@ -4,6 +4,8 @@ import type {
   GenerationConfidence,
   QueryHit,
   RetrievalAgentStreamCallbacks,
+  SSEStepStarted,
+  SSEToolMode,
 } from "@antfly/sdk";
 import {
   AntflyClient,
@@ -166,7 +168,9 @@ export interface AnswerCallbacks {
   onConfidence?: (data: GenerationConfidence) => void;
   onFollowup?: (question: string) => void;
   onEvalResult?: (data: EvalResult) => void;
-  onStepStarted?: (step: import("@antfly/sdk").SSEStepStarted) => void;
+  onToolMode?: (data: SSEToolMode) => void;
+  onStepStarted?: (step: SSEStepStarted) => void;
+  onStepProgress?: (data: Record<string, unknown>) => void;
   onStepCompleted?: (step: import("@antfly/sdk").AgentStep) => void;
   onComplete?: () => void;
   onError?: (error: Error | string) => void;
@@ -202,7 +206,10 @@ export async function streamAnswer(
       callbacks.onGeneration ||
       callbacks.onConfidence ||
       callbacks.onFollowup ||
+      callbacks.onEvalResult ||
+      callbacks.onToolMode ||
       callbacks.onStepStarted ||
+      callbacks.onStepProgress ||
       callbacks.onStepCompleted
     );
 
@@ -219,7 +226,9 @@ export async function streamAnswer(
           onReasoning: callbacks.onReasoning,
           onHit: callbacks.onHit,
           onGeneration: callbacks.onGeneration,
+          onToolMode: callbacks.onToolMode,
           onStepStarted: callbacks.onStepStarted,
+          onStepProgress: callbacks.onStepProgress,
           onStepCompleted: callbacks.onStepCompleted,
           onConfidence: callbacks.onConfidence,
           onFollowup: callbacks.onFollowup,

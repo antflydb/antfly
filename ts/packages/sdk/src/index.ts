@@ -361,6 +361,7 @@ export type {
   SortProfile,
   SparseEmbedding,
   SSEStepStarted,
+  SSEToolMode,
   // Table types
   Table,
   TableMigration,
