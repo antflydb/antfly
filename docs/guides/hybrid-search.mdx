@@ -122,23 +122,26 @@ antfly query --table wikipedia \
   --semantic-search "theory of relativity and physics" \
   --indexes "title_body" \
   --fields "title,url" \
-  --limit 50 \
+  --limit 10 \
   --reranker '{
     "provider": "antfly",
     "field": "body",
-    "candidate_count": 50,
-    "top_n": 10
+    "candidate_count": 50
   }'
 ```
 
-The `field` parameter tells the reranker which document field to score against the query. `candidate_count` controls the expensive scoring window, while `top_n` controls the number returned. The built-in `antfly` reranker uses a cross-encoder model bundled in the binary. For larger or custom models, use `"provider": "antfly"` with a model like `cross-encoder/ms-marco-MiniLM-L-6-v2`.
+The `field` parameter tells the reranker which document field to score against the query. `candidate_count` controls the expensive scoring window, while the query's `limit` controls the number returned. The built-in `antfly` reranker uses a cross-encoder model bundled in the binary. For larger or custom models, use `"provider": "antfly"` with a model like `cross-encoder/ms-marco-MiniLM-L-6-v2`.
 
 The executable reranker providers are `antfly`, `cohere`, and `vertex`.
-Antfly validates `top_n <= candidate_count` before retrieval and only sends the
-bounded candidate window to a remote reranker.
+Antfly retrieves the bounded window from each shard, retains the globally best
+`candidate_count` hits, and makes one batched reranker call at the coordinator.
+`offset` and `limit` are applied after reranking. The legacy reranker `top_n`
+field remains as a deprecated limit override and is validated against
+`candidate_count`. Reranking changes the returned order and page, while
+`hits.total` continues to report the underlying retrieval match count.
 
 <Callout type="tip">
-Retrieve more results than you need (50-100), then use `candidate_count` to bound reranking cost and `top_n` for the final response size. A larger candidate set can improve recall but increases latency.
+Set `candidate_count` higher than `offset + limit` (often 50-100) to improve recall while keeping remote scoring cost bounded. Use the normal query `limit` for the final response size. A larger candidate set can improve recall but increases latency.
 </Callout>
 
 ## Pruning
@@ -215,12 +218,11 @@ curl -X POST http://localhost:8080/v1/query \
     "indexes": ["title_body"],
     "fields": ["title", "body", "url"],
     "merge_config": {"strategy": "rsf"},
-    "limit": 50,
+    "limit": 10,
     "reranker": {
       "provider": "antfly",
       "field": "body",
-      "candidate_count": 50,
-      "top_n": 10
+      "candidate_count": 50
     },
     "pruner": {
       "min_score_ratio": 0.5,

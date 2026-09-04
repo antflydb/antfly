@@ -28,14 +28,42 @@ pub const Provider = lib.Provider;
 /// Long-lived resources shared by reranking requests. This keeps HTTP
 /// connections warm and lets ADC refresh single-flight per credential/scope.
 pub const Runtime = struct {
+    io: std.Io,
     http: httpx.Client,
     credentials: google_auth.CredentialManager,
+    admission: std.Io.Semaphore = .{ .permits = 16 },
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) Runtime {
         return .{
+            .io = io,
             .http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = true }),
             .credentials = google_auth.CredentialManager.init(alloc, io),
         };
+    }
+
+    /// Runs one batched provider call through the process-level pool. The
+    /// concurrency gate protects provider sockets and credential refresh from
+    /// request fan-in while preserving I/O cancellation.
+    pub fn rerank(
+        self: *Runtime,
+        alloc: std.mem.Allocator,
+        cfg: Config,
+        dependencies: Options,
+        query: []const u8,
+        documents: []const []const u8,
+    ) ![]f32 {
+        try self.admission.wait(self.io);
+        defer self.admission.post(self.io);
+        var options = dependencies;
+        options.runtime = self;
+        return try rerankDocumentsWithOptions(
+            alloc,
+            &self.http,
+            cfg,
+            options,
+            query,
+            documents,
+        );
     }
 
     pub fn deinit(self: *Runtime) void {
@@ -44,6 +72,54 @@ pub const Runtime = struct {
         self.* = undefined;
     }
 };
+
+/// Collapses provider and transport failures into the stable query-layer
+/// taxonomy shared by table, global, and retrieval-agent queries.
+pub fn normalizeOperationalError(err: anyerror) anyerror {
+    return switch (err) {
+        error.RerankRateLimited,
+        error.RerankTransientFailure,
+        error.RerankUpstreamFailure,
+        error.Timeout,
+        error.Canceled,
+        error.Cancelled,
+        => err,
+        error.RerankRequestFailed,
+        error.EmptyResponse,
+        error.InvalidRerankerResponse,
+        error.InvalidResponse,
+        => error.RerankUpstreamFailure,
+        error.ConnectionTimedOut => error.Timeout,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        => error.RerankTransientFailure,
+        else => err,
+    };
+}
+
+pub fn statusError(status: u16) anyerror {
+    return switch (status) {
+        408, 504 => error.Timeout,
+        429 => error.RerankRateLimited,
+        500...503, 505...599 => error.RerankTransientFailure,
+        else => error.RerankRequestFailed,
+    };
+}
+
+test "reranking runtime failures use stable query dependency classes" {
+    try std.testing.expectEqual(error.RerankRateLimited, statusError(429));
+    try std.testing.expectEqual(error.RerankTransientFailure, statusError(503));
+    try std.testing.expectEqual(error.Timeout, statusError(504));
+    try std.testing.expectEqual(error.RerankRequestFailed, statusError(401));
+    try std.testing.expectEqual(error.RerankUpstreamFailure, normalizeOperationalError(error.InvalidRerankerResponse));
+    try std.testing.expectEqual(error.RerankTransientFailure, normalizeOperationalError(error.ConnectionRefused));
+    try std.testing.expectEqual(error.Timeout, normalizeOperationalError(error.ConnectionTimedOut));
+    try std.testing.expectEqual(error.Canceled, normalizeOperationalError(error.Canceled));
+}
 
 pub fn rerankDocuments(
     alloc: std.mem.Allocator,
@@ -157,7 +233,7 @@ fn rerankCohere(
     const headers = [_][2][]const u8{.{ "Authorization", authorization }};
     var response = try http.post(url, .{ .json = body, .headers = &headers });
     defer response.deinit();
-    if (!response.ok()) return error.RerankRequestFailed;
+    if (!response.ok()) return statusError(response.status.code);
     const Response = struct {
         results: []const struct {
             index: usize,

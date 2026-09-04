@@ -516,6 +516,7 @@ pub const QueryBuilderRequest = types.QueryBuilderRequest;
 pub const QueryBuilderResult = types.QueryBuilderResult;
 pub const QueryCandidateBudgetExceededError = types.QueryCandidateBudgetExceededError;
 pub const QueryConflictError = types.QueryConflictError;
+pub const QueryDependencyError = types.QueryDependencyError;
 pub const QueryFilterError = types.QueryFilterError;
 pub const QueryHierarchy = types.QueryHierarchy;
 pub const QueryHit = types.QueryHit;

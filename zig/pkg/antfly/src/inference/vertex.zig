@@ -226,7 +226,12 @@ pub const Provider = struct {
 
         var response = try self.http.post(url, .{ .json = request_body, .headers = headers.items });
         defer response.deinit();
-        if (!response.ok()) return error.RerankRequestFailed;
+        if (!response.ok()) return switch (response.status.code) {
+            408, 504 => error.Timeout,
+            429 => error.RerankRateLimited,
+            500...503, 505...599 => error.RerankTransientFailure,
+            else => error.RerankRequestFailed,
+        };
         const Response = struct {
             records: []const struct {
                 id: []const u8,

@@ -763,6 +763,8 @@ from .query_builder_result_query import QueryBuilderResultQuery
 from .query_candidate_budget_exceeded_error import QueryCandidateBudgetExceededError
 from .query_candidate_budget_exceeded_error_error import QueryCandidateBudgetExceededErrorError
 from .query_candidate_budget_exceeded_error_status import QueryCandidateBudgetExceededErrorStatus
+from .query_dependency_error import QueryDependencyError
+from .query_dependency_error_code import QueryDependencyErrorCode
 from .query_filter_error import QueryFilterError
 from .query_filter_error_error import QueryFilterErrorError
 from .query_filter_error_field import QueryFilterErrorField
@@ -1748,6 +1750,8 @@ __all__ = (
     "QueryCandidateBudgetExceededError",
     "QueryCandidateBudgetExceededErrorError",
     "QueryCandidateBudgetExceededErrorStatus",
+    "QueryDependencyError",
+    "QueryDependencyErrorCode",
     "QueryFilterError",
     "QueryFilterErrorError",
     "QueryFilterErrorField",

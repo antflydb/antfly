@@ -2873,7 +2873,7 @@ export interface components {
              * @description Stable machine-readable retry classification.
              * @enum {string}
              */
-            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable";
+            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable" | "reranker_temporarily_unavailable";
             /** @description Human-readable error summary. */
             message: string;
             /**
@@ -2881,6 +2881,15 @@ export interface components {
              * @enum {boolean}
              */
             retryable: true;
+        };
+        /** @description A stable failure envelope for query embedding and reranking dependencies. */
+        QueryDependencyError: {
+            /** @enum {string} */
+            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "query_timeout";
+            /** @description Legacy alias of code. Use code for programmatic handling. */
+            error: string;
+            message: string;
+            retryable: boolean;
         };
         /** @description A hierarchy traversal cursor bound to an older source-artifact revision. */
         HierarchyCursorStaleError: {
@@ -3238,7 +3247,7 @@ export interface components {
             actual: number;
         };
         GraphQueryUnprocessableError: components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphWorkBudgetExceededError"] | components["schemas"]["GraphPathWeightDomainError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphQueryUnsupportedError"] | components["schemas"]["GraphMatchOperationLimitExceededError"];
-        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphQueryUnprocessableError"] | components["schemas"]["QueryFilterError"] | components["schemas"]["UnsupportedHierarchyGroupingError"] | components["schemas"]["UnsupportedQueryError"];
+        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphQueryUnprocessableError"] | components["schemas"]["QueryFilterError"] | components["schemas"]["UnsupportedHierarchyGroupingError"] | components["schemas"]["UnsupportedQueryError"] | components["schemas"]["QueryDependencyError"];
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -12231,9 +12240,12 @@ export interface components {
             field?: string;
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
-            /** @description Maximum number of highest-ranked retrieval candidates to send to the reranker. Defaults to all candidates returned by retrieval; candidates outside this window are not returned. */
+            /** @description Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. */
             candidate_count?: number;
-            /** @description Number of reranked documents to return after candidate_count documents have been scored. Defaults to candidate_count and cannot exceed it. */
+            /**
+             * @deprecated
+             * @description Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present.
+             */
             top_n?: number;
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
         /** @description User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes. */
@@ -14975,6 +14987,44 @@ export interface components {
                 "application/json": components["schemas"]["QueryTemporarilyUnavailableError"];
             };
         };
+        /** @description Query embedding input exceeds the provider or server limit */
+        QueryPayloadTooLarge: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["QueryDependencyError"];
+            };
+        };
+        /** @description A query embedding or reranking dependency is rate limited */
+        QueryRateLimited: {
+            headers: {
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["QueryDependencyError"];
+            };
+        };
+        /** @description A query embedding or reranking provider returned an unusable response */
+        QueryBadGateway: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["QueryDependencyError"];
+            };
+        };
+        /** @description Query execution or a query dependency timed out */
+        QueryGatewayTimeout: {
+            headers: {
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["QueryDependencyError"];
+            };
+        };
         /** @description Internal server error */
         InternalServerError: {
             headers: {
@@ -15996,9 +16046,13 @@ export interface operations {
                 };
             };
             409: components["responses"]["QueryConflict"];
+            413: components["responses"]["QueryPayloadTooLarge"];
             422: components["responses"]["QueryUnprocessable"];
+            429: components["responses"]["QueryRateLimited"];
             500: components["responses"]["QueryInternalServerError"];
+            502: components["responses"]["QueryBadGateway"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
+            504: components["responses"]["QueryGatewayTimeout"];
         };
     };
     evaluate: {
@@ -16126,6 +16180,10 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["QueryPayloadTooLarge"];
+            422: components["responses"]["QueryUnprocessable"];
+            429: components["responses"]["QueryRateLimited"];
             /** @description Internal server error */
             500: {
                 headers: {
@@ -16135,6 +16193,9 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            502: components["responses"]["QueryBadGateway"];
+            503: components["responses"]["QueryTemporarilyUnavailable"];
+            504: components["responses"]["QueryGatewayTimeout"];
         };
     };
     listTables: {
@@ -16291,9 +16352,13 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["QueryConflict"];
+            413: components["responses"]["QueryPayloadTooLarge"];
             422: components["responses"]["QueryUnprocessable"];
+            429: components["responses"]["QueryRateLimited"];
             500: components["responses"]["QueryInternalServerError"];
+            502: components["responses"]["QueryBadGateway"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
+            504: components["responses"]["QueryGatewayTimeout"];
         };
     };
     batchWrite: {

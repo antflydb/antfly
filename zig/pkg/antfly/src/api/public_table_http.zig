@@ -157,10 +157,15 @@ pub const TableApi = struct {
         HierarchyCursorStale,
         TopologyChanged,
         QueryEmbeddingInputTooLarge,
+        EmbeddingIndexNotFound,
         QueryEmbeddingOverloaded,
         EmbedRateLimited,
         EmbedTransientFailure,
         EmbedUpstreamFailure,
+        RerankRateLimited,
+        RerankTransientFailure,
+        RerankUpstreamFailure,
+        Timeout,
         Canceled,
         DeadlineExceeded,
         InvalidManifest,
@@ -717,6 +722,7 @@ pub const QueryTemporarilyUnavailableReason = enum {
     storage_read_temporarily_unavailable,
     index_rebuilding,
     query_embedding_temporarily_unavailable,
+    reranker_temporarily_unavailable,
 };
 
 pub fn queryTemporarilyUnavailableOwnedResponse(
@@ -730,6 +736,7 @@ pub fn queryTemporarilyUnavailableOwnedResponse(
         .storage_read_temporarily_unavailable => "storage read temporarily unavailable",
         .index_rebuilding => "required index is rebuilding",
         .query_embedding_temporarily_unavailable => "query embedding temporarily unavailable",
+        .reranker_temporarily_unavailable => "reranker temporarily unavailable",
     };
     return .{
         .status = 503,
@@ -741,6 +748,55 @@ pub fn queryTemporarilyUnavailableOwnedResponse(
         .json = true,
         .retry_after_seconds = storage_read_temporarily_unavailable_retry_after_seconds,
     };
+}
+
+pub fn queryDependencyErrorOwnedResponse(
+    alloc: std.mem.Allocator,
+    status: u16,
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+) !OwnedResponse {
+    return .{
+        .status = status,
+        .body = try std.json.Stringify.valueAlloc(alloc, .{
+            .code = code,
+            .@"error" = code,
+            .message = message,
+            .retryable = retryable,
+        }, .{}),
+        .json = true,
+        .retry_after_seconds = if (retryable) 1 else null,
+    };
+}
+
+test "query dependency errors expose a stable JSON retry contract" {
+    const alloc = std.testing.allocator;
+    var response = try queryDependencyErrorOwnedResponse(
+        alloc,
+        429,
+        "reranker_rate_limited",
+        "reranker rate limited",
+        true,
+    );
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 429), response.status);
+    try std.testing.expect(response.json);
+    try std.testing.expectEqual(@as(?u32, 1), response.retry_after_seconds);
+
+    const Parsed = struct {
+        code: []const u8,
+        @"error": []const u8,
+        message: []const u8,
+        retryable: bool,
+    };
+    var parsed = try std.json.parseFromSlice(Parsed, alloc, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("reranker_rate_limited", parsed.value.code);
+    try std.testing.expectEqualStrings(parsed.value.code, parsed.value.@"error");
+    try std.testing.expectEqualStrings("reranker rate limited", parsed.value.message);
+    try std.testing.expect(parsed.value.retryable);
 }
 
 pub fn storageReadTemporarilyUnavailableOwnedResponse(alloc: std.mem.Allocator) !OwnedResponse {
@@ -1485,13 +1541,16 @@ pub fn handleTableQueryRequest(
                 };
             },
             error.QueryEmbeddingInputTooLarge => {
-                return .{ .status = 413, .body = try alloc.dupe(u8, "query embedding input too large") };
+                return try queryDependencyErrorOwnedResponse(alloc, 413, "query_embedding_input_too_large", "query embedding input too large", false);
+            },
+            error.EmbeddingIndexNotFound => {
+                return try queryDependencyErrorOwnedResponse(alloc, 422, "embedding_index_not_found", "embedding index not found", false);
             },
             error.QueryEmbeddingOverloaded => {
-                return .{ .status = 429, .body = try alloc.dupe(u8, "query embedding overloaded") };
+                return try queryDependencyErrorOwnedResponse(alloc, 429, "query_embedding_overloaded", "query embedding overloaded", true);
             },
             error.EmbedRateLimited => {
-                return .{ .status = 429, .body = try alloc.dupe(u8, "query embedding rate limited") };
+                return try queryDependencyErrorOwnedResponse(alloc, 429, "query_embedding_rate_limited", "query embedding rate limited", true);
             },
             error.EmbedTransientFailure => {
                 std.log.warn("public table query embedding temporarily unavailable table={s}", .{table_name});
@@ -1499,7 +1558,21 @@ pub fn handleTableQueryRequest(
             },
             error.EmbedUpstreamFailure => {
                 std.log.warn("public table query embedding upstream failure table={s}", .{table_name});
-                return .{ .status = 502, .body = try alloc.dupe(u8, "query embedding provider failed") };
+                return try queryDependencyErrorOwnedResponse(alloc, 502, "query_embedding_upstream_failure", "query embedding provider failed", false);
+            },
+            error.RerankRateLimited => {
+                return try queryDependencyErrorOwnedResponse(alloc, 429, "reranker_rate_limited", "reranker rate limited", true);
+            },
+            error.RerankTransientFailure => {
+                std.log.warn("public table reranker temporarily unavailable table={s}", .{table_name});
+                return try queryTemporarilyUnavailableOwnedResponse(alloc, .reranker_temporarily_unavailable);
+            },
+            error.RerankUpstreamFailure => {
+                std.log.warn("public table reranker upstream failure table={s}", .{table_name});
+                return try queryDependencyErrorOwnedResponse(alloc, 502, "reranker_upstream_failure", "reranker provider failed", false);
+            },
+            error.Timeout => {
+                return try queryDependencyErrorOwnedResponse(alloc, 504, "query_timeout", "query timed out", true);
             },
             error.IncompletePublishedSnapshot => {
                 std.log.warn("public table query detected incomplete index generation table={s}", .{table_name});

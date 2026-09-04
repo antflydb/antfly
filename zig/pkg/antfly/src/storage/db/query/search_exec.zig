@@ -1711,8 +1711,12 @@ fn componentPaging(req: types.SearchRequest) ComponentPaging {
         if (merge_config.window_size > limit) limit = merge_config.window_size;
     }
     if (req.reranker) |reranker| {
+        if (reranker.candidate_count) |candidate_count| {
+            if (candidate_count > limit) limit = candidate_count;
+        }
         if (reranker.top_n) |top_n| {
-            if (top_n > limit) limit = top_n;
+            const reranker_page_end = top_n +| req.offset;
+            if (reranker_page_end > limit) limit = reranker_page_end;
         }
     }
 
@@ -1720,6 +1724,20 @@ fn componentPaging(req: types.SearchRequest) ComponentPaging {
         .offset = 0,
         .limit = limit,
     };
+}
+
+test "reranker component paging includes the post-rerank offset" {
+    const paging = componentPaging(.{
+        .limit = 5,
+        .offset = 7,
+        .reranker = .{
+            .provider = .antfly,
+            .field = "body",
+            .top_n = 10,
+        },
+    });
+    try std.testing.expectEqual(@as(u32, 0), paging.offset);
+    try std.testing.expectEqual(@as(u32, 17), paging.limit);
 }
 
 fn requestHasPostprocessPageTransforms(req: types.SearchRequest) bool {

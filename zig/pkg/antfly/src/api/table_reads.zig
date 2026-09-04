@@ -4390,6 +4390,8 @@ pub const HostedProvisionedTableReadSource = struct {
     internal_service_issuer: ?[]const u8 = null,
     io_impl: ?*std.Io.Threaded = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    reranker_runtime: ?*reranking_runtime.Runtime = null,
+    secret_store: ?*common_secrets.FileStore = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
     incoming_graph_routes: ?*distributed_graph.IncomingSourceGroupCache = null,
 
@@ -4416,6 +4418,16 @@ pub const HostedProvisionedTableReadSource = struct {
 
     pub fn withBackendRuntime(self: *HostedProvisionedTableReadSource, backend_runtime: *db_mod.background_runtime.BackendRuntime) *HostedProvisionedTableReadSource {
         self.backend_runtime = backend_runtime;
+        return self;
+    }
+
+    pub fn withRerankerRuntime(self: *HostedProvisionedTableReadSource, runtime: *reranking_runtime.Runtime) *HostedProvisionedTableReadSource {
+        self.reranker_runtime = runtime;
+        return self;
+    }
+
+    pub fn withSecretStore(self: *HostedProvisionedTableReadSource, secret_store: ?*common_secrets.FileStore) *HostedProvisionedTableReadSource {
+        self.secret_store = secret_store;
         return self;
     }
 
@@ -5060,7 +5072,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, execution.db(), consistency);
                 execution.releaseDb();
                 try checkQueryDeadline(response_req);
-                try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null, null);
+                try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, self.secret_store, self.reranker_runtime);
                 return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
             }
         }
@@ -5109,7 +5121,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer meta.deinit(alloc);
             try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, consistency);
             try checkQueryDeadline(graph_req);
-            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, null, null, null);
+            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, null, self.secret_store, self.reranker_runtime);
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         var merged = try queryHostedAcrossGroups(self, alloc, group_ids, req, table_name, consistency);
@@ -5123,7 +5135,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer meta.deinit(alloc);
         try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, null, consistency);
         try checkQueryDeadline(req);
-        try applyQueryPostProcessing(alloc, req, &merged, &meta, null, null, null);
+        try applyQueryPostProcessing(alloc, req, &merged, &meta, null, self.secret_store, self.reranker_runtime);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
 
@@ -5278,7 +5290,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer meta.deinit(alloc);
         try applyHostedProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), consistency);
         execution.releaseDb();
-        try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null, null);
+        try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, self.secret_store, self.reranker_runtime);
         return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
     }
 
@@ -5912,7 +5924,8 @@ fn queryProvisionedAcrossGroupsParallel(
     const shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     defer alloc.free(shard_results);
     for (slots, 0..) |slot, i| shard_results[i] = slot.result.?;
-    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, req.offset, req.limit);
+    const coordinator_paging = distributedCoordinatorPaging(req);
+    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, coordinator_paging.offset, coordinator_paging.limit);
     errdefer merged.deinit();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
     recordParallelFanout(.query, @intCast(platform_time.monotonicNs() - start_ns));
@@ -6001,7 +6014,8 @@ fn queryHostedAcrossGroupsParallel(
     const shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     defer alloc.free(shard_results);
     for (slots, 0..) |slot, i| shard_results[i] = slot.result.?;
-    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, req.offset, req.limit);
+    const coordinator_paging = distributedCoordinatorPaging(req);
+    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, coordinator_paging.offset, coordinator_paging.limit);
     errdefer merged.deinit();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
     recordParallelFanout(.query, @intCast(platform_time.monotonicNs() - start_ns));
@@ -6009,9 +6023,52 @@ fn queryHostedAcrossGroupsParallel(
 }
 
 fn distributedSearchShardLimit(req: db_mod.types.SearchRequest) u32 {
+    if (req.reranker) |reranker| {
+        if (reranker.candidate_count) |candidate_count| return candidate_count;
+        const output_limit = reranker.top_n orelse req.limit;
+        return output_limit +| req.offset;
+    }
     if (req.search_after.len > 0 or req.search_before.len > 0) return req.limit;
     const shard_limit = req.limit +| req.offset;
     return if (shard_limit == 0) req.limit else shard_limit;
+}
+
+const DistributedCoordinatorPaging = struct {
+    offset: u32,
+    limit: u32,
+};
+
+/// Reranking is a coordinator transform. Retain the global retrieval window
+/// here and apply the caller's offset/final limit only after provider scoring.
+fn distributedCoordinatorPaging(req: db_mod.types.SearchRequest) DistributedCoordinatorPaging {
+    if (req.reranker != null) return .{
+        .offset = 0,
+        .limit = distributedSearchShardLimit(req),
+    };
+    return .{ .offset = req.offset, .limit = req.limit };
+}
+
+test "distributed reranking widens retrieval and stays coordinator owned" {
+    const req = db_mod.types.SearchRequest{
+        .limit = 10,
+        .offset = 5,
+        .reranker = .{
+            .provider = .antfly,
+            .field = "body",
+            .candidate_count = 50,
+            .top_n = 10,
+        },
+        .reranker_query_text = "query",
+    };
+    const shard = distributedSearchShardRequest(req, &.{}, false);
+    try std.testing.expectEqual(@as(u32, 50), shard.limit);
+    try std.testing.expectEqual(@as(u32, 0), shard.offset);
+    try std.testing.expect(shard.reranker == null);
+    try std.testing.expectEqual(@as(usize, 0), shard.reranker_query_text.len);
+
+    const coordinator = distributedCoordinatorPaging(req);
+    try std.testing.expectEqual(@as(u32, 0), coordinator.offset);
+    try std.testing.expectEqual(@as(u32, 50), coordinator.limit);
 }
 
 const complete_match_anchor_order = [_]db_mod.types.SortField{.{ .field = "_id" }};
@@ -6282,6 +6339,11 @@ fn distributedSearchShardRequest(
     copy.offset = 0;
     copy.limit = distributedSearchShardLimit(req);
     copy.distributed_text_stats = distributed_text_stats;
+    // Provider calls are coordinator-owned. In particular, a remote shard
+    // must never rerank independently and then be reranked a second time after
+    // the global merge.
+    copy.reranker = null;
+    copy.reranker_query_text = "";
     // Unit payloads and their parent-owned navigation state may belong to
     // independent child ranges. Shards select identities from local state; the
     // coordinator hydrates the globally selected unit page through routed
@@ -9066,7 +9128,8 @@ fn queryProvisionedAcrossGroupsPhase(
     }
     var merge_req = req;
     if (graph_accumulator != null) merge_req.clearGraphQueries();
-    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, merge_req, shard_results[0..initialized], req.offset, req.limit);
+    const coordinator_paging = distributedCoordinatorPaging(req);
+    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, merge_req, shard_results[0..initialized], coordinator_paging.offset, coordinator_paging.limit);
     errdefer merged.deinit();
     if (graph_accumulator) |*accumulator|
         merged.graph_results = try accumulator.toOwned();
@@ -9127,7 +9190,8 @@ fn queryHostedAcrossGroupsPhase(
     }
     var merge_req = req;
     if (graph_accumulator != null) merge_req.clearGraphQueries();
-    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, merge_req, shard_results[0..initialized], req.offset, req.limit);
+    const coordinator_paging = distributedCoordinatorPaging(req);
+    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, merge_req, shard_results[0..initialized], coordinator_paging.offset, coordinator_paging.limit);
     errdefer merged.deinit();
     if (graph_accumulator) |*accumulator|
         merged.graph_results = try accumulator.toOwned();
@@ -17236,22 +17300,45 @@ fn applyReranker(
     };
 
     const rerank_start_ns = platform_time.monotonicNs();
-    const scores = reranking_runtime.rerankDocumentsWithOptions(
-        alloc,
-        http,
-        cfg,
-        .{ .antfly_provider = antfly_provider, .secret_store = secret_store, .runtime = reranker_runtime },
-        req.reranker_query_text,
-        documents,
-    ) catch |err| switch (err) {
-        error.InvalidRerankerConfig, error.UnsupportedRerankerProvider => return error.InvalidQueryRequest,
-        else => return err,
+    const scores = if (reranker_runtime) |runtime|
+        runtime.rerank(alloc, cfg, .{ .antfly_provider = antfly_provider, .secret_store = secret_store }, req.reranker_query_text, documents)
+    else
+        reranking_runtime.rerankDocumentsWithOptions(
+            alloc,
+            http,
+            cfg,
+            .{ .antfly_provider = antfly_provider, .secret_store = secret_store },
+            req.reranker_query_text,
+            documents,
+        );
+    const owned_scores = scores catch |err| switch (err) {
+        error.InvalidRerankerConfig,
+        error.UnsupportedRerankerProvider,
+        error.MissingVertexCredentials,
+        error.SecretNotFound,
+        => return error.InvalidQueryRequest,
+        else => {
+            const normalized = reranking_runtime.normalizeOperationalError(err);
+            return switch (normalized) {
+                error.OutOfMemory,
+                error.Timeout,
+                error.Canceled,
+                error.Cancelled,
+                error.RerankRateLimited,
+                error.RerankTransientFailure,
+                error.RerankUpstreamFailure,
+                => normalized,
+                // Provider implementations expose transport- and parser-
+                // specific errors. Keep those details out of the public API.
+                else => error.RerankUpstreamFailure,
+            };
+        },
     };
-    defer alloc.free(scores);
-    if (scores.len != rerank_count) return error.InvalidRerankerResponse;
+    defer alloc.free(owned_scores);
+    if (owned_scores.len != rerank_count) return error.RerankUpstreamFailure;
 
     for (result.hits[0..rerank_count], 0..) |*hit, i| {
-        hit.score = scores[i];
+        hit.score = owned_scores[i];
     }
     std.sort.pdq(db_mod.types.SearchHit, result.hits[0..rerank_count], {}, struct {
         fn lessThan(_: void, a: db_mod.types.SearchHit, b: db_mod.types.SearchHit) bool {
@@ -17262,13 +17349,12 @@ fn applyReranker(
         }
     }.lessThan);
 
-    const output_count = rerankerOutputCount(rerank_count, cfg.top_n);
-    try truncateSearchHits(alloc, result, output_count);
-    result.total_hits = @min(result.total_hits, output_count);
+    const output_limit = rerankerOutputLimit(req.limit, cfg.top_n);
+    try pageRerankedSearchHits(alloc, result, rerank_count, req.offset, output_limit);
 
     meta.reranker = .{
         .model = cfg.model,
-        .documents_reranked = @intCast(scores.len),
+        .documents_reranked = @intCast(owned_scores.len),
         .duration_ms = @intCast(@divTrunc(platform_time.monotonicNs() - rerank_start_ns, std.time.ns_per_ms)),
     };
 }
@@ -17277,15 +17363,15 @@ fn rerankerCandidateCount(hit_count: usize, candidate_count: ?u32) usize {
     return if (candidate_count) |count| @min(hit_count, count) else hit_count;
 }
 
-fn rerankerOutputCount(candidate_count: usize, top_n: ?u32) usize {
-    return if (top_n) |count| @min(candidate_count, count) else candidate_count;
+fn rerankerOutputLimit(query_limit: u32, top_n: ?u32) u32 {
+    return top_n orelse query_limit;
 }
 
 test "reranker candidate and output windows have distinct bounds" {
     try std.testing.expectEqual(@as(usize, 50), rerankerCandidateCount(100, 50));
     try std.testing.expectEqual(@as(usize, 100), rerankerCandidateCount(100, null));
-    try std.testing.expectEqual(@as(usize, 10), rerankerOutputCount(50, 10));
-    try std.testing.expectEqual(@as(usize, 50), rerankerOutputCount(50, null));
+    try std.testing.expectEqual(@as(u32, 10), rerankerOutputLimit(25, 10));
+    try std.testing.expectEqual(@as(u32, 25), rerankerOutputLimit(25, null));
 }
 
 fn renderRerankerDocument(
@@ -17297,20 +17383,48 @@ fn renderRerankerDocument(
     return template_mod.renderDocument(alloc, doc_template, raw) catch try alloc.dupe(u8, "");
 }
 
-fn truncateSearchHits(
+fn pageRerankedSearchHits(
     alloc: std.mem.Allocator,
     result: *db_mod.types.SearchResult,
-    keep_len: usize,
+    candidate_count: usize,
+    offset: u32,
+    limit: u32,
 ) !void {
-    if (keep_len >= result.hits.len) return;
     const old_hits = result.hits;
+    const candidate_end = @min(candidate_count, old_hits.len);
+    const start = @min(@as(usize, offset), candidate_end);
+    const keep_len = @min(@as(usize, limit), candidate_end - start);
+    if (start == 0 and keep_len == old_hits.len and candidate_end == old_hits.len) return;
     var kept = try alloc.alloc(db_mod.types.SearchHit, keep_len);
-    for (old_hits[0..keep_len], 0..) |hit, i| {
-        kept[i] = hit;
+    for (old_hits, 0..) |*hit, i| {
+        if (i >= start and i < start + keep_len) {
+            kept[i - start] = hit.*;
+            hit.* = undefined;
+        } else {
+            hit.deinit(alloc);
+        }
     }
-    for (old_hits[keep_len..]) |*hit| hit.deinit(alloc);
     alloc.free(old_hits);
     result.hits = kept;
+}
+
+test "reranker paging preserves the underlying retrieval total" {
+    const alloc = std.testing.allocator;
+    const hits = try alloc.alloc(db_mod.types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "a") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "b") };
+    hits[2] = .{ .id = try alloc.dupe(u8, "c") };
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 100,
+    };
+    defer result.deinit();
+
+    try pageRerankedSearchHits(alloc, &result, 2, 1, 3);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("b", result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 100), result.total_hits);
 }
 
 fn lookupRemote(

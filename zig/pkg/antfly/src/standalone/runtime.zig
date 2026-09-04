@@ -871,6 +871,8 @@ const LocalStandaloneMetadata = struct {
                 .drop_table_exact = dropTableExact,
                 .update_schema = updateSchema,
                 .update_schema_versioned = updateSchemaVersioned,
+                .update_schema_versioned_expected = updateSchemaVersionedExpected,
+                .mutate_schema = mutateSchema,
                 .create_index = createIndex,
                 .drop_index = dropIndex,
                 .put_artifact_enrichment = putArtifactEnrichment,
@@ -1278,19 +1280,53 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn updateSchemaVersioned(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !u32 {
+        var result = try mutateSchema(ptr, alloc, table_name, .replace, schema_json, null);
+        defer result.deinit(alloc);
+        return result.version;
+    }
+
+    fn updateSchemaVersionedExpected(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema_json: []const u8,
+        expected_version: ?u32,
+    ) !u32 {
+        var result = try mutateSchema(ptr, alloc, table_name, .replace, schema_json, expected_version);
+        defer result.deinit(alloc);
+        return result.version;
+    }
+
+    fn mutateSchema(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        mode: antfly.public_api.tables.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !antfly.public_api.tables.SchemaMutationResult {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
-        const updated = try antfly.public_api.tables.applySchemaUpdateRecord(alloc, table, schema_json);
+        if (expected_version) |expected| {
+            if (try antfly.public_api.tables.schemaVersion(table.schema_json) != expected)
+                return error.SchemaVersionChanged;
+        }
+        const updated = try antfly.public_api.tables.applySchemaMutationRecord(alloc, table, mode, body);
         defer antfly.metadata.table_manager.freeTable(alloc, updated);
         const version = try antfly.public_api.tables.schemaVersion(updated.schema_json);
+        var result = antfly.public_api.tables.SchemaMutationResult{
+            .version = version,
+            .schema_json = try alloc.dupe(u8, updated.schema_json),
+        };
+        errdefer result.deinit(alloc);
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try self.manager.upsertTable(updated);
         self.epoch +|= 1;
         try mutation.commit(self);
-        return version;
+        return result;
     }
 
     fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -8004,6 +8040,45 @@ test "standalone metadata advertises a linearizable owned snapshot" {
     try std.testing.expectEqual(@as(u64, 7), dropped.table_id);
     try std.testing.expectEqualSlices(u64, &.{7001}, dropped.group_ids);
     try std.testing.expect(metadata.findTableByNameLocked("docs") == null);
+}
+
+test "standalone schema mutation supports atomic merge patch and version CAS" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, catalog_path),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+    try metadata.manager.upsertTable(.{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":0,\"description\":\"before\"}",
+    });
+
+    const source = metadata.statusSource();
+    var result = try source.mutateSchema(alloc, "docs", .merge_patch, "{\"description\":\"after\"}", 0);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), result.version);
+    try std.testing.expect(std.mem.indexOf(u8, result.schema_json, "\"description\":\"after\"") != null);
+    try std.testing.expectError(
+        error.SchemaVersionChanged,
+        source.mutateSchema(alloc, "docs", .replace, "{}", 0),
+    );
 }
 
 test "standalone routing watch does not report absence after one probe" {

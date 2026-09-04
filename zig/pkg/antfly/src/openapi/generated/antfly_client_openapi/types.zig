@@ -24501,6 +24501,15 @@ pub const QueryConflictError = union(enum) {
     }
 };
 
+/// A stable failure envelope for query embedding and reranking dependencies.
+pub const QueryDependencyError = struct {
+    code: []const u8,
+    /// Legacy alias of code. Use code for programmatic handling.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
 /// A public filter or exclusion query contains an invalid or unsupported node.
 pub const QueryFilterError = struct {
     status: i32,
@@ -25385,6 +25394,7 @@ pub const QueryUnprocessableError = union(enum) {
     graph_anchor_filter_requires_index_error: *GraphAnchorFilterRequiresIndexError,
     unsupported_query_error: *UnsupportedQueryError,
     query_filter_error: *QueryFilterError,
+    query_dependency_error: *QueryDependencyError,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
         const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
@@ -25554,6 +25564,14 @@ pub const QueryUnprocessableError = union(enum) {
         })) {
             if (try parseStructuralVariant(QueryFilterError, allocator, source, options)) |parsed| return .{ .query_filter_error = parsed };
         }
+        if (objectHasAnyKey(source.object, &.{
+            "code",
+            "error",
+            "message",
+            "retryable",
+        })) {
+            if (try parseStructuralVariant(QueryDependencyError, allocator, source, options)) |parsed| return .{ .query_dependency_error = parsed };
+        }
         return error.UnexpectedToken;
     }
 
@@ -25570,6 +25588,7 @@ pub const QueryUnprocessableError = union(enum) {
             .graph_anchor_filter_requires_index_error => |v| try jw.write(v.*),
             .unsupported_query_error => |v| try jw.write(v.*),
             .query_filter_error => |v| try jw.write(v.*),
+            .query_dependency_error => |v| try jw.write(v.*),
         }
     }
 };
@@ -26155,9 +26174,9 @@ pub const RerankerConfig = struct {
     field: ?[]const u8 = null,
     /// Handlebars template to render document text for reranking.
     template: ?[]const u8 = null,
-    /// Maximum number of highest-ranked retrieval candidates to send to the reranker. Defaults to all candidates returned by retrieval; candidates outside this window are not returned.
+    /// Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count.
     candidate_count: ?i64 = null,
-    /// Number of reranked documents to return after candidate_count documents have been scored. Defaults to candidate_count and cannot exceed it.
+    /// Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present.
     top_n: ?i64 = null,
     /// The name of the reranking model (e.g., cross-encoder model name).
     model: ?[]const u8 = null,

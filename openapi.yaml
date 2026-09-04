@@ -3433,10 +3433,18 @@ paths:
                 $ref: '#/components/schemas/Error'
         '409':
           $ref: '#/components/responses/QueryConflict'
+        '413':
+          $ref: '#/components/responses/QueryPayloadTooLarge'
         '422':
           $ref: '#/components/responses/QueryUnprocessable'
+        '429':
+          $ref: '#/components/responses/QueryRateLimited'
+        '502':
+          $ref: '#/components/responses/QueryBadGateway'
         '503':
           $ref: '#/components/responses/QueryTemporarilyUnavailable'
+        '504':
+          $ref: '#/components/responses/QueryGatewayTimeout'
         '500':
           $ref: '#/components/responses/QueryInternalServerError'
       security:
@@ -3637,6 +3645,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/QueryPayloadTooLarge'
+        '422':
+          $ref: '#/components/responses/QueryUnprocessable'
+        '429':
+          $ref: '#/components/responses/QueryRateLimited'
+        '502':
+          $ref: '#/components/responses/QueryBadGateway'
+        '503':
+          $ref: '#/components/responses/QueryTemporarilyUnavailable'
+        '504':
+          $ref: '#/components/responses/QueryGatewayTimeout'
         '500':
           description: Internal server error
           content:
@@ -3932,12 +3954,20 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '409':
           $ref: '#/components/responses/QueryConflict'
+        '413':
+          $ref: '#/components/responses/QueryPayloadTooLarge'
         '422':
           $ref: '#/components/responses/QueryUnprocessable'
         '404':
           $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/QueryRateLimited'
+        '502':
+          $ref: '#/components/responses/QueryBadGateway'
         '503':
           $ref: '#/components/responses/QueryTemporarilyUnavailable'
+        '504':
+          $ref: '#/components/responses/QueryGatewayTimeout'
         '500':
           $ref: '#/components/responses/QueryInternalServerError'
       security:
@@ -8320,6 +8350,7 @@ components:
             - storage_read_temporarily_unavailable
             - index_rebuilding
             - query_embedding_temporarily_unavailable
+            - reranker_temporarily_unavailable
           description: Stable machine-readable retry classification.
         message:
           type: string
@@ -8329,6 +8360,34 @@ components:
           enum:
             - true
           description: Always true; retry after the response's Retry-After delay.
+    QueryDependencyError:
+      type: object
+      additionalProperties: false
+      description: A stable failure envelope for query embedding and reranking dependencies.
+      required:
+        - code
+        - error
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+          enum:
+            - embedding_index_not_found
+            - query_embedding_input_too_large
+            - query_embedding_overloaded
+            - query_embedding_rate_limited
+            - query_embedding_upstream_failure
+            - reranker_rate_limited
+            - reranker_upstream_failure
+            - query_timeout
+        error:
+          type: string
+          description: Legacy alias of code. Use code for programmatic handling.
+        message:
+          type: string
+        retryable:
+          type: boolean
     HierarchyCursorStaleError:
       type: object
       additionalProperties: false
@@ -8924,6 +8983,7 @@ components:
         - $ref: '#/components/schemas/QueryFilterError'
         - $ref: '#/components/schemas/UnsupportedHierarchyGroupingError'
         - $ref: '#/components/schemas/UnsupportedQueryError'
+        - $ref: '#/components/schemas/QueryDependencyError'
     SortDirection:
       type: boolean
       description: Sort direction for a single field. true = descending, false = ascending.
@@ -23360,14 +23420,18 @@ components:
             candidate_count:
               type: integer
               minimum: 1
-              description: Maximum number of highest-ranked retrieval candidates to send to the reranker.
-                Defaults to all candidates returned by retrieval; candidates outside this window are not
-                returned.
+              description: Maximum number of globally highest-ranked retrieval candidates to send to the
+                reranker. In distributed deployments each shard retrieves at most this many candidates,
+                the coordinator retains the global window, and the provider is called once. Defaults to
+                offset plus the effective final result limit. Candidates outside this window are not returned,
+                but hits.total continues to describe the underlying retrieval match count.
             top_n:
               type: integer
               minimum: 1
-              description: Number of reranked documents to return after candidate_count documents have
-                been scored. Defaults to candidate_count and cannot exceed it.
+              deprecated: true
+              description: Deprecated compatibility override for QueryRequest.limit. When present, this
+                is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit.
+                Cannot exceed candidate_count when both are present.
           required:
             - provider
         - oneOf:
@@ -28440,6 +28504,42 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/QueryTemporarilyUnavailableError'
+    QueryPayloadTooLarge:
+      description: Query embedding input exceeds the provider or server limit
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/QueryDependencyError'
+    QueryRateLimited:
+      description: A query embedding or reranking dependency is rate limited
+      headers:
+        Retry-After:
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/QueryDependencyError'
+    QueryBadGateway:
+      description: A query embedding or reranking provider returned an unusable response
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/QueryDependencyError'
+    QueryGatewayTimeout:
+      description: Query execution or a query dependency timed out
+      headers:
+        Retry-After:
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/QueryDependencyError'
     InternalServerError:
       description: Internal server error
       content:

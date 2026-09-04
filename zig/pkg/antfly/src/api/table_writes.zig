@@ -12300,7 +12300,11 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn invalidateWriteCacheForTable(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         lockAtomic(&self.local_db_mutex);
-        if (self.write_cache) |cache| cache.invalidateTable(table_name);
+        // A cached DB may still have enrichment/index workers publishing
+        // visibility events. Detach their source-owned callbacks through the
+        // common invalidation path before retiring the entry; otherwise a
+        // draining worker can call back through a stale source pointer.
+        self.invalidateWriteCache(table_name);
         self.local_db_mutex.unlock();
         self.drainWriteCachePendingCloses();
     }

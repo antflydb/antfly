@@ -826,20 +826,21 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
-    fn respondQueryEmbeddingOperationalError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
-        const normalized = http_server_mod.normalizeQueryEmbeddingOperationalError(err) orelse return null;
-        const response = switch (normalized) {
-            error.QueryEmbeddingInputTooLarge => .{ @as(u16, 413), "query embedding input too large", false },
-            error.QueryEmbeddingOverloaded => .{ @as(u16, 429), "query embedding overloaded", true },
-            error.EmbedRateLimited => .{ @as(u16, 429), "query embedding rate limited", true },
-            error.EmbedTransientFailure => .{ @as(u16, 503), "query embedding temporarily unavailable", true },
-            error.EmbedUpstreamFailure => .{ @as(u16, 502), "query embedding provider failed", false },
-            error.Timeout => .{ @as(u16, 504), "query embedding timed out", false },
+    fn respondQueryOperationalError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
+        const normalized = http_server_mod.normalizeQueryOperationalError(err) orelse return null;
+        var response = switch (normalized) {
+            error.QueryEmbeddingInputTooLarge => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 413, "query_embedding_input_too_large", "query embedding input too large", false),
+            error.QueryEmbeddingOverloaded => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 429, "query_embedding_overloaded", "query embedding overloaded", true),
+            error.EmbedRateLimited => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 429, "query_embedding_rate_limited", "query embedding rate limited", true),
+            error.EmbedTransientFailure => try public_table_http.queryTemporarilyUnavailableOwnedResponse(ctx.allocator, .query_embedding_temporarily_unavailable),
+            error.EmbedUpstreamFailure => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 502, "query_embedding_upstream_failure", "query embedding provider failed", false),
+            error.RerankRateLimited => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 429, "reranker_rate_limited", "reranker rate limited", true),
+            error.RerankTransientFailure => try public_table_http.queryTemporarilyUnavailableOwnedResponse(ctx.allocator, .reranker_temporarily_unavailable),
+            error.RerankUpstreamFailure => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 502, "reranker_upstream_failure", "reranker provider failed", false),
+            error.Timeout => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 504, "query_timeout", "query timed out", true),
             else => return null,
         };
-        if (response[2]) try ctx.setHeader("Retry-After", "1");
-        _ = ctx.status(response[0]);
-        return try ctx.text(response[1]);
+        return try respondOwnedApiResponse(ctx, &response);
     }
 
     const OffloadedTableBatch = struct {
@@ -4395,6 +4396,16 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text("invalid retrieval agent request");
             },
+            error.EmbeddingIndexNotFound => {
+                var response = try public_table_http.queryDependencyErrorOwnedResponse(
+                    alloc,
+                    422,
+                    "embedding_index_not_found",
+                    "embedding index not found",
+                    false,
+                );
+                return try respondOwnedApiResponse(ctx, &response);
+            },
             error.MissingGenerationConfig => {
                 _ = ctx.status(422);
                 return ctx.text("steps.generation requires a step-level or top-level generator or chain");
@@ -4412,7 +4423,7 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("doc identity unavailable");
             },
             else => {
-                if (try respondQueryEmbeddingOperationalError(ctx, err)) |response| return response;
+                if (try respondQueryOperationalError(ctx, err)) |response| return response;
                 std.log.err("public retrieval failed err={}", .{err});
                 return err;
             },

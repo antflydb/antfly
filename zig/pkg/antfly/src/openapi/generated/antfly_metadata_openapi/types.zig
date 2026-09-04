@@ -6733,6 +6733,15 @@ pub const QueryConflictError = union(enum) {
     }
 };
 
+/// A stable failure envelope for query embedding and reranking dependencies.
+pub const QueryDependencyError = struct {
+    code: []const u8,
+    /// Legacy alias of code. Use code for programmatic handling.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
 /// A public filter or exclusion query contains an invalid or unsupported node.
 pub const QueryFilterError = struct {
     status: i32,
@@ -7577,6 +7586,7 @@ pub const QueryUnprocessableError = union(enum) {
     graph_anchor_filter_requires_index_error: *GraphAnchorFilterRequiresIndexError,
     unsupported_query_error: *UnsupportedQueryError,
     query_filter_error: *QueryFilterError,
+    query_dependency_error: *QueryDependencyError,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
         const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
@@ -7746,6 +7756,14 @@ pub const QueryUnprocessableError = union(enum) {
         })) {
             if (try parseStructuralVariant(QueryFilterError, allocator, source, options)) |parsed| return .{ .query_filter_error = parsed };
         }
+        if (objectHasAnyKey(source.object, &.{
+            "code",
+            "error",
+            "message",
+            "retryable",
+        })) {
+            if (try parseStructuralVariant(QueryDependencyError, allocator, source, options)) |parsed| return .{ .query_dependency_error = parsed };
+        }
         return error.UnexpectedToken;
     }
 
@@ -7762,6 +7780,7 @@ pub const QueryUnprocessableError = union(enum) {
             .graph_anchor_filter_requires_index_error => |v| try jw.write(v.*),
             .unsupported_query_error => |v| try jw.write(v.*),
             .query_filter_error => |v| try jw.write(v.*),
+            .query_dependency_error => |v| try jw.write(v.*),
         }
     }
 };

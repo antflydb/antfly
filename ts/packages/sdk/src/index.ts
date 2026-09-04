@@ -235,7 +235,6 @@ export type {
   // Model and reranker types
   EmbedderConfig,
   EmbedderProvider,
-  IndexEmbedderProvider,
   // Embedding types
   Embedding,
   // Eval types
@@ -304,6 +303,8 @@ export type {
   GraphTraverseQuery,
   GraphWhereExpression,
   IndexConfig,
+  IndexEmbedderConfig,
+  IndexEmbedderProvider,
   IndexRuntimeCapabilities,
   IndexStatus,
   IndexType,
@@ -321,7 +322,6 @@ export type {
   LegacyGraphSearchResult,
   LinearMergeRequest,
   LinearMergeResult,
-  IndexEmbedderConfig,
   MergeProfile,
   MultiBatchRequest,
   MultiBatchResult,
@@ -383,10 +383,10 @@ export type {
 export {
   embedderProviderCapabilities,
   embedderProviders,
-  indexEmbedderProviders,
   formatQueryHitsTotal,
   generatorProviderCapabilities,
   generatorProviders,
+  indexEmbedderProviders,
   queryHitsTotalIsExact,
   queryHitsTotalValue,
   queryResultHitsTotal,

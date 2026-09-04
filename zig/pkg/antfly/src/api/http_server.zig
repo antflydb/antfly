@@ -82,6 +82,7 @@ const db_mod = struct {
 const graph_mod = @import("../graph/graph.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const db_query_search = @import("../storage/db/query/search_exec.zig");
+const reranking_runtime = @import("../reranking/mod.zig");
 const storage_schema = @import("../storage/schema.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const table_catalog = @import("table_catalog.zig");
@@ -6514,6 +6515,10 @@ pub const ApiHttpServer = struct {
                 try queue.status(alloc, task_id, context_id, "failed", "invalid retrieval agent request");
                 return;
             },
+            error.EmbeddingIndexNotFound => {
+                try queue.status(alloc, task_id, context_id, "failed", "embedding index not found");
+                return;
+            },
             error.MissingGenerationConfig => {
                 try queue.status(alloc, task_id, context_id, "failed", "steps.generation requires a generator or chain");
                 return;
@@ -6531,14 +6536,17 @@ pub const ApiHttpServer = struct {
                 return;
             },
             else => {
-                if (normalizeQueryEmbeddingOperationalError(err)) |normalized| {
+                if (normalizeQueryOperationalError(err)) |normalized| {
                     const message = switch (normalized) {
                         error.QueryEmbeddingInputTooLarge => "query embedding input too large",
                         error.QueryEmbeddingOverloaded => "query embedding overloaded",
                         error.EmbedRateLimited => "query embedding rate limited",
                         error.EmbedTransientFailure => "query embedding temporarily unavailable",
                         error.EmbedUpstreamFailure => "query embedding provider failed",
-                        error.Timeout => "query embedding timed out",
+                        error.RerankRateLimited => "reranker rate limited",
+                        error.RerankTransientFailure => "reranker temporarily unavailable",
+                        error.RerankUpstreamFailure => "reranker provider failed",
+                        error.Timeout => "query timed out",
                         else => "query embedding failed",
                     };
                     try queue.status(alloc, task_id, context_id, "failed", message);
@@ -10403,7 +10411,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
             error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
-            error.Timeout => return error.ReadUnavailable,
+            error.Timeout => return error.Timeout,
             error.IdentityReadGenerationChanged => return error.ReadUnavailable,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.TopologyChanged => return error.TopologyChanged,
@@ -10432,10 +10440,14 @@ pub const ApiHttpServer = struct {
             error.GraphExternalAliasSourceUnsupported => return error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported => return error.GraphReverseVariablePathUnsupported,
             error.QueryEmbeddingInputTooLarge => return error.QueryEmbeddingInputTooLarge,
+            error.EmbeddingIndexNotFound => return error.EmbeddingIndexNotFound,
             error.QueryEmbeddingOverloaded => return error.QueryEmbeddingOverloaded,
             error.EmbedRateLimited => return error.EmbedRateLimited,
             error.EmbedTransientFailure => return error.EmbedTransientFailure,
             error.EmbedUpstreamFailure => return error.EmbedUpstreamFailure,
+            error.RerankRateLimited => return error.RerankRateLimited,
+            error.RerankTransientFailure => return error.RerankTransientFailure,
+            error.RerankUpstreamFailure => return error.RerankUpstreamFailure,
             error.Cancelled, error.Canceled => return error.Canceled,
             error.InvalidManifest => return error.InvalidManifest,
             error.InvalidTableFile => return error.InvalidTableFile,
@@ -10616,6 +10628,7 @@ pub const ApiHttpServer = struct {
                 error.GraphReverseVariablePathUnsupported,
                 => return err,
                 error.QueryEmbeddingInputTooLarge,
+                error.EmbeddingIndexNotFound,
                 error.QueryEmbeddingOverloaded,
                 error.EmbedRateLimited,
                 error.EmbedTransientFailure,
@@ -10642,6 +10655,7 @@ pub const ApiHttpServer = struct {
                 error.IncompletePublishedSnapshot,
                 => return err,
                 else => {
+                    if (normalizeQueryOperationalError(err)) |normalized| return normalized;
                     std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                     return error.InternalFailure;
                 },
@@ -10674,6 +10688,7 @@ pub const ApiHttpServer = struct {
             error.GraphReverseVariablePathUnsupported,
             => return err,
             error.QueryEmbeddingInputTooLarge,
+            error.EmbeddingIndexNotFound,
             error.QueryEmbeddingOverloaded,
             error.EmbedRateLimited,
             error.EmbedTransientFailure,
@@ -10704,6 +10719,7 @@ pub const ApiHttpServer = struct {
             error.IncompletePublishedSnapshot,
             => return err,
             else => {
+                if (normalizeQueryOperationalError(err)) |normalized| return normalized;
                 std.log.err("foreign public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
             },
@@ -10769,6 +10785,7 @@ pub const ApiHttpServer = struct {
             error.GraphReverseVariablePathUnsupported,
             => return err,
             error.QueryEmbeddingInputTooLarge,
+            error.EmbeddingIndexNotFound,
             error.QueryEmbeddingOverloaded,
             error.EmbedRateLimited,
             error.EmbedTransientFailure,
@@ -10795,6 +10812,7 @@ pub const ApiHttpServer = struct {
             error.IncompletePublishedSnapshot,
             => return err,
             else => {
+                if (normalizeQueryOperationalError(err)) |normalized| return normalized;
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
             },
@@ -14591,14 +14609,17 @@ pub const ApiHttpServer = struct {
                 try public_table_http.graphQueryCapabilityUnsupportedBody(self.alloc, body, "reverse_variable_path_not_supported"),
                 false,
             ),
-            error.QueryEmbeddingInputTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "query embedding input too large"),
-            error.EmbeddingIndexNotFound => try contextual_operations.textAlloc(self.alloc, 422, "embedding index not found"),
-            error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(self.alloc, 429, "query embedding overloaded"),
-            error.EmbedRateLimited => try contextualRetryableTextResponse(self.alloc, 429, "query embedding rate limited"),
+            error.QueryEmbeddingInputTooLarge => try contextualQueryDependencyErrorResponse(self.alloc, 413, "query_embedding_input_too_large", "query embedding input too large", false),
+            error.EmbeddingIndexNotFound => try contextualQueryDependencyErrorResponse(self.alloc, 422, "embedding_index_not_found", "embedding index not found", false),
+            error.QueryEmbeddingOverloaded => try contextualQueryDependencyErrorResponse(self.alloc, 429, "query_embedding_overloaded", "query embedding overloaded", true),
+            error.EmbedRateLimited => try contextualQueryDependencyErrorResponse(self.alloc, 429, "query_embedding_rate_limited", "query embedding rate limited", true),
             error.EmbedTransientFailure => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .query_embedding_temporarily_unavailable),
-            error.EmbedUpstreamFailure => try contextual_operations.textAlloc(self.alloc, 502, "query embedding provider failed"),
-            error.Timeout => try contextual_operations.textAlloc(self.alloc, 504, "query timed out"),
-            error.Cancelled => try contextual_operations.textAlloc(self.alloc, 499, "client closed request"),
+            error.EmbedUpstreamFailure => try contextualQueryDependencyErrorResponse(self.alloc, 502, "query_embedding_upstream_failure", "query embedding provider failed", false),
+            error.RerankRateLimited => try contextualQueryDependencyErrorResponse(self.alloc, 429, "reranker_rate_limited", "reranker rate limited", true),
+            error.RerankTransientFailure => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .reranker_temporarily_unavailable),
+            error.RerankUpstreamFailure => try contextualQueryDependencyErrorResponse(self.alloc, 502, "reranker_upstream_failure", "reranker provider failed", false),
+            error.Timeout => try contextualQueryDependencyErrorResponse(self.alloc, 504, "query_timeout", "query timed out", true),
+            error.Cancelled, error.Canceled => try contextual_operations.textAlloc(self.alloc, 499, "client closed request"),
             error.NotFound, error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
             error.ModelNotFound => contextual_operations.json(try self.alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"), false),
             error.DocIdentityNamespaceMismatch => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .doc_identity_unavailable),
@@ -17924,6 +17945,18 @@ fn contextualQueryTemporarilyUnavailableResponse(
     return try contextualResponseFromPublicTable(alloc, response);
 }
 
+fn contextualQueryDependencyErrorResponse(
+    alloc: std.mem.Allocator,
+    status: u16,
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+) !contextual_operations.OwnedResponse {
+    var response = try public_table_http.queryDependencyErrorOwnedResponse(alloc, status, code, message, retryable);
+    defer response.deinit(alloc);
+    return try contextualResponseFromPublicTable(alloc, response);
+}
+
 fn ownedContextualHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !contextual_operations.Header {
     const owned_name = try alloc.dupe(u8, name);
     errdefer alloc.free(owned_name);
@@ -19668,6 +19701,17 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
         error.ConnectionTimedOut,
         error.Canceled,
         => error.EmbedTransientFailure,
+        else => null,
+    };
+}
+
+pub fn normalizeQueryOperationalError(err: anyerror) ?anyerror {
+    if (normalizeQueryEmbeddingOperationalError(err)) |normalized| return normalized;
+    return switch (reranking_runtime.normalizeOperationalError(err)) {
+        error.RerankRateLimited,
+        error.RerankTransientFailure,
+        error.RerankUpstreamFailure,
+        => |normalized| normalized,
         else => null,
     };
 }
@@ -33271,6 +33315,7 @@ test "api http server preserves public query availability errors" {
         status: u16,
         body: []const u8,
         json: bool = false,
+        retry_after: bool = false,
         unavailable_code: ?[]const u8 = null,
         unavailable_message: []const u8 = "",
     }{
@@ -33280,6 +33325,9 @@ test "api http server preserves public query availability errors" {
         .{ .query_error = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
         .{ .query_error = error.IndexRebuilding, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
         .{ .query_error = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
+        .{ .query_error = error.RerankRateLimited, .status = 429, .body = "{\"code\":\"reranker_rate_limited\",\"error\":\"reranker_rate_limited\",\"message\":\"reranker rate limited\",\"retryable\":true}", .json = true, .retry_after = true },
+        .{ .query_error = error.RerankTransientFailure, .status = 503, .body = "", .json = true, .unavailable_code = "reranker_temporarily_unavailable", .unavailable_message = "reranker temporarily unavailable" },
+        .{ .query_error = error.RerankUpstreamFailure, .status = 502, .body = "{\"code\":\"reranker_upstream_failure\",\"error\":\"reranker_upstream_failure\",\"message\":\"reranker provider failed\",\"retryable\":false}", .json = true },
         .{ .query_error = error.TableNotFound, .status = 404, .body = "not found" },
         .{ .query_error = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
         .{ .query_error = error.IncompletePublishedSnapshot, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
@@ -33308,7 +33356,7 @@ test "api http server preserves public query availability errors" {
         }
         try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", resp.content_type);
         try std.testing.expectEqual(
-            case.unavailable_code != null,
+            case.unavailable_code != null or case.retry_after,
             resp.headers.len == 1 and std.ascii.eqlIgnoreCase(resp.headers[0].name, "Retry-After"),
         );
 
@@ -33329,6 +33377,10 @@ test "api http server preserves public query availability errors" {
             try std.testing.expectEqualStrings(case.body, multi_resp.body);
         }
         try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", multi_resp.content_type);
+        try std.testing.expectEqual(
+            case.unavailable_code != null or case.retry_after,
+            multi_resp.headers.len == 1 and std.ascii.eqlIgnoreCase(multi_resp.headers[0].name, "Retry-After"),
+        );
     }
 }
 

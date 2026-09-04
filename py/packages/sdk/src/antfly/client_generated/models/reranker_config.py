@@ -23,10 +23,14 @@ class RerankerConfig:
         provider (RerankerProvider): The reranking provider to use.
         field (str | Unset): Field name to extract from documents for reranking.
         template (str | Unset): Handlebars template to render document text for reranking.
-        candidate_count (int | Unset): Maximum number of highest-ranked retrieval candidates to send to the reranker.
-            Defaults to all candidates returned by retrieval; candidates outside this window are not returned.
-        top_n (int | Unset): Number of reranked documents to return after candidate_count documents have been scored.
-            Defaults to candidate_count and cannot exceed it.
+        candidate_count (int | Unset): Maximum number of globally highest-ranked retrieval candidates to send to the
+            reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains
+            the global window, and the provider is called once. Defaults to offset plus the effective final result limit.
+            Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval
+            match count.
+        top_n (int | Unset): Deprecated compatibility override for QueryRequest.limit. When present, this is the final
+            page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed
+            candidate_count when both are present.
     """
 
     provider: RerankerProvider
