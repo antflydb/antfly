@@ -82,10 +82,6 @@ def verify_payload(
                 release_line_policy,
                 allow_closed=True,
             )
-            if source_ref_head != commit:
-                raise SystemExit(
-                    "release ledger source head differs from release commit"
-                )
 
     entries: dict[str, dict[str, object]] = {}
     ledger_artifacts = ledger.get("artifacts")

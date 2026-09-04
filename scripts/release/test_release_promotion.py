@@ -18,6 +18,7 @@ from unittest import mock
 
 RELEASE_DIR = Path(__file__).resolve().parent
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
+SOURCE_HEAD = "1" * 40
 sys.path.insert(0, str(RELEASE_DIR))
 
 
@@ -112,13 +113,13 @@ class ReleasePromotionTests(unittest.TestCase):
             "f" * 40,
             release_line="0.2",
             source_ref="refs/heads/main",
-            source_ref_head=COMMIT,
+            source_ref_head=SOURCE_HEAD,
         ).document()
 
         self.assertEqual(document["schema_version"], 5)
         self.assertEqual(document["release_line"], "0.2")
         self.assertEqual(document["source_ref"], "refs/heads/main")
-        self.assertEqual(document["source_ref_head"], COMMIT)
+        self.assertEqual(document["source_ref_head"], SOURCE_HEAD)
 
     def test_schema_five_ledger_enforces_controller_release_line(self) -> None:
         verifier = load_module(
@@ -135,7 +136,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 "commit": COMMIT,
                 "release_line": "0.2",
                 "source_ref": "refs/heads/main",
-                "source_ref_head": COMMIT,
+                "source_ref_head": SOURCE_HEAD,
                 "build_controller_commit": "e" * 40,
                 "promotion_controller_commit": "f" * 40,
                 "artifacts": [
@@ -190,7 +191,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 "commit": COMMIT,
                 "release_line": "0.2",
                 "source_ref": "refs/heads/main",
-                "source_ref_head": COMMIT,
+                "source_ref_head": SOURCE_HEAD,
                 "build_controller_commit": "e" * 40,
                 "promotion_controller_commit": "f" * 40,
                 "artifacts": [
@@ -1397,7 +1398,7 @@ class ReleasePromotionTests(unittest.TestCase):
                         "source_commit": COMMIT,
                         "release_line": "0.2",
                         "source_ref": "refs/heads/main",
-                        "source_ref_head": COMMIT,
+                        "source_ref_head": SOURCE_HEAD,
                         "build_controller_commit": "f" * 40,
                         "build_contract_schema": 1,
                         "registry_versions": {
@@ -1436,7 +1437,7 @@ class ReleasePromotionTests(unittest.TestCase):
             self.assertEqual(ledger["schema_version"], 5)
             self.assertEqual(ledger["release_line"], "0.2")
             self.assertEqual(ledger["source_ref"], "refs/heads/main")
-            self.assertEqual(ledger["source_ref_head"], COMMIT)
+            self.assertEqual(ledger["source_ref_head"], SOURCE_HEAD)
             self.assertEqual(ledger["build_controller_commit"], "f" * 40)
             self.assertEqual(ledger["promotion_controller_commit"], "e" * 40)
             self.assertEqual(ledger["generated_at"], "1970-01-01T00:00:00Z")

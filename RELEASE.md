@@ -58,9 +58,11 @@ credentials.
    `.github/workflows/antfly-nightly.yml` emit only an untrusted JSON request.
    They never call a builder. `.github/workflows/antfly-release-build-controller.yml`
    is loaded through `workflow_run` from the default branch. It requires tag
-   requests to match the pushed tag and commit and to point at the exact tip of
-   the controller-selected release branch. Nightly requests must have been
-   dispatched on the default branch.
+   requests to match the pushed tag and commit and to belong to the
+   controller-selected release branch. Nightly requests must have been
+   dispatched on the default branch. Before resolving either request, the
+   controller also requires its release-line policy bundle to match one atomic
+   snapshot of the current default branch.
 2. The build controller pins its exact commit and calls
    `.github/workflows/antfly-artifact-build.yml`, the sole reusable artifact
    builder, from that same commit. The requested source commit supplies only
@@ -334,9 +336,10 @@ journals during recovery, but cannot create a new release candidate.
 `scripts/release/release-lines.json` is the default-branch controller's map
 from a tag's `X.Y` version line to its trusted source branch. It currently maps
 `0.2` to `main`; no maintenance-branch rollout is active yet. Release tags are
-still created and pushed manually, and a new non-nightly tag is accepted only
-when its commit is the selected branch's exact tip when the controller validates
-the request. The request cannot nominate its own source branch.
+still created and pushed manually. A non-nightly tag is accepted when its
+commit belongs to the selected branch when the controller validates it. This
+keeps a tag request replayable after the branch advances. The request cannot
+nominate its own source branch.
 
 The selected branch and observed branch head are recorded in schema-v5 release
 provenance and carried through artifact build, promotion, ledger verification,
@@ -353,8 +356,8 @@ When `main` begins 0.3 development:
    `refs/heads/main`, and add an active `0.3` line sourced from
    `refs/heads/main`.
 3. Backport later 0.2 fixes through PRs into `v0.2.x`, and create canonical
-   `v0.2.*` tags only from its exact tip. Do not merge 0.3-era `main` back into
-   the maintenance branch.
+   `v0.2.*` tags only from commits in that branch. Do not merge 0.3-era `main`
+   back into the maintenance branch.
 
 Privileged build and promotion policy always remains on `main`; only versioned
 release source comes from the mapped maintenance branch. Repository branch/tag

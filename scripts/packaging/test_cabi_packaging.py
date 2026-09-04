@@ -219,7 +219,15 @@ class CAbiPackagingTests(unittest.TestCase):
             build_controller_workflow,
         )
         self.assertIn(
+            'git merge-base --is-ancestor "$source_commit" "$source_ref_head"',
+            build_controller_workflow,
+        )
+        self.assertNotIn(
             'test "$source_commit" = "$source_ref_head"',
+            build_controller_workflow,
+        )
+        self.assertIn(
+            "release-line policy changed after this controller was queued",
             build_controller_workflow,
         )
         self.assertIn("permissions:\n  contents: read", artifact_build_workflow)

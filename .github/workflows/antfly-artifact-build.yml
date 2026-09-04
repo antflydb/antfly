@@ -93,7 +93,6 @@ jobs:
               --tag "$RELEASE_TAG" \
               --release-line "$RELEASE_LINE" \
               --source-ref "$SOURCE_REF" >/dev/null
-            test "$SOURCE_COMMIT" = "$SOURCE_REF_HEAD"
           fi
           git fetch --no-tags origin "$SOURCE_REF"
           current_source_head="$(git rev-parse FETCH_HEAD)"

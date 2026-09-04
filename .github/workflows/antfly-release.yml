@@ -233,7 +233,6 @@ jobs:
                   --release-line "$RELEASE_LINE" \
                   --source-ref "$SOURCE_REF" \
                   --allow-closed >/dev/null
-                test "$RELEASE_COMMIT" = "$SOURCE_REF_HEAD"
               fi
               git fetch --no-tags origin "$SOURCE_REF"
               current_source_head="$(git rev-parse FETCH_HEAD)"
@@ -412,7 +411,6 @@ jobs:
                 --release-line "$release_line" \
                 --source-ref "$source_ref" \
                 --allow-closed >/dev/null
-              test "$RELEASE_COMMIT" = "$source_ref_head"
             fi
             git fetch --no-tags origin "$source_ref"
             current_source_head="$(git rev-parse FETCH_HEAD)"
