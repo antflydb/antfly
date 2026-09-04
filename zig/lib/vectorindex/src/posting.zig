@@ -277,12 +277,6 @@ pub const PostingStore = struct {
         index.write_profile.centroid_recompute_members_total += @intCast(node.members.len);
         if (node.members.len > index.write_profile.centroid_recompute_members_max) {
             index.write_profile.centroid_recompute_members_max = @intCast(node.members.len);
-            if (indexHasExternalVectorLoader(index) and node.members.len > index.config.max_cached_vectors) {
-                std.log.warn(
-                    "hbc centroid recompute external posting_members={} max_cached_vectors={} active_count={} node_count={}",
-                    .{ node.members.len, index.config.max_cached_vectors, index.metadata.active_count, index.metadata.node_count },
-                );
-            }
         }
 
         if (node.centroid.len != index.config.dims) {
@@ -516,15 +510,6 @@ fn indexOfMember(members: []const VectorId, vector_id: VectorId) ?usize {
 
 fn containsMember(members: []const VectorId, vector_id: VectorId) bool {
     return indexOfMember(members, vector_id) != null;
-}
-
-fn indexHasExternalVectorLoader(index: anytype) bool {
-    const Index = switch (@typeInfo(@TypeOf(index))) {
-        .pointer => |ptr| ptr.child,
-        else => @TypeOf(index),
-    };
-    if (comptime @hasDecl(Index, "hasExternalVectorLoader")) return index.hasExternalVectorLoader();
-    return false;
 }
 
 fn normalizeCentroidForMetric(index: anytype, centroid: []f32) void {

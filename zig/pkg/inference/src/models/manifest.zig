@@ -748,6 +748,14 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
         }
     }
 
+    // SentenceTransformers checkpoints carry their embedding reduction in a
+    // numbered pooling module. Honor a single declared reduction before an
+    // Antfly-specific model_manifest.json, which remains the explicit override.
+    if (try catalog.readOptional("1_Pooling/config.json")) |pooling_bytes| {
+        defer allocator.free(pooling_bytes);
+        try ignoreNonResourceMetadataError(parseSentenceTransformersPoolingConfig(&manifest, allocator, pooling_bytes));
+    }
+
     // Try to parse model_manifest.json
     if (try catalog.readOptional("model_manifest.json")) |manifest_bytes| {
         defer allocator.free(manifest_bytes);
@@ -1713,6 +1721,34 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
             }
         }
     }
+}
+
+fn parseSentenceTransformersPoolingConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return;
+    const obj = parsed.value.object;
+    var selected: ?PoolingStrategy = null;
+
+    if (jsonBool(obj.get("pooling_mode_cls_token"))) selected = .cls;
+    if (jsonBool(obj.get("pooling_mode_mean_tokens"))) {
+        if (selected != null) return;
+        selected = .mean;
+    }
+    if (jsonBool(obj.get("pooling_mode_max_tokens"))) {
+        if (selected != null) return;
+        selected = .max;
+    }
+    if (jsonBool(obj.get("pooling_mode_lasttoken"))) {
+        if (selected != null) return;
+        selected = .last;
+    }
+
+    // Multiple enabled modes concatenate vectors in SentenceTransformers. Our
+    // manifest represents one reduction, so leave its configured/default mode
+    // intact rather than silently selecting an incompatible partial output.
+    if (selected) |pooling| manifest.pooling = pooling;
 }
 
 fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
@@ -2713,6 +2749,13 @@ fn jsonU32(val: std.json.Value) ?u32 {
     };
 }
 
+fn jsonBool(val: ?std.json.Value) bool {
+    return if (val) |value| switch (value) {
+        .bool => |enabled| enabled,
+        else => false,
+    } else false;
+}
+
 // -- Tests --
 
 test "manifest from config.json" {
@@ -2837,6 +2880,25 @@ test "loadFromDir infers SPLADE sparse output layout from pooling sidecar" {
     defer manifest.deinit();
 
     try std.testing.expectEqual(Sparse3DOutputLayout.batch_seq, manifest.sparse_3d_output_layout.?);
+}
+
+test "loadFromDir honors SentenceTransformers pooling metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "model/1_Pooling");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/config.json", .data = "{\"model_type\":\"modernbert\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/1_Pooling/config.json", .data = "{\"pooling_mode_cls_token\":true,\"pooling_mode_mean_tokens\":false}" });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(dir_path);
+
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(PoolingStrategy.cls, manifest.pooling);
 }
 
 test "manifest from model_manifest.json" {

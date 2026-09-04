@@ -135,6 +135,7 @@ pub const AdminSource = struct {
         drop_table_with_context: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) anyerror!void = null,
         drop_table_exact_with_context: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) anyerror!table_topology_mutations.DropResult = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
+        mutate_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) anyerror!tables_api.SchemaMutationResult = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
         put_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) anyerror!void = null,
@@ -326,6 +327,18 @@ pub const AdminSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, schema_json);
     }
 
+    pub fn mutateSchema(
+        self: AdminSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        mode: tables_api.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !tables_api.SchemaMutationResult {
+        const fn_ptr = self.vtable.mutate_schema orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, mode, body, expected_version);
+    }
+
     pub fn createIndex(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
         const fn_ptr = self.vtable.create_index orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, index_name, index_json);
@@ -490,6 +503,7 @@ pub const AdminSource = struct {
                 .drop_table_with_context = metadataServiceDropTableWithContext,
                 .drop_table_exact_with_context = metadataServiceDropTableExactWithContext,
                 .update_schema = metadataServiceUpdateSchema,
+                .mutate_schema = metadataServiceMutateSchema,
                 .create_index = metadataServiceCreateIndex,
                 .drop_index = metadataServiceDropIndex,
                 .put_artifact_enrichment = metadataServicePutArtifactEnrichment,
@@ -549,6 +563,7 @@ pub const AdminSource = struct {
                 .drop_table_with_context = metadataHttpServiceDropTableWithContext,
                 .drop_table_exact_with_context = metadataHttpServiceDropTableExactWithContext,
                 .update_schema = metadataHttpServiceUpdateSchema,
+                .mutate_schema = metadataHttpServiceMutateSchema,
                 .create_index = metadataHttpServiceCreateIndex,
                 .drop_index = metadataHttpServiceDropIndex,
                 .put_artifact_enrichment = metadataHttpServicePutArtifactEnrichment,
@@ -762,17 +777,58 @@ pub const AdminSource = struct {
         return try table_topology_mutations.drop(svc, alloc, request, table_name);
     }
 
-    fn metadataServiceUpdateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
-        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        var snapshot = try svc.adminSnapshot();
-        defer svc.freeAdminSnapshot(&snapshot);
-        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
+    fn mutateSchemaOnService(
+        svc: anytype,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        mode: tables_api.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !tables_api.SchemaMutationResult {
+        // Unconditional mutations retry a generation race against the newest
+        // authoritative document. Conditional mutations must surface the race
+        // to the caller instead of silently changing their precondition.
+        for (0..8) |_| {
+            var snapshot = try svc.adminSnapshot();
+            defer svc.freeAdminSnapshot(&snapshot);
+            const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+            if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
+            if (expected_version) |expected| {
+                if (try tables_api.schemaVersion(table.schema_json) != expected)
+                    return error.SchemaVersionChanged;
+            }
 
-        const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
-        defer metadata_table_manager.freeTable(alloc, updated);
-        try svc.replaceTableDefinition(table.*, updated);
+            const updated = try tables_api.applySchemaMutationRecord(alloc, table, mode, body);
+            defer metadata_table_manager.freeTable(alloc, updated);
+            svc.replaceTableDefinition(table.*, updated) catch |err| switch (err) {
+                error.TableGenerationChanged => {
+                    if (expected_version != null) return error.SchemaVersionChanged;
+                    continue;
+                },
+                else => return err,
+            };
+            return .{
+                .version = try tables_api.schemaVersion(updated.schema_json),
+                .schema_json = try alloc.dupe(u8, updated.schema_json),
+            };
+        }
+        return error.TableGenerationChanged;
+    }
+
+    fn metadataServiceUpdateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+        var result = try metadataServiceMutateSchema(ptr, alloc, table_name, .replace, schema_json, null);
+        result.deinit(alloc);
+    }
+
+    fn metadataServiceMutateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) !tables_api.SchemaMutationResult {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        const result = try mutateSchemaOnService(svc, alloc, table_name, mode, body, expected_version);
+        errdefer {
+            var owned = result;
+            owned.deinit(alloc);
+        }
         try flushMetadataServiceMutation(svc);
+        return result;
     }
 
     fn metadataServiceCreateIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -1186,16 +1242,19 @@ pub const AdminSource = struct {
     }
 
     fn metadataHttpServiceUpdateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
-        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        var snapshot = try svc.adminSnapshot();
-        defer svc.freeAdminSnapshot(&snapshot);
-        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
+        var result = try metadataHttpServiceMutateSchema(ptr, alloc, table_name, .replace, schema_json, null);
+        result.deinit(alloc);
+    }
 
-        const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
-        defer metadata_table_manager.freeTable(alloc, updated);
-        try svc.replaceTableDefinition(table.*, updated);
+    fn metadataHttpServiceMutateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) !tables_api.SchemaMutationResult {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        const result = try mutateSchemaOnService(svc, alloc, table_name, mode, body, expected_version);
+        errdefer {
+            var owned = result;
+            owned.deinit(alloc);
+        }
         try flushMetadataHttpServiceMutation(svc);
+        return result;
     }
 
     fn metadataHttpServiceCreateIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -1585,6 +1644,11 @@ pub const MetadataHttpServer = struct {
         try server.delete(table_path, httpx.Handler.bind(self, metadataDropTable));
         try server.put(table_path ++ routes.Routes.internal_table_definition_suffix, httpx.Handler.bind(self, metadataReplaceTableDefinition));
         try server.put(table_path ++ routes.Routes.internal_table_schema_suffix, httpx.Handler.bind(self, metadataUpdateTableSchema));
+        try server.postWithBodyLimit(
+            table_path ++ routes.Routes.internal_table_schema_mutation_suffix,
+            tables_api.max_table_create_body_bytes,
+            httpx.Handler.bind(self, metadataMutateTableSchema),
+        );
         const index_path = table_path ++ routes.Routes.internal_table_indexes_infix ++ ":index_name";
         try server.put(index_path, httpx.Handler.bind(self, metadataCreateTableIndex));
         try server.delete(index_path, httpx.Handler.bind(self, metadataDropTableIndex));
@@ -2557,6 +2621,7 @@ pub const MetadataHttpServer = struct {
             .drop_table = dropTableOperation,
             .drop_table_with_context = dropTableOperationWithContext,
             .update_schema = updateTableSchemaOperation,
+            .mutate_schema = mutateTableSchemaOperation,
             .create_index = createTableIndexOperation,
             .drop_index = dropTableIndexOperation,
             .put_enrichment = putTableEnrichmentOperation,
@@ -2607,6 +2672,11 @@ pub const MetadataHttpServer = struct {
     fn updateTableSchemaOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         return self.source.updateSchema(alloc, table_name, schema_json);
+    }
+
+    fn mutateTableSchemaOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) !tables_api.SchemaMutationResult {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.mutateSchema(alloc, table_name, mode, body, expected_version);
     }
 
     fn createTableIndexOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -2881,6 +2951,42 @@ pub const MetadataHttpServer = struct {
             else => return metadataReadError(ctx, err),
         };
         return ctx.status(202).text("accepted");
+    }
+
+    fn metadataMutateTableSchema(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        const mode_text = ctx.header("X-Antfly-Schema-Mutation-Mode") orelse
+            return ctx.status(400).text("missing schema mutation mode");
+        const mode: tables_api.SchemaMutationMode = if (std.mem.eql(u8, mode_text, "replace"))
+            .replace
+        else if (std.mem.eql(u8, mode_text, "merge-patch"))
+            .merge_patch
+        else
+            return ctx.status(400).text("invalid schema mutation mode");
+        const expected_version: ?u32 = if (ctx.header("X-Antfly-Expected-Schema-Version")) |raw|
+            std.fmt.parseUnsigned(u32, raw, 10) catch
+                return ctx.status(400).text("invalid expected schema version")
+        else
+            null;
+
+        var result = self.tableOperations().mutateSchema(
+            ctx.allocator,
+            requestContext(ctx),
+            table_name,
+            mode,
+            (try ctx.body()) orelse "",
+            expected_version,
+        ) catch |err| switch (err) {
+            error.TableNotFound => return ctx.status(404).text("table not found"),
+            error.SchemaVersionChanged, error.TableGenerationChanged => return ctx.status(409).text("schema version changed"),
+            error.TableTransitionActive => return ctx.status(409).text("table transition active"),
+            error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),
+            error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
+            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest, error.SchemaVersionManagedByBackend => return ctx.status(400).text("invalid schema update request"),
+            else => return metadataReadError(ctx, err),
+        };
+        defer result.deinit(ctx.allocator);
+        return ctx.json(.{ .version = result.version, .schema_json = result.schema_json });
     }
 
     fn metadataCreateTableIndex(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {

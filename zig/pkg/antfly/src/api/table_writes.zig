@@ -961,7 +961,6 @@ var test_after_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_before_create_structural_publish_hook: ?TestExecutionHook = null;
 var test_before_post_create_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_before_startup_catch_up_replay_hook: ?TestStartupCatchUpReplayPassHook = null;
-var test_after_startup_catch_up_replay_pass_hook: ?TestStartupCatchUpReplayPassHook = null;
 var test_writer_open_persistent_descriptor_failures_remaining: std.atomic.Value(u32) = .init(0);
 var test_recovery_intent_read_failures_remaining: std.atomic.Value(u32) = .init(0);
 var test_dropped_table_job_submit_failures_remaining: std.atomic.Value(u32) = .init(0);
@@ -1173,12 +1172,6 @@ fn runTestBeforePostCreateRuntimeStatusPublishHook() void {
 fn runTestBeforeCreateStructuralPublishHook() void {
     if (comptime builtin.is_test) {
         if (test_before_create_structural_publish_hook) |hook| hook.run(hook.ptr);
-    }
-}
-
-fn runTestAfterStartupCatchUpReplayPassHook(db: *db_mod.DB) !void {
-    if (comptime builtin.is_test) {
-        if (test_after_startup_catch_up_replay_pass_hook) |hook| try hook.run(hook.ptr, db);
     }
 }
 
@@ -7298,9 +7291,23 @@ pub const ProvisionedTableWriteSource = struct {
     };
 
     pub const StartupCatchUpResult = struct {
+        pub const Activity = enum {
+            noop,
+            deferred,
+            attempted,
+            progressed,
+            repaired,
+        };
+
+        pub const RepairHealthObservation = enum {
+            unknown,
+            non_terminal,
+            terminal_degraded,
+        };
+
         had_debt: bool = false,
         cleared_debt: bool = false,
-        terminal_degraded: bool = false,
+        repair_health: RepairHealthObservation = .unknown,
         busy: bool = false,
         made_progress: bool = false,
         quarantined: bool = false,
@@ -7321,6 +7328,24 @@ pub const ProvisionedTableWriteSource = struct {
         index_repair_disk_wait: bool = false,
         index_repair_retry_at_ms: u64 = 0,
         index_repair_wake: db_mod.DB.IndexRepairWake = .empty,
+
+        /// Reduce the detailed scheduler facts to one stable work-activity
+        /// classification. Repair health is deliberately independent: an
+        /// early return may make progress without reaching the authoritative
+        /// final audit.
+        pub fn activity(self: @This()) Activity {
+            if (self.index_repair_repaired) return .repaired;
+            if (self.made_progress or self.cleared_debt) return .progressed;
+            if (self.index_repair_attempted or self.index_repair_degraded) return .attempted;
+            if (self.had_debt or self.index_repair_pending or self.index_repair_paused or
+                self.busy or self.index_repair_disk_wait)
+                return .deferred;
+            return .noop;
+        }
+
+        pub fn terminalDegraded(self: @This()) bool {
+            return self.repair_health == .terminal_degraded;
+        }
     };
 
     pub const LocalChangeKind = enum {
@@ -12473,7 +12498,11 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn invalidateWriteCacheForTable(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         lockAtomic(&self.local_db_mutex);
-        if (self.write_cache) |cache| cache.invalidateTable(table_name);
+        // A cached DB may still have enrichment/index workers publishing
+        // visibility events. Detach their source-owned callbacks through the
+        // common invalidation path before retiring the entry; otherwise a
+        // draining worker can call back through a stale source pointer.
+        self.invalidateWriteCache(table_name);
         self.local_db_mutex.unlock();
         self.drainWriteCachePendingCloses();
     }
@@ -13830,7 +13859,7 @@ pub const ProvisionedTableWriteSource = struct {
                         const terminal_status_published = try publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err);
                         return .{
                             .had_debt = true,
-                            .terminal_degraded = true,
+                            .repair_health = .terminal_degraded,
                             .index_repair_pending = !terminal_status_published,
                         };
                     }
@@ -13871,7 +13900,7 @@ pub const ProvisionedTableWriteSource = struct {
                         const terminal_status_published = try publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err);
                         return .{
                             .had_debt = true,
-                            .terminal_degraded = true,
+                            .repair_health = .terminal_degraded,
                             .index_repair_pending = !terminal_status_published,
                         };
                     }
@@ -13899,7 +13928,7 @@ pub const ProvisionedTableWriteSource = struct {
                         const terminal_status_published = try publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err);
                         return .{
                             .had_debt = true,
-                            .terminal_degraded = true,
+                            .repair_health = .terminal_degraded,
                             .index_repair_pending = !terminal_status_published,
                         };
                     }
@@ -13957,7 +13986,7 @@ pub const ProvisionedTableWriteSource = struct {
                     );
                     return .{
                         .had_debt = true,
-                        .terminal_degraded = true,
+                        .repair_health = .terminal_degraded,
                         .index_repair_pending = !terminal_status_published,
                     };
                 }
@@ -14058,7 +14087,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
             return err;
         };
-        if (live_broad_recovery and !result.terminal_degraded) {
+        if (live_broad_recovery and !result.terminalDegraded()) {
             if (restore_index_prerequisite) {
                 // Restore's final availability proof depends on repairing the
                 // unavailable generation. Release broad exclusivity before
@@ -14078,7 +14107,7 @@ pub const ProvisionedTableWriteSource = struct {
                     metadata.index_repair_options,
                 );
                 mergeLiveIndexRepairResult(&result, repair_result);
-                if (!result.terminal_degraded and !result.index_repair_paused) {
+                if (!result.terminalDegraded() and !result.index_repair_paused) {
                     result.busy = true;
                     result.index_repair_pending = true;
                 }
@@ -14145,13 +14174,13 @@ pub const ProvisionedTableWriteSource = struct {
             if (managed_owner_is_live_writer) .live_writer else .isolated,
         );
         result.index_repair_paused = false;
-        result.terminal_degraded = false;
+        result.repair_health = .non_terminal;
         if (final_restore_repair_needed and final_index_load_failure) {
             // Restore cannot prove projection availability while any required
             // generation is unavailable. Preserve the original fail-closed
             // precedence even if that generation also has a runnable intent.
             result.had_debt = true;
-            result.terminal_degraded = true;
+            result.repair_health = .terminal_degraded;
             const terminal_status_published = try publishTerminalStartupRuntimeStatusSnapshot(self, alloc, table_name, group_id, db);
             startup_retirement_status_token = self.capturePublishedRuntimeStatusPreservation(table_name, terminal_status_published);
             result.index_repair_pending = final_automatic_discovery_pending or !terminal_status_published;
@@ -14161,7 +14190,7 @@ pub const ProvisionedTableWriteSource = struct {
             result.index_repair_pending = true;
         } else if (final_repair_summary.terminal != 0 or final_index_load_failure) {
             result.had_debt = true;
-            result.terminal_degraded = true;
+            result.repair_health = .terminal_degraded;
             const terminal_status_published = try publishTerminalStartupRuntimeStatusSnapshot(self, alloc, table_name, group_id, db);
             startup_retirement_status_token = self.capturePublishedRuntimeStatusPreservation(table_name, terminal_status_published);
             result.index_repair_pending = final_automatic_discovery_pending or !terminal_status_published;
@@ -14176,7 +14205,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.markRepairHandoffOwnerAuditCompleteBestEffort(table_name, group_id);
         }
         self.retireCachesAfterIndexRepairCompletion(table_name, result, !use_live_owner);
-        if (result.terminal_degraded) {
+        if (result.terminalDegraded()) {
             // The terminal observation was published from the final durable
             // audit above. Do not relabel it as a fresh live-writer snapshot.
             startup_status_active = false;
@@ -14230,7 +14259,7 @@ pub const ProvisionedTableWriteSource = struct {
         // retry. Retaining this writer would prevent the durable repair owner
         // and structural reconciler from opening the shard.
         return result.had_debt and !result.cleared_debt and
-            !result.terminal_degraded and !result.busy and !result.made_progress and
+            !result.terminalDegraded() and !result.busy and !result.made_progress and
             !result.index_repair_pending;
     }
 
@@ -29051,7 +29080,7 @@ fn mergeLiveIndexRepairResult(
     result.index_repair_disk_wait = repair.index_repair_disk_wait;
     result.index_repair_retry_at_ms = repair.index_repair_retry_at_ms;
     result.index_repair_wake = repair.index_repair_wake;
-    result.terminal_degraded = repair.terminal_degraded;
+    result.repair_health = repair.repair_health;
 }
 
 const ManagedCatchUpMode = enum {
@@ -29341,7 +29370,7 @@ fn catchUpManagedDb(
         // has replaced) the unavailable generation.
         return .{
             .had_debt = true,
-            .terminal_degraded = true,
+            .repair_health = .terminal_degraded,
         };
     }
 
@@ -29481,8 +29510,6 @@ fn catchUpManagedDb(
                 }
                 return err;
             };
-            try runTestAfterStartupCatchUpReplayPassHook(db);
-
             const next_debt_signature = try startupReplayDebtSignature(alloc, db);
             if (next_debt_signature.remaining < last_debt_signature.remaining or
                 next_debt_signature.applied_sum > last_debt_signature.applied_sum)
@@ -29663,7 +29690,7 @@ fn catchUpManagedDb(
     if (repair_summary.terminal != 0) {
         return .{
             .had_debt = true,
-            .terminal_degraded = true,
+            .repair_health = .terminal_degraded,
             .made_progress = made_progress,
             // A genuine terminal intent may coexist with an incompletely
             // inspected automatic-load-failure sweep. Preserve both truths:
@@ -29687,7 +29714,7 @@ fn catchUpManagedDb(
     if (try managedDbHasIndexLoadFailure(alloc, db)) {
         return .{
             .had_debt = true,
-            .terminal_degraded = true,
+            .repair_health = .terminal_degraded,
             .made_progress = made_progress,
         };
     }
@@ -36984,10 +37011,15 @@ test "structural reconcile reconfigures retained writer before managed dense wri
 
     FakeEmbeddingProvider.request_count.store(0, .monotonic);
 
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
+    write_cache.backend_runtime = backend_runtime.ptr();
 
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
+    source.backend_runtime = backend_runtime.ptr();
     source.write_cache = &write_cache;
     // Create the resident writer from the table's original empty index
     // configuration. Structural reconciliation must update this owner in
@@ -37210,15 +37242,19 @@ test "provisioned managed replay tails converge and publish without later traffi
     FakeEmbeddingProvider.request_count.store(0, .monotonic);
     FakeEmbeddingProvider.embedded_count.store(0, .monotonic);
 
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
     var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
     var snapshot_cache_live = true;
     defer if (snapshot_cache_live) snapshot_cache.deinit();
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     var write_cache_live = true;
     defer if (write_cache_live) write_cache.deinit();
+    write_cache.backend_runtime = backend_runtime.ptr();
     var source = ProvisionedTableWriteSource.init(path, Catalog.iface());
     var source_live = true;
     defer if (source_live) source.deinit();
+    source.backend_runtime = backend_runtime.ptr();
     source.write_cache = &write_cache;
     source.runtime_status_cache = &snapshot_cache;
 
@@ -37252,9 +37288,19 @@ test "provisioned managed replay tails converge and publish without later traffi
 
     _ = try source.source().batch(alloc, "docs", .{
         .deletes = &.{"doc-1"},
-        .sync_level = .write,
+        .sync_level = .full_index,
     });
-    _ = try Wait.forPublishedConvergence(&snapshot_cache, 5);
+    {
+        const query_vec = [_]f32{ 1, 0, 0 };
+        var result = try write_cache.entries.items[0].db.search(alloc, .{
+            .index_name = "semantic_idx",
+            .dense = .{ .vector = query_vec[0..], .k = 16 },
+            .limit = 16,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 5), result.total_hits);
+        for (result.hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit.id, "doc-1"));
+    }
 
     // Repeated mixed bursts exercise notify/drain/park transitions. Every
     // iteration ends in a no-op-for-this-index write, and there is no probe or
@@ -37378,8 +37424,10 @@ test "provisioned managed replay tails converge and publish without later traffi
     defer restarted_snapshot_cache.deinit();
     var restarted_write_cache = ProvisionedTableWriteCache.init(alloc);
     defer restarted_write_cache.deinit();
+    restarted_write_cache.backend_runtime = backend_runtime.ptr();
     var restarted_source = ProvisionedTableWriteSource.init(path, Catalog.iface());
     defer restarted_source.deinit();
+    restarted_source.backend_runtime = backend_runtime.ptr();
     restarted_source.write_cache = &restarted_write_cache;
     restarted_source.runtime_status_cache = &restarted_snapshot_cache;
 
@@ -42062,7 +42110,7 @@ test "repair handoff status settles after authoritative cached publication" {
     var publication_retry = ProvisionedTableWriteSource.StartupCatchUpResult{};
     source.retainRepairRouteForPendingHandoffBestEffort("docs", 7001, &publication_retry);
     try std.testing.expect(publication_retry.index_repair_pending);
-    var terminal = ProvisionedTableWriteSource.StartupCatchUpResult{ .terminal_degraded = true };
+    var terminal = ProvisionedTableWriteSource.StartupCatchUpResult{ .repair_health = .terminal_degraded };
     source.retainRepairRouteForPendingHandoffBestEffort("docs", 7001, &terminal);
     try std.testing.expect(terminal.index_repair_pending);
     var paused = ProvisionedTableWriteSource.StartupCatchUpResult{
@@ -42416,7 +42464,7 @@ test "terminal repair publication settles handoff or retains one fenced retry" {
     try std.testing.expectEqual(@as(usize, 1), fence.calls);
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
     var terminal_retry = ProvisionedTableWriteSource.StartupCatchUpResult{
-        .terminal_degraded = true,
+        .repair_health = .terminal_degraded,
         .index_repair_pending = true,
     };
     source.retainRepairRouteForPendingHandoffBestEffort("docs", 7002, &terminal_retry);
@@ -46046,7 +46094,7 @@ test "provisioned owner publication clears ambiguous replay-only backfill" {
     try std.testing.expectEqual(@as(f64, 1.0), statuses.items[0].stats.indexes[0].backfill_progress);
 }
 
-test "provisioned owner publication preserves non-replay backfill" {
+test "provisioned owner publication replaces stale cached backfill" {
     const alloc = std.testing.allocator;
 
     const Catalog = struct {
@@ -46139,8 +46187,11 @@ test "provisioned owner publication preserves non-replay backfill" {
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);
     try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
-    try std.testing.expect(statuses.items[0].stats.indexes[0].backfill_active);
-    try std.testing.expectEqual(@as(f64, 0.42), statuses.items[0].stats.indexes[0].backfill_progress);
+    // A writer observation samples the complete lifecycle under the apply
+    // lock. It therefore replaces stale cached backfill state regardless of
+    // how that cached state was originally classified.
+    try std.testing.expect(!statuses.items[0].stats.indexes[0].backfill_active);
+    try std.testing.expectEqual(@as(f64, 1.0), statuses.items[0].stats.indexes[0].backfill_progress);
 }
 
 test "provisioned table read source serves profiled dense query without runtime status warmup" {
@@ -48103,7 +48154,7 @@ test "managed startup catch-up quarantines repeated zero progress with bounded b
 
     var terminal_attempt: usize = 0;
     while (terminal_attempt < startup_catch_up_no_progress_threshold) : (terminal_attempt += 1) {
-        var terminal = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true, .terminal_degraded = true };
+        var terminal = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true, .repair_health = .terminal_degraded };
         source.updateStartupCatchUpBackoff(7002, 50_000 + terminal_attempt, epoch, &terminal);
         try std.testing.expectEqual(terminal_attempt + 1 == startup_catch_up_no_progress_threshold, terminal.quarantined);
     }
@@ -48530,7 +48581,7 @@ test "managed startup catch-up marks FileNotFound index open terminal degraded" 
         });
     };
     try std.testing.expectEqual(@as(usize, 1), fence.calls);
-    try std.testing.expect(fenced_result.terminal_degraded);
+    try std.testing.expect(fenced_result.terminalDegraded());
     try std.testing.expect(fenced_result.index_repair_pending);
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
 
@@ -48544,7 +48595,7 @@ test "managed startup catch-up marks FileNotFound index open terminal degraded" 
     try std.testing.expectEqual(@as(usize, 2), catalog.calls);
     try std.testing.expect(!result.busy);
     try std.testing.expect(result.had_debt);
-    try std.testing.expect(result.terminal_degraded);
+    try std.testing.expect(result.terminalDegraded());
     try std.testing.expect(!result.cleared_debt);
     try std.testing.expect(!result.index_repair_pending);
     try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
@@ -48650,7 +48701,7 @@ test "managed startup catch-up preserves restore repair debt while index load is
     });
     try std.testing.expect(!terminal.busy);
     try std.testing.expect(terminal.had_debt);
-    try std.testing.expect(terminal.terminal_degraded);
+    try std.testing.expect(terminal.terminalDegraded());
     try std.testing.expect(!terminal.cleared_debt);
     try std.testing.expect(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, path));
     try std.testing.expectEqual(@as(usize, 0), catalog.calls);
@@ -48948,7 +48999,7 @@ test "managed startup catch-up invalidates stale cached writer status after repl
     try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
 }
 
-test "live managed repair upgrades broad recovery alongside status before bounded index repair" {
+test "live managed repair leaves resident replay and status reads nonblocking" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -49055,24 +49106,6 @@ test "live managed repair upgrades broad recovery alongside status before bounde
         });
     }
 
-    const ReplayPassHook = struct {
-        alloc: std.mem.Allocator,
-        source: *ProvisionedTableWriteSource,
-        passes: usize = 0,
-        inserted: bool = false,
-        observed_read_blocking_owner: bool = false,
-
-        fn run(ptr: *anyopaque, db: *db_mod.DB) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.passes += 1;
-            self.observed_read_blocking_owner = self.observed_read_blocking_owner or
-                self.source.hasReadBlockingActivityBestEffort("docs", 7001);
-            if (self.inserted) return;
-            self.inserted = true;
-            _ = try ReplaySeed.appendDenseReplay(self.alloc, db, "doc:b", "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1]}}", &[_]f32{ 0, 1 });
-        }
-    };
-
     const StatusPoller = struct {
         source: *ProvisionedTableWriteSource,
         stop: std.atomic.Value(bool) = .init(false),
@@ -49100,14 +49133,6 @@ test "live managed repair upgrades broad recovery alongside status before bounde
     defer source.deinit();
     source.write_cache = &write_cache;
     source.runtime_status_cache = &snapshot_cache;
-
-    var hook_ctx = ReplayPassHook{ .alloc = alloc, .source = &source };
-    const previous_hook = test_after_startup_catch_up_replay_pass_hook;
-    test_after_startup_catch_up_replay_pass_hook = .{
-        .ptr = &hook_ctx,
-        .run = ReplayPassHook.run,
-    };
-    defer test_after_startup_catch_up_replay_pass_hook = previous_hook;
 
     var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .writer_no_replay, null, null);
     try std.testing.expect(cached.db.core.index_manager.denseIndex("dense_idx") != null);
@@ -49149,6 +49174,7 @@ test "live managed repair upgrades broad recovery alongside status before bounde
     defer if (status_group_active) {
         status_poller.stop.store(true, .release);
         status_group.cancel(status_io);
+        status_group.await(status_io) catch {};
     };
     while (status_poller.polls.load(.acquire) == 0) {
         try status_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
@@ -49161,100 +49187,45 @@ test "live managed repair upgrades broad recovery alongside status before bounde
         });
         if (!replay_result.index_repair_pending) break;
     }
-    try std.testing.expect(!replay_result.busy);
-    try std.testing.expect(replay_result.had_debt);
-    try std.testing.expect(replay_result.cleared_debt);
-    try std.testing.expect(hook_ctx.inserted);
-    try std.testing.expect(hook_ctx.passes >= 1);
-    try std.testing.expect(hook_ctx.observed_read_blocking_owner);
-
-    cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .writer_no_replay, null, null);
-    try std.testing.expect(!try cached.db.hasPendingIndexRepairIntents(alloc));
-    var repaired_dense = cached.db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u64, 3), repaired_dense.index.stats().active_count);
-    try std.testing.expect(!try managedDbHasNonRepairCatchUpDebt(alloc, cached.db, .isolated));
-
-    var search = try cached.db.search(alloc, .{
-        .index_name = "dense_idx",
-        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 3 } },
-        .limit = 3,
-    });
-    try std.testing.expectEqual(@as(u32, 3), search.total_hits);
-    try std.testing.expectEqualStrings("doc:a", search.hits[0].id);
-    search.deinit();
-
-    // Exercise the live-restore variant independently after replay/index
-    // coexistence has proven its contents. Non-dense phase transitions retain
-    // the warm resident cache; the first dense mutation retires it while the
-    // durable route remains pinned across bounded quanta.
-    _ = try repaired_dense.index.cacheMetadata(9999, "stale-before-restore");
-    try std.testing.expect(repaired_dense.index.hbcCacheStats().metadata.used_bytes > 0);
-    queued = try cached.db.repairArtifactIssuesWithRequestOptions(alloc, .{
-        .target = .index,
-        .artifact_kind = .embedding,
-        .index_name = "dense_idx",
-        .limit = 1,
-        .force = true,
-    }, .{ .defer_durable_index_repair_execution = true });
-    queued.deinit(alloc);
-    cached.deinit(alloc);
-
-    try db_mod.DB.markRestorePrimaryRestoredForPathWithArtifact(
-        alloc,
-        path,
-        "snap1",
-        "local",
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "snap1/groups/7001",
-        7001,
-    );
-
-    var restore_result: ProvisionedTableWriteSource.StartupCatchUpResult = undefined;
-    restore_result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
+    // Ordinary replay is resident-worker-owned. Draining it can materialize a
+    // generation-recovery intent, which is then consumed by the bounded repair
+    // owner. Exercise both sides of that handoff deterministically.
+    {
+        cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .writer_no_replay, null, null);
+        defer cached.deinit(alloc);
+        try cached.db.runUntilIdle();
+    }
+    replay_result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
         .advance_index_repairs = true,
     });
-    try std.testing.expect(restore_result.busy);
-    try std.testing.expect(restore_result.index_repair_pending);
-
-    cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .writer_no_replay, null, null);
-    const recovering_dense = cached.db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(recovering_dense.index.hbcCacheStats().metadata.used_bytes > 0);
-    cached.deinit(alloc);
-
-    for (0..16) |_| {
-        restore_result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
-            .advance_index_repairs = true,
-        });
-        if (!restore_result.index_repair_pending) break;
+    try std.testing.expect(!replay_result.busy);
+    try std.testing.expect(replay_result.had_debt);
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.StartupCatchUpResult.RepairHealthObservation.non_terminal,
+        replay_result.repair_health,
+    );
+    try std.testing.expect(replay_result.index_repair_pending);
+    {
         cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .writer_no_replay, null, null);
-        // Deterministically stand in for the resident writer's async workers
-        // between scheduler quanta while status polls concurrently.
-        try cached.db.runUntilIdle();
-        cached.deinit(alloc);
+        defer cached.deinit(alloc);
+        const repaired_dense = cached.db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u64, 3), repaired_dense.index.stats().active_count);
+        // A resident writer owns ordinary replay asynchronously. The same
+        // durable lag remains visible to an isolated owner, but it must not
+        // keep the repair lane in broad, reader-blocking catch-up.
+        try std.testing.expect(!try managedDbHasNonRepairCatchUpDebt(alloc, cached.db, .live_writer));
+
+        try std.testing.expectError(error.IndexRebuilding, cached.db.search(alloc, .{
+            .index_name = "dense_idx",
+            .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 3 } },
+            .limit = 3,
+        }));
     }
     status_poller.stop.store(true, .release);
     try status_group.await(status_io);
     status_group_active = false;
     try std.testing.expect(!status_poller.failed.load(.acquire));
     try std.testing.expect(status_poller.polls.load(.acquire) > 1);
-    try std.testing.expect(!restore_result.busy);
-    try std.testing.expect(restore_result.had_debt);
-    try std.testing.expect(restore_result.cleared_debt);
-
-    cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .writer_no_replay, null, null);
-    defer cached.deinit(alloc);
-    try std.testing.expect(!try cached.db.restoreRuntimeRepairNeeded());
-    try std.testing.expect(!try cached.db.hasPendingIndexRepairIntents(alloc));
-    repaired_dense = cached.db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u64, 3), repaired_dense.index.stats().active_count);
-    search = try cached.db.search(alloc, .{
-        .index_name = "dense_idx",
-        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 3 } },
-        .limit = 3,
-    });
-    defer search.deinit();
-    try std.testing.expectEqual(@as(u32, 3), search.total_hits);
-    try std.testing.expectEqualStrings("doc:a", search.hits[0].id);
 }
 
 test "managed dense maintenance does not report delegated repair rediscovery as progress" {
@@ -49463,7 +49434,7 @@ test "managed catch-up reaches durable generation repair when dense replay needs
         .index_repair_prerequisite,
         .{},
     );
-    try std.testing.expect(result.index_repair_attempted or result.terminal_degraded);
+    try std.testing.expect(result.index_repair_attempted or result.terminalDegraded());
 }
 
 test "managed startup catch-up defers while shared writer cache owns the table" {
@@ -52701,7 +52672,7 @@ test "managed startup catch-up advances counterless incomplete dense repair" {
     var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
     const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &managed_db, true, .isolated, .all_debt, .{});
     try std.testing.expect(!result.busy);
-    try std.testing.expect(!result.terminal_degraded);
+    try std.testing.expect(!result.terminalDegraded());
     try std.testing.expect(result.had_debt);
     try std.testing.expect(result.cleared_debt);
     try std.testing.expect(result.index_repair_attempted);
@@ -53944,9 +53915,14 @@ test "hosted runtime status reads owner snapshot without inspecting live writer"
     // The hosted adapter must not regress to the mutable write-cache path.
     // Holding its coordination mutex while reading status proves that the
     // owner-published snapshot remains an independent control plane.
+    // Constructing the hosted source starts its persistent cleanup owner and
+    // intentionally takes the cache coordination mutex. Capture the published
+    // interface before holding that mutex; the status callback itself must
+    // remain independent from the mutable writer plane.
+    const published_source = source.source();
     lockAtomic(&hosted_cache.mutex);
     defer hosted_cache.mutex.unlock();
-    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    var statuses = (try published_source.localRuntimeStatuses(alloc, "docs")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, statuses.items[0].metadata.source);

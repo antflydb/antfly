@@ -19,8 +19,8 @@ func TestNewEmbedderConfigSupportsAntfly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEmbedderConfig failed: %v", err)
 	}
-	if cfg.Provider != EmbedderProviderAntfly {
-		t.Fatalf("provider = %q, want %q", cfg.Provider, EmbedderProviderAntfly)
+	if provider := cfg.Provider; provider != EmbedderProviderAntfly {
+		t.Fatalf("provider = %q, want %q", provider, EmbedderProviderAntfly)
 	}
 
 	embedder, err := cfg.AsAntflyEmbedderConfig()
@@ -29,6 +29,33 @@ func TestNewEmbedderConfigSupportsAntfly(t *testing.T) {
 	}
 	if embedder.Model != "antflydb/clipclap" {
 		t.Fatalf("model = %q, want %q", embedder.Model, "antflydb/clipclap")
+	}
+}
+
+func TestNewRerankerConfigOmitsUnsetOptionalWindows(t *testing.T) {
+	cfg, err := NewRerankerConfig(AntflyRerankerConfig{
+		Model: "mixedbread-ai/mxbai-rerank-base-v1",
+	})
+	if err != nil {
+		t.Fatalf("NewRerankerConfig failed: %v", err)
+	}
+	cfg.Field = "body"
+
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal reranker config: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("unmarshal reranker config: %v", err)
+	}
+	for _, field := range []string{"candidate_count", "top_n"} {
+		if _, exists := body[field]; exists {
+			t.Fatalf("unset optional field %q must be omitted: %s", field, data)
+		}
+	}
+	if body["provider"] != "antfly" || body["field"] != "body" {
+		t.Fatalf("unexpected reranker config: %s", data)
 	}
 }
 

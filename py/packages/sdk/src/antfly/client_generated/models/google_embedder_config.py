@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.google_embedder_config_provider import GoogleEmbedderConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="GoogleEmbedderConfig")
@@ -25,6 +26,7 @@ class GoogleEmbedderConfig:
             {'provider': 'gemini', 'model': 'gemini-embedding-001', 'dimension': 3072, 'api_key': 'your-api-key'}
 
         Attributes:
+            provider (GoogleEmbedderConfigProvider):
             model (str): The name of the embedding model to use. Default: 'gemini-embedding-001'. Example: gemini-
                 embedding-001.
             project_id (str | Unset): The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
@@ -35,6 +37,7 @@ class GoogleEmbedderConfig:
             url (str | Unset): The URL of the Google API endpoint (optional, uses default if not specified).
     """
 
+    provider: GoogleEmbedderConfigProvider
     model: str = "gemini-embedding-001"
     project_id: str | Unset = UNSET
     location: str | Unset = UNSET
@@ -44,6 +47,8 @@ class GoogleEmbedderConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         project_id = self.project_id
@@ -60,6 +65,7 @@ class GoogleEmbedderConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -79,6 +85,8 @@ class GoogleEmbedderConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = GoogleEmbedderConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         project_id = d.pop("project_id", UNSET)
@@ -92,6 +100,7 @@ class GoogleEmbedderConfig:
         url = d.pop("url", UNSET)
 
         google_embedder_config = cls(
+            provider=provider,
             model=model,
             project_id=project_id,
             location=location,

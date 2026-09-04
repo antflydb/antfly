@@ -1307,6 +1307,89 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     return try schema_mod.parseSchemaUpdateRequest(alloc, body);
 }
 
+pub const SchemaMutationMode = enum {
+    replace,
+    merge_patch,
+};
+
+pub const SchemaMutationResult = struct {
+    version: u32,
+    schema_json: []u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.schema_json);
+        self.* = undefined;
+    }
+};
+
+/// Applies RFC 7396 to the authoritative schema document. Keeping this in the
+/// metadata mutation domain ensures PATCH never merges against an eventually
+/// consistent API projection.
+pub fn mergeSchemaPatchRequest(
+    alloc: std.mem.Allocator,
+    current_schema_json: []const u8,
+    patch_json: []const u8,
+) ![]u8 {
+    if (patch_json.len == 0) return error.InvalidSchemaUpdateRequest;
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var current = std.json.parseFromSliceLeaky(std.json.Value, arena, current_schema_json, .{}) catch
+        return error.InvalidSchemaUpdateRequest;
+    const patch = std.json.parseFromSliceLeaky(std.json.Value, arena, patch_json, .{}) catch
+        return error.InvalidSchemaUpdateRequest;
+    if (current != .object or patch != .object) return error.InvalidSchemaUpdateRequest;
+    if (patch.object.get("version")) |version| {
+        if (version != .null) return error.SchemaVersionManagedByBackend;
+    }
+
+    try applyJsonMergePatch(arena, &current, patch);
+    _ = current.object.orderedRemove("version");
+    const merged = try std.json.Stringify.valueAlloc(alloc, current, .{});
+    errdefer alloc.free(merged);
+    const validated = try parseSchemaUpdateRequest(alloc, merged);
+    alloc.free(merged);
+    return validated;
+}
+
+fn applyJsonMergePatch(alloc: std.mem.Allocator, target: *std.json.Value, patch: std.json.Value) !void {
+    if (patch != .object) {
+        target.* = patch;
+        return;
+    }
+    if (target.* != .object) target.* = .{ .object = .empty };
+
+    var it = patch.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* == .null) {
+            _ = target.object.orderedRemove(entry.key_ptr.*);
+            continue;
+        }
+        if (entry.value_ptr.* == .object) {
+            const gop = try target.object.getOrPut(alloc, entry.key_ptr.*);
+            if (!gop.found_existing) gop.value_ptr.* = .{ .object = .empty };
+            try applyJsonMergePatch(alloc, gop.value_ptr, entry.value_ptr.*);
+        } else {
+            try target.object.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+}
+
+pub fn applySchemaMutationRecord(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    mode: SchemaMutationMode,
+    body: []const u8,
+) !metadata_table_manager.TableRecord {
+    const schema_json = switch (mode) {
+        .replace => try parseSchemaUpdateRequest(alloc, body),
+        .merge_patch => try mergeSchemaPatchRequest(alloc, table.schema_json, body),
+    };
+    defer alloc.free(schema_json);
+    return try applySchemaUpdateRecord(alloc, table, schema_json);
+}
+
 pub fn parseValidatedTableSchema(alloc: std.mem.Allocator, schema_json: []const u8) !ParsedTableSchema {
     return try schema_mod.parseValidatedTableSchema(alloc, schema_json);
 }

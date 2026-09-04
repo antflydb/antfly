@@ -5,8 +5,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ClusterStatus,
   CreateTableRequest,
+  GlobalQueryRequest,
   QueryRequest,
   TableQueryRequest,
+  TableSchema,
   TableStatus,
 } from "../src/types.js";
 
@@ -14,6 +16,7 @@ import type {
 const mockGet = vi.fn();
 const mockPost = vi.fn();
 const mockPut = vi.fn();
+const mockPatch = vi.fn();
 const mockDelete = vi.fn();
 
 vi.mock("openapi-fetch", () => ({
@@ -24,7 +27,7 @@ vi.mock("openapi-fetch", () => ({
     DELETE: mockDelete,
     OPTIONS: vi.fn(),
     HEAD: vi.fn(),
-    PATCH: vi.fn(),
+    PATCH: mockPatch,
     TRACE: vi.fn(),
     request: vi.fn(),
     use: vi.fn(),
@@ -162,7 +165,7 @@ describe("AntflyClient", () => {
         error: undefined,
       });
 
-      const request: QueryRequest = {
+      const request: GlobalQueryRequest = {
         table: "test",
         limit: 10,
       };
@@ -180,7 +183,7 @@ describe("AntflyClient", () => {
         error: undefined,
       });
       const controller = new AbortController();
-      const request: QueryRequest = { limit: 3 };
+      const request: GlobalQueryRequest = { table: "products", limit: 3 };
 
       await client.query(request, { signal: controller.signal });
 
@@ -188,6 +191,15 @@ describe("AntflyClient", () => {
         body: request,
         signal: controller.signal,
       });
+    });
+
+    it("rejects a missing global table before transport", async () => {
+      const invalid = { limit: 3 } as unknown as GlobalQueryRequest;
+
+      await expect(client.query(invalid)).rejects.toThrow(
+        "Global query request.table must be a non-empty string"
+      );
+      expect(mockPost).not.toHaveBeenCalled();
     });
 
     it("should handle query with Bleve full_text_search", async () => {
@@ -212,7 +224,7 @@ describe("AntflyClient", () => {
         error: undefined,
       });
 
-      const request: TableQueryRequest = {
+      const request: GlobalQueryRequest = {
         table: "products",
         full_text_index: "product_text",
         full_text_search: {
@@ -317,6 +329,26 @@ describe("AntflyClient", () => {
       expect(mockPost).not.toHaveBeenCalled();
     });
 
+    it("separates full schema replacement from merge patch updates", async () => {
+      mockPut.mockResolvedValueOnce({ data: { name: "products" }, error: undefined });
+      mockPatch.mockResolvedValueOnce({ data: { name: "products" }, error: undefined });
+      const replacement = { default_type: "product" } as TableSchema;
+
+      await client.tables.replaceSchema("products", replacement, { expectedVersion: 4 });
+      expect(mockPut).toHaveBeenCalledWith("/db/v1/tables/{tableName}/schema", {
+        params: { path: { tableName: "products" } },
+        body: replacement,
+        headers: { "If-Match": '"schema-4"' },
+      });
+
+      await client.tables.patchSchema("products", { ttl: null }, { expectedVersion: 5 });
+      expect(mockPatch).toHaveBeenCalledWith("/db/v1/tables/{tableName}/schema", {
+        params: { path: { tableName: "products" } },
+        body: { ttl: null },
+        headers: { "If-Match": '"schema-5"' },
+      });
+    });
+
     it("should query a specific table", async () => {
       const mockResponse = {
         responses: [
@@ -336,7 +368,7 @@ describe("AntflyClient", () => {
         error: undefined,
       });
 
-      const request: QueryRequest = {
+      const request: TableQueryRequest = {
         full_text_search: {
           query: "laptop",
         },
@@ -1165,6 +1197,29 @@ describe("AntflyClient", () => {
     }
 
     describe("Retrieval Agent SSE parsing", () => {
+      it("keeps JSON and streaming retrieval modes explicit on the wire", async () => {
+        const jsonFetch = vi
+          .spyOn(globalThis, "fetch")
+          .mockResolvedValueOnce(Response.json({ query: "test query", hits: [] }, { status: 200 }));
+
+        await client.retrievalAgent({ table: "test", query: "test query", stream: true });
+        expect(JSON.parse(String(jsonFetch.mock.calls[0][1]?.body))).toMatchObject({
+          stream: false,
+        });
+
+        jsonFetch.mockResolvedValueOnce(
+          createSSEResponse([{ event: "done", data: JSON.stringify({ query: "test query" }) }])
+        );
+        await client.streamRetrievalAgent(
+          { table: "test", query: "test query", stream: false },
+          {}
+        );
+        expect(JSON.parse(String(jsonFetch.mock.calls[1][1]?.body))).toMatchObject({
+          stream: true,
+        });
+        jsonFetch.mockRestore();
+      });
+
       it("should JSON-parse reasoning events to preserve newlines", async () => {
         const reasoningWithNewlines =
           "Step 1: First thing\nStep 2: Second thing\nStep 3: Third thing";
@@ -1179,7 +1234,7 @@ describe("AntflyClient", () => {
 
         const receivedReasoning: string[] = [];
         let doneReceived = false;
-        await client.retrievalAgent(
+        await client.streamRetrievalAgent(
           { table: "test", query: "test query" },
           {
             onReasoning: (text) => receivedReasoning.push(text),
@@ -1263,6 +1318,40 @@ describe("AntflyClient", () => {
         expect(receivedFollowups[0]).toContain("\n");
         expect(doneReceived).toBe(true);
 
+        mockFetch.mockRestore();
+      });
+
+      it("should expose tool mode and confidence from the authoritative done payload", async () => {
+        const events = [
+          {
+            event: "tool_mode",
+            data: JSON.stringify({ mode: "native", tools_count: 3 }),
+          },
+          {
+            event: "done",
+            data: JSON.stringify({ generation_confidence: 0.8, context_relevance: 0.9 }),
+          },
+        ];
+        const mockFetch = vi
+          .spyOn(globalThis, "fetch")
+          .mockResolvedValueOnce(createSSEResponse(events));
+        const toolModes: Array<{ mode: string; tools_count?: number }> = [];
+        const confidence: Array<{
+          generation_confidence: number;
+          context_relevance: number;
+        }> = [];
+
+        await client.retrievalAgent(
+          { table: "test", query: "test query" },
+          {
+            onToolMode: (data) => toolModes.push(data),
+            onConfidence: (data) => confidence.push(data),
+          }
+        );
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        expect(toolModes).toEqual([{ mode: "native", tools_count: 3 }]);
+        expect(confidence).toEqual([{ generation_confidence: 0.8, context_relevance: 0.9 }]);
         mockFetch.mockRestore();
       });
     });

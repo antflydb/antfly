@@ -68,7 +68,7 @@ class BatchRequest:
 
                 Notes:
                 - Non-existent keys are silently ignored
-                - Deletions are processed before inserts in the same batch
+                - Deletions take precedence over inserts for the same key in one batch
                 - Keys are permanently removed from storage and indexes
                  Example: ['user:789', 'user:old_account'].
             transforms (list[Transform] | Unset): Array of transform operations for in-place document updates using MongoDB-
