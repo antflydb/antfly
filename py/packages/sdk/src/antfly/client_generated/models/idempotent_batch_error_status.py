@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class IdempotentBatchErrorStatus(str, Enum):
+class IdempotentBatchErrorStatus(StrEnum):
     ABORTED = "aborted"
     NOT_APPLIED = "not_applied"
     UNKNOWN = "unknown"
