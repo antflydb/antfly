@@ -308,12 +308,32 @@ fn deinitSpeaker(alloc: Allocator, speaker: *Speaker) void {
     speaker.* = undefined;
 }
 
+pub const RemoteOptions = struct {
+    source_table: []const u8 = "",
+};
+
 fn initTranscriber(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
+    return initTranscriberWithOptions(alloc, http, cfg, .{});
+}
+
+fn initTranscriberWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Transcriber {
     return switch (cfg.provider) {
-        .antfly => try AntflyTranscriberState.init(alloc, http, cfg),
+        .antfly => try AntflyTranscriberState.init(alloc, http, cfg, options),
         .openai => try OpenAiTranscriberState.init(alloc, http, cfg),
         .vertex => try VertexTranscriberState.init(alloc, http, cfg),
     };
+}
+
+pub fn transcribeWithConfig(
+    alloc: Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    request: Request,
+    options: RemoteOptions,
+) !Response {
+    const transcriber = try initTranscriberWithOptions(alloc, http, cfg, options);
+    defer transcriber.deinit();
+    return try transcriber.transcribe(alloc, request);
 }
 
 const AntflyTranscriberState = struct {
@@ -323,11 +343,12 @@ const AntflyTranscriberState = struct {
     auth_header: ?[2][]const u8 = null,
     capability_token: ?[]const u8 = null,
     capability_revision: ?[]const u8 = null,
+    source_table: ?[]u8 = null,
     model: []const u8,
     language_code: ?[]const u8 = null,
     max_response_bytes: ?usize = null,
 
-    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
+    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Transcriber {
         const configured_model = cfg.model orelse return error.InvalidTranscribingConfig;
         const model_name = std.mem.trim(u8, configured_model, " \t\r\n");
         if (model_name.len == 0) return error.InvalidTranscribingConfig;
@@ -342,6 +363,11 @@ const AntflyTranscriberState = struct {
         errdefer freeOpt(alloc, capability_token);
         const capability_revision = try dupOpt(alloc, cfg.capability_revision);
         errdefer freeOpt(alloc, capability_revision);
+        const source_table = if (options.source_table.len > 0)
+            try alloc.dupe(u8, options.source_table)
+        else
+            null;
+        errdefer freeOpt(alloc, source_table);
         const language_code = try dupOpt(alloc, cfg.language_code);
         errdefer freeOpt(alloc, language_code);
 
@@ -352,6 +378,7 @@ const AntflyTranscriberState = struct {
             .model = model,
             .capability_token = capability_token,
             .capability_revision = capability_revision,
+            .source_table = source_table,
             .language_code = language_code,
             .max_response_bytes = cfg.max_response_bytes,
         };
@@ -375,6 +402,7 @@ const AntflyTranscriberState = struct {
         freeOpt(self.alloc, self.language_code);
         freeOpt(self.alloc, self.capability_token);
         freeOpt(self.alloc, self.capability_revision);
+        freeOpt(self.alloc, self.source_table);
         if (self.auth_header) |header| self.alloc.free(header[1]);
         self.alloc.destroy(self);
     }
@@ -407,10 +435,14 @@ const AntflyTranscriberState = struct {
         });
         defer alloc.free(body);
 
-        var header_buf: [3][2][]const u8 = undefined;
+        var header_buf: [4][2][]const u8 = undefined;
         var header_count: usize = 0;
         if (self.auth_header) |header| {
             header_buf[header_count] = header;
+            header_count += 1;
+        }
+        if (self.source_table) |source_table| {
+            header_buf[header_count] = .{ "X-Antfly-Source-Table", source_table };
             header_count += 1;
         }
         if (self.capability_token) |token| {

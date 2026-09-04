@@ -179,9 +179,10 @@ pub const Provider = struct {
     base_url: []const u8,
     cancellation: ?CancellationToken = null,
     auth_header: ?[2][]const u8 = null,
+    source_table: ?[]u8 = null,
     capability_token: ?[]u8 = null,
     capability_revision: ?[]u8 = null,
-    request_header_storage: [3][2][]const u8 = undefined,
+    request_header_storage: [4][2][]const u8 = undefined,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -204,6 +205,10 @@ pub const Provider = struct {
         if (self.auth_header) |h| {
             self.allocator.free(h[1]);
             self.auth_header = null;
+        }
+        if (self.source_table) |source_table| {
+            self.allocator.free(source_table);
+            self.source_table = null;
         }
         if (self.capability_token) |token| {
             self.allocator.free(token);
@@ -228,6 +233,18 @@ pub const Provider = struct {
         const replacement = try self.allocator.dupe(u8, auth_header);
         if (self.auth_header) |h| self.allocator.free(h[1]);
         self.auth_header = .{ "Authorization", replacement };
+    }
+
+    pub fn setSourceTable(self: *Provider, source_table: []const u8) !void {
+        if (self.source_table) |existing| {
+            if (std.mem.eql(u8, existing, source_table)) return;
+        }
+        const replacement = if (source_table.len > 0)
+            try self.allocator.dupe(u8, source_table)
+        else
+            null;
+        if (self.source_table) |existing| self.allocator.free(existing);
+        self.source_table = replacement;
     }
 
     /// Bind execution to the distributed capability snapshot used by the
@@ -286,6 +303,10 @@ pub const Provider = struct {
         var count: usize = 0;
         if (self.auth_header) |header| {
             self.request_header_storage[count] = header;
+            count += 1;
+        }
+        if (self.source_table) |source_table| {
+            self.request_header_storage[count] = .{ "X-Antfly-Source-Table", source_table };
             count += 1;
         }
         if (self.capability_token) |token| {
@@ -627,15 +648,18 @@ test "antfly provider composes authorization and capability lease headers" {
     var provider = Provider.init(std.testing.allocator, &http, "http://inference");
     defer provider.deinit();
     try provider.setAuthorizationHeader("Bearer secret");
+    try provider.setSourceTable("docs");
     try provider.setCapabilityToken("route-token");
     try provider.setCapabilityRevision("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
     const headers = provider.requestHeaders() orelse return error.TestExpectedHeaders;
-    try std.testing.expectEqual(@as(usize, 3), headers.len);
+    try std.testing.expectEqual(@as(usize, 4), headers.len);
     try std.testing.expectEqualStrings("Authorization", headers[0][0]);
     try std.testing.expectEqualStrings("Bearer secret", headers[0][1]);
-    try std.testing.expectEqualStrings("X-Antfly-Capability-Token", headers[1][0]);
-    try std.testing.expectEqualStrings("route-token", headers[1][1]);
-    try std.testing.expectEqualStrings("X-Antfly-Capability-Revision", headers[2][0]);
+    try std.testing.expectEqualStrings("X-Antfly-Source-Table", headers[1][0]);
+    try std.testing.expectEqualStrings("docs", headers[1][1]);
+    try std.testing.expectEqualStrings("X-Antfly-Capability-Token", headers[2][0]);
+    try std.testing.expectEqualStrings("route-token", headers[2][1]);
+    try std.testing.expectEqualStrings("X-Antfly-Capability-Revision", headers[3][0]);
 }
 
 test "antfly embed request omits nullable generated fields" {

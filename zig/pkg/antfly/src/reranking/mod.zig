@@ -20,6 +20,7 @@ const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const antfly_provider = @import("../inference/local.zig");
 const remote_capabilities = @import("../inference/remote_capabilities.zig");
 const common_secrets = @import("../common/secrets.zig");
+const execution_context = @import("../inference/execution_context.zig");
 
 pub const Config = lib.Config;
 pub const Provider = lib.Provider;
@@ -49,6 +50,7 @@ pub const Options = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     capability_cache: ?*remote_capabilities.Cache = null,
+    execution: execution_context.Context = .{},
 };
 
 pub fn rerankDocumentsWithOptions(
@@ -69,27 +71,35 @@ pub fn rerankDocumentsWithOptions(
 
     switch (cfg.provider) {
         .antfly => {
-            if (cfg.url.len == 0) {
-                if (options.antfly_provider) |local| {
-                    if (local.rerank_texts) |rerank| {
-                        return try rerank(local.ptr, alloc, cfg.model, query, documents);
-                    }
-                }
+            const explicit_endpoint = if (std.mem.trim(u8, cfg.url, " \t\r\n").len > 0) cfg.url else null;
+            const linked_reranker = if (options.antfly_provider) |local| local.rerank_texts else null;
+            const resolved_endpoint = options.execution.resolveAntflyEndpoint(
+                explicit_endpoint,
+                linked_reranker != null,
+            );
+            if (resolved_endpoint == null and linked_reranker != null) {
+                const local = options.antfly_provider.?;
+                return try linked_reranker.?(local.ptr, alloc, cfg.model, query, documents);
             }
-            var provider = antfly_provider.Provider.init(alloc, http, cfg.defaultedUrl());
+            const endpoint = resolved_endpoint orelse cfg.defaultedUrl();
+            var provider = antfly_provider.Provider.init(alloc, http, endpoint);
             defer provider.deinit();
+            try provider.setSourceTable(options.execution.routing.source_table);
             var authorization_header: ?[]u8 = null;
             defer if (authorization_header) |value| alloc.free(value);
-            var header_storage: [1][2][]const u8 = undefined;
-            const headers: []const [2][]const u8 = if (api_key) |value| blk: {
+            var header_storage: [2][2][]const u8 = undefined;
+            var header_count: usize = 0;
+            if (api_key) |value| {
                 authorization_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value});
-                header_storage[0] = .{ "Authorization", authorization_header.? };
-                break :blk &header_storage;
-            } else &.{};
+                header_storage[header_count] = .{ "Authorization", authorization_header.? };
+                header_count += 1;
+            }
+            header_count = try options.execution.routing.appendHeaders(&header_storage, header_count);
+            const headers = header_storage[0..header_count];
             if (authorization_header) |value| try provider.setAuthorizationHeader(value);
             var fallback_cache: ?remote_capabilities.Cache = null;
             defer if (fallback_cache) |*cache| cache.deinit();
-            var capability_cache = options.capability_cache;
+            var capability_cache = options.execution.capability_cache orelse options.capability_cache;
             if (capability_cache == null) {
                 if (options.antfly_provider) |local| capability_cache = local.remote_capability_cache;
             }
@@ -99,7 +109,7 @@ pub fn rerankDocumentsWithOptions(
             }
             const capability_lease = try capability_cache.?.getOrDiscoverLease(
                 http,
-                cfg.defaultedUrl(),
+                endpoint,
                 cfg.model,
                 .rerank,
                 headers,
@@ -119,7 +129,7 @@ pub fn rerankDocumentsWithOptions(
                 try provider.setCapabilityRevision(revision.slice());
             var result = provider.reranker().rerank(alloc, cfg.model, query, documents) catch |err| {
                 if (err == error.InferenceCapabilitiesStale)
-                    try capability_cache.?.invalidate(cfg.defaultedUrl(), cfg.model, .rerank, headers);
+                    try capability_cache.?.invalidate(endpoint, cfg.model, .rerank, headers);
                 return err;
             };
             defer result.deinit();
@@ -143,6 +153,7 @@ fn maximumDocumentBytes(documents: []const []const u8) usize {
 
 fn expectRerankerAuthorization(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqualStrings("Bearer test-token", req.header("Authorization") orelse "");
+    try std.testing.expectEqualStrings("docs", req.header("X-Antfly-Source-Table") orelse "");
 }
 
 test "reranking runtime delegates to antfly provider" {
@@ -188,7 +199,9 @@ test "reranking runtime delegates to antfly provider" {
                 .api_key = "test-token",
                 .field = "body",
             };
-            out.* = rerankDocuments(a, test_client, cfg, "query", &.{ "doc1", "doc2" }) catch |err| {
+            out.* = rerankDocumentsWithOptions(a, test_client, cfg, .{
+                .execution = .{ .routing = .{ .source_table = "docs" } },
+            }, "query", &.{ "doc1", "doc2" }) catch |err| {
                 err_out.* = err;
                 return;
             };
@@ -226,7 +239,7 @@ test "reranking runtime routes antfly provider to local antfly" {
         fn rerank(ptr: *anyopaque, a: std.mem.Allocator, model: []const u8, query: []const u8, documents: []const []const u8) anyerror![]f32 {
             const state: *@This() = @ptrCast(@alignCast(ptr));
             state.called = true;
-            try std.testing.expectEqualStrings("", model);
+            try std.testing.expectEqualStrings("local-reranker", model);
             try std.testing.expectEqualStrings("query", query);
             try std.testing.expectEqual(@as(usize, 2), documents.len);
             const scores = try a.alloc(f32, 2);
@@ -245,6 +258,7 @@ test "reranking runtime routes antfly provider to local antfly" {
     };
     const cfg = Config{
         .provider = .antfly,
+        .model = "local-reranker",
         .field = "body",
     };
     const scores = try rerankDocumentsWithAntflyProvider(alloc, &client, cfg, local, "query", &.{ "doc1", "doc2" });

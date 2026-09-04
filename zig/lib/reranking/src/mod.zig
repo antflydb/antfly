@@ -61,11 +61,10 @@ pub const Config = struct {
 
     pub fn validate(self: Config) !void {
         if (self.field.len == 0 and self.template.len == 0) return error.InvalidRerankerConfig;
+        if (std.mem.trim(u8, self.model, " \t\r\n").len == 0)
+            return error.InvalidRerankerConfig;
         switch (self.provider) {
-            .antfly => {},
-            .ollama, .cohere, .vertex => {
-                if (self.model.len == 0) return error.InvalidRerankerConfig;
-            },
+            .antfly, .ollama, .cohere, .vertex => {},
         }
         if (self.top_n) |top_n| {
             if (top_n == 0) return error.InvalidRerankerConfig;
@@ -76,7 +75,7 @@ pub const Config = struct {
     }
 
     pub fn defaultedUrl(self: Config) []const u8 {
-        if (self.url.len > 0) return self.url;
+        if (std.mem.trim(u8, self.url, " \t\r\n").len > 0) return self.url;
         return switch (self.provider) {
             .ollama => "http://127.0.0.1:11434",
             .antfly => "http://127.0.0.1:8082",
@@ -84,6 +83,17 @@ pub const Config = struct {
         };
     }
 };
+
+test "reranker requires an explicit routing model" {
+    try std.testing.expectError(
+        error.InvalidRerankerConfig,
+        (Config{ .provider = .antfly, .field = "body" }).validate(),
+    );
+    try std.testing.expectError(
+        error.InvalidRerankerConfig,
+        (Config{ .provider = .antfly, .field = "body", .model = " \t" }).validate(),
+    );
+}
 
 pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
     const parsed = try json.parseFromSlice(openapi.RerankerConfig, alloc, raw, .{});

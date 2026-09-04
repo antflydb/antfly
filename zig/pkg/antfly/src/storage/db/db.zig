@@ -74997,6 +74997,7 @@ test "db preflightSearchRequest validates live lane bindings" {
         .aggregations_json = "{}",
         .reranker = .{
             .provider = .antfly,
+            .model = "test-reranker",
             .field = "body",
             .top_n = 4,
         },

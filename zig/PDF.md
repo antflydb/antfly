@@ -1473,6 +1473,36 @@ document. They are architectural requirements, not Florence-specific cleanup:
     activation therefore preserves the same resolved-model contracts as steady
     state execution, and the Linux storage/e2e build paths compile the identical
     distributed configuration instead of a reduced local-only signature.
+160. **Data-only nodes classified URL-less asset producers as linked-local
+    before applying the configured inference endpoint.** The durable boundary
+    is now an immutable `InferenceExecutionContext`: explicit model URLs win,
+    an actually available linked task callback wins for URL-less configs, and
+    otherwise the provisioned default inference endpoint is selected before
+    capability lookup, batch classification, foreground-bounded reporting, or
+    invocation-memory admission. Reader, generator, extractor, and transcriber
+    execution all consume that resolved route, so a distributed data node no
+    longer fails with `InferenceInvocationMemoryUnavailable` merely because
+    the model config intentionally omits a per-index URL.
+161. **Rerankers constructed an isolated executor and capability cache for
+    every query.** Query post-processing now receives the complete managed-read
+    execution context, reuses the provisioned backend I/O executor and shared
+    capability cache, and resolves the same default inference endpoint as the
+    other model families. A private threaded executor and bounded cache remain
+    compatibility fallbacks only for genuinely standalone callers.
+162. **Capability discovery knew the authenticated request but lost its source
+    table before distributed execution.** Trusted routing metadata is now a
+    distinct internal context, never a user model-config field. The source
+    table header participates in capability-cache identity and is sent on both
+    discovery and execution for remote reads, generation, embeddings,
+    reranking, extraction, and transcription. Persistent asset and embedding
+    runtimes own their copied routing strings, preventing request-lifetime
+    slices from escaping into background enrichment work.
+163. **Antfly readers and rerankers admitted an empty routing model.** Both
+    families now require a nonempty, trimmed model at their configuration
+    admission boundary, matching transcription and the inference proxy.
+    Provider-specific defaults remain available only to providers whose
+    contracts define them; Antfly's distributed route identity is always
+    explicit.
 
 ### Post-review implementation contract
 
@@ -2822,6 +2852,11 @@ enrichment-compute ABI is not reintroduced.
 
 This phase removes repeated per-page parsing without making thread-safety
 claims.
+- Model configuration describes what executes; `InferenceExecutionContext`
+  describes where it executes. The context carries the default Antfly
+  endpoint, shared capability cache/I/O ownership, and trusted source routing.
+  Task adapters may consume this context but may not synthesize their own
+  localhost, cache, or tenant-routing policy.
 
 ### Phase 3: Immutable document and controlled concurrency
 

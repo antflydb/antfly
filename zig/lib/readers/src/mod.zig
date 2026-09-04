@@ -303,6 +303,7 @@ pub const Registry = struct {
     }
 
     pub fn registerConfig(self: *Registry, name: []const u8, cfg: Config) !void {
+        try cfg.validate();
         const key = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(key);
         const owned = try cloneConfig(self.allocator, cfg);
@@ -366,12 +367,33 @@ fn deinitConfigValue(alloc: Allocator, cfg: Config) void {
     deinitConfig(alloc, &owned);
 }
 
+pub const RemoteOptions = struct {
+    source_table: []const u8 = "",
+};
+
 fn initReader(alloc: Allocator, http: *httpx.Client, cfg: Config) !Reader {
+    return initReaderWithOptions(alloc, http, cfg, .{});
+}
+
+fn initReaderWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Reader {
+    try cfg.validate();
     return switch (cfg.provider) {
-        .antfly => try AntflyReaderState.init(alloc, http, cfg),
+        .antfly => try AntflyReaderState.init(alloc, http, cfg, options),
         .openai => try OpenAiReaderState.init(alloc, http, cfg),
         .vertex => try VertexReaderState.init(alloc, http, cfg),
     };
+}
+
+pub fn readWithConfigReported(
+    alloc: Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    request: Request,
+    options: RemoteOptions,
+) !BatchResult {
+    const reader = try initReaderWithOptions(alloc, http, cfg, options);
+    defer reader.deinit();
+    return try reader.readReported(alloc, request);
 }
 
 const AntflyReaderState = struct {
@@ -381,11 +403,12 @@ const AntflyReaderState = struct {
     auth_header: ?[2][]const u8 = null,
     capability_token: ?[]const u8 = null,
     capability_revision: ?[]const u8 = null,
+    source_table: ?[]u8 = null,
     model: []const u8,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
 
-    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Reader {
+    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Reader {
         const state = try alloc.create(AntflyReaderState);
         errdefer alloc.destroy(state);
         const api_url = try alloc.dupe(u8, cfg.resolvedUrl() orelse "http://127.0.0.1:8080");
@@ -398,6 +421,11 @@ const AntflyReaderState = struct {
         errdefer freeOpt(alloc, capability_token);
         const capability_revision = try dupOpt(alloc, cfg.capability_revision);
         errdefer freeOpt(alloc, capability_revision);
+        const source_table = if (options.source_table.len > 0)
+            try alloc.dupe(u8, options.source_table)
+        else
+            null;
+        errdefer freeOpt(alloc, source_table);
         state.* = .{
             .alloc = alloc,
             .http = http,
@@ -407,6 +435,7 @@ const AntflyReaderState = struct {
             .max_tokens = cfg.max_tokens,
             .capability_token = capability_token,
             .capability_revision = capability_revision,
+            .source_table = source_table,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
@@ -422,6 +451,7 @@ const AntflyReaderState = struct {
         if (self.auth_header) |header| self.alloc.free(header[1]);
         freeOpt(self.alloc, self.capability_token);
         freeOpt(self.alloc, self.capability_revision);
+        freeOpt(self.alloc, self.source_table);
         self.alloc.destroy(self);
     }
 
@@ -450,10 +480,14 @@ const AntflyReaderState = struct {
 
         const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
         defer alloc.free(url);
-        var header_buf: [3][2][]const u8 = undefined;
+        var header_buf: [4][2][]const u8 = undefined;
         var header_count: usize = 0;
         if (self.auth_header) |header| {
             header_buf[header_count] = header;
+            header_count += 1;
+        }
+        if (self.source_table) |source_table| {
+            header_buf[header_count] = .{ "X-Antfly-Source-Table", source_table };
             header_count += 1;
         }
         if (self.capability_token) |token| {

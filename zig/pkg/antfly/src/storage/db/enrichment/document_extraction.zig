@@ -1460,6 +1460,7 @@ fn validateReaderConfigJson(alloc: Allocator, raw: []const u8) !void {
         else => return error.InvalidDocumentExtractionConfig,
     };
     defer parsed.deinit();
+    parsed.value.validate() catch return error.InvalidDocumentExtractionConfig;
 }
 
 fn validateGeneratorConfigJson(alloc: Allocator, raw: []const u8) !void {
@@ -3969,7 +3970,7 @@ test "document extraction parses generated OCR and transcription config" {
     var config = try parseConfig(alloc,
         \\{
         \\  "ocr_fallback": true,
-        \\  "ocr": {"config": {"provider": "antfly"}},
+        \\  "ocr": {"config": {"provider": "antfly", "model": "antflydb/Florence-2-base"}},
         \\  "transcription": {"enabled": true, "config": {"provider": "mock-transcriber"}}
         \\}
     );

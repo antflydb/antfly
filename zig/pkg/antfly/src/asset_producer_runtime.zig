@@ -26,6 +26,7 @@ const extraction_api = @import("antfly_extraction_openapi");
 const asset_producer = @import("storage/db/enrichment/asset_producer.zig");
 const inference_work = @import("inference/work.zig");
 const remote_capabilities = @import("inference/remote_capabilities.zig");
+const execution_context = @import("inference/execution_context.zig");
 
 const Allocator = std.mem.Allocator;
 const local_reader_batch_ceiling: usize = 64;
@@ -197,8 +198,10 @@ pub const Runtime = struct {
     alloc: Allocator,
     http: *httpx.Client,
     capability_cache: remote_capabilities.Cache,
-    remote_capability_cache: ?*remote_capabilities.Cache = null,
+    execution: execution_context.Context = .{},
     owned_http: ?*httpx.Client = null,
+    owned_default_endpoint: ?[]u8 = null,
+    owned_source_table: ?[]u8 = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     max_provider_response_bytes: usize = default_asset_provider_response_bytes,
@@ -212,6 +215,8 @@ pub const Runtime = struct {
         provider_response_envelope_bytes: usize = default_provider_response_envelope_bytes,
         result_limits: ResultLimits = .{},
         remote_capability_cache: ?*remote_capabilities.Cache = null,
+        inference_api_url: ?[]const u8 = null,
+        source_table: []const u8 = "",
     };
 
     pub fn init(alloc: Allocator, http: *httpx.Client) Runtime {
@@ -223,7 +228,12 @@ pub const Runtime = struct {
             .alloc = alloc,
             .http = http,
             .capability_cache = remote_capabilities.Cache.init(alloc, http.io),
-            .remote_capability_cache = options.remote_capability_cache,
+            .execution = .{
+                .default_endpoint = options.inference_api_url,
+                .capability_cache = options.remote_capability_cache,
+                .io = http.io,
+                .routing = .{ .source_table = options.source_table },
+            },
             .antfly_provider = options.antfly_provider,
             .secret_store = options.secret_store,
             .max_provider_response_bytes = options.max_provider_response_bytes,
@@ -249,13 +259,30 @@ pub const Runtime = struct {
         client.* = httpx.Client.initWithConfig(alloc, io, client_config);
         errdefer client.deinit();
 
+        const owned_default_endpoint = if (options.inference_api_url) |endpoint|
+            try alloc.dupe(u8, endpoint)
+        else
+            null;
+        errdefer if (owned_default_endpoint) |endpoint| alloc.free(endpoint);
+        const owned_source_table = if (options.source_table.len > 0)
+            try alloc.dupe(u8, options.source_table)
+        else
+            null;
+        errdefer if (owned_source_table) |source_table| alloc.free(source_table);
+
         runtime.* = Runtime.initWithOptions(alloc, client, options);
         runtime.owned_http = client;
+        runtime.owned_default_endpoint = owned_default_endpoint;
+        runtime.owned_source_table = owned_source_table;
+        runtime.execution.default_endpoint = owned_default_endpoint;
+        runtime.execution.routing.source_table = owned_source_table orelse "";
         return runtime;
     }
 
     pub fn deinit(self: *Runtime) void {
         self.capability_cache.deinit();
+        if (self.owned_default_endpoint) |endpoint| self.alloc.free(endpoint);
+        if (self.owned_source_table) |source_table| self.alloc.free(source_table);
         if (self.owned_http) |client| {
             client.deinit();
             self.alloc.destroy(client);
@@ -265,7 +292,57 @@ pub const Runtime = struct {
     }
 
     fn capabilityCache(self: *Runtime) *remote_capabilities.Cache {
-        return self.remote_capability_cache orelse &self.capability_cache;
+        return self.execution.capability_cache orelse &self.capability_cache;
+    }
+
+    fn linkedReaderAvailable(self: *const Runtime) bool {
+        const provider = self.antfly_provider orelse return false;
+        return provider.read_images != null or provider.read_encoded_images != null or
+            provider.read_encoded_images_reported != null;
+    }
+
+    fn linkedGeneratorAvailable(self: *const Runtime) bool {
+        const provider = self.antfly_provider orelse return false;
+        return provider.generate_messages != null or provider.generate_text != null or
+            provider.generate_messages_with_attachments != null;
+    }
+
+    fn linkedExtractorAvailable(self: *const Runtime) bool {
+        const provider = self.antfly_provider orelse return false;
+        return provider.extract != null;
+    }
+
+    fn linkedTranscriberAvailable(self: *const Runtime) bool {
+        const provider = self.antfly_provider orelse return false;
+        return provider.transcribe_audio != null;
+    }
+
+    fn routedReaderConfig(self: *const Runtime, cfg: readers.Config) readers.Config {
+        if (cfg.provider != .antfly) return cfg;
+        var routed = cfg;
+        routed.url = self.execution.resolveAntflyEndpoint(cfg.resolvedUrl(), self.linkedReaderAvailable());
+        routed.api_url = null;
+        return routed;
+    }
+
+    fn routedTranscriberConfig(self: *const Runtime, cfg: transcribing.Config) transcribing.Config {
+        if (cfg.provider != .antfly) return cfg;
+        var routed = cfg;
+        routed.url = self.execution.resolveAntflyEndpoint(cfg.resolvedUrl(), self.linkedTranscriberAvailable());
+        routed.api_url = null;
+        return routed;
+    }
+
+    fn routeGeneratorConfig(self: *const Runtime, alloc: Allocator, cfg: *generating_runtime.GeneratorConfig) !void {
+        if (cfg.provider != .antfly or cfg.url.len > 0 or self.linkedGeneratorAvailable()) return;
+        const endpoint = self.execution.resolveAntflyEndpoint(null, false) orelse return;
+        cfg.url = try alloc.dupe(u8, endpoint);
+    }
+
+    fn routeExtractorConfig(self: *const Runtime, alloc: Allocator, cfg: *extracting.Config) !void {
+        if (cfg.provider != .antfly or cfg.resolvedUrl() != null or self.linkedExtractorAvailable()) return;
+        const endpoint = self.execution.resolveAntflyEndpoint(null, false) orelse return;
+        cfg.url = try alloc.dupe(u8, endpoint);
     }
 
     pub fn producer(self: *Runtime) asset_producer.Producer {
@@ -340,7 +417,9 @@ pub const Runtime = struct {
                     .ignore_unknown_fields = true,
                 });
                 defer parsed.deinit();
-                remote = !isLocalReaderProvider(parsed.value.provider, parsed.value.resolvedUrl());
+                const cfg = self.routedReaderConfig(parsed.value);
+                try cfg.validate();
+                remote = !isLocalReaderProvider(cfg.provider, cfg.resolvedUrl());
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
                     allocator_owner = try localInvocationAllocatorOwner(local);
@@ -353,6 +432,7 @@ pub const Runtime = struct {
             .generator => blk: {
                 var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
                 defer parsed.deinit(alloc);
+                try self.routeGeneratorConfig(alloc, &parsed.generator);
                 remote = parsed.generator.url.len > 0 or parsed.generator.provider != .antfly;
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
@@ -369,6 +449,7 @@ pub const Runtime = struct {
             .extractor => blk: {
                 var parsed = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
                 defer parsed.deinit(alloc);
+                try self.routeExtractorConfig(alloc, &parsed);
                 remote = !isLocalExtractionProvider(parsed.provider, parsed.resolvedUrl());
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
@@ -383,7 +464,8 @@ pub const Runtime = struct {
                     .ignore_unknown_fields = true,
                 });
                 defer parsed.deinit();
-                remote = !isLocalTranscriberProvider(parsed.value.provider, parsed.value.resolvedUrl());
+                const cfg = self.routedTranscriberConfig(parsed.value);
+                remote = !isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl());
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
                     allocator_owner = try localInvocationAllocatorOwner(local);
@@ -497,6 +579,7 @@ pub const Runtime = struct {
             .generator => blk: {
                 var parsed = try parseGeneratorProducerConfig(alloc, request.config_json);
                 defer parsed.deinit(alloc);
+                try self.routeGeneratorConfig(alloc, &parsed.generator);
                 const local = self.antfly_provider orelse break :blk true;
                 break :blk !(parsed.generator.provider == .antfly and
                     parsed.generator.url.len == 0 and
@@ -508,8 +591,9 @@ pub const Runtime = struct {
                     .ignore_unknown_fields = true,
                 });
                 defer parsed.deinit();
+                const cfg = self.routedReaderConfig(parsed.value);
                 const local = self.antfly_provider orelse break :blk true;
-                break :blk !(isLocalReaderProvider(parsed.value.provider, parsed.value.resolvedUrl()) and
+                break :blk !(isLocalReaderProvider(cfg.provider, cfg.resolvedUrl()) and
                     (local.read_images != null or local.read_encoded_images != null));
             },
             .transcriber => blk: {
@@ -518,13 +602,15 @@ pub const Runtime = struct {
                     .ignore_unknown_fields = true,
                 });
                 defer parsed.deinit();
+                const cfg = self.routedTranscriberConfig(parsed.value);
                 const local = self.antfly_provider orelse break :blk true;
-                break :blk !(isLocalTranscriberProvider(parsed.value.provider, parsed.value.resolvedUrl()) and
+                break :blk !(isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl()) and
                     local.transcribe_audio != null);
             },
             .extractor => blk: {
                 var parsed = try extracting.parseConfigFromSlice(alloc, request.config_json);
                 defer parsed.deinit(alloc);
+                try self.routeExtractorConfig(alloc, &parsed);
                 const local = self.antfly_provider orelse break :blk true;
                 break :blk !(isLocalExtractionProvider(parsed.provider, parsed.resolvedUrl()) and
                     local.extract != null);
@@ -562,6 +648,7 @@ pub const Runtime = struct {
             .generator => blk: {
                 var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
                 defer parsed.deinit(alloc);
+                try self.routeGeneratorConfig(alloc, &parsed.generator);
                 if (parsed.generator.provider == .antfly and parsed.generator.url.len == 0) {
                     const local = self.antfly_provider orelse break :blk null;
                     const resolve = local.model_capabilities orelse break :blk null;
@@ -581,12 +668,15 @@ pub const Runtime = struct {
                     defer if (token) |value| alloc.free(value);
                     var auth_value: ?[]u8 = null;
                     defer if (auth_value) |value| alloc.free(value);
-                    var header_storage: [1][2][]const u8 = undefined;
-                    const headers: []const [2][]const u8 = if (token) |value| auth: {
+                    var header_storage: [2][2][]const u8 = undefined;
+                    var header_count: usize = 0;
+                    if (token) |value| {
                         auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value});
-                        header_storage[0] = .{ "Authorization", auth_value.? };
-                        break :auth &header_storage;
-                    } else &.{};
+                        header_storage[header_count] = .{ "Authorization", auth_value.? };
+                        header_count += 1;
+                    }
+                    header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
+                    const headers = header_storage[0..header_count];
                     break :blk self.capabilityCache().getOrDiscover(
                         self.http,
                         parsed.generator.url,
@@ -637,6 +727,7 @@ pub const Runtime = struct {
                 if (!try self.canGenerateBatch(alloc, requests)) break :blk .none;
                 var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
                 defer parsed.deinit(alloc);
+                try self.routeGeneratorConfig(alloc, &parsed.generator);
                 // The embedded callback is one invocation per item today.
                 if (parsed.generator.url.len == 0) break :blk .serial_compatibility;
                 const capabilities = (try capabilitiesForRequests(ptr, alloc, requests)) orelse
@@ -713,19 +804,24 @@ pub const Runtime = struct {
     fn readerCapabilities(
         self: *Runtime,
         alloc: Allocator,
-        cfg: readers.Config,
+        raw_cfg: readers.Config,
     ) !?inference_work.InferenceCapabilities {
+        const cfg = self.routedReaderConfig(raw_cfg);
+        try cfg.validate();
         if (!isLocalReaderProvider(cfg.provider, cfg.resolvedUrl())) {
             if (cfg.provider != .antfly) return null;
             const endpoint = cfg.resolvedUrl() orelse return null;
             var auth_value: ?[]u8 = null;
             defer if (auth_value) |value| alloc.free(value);
-            var header_storage: [1][2][]const u8 = undefined;
-            const headers: []const [2][]const u8 = if (cfg.bearer_token orelse cfg.api_key) |token| blk: {
+            var header_storage: [2][2][]const u8 = undefined;
+            var header_count: usize = 0;
+            if (cfg.bearer_token orelse cfg.api_key) |token| {
                 auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
-                header_storage[0] = .{ "Authorization", auth_value.? };
-                break :blk &header_storage;
-            } else &.{};
+                header_storage[header_count] = .{ "Authorization", auth_value.? };
+                header_count += 1;
+            }
+            header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
+            const headers = header_storage[0..header_count];
             return self.capabilityCache().getOrDiscover(
                 self.http,
                 endpoint,
@@ -754,6 +850,7 @@ pub const Runtime = struct {
         }
         var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
         defer parsed.deinit(alloc);
+        try self.routeGeneratorConfig(alloc, &parsed.generator);
         const cfg = parsed.generator;
         const local_serial = all_have_media and cfg.provider == .antfly and cfg.url.len == 0 and
             self.antfly_provider != null and
@@ -776,6 +873,7 @@ pub const Runtime = struct {
             capabilities.batch.mode == .none) return false;
         var cfg = extracting.parseConfigFromSlice(alloc, requests[0].config_json) catch return false;
         defer cfg.deinit(alloc);
+        self.routeExtractorConfig(alloc, &cfg) catch return false;
         validateExtractorBatchPlan(
             alloc,
             capabilities,
@@ -790,7 +888,11 @@ pub const Runtime = struct {
         alloc: Allocator,
         cfg: extracting.Config,
     ) !?inference_work.InferenceCapabilities {
-        if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) {
+        const endpoint = if (cfg.provider == .antfly)
+            self.execution.resolveAntflyEndpoint(cfg.resolvedUrl(), self.linkedExtractorAvailable())
+        else
+            cfg.resolvedUrl();
+        if (isLocalExtractionProvider(cfg.provider, endpoint)) {
             const local = self.antfly_provider orelse return null;
             if (local.extract == null) return null;
             const resolve = local.model_capabilities orelse return null;
@@ -800,18 +902,21 @@ pub const Runtime = struct {
             return capabilities;
         }
         if (cfg.provider != .antfly) return null;
-        const endpoint = cfg.resolvedUrl() orelse return null;
+        const remote_endpoint = endpoint orelse return null;
         var auth_value: ?[]u8 = null;
         defer if (auth_value) |value| alloc.free(value);
-        var header_storage: [1][2][]const u8 = undefined;
-        const headers: []const [2][]const u8 = if (cfg.bearer_token orelse cfg.api_key) |token| blk: {
+        var header_storage: [2][2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (cfg.bearer_token orelse cfg.api_key) |token| {
             auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
-            header_storage[0] = .{ "Authorization", auth_value.? };
-            break :blk &header_storage;
-        } else &.{};
+            header_storage[header_count] = .{ "Authorization", auth_value.? };
+            header_count += 1;
+        }
+        header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
+        const headers = header_storage[0..header_count];
         return self.capabilityCache().getOrDiscover(
             self.http,
-            endpoint,
+            remote_endpoint,
             cfg.model,
             .extract,
             headers,
@@ -825,12 +930,15 @@ pub const Runtime = struct {
         if (cfg.provider != .antfly or cfg.resolvedUrl() == null) return;
         var auth_value: ?[]u8 = null;
         defer if (auth_value) |value| alloc.free(value);
-        var header_storage: [1][2][]const u8 = undefined;
-        const headers: []const [2][]const u8 = if (cfg.bearer_token orelse cfg.api_key) |token| blk: {
+        var header_storage: [2][2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (cfg.bearer_token orelse cfg.api_key) |token| {
             auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
-            header_storage[0] = .{ "Authorization", auth_value.? };
-            break :blk &header_storage;
-        } else &.{};
+            header_storage[header_count] = .{ "Authorization", auth_value.? };
+            header_count += 1;
+        }
+        header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
+        const headers = header_storage[0..header_count];
         const lease = try self.capabilityCache().getOrDiscoverLease(
             self.http,
             cfg.resolvedUrl().?,
@@ -845,12 +953,15 @@ pub const Runtime = struct {
         if (cfg.provider != .antfly or cfg.resolvedUrl() == null) return;
         var auth_value: ?[]u8 = null;
         defer if (auth_value) |value| alloc.free(value);
-        var header_storage: [1][2][]const u8 = undefined;
-        const headers: []const [2][]const u8 = if (cfg.bearer_token orelse cfg.api_key) |token| blk: {
+        var header_storage: [2][2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (cfg.bearer_token orelse cfg.api_key) |token| {
             auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
-            header_storage[0] = .{ "Authorization", auth_value.? };
-            break :blk &header_storage;
-        } else &.{};
+            header_storage[header_count] = .{ "Authorization", auth_value.? };
+            header_count += 1;
+        }
+        header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
+        const headers = header_storage[0..header_count];
         try self.capabilityCache().invalidate(cfg.resolvedUrl().?, cfg.model, .extract, headers);
     }
 
@@ -1003,6 +1114,7 @@ pub const Runtime = struct {
         const capabilities = (try capabilitiesForRequests(self, alloc, requests)) orelse return error.BatchIncompatible;
         var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
         defer cfg.deinit(alloc);
+        try self.routeExtractorConfig(alloc, &cfg);
         const attachment_transport = extractorAttachmentTransport(cfg);
         try validateExtractorBatchCompatibility(alloc, capabilities, attachment_transport, requests);
         const outputs = try alloc.alloc([]u8, requests.len);
@@ -1043,6 +1155,7 @@ pub const Runtime = struct {
     fn tryExtractBatchChunk(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
         var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
         defer cfg.deinit(alloc);
+        try self.routeExtractorConfig(alloc, &cfg);
         try self.bindExtractorCapabilityLease(alloc, &cfg);
 
         const inputs = try alloc.alloc(extracting.Input, requests.len);
@@ -1100,7 +1213,9 @@ pub const Runtime = struct {
             const local = self.antfly_provider orelse return error.BatchIncompatible;
             const extract_fn = local.extract orelse return error.BatchIncompatible;
             break :blk try extract_fn(local.ptr, alloc, cfg.model, extract_request);
-        } else extracting.extractWithConfig(alloc, self.http, cfg, extract_request) catch |err| {
+        } else extracting.extractWithConfigAndOptions(alloc, self.http, cfg, extract_request, .{
+            .source_table = self.execution.routing.source_table,
+        }) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
                 try self.invalidateExtractorCapabilityLease(alloc, cfg);
             return err;
@@ -1126,6 +1241,7 @@ pub const Runtime = struct {
 
         var parsed_cfg = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
         defer parsed_cfg.deinit(alloc);
+        try self.routeGeneratorConfig(alloc, &parsed_cfg.generator);
         const cfg = parsed_cfg.generator;
         if (cfg.provider != .antfly) return error.BatchIncompatible;
         if (cfg.project_id != null or cfg.location != null or cfg.credentials_path != null) return error.BatchIncompatible;
@@ -1158,13 +1274,15 @@ pub const Runtime = struct {
         defer if (token) |value| alloc.free(value);
         var auth_value: ?[]u8 = null;
         defer if (auth_value) |value| alloc.free(value);
-        var header_storage: [3][2][]const u8 = undefined;
-        const auth_headers: []const [2][]const u8 = if (token) |value| auth: {
+        var header_storage: [4][2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (token) |value| {
             auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value});
-            header_storage[0] = .{ "Authorization", auth_value.? };
-            break :auth header_storage[0..1];
-        } else &.{};
-        var header_count = auth_headers.len;
+            header_storage[header_count] = .{ "Authorization", auth_value.? };
+            header_count += 1;
+        }
+        header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
+        const auth_headers = header_storage[0..header_count];
         const capability_lease = try self.capabilityCache().getOrDiscoverLease(
             self.http,
             cfg.url,
@@ -1273,12 +1391,15 @@ pub const Runtime = struct {
         defer if (secret_value) |value| alloc.free(value);
         var auth_value: ?[]u8 = null;
         defer if (auth_value) |value| alloc.free(value);
-        var header_storage: [1][2][]const u8 = undefined;
-        const headers: []const [2][]const u8 = if (secret_value) |value| blk: {
+        var header_storage: [2][2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (secret_value) |value| {
             auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value});
-            header_storage[0] = .{ "Authorization", auth_value.? };
-            break :blk &header_storage;
-        } else &.{};
+            header_storage[header_count] = .{ "Authorization", auth_value.? };
+            header_count += 1;
+        }
+        header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
+        const headers = header_storage[0..header_count];
         const lease = try self.capabilityCache().getOrDiscoverLease(
             self.http,
             cfg.url,
@@ -1305,12 +1426,15 @@ pub const Runtime = struct {
         defer if (secret_value) |value| alloc.free(value);
         var auth_value: ?[]u8 = null;
         defer if (auth_value) |value| alloc.free(value);
-        var header_storage: [1][2][]const u8 = undefined;
-        const headers: []const [2][]const u8 = if (secret_value) |value| blk: {
+        var header_storage: [2][2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (secret_value) |value| {
             auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value});
-            header_storage[0] = .{ "Authorization", auth_value.? };
-            break :blk &header_storage;
-        } else &.{};
+            header_storage[header_count] = .{ "Authorization", auth_value.? };
+            header_count += 1;
+        }
+        header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
+        const headers = header_storage[0..header_count];
         try self.capabilityCache().invalidate(cfg.url, cfg.model, .generate, headers);
     }
 
@@ -1325,6 +1449,7 @@ pub const Runtime = struct {
             .ignore_unknown_fields = true,
         });
         defer cfg_parsed.deinit();
+        cfg_parsed.value = self.routedTranscriberConfig(cfg_parsed.value);
         if (!isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) return error.BatchIncompatible;
         const model = requiredAntflyTranscriberModel(cfg_parsed.value) catch return error.BatchIncompatible;
         const local = self.antfly_provider orelse return error.BatchIncompatible;
@@ -1551,6 +1676,7 @@ pub const Runtime = struct {
     fn generate(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         var parsed_cfg = try parseGeneratorProducerConfig(alloc, request.config_json);
         defer parsed_cfg.deinit(alloc);
+        try self.routeGeneratorConfig(alloc, &parsed_cfg.generator);
         var cfg = parsed_cfg.generator;
         if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
         for (request.media) |media| try validateEncodedMedia(media);
@@ -1615,6 +1741,7 @@ pub const Runtime = struct {
             .antfly_provider = self.antfly_provider,
             .secret_store = self.secret_store,
             .max_response_bytes = self.responseLimitForTask(.generator, 1),
+            .source_table = self.execution.routing.source_table,
         }, &messages) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
                 try self.invalidateGeneratorCapabilityLease(alloc, cfg);
@@ -1680,31 +1807,35 @@ pub const Runtime = struct {
     }
 
     fn readImagesWithConfigReported(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) !readers.BatchResult {
-        const local_reader = isLocalReaderProvider(cfg.provider, cfg.resolvedUrl());
-        var execution_cfg = cfg;
+        var execution_cfg = self.routedReaderConfig(cfg);
+        try execution_cfg.validate();
+        const local_reader = isLocalReaderProvider(execution_cfg.provider, execution_cfg.resolvedUrl());
         var capability_auth_value: ?[]u8 = null;
         defer if (capability_auth_value) |value| alloc.free(value);
-        var capability_auth_storage: [1][2][]const u8 = undefined;
-        const capability_auth_headers: []const [2][]const u8 = if (!local_reader and cfg.provider == .antfly and
+        var capability_auth_storage: [2][2][]const u8 = undefined;
+        var capability_auth_count: usize = 0;
+        if (!local_reader and execution_cfg.provider == .antfly and
             (cfg.bearer_token orelse cfg.api_key) != null)
-        blk: {
+        {
             capability_auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{cfg.bearer_token orelse cfg.api_key.?});
-            capability_auth_storage[0] = .{ "Authorization", capability_auth_value.? };
-            break :blk &capability_auth_storage;
-        } else &.{};
-        const discovered_capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and cfg.provider == .antfly) blk: {
-            const endpoint = cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
+            capability_auth_storage[capability_auth_count] = .{ "Authorization", capability_auth_value.? };
+            capability_auth_count += 1;
+        }
+        capability_auth_count = try self.execution.routing.appendHeaders(&capability_auth_storage, capability_auth_count);
+        const capability_auth_headers = capability_auth_storage[0..capability_auth_count];
+        const discovered_capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
+            const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
             const lease = try self.capabilityCache().getOrDiscoverLease(
                 self.http,
                 endpoint,
-                cfg.model orelse "",
+                execution_cfg.model orelse "",
                 .read,
                 capability_auth_headers,
             );
             if (lease.routing_token) |token| execution_cfg.capability_token = token.slice();
             if (lease.descriptor_revision) |revision| execution_cfg.capability_revision = revision.slice();
             break :blk lease.capabilities;
-        } else try self.readerCapabilities(alloc, cfg);
+        } else try self.readerCapabilities(alloc, execution_cfg);
         if (discovered_capabilities) |capabilities| {
             const inline_shape = try readerUriInvocationShape(alloc, capabilities, request);
             try capabilities.validateInvocation(.read, .{
@@ -1729,23 +1860,16 @@ pub const Runtime = struct {
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             const read_images = local.read_images orelse return error.UnsupportedReaderProvider;
-            const items = try read_images(local.ptr, alloc, cfg.model orelse "", request);
+            const items = try read_images(local.ptr, alloc, execution_cfg.model orelse "", request);
             return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
         }
 
-        var registry = readers.Registry.init(alloc);
-        defer registry.deinit();
-        try registry.registerConfig("asset", execution_cfg);
-
-        var runtime = readers.Runtime.init(alloc);
-        defer runtime.deinit();
-        try runtime.loadFromRegistry(self.http, &registry);
-
-        const provider = try runtime.get("asset");
-        return provider.readReported(alloc, request) catch |err| {
-            if (err == error.InferenceCapabilitiesStale and cfg.provider == .antfly) {
-                const endpoint = cfg.resolvedUrl() orelse return err;
-                try self.capabilityCache().invalidate(endpoint, cfg.model orelse "", .read, capability_auth_headers);
+        return readers.readWithConfigReported(alloc, self.http, execution_cfg, request, .{
+            .source_table = self.execution.routing.source_table,
+        }) catch |err| {
+            if (err == error.InferenceCapabilitiesStale and execution_cfg.provider == .antfly) {
+                const endpoint = execution_cfg.resolvedUrl() orelse return err;
+                try self.capabilityCache().invalidate(endpoint, execution_cfg.model orelse "", .read, capability_auth_headers);
             }
             return err;
         };
@@ -1787,8 +1911,10 @@ pub const Runtime = struct {
 
     fn readEncodedImagesWithConfigReported(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.EncodedRequest) !readers.BatchResult {
         try readers.validateEncodedRequest(request);
-        const local_reader = isLocalReaderProvider(cfg.provider, cfg.resolvedUrl());
-        const capabilities = try self.readerCapabilities(alloc, cfg);
+        const execution_cfg = self.routedReaderConfig(cfg);
+        try execution_cfg.validate();
+        const local_reader = isLocalReaderProvider(execution_cfg.provider, execution_cfg.resolvedUrl());
+        const capabilities = try self.readerCapabilities(alloc, execution_cfg);
         if (capabilities) |resolved| {
             var encoded_bytes: usize = 0;
             var decoded_pixels: u64 = 0;
@@ -1824,9 +1950,9 @@ pub const Runtime = struct {
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             if (local.read_encoded_images_reported) |read_reported|
-                return try read_reported(local.ptr, alloc, cfg.model orelse "", request);
+                return try read_reported(local.ptr, alloc, execution_cfg.model orelse "", request);
             if (local.read_encoded_images) |read_encoded_images| {
-                const items = try read_encoded_images(local.ptr, alloc, cfg.model orelse "", request);
+                const items = try read_encoded_images(local.ptr, alloc, execution_cfg.model orelse "", request);
                 errdefer {
                     for (items) |*item| readers.deinitResult(alloc, item);
                     alloc.free(items);
@@ -1864,7 +1990,7 @@ pub const Runtime = struct {
             urls[i] = url;
             initialized += 1;
         }
-        var adapted = try self.readImagesWithConfigReported(alloc, cfg, .{
+        var adapted = try self.readImagesWithConfigReported(alloc, execution_cfg, .{
             .images = urls,
             .prompt = request.prompt,
             .max_tokens = request.max_tokens,
@@ -1892,6 +2018,7 @@ pub const Runtime = struct {
             .ignore_unknown_fields = true,
         });
         defer cfg_parsed.deinit();
+        cfg_parsed.value = self.routedTranscriberConfig(cfg_parsed.value);
         cfg_parsed.value.max_response_bytes = self.responseLimitForTask(.transcriber, 1);
         const antfly_model = if (cfg_parsed.value.provider == .antfly)
             try requiredAntflyTranscriberModel(cfg_parsed.value)
@@ -1915,18 +2042,21 @@ pub const Runtime = struct {
 
         var capability_auth_value: ?[]u8 = null;
         defer if (capability_auth_value) |value| alloc.free(value);
-        var capability_auth_storage: [1][2][]const u8 = undefined;
-        const capability_auth_headers: []const [2][]const u8 = if (cfg_parsed.value.provider == .antfly and
+        var capability_auth_storage: [2][2][]const u8 = undefined;
+        var capability_auth_count: usize = 0;
+        if (cfg_parsed.value.provider == .antfly and
             (cfg_parsed.value.bearer_token orelse cfg_parsed.value.api_key) != null)
-        blk: {
+        {
             capability_auth_value = try std.fmt.allocPrint(
                 alloc,
                 "Bearer {s}",
                 .{cfg_parsed.value.bearer_token orelse cfg_parsed.value.api_key.?},
             );
-            capability_auth_storage[0] = .{ "Authorization", capability_auth_value.? };
-            break :blk &capability_auth_storage;
-        } else &.{};
+            capability_auth_storage[capability_auth_count] = .{ "Authorization", capability_auth_value.? };
+            capability_auth_count += 1;
+        }
+        capability_auth_count = try self.execution.routing.appendHeaders(&capability_auth_storage, capability_auth_count);
+        const capability_auth_headers = capability_auth_storage[0..capability_auth_count];
         if (cfg_parsed.value.provider == .antfly) {
             const endpoint = cfg_parsed.value.resolvedUrl() orelse return error.InvalidTranscribingConfig;
             const lease = try self.capabilityCache().getOrDiscoverLease(
@@ -1946,16 +2076,13 @@ pub const Runtime = struct {
                 cfg_parsed.value.capability_revision = revision.slice();
         }
 
-        var registry = transcribing.Registry.init(alloc);
-        defer registry.deinit();
-        try registry.registerConfig("asset", cfg_parsed.value);
-
-        var runtime = transcribing.Runtime.init(alloc);
-        defer runtime.deinit();
-        try runtime.loadFromRegistry(self.http, &registry);
-
-        const provider = try runtime.get("asset");
-        var result = provider.transcribe(alloc, .{ .url = request.source_text }) catch |err| {
+        var result = transcribing.transcribeWithConfig(
+            alloc,
+            self.http,
+            cfg_parsed.value,
+            .{ .url = request.source_text },
+            .{ .source_table = self.execution.routing.source_table },
+        ) catch |err| {
             if (err == error.InferenceCapabilitiesStale and cfg_parsed.value.provider == .antfly) {
                 const endpoint = cfg_parsed.value.resolvedUrl() orelse return err;
                 try self.capabilityCache().invalidate(
@@ -1980,6 +2107,7 @@ pub const Runtime = struct {
         for (request.media) |media| try validateEncodedMedia(media);
         var cfg = try extracting.parseConfigFromSlice(alloc, request.config_json);
         defer cfg.deinit(alloc);
+        try self.routeExtractorConfig(alloc, &cfg);
 
         if (try self.extractorCapabilities(alloc, cfg)) |capabilities| {
             try validateExtractorInvocation(
@@ -2013,7 +2141,9 @@ pub const Runtime = struct {
             const local = self.antfly_provider orelse return error.UnsupportedExtractionProvider;
             const extract_fn = local.extract orelse return error.UnsupportedExtractionProvider;
             break :blk try extract_fn(local.ptr, alloc, cfg.model, extract_request);
-        } else extracting.extractWithConfig(alloc, self.http, cfg, extract_request) catch |err| {
+        } else extracting.extractWithConfigAndOptions(alloc, self.http, cfg, extract_request, .{
+            .source_table = self.execution.routing.source_table,
+        }) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
                 try self.invalidateExtractorCapabilityLease(alloc, cfg);
             return err;
@@ -2193,6 +2323,31 @@ test "antfly transcription requires an explicit routing model" {
         "openai/whisper-tiny",
         try requiredAntflyTranscriberModel(.{ .provider = .antfly, .model = "openai/whisper-tiny" }),
     );
+}
+
+test "asset producer runtime routes every remote model family through the distributed default before admission" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.init(alloc, io_impl.io());
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(alloc, &client, .{
+        .inference_api_url = "https://inference.example/ai/v1",
+        .source_table = "docs",
+    });
+    defer runtime.deinit();
+    const producer = runtime.producer();
+
+    const requests = [_]asset_producer.Request{
+        .{ .producer_type = .reader, .config_json = "{\"provider\":\"antfly\",\"model\":\"reader\"}", .source_text = "image" },
+        .{ .producer_type = .generator, .config_json = "{\"provider\":\"antfly\",\"model\":\"generator\"}", .source_text = "prompt" },
+        .{ .producer_type = .extractor, .config_json = "{\"provider\":\"antfly\",\"model\":\"extractor\"}", .source_text = "content" },
+        .{ .producer_type = .transcriber, .config_json = "{\"provider\":\"antfly\",\"model\":\"transcriber\"}", .source_text = "audio" },
+    };
+    for (requests) |request| {
+        const plan = try producer.invocationMemoryForRequests(alloc, &.{request});
+        try std.testing.expect(plan.fixed_bytes > 0);
+    }
 }
 
 fn isLocalExtractionProvider(provider: extracting.Provider, url: ?[]const u8) bool {

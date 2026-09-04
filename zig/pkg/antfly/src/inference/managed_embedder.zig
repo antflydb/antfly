@@ -260,6 +260,7 @@ pub const InitOptions = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
+    source_table: []const u8 = "",
 };
 
 const DimensionProbeValidation = enum {
@@ -493,6 +494,7 @@ pub const ManagedEmbeddingEntry = struct {
     provider: ProviderKind,
     model: []u8,
     base_url: []u8,
+    source_table: []u8 = "",
     region: []u8 = "",
     bedrock_request_format: bedrock_provider.RequestFormat = .auto,
     input_type: []u8 = "",
@@ -538,6 +540,7 @@ pub const ManagedEmbeddingEntry = struct {
         if (self.lookup_aliases.len > 0) alloc.free(self.lookup_aliases);
         alloc.free(self.model);
         alloc.free(self.base_url);
+        if (self.source_table.len > 0) alloc.free(self.source_table);
         if (self.region.len > 0) alloc.free(self.region);
         if (self.input_type.len > 0) alloc.free(self.input_type);
         if (self.truncate.len > 0) alloc.free(self.truncate);
@@ -1330,13 +1333,20 @@ pub const ManagedEmbedder = struct {
             defer http.deinit();
             var auth_header: ?[]u8 = null;
             defer if (auth_header) |value| alloc.free(value);
-            var header_storage: [1][2][]const u8 = undefined;
-            const headers: []const [2][]const u8 = if (entry.api_key) |*api_key_ref| blk: {
+            var header_storage: [2][2][]const u8 = undefined;
+            var header_count: usize = 0;
+            if (entry.api_key) |*api_key_ref| {
                 auth_header = try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref);
-                if (auth_header == null) break :blk &.{};
-                header_storage[0] = .{ "Authorization", auth_header.? };
-                break :blk &header_storage;
-            } else &.{};
+                if (auth_header) |value| {
+                    header_storage[header_count] = .{ "Authorization", value };
+                    header_count += 1;
+                }
+            }
+            if (entry.source_table.len > 0) {
+                header_storage[header_count] = .{ "X-Antfly-Source-Table", entry.source_table };
+                header_count += 1;
+            }
+            const headers = header_storage[0..header_count];
             const cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
             const discovered: ?remote_capabilities.CapabilityLease = cache.getOrDiscoverLeaseWithContext(
                 &http,
@@ -3566,6 +3576,11 @@ fn buildManagedEmbeddingEntry(
     errdefer if (input_type.len > 0) alloc.free(input_type);
     const truncate = if (embedder_cfg.truncate.len > 0) try alloc.dupe(u8, embedder_cfg.truncate) else @constCast("");
     errdefer if (truncate.len > 0) alloc.free(truncate);
+    const source_table: []u8 = if (options.source_table.len > 0)
+        try alloc.dupe(u8, options.source_table)
+    else
+        @constCast("");
+    errdefer if (source_table.len > 0) alloc.free(source_table);
     const api_key = switch (provider) {
         .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
         .antfly => try common_secrets.SecretValue.initConfigOrEnv(
@@ -3589,6 +3604,7 @@ fn buildManagedEmbeddingEntry(
         .provider = provider,
         .model = owned_model,
         .base_url = base_url,
+        .source_table = source_table,
         .region = bedrock_region,
         .bedrock_request_format = bedrock_request_format,
         .input_type = input_type,
@@ -4230,6 +4246,7 @@ fn embedWithEntryParts(
         var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
         defer provider.deinit();
         provider.setRequestCancellation(entry.cancellation);
+        try provider.setSourceTable(entry.source_table);
         if (entry.api_key) |*api_key_ref| {
             if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
                 defer alloc.free(auth_header);
@@ -4520,18 +4537,24 @@ fn embedPartItemsWithEntry(
     var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
     defer provider.deinit();
     provider.setRequestCancellation(entry.cancellation);
+    try provider.setSourceTable(entry.source_table);
     var auth_header_owned: ?[]u8 = null;
     defer if (auth_header_owned) |value| alloc.free(value);
-    var capability_header_storage: [1][2][]const u8 = undefined;
-    var capability_headers: []const [2][]const u8 = &.{};
+    var capability_header_storage: [2][2][]const u8 = undefined;
+    var capability_header_count: usize = 0;
     if (entry.api_key) |*api_key_ref| {
         if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
             auth_header_owned = auth_header;
             try provider.setAuthorizationHeader(auth_header);
-            capability_header_storage[0] = .{ "Authorization", auth_header };
-            capability_headers = &capability_header_storage;
+            capability_header_storage[capability_header_count] = .{ "Authorization", auth_header };
+            capability_header_count += 1;
         }
     }
+    if (entry.source_table.len > 0) {
+        capability_header_storage[capability_header_count] = .{ "X-Antfly-Source-Table", entry.source_table };
+        capability_header_count += 1;
+    }
+    const capability_headers = capability_header_storage[0..capability_header_count];
     const capability_cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
     const capability_lease = try capability_cache.getOrDiscoverLeaseWithContext(
         &http,
@@ -4600,6 +4623,7 @@ fn embedSparseBatchWithEntry(
             var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
             defer provider.deinit();
             provider.setRequestCancellation(entry.cancellation);
+            try provider.setSourceTable(entry.source_table);
             if (entry.api_key) |*api_key_ref| {
                 if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
                     defer alloc.free(auth_header);
@@ -4816,6 +4840,7 @@ fn embedBatchWithEntry(
             var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
             defer provider.deinit();
             provider.setRequestCancellation(entry.cancellation);
+            try provider.setSourceTable(entry.source_table);
             if (entry.api_key) |*api_key_ref| {
                 if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
                     defer alloc.free(auth_header);

@@ -286,15 +286,35 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
     };
 }
 
+pub const RemoteOptions = struct {
+    source_table: []const u8 = "",
+};
+
 pub fn initExtractor(alloc: Allocator, http: *httpx.Client, cfg: Config) !Extractor {
+    return initExtractorWithOptions(alloc, http, cfg, .{});
+}
+
+fn initExtractorWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Extractor {
     return switch (cfg.provider) {
-        .antfly, .pioneer, .openai => try HttpExtractorState.init(alloc, http, cfg),
+        .antfly, .pioneer, .openai => try HttpExtractorState.init(alloc, http, cfg, options),
         .mock => error.UnsupportedExtractionProvider,
     };
 }
 
 pub fn extractWithConfig(alloc: Allocator, http: *httpx.Client, cfg: Config, req: Request) !Response {
     const extractor = try initExtractor(alloc, http, cfg);
+    defer extractor.deinit();
+    return try extractor.extract(alloc, req);
+}
+
+pub fn extractWithConfigAndOptions(
+    alloc: Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    req: Request,
+    options: RemoteOptions,
+) !Response {
+    const extractor = try initExtractorWithOptions(alloc, http, cfg, options);
     defer extractor.deinit();
     return try extractor.extract(alloc, req);
 }
@@ -316,14 +336,23 @@ const HttpExtractorState = struct {
     alloc: Allocator,
     http: *httpx.Client,
     cfg: Config,
+    source_table: ?[]u8 = null,
 
-    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Extractor {
+    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Extractor {
         const state = try alloc.create(HttpExtractorState);
         errdefer alloc.destroy(state);
+        // Source routing is an Antfly-internal protocol. Never forward it to
+        // third-party extractor endpoints that happen to share this adapter.
+        const source_table = if (cfg.provider == .antfly and options.source_table.len > 0)
+            try alloc.dupe(u8, options.source_table)
+        else
+            null;
+        errdefer if (source_table) |value| alloc.free(value);
         state.* = .{
             .alloc = alloc,
             .http = http,
             .cfg = try cloneConfig(alloc, cfg),
+            .source_table = source_table,
         };
         return .{ .ptr = state, .vtable = &.{ .extract = extract, .deinit = deinit } };
     }
@@ -331,6 +360,7 @@ const HttpExtractorState = struct {
     fn deinit(ptr: *anyopaque) void {
         const self: *HttpExtractorState = @ptrCast(@alignCast(ptr));
         self.cfg.deinit(self.alloc);
+        if (self.source_table) |source_table| self.alloc.free(source_table);
         self.alloc.destroy(self);
     }
 
@@ -358,6 +388,8 @@ const HttpExtractorState = struct {
             auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
             try headers.append(alloc, .{ "Authorization", auth_header.? });
         }
+        if (self.source_table) |source_table|
+            try headers.append(alloc, .{ "X-Antfly-Source-Table", source_table });
         if (self.cfg.capability_token) |token|
             try headers.append(alloc, .{ "X-Antfly-Capability-Token", token });
         if (self.cfg.capability_revision) |revision|

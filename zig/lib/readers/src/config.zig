@@ -76,7 +76,22 @@ pub const Config = struct {
     location: ?[]const u8 = null,
     credentials_path: ?[]const u8 = null,
 
+    pub fn validate(self: Config) !void {
+        if (self.provider == .antfly) {
+            const model = self.model orelse return error.InvalidReaderConfig;
+            if (std.mem.trim(u8, model, " \t\r\n").len == 0)
+                return error.InvalidReaderConfig;
+        }
+    }
+
     pub fn resolvedUrl(self: Config) ?[]const u8 {
         return self.url orelse self.api_url;
     }
 };
+
+test "antfly reader requires an explicit routing model" {
+    try std.testing.expectError(error.InvalidReaderConfig, (Config{ .provider = .antfly }).validate());
+    try std.testing.expectError(error.InvalidReaderConfig, (Config{ .provider = .antfly, .model = " \t" }).validate());
+    try (Config{ .provider = .antfly, .model = "antflydb/Florence-2-base" }).validate();
+    try (Config{ .provider = .openai }).validate();
+}

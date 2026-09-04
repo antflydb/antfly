@@ -47,6 +47,7 @@ pub const BackendFactory = struct {
     secret_store: ?*common_secrets.FileStore = null,
     inference_api_key: ?[]const u8 = null,
     max_response_bytes: ?usize = null,
+    source_table: []const u8 = "",
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -65,6 +66,7 @@ pub const BackendFactory = struct {
         secret_store: ?*common_secrets.FileStore = null,
         inference_api_key: ?[]const u8 = null,
         max_response_bytes: ?usize = null,
+        source_table: []const u8 = "",
     };
 
     pub fn initWithOptions(
@@ -79,6 +81,7 @@ pub const BackendFactory = struct {
             .secret_store = options.secret_store,
             .inference_api_key = options.inference_api_key,
             .max_response_bytes = options.max_response_bytes,
+            .source_table = options.source_table,
         };
     }
 
@@ -91,7 +94,7 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
-        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.source_table);
     }
 };
 
@@ -118,6 +121,7 @@ const BackendState = struct {
         secret_store: ?*common_secrets.FileStore,
         inference_api_key: ?[]const u8,
         max_response_bytes: ?usize,
+        source_table: []const u8,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
@@ -162,6 +166,7 @@ const BackendState = struct {
                 .{ .embedded_antfly = embedded_antfly_provider.? }
             else blk: {
                 var provider = antfly_provider.Provider.init(alloc, http, if (cfg.url.len > 0) cfg.url else "http://127.0.0.1:8082");
+                try provider.setSourceTable(source_table);
                 if (cfg.capability_token) |token| try provider.setCapabilityToken(token);
                 if (cfg.capability_revision) |revision| try provider.setCapabilityRevision(revision);
                 break :blk .{ .remote_antfly = provider };
