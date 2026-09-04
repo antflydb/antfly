@@ -44,6 +44,9 @@ fn isExpectedControlRoundError(err: anyerror) bool {
 
 const metadata_raft_max_snapshot_transfer_bytes: usize = 1 << 30;
 const metadata_raft_max_regular_ready_bytes: usize = 64 * 1024 * 1024;
+// Bound each follower's append pipeline so ordinary replication cannot build
+// an aggregate Ready large enough to trip the runtime's last-resort ceiling.
+const metadata_raft_max_inflight_bytes_per_peer: usize = metadata_raft_max_regular_ready_bytes;
 const metadata_raft_max_single_ready_bytes: usize =
     metadata_raft_max_snapshot_transfer_bytes + metadata_raft_max_regular_ready_bytes;
 
@@ -147,6 +150,7 @@ const Factory = struct {
                     .check_quorum = true,
                     .step_down_on_removal = true,
                     .max_size_per_msg = metadata_raft_max_regular_ready_bytes,
+                    .max_inflight_bytes = metadata_raft_max_inflight_bytes_per_peer,
                     .max_committed_size_per_ready = metadata_raft_max_regular_ready_bytes,
                     .random_seed = antfly.raft.stableRandomSeed(record.group_id, record.local_node_id),
                 },
@@ -2024,6 +2028,31 @@ test "metadata runtime enables bounded raft storage compaction for multi-node gr
     try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), runtime_cfg.applied_log_retained_entries);
     try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), runtime_cfg.applied_log_compaction_min_interval_entries);
     try std.testing.expect(!runtime_cfg.applied_log_compaction_single_node_only);
+}
+
+test "metadata descriptor bounds each peer replication pipeline" {
+    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = Factory{
+        .alloc = std.testing.allocator,
+        .store = &store,
+        .metadata_group_id = group_ids.main_metadata_group_id,
+        .metadata_peer_node_ids = try std.testing.allocator.dupe(u64, &.{ 1, 2, 3 }),
+    };
+    defer factory.deinit();
+
+    var desc = try factory.iface().buildDescriptor(.{
+        .group_id = group_ids.main_metadata_group_id,
+        .replica_id = 1,
+        .local_node_id = 1,
+    });
+    defer factory.iface().freeDescriptor(std.testing.allocator, &desc);
+
+    try std.testing.expectEqual(
+        metadata_raft_max_inflight_bytes_per_peer,
+        desc.group.raft_config.max_inflight_bytes,
+    );
+    try std.testing.expect(desc.group.raft_config.max_inflight_bytes != std.math.maxInt(usize));
 }
 
 test "metadata runtime chooses one preferred bootstrap campaigner" {
