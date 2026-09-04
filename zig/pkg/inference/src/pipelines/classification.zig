@@ -26,6 +26,7 @@ const tokenizer_mod = @import("inference_tokenizer");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Tensor = backends.Tensor;
 const runtime = @import("../runtime/root.zig");
+const session_mod = @import("../backends/session.zig");
 
 pub const ClassificationConfig = struct {
     max_length: usize = 512,
@@ -41,6 +42,54 @@ pub const ClassificationConfig = struct {
 pub const ClassificationResult = struct {
     label: []const u8,
     score: f32,
+};
+
+/// Tokenized NLI rows shared by executor-contract validation, usage
+/// accounting, and model execution. `labels` remain caller-owned, matching the
+/// borrowed labels in `ClassificationResult`; every encoded row, the label
+/// semantics snapshot, and the hypothesis-template snapshot are owned by this
+/// value and released by `deinit`.
+pub const PreparedClassificationInputs = struct {
+    allocator: std.mem.Allocator,
+    labels: []const []const u8,
+    /// Exact owned copy of the labels used to build `encoded`. Results retain
+    /// the public API's borrowed labels, while this snapshot prevents changed
+    /// contents or ordering from silently re-attributing logits.
+    label_semantics: [][]u8,
+    encoded: []tokenizer_mod.EncodeResult,
+    text_count: usize,
+    max_length: usize,
+    owner_session_ptr: *anyopaque,
+    owner_session_vtable: *const backends.Session.VTable,
+    owner_tokenizer_ptr: *anyopaque,
+    owner_tokenizer_vtable: *const Tokenizer.VTable,
+    hypothesis_template: []u8,
+    multi_label: bool,
+    entailment_index: ?usize,
+    trim_padding_to_batch_max: bool,
+    preprocess_permit: ?session_mod.RunPermit = null,
+    run_permit: ?session_mod.RunPermit = null,
+    max_input_tokens_per_item: usize = 0,
+    prompt_tokens: usize = 0,
+
+    pub fn deinit(self: *@This()) void {
+        if (self.preprocess_permit) |*permit| permit.deinit();
+        if (self.run_permit) |*permit| permit.deinit();
+        for (self.encoded) |*item| item.deinit();
+        self.allocator.free(self.encoded);
+        for (self.label_semantics) |label| self.allocator.free(label);
+        self.allocator.free(self.label_semantics);
+        self.allocator.free(self.hypothesis_template);
+        self.* = undefined;
+    }
+
+    fn labelsMatchSemantics(self: *const @This()) bool {
+        if (self.labels.len != self.label_semantics.len) return false;
+        for (self.labels, self.label_semantics) |label, semantic_label| {
+            if (!std.mem.eql(u8, label, semantic_label)) return false;
+        }
+        return true;
+    }
 };
 
 pub const ClassificationPipeline = struct {
@@ -91,8 +140,134 @@ pub const ClassificationPipeline = struct {
         texts: []const []const u8,
         labels: []const []const u8,
     ) ![][]ClassificationResult {
-        var prompt_tokens: usize = 0;
-        return self.classifyBatchWithPromptTokens(texts, labels, &prompt_tokens);
+        var prepared = try self.prepareInputs(texts, labels);
+        defer prepared.deinit();
+        return self.classifyPrepared(&prepared);
+    }
+
+    pub fn prepareInputs(
+        self: *ClassificationPipeline,
+        texts: []const []const u8,
+        labels: []const []const u8,
+    ) !PreparedClassificationInputs {
+        return self.prepareInputsInternal(texts, labels, true);
+    }
+
+    fn prepareInputsInternal(
+        self: *ClassificationPipeline,
+        texts: []const []const u8,
+        labels: []const []const u8,
+        admit: bool,
+    ) !PreparedClassificationInputs {
+        const alloc = self.allocator;
+        const total_pairs = std.math.mul(usize, texts.len, labels.len) catch
+            return error.ClassificationBatchTooLarge;
+        const max_preprocess_tokens = std.math.mul(usize, total_pairs, self.config.max_length) catch
+            return error.ClassificationBatchTooLarge;
+        var preprocess_permit: ?session_mod.RunPermit = if (admit and total_pairs != 0)
+            try self.session.admitHostPreprocess(
+                std.math.mul(usize, max_preprocess_tokens, 40) catch
+                    return error.ResourceLimitExceeded,
+            )
+        else
+            null;
+        errdefer if (preprocess_permit) |*permit| permit.deinit();
+        const encoded = try alloc.alloc(tokenizer_mod.EncodeResult, total_pairs);
+        var encoded_count: usize = 0;
+        errdefer {
+            for (encoded[0..encoded_count]) |*item| item.deinit();
+            alloc.free(encoded);
+        }
+        const hypothesis_template = try alloc.dupe(u8, self.config.hypothesis_template);
+        var hypothesis_template_transferred = false;
+        errdefer if (!hypothesis_template_transferred) alloc.free(hypothesis_template);
+        const label_semantics = try alloc.alloc([]u8, labels.len);
+        var label_semantics_count: usize = 0;
+        var label_semantics_transferred = false;
+        errdefer if (!label_semantics_transferred) {
+            for (label_semantics[0..label_semantics_count]) |label| alloc.free(label);
+            alloc.free(label_semantics);
+        };
+        for (labels, 0..) |label, index| {
+            label_semantics[index] = try alloc.dupe(u8, label);
+            label_semantics_count += 1;
+        }
+
+        var prepared = PreparedClassificationInputs{
+            .allocator = alloc,
+            .labels = labels,
+            .label_semantics = label_semantics,
+            .encoded = encoded,
+            .text_count = texts.len,
+            .max_length = self.config.max_length,
+            .owner_session_ptr = self.session.ptr,
+            .owner_session_vtable = self.session.vtable,
+            .owner_tokenizer_ptr = self.tok.ptr,
+            .owner_tokenizer_vtable = self.tok.vtable,
+            .hypothesis_template = hypothesis_template,
+            .multi_label = self.config.multi_label,
+            .entailment_index = self.config.entailment_index,
+            .trim_padding_to_batch_max = self.config.trim_padding_to_batch_max,
+            .preprocess_permit = preprocess_permit,
+        };
+        hypothesis_template_transferred = true;
+        label_semantics_transferred = true;
+        preprocess_permit = null;
+        errdefer {
+            if (prepared.preprocess_permit) |*permit| permit.deinit();
+            if (prepared.run_permit) |*permit| permit.deinit();
+            for (prepared.label_semantics) |label| alloc.free(label);
+            alloc.free(prepared.label_semantics);
+            alloc.free(prepared.hypothesis_template);
+        }
+        if (total_pairs == 0) return prepared;
+
+        const hypotheses = try alloc.alloc([]const u8, labels.len);
+        var hypotheses_count: usize = 0;
+        defer {
+            for (hypotheses[0..hypotheses_count]) |hypothesis| alloc.free(hypothesis);
+            alloc.free(hypotheses);
+        }
+        for (labels, 0..) |label, index| {
+            hypotheses[index] = try self.formatHypothesis(label);
+            hypotheses_count += 1;
+        }
+
+        for (texts, 0..) |text, text_index| {
+            for (hypotheses, 0..) |hypothesis, label_index| {
+                const pair_index = text_index * labels.len + label_index;
+                encoded[pair_index] = try self.tok.encodeForPair(
+                    alloc,
+                    text,
+                    hypothesis,
+                    self.config.max_length,
+                );
+                encoded_count += 1;
+                const active_tokens = activeTokenLength(encoded[pair_index].attention_mask);
+                prepared.max_input_tokens_per_item = @max(
+                    prepared.max_input_tokens_per_item,
+                    active_tokens,
+                );
+                for (encoded[pair_index].attention_mask) |mask| {
+                    if (mask != 0) {
+                        prepared.prompt_tokens = std.math.add(
+                            usize,
+                            prepared.prompt_tokens,
+                            1,
+                        ) catch return error.ClassificationBatchTooLarge;
+                    }
+                }
+            }
+        }
+        if (admit) {
+            const fixed_len = hasFixedTextSequenceLength(self.session.inputInfo());
+            const effective_len = if (self.config.trim_padding_to_batch_max and !fixed_len)
+                @max(@as(usize, 1), prepared.max_input_tokens_per_item)
+            else
+                self.config.max_length;
+            prepared.run_permit = try self.admitPreparedRows(total_pairs, effective_len);
+        }
+        return prepared;
     }
 
     /// Returns the largest exact non-padding model row in this request. Each
@@ -102,24 +277,9 @@ pub const ClassificationPipeline = struct {
         texts: []const []const u8,
         labels: []const []const u8,
     ) !usize {
-        var result: usize = 0;
-        for (labels) |label| {
-            const hypothesis = try self.formatHypothesis(label);
-            defer self.allocator.free(hypothesis);
-            for (texts) |text| {
-                var encoded = try self.tok.encodeForPair(
-                    self.allocator,
-                    text,
-                    hypothesis,
-                    self.config.max_length,
-                );
-                defer encoded.deinit();
-                var count: usize = 0;
-                for (encoded.attention_mask) |mask| count += @intFromBool(mask != 0);
-                result = @max(result, count);
-            }
-        }
-        return result;
+        var prepared = try self.prepareInputsInternal(texts, labels, false);
+        defer prepared.deinit();
+        return prepared.max_input_tokens_per_item;
     }
 
     /// Classify a batch and report the exact number of non-padding tokens sent
@@ -130,9 +290,35 @@ pub const ClassificationPipeline = struct {
         labels: []const []const u8,
         prompt_tokens: *usize,
     ) ![][]ClassificationResult {
+        var prepared = try self.prepareInputs(texts, labels);
+        defer prepared.deinit();
+        prompt_tokens.* = prepared.prompt_tokens;
+        return self.classifyPrepared(&prepared);
+    }
+
+    pub fn classifyPrepared(
+        self: *ClassificationPipeline,
+        prepared: *PreparedClassificationInputs,
+    ) ![][]ClassificationResult {
         const alloc = self.allocator;
-        prompt_tokens.* = 0;
-        const results = try alloc.alloc([]ClassificationResult, texts.len);
+        if (prepared.owner_session_ptr != self.session.ptr or
+            prepared.owner_session_vtable != self.session.vtable or
+            prepared.owner_tokenizer_ptr != self.tok.ptr or
+            prepared.owner_tokenizer_vtable != self.tok.vtable or
+            !std.mem.eql(u8, prepared.hypothesis_template, self.config.hypothesis_template) or
+            !prepared.labelsMatchSemantics() or
+            prepared.max_length != self.config.max_length or
+            prepared.multi_label != self.config.multi_label or
+            prepared.entailment_index != self.config.entailment_index or
+            prepared.trim_padding_to_batch_max != self.config.trim_padding_to_batch_max)
+            return error.InvalidPreparedClassificationInputs;
+        const labels = prepared.labels;
+        const total_pairs = std.math.mul(usize, prepared.text_count, labels.len) catch
+            return error.InvalidPreparedClassificationInputs;
+        if (total_pairs != prepared.encoded.len)
+            return error.InvalidPreparedClassificationInputs;
+
+        const results = try alloc.alloc([]ClassificationResult, prepared.text_count);
         var initialized: usize = 0;
         errdefer {
             for (results[0..initialized]) |r| alloc.free(r);
@@ -140,67 +326,24 @@ pub const ClassificationPipeline = struct {
         }
 
         if (labels.len == 0) {
-            for (texts, 0..) |_, i| {
-                results[i] = try alloc.alloc(ClassificationResult, 0);
+            for (results) |*row| {
+                row.* = try alloc.alloc(ClassificationResult, 0);
                 initialized += 1;
             }
             return results;
         }
 
-        if (texts.len == 0) return results;
+        if (prepared.text_count == 0) return results;
 
-        const max_len = self.config.max_length;
-        const total_pairs = std.math.mul(usize, texts.len, labels.len) catch return error.ClassificationBatchTooLarge;
-        const admitted_input_len = std.math.mul(usize, total_pairs, max_len) catch return error.ClassificationBatchTooLarge;
-        // Reserve the configured upper bound before tokenizer and packing
-        // buffers are allocated. Dynamic sessions execute the shorter,
-        // batch-local sequence below without weakening admission.
-        var run_permit = try self.session.admit(.{
-            .batch = total_pairs,
-            .sequence = max_len,
-            .input_bytes = std.math.mul(usize, admitted_input_len, 24) catch
-                return error.ResourceLimitExceeded,
-            .host_preprocess_bytes = std.math.mul(usize, admitted_input_len, 40) catch
-                return error.ResourceLimitExceeded,
-        });
-        defer run_permit.deinit();
-
-        var hypotheses = try alloc.alloc([]const u8, labels.len);
-        defer {
-            for (hypotheses) |h| alloc.free(h);
-            alloc.free(hypotheses);
-        }
-        for (labels, 0..) |label, i| {
-            hypotheses[i] = try self.formatHypothesis(label);
-        }
-
-        const encoded = try alloc.alloc(tokenizer_mod.EncodeResult, total_pairs);
-        defer alloc.free(encoded);
-        var encoded_count: usize = 0;
-        defer {
-            for (encoded[0..encoded_count]) |*result| result.deinit();
-        }
+        const max_len = prepared.max_length;
+        const run_permit = if (prepared.run_permit) |*permit| permit else return error.InvalidPreparedClassificationInputs;
 
         const fixed_len = hasFixedTextSequenceLength(self.session.inputInfo());
         const trim_padding = self.config.trim_padding_to_batch_max and !fixed_len;
         var effective_len: usize = if (trim_padding) 1 else max_len;
-        for (texts, 0..) |text, text_i| {
-            for (hypotheses, 0..) |hyp, label_i| {
-                const pair_i = text_i * labels.len + label_i;
-                encoded[pair_i] = try self.tok.encodeForPair(alloc, text, hyp, max_len);
-                encoded_count += 1;
-                for (encoded[pair_i].attention_mask) |mask| {
-                    if (mask != 0) {
-                        prompt_tokens.* = std.math.add(usize, prompt_tokens.*, 1) catch
-                            return error.ClassificationBatchTooLarge;
-                    }
-                }
-                if (trim_padding) {
-                    effective_len = @max(
-                        effective_len,
-                        activeTokenLength(encoded[pair_i].attention_mask),
-                    );
-                }
+        if (trim_padding) {
+            for (prepared.encoded) |item| {
+                effective_len = @max(effective_len, activeTokenLength(item.attention_mask));
             }
         }
 
@@ -211,10 +354,10 @@ pub const ClassificationPipeline = struct {
         const all_mask = try alloc.alloc(i32, input_len);
         defer alloc.free(all_mask);
 
-        for (texts, 0..) |_, text_i| {
-            for (hypotheses, 0..) |_, label_i| {
+        for (0..prepared.text_count) |text_i| {
+            for (0..labels.len) |label_i| {
                 const pair_i = text_i * labels.len + label_i;
-                const result = encoded[pair_i];
+                const result = prepared.encoded[pair_i];
                 if (result.ids.len < effective_len or result.attention_mask.len < effective_len)
                     return error.UnexpectedInputShape;
                 @memcpy(
@@ -294,7 +437,7 @@ pub const ClassificationPipeline = struct {
         const scores = try alloc.alloc(f32, labels.len);
         defer alloc.free(scores);
 
-        for (texts, 0..) |_, text_i| {
+        for (0..prepared.text_count) |text_i| {
             const raw_slice = raw_scores[text_i * labels.len .. (text_i + 1) * labels.len];
             if (self.config.multi_label) {
                 for (raw_slice, 0..) |raw_score, label_i| {
@@ -321,6 +464,17 @@ pub const ClassificationPipeline = struct {
         }
 
         return results;
+    }
+
+    fn admitPreparedRows(self: *ClassificationPipeline, total_pairs: usize, sequence: usize) !session_mod.RunPermit {
+        const admitted_input_len = std.math.mul(usize, total_pairs, sequence) catch
+            return error.ClassificationBatchTooLarge;
+        return self.session.admit(.{
+            .batch = total_pairs,
+            .sequence = sequence,
+            .input_bytes = std.math.mul(usize, admitted_input_len, 24) catch
+                return error.ResourceLimitExceeded,
+        });
     }
 
     fn formatHypothesis(self: *ClassificationPipeline, label: []const u8) ![]const u8 {
@@ -425,21 +579,22 @@ test "classifyBatch runs all text-label pairs in one session batch" {
 
     const texts = [_][]const u8{ "first", "second", "third" };
     const labels = [_][]const u8{ "negative", "positive" };
-    try std.testing.expectEqual(
-        @as(usize, 5),
-        try pipeline.maxInputTokensPerItem(&texts, &labels),
-    );
-    var prompt_tokens: usize = 0;
-    const results = try pipeline.classifyBatchWithPromptTokens(&texts, &labels, &prompt_tokens);
+    var prepared = try pipeline.prepareInputs(&texts, &labels);
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 5), prepared.max_input_tokens_per_item);
+    try std.testing.expectEqual(@as(usize, 30), prepared.prompt_tokens);
+    const encode_calls = fake_tokenizer.encode_calls;
+
+    const results = try pipeline.classifyPrepared(&prepared);
     defer {
         for (results) |row| allocator.free(row);
         allocator.free(results);
     }
 
+    try std.testing.expectEqual(encode_calls, fake_tokenizer.encode_calls);
     try std.testing.expectEqual(@as(usize, 1), fake_session.run_count);
     try std.testing.expectEqual(@as(usize, 6), fake_session.last_batch);
     try std.testing.expectEqual(@as(usize, 5), fake_session.last_sequence);
-    try std.testing.expectEqual(@as(usize, 30), prompt_tokens);
     try std.testing.expectEqual(@as(usize, texts.len), results.len);
     for (results) |row| {
         try std.testing.expectEqual(@as(usize, labels.len), row.len);
@@ -467,6 +622,141 @@ test "classification trims dynamic padding but preserves fixed input shapes" {
 
     try std.testing.expectEqual(@as(usize, 1), fake_session.run_count);
     try std.testing.expectEqual(@as(usize, 8), fake_session.last_sequence);
+}
+
+test "classification admission rejects before tokenization" {
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    controller.configureForcedRunDenialsForTesting(1);
+
+    var fake_session = FakeClassificationSession{};
+    var admitted_session = fake_session.session();
+    admitted_session.run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{},
+        .static_workspace_bytes = 1,
+    };
+    var fake_tokenizer = FakeClassificationTokenizer{};
+    var pipeline = ClassificationPipeline.init(
+        std.testing.allocator,
+        admitted_session,
+        fake_tokenizer.tokenizer(),
+        .{ .max_length = 8 },
+    );
+
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        pipeline.classifyBatch(&.{"first"}, &.{"positive"}),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake_tokenizer.encode_calls);
+}
+
+test "prepared classification inputs are bound to their pipeline generation" {
+    var first_session = FakeClassificationSession{};
+    var second_session = FakeClassificationSession{};
+    var tokenizer = FakeClassificationTokenizer{};
+    var first = ClassificationPipeline.init(
+        std.testing.allocator,
+        first_session.session(),
+        tokenizer.tokenizer(),
+        .{ .max_length = 8 },
+    );
+    var second = ClassificationPipeline.init(
+        std.testing.allocator,
+        second_session.session(),
+        tokenizer.tokenizer(),
+        .{ .max_length = 8 },
+    );
+    var prepared = try first.prepareInputs(&.{"first"}, &.{"positive"});
+    defer prepared.deinit();
+
+    try std.testing.expectError(
+        error.InvalidPreparedClassificationInputs,
+        second.classifyPrepared(&prepared),
+    );
+    first.config.multi_label = true;
+    try std.testing.expectError(
+        error.InvalidPreparedClassificationInputs,
+        first.classifyPrepared(&prepared),
+    );
+}
+
+test "prepared classification inputs reject a different tokenizer on the same session" {
+    var session_state = FakeClassificationSession{};
+    var first_tokenizer = FakeClassificationTokenizer{};
+    var second_tokenizer = FakeClassificationTokenizer{};
+    var first = ClassificationPipeline.init(
+        std.testing.allocator,
+        session_state.session(),
+        first_tokenizer.tokenizer(),
+        .{ .max_length = 8 },
+    );
+    var second = ClassificationPipeline.init(
+        std.testing.allocator,
+        session_state.session(),
+        second_tokenizer.tokenizer(),
+        .{ .max_length = 8 },
+    );
+    var prepared = try first.prepareInputs(&.{"first"}, &.{"positive"});
+    defer prepared.deinit();
+
+    try std.testing.expectError(
+        error.InvalidPreparedClassificationInputs,
+        second.classifyPrepared(&prepared),
+    );
+}
+
+test "prepared classification inputs reject in-place hypothesis template mutation" {
+    var session_state = FakeClassificationSession{};
+    var tokenizer_state = FakeClassificationTokenizer{};
+    var template = [_]u8{ 'T', 'h', 'i', 's', ' ', 'i', 's', ' ', '{', '}', '.' };
+    var pipeline = ClassificationPipeline.init(
+        std.testing.allocator,
+        session_state.session(),
+        tokenizer_state.tokenizer(),
+        .{
+            .max_length = 8,
+            .hypothesis_template = &template,
+        },
+    );
+    var prepared = try pipeline.prepareInputs(&.{"first"}, &.{"positive"});
+    defer prepared.deinit();
+
+    template[0] = 't';
+    try std.testing.expectError(
+        error.InvalidPreparedClassificationInputs,
+        pipeline.classifyPrepared(&prepared),
+    );
+}
+
+test "prepared classification inputs reject label reorder and content mutation" {
+    var session_state = FakeClassificationSession{};
+    var tokenizer_state = FakeClassificationTokenizer{};
+    var first_label = [_]u8{ 'f', 'i', 'r', 's', 't' };
+    var second_label = [_]u8{ 'o', 't', 'h', 'e', 'r' };
+    var labels = [_][]const u8{ &first_label, &second_label };
+    var pipeline = ClassificationPipeline.init(
+        std.testing.allocator,
+        session_state.session(),
+        tokenizer_state.tokenizer(),
+        .{ .max_length = 8 },
+    );
+    var prepared = try pipeline.prepareInputs(&.{"text"}, &labels);
+    defer prepared.deinit();
+
+    std.mem.swap([]const u8, &labels[0], &labels[1]);
+    try std.testing.expectError(
+        error.InvalidPreparedClassificationInputs,
+        pipeline.classifyPrepared(&prepared),
+    );
+
+    std.mem.swap([]const u8, &labels[0], &labels[1]);
+    first_label[0] = 'F';
+    try std.testing.expectError(
+        error.InvalidPreparedClassificationInputs,
+        pipeline.classifyPrepared(&prepared),
+    );
 }
 
 const FakeClassificationSession = struct {
@@ -537,6 +827,8 @@ const FakeClassificationSession = struct {
 };
 
 const FakeClassificationTokenizer = struct {
+    encode_calls: usize = 0,
+
     fn tokenizer(self: *FakeClassificationTokenizer) Tokenizer {
         return .{
             .ptr = self,
@@ -553,7 +845,9 @@ const FakeClassificationTokenizer = struct {
         };
     }
 
-    fn encode(_: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror![]i32 {
+    fn encode(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror![]i32 {
+        const self: *FakeClassificationTokenizer = @ptrCast(@alignCast(ptr));
+        self.encode_calls += 1;
         const ids = try allocator.alloc(i32, 1);
         ids[0] = if (text.len == 0) 1 else @as(i32, @intCast(text[0]));
         return ids;

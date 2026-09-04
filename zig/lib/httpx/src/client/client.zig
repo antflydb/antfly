@@ -112,10 +112,17 @@ pub const RequestOptions = struct {
     /// Per-request response ceiling. This may lower, but never raise, the
     /// client-wide maximum.
     max_response_size: ?usize = null,
+    /// Override ambient cookie persistence for this request. Credentialed API
+    /// clients should set this false even when borrowing a general client.
+    cookies_enabled: ?bool = null,
     /// Borrowed transport-neutral cancellation source. It must remain valid
     /// until the request method returns.
     cancellation: ?CancellationToken = null,
 };
+
+fn requestCookiesEnabled(config: ClientConfig, options: RequestOptions) bool {
+    return options.cookies_enabled orelse config.cookies_enabled;
+}
 
 pub const CancellationToken = struct {
     ptr: *const anyopaque,
@@ -705,7 +712,8 @@ pub const Client = struct {
             try req.headers.set(HeaderName.ACCEPT_ENCODING, "gzip, deflate");
         }
 
-        if (self.config.cookies_enabled) try self.attachCookies(&req);
+        const cookies_enabled = requestCookiesEnabled(self.config, reqOpts);
+        if (cookies_enabled) try self.attachCookies(&req);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.request_fn) |f| {
@@ -716,7 +724,7 @@ pub const Client = struct {
         var response = try self.executeRequest(&req, reqOpts.timeout_ms, reqOpts.cancellation);
         errdefer response.deinit();
 
-        if (self.config.cookies_enabled) try self.storeCookies(&response);
+        if (cookies_enabled) try self.storeCookies(&response);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.response_fn) |f| {
@@ -799,7 +807,8 @@ pub const Client = struct {
             try req.headers.set(HeaderName.ACCEPT_ENCODING, "gzip, deflate");
         }
 
-        if (self.config.cookies_enabled) try self.attachCookies(&req);
+        const cookies_enabled = requestCookiesEnabled(self.config, reqOpts);
+        if (cookies_enabled) try self.attachCookies(&req);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.request_fn) |f| {
@@ -810,7 +819,7 @@ pub const Client = struct {
         var response = try self.executeRequestToWriter(&req, reqOpts.timeout_ms, writer, progress_cb, progress_ctx, reqOpts.cancellation);
         errdefer response.deinit();
 
-        if (self.config.cookies_enabled) try self.storeCookies(&response);
+        if (cookies_enabled) try self.storeCookies(&response);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.response_fn) |f| {
@@ -3427,6 +3436,12 @@ test "Client hasCookie and cookieCount" {
     try client.setCookie("session", "abc123");
     try std.testing.expectEqual(@as(usize, 1), client.cookieCount());
     try std.testing.expect(client.hasCookie("session"));
+}
+
+test "request cookie override is independent of the shared client default" {
+    try std.testing.expect(requestCookiesEnabled(.{ .cookies_enabled = true }, .{}));
+    try std.testing.expect(!requestCookiesEnabled(.{ .cookies_enabled = true }, .{ .cookies_enabled = false }));
+    try std.testing.expect(requestCookiesEnabled(.{ .cookies_enabled = false }, .{ .cookies_enabled = true }));
 }
 
 test "Client response size limit" {

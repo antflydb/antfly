@@ -3822,17 +3822,18 @@ pub const Node = struct {
         defer model_handle.release();
         const model = model_handle.get();
         var pipeline = model.rerankingPipeline(allocator);
-        const input_tokens = try pipeline.maxInputTokensPerItem(query, documents);
+        var prepared = try pipeline.prepareInputs(query, documents);
+        defer prepared.deinit();
         try validateTextExecutorInvocation(
             executor_contract,
             1,
             documents,
             query.len,
-            input_tokens,
+            prepared.max_input_tokens_per_item,
             documents.len,
             0,
         );
-        const scores = try pipeline.rerank(query, documents);
+        const scores = try pipeline.rerankPrepared(&prepared);
         errdefer allocator.free(scores);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         return scores;
@@ -4007,17 +4008,18 @@ pub const Node = struct {
                 .multi_label = multi_label,
                 .entailment_index = entailment_idx,
             });
-            const input_tokens = try pipeline.maxInputTokensPerItem(texts, labels);
+            var prepared = try pipeline.prepareInputs(texts, labels);
+            defer prepared.deinit();
             try validateTextExecutorInvocation(
                 executor_contract,
                 texts.len,
                 texts,
                 additional_text_bytes,
-                input_tokens,
+                prepared.max_input_tokens_per_item,
                 labels.len,
                 0,
             );
-            const results = try pipeline.classifyBatch(texts, labels);
+            const results = try pipeline.classifyPrepared(&prepared);
             defer {
                 for (results) |item| allocator.free(item);
                 allocator.free(results);
@@ -5881,21 +5883,21 @@ pub const Node = struct {
                 .multi_label = classification_schema.multi_label orelse false,
                 .entailment_index = nliEntailmentIndex(model.manifest.id2label),
             });
-            const input_tokens = try pipeline.maxInputTokensPerItem(texts, classification_schema.labels);
+            var prepared = try pipeline.prepareInputs(texts, classification_schema.labels);
+            defer prepared.deinit();
             try validateTextExecutorInvocation(
                 executor_contract,
                 texts.len,
                 texts,
                 maxTextBytes(classification_schema.labels),
-                input_tokens,
+                prepared.max_input_tokens_per_item,
                 classification_schema.labels.len,
                 schema_json.len,
             );
-            var schema_prompt_tokens: usize = 0;
-            const results = try pipeline.classifyBatchWithPromptTokens(texts, classification_schema.labels, &schema_prompt_tokens);
+            const results = try pipeline.classifyPrepared(&prepared);
             defer freeClassificationBatch(allocator, results);
             try appendExtractionClassificationBatch(alloc, lists, classification_schema, options, results);
-            prompt_tokens = try std.math.add(usize, prompt_tokens, schema_prompt_tokens);
+            prompt_tokens = try std.math.add(usize, prompt_tokens, prepared.prompt_tokens);
         }
 
         const data = try alloc.alloc(extraction_api.ExtractionObject, texts.len);
@@ -6925,19 +6927,16 @@ pub const Node = struct {
         defer model_handle.release();
         const model = model_handle.get();
         var pipeline = model.rerankingPipeline(ctx.allocator);
-        const input_tokens_per_item = pipeline.maxInputTokensPerItem(body.query, body.prompts) catch |err|
+        var prepared = pipeline.prepareInputs(body.query, body.prompts) catch |err|
             return inferenceFailureResponse(ctx, err);
-        validateTextExecutorInvocation(executor_contract, 1, body.prompts, body.query.len, input_tokens_per_item, body.prompts.len, 0) catch |err|
+        defer prepared.deinit();
+        validateTextExecutorInvocation(executor_contract, 1, body.prompts, body.query.len, prepared.max_input_tokens_per_item, body.prompts.len, 0) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
 
-        const scores = pipeline.rerank(body.query, body.prompts) catch |err|
+        const scores = pipeline.rerankPrepared(&prepared) catch |err|
             return inferenceFailureResponse(ctx, err);
         defer ctx.allocator.free(scores);
-
-        const prompt_tokens =
-            (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * body.prompts.len +
-            (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.prompts) catch estimateTextsTokens(body.prompts));
-        return writeRerankScoresResponse(ctx, body.model, scores, prompt_tokens);
+        return writeRerankScoresResponse(ctx, body.model, scores, prepared.prompt_tokens);
     }
 
     pub fn rerankMultimodalPrompts(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -7050,22 +7049,20 @@ pub const Node = struct {
             for (parsed_docs.items, 0..) |doc, idx| flat_texts[idx] = doc.text;
 
             var pipeline = model.rerankingPipeline(ctx.allocator);
-            const input_tokens = pipeline.maxInputTokensPerItem(body.query, flat_texts) catch |err|
+            var prepared = pipeline.prepareInputs(body.query, flat_texts) catch |err|
                 return inferenceFailureResponse(ctx, err);
+            defer prepared.deinit();
             validateInferenceExecutorInvocation(executor_contract, .{
                 .item_count = 1,
                 .text_bytes_per_item = rerank_text_bytes,
-                .input_tokens_per_item = input_tokens,
+                .input_tokens_per_item = prepared.max_input_tokens_per_item,
                 .candidates_per_request = body.documents.len,
                 .has_text = true,
             }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
-            const scores = pipeline.rerank(body.query, flat_texts) catch |err|
+            const scores = pipeline.rerankPrepared(&prepared) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer ctx.allocator.free(scores);
-            const prompt_tokens =
-                (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * flat_texts.len +
-                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), flat_texts) catch estimateTextsTokens(flat_texts));
-            return writeRerankScoresResponse(ctx, body.model, scores, prompt_tokens);
+            return writeRerankScoresResponse(ctx, body.model, scores, prepared.prompt_tokens);
         }
 
         if (!(model.manifest.hasCapability("colqwen") or model.manifest.hasCapability("multimodal_late_interaction"))) {
@@ -9297,6 +9294,20 @@ pub const Node = struct {
         }
     };
 
+    const PreparedGenerateBatchModel = struct {
+        requested_model: []u8,
+        model_path: []const u8,
+        manifest: manifest_mod.ModelManifest,
+        executor_contract: ResolvedInferenceExecutorContract,
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            allocator.free(self.requested_model);
+            allocator.free(self.model_path);
+            self.manifest.deinit();
+            self.* = undefined;
+        }
+    };
+
     const BatchExecutionMode = enum {
         /// NativeCompute is cheap request state over a shared, internally
         /// synchronized weight store. Give each item its own instance so task
@@ -9441,6 +9452,20 @@ pub const Node = struct {
         const item_encoded_media_bytes = try ctx.allocator.alloc(usize, body.requests.len);
         defer ctx.allocator.free(item_encoded_media_bytes);
         @memset(item_encoded_media_bytes, 0);
+        const item_decoded_pixels = try ctx.allocator.alloc(u64, body.requests.len);
+        defer ctx.allocator.free(item_decoded_pixels);
+        @memset(item_decoded_pixels, 0);
+        const prompt_estimates = try ctx.allocator.alloc(?NativePromptEstimate, body.requests.len);
+        @memset(prompt_estimates, null);
+        defer {
+            for (prompt_estimates) |*estimate| if (estimate.*) |*owned| owned.deinit();
+            ctx.allocator.free(prompt_estimates);
+        }
+        var prepared_models = std.ArrayListUnmanaged(PreparedGenerateBatchModel).empty;
+        defer {
+            for (prepared_models.items) |*prepared| prepared.deinit(ctx.allocator);
+            prepared_models.deinit(ctx.allocator);
+        }
 
         for (body.requests, 0..) |item, idx| {
             results[idx] = .{
@@ -9461,46 +9486,71 @@ pub const Node = struct {
         // the parser's allocation boundary from a stricter model byte ceiling.
         for (body.requests, 0..) |item, idx| {
             if (!pending[idx]) continue;
-            const model_path = self.resolveRequestModelPath(
-                ctx.allocator,
-                ctx.io,
-                item.body.model,
-                "generators",
-            ) catch |err| {
-                results[idx].@"error" = switch (requestModelResolutionErrorKind(err)) {
-                    .invalid => .{ .code = "INVALID_REQUEST", .message = "model must be a relative identifier within models_dir", .retryable = false },
-                    .missing => .{ .code = "MODEL_NOT_FOUND", .message = "model not found", .retryable = false },
-                    .internal => .{ .code = "MODEL_RESOLUTION_FAILED", .message = internalErrorMessage("MODEL_RESOLUTION_FAILED", err), .retryable = true },
+            var prepared_model: ?*PreparedGenerateBatchModel = null;
+            for (prepared_models.items) |*prepared| {
+                if (std.mem.eql(u8, prepared.requested_model, item.body.model)) {
+                    prepared_model = prepared;
+                    break;
+                }
+            }
+            if (prepared_model == null) {
+                const model_path = self.resolveRequestModelPath(
+                    ctx.allocator,
+                    ctx.io,
+                    item.body.model,
+                    "generators",
+                ) catch |err| {
+                    results[idx].@"error" = switch (requestModelResolutionErrorKind(err)) {
+                        .invalid => .{ .code = "INVALID_REQUEST", .message = "model must be a relative identifier within models_dir", .retryable = false },
+                        .missing => .{ .code = "MODEL_NOT_FOUND", .message = "model not found", .retryable = false },
+                        .internal => .{ .code = "MODEL_RESOLUTION_FAILED", .message = internalErrorMessage("MODEL_RESOLUTION_FAILED", err), .retryable = true },
+                    };
+                    pending[idx] = false;
+                    continue;
                 };
-                pending[idx] = false;
-                continue;
-            };
-            defer ctx.allocator.free(model_path);
-            var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err| {
-                results[idx].@"error" = batchModelLoadError(err);
-                pending[idx] = false;
-                continue;
-            };
-            defer admission_manifest.deinit();
-            const executor_contract = resolvedGenerateExecutorContract(self, &admission_manifest) catch |err| {
-                results[idx].@"error" = generateExecutorContractError(err).batch;
-                pending[idx] = false;
-                continue;
-            };
-            const item_media_shape = generateRequestMediaShape(item.body);
+                var model_path_owned = true;
+                defer if (model_path_owned) ctx.allocator.free(model_path);
+                var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err| {
+                    results[idx].@"error" = batchModelLoadError(err);
+                    pending[idx] = false;
+                    continue;
+                };
+                var manifest_owned = true;
+                defer if (manifest_owned) admission_manifest.deinit();
+                const executor_contract = resolvedGenerateExecutorContract(self, &admission_manifest) catch |err| {
+                    results[idx].@"error" = generateExecutorContractError(err).batch;
+                    pending[idx] = false;
+                    continue;
+                };
+                const requested_model = try ctx.allocator.dupe(u8, item.body.model);
+                errdefer ctx.allocator.free(requested_model);
+                try prepared_models.append(ctx.allocator, .{
+                    .requested_model = requested_model,
+                    .model_path = model_path,
+                    .manifest = admission_manifest,
+                    .executor_contract = executor_contract,
+                });
+                model_path_owned = false;
+                manifest_owned = false;
+                prepared_model = &prepared_models.items[prepared_models.items.len - 1];
+            }
+            // This manifest is intentionally provisional: use it to reject
+            // raw envelopes that are already known to exceed model limits
+            // before base64/download allocation, then revalidate against the
+            // exact loaded model generation before execution.
+            const media_shape = generateRequestMediaShape(item.body);
             const max_tokens: usize = if (item.body.max_tokens) |value| @intCast(value) else 256;
-            validateGenerateExecutorInvocation(executor_contract, .{
+            validateGenerateExecutorInvocation(prepared_model.?.executor_contract, .{
                 .text_bytes_per_item = estimateGenerateRequestTextBytes(item.body),
                 .has_text = true,
                 .output_tokens_per_item = max_tokens,
-                .encoded_media_bytes = item_media_shape.inline_bytes +| item_media_shape.borrowed_bytes,
-                .media_parts_per_item = item_media_shape.media_count,
-                .has_image = item_media_shape.image_count > 0,
-                .has_audio = item_media_shape.has_audio,
+                .encoded_media_bytes = media_shape.inline_bytes +| media_shape.borrowed_bytes,
+                .media_parts_per_item = media_shape.media_count,
+                .has_image = media_shape.image_count > 0,
+                .has_audio = media_shape.has_audio,
             }) catch |err| {
                 results[idx].@"error" = generateExecutorContractError(err).batch;
                 pending[idx] = false;
-                continue;
             };
         }
 
@@ -9560,6 +9610,45 @@ pub const Node = struct {
         if (try self.growSlotUnits(ctx, reserved_units, decoded_required_units)) |resp| return resp;
         reserved_units = @max(reserved_units, decoded_required_units);
 
+        // The directory manifest is a provisional optimization boundary, not
+        // the final authority: reject work it already proves invalid before a
+        // costly model load, then repeat the same validation against the exact
+        // loaded model generation below to close publication races.
+        for (body.requests, 0..) |item, idx| {
+            if (!pending[idx]) continue;
+            const prepared_model = blk: {
+                for (prepared_models.items) |*prepared| {
+                    if (std.mem.eql(u8, prepared.requested_model, item.body.model)) break :blk prepared;
+                }
+                return error.InvalidInferenceCapabilities;
+            };
+            const pixels = measureGenerateDecodedImages(
+                &prepared_model.manifest,
+                owned_messages[idx].decoded_images,
+            ) catch |err| {
+                results[idx].@"error" = generateExecutorContractError(err).batch;
+                pending[idx] = false;
+                continue;
+            };
+            const item_media_shape = generateRequestMediaShape(item.body);
+            const max_tokens: usize = if (item.body.max_tokens) |value| @intCast(value) else 256;
+            validateGenerateExecutorInvocation(prepared_model.executor_contract, .{
+                .text_bytes_per_item = self.estimateGeneratePromptBytes(owned_messages[idx].messages),
+                .has_text = true,
+                .output_tokens_per_item = max_tokens,
+                .encoded_media_bytes = item_encoded_media_bytes[idx],
+                .decoded_pixels = pixels,
+                .media_parts_per_item = item_media_shape.media_count,
+                .has_image = owned_messages[idx].decoded_images.len > 0,
+                .has_audio = owned_messages[idx].decoded_audio.len > 0,
+            }) catch |err| {
+                results[idx].@"error" = generateExecutorContractError(err).batch;
+                pending[idx] = false;
+                continue;
+            };
+            item_decoded_pixels[idx] = pixels;
+        }
+
         while (true) {
             const first_idx = blk: {
                 for (pending, 0..) |is_pending, idx| {
@@ -9568,16 +9657,16 @@ pub const Node = struct {
                 break :blk null;
             } orelse break;
             const first_body = body.requests[first_idx].body;
-            const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, first_body.model, "generators") catch |err| {
-                results[first_idx].@"error" = switch (requestModelResolutionErrorKind(err)) {
-                    .invalid => .{ .code = "INVALID_REQUEST", .message = "model must be a relative identifier within models_dir", .retryable = false },
-                    .missing => .{ .code = "MODEL_NOT_FOUND", .message = "model not found", .retryable = false },
-                    .internal => .{ .code = "MODEL_RESOLUTION_FAILED", .message = internalErrorMessage("MODEL_RESOLUTION_FAILED", err), .retryable = true },
-                };
-                pending[first_idx] = false;
-                continue;
+            const prepared_model = blk: {
+                for (prepared_models.items) |*prepared| {
+                    if (std.mem.eql(u8, prepared.requested_model, first_body.model)) break :blk prepared;
+                }
+                // A pending item passed the contract preflight above, so its
+                // immutable prepared model group must still be present.
+                return error.InvalidInferenceCapabilities;
             };
-            defer ctx.allocator.free(model_path);
+            const model_path = prepared_model.model_path;
+            const provisional_contract = prepared_model.executor_contract;
             const selection = parseGenerateBackendSelection(first_body.backend, first_body.mode, first_body.compiled_target) catch {
                 results[first_idx].@"error" = .{ .code = "INVALID_REQUEST", .message = "unsupported backend", .retryable = false };
                 pending[first_idx] = false;
@@ -9597,23 +9686,6 @@ pub const Node = struct {
                 try group_indices.append(ctx.allocator, idx);
             }
 
-            var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err| {
-                for (group_indices.items) |idx| {
-                    results[idx].@"error" = batchModelLoadError(err);
-                    pending[idx] = false;
-                }
-                continue;
-            };
-            defer admission_manifest.deinit();
-            const executor_contract = resolvedGenerateExecutorContract(self, &admission_manifest) catch |err| {
-                const failure = generateExecutorContractError(err).batch;
-                for (group_indices.items) |idx| {
-                    results[idx].@"error" = failure;
-                    pending[idx] = false;
-                }
-                continue;
-            };
-
             // Build the largest valid model-contract window. Invalid singleton
             // items receive an exact per-item failure; otherwise the remaining
             // compatible items stay pending for the next bounded window.
@@ -9621,42 +9693,15 @@ pub const Node = struct {
             var group_encoded_bytes: usize = 0;
             var group_decoded_pixels: u64 = 0;
             for (group_indices.items) |idx| {
-                if (admitted_group_len == executor_contract.batch.max_items) break;
-                const item_media_shape = generateRequestMediaShape(body.requests[idx].body);
-                const item_pixels = measureGenerateDecodedImages(
-                    &admission_manifest,
-                    owned_messages[idx].decoded_images,
-                ) catch |err| {
-                    results[idx].@"error" = generateExecutorContractError(err).batch;
-                    pending[idx] = false;
-                    continue;
-                };
-                const max_tokens: usize = if (body.requests[idx].body.max_tokens) |value|
-                    @intCast(value)
-                else
-                    256;
-                validateGenerateExecutorInvocation(executor_contract, .{
-                    .text_bytes_per_item = self.estimateGeneratePromptBytes(owned_messages[idx].messages),
-                    .has_text = true,
-                    .output_tokens_per_item = max_tokens,
-                    .encoded_media_bytes = item_encoded_media_bytes[idx],
-                    .decoded_pixels = item_pixels,
-                    .media_parts_per_item = item_media_shape.media_count,
-                    .has_image = owned_messages[idx].decoded_images.len > 0,
-                    .has_audio = owned_messages[idx].decoded_audio.len > 0,
-                }) catch |err| {
-                    results[idx].@"error" = generateExecutorContractError(err).batch;
-                    pending[idx] = false;
-                    continue;
-                };
+                if (admitted_group_len == provisional_contract.batch.max_items) break;
                 const next_encoded = std.math.add(usize, group_encoded_bytes, item_encoded_media_bytes[idx]) catch
                     std.math.maxInt(usize);
-                const next_pixels = std.math.add(u64, group_decoded_pixels, item_pixels) catch
+                const next_pixels = std.math.add(u64, group_decoded_pixels, item_decoded_pixels[idx]) catch
                     std.math.maxInt(u64);
                 if (admitted_group_len > 0 and
-                    (next_encoded > executor_contract.batch.max_encoded_media_bytes or
-                        (executor_contract.batch.max_decoded_pixels != null and
-                            next_pixels > executor_contract.batch.max_decoded_pixels.?)))
+                    (next_encoded > provisional_contract.batch.max_encoded_media_bytes or
+                        (provisional_contract.batch.max_decoded_pixels != null and
+                            next_pixels > provisional_contract.batch.max_decoded_pixels.?)))
                 {
                     break;
                 }
@@ -9712,6 +9757,73 @@ pub const Node = struct {
 
             {
                 defer model_handle.release();
+
+                // Bind validation to the exact artifact generation owned by
+                // this handle. Compact the provisional window in place; items
+                // beyond an authoritative batch/resource boundary remain
+                // pending for a later window, while invalid singleton items
+                // receive their own stable error.
+                const executor_contract = resolvedGenerateExecutorContract(self, &model.manifest) catch |err| {
+                    for (group_indices.items) |idx| {
+                        results[idx].@"error" = generateExecutorContractError(err).batch;
+                        pending[idx] = false;
+                    }
+                    continue;
+                };
+                admitted_group_len = 0;
+                group_encoded_bytes = 0;
+                group_decoded_pixels = 0;
+                for (group_indices.items) |idx| {
+                    if (admitted_group_len == executor_contract.batch.max_items) break;
+                    const item_media_shape = generateRequestMediaShape(body.requests[idx].body);
+                    const item_pixels = measureGenerateDecodedImages(
+                        &model.manifest,
+                        owned_messages[idx].decoded_images,
+                    ) catch |err| {
+                        results[idx].@"error" = generateExecutorContractError(err).batch;
+                        pending[idx] = false;
+                        continue;
+                    };
+                    const max_tokens: usize = if (body.requests[idx].body.max_tokens) |value|
+                        @intCast(value)
+                    else
+                        256;
+                    validateGenerateExecutorInvocation(executor_contract, .{
+                        .text_bytes_per_item = self.estimateGeneratePromptBytes(owned_messages[idx].messages),
+                        .has_text = true,
+                        .output_tokens_per_item = max_tokens,
+                        .encoded_media_bytes = item_encoded_media_bytes[idx],
+                        .decoded_pixels = item_pixels,
+                        .media_parts_per_item = item_media_shape.media_count,
+                        .has_image = owned_messages[idx].decoded_images.len > 0,
+                        .has_audio = owned_messages[idx].decoded_audio.len > 0,
+                    }) catch |err| {
+                        results[idx].@"error" = generateExecutorContractError(err).batch;
+                        pending[idx] = false;
+                        continue;
+                    };
+                    const next_encoded = std.math.add(usize, group_encoded_bytes, item_encoded_media_bytes[idx]) catch
+                        std.math.maxInt(usize);
+                    const next_pixels = std.math.add(u64, group_decoded_pixels, item_pixels) catch
+                        std.math.maxInt(u64);
+                    if (admitted_group_len > 0 and
+                        (next_encoded > executor_contract.batch.max_encoded_media_bytes or
+                            (executor_contract.batch.max_decoded_pixels != null and
+                                next_pixels > executor_contract.batch.max_decoded_pixels.?)))
+                    {
+                        break;
+                    }
+                    group_indices.items[admitted_group_len] = idx;
+                    admitted_group_len += 1;
+                    group_encoded_bytes = next_encoded;
+                    group_decoded_pixels = next_pixels;
+                }
+                group_indices.items.len = admitted_group_len;
+                if (admitted_group_len == 0) continue;
+                defer for (group_indices.items) |idx| {
+                    if (prompt_estimates[idx]) |*estimate| estimate.deinit();
+                    prompt_estimates[idx] = null;
+                };
 
                 const gpt_config = session_factory.getGptConfig(model.session) orelse {
                     for (group_indices.items) |idx| {
@@ -9787,7 +9899,7 @@ pub const Node = struct {
                         configs[pos].max_tokens,
                         if (configs[pos].speculation_requested and configs[pos].speculation_policy != .off and configs[pos].speculative_k > 0) 1 else 0,
                         configs[pos].enable_thinking,
-                        null,
+                        &prompt_estimates[idx],
                     ) catch |err| {
                         results[idx].@"error" = if (err == error.PromptTooLong)
                             .{
@@ -10209,6 +10321,12 @@ pub const Node = struct {
                             .add_bos_token = model.manifest.add_bos_token,
                             .bos_token = model.manifest.bos_token,
                             .chat_template = model.chat_tmpl,
+                            .preformatted_prompt = if (prompt_estimates[idx]) |estimate| estimate.prompt else null,
+                            .pre_encoded_prompt = if (prompt_estimates[idx]) |estimate| .{
+                                .ids = estimate.encoded.ids,
+                                .attention_mask = estimate.encoded.attention_mask,
+                                .prompt_token_limit = estimate.prompt_token_limit,
+                            } else null,
                             .print_timing = serverGenerateTimingEnabled(),
                             .model_dir = model_path,
                             .gguf_projector_path = model.manifest.gguf_projector_path,
@@ -12597,23 +12715,23 @@ pub const Node = struct {
                 .multi_label = schema.multi_label orelse false,
                 .entailment_index = nliEntailmentIndex(model.manifest.id2label),
             });
-            const input_tokens = pipeline.maxInputTokensPerItem(texts, schema.labels) catch |err|
+            var prepared = pipeline.prepareInputs(texts, schema.labels) catch |err|
                 return inferenceFailureResponse(ctx, err);
+            defer prepared.deinit();
             validateTextExecutorInvocation(
                 executor_contract,
                 texts.len,
                 texts,
                 maxTextBytes(schema.labels),
-                input_tokens,
+                prepared.max_input_tokens_per_item,
                 schema.labels.len,
                 schema_json.len,
             ) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
-            var schema_prompt_tokens: usize = 0;
-            const results = pipeline.classifyBatchWithPromptTokens(texts, schema.labels, &schema_prompt_tokens) catch |err|
+            const results = pipeline.classifyPrepared(&prepared) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer freeClassificationBatch(ctx.allocator, results);
             try appendExtractionClassificationBatch(alloc, lists, schema, options, results);
-            prompt_tokens = std.math.add(usize, prompt_tokens, schema_prompt_tokens) catch
+            prompt_tokens = std.math.add(usize, prompt_tokens, prepared.prompt_tokens) catch
                 return inferenceFailureResponse(ctx, error.ResourceLimitExceeded);
         }
 

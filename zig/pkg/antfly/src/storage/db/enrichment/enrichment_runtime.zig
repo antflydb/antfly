@@ -53,6 +53,7 @@ const chunking_types_mod = @import("../../../chunking/types.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const ownership_mod = @import("../ownership.zig");
+const lease_mod = @import("../lease.zig");
 const types = @import("../types.zig");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
@@ -5839,6 +5840,11 @@ fn processDocumentExtractionAsset(
     const from_generation = if (existing_manifest) |value| try documentExtractionManifestGeneration(runtime.alloc, value) else 0;
     const to_generation = from_generation + 1;
 
+    // A prior owner may have crashed after spilling finalized units. Scavenge
+    // under the current lease epoch before either fingerprint fast path so an
+    // unchanged document cannot strand private rows forever.
+    try clearRuntimeDocumentUnitSpoolAttempts(runtime, request.doc_key, artifact_name);
+
     const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(runtime.alloc, source_url, config_json, config);
     defer if (metadata_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
     if (metadata_fingerprint) |fingerprint| {
@@ -5927,7 +5933,8 @@ fn processDocumentExtractionAsset(
         },
     };
     var downloaded_mut = downloaded;
-    defer downloaded_mut.deinit(download_alloc);
+    var downloaded_live = true;
+    defer if (downloaded_live) downloaded_mut.deinit(download_alloc);
     if (download_budgeted != null) {
         resource_tracker.setExternallyAccountedDownloadedBytes(downloaded_mut.data.len);
     } else {
@@ -5962,6 +5969,13 @@ fn processDocumentExtractionAsset(
     const collection_alloc = if (collection_budgeted) |*allocator| allocator.allocator() else runtime.alloc;
 
     const source_is_pdf = document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data);
+    // Any remote asset producer (PDF/image OCR, audio transcription, or a
+    // future document transform) can exceed the ordinary lease TTL. Keep the
+    // current tenure alive through materialization and publication;
+    // transaction fences below remain the final authority if renewal is lost.
+    var extraction_lease_guard = RuntimeLeaseHeartbeatGuard.init(runtime);
+    try extraction_lease_guard.start();
+    defer extraction_lease_guard.stop();
     var pdf_output_budgeted: ?resource_manager_mod.BudgetedAllocator = if (source_is_pdf and resource_tracker.manager != null)
         resource_manager_mod.BudgetedAllocator.init(resource_tracker.manager.?, .document_extraction_working_set, runtime.alloc, 1)
     else
@@ -6029,23 +6043,35 @@ fn processDocumentExtractionAsset(
     defer unit_text_lengths.deinit(collection_alloc);
     var generated_units = RuntimeGeneratedUnitCache{};
     defer generated_units.deinit(collection_alloc);
-    const extraction_attempt_id = if (source_is_pdf)
-        try std.fmt.allocPrint(collection_alloc, "{d}:{s}", .{ to_generation, source_fingerprint })
-    else
-        null;
-    defer if (extraction_attempt_id) |attempt_id| collection_alloc.free(attempt_id);
-    var unit_spool: ?RuntimeDocumentUnitSpool = if (extraction_attempt_id) |attempt_id|
+    const extraction_attempt_id = try std.fmt.allocPrint(collection_alloc, "{d}:{s}:{d}:{d}", .{
+        to_generation,
+        source_fingerprint,
+        if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0,
+        runtime.activity_epoch,
+    });
+    defer collection_alloc.free(extraction_attempt_id);
+    var unit_spool: ?RuntimeDocumentUnitSpool = if (source_is_pdf)
         try RuntimeDocumentUnitSpool.init(
+            runtime,
             &runtime.store,
             runtime.alloc,
             collection_alloc,
             request.doc_key,
             artifact_name,
-            attempt_id,
+            extraction_attempt_id,
         )
     else
         null;
     defer if (unit_spool) |*spool| spool.deinit();
+    var publication_spool = try RuntimeDocumentPublicationSpool.init(
+        runtime,
+        &runtime.store,
+        runtime.alloc,
+        request.doc_key,
+        artifact_name,
+        extraction_attempt_id,
+    );
+    defer publication_spool.deinit();
 
     var collect_ctx = RuntimeDocumentExtractionCollectContext{
         .runtime = runtime,
@@ -6127,6 +6153,12 @@ fn processDocumentExtractionAsset(
     // The streaming extractor has released its last borrowed unit. Retained
     // collection allocations remain independently charged by collection_alloc.
     try resource_tracker.setBytes(resource_tracker.locallyAccountedDownloadedBytes());
+    if (source_is_pdf) {
+        collect_ctx.source_bytes = &.{};
+        downloaded_mut.deinit(download_alloc);
+        downloaded_live = false;
+        try resource_tracker.releaseDownloadedBytes();
+    }
 
     const desired_unit_descriptors = documentExtractionUnitDescriptorsFromKeysAlloc(collection_alloc, desired_unit_keys.items, desired_unit_fingerprints.items) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
@@ -6212,14 +6244,10 @@ fn processDocumentExtractionAsset(
         for (previous_state.unit_keys) |previous_key| {
             if (runtimeContainsConstKey(desired_unit_keys.items, previous_key)) continue;
             try appendUniqueOwnedRuntimeKey([]const u8, &resource_tracker, runtime.alloc, &deletes, previous_key);
-            try appendUniqueOwnedRuntimeKey([]u8, &resource_tracker, runtime.alloc, &window.changed_artifact_keys, previous_key);
-            try appendUniqueOwnedRuntimeKey([]u8, &resource_tracker, runtime.alloc, &window.deleted_keys, previous_key);
         }
         for (previous_state.chunk_keys) |previous_key| {
             if (runtimeContainsConstKey(desired_chunk_keys.items, previous_key)) continue;
             try appendUniqueOwnedRuntimeKey([]const u8, &resource_tracker, runtime.alloc, &deletes, previous_key);
-            try appendUniqueOwnedRuntimeKey([]u8, &resource_tracker, runtime.alloc, &window.changed_artifact_keys, previous_key);
-            try appendUniqueOwnedRuntimeKey([]u8, &resource_tracker, runtime.alloc, &window.deleted_keys, previous_key);
         }
         try appendRuntimeObsoleteNavigationBlockDeletes(
             runtime.alloc,
@@ -6232,75 +6260,26 @@ fn processDocumentExtractionAsset(
     }
 
     const empty_units: [0]document_extraction_mod.Unit = .{};
-    var ocr_failed_page_numbers = std.ArrayListUnmanaged(u32).empty;
-    defer ocr_failed_page_numbers.deinit(runtime.alloc);
-    var ocr_failure_details = std.ArrayListUnmanaged(document_extraction_mod.OcrFailureDetail).empty;
-    defer ocr_failure_details.deinit(runtime.alloc);
-    var ocr_attempted_count: usize = 0;
-    var ocr_selected_count: usize = 0;
-    var ocr_retained_embedded_count: usize = 0;
-    var ocr_failed_count: usize = 0;
-    for (generated_units.entries.items) |entry| {
-        const unit = entry.unit;
-        if (!unit.ocr_attempted) continue;
-        ocr_attempted_count += 1;
-        if (unit.ocr_used) ocr_selected_count += 1;
-        if (unit.extraction_status) |status| {
-            if (std.mem.eql(u8, status, "completed_embedded_preferred")) ocr_retained_embedded_count += 1;
-            if (std.mem.eql(u8, status, "failed_ocr")) {
-                ocr_failed_count += 1;
-                if (ocr_failed_page_numbers.items.len < 32) if (unit.page_number) |page| try ocr_failed_page_numbers.append(runtime.alloc, page);
-                if (ocr_failure_details.items.len < 32) try ocr_failure_details.append(runtime.alloc, .{
-                    .page_number = unit.page_number,
-                    .unit_id = unit.unit_id,
-                    .retained_method = unit.method,
-                    .error_message = unit.extraction_warning orelse "OCR failed without a recorded cause",
-                    .failure_stage = unit.ocr_failure_stage,
-                    .retryable = unit.ocr_failure_retryable orelse false,
-                });
-            }
-        }
+    const ocr_failure_details = try collection_alloc.alloc(
+        document_extraction_mod.OcrFailureDetail,
+        collect_ctx.ocr_failure_summaries.items.len,
+    );
+    defer collection_alloc.free(ocr_failure_details);
+    for (collect_ctx.ocr_failure_summaries.items, 0..) |*summary, index| {
+        ocr_failure_details[index] = summary.borrowed();
     }
     const streamed_extraction = document_extraction_mod.Result{
         .content_type = collect_ctx.info.content_type,
         .route_type = collect_ctx.info.route_type,
         .unsupported_reason = collect_ctx.info.unsupported_reason,
         .units = @constCast(empty_units[0..]),
-        .ocr_attempted_count = ocr_attempted_count,
-        .ocr_selected_count = ocr_selected_count,
-        .ocr_retained_embedded_count = ocr_retained_embedded_count,
-        .ocr_failed_count = ocr_failed_count,
-        .ocr_failed_page_numbers = ocr_failed_page_numbers.items,
-        .ocr_failure_details = ocr_failure_details.items,
+        .ocr_attempted_count = collect_ctx.ocr_attempted_count,
+        .ocr_selected_count = collect_ctx.ocr_selected_count,
+        .ocr_retained_embedded_count = collect_ctx.ocr_retained_embedded_count,
+        .ocr_failed_count = collect_ctx.ocr_failed_count,
+        .ocr_failed_page_numbers = collect_ctx.ocr_failed_page_numbers.items,
+        .ocr_failure_details = ocr_failure_details,
     };
-
-    const in_progress_manifest = try documentExtractionManifestPayloadAlloc(
-        runtime.alloc,
-        request.doc_key,
-        artifact_name,
-        source_url,
-        source_fingerprint,
-        streamed_extraction,
-        unit_text_lengths.items,
-        desired_unit_keys.items,
-        desired_unit_descriptors,
-        desired_chunk_keys.items,
-        previous_child_ranges,
-        previous_state.unit_keys,
-        previous_state.unit_descriptors,
-        previous_state.chunk_keys,
-        &.{},
-        from_generation,
-        from_generation,
-        to_generation,
-        "in_progress",
-        null,
-    );
-    defer runtime.alloc.free(in_progress_manifest);
-    const in_progress_key = try runtime.alloc.dupe(u8, manifest_key);
-    defer runtime.alloc.free(in_progress_key);
-    const in_progress_writes = [_]KVPair{.{ .key = in_progress_key, .value = in_progress_manifest }};
-    try storePutBatchWithRetry(runtime, in_progress_writes[0..], &.{});
 
     const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, request.full_text_index);
     defer {
@@ -6326,9 +6305,9 @@ fn processDocumentExtractionAsset(
         .deletes = &deletes,
         .window = window,
         .max_window_items = max_window_items,
+        .publication_spool = &publication_spool,
         .resource_tracker = &resource_tracker,
-        .generated_units = &generated_units,
-        .mode = .store_artifacts,
+        .generated_units = if (unit_spool == null) &generated_units else null,
         .unit_alloc = runtime.alloc,
     };
     store_ctx.pdf_inspection_reserved = unit_spool != null;
@@ -6367,7 +6346,10 @@ fn processDocumentExtractionAsset(
     if (!source_is_pdf) try resource_tracker.releasePdfOperation();
     config.pdf_decode_limits = configured_pdf_decode_limits;
     config.pdf_render_max_inflight_bytes = configured_pdf_render_inflight_bytes;
-    try flushRuntimeKVBatchAndClear(runtime, &writes, &deletes);
+    // No final artifact or search mutation has occurred above. Freeze the
+    // complete attempt-private publication plan only after every unit and
+    // chunk has materialized successfully.
+    try publication_spool.seal();
 
     const manifest = try documentExtractionManifestPayloadAlloc(
         runtime.alloc,
@@ -6392,14 +6374,9 @@ fn processDocumentExtractionAsset(
         null,
     );
     defer runtime.alloc.free(manifest);
-    try writes.append(runtime.alloc, .{
-        .key = try runtime.alloc.dupe(u8, manifest_key),
-        .value = try runtime.alloc.dupe(u8, manifest),
-    });
-    // Publish the converged manifest, navigation index, and extraction state
-    // in one atomic store batch. Readers reject the preceding in-progress
-    // manifest, so they can observe either the old revision or the complete
-    // new revision, never a hybrid of the two.
+    // Stage generation metadata behind the same publication boundary. The
+    // manifest follows its navigation/state rows, so readers cannot observe
+    // it before the metadata needed to interpret that generation is present.
     try appendRuntimeDocumentExtractionNavigationWrites(
         runtime.alloc,
         request.doc_key,
@@ -6414,59 +6391,39 @@ fn processDocumentExtractionAsset(
         .key = try runtime.alloc.dupe(u8, state_key),
         .value = try runtime.alloc.dupe(u8, new_state),
     });
-    try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
-
-    try storePutBatchWithRetry(runtime, writes.items, deletes.items);
-    recordArtifactBytes(runtime, .asset, manifest.len);
+    for (writes.items) |write| {
+        try publication_spool.stageUpsert(write.key, write.value, &.{}, false);
+    }
+    for (writes.items) |write| {
+        runtime.alloc.free(@constCast(write.key));
+        runtime.alloc.free(@constCast(write.value));
+    }
+    writes.clearRetainingCapacity();
+    try publication_spool.stageUpsert(manifest_key, manifest, &.{}, true);
+    for (deletes.items) |key| {
+        const publishes_change = runtimeContainsConstKey(previous_state.unit_keys, key) or
+            runtimeContainsConstKey(previous_state.chunk_keys, key);
+        try publication_spool.stageDelete(key, publishes_change);
+    }
     clearRuntimeKVBatch(runtime, &writes, &deletes);
+    try publication_spool.seal();
 
-    var replay_ctx = RuntimeDocumentExtractionMaterializeContext{
-        .runtime = runtime,
-        .config = config,
-        .source_url = source_url,
-        .doc_key = request.doc_key,
-        .artifact_name = artifact_name,
-        .info = collect_ctx.info,
-        .desired_unit_keys = desired_unit_keys.items,
-        .desired_unit_descriptors = desired_unit_descriptors,
-        .desired_chunk_keys = desired_chunk_keys.items,
-        .unit_text_lengths = unit_text_lengths.items,
-        .previous_child_ranges = previous_child_ranges,
-        .text_indexes = text_indexes,
-        .writes = &writes,
-        .deletes = &deletes,
-        .window = window,
-        .max_window_items = max_window_items,
-        .resource_tracker = &resource_tracker,
-        .generated_units = &generated_units,
-        .mode = .publish_replay,
-        .unit_alloc = runtime.alloc,
-    };
-    replay_ctx.pdf_inspection_reserved = unit_spool != null;
-    const replay_extraction_result = if (unit_spool) |*spool|
-        spool.replay(collect_ctx.info.streamInfo(), replay_ctx.sink(), &resource_tracker)
-    else
-        document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, replay_ctx.sink());
-    replay_extraction_result catch |raw_err| {
-        if (!source_is_pdf) try resource_tracker.releasePdfOperation();
-        config.pdf_decode_limits = configured_pdf_decode_limits;
-        config.pdf_render_max_inflight_bytes = configured_pdf_render_inflight_bytes;
-        return if (raw_err == error.OutOfMemory and pdf_inspection_reservation.limit_exceeded)
-            error.DocumentExtractionWorkingSetTooLarge
-        else
-            raw_err;
-    };
-    try resource_tracker.releasePdfOperation();
-    config.pdf_decode_limits = configured_pdf_decode_limits;
-    config.pdf_render_max_inflight_bytes = configured_pdf_render_inflight_bytes;
+    // Each replay window atomically promotes its staged artifacts and appends
+    // matching derived/outbox records. Private record reads are closed before
+    // the generated writer begins, preserving LMDB's one-transaction-per-
+    // thread constraint.
+    try extraction_lease_guard.check();
+    try publication_spool.replay(runtime, window, max_window_items, &resource_tracker);
+    try flushGeneratedReplayWindow(runtime, window);
+    recordArtifactBytes(runtime, .asset, manifest.len);
     // A successful extraction can legitimately produce no chunk artifacts (for
     // example, an image-only PDF whose OCR output is rejected as trivial). No
     // downstream chunk or embedding request will exist to close coverage for
-    // that source, so make the final outcome explicit here.
+    // that source, so make the final outcome explicit after publication.
     if (desired_chunk_keys.items.len == 0) {
         try finalizeEmptyDocumentExtractionCoverage(runtime, window, request, manifest);
+        try flushGeneratedReplayWindow(runtime, window);
     }
-    try flushGeneratedReplayWindow(runtime, window);
 }
 
 fn writeDocumentExtractionFailureManifest(
@@ -8681,6 +8638,53 @@ const RuntimeGeneratedUnitCache = struct {
     }
 };
 
+const RuntimeOcrFailureSummary = struct {
+    page_number: ?u32,
+    unit_id: []const u8,
+    retained_method: []const u8,
+    error_message: []const u8,
+    failure_stage: ?[]const u8,
+    retryable: bool,
+
+    fn initClone(alloc: Allocator, unit: document_extraction_mod.Unit) !@This() {
+        const unit_id = try alloc.dupe(u8, unit.unit_id);
+        errdefer alloc.free(unit_id);
+        const retained_method = try alloc.dupe(u8, unit.method);
+        errdefer alloc.free(retained_method);
+        const error_message = try alloc.dupe(u8, unit.extraction_warning orelse "OCR failed without a recorded cause");
+        errdefer alloc.free(error_message);
+        const failure_stage = if (unit.ocr_failure_stage) |stage| try alloc.dupe(u8, stage) else null;
+        errdefer if (failure_stage) |stage| alloc.free(stage);
+        return .{
+            .page_number = unit.page_number,
+            .unit_id = unit_id,
+            .retained_method = retained_method,
+            .error_message = error_message,
+            .failure_stage = failure_stage,
+            .retryable = unit.ocr_failure_retryable orelse false,
+        };
+    }
+
+    fn borrowed(self: *const @This()) document_extraction_mod.OcrFailureDetail {
+        return .{
+            .page_number = self.page_number,
+            .unit_id = self.unit_id,
+            .retained_method = self.retained_method,
+            .error_message = self.error_message,
+            .failure_stage = self.failure_stage,
+            .retryable = self.retryable,
+        };
+    }
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(@constCast(self.unit_id));
+        alloc.free(@constCast(self.retained_method));
+        alloc.free(@constCast(self.error_message));
+        if (self.failure_stage) |stage| alloc.free(@constCast(stage));
+        self.* = undefined;
+    }
+};
+
 fn runtimeGeneratedUnitCacheEntryBytes(entry: RuntimeGeneratedUnitCacheEntry) usize {
     return addUsizeSaturating(entry.unit_id.len, runtimeDocumentExtractionUnitOwnedBytes(entry.unit));
 }
@@ -8835,8 +8839,19 @@ const RuntimeDocumentExtractionCollectContext = struct {
     /// allocator whose complete ceiling is atomically reserved.
     pdf_inspection_reserved: bool = false,
     pending_generated_units: std.ArrayListUnmanaged(document_extraction_mod.Unit) = .empty,
+    /// True for slots that require model-generated text. Non-generated slots
+    /// may remain between candidates so a mixed born-digital/scanned window
+    /// still reaches a useful model batch while finalization stays ordered.
+    pending_generated_mask: std.ArrayListUnmanaged(bool) = .empty,
     pending_generated_kind: ?RuntimeGeneratedUnitTextKind = null,
     pending_generated_bytes: usize = 0,
+    pending_total_bytes: usize = 0,
+    ocr_attempted_count: usize = 0,
+    ocr_selected_count: usize = 0,
+    ocr_retained_embedded_count: usize = 0,
+    ocr_failed_count: usize = 0,
+    ocr_failed_page_numbers: std.ArrayListUnmanaged(u32) = .empty,
+    ocr_failure_summaries: std.ArrayListUnmanaged(RuntimeOcrFailureSummary) = .empty,
     pdf_coordinator: ?*RuntimePdfOcrCoordinator = null,
     prepared_pdf_session: ?*document_extraction_mod.PdfRenderSession = null,
     resolved_char_cursor: usize = 0,
@@ -8855,6 +8870,10 @@ const RuntimeDocumentExtractionCollectContext = struct {
         self.info.deinit(self.alloc);
         self.clearPendingGeneratedUnits();
         self.pending_generated_units.deinit(self.alloc);
+        self.pending_generated_mask.deinit(self.alloc);
+        self.ocr_failed_page_numbers.deinit(self.alloc);
+        for (self.ocr_failure_summaries.items) |*summary| summary.deinit(self.alloc);
+        self.ocr_failure_summaries.deinit(self.alloc);
     }
 
     fn onBegin(ptr: *anyopaque, info: document_extraction_mod.StreamInfo) anyerror!void {
@@ -8864,35 +8883,54 @@ const RuntimeDocumentExtractionCollectContext = struct {
 
     fn onUnit(ptr: *anyopaque, unit: *document_extraction_mod.Unit) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (runtimeGeneratedTextKind(self.config, self.info.route_type, unit.*)) |kind| {
+        const generated_kind = runtimeGeneratedTextKind(self.config, self.info.route_type, unit.*);
+        if (generated_kind) |kind| {
             if (self.pending_generated_kind != null and self.pending_generated_kind.? != kind) {
                 try self.flushPendingGeneratedText();
             }
             self.pending_generated_kind = kind;
-            const unit_bytes = runtimeDocumentExtractionUnitOwnedBytes(unit.*);
-            if (self.pending_generated_units.items.len > 0 and
-                addUsizeSaturating(self.pending_generated_bytes, unit_bytes) > self.batch_policy.max_bytes)
-            {
-                try self.flushPendingGeneratedText();
-                self.pending_generated_kind = kind;
-            }
-            var cloned = try cloneDocumentExtractionUnit(self.alloc, unit.*);
-            var owns_cloned = true;
-            errdefer if (owns_cloned) cloned.deinit(self.alloc);
-            try self.pending_generated_units.append(self.alloc, cloned);
-            owns_cloned = false;
-            self.pending_generated_bytes = addUsizeSaturating(self.pending_generated_bytes, runtimeDocumentExtractionUnitOwnedBytes(cloned));
-            if (self.pending_generated_units.items.len >= self.batch_policy.max_items or self.pending_generated_bytes >= self.batch_policy.max_bytes) {
-                try self.flushPendingGeneratedText();
-            }
+        }
+        const unit_bytes = runtimeDocumentExtractionUnitOwnedBytes(unit.*);
+        const generated_bytes = if (generated_kind != null) unit_bytes else 0;
+        if (self.pending_generated_units.items.len > 0 and
+            (self.pending_generated_units.items.len >= self.batch_policy.max_items or
+                addUsizeSaturating(self.pending_total_bytes, unit_bytes) > self.batch_policy.max_bytes or
+                addUsizeSaturating(self.pending_generated_bytes, generated_bytes) > self.batch_policy.max_bytes))
+        {
+            try self.flushPendingGeneratedText();
+            if (generated_kind) |kind| self.pending_generated_kind = kind;
+        }
+        // Finalize ordinary units immediately until a generated candidate opens
+        // an ordered window. Once open, retain intervening units in bounded
+        // slots so later compatible pages may join the same model batch.
+        if (generated_kind == null and self.pending_generated_units.items.len == 0) {
+            try self.finalizeUnit(unit, false);
             return;
         }
-        try self.flushPendingGeneratedText();
+        var cloned = try cloneDocumentExtractionUnit(self.alloc, unit.*);
+        var owns_cloned = true;
+        errdefer if (owns_cloned) cloned.deinit(self.alloc);
+        try self.pending_generated_units.append(self.alloc, cloned);
+        errdefer _ = self.pending_generated_units.pop();
+        try self.pending_generated_mask.append(self.alloc, generated_kind != null);
+        owns_cloned = false;
+        self.pending_total_bytes = addUsizeSaturating(self.pending_total_bytes, unit_bytes);
+        self.pending_generated_bytes = addUsizeSaturating(self.pending_generated_bytes, generated_bytes);
+        if (self.pending_generated_units.items.len >= self.batch_policy.max_items or
+            self.pending_total_bytes >= self.batch_policy.max_bytes)
+        {
+            try self.flushPendingGeneratedText();
+        }
+    }
+
+    fn finalizeUnit(self: *@This(), unit: *document_extraction_mod.Unit, generated: bool) !void {
         unit.char_start = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
         self.resolved_char_cursor = std.math.add(usize, self.resolved_char_cursor, unit.text.len) catch
             return error.DocumentExtractionOffsetOverflow;
         unit.char_end = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
-        try self.collectUnit(unit.*, false);
+        try self.recordOcrSummary(unit.*);
+        if (generated and self.unit_spool == null) try self.generated_units.putClone(self.alloc, unit.*);
+        try self.collectUnit(unit.*, generated);
     }
 
     fn onEnd(ptr: *anyopaque) anyerror!void {
@@ -8911,35 +8949,71 @@ const RuntimeDocumentExtractionCollectContext = struct {
 
     fn flushPendingGeneratedText(self: *@This()) !void {
         if (self.pending_generated_units.items.len == 0) return;
-        const producer = self.runtime.config.asset_producer orelse return error.MissingAssetProducer;
-        const kind = self.pending_generated_kind orelse return error.InvalidAssetProducerResponse;
-        try completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
-            self.runtime,
-            self.alloc,
-            self.runtime.alloc,
-            producer,
-            self.config,
-            self.batch_policy,
-            self.source_url,
-            self.source_bytes,
-            self.info.route_type,
-            self.info.content_type,
-            self.pending_generated_units.items,
-            kind,
-            &self.pdf_coordinator,
-            self.prepared_pdf_session,
-            self.pdf_working_alloc,
-            self.pdf_output_bytes,
-        );
-        for (self.pending_generated_units.items) |*unit| {
-            unit.char_start = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
-            self.resolved_char_cursor = std.math.add(usize, self.resolved_char_cursor, unit.text.len) catch
-                return error.DocumentExtractionOffsetOverflow;
-            unit.char_end = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
-            try self.generated_units.putClone(self.alloc, unit.*);
-            try self.collectUnit(unit.*, true);
+        var generated_count: usize = 0;
+        for (self.pending_generated_mask.items) |generated| if (generated) {
+            generated_count += 1;
+        };
+        if (generated_count > 0) {
+            const producer = self.runtime.config.asset_producer orelse return error.MissingAssetProducer;
+            const kind = self.pending_generated_kind orelse return error.InvalidAssetProducerResponse;
+            const generated_batch = try self.alloc.alloc(document_extraction_mod.Unit, generated_count);
+            defer self.alloc.free(generated_batch);
+            var initialized: usize = 0;
+            defer for (generated_batch[0..initialized]) |*unit| unit.deinit(self.alloc);
+            for (self.pending_generated_units.items, self.pending_generated_mask.items) |unit, generated| {
+                if (!generated) continue;
+                generated_batch[initialized] = try cloneDocumentExtractionUnit(self.alloc, unit);
+                initialized += 1;
+            }
+            try completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
+                self.runtime,
+                self.alloc,
+                self.runtime.alloc,
+                producer,
+                self.config,
+                self.batch_policy,
+                self.source_url,
+                self.source_bytes,
+                self.info.route_type,
+                self.info.content_type,
+                generated_batch,
+                kind,
+                &self.pdf_coordinator,
+                self.prepared_pdf_session,
+                self.pdf_working_alloc,
+                self.pdf_output_bytes,
+            );
+            var generated_index: usize = 0;
+            for (self.pending_generated_units.items, self.pending_generated_mask.items) |*unit, generated| {
+                if (!generated) continue;
+                unit.deinit(self.alloc);
+                unit.* = generated_batch[generated_index];
+                generated_batch[generated_index] = undefined;
+                generated_index += 1;
+            }
+            initialized = 0;
+        }
+        for (self.pending_generated_units.items, self.pending_generated_mask.items) |*unit, generated| {
+            try self.finalizeUnit(unit, generated);
         }
         self.clearPendingGeneratedUnits();
+    }
+
+    fn recordOcrSummary(self: *@This(), unit: document_extraction_mod.Unit) !void {
+        if (!unit.ocr_attempted) return;
+        self.ocr_attempted_count += 1;
+        if (unit.ocr_used) self.ocr_selected_count += 1;
+        const status = unit.extraction_status orelse return;
+        if (std.mem.eql(u8, status, "completed_embedded_preferred")) self.ocr_retained_embedded_count += 1;
+        if (!std.mem.eql(u8, status, "failed_ocr")) return;
+        self.ocr_failed_count += 1;
+        if (self.ocr_failed_page_numbers.items.len < 32) if (unit.page_number) |page|
+            try self.ocr_failed_page_numbers.append(self.alloc, page);
+        if (self.ocr_failure_summaries.items.len < 32) {
+            var summary = try RuntimeOcrFailureSummary.initClone(self.alloc, unit);
+            errdefer summary.deinit(self.alloc);
+            try self.ocr_failure_summaries.append(self.alloc, summary);
+        }
     }
 
     fn collectUnit(self: *@This(), unit: document_extraction_mod.Unit, generated: bool) !void {
@@ -8955,21 +9029,22 @@ const RuntimeDocumentExtractionCollectContext = struct {
     fn clearPendingGeneratedUnits(self: *@This()) void {
         for (self.pending_generated_units.items) |*unit| unit.deinit(self.alloc);
         self.pending_generated_units.clearRetainingCapacity();
+        self.pending_generated_mask.clearRetainingCapacity();
         self.pending_generated_kind = null;
         self.pending_generated_bytes = 0;
+        self.pending_total_bytes = 0;
     }
 };
 
 const runtime_document_extraction_flush_write_count: usize = 128;
 const runtime_document_extraction_flush_write_bytes: usize = 4 * 1024 * 1024;
-const RuntimeDocumentExtractionMaterializeMode = enum { store_artifacts, publish_replay };
-
 /// Bounded, attempt-private replay storage for resolved document units. PDF
 /// extraction can include rendering and model inference, so re-running it to
 /// materialize and publish the same units is both expensive and semantically
 /// risky. This spool preserves the streaming memory bound: only one bounded
 /// write batch or one replayed unit is resident at a time.
 const RuntimeDocumentUnitSpool = struct {
+    runtime: ?*EnrichmentRuntime,
     store: *backend_erased.Store,
     runtime_alloc: Allocator,
     alloc: Allocator,
@@ -8980,6 +9055,7 @@ const RuntimeDocumentUnitSpool = struct {
     cleanup_pending: bool = true,
 
     fn init(
+        runtime: ?*EnrichmentRuntime,
         store: *backend_erased.Store,
         runtime_alloc: Allocator,
         alloc: Allocator,
@@ -8987,15 +9063,6 @@ const RuntimeDocumentUnitSpool = struct {
         artifact_name: []const u8,
         attempt_id: []const u8,
     ) !@This() {
-        const artifact_root = try internal_keys.documentExtractionUnitSpoolArtifactRootPrefixAlloc(
-            alloc,
-            doc_key,
-            artifact_name,
-        );
-        defer alloc.free(artifact_root);
-        // The artifact's enrichment lease serializes attempts. Clear every
-        // crashed fingerprint/generation, not only the identity about to run.
-        try clearPrivateStorePrefix(alloc, store, artifact_root);
         const root = try internal_keys.documentExtractionUnitSpoolRootPrefixAlloc(
             alloc,
             doc_key,
@@ -9004,6 +9071,7 @@ const RuntimeDocumentUnitSpool = struct {
         );
         errdefer alloc.free(root);
         return .{
+            .runtime = runtime,
             .store = store,
             .runtime_alloc = runtime_alloc,
             .alloc = alloc,
@@ -9028,7 +9096,7 @@ const RuntimeDocumentUnitSpool = struct {
 
     fn flush(self: *@This()) !void {
         if (self.writes.items.len == 0) return;
-        try storePutPrivateBatchWithRetry(self.store, self.writes.items, &.{});
+        try storePutPrivateBatchWithRetry(self.runtime, self.store, self.writes.items, &.{});
         self.spilled = true;
         self.clearPendingWrites();
     }
@@ -9053,26 +9121,61 @@ const RuntimeDocumentUnitSpool = struct {
             return;
         }
         var unit_index: u64 = 0;
-        while (unit_index < self.unit_count) : (unit_index += 1) {
+        while (unit_index < self.unit_count) {
             var budgeted: ?resource_manager_mod.BudgetedAllocator = if (resource_tracker.manager) |manager|
                 resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, self.runtime_alloc, 1)
             else
                 null;
             defer if (budgeted) |*allocator| allocator.deinit();
             const unit_alloc = if (budgeted) |*allocator| allocator.allocator() else self.runtime_alloc;
-            const key = try internal_keys.documentExtractionUnitSpoolKeyAlloc(unit_alloc, self.root, unit_index);
-            defer unit_alloc.free(key);
-            const encoded = storeGetWithAllocator(self.store, unit_alloc, key) catch |err| {
-                if (err == error.OutOfMemory and budgeted != null and budgeted.?.denied())
-                    return error.DocumentExtractionWorkingSetTooLarge;
-                return err;
-            };
-            defer unit_alloc.free(encoded);
-            replayEncodedWithAllocator(unit_alloc, encoded, sink) catch |err| {
-                if (err == error.OutOfMemory and budgeted != null and budgeted.?.denied())
-                    return error.DocumentExtractionWorkingSetTooLarge;
-                return err;
-            };
+            var encoded_segment = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (encoded_segment.items) |encoded| unit_alloc.free(encoded);
+                encoded_segment.deinit(unit_alloc);
+            }
+            {
+                // LMDB's default transaction mode permits only one active
+                // transaction per thread. Copy a byte-bounded segment while
+                // the read transaction is open, close it, and only then call
+                // a sink that may begin artifact write transactions.
+                var txn = try self.store.beginRead();
+                defer txn.abort();
+                const segment_end = @min(
+                    self.unit_count,
+                    unit_index +| runtime_document_extraction_flush_write_count,
+                );
+                var segment_bytes: usize = 0;
+                while (unit_index < segment_end) {
+                    const key = try internal_keys.documentExtractionUnitSpoolKeyAlloc(unit_alloc, self.root, unit_index);
+                    defer unit_alloc.free(key);
+                    const encoded = txn.get(key) catch |err| {
+                        if (err == error.OutOfMemory and budgeted != null and budgeted.?.denied())
+                            return error.DocumentExtractionWorkingSetTooLarge;
+                        return err;
+                    };
+                    const next_bytes = std.math.add(usize, segment_bytes, encoded.len) catch
+                        return error.DocumentExtractionWorkingSetTooLarge;
+                    if (encoded_segment.items.len > 0 and
+                        next_bytes > runtime_document_extraction_flush_write_bytes)
+                        break;
+                    const owned = unit_alloc.dupe(u8, encoded) catch |err| {
+                        if (err == error.OutOfMemory and budgeted != null and budgeted.?.denied())
+                            return error.DocumentExtractionWorkingSetTooLarge;
+                        return err;
+                    };
+                    errdefer unit_alloc.free(owned);
+                    try encoded_segment.append(unit_alloc, owned);
+                    segment_bytes = next_bytes;
+                    unit_index += 1;
+                }
+            }
+            for (encoded_segment.items) |encoded| {
+                replayEncodedWithAllocator(unit_alloc, encoded, sink) catch |err| {
+                    if (err == error.OutOfMemory and budgeted != null and budgeted.?.denied())
+                        return error.DocumentExtractionWorkingSetTooLarge;
+                    return err;
+                };
+            }
         }
         try sink.on_end(sink.ptr);
     }
@@ -9122,7 +9225,7 @@ const RuntimeDocumentUnitSpool = struct {
     fn cleanup(self: *@This()) !void {
         self.clearPendingWrites();
         if (!self.cleanup_pending) return;
-        if (self.spilled) try clearPrivateStorePrefix(self.alloc, self.store, self.root);
+        if (self.spilled) try clearPrivateStorePrefix(self.runtime, self.alloc, self.store, self.root);
         self.cleanup_pending = false;
     }
 
@@ -9138,7 +9241,291 @@ const RuntimeDocumentUnitSpool = struct {
     }
 };
 
+const RuntimeDocumentPublicationAction = enum { upsert, delete };
+
+const RuntimeDocumentPublicationRecord = struct {
+    action: RuntimeDocumentPublicationAction,
+    staged_key: []const u8 = "",
+    final_key: []const u8,
+    text_indexes: []const []const u8 = &.{},
+    publish_change: bool = true,
+};
+
+const runtime_document_publication_stage_kind: u8 = 0xfd;
+const runtime_document_publication_record_kind: u8 = 0xfe;
+
+fn runtimeDocumentPublicationPrivateKeyAlloc(
+    alloc: Allocator,
+    root: []const u8,
+    kind: u8,
+    record_index: u64,
+) ![]u8 {
+    const key = try alloc.alloc(u8, root.len + 1 + @sizeOf(u64));
+    @memcpy(key[0..root.len], root);
+    key[root.len] = kind;
+    std.mem.writeInt(u64, key[root.len + 1 ..][0..@sizeOf(u64)], record_index, .big);
+    return key;
+}
+
+/// Durable, attempt-private publication plan for one document generation.
+/// Materialization writes only stage values and records here. Once every unit
+/// and chunk has materialized successfully, replay promotes bounded windows
+/// through the generated writer, which atomically publishes each artifact and
+/// its search/outbox obligation under the active lease fence.
+const RuntimeDocumentPublicationSpool = struct {
+    runtime: ?*EnrichmentRuntime,
+    store: *backend_erased.Store,
+    alloc: Allocator,
+    root: []u8,
+    writes: std.ArrayListUnmanaged(KVPair) = .empty,
+    record_count: u64 = 0,
+    spilled: bool = false,
+    cleanup_pending: bool = true,
+
+    fn init(
+        runtime: ?*EnrichmentRuntime,
+        store: *backend_erased.Store,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        attempt_id: []const u8,
+    ) !@This() {
+        return .{
+            .runtime = runtime,
+            .store = store,
+            .alloc = alloc,
+            .root = try internal_keys.documentExtractionUnitSpoolRootPrefixAlloc(
+                alloc,
+                doc_key,
+                artifact_name,
+                attempt_id,
+            ),
+        };
+    }
+
+    fn stageUpsert(
+        self: *@This(),
+        final_key: []const u8,
+        value: []const u8,
+        text_indexes: []const []const u8,
+        publish_change: bool,
+    ) !void {
+        const next_record_count = std.math.add(u64, self.record_count, 1) catch
+            return error.DocumentExtractionOffsetOverflow;
+        var transferred = false;
+        const staged_key = try runtimeDocumentPublicationPrivateKeyAlloc(
+            self.alloc,
+            self.root,
+            runtime_document_publication_stage_kind,
+            self.record_count,
+        );
+        errdefer if (!transferred) self.alloc.free(staged_key);
+        const record_key = try runtimeDocumentPublicationPrivateKeyAlloc(
+            self.alloc,
+            self.root,
+            runtime_document_publication_record_kind,
+            self.record_count,
+        );
+        errdefer if (!transferred) self.alloc.free(record_key);
+        const staged_value = try self.alloc.dupe(u8, value);
+        errdefer if (!transferred) self.alloc.free(staged_value);
+        const encoded = try std.json.Stringify.valueAlloc(self.alloc, RuntimeDocumentPublicationRecord{
+            .action = .upsert,
+            .staged_key = staged_key,
+            .final_key = final_key,
+            .text_indexes = text_indexes,
+            .publish_change = publish_change,
+        }, .{});
+        errdefer if (!transferred) self.alloc.free(encoded);
+
+        try self.writes.ensureUnusedCapacity(self.alloc, 2);
+        self.writes.appendAssumeCapacity(.{ .key = staged_key, .value = staged_value });
+        self.writes.appendAssumeCapacity(.{ .key = record_key, .value = encoded });
+        transferred = true;
+        self.record_count = next_record_count;
+        try self.flushIfNeeded();
+    }
+
+    fn stageDelete(self: *@This(), final_key: []const u8, publish_change: bool) !void {
+        const next_record_count = std.math.add(u64, self.record_count, 1) catch
+            return error.DocumentExtractionOffsetOverflow;
+        var transferred = false;
+        const record_key = try runtimeDocumentPublicationPrivateKeyAlloc(
+            self.alloc,
+            self.root,
+            runtime_document_publication_record_kind,
+            self.record_count,
+        );
+        errdefer if (!transferred) self.alloc.free(record_key);
+        const encoded = try std.json.Stringify.valueAlloc(self.alloc, RuntimeDocumentPublicationRecord{
+            .action = .delete,
+            .final_key = final_key,
+            .publish_change = publish_change,
+        }, .{});
+        errdefer if (!transferred) self.alloc.free(encoded);
+        try self.writes.append(self.alloc, .{ .key = record_key, .value = encoded });
+        transferred = true;
+        self.record_count = next_record_count;
+        try self.flushIfNeeded();
+    }
+
+    fn flushIfNeeded(self: *@This()) !void {
+        if (self.writes.items.len >= runtime_document_extraction_flush_write_count or
+            runtimeDocumentExtractionWriteBytes(self.writes.items) >= runtime_document_extraction_flush_write_bytes)
+        {
+            try self.flush();
+        }
+    }
+
+    fn flush(self: *@This()) !void {
+        if (self.writes.items.len == 0) return;
+        try storePutPrivateBatchWithRetry(self.runtime, self.store, self.writes.items, &.{});
+        self.spilled = true;
+        self.clearPendingWrites();
+    }
+
+    fn seal(self: *@This()) !void {
+        // Unlike the input-unit spool, publication must survive the boundary
+        // between completed materialization and bounded promotion replay even
+        // for small documents.
+        try self.flush();
+    }
+
+    fn pendingWorkingSetBytes(self: *const @This()) usize {
+        return runtimeDocumentExtractionWriteWorkingSetBytes(&self.writes);
+    }
+
+    fn replay(
+        self: *@This(),
+        runtime: *EnrichmentRuntime,
+        window: *GeneratedReplayWindow,
+        max_window_items: usize,
+        resource_tracker: *RuntimeDocumentExtractionResourceTracker,
+    ) !void {
+        try self.seal();
+        var record_index: u64 = 0;
+        while (record_index < self.record_count) : (record_index += 1) {
+            var budgeted: ?resource_manager_mod.BudgetedAllocator = if (resource_tracker.manager) |manager|
+                resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
+            else
+                null;
+            defer if (budgeted) |*allocator| allocator.deinit();
+            const replay_alloc = if (budgeted) |*allocator| allocator.allocator() else runtime.alloc;
+            const record_key = try runtimeDocumentPublicationPrivateKeyAlloc(
+                replay_alloc,
+                self.root,
+                runtime_document_publication_record_kind,
+                record_index,
+            );
+            defer replay_alloc.free(record_key);
+            const encoded = blk: {
+                // LMDB permits only one transaction per thread in its default
+                // mode. Copy the private record, close the read transaction,
+                // and only then enter the generated publication writer.
+                var txn = try self.store.beginRead();
+                defer txn.abort();
+                break :blk try replay_alloc.dupe(u8, try txn.get(record_key));
+            };
+            defer replay_alloc.free(encoded);
+            var parsed = try std.json.parseFromSlice(
+                RuntimeDocumentPublicationRecord,
+                replay_alloc,
+                encoded,
+                .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
+            );
+            defer parsed.deinit();
+
+            switch (parsed.value.action) {
+                .upsert => {
+                    if (parsed.value.staged_key.len == 0) return error.InvalidGeneratedArtifactPromotion;
+                    const payload = blk: {
+                        var txn = try self.store.beginRead();
+                        defer txn.abort();
+                        break :blk try replay_alloc.dupe(u8, try txn.get(parsed.value.staged_key));
+                    };
+                    defer replay_alloc.free(payload);
+                    try appendRuntimeDocumentPublicationUpsert(
+                        runtime.alloc,
+                        resource_tracker,
+                        window,
+                        parsed.value.staged_key,
+                        parsed.value.final_key,
+                        payload,
+                        parsed.value.text_indexes,
+                        parsed.value.publish_change,
+                    );
+                },
+                .delete => try appendRuntimeDocumentPublicationDelete(
+                    runtime.alloc,
+                    resource_tracker,
+                    window,
+                    parsed.value.final_key,
+                    parsed.value.publish_change,
+                ),
+            }
+            if (window.itemCount() >= max_window_items) {
+                try flushGeneratedReplayWindow(runtime, window);
+                // reserveAdditional is conservative while a window is being
+                // assembled. Reconcile after every durable flush so a large
+                // document is bounded by one window rather than accumulating
+                // accounting debt across the entire publication.
+                const empty_writes = std.ArrayListUnmanaged(KVPair).empty;
+                const empty_deletes = std.ArrayListUnmanaged([]const u8).empty;
+                try resource_tracker.updateWorkingSetWithPrivateBytes(
+                    0,
+                    0,
+                    &empty_writes,
+                    &empty_deletes,
+                    window,
+                    self.pendingWorkingSetBytes(),
+                );
+            }
+        }
+    }
+
+    fn clearPendingWrites(self: *@This()) void {
+        for (self.writes.items) |write| {
+            self.alloc.free(@constCast(write.key));
+            self.alloc.free(@constCast(write.value));
+        }
+        self.writes.clearRetainingCapacity();
+    }
+
+    fn cleanup(self: *@This()) !void {
+        self.clearPendingWrites();
+        if (!self.cleanup_pending) return;
+        if (self.spilled) try clearPrivateStorePrefix(self.runtime, self.alloc, self.store, self.root);
+        self.cleanup_pending = false;
+    }
+
+    fn deinit(self: *@This()) void {
+        self.cleanup() catch |err| std.log.warn(
+            "deferred document publication spool cleanup failed err={s}",
+            .{@errorName(err)},
+        );
+        self.clearPendingWrites();
+        self.writes.deinit(self.alloc);
+        self.alloc.free(self.root);
+        self.* = undefined;
+    }
+};
+
+fn clearRuntimeDocumentUnitSpoolAttempts(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) !void {
+    const artifact_root = try internal_keys.documentExtractionUnitSpoolArtifactRootPrefixAlloc(
+        runtime.alloc,
+        doc_key,
+        artifact_name,
+    );
+    defer runtime.alloc.free(artifact_root);
+    try clearPrivateStorePrefix(runtime, runtime.alloc, &runtime.store, artifact_root);
+}
+
 fn clearPrivateStorePrefix(
+    runtime: ?*EnrichmentRuntime,
     alloc: Allocator,
     store: *backend_erased.Store,
     root: []const u8,
@@ -9155,15 +9542,9 @@ fn clearPrivateStorePrefix(
         const deletes = try alloc.alloc([]const u8, page.keys.len);
         defer alloc.free(deletes);
         for (page.keys, 0..) |key, index| deletes[index] = key;
-        try storePutPrivateBatchWithRetry(store, &.{}, deletes);
+        try storePutPrivateBatchWithRetry(runtime, store, &.{}, deletes);
         if (!page.has_more) return;
     }
-}
-
-fn storeGetWithAllocator(store: *backend_erased.Store, alloc: Allocator, key: []const u8) ![]u8 {
-    var txn = try store.beginRead();
-    defer txn.abort();
-    return try alloc.dupe(u8, try txn.get(key));
 }
 
 /// Attempt-private work only needs transactional visibility. It is discarded
@@ -9171,10 +9552,11 @@ fn storeGetWithAllocator(store: *backend_erased.Store, alloc: Allocator, key: []
 /// bounded spool window would add latency without improving correctness. Keep
 /// this path independent from artifact accounting: private spool keys are not
 /// durable artifacts and must not update dense targets or source indexes.
-fn storePutPrivateBatchWithRetry(store: *backend_erased.Store, writes: []const KVPair, deletes: []const []const u8) !void {
+fn storePutPrivateBatchWithRetry(runtime: ?*EnrichmentRuntime, store: *backend_erased.Store, writes: []const KVPair, deletes: []const []const u8) !void {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        storePutPrivateBatch(store, writes, deletes) catch |err| switch (err) {
+        if (runtime) |owner| try heartbeatEnrichmentLease(owner);
+        storePutPrivateBatch(runtime, store, writes, deletes) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -9186,9 +9568,11 @@ fn storePutPrivateBatchWithRetry(store: *backend_erased.Store, writes: []const K
     }
 }
 
-fn storePutPrivateBatch(store: *backend_erased.Store, writes: []const KVPair, deletes: []const []const u8) !void {
+fn storePutPrivateBatch(runtime: ?*EnrichmentRuntime, store: *backend_erased.Store, writes: []const KVPair, deletes: []const []const u8) !void {
+    const fence = if (runtime) |owner| try requiredRuntimeStoreWriteFence(owner) else null;
     var batch = try store.beginBatch();
     errdefer batch.abort();
+    if (runtime) |owner| try validateRuntimeStoreWriteFenceTxn(owner, &batch, fence);
     for (writes) |write| try batch.put(write.key, write.value);
     for (deletes) |key| {
         batch.delete(key) catch |err| switch (err) {
@@ -9196,6 +9580,7 @@ fn storePutPrivateBatch(store: *backend_erased.Store, writes: []const KVPair, de
             else => return err,
         };
     }
+    if (runtime) |owner| try validateRuntimeStoreWriteFenceTxn(owner, &batch, fence);
     try batch.commit();
 }
 
@@ -9207,7 +9592,7 @@ test "resolved document unit spool replays in order and cleans its attempt prefi
     defer store.deinit();
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
-    var spool = try RuntimeDocumentUnitSpool.init(&erased_store, alloc, alloc, "doc:spool", "pages", "1:abc");
+    var spool = try RuntimeDocumentUnitSpool.init(null, &erased_store, alloc, alloc, "doc:spool", "pages", "1:abc");
     defer spool.deinit();
 
     try spool.append(.{
@@ -9273,7 +9658,7 @@ test "resolved document unit spool replays in order and cleans its attempt prefi
     try std.testing.expectEqualStrings("first", capture.text.items[0]);
     try std.testing.expectEqualStrings("second", capture.text.items[1]);
 
-    var replacement = try RuntimeDocumentUnitSpool.init(&erased_store, alloc, alloc, "doc:spool", "pages", "2:def");
+    var replacement = try RuntimeDocumentUnitSpool.init(null, &erased_store, alloc, alloc, "doc:spool", "pages", "2:def");
     defer replacement.deinit();
     const stale = try backend_scan.scanPrefix(alloc, &erased_store, spool.root);
     defer backend_scan.freeResults(alloc, stale);
@@ -9298,6 +9683,159 @@ test "resolved document unit spool replays in order and cleans its attempt prefi
     const cleaned = try backend_scan.scanPrefix(alloc, &erased_store, spool.root);
     defer backend_scan.freeResults(alloc, cleaned);
     try std.testing.expectEqual(@as(usize, 0), cleaned.len);
+}
+
+test "storage.db.db.test.document publication spool preserves prior artifacts on failure and crash cleanup" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+
+    const final_key = "artifact:final";
+    const old_value = "old generation";
+    const new_value = "new generation";
+    try storePutPrivateBatchWithRetry(null, &erased_store, &.{.{
+        .key = final_key,
+        .value = old_value,
+    }}, &.{});
+
+    var failed = try RuntimeDocumentPublicationSpool.init(
+        null,
+        &erased_store,
+        alloc,
+        "doc:publication",
+        "pages",
+        "attempt:failed",
+    );
+    defer failed.deinit();
+    var unpublished_window = GeneratedReplayWindow{ .alloc = alloc };
+    defer unpublished_window.deinit();
+    try failed.stageUpsert(final_key, new_value, &.{"body"}, true);
+    // A materializer failure before seal cannot have queued a promotion,
+    // changed-artifact marker, or searchable derived document.
+    try std.testing.expect(unpublished_window.isEmpty());
+    {
+        var txn = try erased_store.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings(old_value, try txn.get(final_key));
+    }
+    const staged_before_failure = try backend_scan.scanPrefix(alloc, &erased_store, failed.root);
+    defer backend_scan.freeResults(alloc, staged_before_failure);
+    try std.testing.expectEqual(@as(usize, 0), staged_before_failure.len);
+    try failed.cleanup();
+    {
+        var txn = try erased_store.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings(old_value, try txn.get(final_key));
+    }
+    const staged_after_failure = try backend_scan.scanPrefix(alloc, &erased_store, failed.root);
+    defer backend_scan.freeResults(alloc, staged_after_failure);
+    try std.testing.expectEqual(@as(usize, 0), staged_after_failure.len);
+
+    // Simulate process death after the private plan reached durable storage:
+    // skip object cleanup, then run the same artifact-root scavenger used at
+    // the beginning of the next fenced attempt.
+    var abandoned = try RuntimeDocumentPublicationSpool.init(
+        null,
+        &erased_store,
+        alloc,
+        "doc:publication",
+        "pages",
+        "attempt:abandoned",
+    );
+    try abandoned.stageUpsert(final_key, new_value, &.{"body"}, true);
+    try abandoned.seal();
+    const artifact_root = try internal_keys.documentExtractionUnitSpoolArtifactRootPrefixAlloc(
+        alloc,
+        "doc:publication",
+        "pages",
+    );
+    defer alloc.free(artifact_root);
+    abandoned.cleanup_pending = false;
+    abandoned.deinit();
+    const durable_private_rows = try backend_scan.scanPrefix(alloc, &erased_store, artifact_root);
+    defer backend_scan.freeResults(alloc, durable_private_rows);
+    try std.testing.expectEqual(@as(usize, 2), durable_private_rows.len);
+    try clearPrivateStorePrefix(null, alloc, &erased_store, artifact_root);
+    const scavenged_private_rows = try backend_scan.scanPrefix(alloc, &erased_store, artifact_root);
+    defer backend_scan.freeResults(alloc, scavenged_private_rows);
+    try std.testing.expectEqual(@as(usize, 0), scavenged_private_rows.len);
+    {
+        var txn = try erased_store.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings(old_value, try txn.get(final_key));
+    }
+}
+
+test "storage.db.db.test.document publication spool owns partial allocations transactionally" {
+    const Runner = struct {
+        fn run(alloc: Allocator, store: *backend_erased.Store) !void {
+            var spool = try RuntimeDocumentPublicationSpool.init(
+                null,
+                store,
+                alloc,
+                "doc:allocation-failure",
+                "pages",
+                "attempt:one",
+            );
+            defer spool.deinit();
+            try spool.stageUpsert(
+                "artifact:final",
+                "replacement payload",
+                &.{ "body", "title" },
+                true,
+            );
+        }
+    };
+
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(std.testing.allocator, store);
+    defer erased_store.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        Runner.run,
+        .{&erased_store},
+    );
+}
+
+test "storage.db.db.test.document publication window appends roll back partial logical records" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = null };
+            defer tracker.deinit();
+            var window = GeneratedReplayWindow{ .alloc = alloc };
+            defer window.deinit();
+            try appendRuntimeDocumentPublicationUpsert(
+                alloc,
+                &tracker,
+                &window,
+                "stage:one",
+                "artifact:one",
+                "payload",
+                &.{ "body", "title" },
+                true,
+            );
+            try appendRuntimeDocumentPublicationDelete(
+                alloc,
+                &tracker,
+                &window,
+                "artifact:old",
+                true,
+            );
+            try std.testing.expectEqual(@as(usize, 1), window.artifact_promotions.items.len);
+            try std.testing.expectEqual(@as(usize, 1), window.documents.items.len);
+            try std.testing.expectEqual(@as(usize, 1), window.artifact_delete_keys.items.len);
+            try std.testing.expectEqual(@as(usize, 1), window.deleted_keys.items.len);
+            try std.testing.expectEqual(@as(usize, 2), window.changed_artifact_keys.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 const PdfOperationBudget = struct {
@@ -9355,6 +9893,12 @@ const RuntimeDocumentExtractionResourceTracker = struct {
     fn setExternallyAccountedDownloadedBytes(self: *@This(), bytes: usize) void {
         self.downloaded_bytes = bytes;
         self.downloaded_bytes_externally_accounted = true;
+    }
+
+    fn releaseDownloadedBytes(self: *@This()) !void {
+        if (!self.downloaded_bytes_externally_accounted) try self.setBytes(0);
+        self.downloaded_bytes = 0;
+        self.downloaded_bytes_externally_accounted = false;
     }
 
     fn locallyAccountedDownloadedBytes(self: *const @This()) usize {
@@ -9432,12 +9976,32 @@ const RuntimeDocumentExtractionResourceTracker = struct {
         deletes: *const std.ArrayListUnmanaged([]const u8),
         window: *const GeneratedReplayWindow,
     ) !void {
+        return self.updateWorkingSetWithPrivateBytes(
+            unit_bytes,
+            generated_cache_bytes,
+            writes,
+            deletes,
+            window,
+            0,
+        );
+    }
+
+    fn updateWorkingSetWithPrivateBytes(
+        self: *@This(),
+        unit_bytes: usize,
+        generated_cache_bytes: usize,
+        writes: *const std.ArrayListUnmanaged(KVPair),
+        deletes: *const std.ArrayListUnmanaged([]const u8),
+        window: *const GeneratedReplayWindow,
+        private_bytes: usize,
+    ) !void {
         var total = self.locallyAccountedDownloadedBytes();
         total = addUsizeSaturating(total, unit_bytes);
         total = addUsizeSaturating(total, generated_cache_bytes);
         total = addUsizeSaturating(total, runtimeDocumentExtractionWriteWorkingSetBytes(writes));
         total = addUsizeSaturating(total, runtimeDocumentExtractionDeleteWorkingSetBytes(deletes));
         total = addUsizeSaturating(total, runtimeDocumentExtractionWindowBytes(window));
+        total = addUsizeSaturating(total, private_bytes);
         try self.setBytes(total);
     }
 
@@ -9971,6 +10535,115 @@ fn appendRuntimeReplayDocument(
     });
 }
 
+fn appendRuntimeDocumentPublicationUpsert(
+    alloc: Allocator,
+    resource_tracker: *RuntimeDocumentExtractionResourceTracker,
+    window: *GeneratedReplayWindow,
+    staged_key: []const u8,
+    final_key: []const u8,
+    payload: []const u8,
+    text_indexes: []const []const u8,
+    publish_change: bool,
+) !void {
+    const promotion_start = window.artifact_promotions.items.len;
+    const changed_start = window.changed_artifact_keys.items.len;
+    const document_start = window.documents.items.len;
+    errdefer {
+        for (window.documents.items[document_start..]) |doc|
+            derived_types.deinitDerivedDocument(alloc, doc);
+        window.documents.shrinkRetainingCapacity(document_start);
+        for (window.changed_artifact_keys.items[changed_start..]) |key|
+            alloc.free(key);
+        window.changed_artifact_keys.shrinkRetainingCapacity(changed_start);
+        for (window.artifact_promotions.items[promotion_start..]) |promotion| {
+            alloc.free(@constCast(promotion.staged_key));
+            alloc.free(@constCast(promotion.final_key));
+        }
+        window.artifact_promotions.shrinkRetainingCapacity(promotion_start);
+    }
+    try ensureRuntimeListAppendCapacity(
+        GeneratedArtifactPromotion,
+        resource_tracker,
+        alloc,
+        &window.artifact_promotions,
+    );
+    try resource_tracker.reserveAdditional(addUsizeSaturating(staged_key.len, final_key.len));
+    var promotion_transferred = false;
+    const owned_staged_key = try alloc.dupe(u8, staged_key);
+    errdefer if (!promotion_transferred) alloc.free(owned_staged_key);
+    const owned_final_key = try alloc.dupe(u8, final_key);
+    errdefer if (!promotion_transferred) alloc.free(owned_final_key);
+    window.artifact_promotions.appendAssumeCapacity(.{
+        .staged_key = owned_staged_key,
+        .final_key = owned_final_key,
+    });
+    promotion_transferred = true;
+    if (publish_change) {
+        try appendUniqueOwnedRuntimeKey(
+            []u8,
+            resource_tracker,
+            alloc,
+            &window.changed_artifact_keys,
+            final_key,
+        );
+    }
+    if (text_indexes.len > 0) {
+        try appendRuntimeReplayDocument(
+            resource_tracker,
+            alloc,
+            window,
+            final_key,
+            payload,
+            text_indexes,
+        );
+    }
+}
+
+fn appendRuntimeDocumentPublicationDelete(
+    alloc: Allocator,
+    resource_tracker: *RuntimeDocumentExtractionResourceTracker,
+    window: *GeneratedReplayWindow,
+    final_key: []const u8,
+    publish_change: bool,
+) !void {
+    const artifact_delete_start = window.artifact_delete_keys.items.len;
+    const deleted_start = window.deleted_keys.items.len;
+    const changed_start = window.changed_artifact_keys.items.len;
+    errdefer {
+        for (window.changed_artifact_keys.items[changed_start..]) |key|
+            alloc.free(key);
+        window.changed_artifact_keys.shrinkRetainingCapacity(changed_start);
+        for (window.deleted_keys.items[deleted_start..]) |key|
+            alloc.free(key);
+        window.deleted_keys.shrinkRetainingCapacity(deleted_start);
+        for (window.artifact_delete_keys.items[artifact_delete_start..]) |key|
+            alloc.free(key);
+        window.artifact_delete_keys.shrinkRetainingCapacity(artifact_delete_start);
+    }
+    try appendUniqueOwnedRuntimeKey(
+        []u8,
+        resource_tracker,
+        alloc,
+        &window.artifact_delete_keys,
+        final_key,
+    );
+    if (!publish_change) return;
+    try appendUniqueOwnedRuntimeKey(
+        []u8,
+        resource_tracker,
+        alloc,
+        &window.deleted_keys,
+        final_key,
+    );
+    try appendUniqueOwnedRuntimeKey(
+        []u8,
+        resource_tracker,
+        alloc,
+        &window.changed_artifact_keys,
+        final_key,
+    );
+}
+
 fn flushRuntimeKVBatchAndClear(
     runtime: *EnrichmentRuntime,
     writes: *std.ArrayListUnmanaged(KVPair),
@@ -9998,9 +10671,9 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
     deletes: *std.ArrayListUnmanaged([]const u8),
     window: *GeneratedReplayWindow,
     max_window_items: usize,
+    publication_spool: *RuntimeDocumentPublicationSpool,
     resource_tracker: *RuntimeDocumentExtractionResourceTracker,
-    generated_units: *const RuntimeGeneratedUnitCache,
-    mode: RuntimeDocumentExtractionMaterializeMode,
+    generated_units: ?*const RuntimeGeneratedUnitCache,
     /// Allocator that owns the borrowed unit supplied by the extractor.
     unit_alloc: Allocator,
     pdf_inspection_reserved: bool = false,
@@ -10021,14 +10694,19 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
     fn onBegin(_: *anyopaque, _: document_extraction_mod.StreamInfo) anyerror!void {}
 
     fn accountWorkingSet(self: *@This(), unit_bytes: usize, generated_cache_bytes: usize) !void {
-        try self.resource_tracker.updateWorkingSet(unit_bytes, generated_cache_bytes, self.writes, self.deletes, self.window);
+        try self.resource_tracker.updateWorkingSetWithPrivateBytes(
+            unit_bytes,
+            generated_cache_bytes,
+            self.writes,
+            self.deletes,
+            self.window,
+            self.publication_spool.pendingWorkingSetBytes(),
+        );
     }
 
     fn accountAndFlushReplay(self: *@This(), unit_bytes: usize, generated_cache_bytes: usize) !void {
-        if (self.mode != .publish_replay) return;
         try self.accountWorkingSet(unit_bytes, generated_cache_bytes);
-        try flushGeneratedReplayWindowIfNeeded(self.runtime, self.window, self.max_window_items);
-        try self.accountWorkingSet(unit_bytes, generated_cache_bytes);
+        _ = self.max_window_items;
     }
 
     fn onUnit(ptr: *anyopaque, unit: *document_extraction_mod.Unit) anyerror!void {
@@ -10050,7 +10728,8 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
 
     fn onUnitWithAllocator(self: *@This(), working_alloc: Allocator, unit: *document_extraction_mod.Unit) !void {
         if (runtimeGeneratedTextNeeded(self.config, self.info.route_type, unit.*)) {
-            const cached = self.generated_units.get(unit.unit_id) orelse return error.MissingGeneratedUnitCache;
+            const generated_units = self.generated_units orelse return error.MissingGeneratedUnitCache;
+            const cached = generated_units.get(unit.unit_id) orelse return error.MissingGeneratedUnitCache;
             try replaceDocumentExtractionUnitWithClone(self.unit_alloc, unit, cached.*);
         }
         unit.char_start = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
@@ -10079,35 +10758,13 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
         );
         defer working_alloc.free(payload);
 
-        if (self.mode == .store_artifacts) {
-            try appendOwnedRuntimeKVPair(self.resource_tracker, self.runtime.alloc, self.writes, unit_key, payload);
-            try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
-            if (self.writes.items.len >= runtime_document_extraction_flush_write_count or
-                runtimeDocumentExtractionWriteBytes(self.writes.items) >= runtime_document_extraction_flush_write_bytes)
-            {
-                try flushRuntimeKVBatchAndClear(self.runtime, self.writes, self.deletes);
-                try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
-            }
-        } else {
-            try appendUniqueOwnedRuntimeKey(
-                []u8,
-                self.resource_tracker,
-                self.runtime.alloc,
-                &self.window.changed_artifact_keys,
-                unit_key,
-            );
-        }
-
-        if (self.mode == .publish_replay and self.text_indexes.len > 0) {
-            try appendRuntimeReplayDocument(
-                self.resource_tracker,
-                self.runtime.alloc,
-                self.window,
-                unit_key,
-                payload,
-                self.text_indexes,
-            );
-        }
+        try self.publication_spool.stageUpsert(
+            unit_key,
+            payload,
+            self.text_indexes,
+            true,
+        );
+        try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
         try self.accountAndFlushReplay(unit_working_bytes, generated_cache_bytes);
 
         try appendRuntimeDocumentUnitChunkWrites(
@@ -10122,12 +10779,6 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
         self.unit_index += 1;
         try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
 
-        if (self.mode == .store_artifacts and (self.writes.items.len >= runtime_document_extraction_flush_write_count or
-            runtimeDocumentExtractionWriteBytes(self.writes.items) >= runtime_document_extraction_flush_write_bytes))
-        {
-            try flushRuntimeKVBatchAndClear(self.runtime, self.writes, self.deletes);
-            try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
-        }
         try self.accountAndFlushReplay(unit_working_bytes, generated_cache_bytes);
         try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
     }
@@ -10174,37 +10825,15 @@ fn appendRuntimeDocumentUnitChunkWrites(
             const chunk_range_id = try documentExtractionRangeIdAlloc(scratch, context.chunk_range_base_index + (chunk_key_index / document_extraction_range_target_children));
             const chunk_route = documentExtractionRangeRoute(context.previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
             const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, context.doc_key, unit_key, unit_fingerprint, entry.name, context.artifact_name, entry.source_field, unit, chunk, true, chunk_route);
-            if (context.mode == .store_artifacts) {
-                try appendOwnedRuntimeKVPair(context.resource_tracker, context.runtime.alloc, context.writes, chunk_key, payload);
-            } else {
-                try appendUniqueOwnedRuntimeKey(
-                    []u8,
-                    context.resource_tracker,
-                    context.runtime.alloc,
-                    &context.window.changed_artifact_keys,
-                    chunk_key,
-                );
-            }
-
-            if (context.mode == .publish_replay and text_indexes.len > 0) {
-                try appendRuntimeReplayDocument(
-                    context.resource_tracker,
-                    context.runtime.alloc,
-                    context.window,
-                    chunk_key,
-                    payload,
-                    text_indexes,
-                );
-            }
+            try context.publication_spool.stageUpsert(
+                chunk_key,
+                payload,
+                text_indexes,
+                true,
+            );
 
             try context.accountAndFlushReplay(unit_working_bytes, generated_cache_bytes);
             try context.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
-            if (context.mode == .store_artifacts and (context.writes.items.len >= runtime_document_extraction_flush_write_count or
-                runtimeDocumentExtractionWriteBytes(context.writes.items) >= runtime_document_extraction_flush_write_bytes))
-            {
-                try flushRuntimeKVBatchAndClear(context.runtime, context.writes, context.deletes);
-                try context.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
-            }
 
             _ = arena_state.reset(.retain_capacity);
         }
@@ -16285,6 +16914,7 @@ fn assetSourceIndexKeyForArtifactAlloc(alloc: Allocator, artifact_key: []const u
 fn storePutWithRetry(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !void {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
+        try heartbeatEnrichmentLease(runtime);
         storePut(runtime, key, value) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
@@ -16300,6 +16930,7 @@ fn storePutWithRetry(runtime: *EnrichmentRuntime, key: []const u8, value: []cons
 fn storePutBatchWithRetry(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
+        try heartbeatEnrichmentLease(runtime);
         storePutBatch(runtime, writes, deletes) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
@@ -16316,6 +16947,8 @@ fn storePutBatchWithRetry(runtime: *EnrichmentRuntime, writes: []const KVPair, d
 fn storeCoverageBatchWithRetry(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
+        try heartbeatEnrichmentLease(runtime);
+        const fence = try requiredRuntimeStoreWriteFence(runtime);
         var batch = runtime.store.beginBatch() catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
@@ -16326,11 +16959,13 @@ fn storeCoverageBatchWithRetry(runtime: *EnrichmentRuntime, writes: []const KVPa
         };
         var committed = false;
         defer if (!committed) batch.abort();
+        try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
         for (writes) |write| try batch.put(write.key, write.value);
         for (deletes) |key| batch.delete(key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
         };
+        try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
         batch.commit() catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
@@ -17194,6 +17829,119 @@ fn heartbeatEnrichmentLease(runtime: *EnrichmentRuntime) !void {
         return error.EnrichmentLeaseFenceLost;
 }
 
+/// Renews an enrichment lease while a long-running document transform is in
+/// provider code. Store writes are still transaction-fenced; this guard avoids
+/// needless duplicate OCR after the fixed lease TTL and reports a lost tenure
+/// before convergence can become visible.
+const RuntimeLeaseHeartbeatGuard = struct {
+    runtime: *EnrichmentRuntime,
+    done: Io.Event = .unset,
+    renewal_failed: std.atomic.Value(bool) = .init(false),
+    future: ?Io.Future(void) = null,
+    lease: ?lease_mod.Lease = null,
+    owner_id: []u8 = &.{},
+    epoch: u64 = 0,
+    ttl_ms: u64 = 0,
+
+    fn init(runtime: *EnrichmentRuntime) @This() {
+        return .{ .runtime = runtime };
+    }
+
+    fn start(self: *@This()) !void {
+        if (comptime builtin.os.tag == .freestanding) return;
+        if (!self.runtime.lease_fencing_enabled or !self.runtime.ownership.lease_owned) return;
+        const io_impl = self.runtime.io_impl orelse return error.MissingBackendRuntimeIo;
+        // The renewal task must not allocate through runtime.alloc concurrently
+        // with the enrichment owner. Give its cloned lease and JSON scratch a
+        // dedicated system allocator and snapshot immutable tenure identity
+        // before starting the task.
+        self.owner_id = try std.heap.smp_allocator.dupe(u8, self.runtime.ownership.owner_id);
+        errdefer {
+            std.heap.smp_allocator.free(self.owner_id);
+            self.owner_id = &.{};
+        }
+        self.epoch = self.runtime.ownership.lease_epoch;
+        self.ttl_ms = self.runtime.ownership.lease_ttl_ms;
+        if (!self.runtime.ownership.has_lease or self.epoch == 0)
+            return error.EnrichmentLeaseFenceLost;
+        self.lease = try lease_mod.Lease.init(
+            std.heap.smp_allocator,
+            self.runtime.store,
+            enrichment_lease.default_lease_key,
+        );
+        errdefer {
+            if (self.lease) |*lease| lease.deinit();
+            self.lease = null;
+        }
+        self.future = try io_impl.io().concurrent(run, .{self});
+    }
+
+    fn stop(self: *@This()) void {
+        if (comptime builtin.os.tag == .freestanding) return;
+        if (self.future) |*future| {
+            const io = self.runtime.io_impl.?.io();
+            self.done.set(io);
+            future.await(io);
+            self.future = null;
+        }
+        if (self.lease) |*lease| lease.deinit();
+        self.lease = null;
+        if (self.owner_id.len > 0) std.heap.smp_allocator.free(self.owner_id);
+        self.owner_id = &.{};
+    }
+
+    fn check(self: *const @This()) !void {
+        if (self.renewal_failed.load(.acquire)) return error.EnrichmentLeaseFenceLost;
+    }
+
+    fn run(self: *@This()) void {
+        const io = self.runtime.io_impl.?.io();
+        const interval_ms = @max(@as(u64, 1), self.ttl_ms / 4);
+        while (!self.done.isSet()) {
+            self.done.waitTimeout(io, .{ .duration = .{
+                .raw = Io.Duration.fromMilliseconds(@intCast(interval_ms)),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => {
+                    self.renewal_failed.store(true, .release);
+                    return;
+                },
+            };
+            if (self.done.isSet()) return;
+            const now_ms = self.runtime.config.clock.nowRealtimeMs();
+            const renewed = self.lease.?.renewFenced(
+                self.owner_id,
+                self.epoch,
+                now_ms,
+                self.ttl_ms,
+            ) catch |err| switch (err) {
+                error.WriterLocked => continue,
+                else => {
+                    self.renewal_failed.store(true, .release);
+                    return;
+                },
+            };
+            if (!renewed) {
+                self.renewal_failed.store(true, .release);
+                return;
+            }
+            // Publish only the cheap scalar expiry update under the runtime
+            // mutex. Parsing/stringification happened on the guard allocator.
+            self.runtime.mutex.lockUncancelable(io);
+            if (!self.runtime.ownership.has_lease or
+                self.runtime.ownership.lease_epoch != self.epoch)
+            {
+                self.runtime.mutex.unlock(io);
+                self.renewal_failed.store(true, .release);
+                return;
+            }
+            self.runtime.ownership.lease_expires_at_ms = std.math.add(u64, now_ms, self.ttl_ms) catch std.math.maxInt(u64);
+            self.runtime.mutex.unlock(io);
+        }
+    }
+};
+
 fn currentGeneratedWriteFence(runtime: *EnrichmentRuntime) ?GeneratedWriteFence {
     if (comptime builtin.os.tag == .freestanding) return null;
     if (!runtime.lease_fencing_enabled or !runtime.ownership.lease_owned) return null;
@@ -17207,6 +17955,44 @@ fn currentGeneratedWriteFence(runtime: *EnrichmentRuntime) ?GeneratedWriteFence 
         .owner_id = runtime.ownership.owner_id,
         .epoch = runtime.ownership.lease_epoch,
     };
+}
+
+fn requiredRuntimeStoreWriteFence(runtime: *EnrichmentRuntime) !?GeneratedWriteFence {
+    if (comptime builtin.os.tag == .freestanding) return null;
+    if (!runtime.lease_fencing_enabled or !runtime.ownership.lease_owned) return null;
+    return currentGeneratedWriteFence(runtime) orelse error.EnrichmentLeaseFenceLost;
+}
+
+/// Revalidate the exact enrichment tenure inside the same transaction that
+/// mutates private spool or materialized artifact state. Heartbeats improve
+/// liveness, but this transaction-local check is the correctness boundary: an
+/// expired/superseded worker can finish provider work yet can never publish it.
+fn validateRuntimeStoreWriteFenceTxn(
+    runtime: *EnrichmentRuntime,
+    txn: anytype,
+    fence: ?GeneratedWriteFence,
+) !void {
+    const expected = fence orelse return;
+    const raw = txn.get(expected.lease_key) catch |err| switch (err) {
+        error.NotFound => return error.EnrichmentLeaseFenceLost,
+        else => return err,
+    };
+    var parsed = std.json.parseFromSlice(
+        lease_mod.LeaseRecord,
+        runtime.alloc,
+        raw,
+        .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.EnrichmentLeaseFenceLost,
+    };
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.owner_id, expected.owner_id) or
+        parsed.value.epoch != expected.epoch or
+        parsed.value.expires_at_ms <= runtime.config.clock.nowRealtimeMs())
+    {
+        return error.EnrichmentLeaseFenceLost;
+    }
 }
 
 const KVPair = struct {
@@ -17275,8 +18061,10 @@ fn storeGetAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
 }
 
 fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !void {
+    const fence = try requiredRuntimeStoreWriteFence(runtime);
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
+    try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
     const write = KVPair{ .key = key, .value = value };
     try updateDenseArtifactTargetCountersTxn(runtime, &txn, &.{write}, &.{});
     try txn.put(key, value);
@@ -17284,12 +18072,15 @@ fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !vo
         defer runtime.alloc.free(marker_key);
         try txn.put(marker_key, key);
     }
+    try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
     try txn.commit();
 }
 
 fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
+    const fence = try requiredRuntimeStoreWriteFence(runtime);
     var batch = try runtime.store.beginBatch();
     errdefer batch.abort();
+    try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
     try updateDenseArtifactTargetCountersTxn(runtime, &batch, writes, deletes);
     var marker_keys = std.ArrayListUnmanaged([]u8).empty;
     defer {
@@ -17316,6 +18107,7 @@ fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: [
             };
         }
     }
+    try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
     try batch.commit();
 }
 

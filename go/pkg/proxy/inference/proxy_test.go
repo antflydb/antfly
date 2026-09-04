@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -2236,11 +2237,466 @@ func TestProxyPartitionsMixedModelGenerateBatchAndRestoresOrder(t *testing.T) {
 	}
 	forwardedMu.Lock()
 	defer forwardedMu.Unlock()
+	slices.Sort(forwarded)
 	if !slices.Equal(forwarded, []string{"a.internal:model-a", "b.internal:model-b"}) {
 		t.Fatalf("forwarded partitions = %v", forwarded)
 	}
 	if used := p.batchResponseAdmission.Used(); used != 0 {
 		t.Fatalf("batch response admission leaked %d bytes", used)
+	}
+}
+
+func TestProxyMixedModelGenerateBatchAllowsUnevenPartitionResponses(t *testing.T) {
+	t.Parallel()
+
+	const responseLimit = int64(96 << 10)
+	spoolDirectory := t.TempDir()
+	p := NewProxy(Config{
+		DefaultPool:                  RoutePoolTarget{Pool: "primary"},
+		RefreshInterval:              time.Minute,
+		MaxBatchResponseBytes:        responseLimit,
+		MaxSpooledBatchResponseBytes: maxConcurrentGenerateBatchPartitions * responseLimit,
+		BatchResponseSpoolDir:        spoolDirectory,
+		Logger:                       zap.NewNop(),
+	})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requestBody, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		plan, err := parseProxyGenerateBatchPlan(requestBody)
+		if err != nil {
+			return nil, err
+		}
+		textBytes := 1024
+		if plan.model == "model-a" {
+			// This is comfortably below the aggregate response limit but above
+			// the old equal per-partition share.
+			textBytes = 60 << 10
+		}
+		encoded, err := json.Marshal(proxyGenerateBatchResponse{
+			Object: "generate.batch",
+			Data: []proxyGenerateBatchResult{{
+				CustomID: plan.items[0].customID,
+				Index:    0,
+				Response: json.RawMessage(fmt.Sprintf(`{"text":%q}`, strings.Repeat("x", textBytes))),
+			}},
+			Summary: proxyGenerateBatchSummary{Total: 1, Succeeded: 1},
+			Execution: &proxyBatchExecutionReport{
+				RequestedItems: 1,
+				SerialItems:    1,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewReader(encoded)),
+			Request:    req,
+		}, nil
+	})}
+	p.RegisterEndpoint("http://models.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://models.internal", map[string]map[OperationType]bool{
+		"model-a": {"generate.batch": true},
+		"model-b": {"generate.batch": true},
+	})
+
+	recorder := httptest.NewRecorder()
+	p.handleGenerateBatch(recorder, httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", strings.NewReader(
+		`{"requests":[{"custom_id":"a","body":{"model":"model-a"}},{"custom_id":"b","body":{"model":"model-b"}}]}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	var response proxyGenerateBatchResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Summary != (proxyGenerateBatchSummary{Total: 2, Succeeded: 2}) {
+		t.Fatalf("summary = %#v", response.Summary)
+	}
+	if int64(recorder.Body.Len()) > responseLimit {
+		t.Fatalf("response size = %d, exceeds aggregate limit %d", recorder.Body.Len(), responseLimit)
+	}
+	entries, err := os.ReadDir(spoolDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("response spill files leaked: %v", entries)
+	}
+}
+
+func TestProxyMixedModelGenerateBatchBoundsConcurrentFanout(t *testing.T) {
+	t.Parallel()
+
+	const groupCount = maxConcurrentGenerateBatchPartitions + 3
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	entered := make(chan struct{}, groupCount)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAll()
+	var active atomic.Int32
+	var maximum atomic.Int32
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for observed := maximum.Load(); current > observed && !maximum.CompareAndSwap(observed, current); observed = maximum.Load() {
+		}
+		entered <- struct{}{}
+		select {
+		case <-release:
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		}
+
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		plan, err := parseProxyGenerateBatchPlan(body)
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := json.Marshal(proxyGenerateBatchResponse{
+			Object: "generate.batch",
+			Data: []proxyGenerateBatchResult{{
+				CustomID: plan.items[0].customID,
+				Index:    0,
+				Response: json.RawMessage(`{"text":"ok"}`),
+			}},
+			Summary: proxyGenerateBatchSummary{Total: 1, Succeeded: 1},
+			Execution: &proxyBatchExecutionReport{
+				RequestedItems: 1,
+				SerialItems:    1,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewReader(encoded)),
+			Request:    req,
+		}, nil
+	})}
+
+	operations := make(map[string]map[OperationType]bool, groupCount)
+	var body strings.Builder
+	body.WriteString(`{"requests":[`)
+	for index := 0; index < groupCount; index++ {
+		model := fmt.Sprintf("model-%02d", index)
+		operations[model] = map[OperationType]bool{"generate.batch": true}
+		if index > 0 {
+			body.WriteByte(',')
+		}
+		fmt.Fprintf(&body, `{"custom_id":"item-%02d","body":{"model":"%s"}}`, index, model)
+	}
+	body.WriteString(`]}`)
+	p.RegisterEndpoint("http://models.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://models.internal", operations)
+
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.handleGenerateBatch(recorder, httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", strings.NewReader(body.String())))
+	}()
+
+	for index := 0; index < maxConcurrentGenerateBatchPartitions; index++ {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d partitions entered the bounded worker pool", index)
+		}
+	}
+	select {
+	case <-entered:
+		t.Fatalf("more than %d partitions entered concurrently", maxConcurrentGenerateBatchPartitions)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseAll()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("mixed-model batch did not complete")
+	}
+
+	if got := maximum.Load(); got != maxConcurrentGenerateBatchPartitions {
+		t.Fatalf("maximum concurrent partitions = %d, want %d", got, maxConcurrentGenerateBatchPartitions)
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	var response proxyGenerateBatchResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Summary != (proxyGenerateBatchSummary{Total: groupCount, Succeeded: groupCount}) {
+		t.Fatalf("summary = %#v", response.Summary)
+	}
+	for index, item := range response.Data {
+		if item.Index != index || item.CustomID != fmt.Sprintf("item-%02d", index) {
+			t.Fatalf("result %d = %#v", index, item)
+		}
+	}
+}
+
+func TestProxyMixedModelGenerateBatchDrainsOutOfOrderResponseWithoutCircularWait(t *testing.T) {
+	t.Parallel()
+
+	bDraining := make(chan struct{})
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		plan, err := parseProxyGenerateBatchPlan(body)
+		if err != nil {
+			return nil, err
+		}
+		if plan.model == "model-a" {
+			select {
+			case <-bDraining:
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
+		}
+		encoded, err := json.Marshal(proxyGenerateBatchResponse{
+			Object: "generate.batch",
+			Data: []proxyGenerateBatchResult{{
+				CustomID: plan.items[0].customID,
+				Index:    0,
+				Response: json.RawMessage(`{"text":"ok"}`),
+			}},
+			Summary: proxyGenerateBatchSummary{Total: 1, Succeeded: 1},
+			Execution: &proxyBatchExecutionReport{
+				RequestedItems: 1,
+				SerialItems:    1,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		var responseBody io.ReadCloser = io.NopCloser(bytes.NewReader(encoded))
+		if plan.model == "model-b" {
+			responseBody = io.NopCloser(&signalingReader{reader: bytes.NewReader(encoded), signal: bDraining})
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: responseBody, Request: req}, nil
+	})}
+	p.RegisterEndpoint("http://models.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://models.internal", map[string]map[OperationType]bool{
+		"model-a": {"generate.batch": true},
+		"model-b": {"generate.batch": true},
+	})
+
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.handleGenerateBatch(recorder, httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", strings.NewReader(
+			`{"requests":[{"custom_id":"a","body":{"model":"model-a"}},{"custom_id":"b","body":{"model":"model-b"}}]}`)))
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ordered reconstruction blocked draining the out-of-order response")
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	var response proxyGenerateBatchResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Summary != (proxyGenerateBatchSummary{Total: 2, Succeeded: 2}) ||
+		response.Data[0].CustomID != "a" || response.Data[1].CustomID != "b" {
+		t.Fatalf("response = %#v, want two ordered successes", response)
+	}
+}
+
+func TestProxyMixedModelGenerateBatchRefillsWorkersBeforeFirstGroupCompletes(t *testing.T) {
+	t.Parallel()
+
+	const groupCount = maxConcurrentGenerateBatchPartitions + 1
+	started := make(chan string, groupCount)
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+	defer release()
+
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requestBody, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		plan, err := parseProxyGenerateBatchPlan(requestBody)
+		if err != nil {
+			return nil, err
+		}
+		started <- plan.model
+		if plan.model == "model-00" {
+			select {
+			case <-releaseFirst:
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
+		}
+		encoded, err := json.Marshal(proxyGenerateBatchResponse{
+			Object: "generate.batch",
+			Data: []proxyGenerateBatchResult{{
+				CustomID: plan.items[0].customID,
+				Index:    0,
+				Response: json.RawMessage(`{"text":"ok"}`),
+			}},
+			Summary: proxyGenerateBatchSummary{Total: 1, Succeeded: 1},
+			Execution: &proxyBatchExecutionReport{
+				RequestedItems: 1,
+				SerialItems:    1,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(encoded)),
+			Request:    req,
+		}, nil
+	})}
+	operations := make(map[string]map[OperationType]bool, groupCount)
+	var requestBody strings.Builder
+	requestBody.WriteString(`{"requests":[`)
+	for index := 0; index < groupCount; index++ {
+		model := fmt.Sprintf("model-%02d", index)
+		operations[model] = map[OperationType]bool{"generate.batch": true}
+		if index > 0 {
+			requestBody.WriteByte(',')
+		}
+		fmt.Fprintf(&requestBody, `{"custom_id":"item-%02d","body":{"model":"%s"}}`, index, model)
+	}
+	requestBody.WriteString(`]}`)
+	p.RegisterEndpoint("http://models.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://models.internal", operations)
+
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.handleGenerateBatch(recorder, httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", strings.NewReader(requestBody.String())))
+	}()
+	startedLaterGroup := false
+	for !startedLaterGroup {
+		select {
+		case model := <-started:
+			startedLaterGroup = model == "model-08"
+		case <-time.After(2 * time.Second):
+			t.Fatal("worker pool did not refill while the first partition remained blocked")
+		}
+	}
+	release()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("mixed-model batch did not complete")
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	var response proxyGenerateBatchResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Summary != (proxyGenerateBatchSummary{Total: groupCount, Succeeded: groupCount}) {
+		t.Fatalf("summary = %#v", response.Summary)
+	}
+}
+
+func TestProxyMixedModelGenerateBatchCleansSpillsAfterCancellation(t *testing.T) {
+	t.Parallel()
+
+	spoolDirectory := t.TempDir()
+	firstWrite := make(chan struct{})
+	p := NewProxy(Config{
+		DefaultPool:           RoutePoolTarget{Pool: "primary"},
+		RefreshInterval:       time.Minute,
+		BatchResponseSpoolDir: spoolDirectory,
+		Logger:                zap.NewNop(),
+	})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requestBody, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		plan, err := parseProxyGenerateBatchPlan(requestBody)
+		if err != nil {
+			return nil, err
+		}
+		var responseBody io.ReadCloser
+		if plan.model == "model-a" {
+			responseBody = &contextBlockingReadCloser{
+				context: req.Context(),
+				first:   []byte(`{"object":"generate.batch",`),
+				signal:  firstWrite,
+			}
+		} else {
+			encoded, marshalErr := json.Marshal(proxyGenerateBatchResponse{
+				Object: "generate.batch",
+				Data: []proxyGenerateBatchResult{{
+					CustomID: plan.items[0].customID,
+					Index:    0,
+					Response: json.RawMessage(`{"text":"ok"}`),
+				}},
+				Summary: proxyGenerateBatchSummary{Total: 1, Succeeded: 1},
+			})
+			if marshalErr != nil {
+				return nil, marshalErr
+			}
+			responseBody = io.NopCloser(bytes.NewReader(encoded))
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: responseBody, Request: req}, nil
+	})}
+	p.RegisterEndpoint("http://models.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://models.internal", map[string]map[OperationType]bool{
+		"model-a": {"generate.batch": true},
+		"model-b": {"generate.batch": true},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", strings.NewReader(
+		`{"requests":[{"custom_id":"a","body":{"model":"model-a"}},{"custom_id":"b","body":{"model":"model-b"}}]}`)).WithContext(ctx)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.handleGenerateBatch(recorder, request)
+	}()
+	select {
+	case <-firstWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream response did not begin draining")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled mixed-model batch did not finish cleanup")
+	}
+	entries, err := os.ReadDir(spoolDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("response spill files leaked after cancellation: %v", entries)
+	}
+	if used := p.batchSpoolAdmission.Used(); used != 0 {
+		t.Fatalf("batch response spill admission leaked %d bytes", used)
 	}
 }
 
@@ -2321,6 +2777,191 @@ func TestProxyMixedModelGenerateBatchIsolatesPartitionFailure(t *testing.T) {
 	}
 }
 
+func TestProxyMixedModelGenerateBatchRejectsCompletedJSONWithTransportError(t *testing.T) {
+	t.Parallel()
+
+	transportErr := errors.New("sentinel response transport failure")
+	var transportFailureMode atomic.Int32
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		plan, err := parseProxyGenerateBatchPlan(body)
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := json.Marshal(proxyGenerateBatchResponse{
+			Object: "generate.batch",
+			Data: []proxyGenerateBatchResult{{
+				CustomID: plan.items[0].customID,
+				Index:    0,
+				Response: json.RawMessage(`{"text":"ok"}`),
+			}},
+			Summary: proxyGenerateBatchSummary{Total: 1, Succeeded: 1},
+			Execution: &proxyBatchExecutionReport{
+				RequestedItems: 1,
+				SerialItems:    1,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		var responseBody io.ReadCloser = io.NopCloser(bytes.NewReader(encoded))
+		if plan.model == "model-a" {
+			responseBody = &errReadCloser{data: encoded, err: transportErr}
+			if transportFailureMode.Load() == 2 {
+				responseBody = &errReadCloser{data: encoded, err: io.EOF, closeErr: transportErr}
+			}
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       responseBody,
+			Request:    req,
+		}, nil
+	})}
+	p.RegisterEndpoint("http://models.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://models.internal", map[string]map[OperationType]bool{
+		"model-a": {"generate.batch": true},
+		"model-b": {"generate.batch": true},
+	})
+
+	for _, test := range []struct {
+		name string
+		mode int32
+	}{
+		{name: "terminal read error", mode: 1},
+		{name: "close error", mode: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			transportFailureMode.Store(test.mode)
+			recorder := httptest.NewRecorder()
+			p.handleGenerateBatch(recorder, httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", strings.NewReader(
+				`{"requests":[{"custom_id":"a","body":{"model":"model-a"}},{"custom_id":"b","body":{"model":"model-b"}}]}`)))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+			}
+			var response proxyGenerateBatchResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.Summary != (proxyGenerateBatchSummary{Total: 2, Succeeded: 1, Failed: 1}) {
+				t.Fatalf("summary = %#v", response.Summary)
+			}
+			if len(response.Data[0].Error) == 0 || len(response.Data[0].Response) != 0 {
+				t.Fatalf("transport-failed partition result = %#v, want typed error", response.Data[0])
+			}
+			if len(response.Data[1].Response) == 0 || len(response.Data[1].Error) != 0 {
+				t.Fatalf("valid sibling result = %#v, want success", response.Data[1])
+			}
+			if response.Execution != nil {
+				t.Fatalf("execution = %#v, want omitted when one partition transport fails", response.Execution)
+			}
+		})
+	}
+}
+
+func TestProxyMixedModelGenerateBatchBoundsManyInvalidNearLimitPartitions(t *testing.T) {
+	t.Parallel()
+
+	const (
+		groupCount           = maxConcurrentGenerateBatchPartitions * 2
+		logicalResponseLimit = int64(512 << 10)
+	)
+	invalidPartition := []byte(fmt.Sprintf(
+		`{"object":"generate.batch","data":[{"custom_id":"wrong","index":0,"response":{"text":"%s"}}],"summary":{"total":1,"succeeded":1,"failed":0}}`,
+		strings.Repeat("x", int(logicalResponseLimit-(48<<10))),
+	))
+	if int64(len(invalidPartition)) < logicalResponseLimit*4/5 || int64(len(invalidPartition)) >= logicalResponseLimit {
+		t.Fatalf("test partition size = %d, want near configured limit %d", len(invalidPartition), logicalResponseLimit)
+	}
+
+	p := NewProxy(Config{
+		DefaultPool:                   RoutePoolTarget{Pool: "primary"},
+		RefreshInterval:               time.Minute,
+		MaxBatchResponseBytes:         logicalResponseLimit,
+		MaxRetainedBatchResponseBytes: proxyBatchResponseAdmissionBytes(logicalResponseLimit),
+		Logger:                        zap.NewNop(),
+	})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewReader(invalidPartition)),
+			Request:    req,
+		}, nil
+	})}
+	operations := make(map[string]map[OperationType]bool, groupCount)
+	var body strings.Builder
+	body.WriteString(`{"requests":[`)
+	for index := 0; index < groupCount; index++ {
+		model := fmt.Sprintf("model-%02d", index)
+		operations[model] = map[OperationType]bool{"generate.batch": true}
+		if index > 0 {
+			body.WriteByte(',')
+		}
+		fmt.Fprintf(&body, `{"custom_id":"item-%02d","body":{"model":"%s"}}`, index, model)
+	}
+	body.WriteString(`]}`)
+	p.RegisterEndpoint("http://models.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://models.internal", operations)
+
+	recorder := httptest.NewRecorder()
+	p.handleGenerateBatch(recorder, httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", strings.NewReader(body.String())))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	if int64(recorder.Body.Len()) > logicalResponseLimit {
+		t.Fatalf("response bytes = %d, exceed configured limit %d", recorder.Body.Len(), logicalResponseLimit)
+	}
+	var response proxyGenerateBatchResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Summary != (proxyGenerateBatchSummary{Total: groupCount, Failed: groupCount}) {
+		t.Fatalf("summary = %#v", response.Summary)
+	}
+	for index, item := range response.Data {
+		if item.CustomID != fmt.Sprintf("item-%02d", index) || item.Index != index || len(item.Error) == 0 || len(item.Response) != 0 {
+			t.Fatalf("result %d = %#v, want ordered proxy error", index, item)
+		}
+	}
+}
+
+func TestProxyMixedModelGenerateBatchRejectsUnrepresentableResponseLimitBeforeForwarding(t *testing.T) {
+	t.Parallel()
+
+	var forwarded atomic.Bool
+	p := NewProxy(Config{
+		DefaultPool:                   RoutePoolTarget{Pool: "primary"},
+		RefreshInterval:               time.Minute,
+		MaxBatchResponseBytes:         128,
+		MaxRetainedBatchResponseBytes: proxyBatchResponseAdmissionBytes(128),
+		Logger:                        zap.NewNop(),
+	})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		forwarded.Store(true)
+		return nil, errors.New("must not forward")
+	})}
+	p.RegisterEndpoint("http://models.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://models.internal", map[string]map[OperationType]bool{
+		"model-a": {"generate.batch": true},
+		"model-b": {"generate.batch": true},
+	})
+
+	recorder := httptest.NewRecorder()
+	p.handleGenerateBatch(recorder, httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", strings.NewReader(
+		`{"requests":[{"custom_id":"a","body":{"model":"model-a"}},{"custom_id":"b","body":{"model":"model-b"}}]}`)))
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413: %s", recorder.Code, recorder.Body.String())
+	}
+	if forwarded.Load() {
+		t.Fatal("batch was forwarded despite an unrepresentable response envelope")
+	}
+}
+
 func TestProxyMixedModelGenerateBatchDiscardsInvalidPartitionBeforeAccounting(t *testing.T) {
 	t.Parallel()
 
@@ -2340,8 +2981,10 @@ func TestProxyMixedModelGenerateBatchDiscardsInvalidPartitionBeforeAccounting(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	logicalResponseLimit := int64(len(validPartition) + 8)
-	invalidPartition := strings.Repeat("x", int(logicalResponseLimit-4))
+	logicalResponseLimit := int64(len(validPartition) + 4096)
+	invalidPartition := strings.Repeat("x", len(validPartition)+64)
+	oversizedPartition := strings.Repeat("x", int(logicalResponseLimit+1))
+	var returnOversized atomic.Bool
 
 	p := NewProxy(Config{
 		DefaultPool:                   RoutePoolTarget{Pool: "primary"},
@@ -2362,6 +3005,9 @@ func TestProxyMixedModelGenerateBatchDiscardsInvalidPartitionBeforeAccounting(t 
 		responseBody := validPartition
 		if plan.model == "model-a" {
 			responseBody = []byte(invalidPartition)
+			if returnOversized.Load() {
+				responseBody = []byte(oversizedPartition)
+			}
 		}
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -2376,26 +3022,37 @@ func TestProxyMixedModelGenerateBatchDiscardsInvalidPartitionBeforeAccounting(t 
 	p.registry.UpdateModelOperations("http://b.internal", map[string]map[OperationType]bool{"model-b": {"generate.batch": true}})
 
 	body := `{"requests":[{"custom_id":"a","body":{"model":"model-a"}},{"custom_id":"b","body":{"model":"model-b"}}]}`
-	recorder := httptest.NewRecorder()
-	p.handleGenerateBatch(recorder, httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", strings.NewReader(body)))
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
-	}
-	var response proxyGenerateBatchResponse
-	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
-	if response.Summary != (proxyGenerateBatchSummary{Total: 2, Succeeded: 1, Failed: 1}) {
-		t.Fatalf("summary = %#v", response.Summary)
-	}
-	if len(response.Data[0].Error) == 0 {
-		t.Fatalf("invalid partition result = %#v, want typed error", response.Data[0])
-	}
-	if len(response.Data[1].Response) == 0 || len(response.Data[1].Error) != 0 {
-		t.Fatalf("valid sibling result = %#v, want success", response.Data[1])
-	}
-	if response.Execution != nil {
-		t.Fatalf("execution = %#v, want omitted when one partition is untrusted", response.Execution)
+	for _, test := range []struct {
+		name      string
+		oversized bool
+	}{
+		{name: "malformed"},
+		{name: "oversized", oversized: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			returnOversized.Store(test.oversized)
+			recorder := httptest.NewRecorder()
+			p.handleGenerateBatch(recorder, httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", strings.NewReader(body)))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+			}
+			var response proxyGenerateBatchResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.Summary != (proxyGenerateBatchSummary{Total: 2, Succeeded: 1, Failed: 1}) {
+				t.Fatalf("summary = %#v", response.Summary)
+			}
+			if len(response.Data[0].Error) == 0 {
+				t.Fatalf("invalid partition result = %#v, want typed error", response.Data[0])
+			}
+			if len(response.Data[1].Response) == 0 || len(response.Data[1].Error) != 0 {
+				t.Fatalf("valid sibling result = %#v, want success", response.Data[1])
+			}
+			if response.Execution != nil {
+				t.Fatalf("execution = %#v, want omitted when one partition is untrusted", response.Execution)
+			}
+		})
 	}
 }
 
@@ -4177,14 +4834,28 @@ func TestProxyBodyAdmissionAccountsForDecodeAndExactRetention(t *testing.T) {
 
 func TestProxyBatchResponseAdmissionAccountsForCaptureAndReassembly(t *testing.T) {
 	t.Parallel()
-	if got := proxyBatchResponseAdmissionBytes(1024); got != 4096 {
-		t.Fatalf("batch response admission = %d, want 4096", got)
+	wantAdmission := int64(4096) + int64(maxConcurrentGenerateBatchPartitions)*proxyResponseWorkerAdmissionBytes(defaultMaxProxyUpstreamResponseHeaderBytes)
+	if got := proxyBatchResponseAdmissionBytes(1024); got != wantAdmission {
+		t.Fatalf("batch response admission = %d, want %d", got, wantAdmission)
+	}
+	wantTwoWorkers := int64(4096) + 2*proxyResponseWorkerAdmissionBytes(defaultMaxProxyUpstreamResponseHeaderBytes)
+	if got := proxyBatchResponseAdmissionBytesForWorkers(1024, 2, defaultMaxProxyUpstreamResponseHeaderBytes); got != wantTwoWorkers {
+		t.Fatalf("two-worker batch response admission = %d, want %d", got, wantTwoWorkers)
 	}
 	if got := proxyBatchResponseAdmissionBytes(math.MaxInt64); got != math.MaxInt64 {
 		t.Fatalf("saturated batch response admission = %d", got)
 	}
-	if got := proxyBatchResponseBytesForAdmission(4095); got != 1023 {
-		t.Fatalf("effective batch response limit = %d, want 1023", got)
+	if got := proxyBatchSpoolAdmissionBytes(1024, 3); got != 3072 {
+		t.Fatalf("batch response spill admission = %d, want 3072", got)
+	}
+	if got := proxyBatchSpoolAdmissionBytes(math.MaxInt64, 2); got != math.MaxInt64 {
+		t.Fatalf("saturated spill admission = %d", got)
+	}
+	if got := proxyBatchSpoolBytesForResponse(3073, 3); got != 1024 {
+		t.Fatalf("effective response spill limit = %d, want 1024", got)
+	}
+	if got := proxyBatchResponseBytesForAdmission(4095); got != 0 {
+		t.Fatalf("effective batch response limit = %d, want 0", got)
 	}
 	p := NewProxy(Config{
 		MaxBatchResponseBytes:         1024,
@@ -4194,8 +4865,8 @@ func TestProxyBatchResponseAdmissionAccountsForCaptureAndReassembly(t *testing.T
 	if got := p.batchResponseAdmission.Limit(); got != 100 {
 		t.Fatalf("batch response admission limit = %d, want configured process ceiling 100", got)
 	}
-	if got := p.maxBatchResponseBytes; got != 25 {
-		t.Fatalf("effective batch response limit = %d, want 25", got)
+	if got := p.maxBatchResponseBytes; got != 0 {
+		t.Fatalf("effective batch response limit = %d, want 0", got)
 	}
 
 	p = NewProxy(Config{
@@ -4208,6 +4879,125 @@ func TestProxyBatchResponseAdmissionAccountsForCaptureAndReassembly(t *testing.T
 	}
 	if got := p.maxRequestBodyBytes; got != 33 {
 		t.Fatalf("effective request body limit = %d, want 33", got)
+	}
+}
+
+func TestProxyTransportRejectsOversizedUpstreamResponseHeaders(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Oversized", strings.Repeat("x", 2048))
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	p := NewProxy(Config{MaxUpstreamResponseHeaderBytes: 1024, Logger: zap.NewNop()})
+	transport, ok := p.registry.client.Transport.(*http.Transport)
+	if !ok || transport.MaxResponseHeaderBytes != 1024 {
+		t.Fatalf("transport = %#v, want 1024-byte response-header ceiling", p.registry.client.Transport)
+	}
+	response, err := p.registry.client.Get(server.URL)
+	if response != nil {
+		_ = response.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("oversized upstream response headers were accepted")
+	}
+}
+
+func TestProxyTransportClonesExplicitHTTPTransport(t *testing.T) {
+	t.Parallel()
+
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.MaxResponseHeaderBytes = 123
+	p := NewProxy(Config{
+		UpstreamTransport:              base,
+		MaxUpstreamResponseHeaderBytes: 4096,
+		Logger:                         zap.NewNop(),
+	})
+	if p.registry.ownedTransport == nil {
+		t.Fatal("proxy did not retain its owned transport clone")
+	}
+	if p.registry.ownedTransport == base {
+		t.Fatal("proxy mutated and retained the caller's transport")
+	}
+	if p.registry.ownedTransport.MaxResponseHeaderBytes != 4096 {
+		t.Fatalf("response header ceiling = %d, want 4096", p.registry.ownedTransport.MaxResponseHeaderBytes)
+	}
+	if base.MaxResponseHeaderBytes != 123 {
+		t.Fatalf("caller transport was mutated: header ceiling = %d", base.MaxResponseHeaderBytes)
+	}
+}
+
+func TestProxyPreservesCustomTransportAndClosesIdleConnectionsOnStop(t *testing.T) {
+	t.Parallel()
+
+	transport := &trackingRoundTripper{}
+	p := NewProxy(Config{
+		UpstreamTransport:              transport,
+		MaxUpstreamResponseHeaderBytes: 1024,
+		Logger:                         zap.NewNop(),
+	})
+	if p.registry.ownedTransport != nil {
+		t.Fatalf("custom transport unexpectedly replaced by owned HTTP transport: %#v", p.registry.ownedTransport)
+	}
+	response, err := p.registry.client.Get("http://inference.internal/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if got := transport.roundTrips.Load(); got != 1 {
+		t.Fatalf("custom transport round trips = %d, want 1", got)
+	}
+	if err := p.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := transport.idleCloses.Load(); got != 2 {
+		t.Fatalf("custom transport idle closes = %d, want 2", got)
+	}
+}
+
+func TestBoundedProxyResponseWriterRetainsOnlyRequiredMetadata(t *testing.T) {
+	t.Parallel()
+
+	capture := newBoundedProxyResponseWriter(1024)
+	t.Cleanup(func() { _ = capture.releaseBody() })
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header: http.Header{
+			"Retry-After": []string{"7"},
+			"X-Ignored":   []string{strings.Repeat("x", 1<<20)},
+		},
+		Body: io.NopCloser(strings.NewReader(`{"error":"busy"}`)),
+	}
+	if err := copyResponse(capture, response); err != nil {
+		t.Fatal(err)
+	}
+	if got := capture.header.Get("Retry-After"); got != "7" {
+		t.Fatalf("Retry-After = %q, want 7", got)
+	}
+	if got := capture.header.Get("X-Ignored"); got != "" {
+		t.Fatalf("irrelevant response metadata was retained: %d bytes", len(got))
+	}
+	if capture.transportErr != nil {
+		t.Fatalf("transport error = %v", capture.transportErr)
+	}
+
+	tooLarge := newBoundedProxyResponseWriter(1024)
+	t.Cleanup(func() { _ = tooLarge.releaseBody() })
+	response = &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Retry-After": []string{strings.Repeat("9", maxRetainedProxyRetryAfterBytes+1)}},
+		Body:       io.NopCloser(strings.NewReader(`{}`)),
+	}
+	if err := copyResponse(tooLarge, response); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(tooLarge.transportErr, errProxyResponseMetadataTooLarge) {
+		t.Fatalf("transport error = %v, want metadata-too-large", tooLarge.transportErr)
 	}
 }
 
@@ -4545,10 +5335,65 @@ func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
 }
 
+type trackingRoundTripper struct {
+	roundTrips atomic.Int32
+	idleCloses atomic.Int32
+}
+
+func (t *trackingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.roundTrips.Add(1)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{}`)),
+		Request:    req,
+	}, nil
+}
+
+func (t *trackingRoundTripper) CloseIdleConnections() {
+	t.idleCloses.Add(1)
+}
+
+type signalingReader struct {
+	reader *bytes.Reader
+	signal chan struct{}
+	once   sync.Once
+}
+
+func (r *signalingReader) Read(buffer []byte) (int, error) {
+	r.once.Do(func() { close(r.signal) })
+	return r.reader.Read(buffer)
+}
+
+type contextBlockingReadCloser struct {
+	context context.Context
+	first   []byte
+	signal  chan struct{}
+	once    sync.Once
+}
+
+func (r *contextBlockingReadCloser) Read(buffer []byte) (int, error) {
+	if len(r.first) != 0 {
+		written := copy(buffer, r.first)
+		r.first = r.first[written:]
+		if len(r.first) == 0 {
+			r.once.Do(func() { close(r.signal) })
+		}
+		return written, nil
+	}
+	<-r.context.Done()
+	return 0, r.context.Err()
+}
+
+func (r *contextBlockingReadCloser) Close() error {
+	return nil
+}
+
 type errReadCloser struct {
-	data []byte
-	err  error
-	read bool
+	data     []byte
+	err      error
+	closeErr error
+	read     bool
 }
 
 func (r *errReadCloser) Read(p []byte) (int, error) {
@@ -4561,5 +5406,5 @@ func (r *errReadCloser) Read(p []byte) (int, error) {
 }
 
 func (r *errReadCloser) Close() error {
-	return nil
+	return r.closeErr
 }

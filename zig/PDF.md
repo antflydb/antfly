@@ -4,7 +4,11 @@ Status: bounded document preparation, indexed reader execution, multimodal
 generation transport, distributed model-aware routing, lease-fenced durable
 page-image embedding, observed remote execution, and post-review batching
 hardening, single-pass PDF preparation, bounded unit replay, and hot-path
-allocation reductions implemented
+allocation reductions implemented. Document-scoped render lanes, dynamically
+bounded parallel preprocessing on a reusable process-wide worker pool, direct
+JPEG-to-CHW writes, prepared tokenizer inputs, lease-renewed and
+transaction-fenced attempt storage, and bounded concurrent proxy partitions
+are also implemented.
 
 This document describes how Antfly turns documents into bounded inference work.
 PDF extraction, page rendering, OCR, generation, and embedding share document
@@ -256,7 +260,48 @@ compatible. Each window is bounded simultaneously by:
 One render window is the default. Optional render/inference overlap uses one
 prefetch window and is enabled only after admission reserves the combined peak
 of both windows. Estimates guide scheduling; hard bounded allocators, decoder
-limits, and model admission remain the enforcement boundary.
+limits, and model admission remain the enforcement boundary for memory visible
+to Antfly allocators. Framework-private renderer memory is handled separately
+under the compatibility-backend contract below.
+
+The implemented preparation work is currently task-specific: generation keeps
+per-model contracts and per-item prompt estimates, while reranking and
+classification-backed extraction own typed encoded inputs through admission and
+execution. A future convergence step may place a process-level microbatch
+broker behind the document coordinator. That broker could coalesce compatible
+tail windows from several documents, but would have to enforce fairness,
+deadlines, cancellation, and independent byte/pixel ceilings. The following
+`PreparedTaskInput` is an illustrative future unification, not a current public
+type:
+
+```zig
+const PreparedTaskInput = union(Task) {
+    read: PreparedReadRows,
+    generate: PreparedGenerationSequences,
+    embed: PreparedEmbeddingRows,
+    rerank: PreparedQueryCandidateRows,
+    extract: PreparedSchemaRows,
+    // Remaining task families retain equally explicit layouts.
+};
+```
+
+Current prepared values own or borrow the encoded rows, masks, exact lengths,
+and execution permits needed by their concrete task. Preflight, usage
+accounting, and execution consume that same value. The future common shape must
+also carry media references, row-to-item mapping, provenance, and admission
+charges. Executor stage support remains explicit—transport grouping, fetch,
+render, decode/preprocess, fused encoder rows, vision prefill, and decoder
+scheduling—because accepting an outer array does not prove that every stage
+executes natively as a batch.
+
+Resource admission is correspondingly multi-axis. Item, candidate, label,
+schema, page/chunk, token, encoded-byte, decoded-pixel, result-byte, and
+accelerator-work dimensions remain distinct. Existing adapters preserve
+input-indexed results with task-specific mappings. A future generic
+`BatchLayout` can make that mapping reusable for fused model rows or generation
+sequences; it must never infer identity from completion order or erase the
+different result semantics of readers, generators, embedders, rerankers,
+extractors/classifiers, chunkers, rewriters, and transcribers.
 
 ### Generic attachment transport ABI
 
@@ -284,6 +329,17 @@ duration of the synchronous invocation. The host validates ABI version,
 pointer/count consistency, indexes, MIME types, byte limits, and per-item
 cardinality before borrowing memory. Unsupported remote transports perform
 base64 or multipart adaptation only at their final provider boundary.
+
+For distributed Antfly-to-Antfly traffic, framed binary metadata plus bounded
+attachment segments is a future transport optimization; current HTTP adapters
+still use their explicit JSON/data-URI compatibility representation. The future
+metadata frame should carry item identities, MIME essences, attachment indexes,
+lengths, and checksums, with subsequent bounded frames carrying bytes. A
+receiver must admit the declared aggregate before reading segments and validate
+actual lengths before preprocessing. External providers and older nodes would
+retain JSON/data-URI adaptation selected by the leased route capability. This
+would remove base64 expansion without weakening the borrowed-attachment
+logical contract already used in-process.
 
 Per-item identity removes the current need to split otherwise compatible local
 batches at document boundaries solely for profiling. Cross-document batching
@@ -2175,7 +2231,8 @@ The hardening above follows these long-term rules:
 63. **Implemented after distributed mixed-batch review:** the proxy accepts the
     same mixed-model generation batch contract as direct inference nodes. It
     authenticates and admits the outer body once, stably partitions items by
-    resolved model, and executes one partition at a time by default. Each
+    resolved model, and executes independent partitions with bounded
+    concurrency. Each
     partition performs ordinary operation-aware routing and admission against
     a fresh route snapshot; an outer capability token is removed because it
     cannot fence several model routes. Results and typed failures are validated
@@ -2202,7 +2259,9 @@ The hardening above follows these long-term rules:
     become retained only after JSON, cardinality, identity, summary, and
     execution-envelope validation succeeds. A discarded partition releases its
     capture and cannot consume the logical aggregate budget needed by a valid
-    later partition.
+    sibling partition. Each active partition receives an independent fair share
+    of one process-admitted capture budget; only validated envelopes enter the
+    request-wide retained-result budget.
 67. **Implemented after execution-telemetry review:** the proxy counts only
     provable local pre-execution failures as rejected items. Upstream status,
     oversize, and malformed-envelope failures make aggregate execution state
@@ -2230,15 +2289,17 @@ The hardening above follows these long-term rules:
     owns inspection, page metadata, and the immutable xref/trailer state used
     by OCR render forks. Final resolved units are serialized once into a
     bounded, attempt-private hybrid spool and replayed one unit at a time for
-    artifact materialization and publication. PDFs below the four-MiB spool
-    window replay directly from admitted memory; larger documents spill in
-    bounded store batches. The old three extraction walks are therefore one
-    transformation walk plus two cheap typed replays. Spill writes are
+    artifact materialization and publication. Attempts that remain below both
+    the 128-unit and four-MiB write thresholds replay directly from admitted
+    memory; larger unit streams spill in bounded store batches. The old three
+    extraction walks are therefore one transformation walk plus two cheap
+    typed replays. Spill writes are
     transactional but intentionally do not force durability or enter artifact
     accounting; a retry prefix-clears every stale attempt for the leased
     document artifact before writing, and every exit performs best-effort
-    cleanup. The PDF reader and its native memory reservation are released
-    before database materialization begins.
+    cleanup. The prepared reader, downloaded source, and native render
+    reservation are released after the input-unit spool is sealed and before
+    bounded materialization/publication replay begins.
 72. **Implemented after renderer metadata review:** render workers borrow the
     prepared document's immutable page index, xref entries, and trailer rather
     than cloning structures proportional to the PDF for every page. Each fork
@@ -2247,12 +2308,14 @@ The hardening above follows these long-term rules:
     fork-control allowance instead of charging the source document once per
     worker.
 73. **Implemented after render scheduling review:** a render call creates its
-    worker team once and reuses those threads across every admitted wave. Each
-    wave still creates and destroys task-local mutable reader state, while a
-    generation counter coordinates reusable workers and joins all active work
-    before buffers are released. Planned adaptive geometry is passed into the
-    first render attempt, avoiding duplicate page-box/rotation work; geometry
-    is recomputed only for a quality/size retry.
+    worker team once and reuses those threads across every admitted wave. A
+    generation counter coordinates workers and joins all active work before
+    buffers are released. The immutable prepared document survives across
+    waves, while each wave creates and destroys private render forks and their
+    mutable caches; worker-thread reuse does not turn those caches into shared
+    or cross-wave state. Planned adaptive geometry is passed into the first
+    render attempt, avoiding duplicate page-box/rotation work; geometry is
+    recomputed only for a quality/size retry.
 74. **Implemented after output-credit and storage review:** page-image
     embedding pins its complete pre-admitted output credit for the whole
     operation instead of releasing and reacquiring capacity between windows.
@@ -2261,9 +2324,119 @@ The hardening above follows these long-term rules:
     writer-transaction amplification without retaining more than one window.
 75. **Implemented after hot-path allocation review:** OCR and visual embedding
     choose the largest admissible prefix with monotonic binary search rather
-    than decrementing one page at a time. Generic image batches and Florence
-    batches preprocess decoded images directly into their final batch tensor,
-    eliminating one full float tensor allocation and copy per image.
+    than decrementing one page at a time. Generic image, CLIP, and Florence
+    batches assign deterministic final tensor slices before dispatch and write
+    into them directly, eliminating one full float tensor allocation and copy
+    per image. Supported baseline color JPEGs additionally decode component
+    planes and write normalized CLIP CHW values into the caller-owned final
+    slice without materializing an intermediate RGBA image; unsupported JPEG
+    variants and other formats retain the bounded decoded-image fallback.
+76. **Implemented after renderer performance review:** render-output retries
+    shrink from the raster's measured dimensions and therefore make strict
+    progress even when the configured ceiling is much larger than the page.
+    One atomic document-batch allocator is the hard aggregate boundary for
+    allocations made through the native Zig render forks, while per-lane
+    limits remain safety rails; page-wave admission also reserves each page's
+    decoder working-set allowance without charging the entire document decoder
+    ceiling to every worker. This allocator cannot observe CoreGraphics or
+    CoreFoundation's internal framework allocations. The macOS compatibility
+    backend therefore borrows the PDF source through no-copy `CFData`, retains
+    one document session, serializes compatibility pages whose CoreGraphics
+    concurrency/retention contract is unknown, and keeps their caller-owned
+    RGBA/PNG buffers under the allocator and pixel ceilings. The surrounding
+    process reservation conservatively accounts for framework work, but peak
+    RSS qualification—not `BudgetedAllocator`—is the enforcement evidence for
+    memory allocated internally by Apple frameworks.
+77. **Implemented after lease, LMDB, and publication review:** every potentially
+    blocking document/media producer keeps its enrichment tenure alive through
+    complete materialization and final publication, not only through PDF OCR.
+    The renewal task owns a cloned lease backed by the process thread-safe
+    allocator; it performs parsing/stringification outside the runtime mutex and
+    publishes only the renewed scalar expiry under that lock. Every private
+    spool mutation and public promotion validates the exact owner/epoch/expiry
+    inside its write transaction. Expired attempt prefixes are scavenged before
+    fingerprint fast paths, downloaded PDF bytes are released after preparation,
+    and spilled PDFs retain no duplicate generated-unit cache. Unit replay copies
+    a count- and byte-bounded segment, closes its LMDB read transaction, and only
+    then invokes a sink that may write. Materialization writes unit, chunk,
+    navigation, state, and manifest values solely to an attempt-private
+    publication spool; a failure before sealing cannot overwrite the prior
+    generation or enqueue searchable work. After complete materialization,
+    bounded replay windows atomically promote each staged artifact with its
+    matching derived/outbox obligation, with the converged manifest staged last.
+    Mixed born-digital and scanned pages preserve ordered slots while coalescing
+    compatible OCR candidates.
+78. **Implemented after repeated-tokenization review:** a generation batch
+    resolves one provisional immutable manifest/contract per requested model.
+    It rejects known-invalid raw envelopes before base64 decoding or model
+    loading, caches the exact encoded-byte and decoded-pixel measurements used
+    to plan bounded windows, then revalidates those measurements against the
+    exact loaded artifact generation before model admission. Each admitted item
+    retains its formatted and tokenized prompt for execution. Reranking and
+    classification-backed extraction expose typed prepared values that own
+    their encoded rows, exact token counts, execution permits, and
+    pipeline-generation identity. Classification additionally snapshots label
+    contents and order so borrowed result labels cannot be re-attributed after
+    preparation; late-interaction reranking binds every tokenization control,
+    including single-text framing and BOS insertion. Admission, usage
+    accounting, and execution consume that same preparation instead of
+    tokenizing again.
+79. **Implemented after remote-client review:** a managed embedder owns a
+    persistent keep-alive HTTP client for its lifetime. The client shell follows
+    the embedder owner, while request, response, pool, DNS, and TLS allocations
+    use a process thread-safe allocator so concurrent calls never borrow a
+    request arena for shared state. Capability discovery, Antfly, Bedrock, and
+    OpenAI-compatible embedding calls reuse that transport with cookies
+    disabled. A Bedrock operation creates one absolute cancellation/deadline
+    context and spends its residual budget across cache waits, STS/ECS/IMDS
+    credential acquisition, every internal model batch, and the final request.
+    Cache-owned credential snapshots likewise use thread-safe lifetime storage;
+    caller-owned result clones retain their caller allocator. Constructor
+    ownership transfer is allocation-transactional: failure after pacer or
+    transport creation releases every shared reference and owned allocation.
+80. **Implemented after model-catalog API review:** classification remains an
+    extraction executor and is absent from the public `/ai/v1/models` family
+    map. CI asserts that clients discover it through `extract` rather than
+    reviving a parallel `/classify` surface.
+81. **Implemented after preprocessing review:** generic image, CLIP, and
+    Florence batches preprocess in deterministic input-indexed waves on the
+    reusable process-wide inference worker pool. Worker count is CPU-aware and
+    capped at eight; the pool's submission gate prevents concurrent requests
+    from multiplying thread teams, its final job runs inline to guarantee
+    progress, and unsupported platforms use its serial fallback. Every codec
+    allocation in a wave (decoded pixels, PNG scan buffers, progressive-JPEG
+    coefficient state, and other scratch) is suballocated from one reusable,
+    thread-safe request slab. The slab starts from the current admitted wave's
+    decoded demand plus bounded worker headroom, grows geometrically only
+    between waves with zero live allocations, retires old backing before a
+    replacement is allocated, and never grows past the 128-MiB default physical
+    boundary. A cap-exhausted wave reduces concurrency; successful waves grow
+    worker width back toward the configured limit so one scratch-heavy prefix
+    cannot serialize a cheap tail. Caller-owned final tensor storage is
+    admitted separately and receives disjoint indexed writes.
+    Florence consumes decoded RGBA directly, while supported baseline JPEG CLIP
+    inputs take the direct component-plane to normalized-CHW path described
+    above.
+82. **Implemented after proxy-fanout review:** mixed-model generation partitions
+    use a bounded eight-worker pool. Routing, inference, and independently
+    bounded body draining overlap; reconstruction alone remains in stable model
+    and item order. Each active partition drains into its own request-bounded
+    temporary spill file under one process-wide, pre-acquired disk admission,
+    so an uneven, oversized, or malformed response cannot steal a sibling's
+    allowance or hold its upstream connection behind reconstruction order.
+    The coordinator consumes each completion immediately, removes its spill,
+    and refills that worker slot; indexed results and per-partition execution
+    reports are merged only in stable order. On POSIX, spill files are unlinked
+    as soon as they open for crash cleanup; explicit close/removal covers other
+    platforms and every normal or cancellation path. The aggregate logical
+    allowance still reserves the final outer envelope and worst-case
+    proxy-generated failures. Shallow validation discards malformed payloads,
+    while read and close errors invalidate even complete JSON. A
+    configured transport header ceiling and conservative per-worker metadata
+    reservation bound completed response headers; captures retain only
+    `Retry-After`. Caller-supplied transports remain in use through a bounded
+    wrapper, owned `http.Transport` clones are tracked, and proxy shutdown
+    closes idle upstream connections.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -2649,9 +2822,19 @@ const PdfRenderAdmission = struct {
 ```
 
 Estimates are intentionally conservative. Every task also uses a hard
-`BudgetedAllocator`, and PDF stream decoding retains its existing decoded
-stream and peak working-set limits. An underestimate therefore causes an
-identified resource failure rather than unbounded growth.
+`BudgetedAllocator` for allocations routed through the native Zig renderer,
+and PDF stream decoding retains its existing decoded-stream and peak
+working-set limits. An underestimate in allocator-accounted work therefore
+causes an identified resource failure rather than unbounded growth.
+
+CoreGraphics and CoreFoundation may retain internal memory outside that
+allocator. Compatibility rendering is consequently a distinct containment
+case: its caller-owned RGBA and PNG buffers remain allocator- and pixel-bounded,
+the PDF source is borrowed without a copy, and one document-scoped compatibility
+session serializes fallback pages. The process-wide native reservation includes
+a conservative allowance for this framework work, but it is admission
+accounting rather than a hard allocator interception. Release qualification
+must measure peak RSS for PDFs that exercise the compatibility backend.
 
 Effective per-document concurrency is:
 
@@ -3143,8 +3326,13 @@ byte admission. Parallelism defaults to one and is operator-capped at eight.
   persistent/decode/raster budgets, and recompute available render bytes before
   each window.
 - Downsize encoded output within each worker before retaining a completed page.
-- Borrow immutable document metadata into worker forks and reuse one worker
-  team across all waves in a render call; mutable caches remain wave-local.
+- Borrow immutable document metadata into wave-local worker forks and reuse one
+  worker thread team across all waves in a render call; mutable reader/cache
+  state is destroyed at the end of each wave.
+- Treat the native Zig allocator ceiling and the CoreGraphics framework
+  allowance as separate guarantees. Compatibility pages are serialized and
+  RSS-qualified because framework-private allocations cannot be intercepted by
+  `BudgetedAllocator`.
 
 ### Phase 4: Binary local media handoff
 
@@ -3175,12 +3363,17 @@ prefetch at zero.
 
 ### Phase 6: Optional decoded-image handoff
 
-Status: direct-to-batch-tensor preprocessing is complete; passing decoded PDF
-rasters across the local model boundary remains measurement-driven follow-up.
+Status: bounded direct-to-batch-tensor preprocessing is complete. It uses the
+process-wide inference worker pool, deterministic output slices, direct RGBA
+consumption for Florence, and direct baseline-JPEG component-plane-to-CHW
+writes for CLIP. Passing decoded PDF rasters across the local model boundary
+remains a measurement-driven future optimization.
 
 - Measure whether PNG encode/decode remains material after Phase 4.
-- If justified, define a stable decoded pixel format at the local boundary.
-- Feed decoded image batches directly into Florence preprocessing.
+- If justified, define a stable decoded pixel format and ownership/admission
+  contract at the local boundary.
+- Pass decoded PDF image batches directly into the already in-place Florence
+  tensor preprocessing path.
 - Preserve encoded-image fallback for other reader families.
 
 ### Phase 7: Fuse PDF inspection and render preparation if needed
@@ -3240,6 +3433,8 @@ The following remain qualification work rather than architectural blockers:
 - Whether a process-wide CPU permit pool materially improves control beyond
   the existing reusable per-render worker team, per-document cap, bounded
   enrichment execution lanes, and global resource-manager byte reservation.
+  This is specifically a renderer decision: image preprocessing already uses
+  the reusable process-wide inference worker pool.
 - Whether the long-term pipeline should retain PNG as the local interchange
   format or move directly to RGB pixels after measuring Phase 4.
 - Whether the attempt spool should eventually use a compact versioned binary

@@ -310,18 +310,15 @@ pub const ReadingPipeline = struct {
         const pixel_values = try allocator.alloc(f32, pixel_count);
         defer allocator.free(pixel_values);
 
-        for (image_datas, 0..) |image_data, i| {
-            const decoded = try image.decode(allocator, image_data);
-            defer decoded.deinit(allocator);
-            try image.preprocessDecodedWithResampleInto(
-                decoded,
-                pixel_values[i * per_image ..][0..per_image],
-                img_size,
-                self.config.image_mean,
-                self.config.image_std,
-                self.config.resample,
-            );
-        }
+        try image.preprocessBatchIntoBounded(
+            pixel_values,
+            image_datas,
+            img_size,
+            self.config.image_mean,
+            self.config.image_std,
+            self.config.resample,
+            .{},
+        );
 
         const prompt_text = self.config.prompt orelse "<OCR>";
         const prompt_i32 = try buildFlorencePromptIds(

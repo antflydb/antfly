@@ -100,6 +100,10 @@ test "managed embedder deadlines bound provider pacing and transport" {
     try local.testAntflyProviderRequestControls();
 }
 
+test "managed embedder constructor releases pacing ownership on allocation failure" {
+    try managed_embedder.testManagedEmbedderConstructorAllocationFailureCleanup();
+}
+
 test "managed embedder cancels an in-flight remote embedding request" {
     try managed_embedder.testRemoteEmbeddingCancellation();
 }

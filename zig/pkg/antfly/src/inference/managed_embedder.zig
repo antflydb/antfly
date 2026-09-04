@@ -359,7 +359,11 @@ fn bindOwnedHttpIoIfNeeded(
     if (options.io != null) return null;
     const io_impl = try alloc.create(std.Io.Threaded);
     errdefer alloc.destroy(io_impl);
-    io_impl.* = std.Io.Threaded.init(alloc, .{});
+    // The caller allocator owns only this stable-lifetime shell. Threaded uses
+    // its allocator from worker threads for futures, groups, and runtime
+    // bookkeeping, so its internal allocator must be thread-safe regardless
+    // of whether the public owner supplied an arena or another local allocator.
+    io_impl.* = std.Io.Threaded.init(std.heap.smp_allocator, .{});
     options.io = io_impl.io();
     options.bounded_http_request = true;
     return io_impl;
@@ -612,6 +616,10 @@ pub const ManagedEmbeddingEntry = struct {
     auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    /// Lifetime-owned by ManagedEmbedder and shared by all remote operations.
+    /// Request-local overlays borrow this pointer, preserving connection/DNS/
+    /// TLS state without moving client synchronization objects.
+    shared_http_client: ?*httpx.Client = null,
     dimensions: u32,
     sparse: bool = false,
     multimodal: bool = false,
@@ -636,6 +644,14 @@ pub const ManagedEmbeddingEntry = struct {
         overlay.shared_remote_capability_cache = self.capabilityCache();
         overlay.remote_capability_cache = null;
         return overlay;
+    }
+
+    fn httpClient(self: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator, fallback: *?httpx.Client) !*httpx.Client {
+        if (self.shared_http_client) |client| return client;
+        // Direct unit construction remains supported; production constructors
+        // always attach the lifetime client below.
+        fallback.* = httpx.Client.initWithConfig(alloc, try embeddingHttpIo(self), try embeddingHttpClientConfig(self));
+        return &fallback.*.?;
     }
 
     fn deinit(self: *ManagedEmbeddingEntry, alloc: std.mem.Allocator) void {
@@ -708,14 +724,24 @@ fn attachRequestPacers(
         if (entry.pacer != null) continue;
 
         const pacer = try acquireSharedRequestPacer(scope_key, entry.requests_per_minute, entry.burst);
-        errdefer releaseSharedRequestPacer(scope_key);
-        const owned_key = try alloc.dupe(u8, scope_key);
-        errdefer alloc.free(owned_key);
-        try pacer_scope_keys.append(alloc, owned_key);
-        try scopes.append(alloc, .{
+        const owned_key = alloc.dupe(u8, scope_key) catch |err| {
+            releaseSharedRequestPacer(scope_key);
+            return err;
+        };
+        pacer_scope_keys.append(alloc, owned_key) catch |err| {
+            alloc.free(owned_key);
+            releaseSharedRequestPacer(scope_key);
+            return err;
+        };
+        scopes.append(alloc, .{
             .key = owned_key,
             .pacer = pacer,
-        });
+        }) catch |err| {
+            _ = pacer_scope_keys.pop();
+            alloc.free(owned_key);
+            releaseSharedRequestPacer(scope_key);
+            return err;
+        };
         entry.pacer = pacer;
     }
 }
@@ -932,6 +958,7 @@ pub const ManagedEmbedder = struct {
     /// The heap allocation keeps std.Io's self pointer stable if this aggregate
     /// is moved after construction.
     owned_http_io: ?*std.Io.Threaded = null,
+    owned_http_client: ?*httpx.Client = null,
 
     pub fn initFromIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !ManagedEmbedder {
         return try initFromIndexesJsonWithOptions(alloc, indexes_json, .{});
@@ -975,8 +1002,11 @@ pub const ManagedEmbedder = struct {
 
         var it = object.iterator();
         while (it.next()) |entry| {
-            const managed = try parseManagedEmbeddingEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, options) orelse continue;
-            try entries.append(alloc, managed);
+            var managed = try parseManagedEmbeddingEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, options) orelse continue;
+            entries.append(alloc, managed) catch |err| {
+                managed.deinit(alloc);
+                return err;
+            };
         }
         try validateAllEmbeddingEnrichmentProducers(alloc, root, options, entries.items);
         try addArtifactBackedManagedEmbeddingEntries(alloc, root, options, &entries);
@@ -996,16 +1026,31 @@ pub const ManagedEmbedder = struct {
         try attachRequestPacers(alloc, entries.items, &pacer_scope_keys);
 
         const owned_entries = try entries.toOwnedSlice(alloc);
+        entries = .empty;
         errdefer {
             for (owned_entries) |*entry| entry.deinit(alloc);
             alloc.free(owned_entries);
         }
         const owned_pacer_scope_keys = try pacer_scope_keys.toOwnedSlice(alloc);
+        pacer_scope_keys = .empty;
+        errdefer {
+            for (owned_pacer_scope_keys) |scope_key| {
+                releaseSharedRequestPacer(scope_key);
+                alloc.free(scope_key);
+            }
+            if (owned_pacer_scope_keys.len > 0) alloc.free(owned_pacer_scope_keys);
+        }
+        const owned_http_client = try createManagedEmbeddingHttpClient(alloc, owned_entries);
+        errdefer deinitManagedEmbeddingHttpClient(alloc, owned_http_client);
+        if (owned_http_client) |client| for (owned_entries) |*entry| {
+            if (entry.antfly_provider == null) entry.shared_http_client = client;
+        };
         return .{
             .alloc = alloc,
             .entries = owned_entries,
             .pacer_scope_keys = owned_pacer_scope_keys,
             .owned_http_io = owned_http_io,
+            .owned_http_client = owned_http_client,
         };
     }
 
@@ -1017,6 +1062,7 @@ pub const ManagedEmbedder = struct {
             self.alloc.free(scope_key);
         }
         if (self.pacer_scope_keys.len > 0) self.alloc.free(self.pacer_scope_keys);
+        deinitManagedEmbeddingHttpClient(self.alloc, self.owned_http_client);
         deinitOwnedHttpIo(self.alloc, self.owned_http_io);
         self.* = undefined;
     }
@@ -1459,8 +1505,9 @@ pub const ManagedEmbedder = struct {
             }
         }
         if (entry.provider == .antfly and entry.base_url.len > 0) {
-            var http = httpx.Client.initWithConfig(alloc, try embeddingHttpIo(entry), try embeddingHttpClientConfig(entry));
-            defer http.deinit();
+            var fallback_http: ?httpx.Client = null;
+            defer if (fallback_http) |*client| client.deinit();
+            const http = try entry.httpClient(alloc, &fallback_http);
             var auth_header: ?[]u8 = null;
             defer if (auth_header) |value| alloc.free(value);
             var header_storage: [2][2][]const u8 = undefined;
@@ -1479,7 +1526,7 @@ pub const ManagedEmbedder = struct {
             const headers = header_storage[0..header_count];
             const cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
             const discovered: ?remote_capabilities.CapabilityLease = cache.getOrDiscoverLeaseWithContext(
-                &http,
+                http,
                 entry.base_url,
                 entry.model,
                 .embed,
@@ -1633,15 +1680,12 @@ fn embeddingHttpClientConfigForDeadline(
 ) !httpx.ClientConfig {
     var config = httpx.ClientConfig{
         .keep_alive = false,
+        // Embedding APIs authenticate explicitly. Ambient cookies must never
+        // cross provider origins when the lifetime client is shared.
+        .cookies_enabled = false,
         .max_response_size = remote_embedding_max_response_bytes,
     };
-    const now_ns = monotonicNowNs();
-    if (now_ns >= deadline) return error.Timeout;
-    const remaining_ns = deadline - now_ns;
-    const timeout_ms = @min(
-        max_embedding_request_timeout_ms,
-        @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms),
-    );
+    const timeout_ms = try embeddingRemainingTimeoutMs(deadline);
     config.timeouts = httpx.Timeouts.uniform(timeout_ms);
     // Both the whole-request and connect watchdogs need an owner-scoped
     // concurrent executor. Managed embedders bind one for their lifetime;
@@ -1652,6 +1696,76 @@ fn embeddingHttpClientConfigForDeadline(
         config.timeouts.connect_ms = 0;
     }
     return config;
+}
+
+fn embeddingRemainingTimeoutMs(deadline: u64) !u64 {
+    const now_ns = monotonicNowNs();
+    if (now_ns >= deadline) return error.Timeout;
+    const remaining_ns = deadline - now_ns;
+    return @min(
+        max_embedding_request_timeout_ms,
+        @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms),
+    );
+}
+
+fn createManagedEmbeddingHttpClient(
+    alloc: std.mem.Allocator,
+    entries: []const ManagedEmbeddingEntry,
+) !?*httpx.Client {
+    for (entries) |*entry| {
+        if (entry.antfly_provider != null or entry.base_url.len == 0) continue;
+        var config = try embeddingHttpClientConfigForDeadline(
+            entry,
+            monotonicNowNs() +| max_embedding_request_timeout_ns,
+        );
+        config.keep_alive = true;
+        const client = try alloc.create(httpx.Client);
+        // httpx uses its client allocator for request-local headers, URLs, and
+        // responses as well as persistent pool state. Managed embedders are
+        // callable concurrently and accept arbitrary owner allocators, so keep
+        // all shared-client allocation on the process thread-safe allocator.
+        client.* = httpx.Client.initWithConfig(std.heap.smp_allocator, try embeddingHttpIo(entry), config);
+        return client;
+    }
+    return null;
+}
+
+fn deinitManagedEmbeddingHttpClient(alloc: std.mem.Allocator, client: ?*httpx.Client) void {
+    const owned = client orelse return;
+    owned.deinit();
+    alloc.destroy(owned);
+}
+
+fn activeSharedRequestPacerReferences() usize {
+    lockAtomic(&shared_request_pacer_mutex);
+    defer shared_request_pacer_mutex.unlock();
+
+    var total: usize = 0;
+    for (shared_request_pacers.items) |entry| total += entry.ref_count;
+    return total;
+}
+
+pub fn testManagedEmbedderConstructorAllocationFailureCleanup() !void {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, baseline_pacer_references: usize) !void {
+            const initialized = ManagedEmbedder.initFromIndexesJsonWithOptions(alloc,
+                \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","requests_per_minute":60,"burst":1}}}
+            , .{ .io = std.Io.Threaded.global_single_threaded.io() });
+            var managed = initialized catch |err| {
+                try std.testing.expectEqual(baseline_pacer_references, activeSharedRequestPacerReferences());
+                return err;
+            };
+            managed.deinit();
+            try std.testing.expectEqual(baseline_pacer_references, activeSharedRequestPacerReferences());
+        }
+    };
+
+    const baseline_pacer_references = activeSharedRequestPacerReferences();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        Runner.run,
+        .{baseline_pacer_references},
+    );
 }
 
 fn applyAntflyEmbeddingRequestControls(
@@ -1739,6 +1853,7 @@ pub fn testEmbeddingProviderDeadlines() !void {
     managed.entries[0].deadline_ns = monotonicNowNs() + 5 * std.time.ns_per_s;
     const config = try embeddingHttpClientConfig(&managed.entries[0]);
     try std.testing.expectEqual(@as(usize, 4 << 20), config.max_response_size);
+    try std.testing.expect(!config.cookies_enabled);
     try std.testing.expect(config.timeouts.request_ms > 0);
     try std.testing.expect(config.timeouts.request_ms <= 5_000);
 
@@ -1747,12 +1862,38 @@ pub fn testEmbeddingProviderDeadlines() !void {
     try std.testing.expect(manual.owned_http_io != null);
     try std.testing.expect(manual.entries[0].io != null);
     try std.testing.expect(manual.entries[0].bounded_http_request);
+    try std.testing.expect(manual.owned_http_client != null);
+    try std.testing.expect(manual.owned_http_io.?.allocator.vtable == std.heap.smp_allocator.vtable);
+    try std.testing.expect(manual.owned_http_client.?.allocator.vtable == std.heap.smp_allocator.vtable);
+    try std.testing.expect(!manual.owned_http_client.?.config.cookies_enabled);
     const manual_config = try embeddingHttpClientConfig(&manual.entries[0]);
     try std.testing.expect(manual_config.timeouts.request_ms > 0);
     try std.testing.expect(manual_config.timeouts.connect_ms > 0);
     try std.testing.expect(manual_config.timeouts.read_ms > 0);
     try std.testing.expect(manual_config.timeouts.write_ms > 0);
     try std.testing.expect(manual.denseInterface().foreground_bounded);
+
+    // The default constructor must remain safe when its owner uses a local,
+    // non-thread-safe allocator. The owner allocator owns the stable Threaded
+    // shell, while the runtime's concurrent bookkeeping uses smp_allocator.
+    var owner_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer owner_arena.deinit();
+    var arena_owned = try ManagedEmbedder.initFromIndexesJson(owner_arena.allocator(), indexes_json);
+    defer arena_owned.deinit();
+    const threaded = arena_owned.owned_http_io orelse return error.TestUnexpectedResult;
+    try std.testing.expect(threaded.allocator.vtable == std.heap.smp_allocator.vtable);
+
+    const Worker = struct {
+        fn run(completed: *std.atomic.Value(usize)) std.Io.Cancelable!void {
+            _ = completed.fetchAdd(1, .acq_rel);
+        }
+    };
+    const worker_count = 16;
+    var completed = std.atomic.Value(usize).init(0);
+    var group: std.Io.Group = .init;
+    for (0..worker_count) |_| group.async(threaded.io(), Worker.run, .{&completed});
+    try group.await(threaded.io());
+    try std.testing.expectEqual(@as(usize, worker_count), completed.load(.acquire));
 
     const Local = struct {
         context_calls: usize = 0,
@@ -4532,10 +4673,11 @@ fn embedWithEntryParts(
 ) ![]f32 {
     if (entry.provider == .bedrock and (entry.multimodal or partsContainMedia(parts))) {
         try waitForEntryPacer(entry);
-        var http = httpx.Client.initWithConfig(alloc, try embeddingHttpIo(entry), try embeddingHttpClientConfig(entry));
-        defer http.deinit();
+        var fallback_http: ?httpx.Client = null;
+        defer if (fallback_http) |*client| client.deinit();
+        const http = try entry.httpClient(alloc, &fallback_http);
 
-        var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
+        var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, http, .{
             .region = entry.region,
             .endpoint = entry.base_url,
             .request_format = entry.bedrock_request_format,
@@ -4543,6 +4685,7 @@ fn embedWithEntryParts(
             .truncate = entry.truncate,
             .dimension = dims,
             .cancellation = entry.cancellation,
+            .timeout_ms = try embeddingRemainingTimeoutMs(embeddingOperationDeadline(entry)),
         }, &@constCast(entry).bedrock_credentials);
         defer provider.deinit();
 
@@ -4577,10 +4720,11 @@ fn embedWithEntryParts(
         }
         try waitForEntryPacer(entry);
         const operation_deadline_ns = embeddingOperationDeadline(entry);
-        var http = httpx.Client.initWithConfig(alloc, try embeddingHttpIo(entry), try embeddingHttpClientConfigForDeadline(entry, operation_deadline_ns));
-        defer http.deinit();
+        var fallback_http: ?httpx.Client = null;
+        defer if (fallback_http) |*client| client.deinit();
+        const http = try entry.httpClient(alloc, &fallback_http);
 
-        var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
+        var provider = antfly_provider_mod.Provider.init(alloc, http, entry.base_url);
         defer provider.deinit();
         provider.setRequestCancellation(entry.cancellation);
         try provider.setSourceTable(entry.source_table);
@@ -4596,7 +4740,7 @@ fn embedWithEntryParts(
         const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
         const capability_lease = try bindRemoteEmbeddingLease(
             entry,
-            &http,
+            http,
             &provider,
             capability_headers,
             operation_deadline_ns,
@@ -4889,9 +5033,10 @@ fn embedPartItemsWithEntry(
 
     try waitForEntryPacer(entry);
     const operation_deadline_ns = embeddingOperationDeadline(entry);
-    var http = httpx.Client.initWithConfig(alloc, try embeddingHttpIo(entry), try embeddingHttpClientConfigForDeadline(entry, operation_deadline_ns));
-    defer http.deinit();
-    var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
+    var fallback_http: ?httpx.Client = null;
+    defer if (fallback_http) |*client| client.deinit();
+    const http = try entry.httpClient(alloc, &fallback_http);
+    var provider = antfly_provider_mod.Provider.init(alloc, http, entry.base_url);
     defer provider.deinit();
     provider.setRequestCancellation(entry.cancellation);
     try provider.setSourceTable(entry.source_table);
@@ -4914,7 +5059,7 @@ fn embedPartItemsWithEntry(
     const capability_headers = capability_header_storage[0..capability_header_count];
     const capability_cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
     const capability_lease = try capability_cache.getOrDiscoverLeaseWithContext(
-        &http,
+        http,
         entry.base_url,
         entry.model,
         .embed,
@@ -4976,10 +5121,11 @@ fn embedSparseBatchWithEntry(
             }
             try waitForEntryPacer(entry);
             const operation_deadline_ns = embeddingOperationDeadline(entry);
-            var http = httpx.Client.initWithConfig(alloc, try embeddingHttpIo(entry), try embeddingHttpClientConfigForDeadline(entry, operation_deadline_ns));
-            defer http.deinit();
+            var fallback_http: ?httpx.Client = null;
+            defer if (fallback_http) |*client| client.deinit();
+            const http = try entry.httpClient(alloc, &fallback_http);
 
-            var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
+            var provider = antfly_provider_mod.Provider.init(alloc, http, entry.base_url);
             defer provider.deinit();
             provider.setRequestCancellation(entry.cancellation);
             try provider.setSourceTable(entry.source_table);
@@ -4995,7 +5141,7 @@ fn embedSparseBatchWithEntry(
             const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
             _ = try bindRemoteEmbeddingLease(
                 entry,
-                &http,
+                http,
                 &provider,
                 capability_headers,
                 operation_deadline_ns,
@@ -5211,10 +5357,11 @@ fn embedBatchWithEntry(
             }
             try waitForEntryPacer(entry);
             const operation_deadline_ns = embeddingOperationDeadline(entry);
-            var http = httpx.Client.initWithConfig(alloc, try embeddingHttpIo(entry), try embeddingHttpClientConfigForDeadline(entry, operation_deadline_ns));
-            defer http.deinit();
+            var fallback_http: ?httpx.Client = null;
+            defer if (fallback_http) |*client| client.deinit();
+            const http = try entry.httpClient(alloc, &fallback_http);
 
-            var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
+            var provider = antfly_provider_mod.Provider.init(alloc, http, entry.base_url);
             defer provider.deinit();
             provider.setRequestCancellation(entry.cancellation);
             try provider.setSourceTable(entry.source_table);
@@ -5230,7 +5377,7 @@ fn embedBatchWithEntry(
             const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
             _ = try bindRemoteEmbeddingLease(
                 entry,
-                &http,
+                http,
                 &provider,
                 capability_headers,
                 operation_deadline_ns,
@@ -5283,9 +5430,10 @@ fn embedBatchWithBedrockRequest(
     dims: u32,
 ) ![]const []const f32 {
     try waitForEntryPacer(entry);
-    var http = httpx.Client.initWithConfig(alloc, try embeddingHttpIo(entry), try embeddingHttpClientConfig(entry));
-    defer http.deinit();
-    var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
+    var fallback_http: ?httpx.Client = null;
+    defer if (fallback_http) |*client| client.deinit();
+    const http = try entry.httpClient(alloc, &fallback_http);
+    var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, http, .{
         .region = entry.region,
         .endpoint = entry.base_url,
         .request_format = entry.bedrock_request_format,
@@ -5293,6 +5441,7 @@ fn embedBatchWithBedrockRequest(
         .truncate = entry.truncate,
         .dimension = dims,
         .cancellation = entry.cancellation,
+        .timeout_ms = try embeddingRemainingTimeoutMs(embeddingOperationDeadline(entry)),
     }, &@constCast(entry).bedrock_credentials);
     defer provider.deinit();
     var result = try provider.embedText(alloc, entry.model, texts);
@@ -5368,12 +5517,14 @@ fn embedBatchWithOpenAiCompatible(
 
     try waitForEntryPacer(entry);
 
-    var client = httpx.Client.initWithConfig(alloc, try embeddingHttpIo(entry), try embeddingHttpClientConfig(entry));
-    defer client.deinit();
+    var fallback_http: ?httpx.Client = null;
+    defer if (fallback_http) |*client| client.deinit();
+    const client = try entry.httpClient(alloc, &fallback_http);
 
     var response = try client.post(url, .{
         .json = json_body,
         .headers = headers_buf[0..header_count],
+        .timeout_ms = try embeddingRemainingTimeoutMs(embeddingOperationDeadline(entry)),
         .cancellation = if (entry.cancellation) |token|
             httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
         else

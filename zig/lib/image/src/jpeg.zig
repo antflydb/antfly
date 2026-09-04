@@ -1295,6 +1295,20 @@ pub fn preprocessClipChw(
     return preprocessClipChwWithOptions(alloc, jpeg_bytes, target_size, mean, std_dev, false);
 }
 
+/// CLIP JPEG preprocessing directly into caller-owned CHW storage. This is
+/// the batch-friendly form: decoded component planes remain temporary, while
+/// the complete normalized tensor is never allocated and copied a second time.
+pub fn preprocessClipChwInto(
+    alloc: Allocator,
+    jpeg_bytes: []const u8,
+    result: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) !void {
+    return preprocessClipChwIntoWithOptions(alloc, jpeg_bytes, result, target_size, mean, std_dev, false);
+}
+
 /// CLIP JPEG preprocessing using JPEG DCT scaling. This is a speed/quality
 /// tradeoff and is not bit-identical to full decode plus resize.
 pub fn preprocessClipChwDctScaled(
@@ -1307,6 +1321,17 @@ pub fn preprocessClipChwDctScaled(
     return preprocessClipChwWithOptions(alloc, jpeg_bytes, target_size, mean, std_dev, true);
 }
 
+pub fn preprocessClipChwDctScaledInto(
+    alloc: Allocator,
+    jpeg_bytes: []const u8,
+    result: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) !void {
+    return preprocessClipChwIntoWithOptions(alloc, jpeg_bytes, result, target_size, mean, std_dev, true);
+}
+
 fn preprocessClipChwWithOptions(
     alloc: Allocator,
     jpeg_bytes: []const u8,
@@ -1315,10 +1340,30 @@ fn preprocessClipChwWithOptions(
     std_dev: [3]f32,
     allow_dct_scale: bool,
 ) ![]f32 {
-    const structure = try parseStructure(jpeg_bytes);
+    const ts: usize = @intCast(target_size);
+    const result = try alloc.alloc(f32, std.math.mul(usize, 3, std.math.mul(usize, ts, ts) catch return error.JpegDecodeFailed) catch return error.JpegDecodeFailed);
+    errdefer alloc.free(result);
+    try preprocessClipChwIntoWithOptions(alloc, jpeg_bytes, result, target_size, mean, std_dev, allow_dct_scale);
+    return result;
+}
+
+fn preprocessClipChwIntoWithOptions(
+    alloc: Allocator,
+    jpeg_bytes: []const u8,
+    result: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    allow_dct_scale: bool,
+) !void {
     if (target_size == 0) return error.JpegDecodeFailed;
+    const ts: usize = @intCast(target_size);
+    const expected = std.math.mul(usize, 3, std.math.mul(usize, ts, ts) catch return error.JpegDecodeFailed) catch
+        return error.JpegDecodeFailed;
+    if (result.len != expected) return error.JpegDecodeFailed;
+    const structure = try parseStructure(jpeg_bytes);
     if (canPureZigDecodeColorBaseline(structure)) {
-        return preprocessClipChwPureZigColorBaseline(alloc, jpeg_bytes, structure, target_size, mean, std_dev, allow_dct_scale);
+        return preprocessClipChwPureZigColorBaselineInto(alloc, jpeg_bytes, structure, result, target_size, mean, std_dev, allow_dct_scale);
     }
     return error.UnsupportedJpegFormat;
 }
@@ -2706,15 +2751,16 @@ fn decodeRgbaPureZigColorBaseline(
     };
 }
 
-fn preprocessClipChwPureZigColorBaseline(
+fn preprocessClipChwPureZigColorBaselineInto(
     alloc: Allocator,
     jpeg_bytes: []const u8,
     structure: Structure,
+    result: []f32,
     target_size: u32,
     mean: [3]f32,
     std_dev: [3]f32,
     allow_dct_scale: bool,
-) ![]f32 {
+) !void {
     const width = structure.info.width;
     const height = structure.info.height;
     const color_encoding = colorEncodingForStructure(structure) orelse return error.JpegDecodeFailed;
@@ -2837,9 +2883,6 @@ fn preprocessClipChwPureZigColorBaseline(
         }
     }
 
-    const ts: usize = @intCast(target_size);
-    const result = try alloc.alloc(f32, 3 * ts * ts);
-    errdefer alloc.free(result);
     writeClipColorPlanesToChw(
         result,
         scaledDimension(width, dct_scale),
@@ -2854,7 +2897,6 @@ fn preprocessClipChwPureZigColorBaseline(
         max_v,
         component_planes,
     );
-    return result;
 }
 
 fn decodeRgbaPureZigLossless(
@@ -4777,6 +4819,9 @@ test "preprocess clip chw matches full decode resize crop on 420 fixture" {
     const target_size: u32 = 4;
     const fast = try preprocessClipChw(alloc, fixture_bytes, target_size, .{ 0.0, 0.0, 0.0 }, .{ 1.0, 1.0, 1.0 });
     defer alloc.free(fast);
+    var direct: [3 * 4 * 4]f32 = undefined;
+    try preprocessClipChwInto(alloc, fixture_bytes, &direct, target_size, .{ 0.0, 0.0, 0.0 }, .{ 1.0, 1.0, 1.0 });
+    try std.testing.expectEqualSlices(f32, fast, &direct);
 
     try std.testing.expectEqual(@as(u32, 8), full.width);
     try std.testing.expectEqual(@as(u32, 8), full.height);
