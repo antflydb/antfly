@@ -38,6 +38,10 @@ function TestProvider({ turns, children }: { turns: ChatTurn[]; children: React.
     config: {
       url: "http://localhost:8082/db/v1",
       table: "test",
+      generator: {
+        provider: "openai",
+        model: "gpt-4.1-mini",
+      },
     },
   };
 

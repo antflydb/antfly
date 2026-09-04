@@ -770,6 +770,15 @@ fn validateSchemaValue(value: std.json.Value) !void {
         else => return error.InvalidSchemaUpdateRequest,
     };
     if (root.get("default_type")) |default_type| if (default_type != .null and default_type != .string) return error.InvalidSchemaUpdateRequest;
+    const has_ttl = root.get("ttl") != null;
+    const has_legacy_ttl = root.get("ttl_duration") != null or root.get("ttl_duration_ns") != null or root.get("ttl_field") != null;
+    if (has_ttl and has_legacy_ttl) return error.InvalidSchemaUpdateRequest;
+    if (root.get("ttl")) |ttl| try validateTtlConfig(ttl);
+    if (root.get("ttl_duration") != null and root.get("ttl_duration_ns") != null) return error.InvalidSchemaUpdateRequest;
+    if (root.get("ttl_duration")) |ttl_duration| if (ttl_duration != .null) switch (ttl_duration) {
+        .string => |text| _ = try parseTtlDurationNs(text),
+        else => return error.InvalidSchemaUpdateRequest,
+    };
     if (root.get("ttl_duration_ns")) |ttl_duration_ns| if (ttl_duration_ns != .null) try validateNonNegativeInteger(ttl_duration_ns);
     if (root.get("ttl_field")) |ttl_field| if (ttl_field != .null) switch (ttl_field) {
         .string => |text| {
@@ -781,6 +790,32 @@ fn validateSchemaValue(value: std.json.Value) !void {
     if (root.get("document_schemas")) |document_schemas| if (document_schemas != .null) try validateDocumentSchemas(document_schemas);
     if (root.get("dynamic_templates")) |dynamic_templates| if (dynamic_templates != .null) try validateDynamicTemplates(dynamic_templates);
     if (root.get("index_sort")) |index_sort| if (index_sort != .null) try validateIndexSort(index_sort);
+}
+
+fn validateTtlConfig(value: std.json.Value) !void {
+    if (value == .null) return;
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "duration") and !std.mem.eql(u8, entry.key_ptr.*, "field")) {
+            return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    const duration_value = object.get("duration") orelse return error.InvalidSchemaUpdateRequest;
+    const duration = switch (duration_value) {
+        .string => |text| try parseTtlDurationNs(text),
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    if (duration == 0) return error.InvalidSchemaUpdateRequest;
+    if (object.get("field")) |field| switch (field) {
+        .string => |text| {
+            if (text.len == 0) return error.InvalidSchemaUpdateRequest;
+        },
+        else => return error.InvalidSchemaUpdateRequest,
+    };
 }
 
 fn validateDocumentSchemas(value: std.json.Value) !void {
@@ -1830,6 +1865,45 @@ fn validateNonNegativeInteger(value: std.json.Value) !void {
     _ = exactU64JsonNumber(value) orelse return error.InvalidSchemaUpdateRequest;
 }
 
+fn parseTtlDurationNs(raw: []const u8) !u64 {
+    const text = std.mem.trim(u8, raw, " \t\r\n");
+    if (text.len == 0) return error.InvalidSchemaUpdateRequest;
+    var total: u64 = 0;
+    var offset: usize = 0;
+    while (offset < text.len) {
+        const number_start = offset;
+        while (offset < text.len and std.ascii.isDigit(text[offset])) : (offset += 1) {}
+        if (offset == number_start) return error.InvalidSchemaUpdateRequest;
+        const amount = std.fmt.parseUnsigned(u64, text[number_start..offset], 10) catch return error.InvalidSchemaUpdateRequest;
+        const remaining = text[offset..];
+        const unit_ns: u64 = if (std.mem.startsWith(u8, remaining, "ns")) blk: {
+            offset += 2;
+            break :blk 1;
+        } else if (std.mem.startsWith(u8, remaining, "us")) blk: {
+            offset += 2;
+            break :blk std.time.ns_per_us;
+        } else if (std.mem.startsWith(u8, remaining, "ms")) blk: {
+            offset += 2;
+            break :blk std.time.ns_per_ms;
+        } else if (std.mem.startsWith(u8, remaining, "s")) blk: {
+            offset += 1;
+            break :blk std.time.ns_per_s;
+        } else if (std.mem.startsWith(u8, remaining, "m")) blk: {
+            offset += 1;
+            break :blk 60 * std.time.ns_per_s;
+        } else if (std.mem.startsWith(u8, remaining, "h")) blk: {
+            offset += 1;
+            break :blk 60 * 60 * std.time.ns_per_s;
+        } else if (std.mem.startsWith(u8, remaining, "d")) blk: {
+            offset += 1;
+            break :blk 24 * 60 * 60 * std.time.ns_per_s;
+        } else return error.InvalidSchemaUpdateRequest;
+        const component = std.math.mul(u64, amount, unit_ns) catch return error.InvalidSchemaUpdateRequest;
+        total = std.math.add(u64, total, component) catch return error.InvalidSchemaUpdateRequest;
+    }
+    return total;
+}
+
 fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !TableSchema {
     const root = value.object;
 
@@ -1854,14 +1928,36 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
             parsed.default_type = try alloc.dupe(u8, default_type.string);
         }
     }
-    if (root.get("ttl_duration_ns")) |ttl_duration_ns| {
-        if (ttl_duration_ns != .null) parsed.ttl_duration_ns = exactU64JsonNumber(ttl_duration_ns) orelse return error.InvalidSchemaUpdateRequest;
-    }
-    if (root.get("ttl_field")) |ttl_field| {
-        if (ttl_field != .null) {
-            if (ttl_field.string.len == 0) return error.InvalidSchemaUpdateRequest;
-            alloc.free(parsed.ttl_field);
-            parsed.ttl_field = try alloc.dupe(u8, ttl_field.string);
+    if (root.get("ttl")) |ttl| {
+        switch (ttl) {
+            .null => {},
+            .object => |ttl_object| {
+                const duration = ttl_object.get("duration") orelse return error.InvalidSchemaUpdateRequest;
+                if (duration != .string) return error.InvalidSchemaUpdateRequest;
+                parsed.ttl_duration_ns = try parseTtlDurationNs(duration.string);
+                if (ttl_object.get("field")) |ttl_field| {
+                    if (ttl_field != .string or ttl_field.string.len == 0) return error.InvalidSchemaUpdateRequest;
+                    alloc.free(parsed.ttl_field);
+                    parsed.ttl_field = try alloc.dupe(u8, ttl_field.string);
+                }
+            },
+            else => return error.InvalidSchemaUpdateRequest,
+        }
+    } else {
+        if (root.get("ttl_duration_ns")) |ttl_duration_ns| {
+            if (ttl_duration_ns != .null) parsed.ttl_duration_ns = exactU64JsonNumber(ttl_duration_ns) orelse return error.InvalidSchemaUpdateRequest;
+        } else if (root.get("ttl_duration")) |ttl_duration| {
+            if (ttl_duration != .null) {
+                if (ttl_duration != .string) return error.InvalidSchemaUpdateRequest;
+                parsed.ttl_duration_ns = try parseTtlDurationNs(ttl_duration.string);
+            }
+        }
+        if (root.get("ttl_field")) |ttl_field| {
+            if (ttl_field != .null) {
+                if (ttl_field != .string or ttl_field.string.len == 0) return error.InvalidSchemaUpdateRequest;
+                alloc.free(parsed.ttl_field);
+                parsed.ttl_field = try alloc.dupe(u8, ttl_field.string);
+            }
         }
     }
     if (root.get("enforce_types")) |enforce_types| {
@@ -6066,6 +6162,38 @@ test "validate ttl field values and schema bindings" {
         "{\"default_type\":\"doc\",\"ttl_duration_ns\":1,\"ttl_field\":\"expires_at\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"expires_at\":{\"type\":\"numeric\"}}}}}}",
     );
     defer numeric_ttl.deinit(std.testing.allocator);
+}
+
+test "table schema parses public ttl duration strings" {
+    var compound = try parseSchema(std.testing.allocator, "{\"ttl_duration\":\"1h30m\"}");
+    defer compound.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 90 * 60 * std.time.ns_per_s), compound.ttl_duration_ns);
+    try std.testing.expectEqualStrings("_timestamp", compound.ttl_field);
+
+    var days = try parseSchema(std.testing.allocator, "{\"ttl_duration\":\"7d\"}");
+    defer days.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 7 * 24 * 60 * 60 * std.time.ns_per_s), days.ttl_duration_ns);
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"ttl_duration\":\"1h\",\"ttl_duration_ns\":1}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"ttl_duration\":\"1.5h\"}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"ttl_duration\":\"forever\"}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"ttl_duration\":\"18446744073709551615h\"}"));
+}
+
+test "table schema parses canonical ttl policy and explicit removal" {
+    var canonical = try parseSchema(std.testing.allocator, "{\"ttl\":{\"duration\":\"1h30m\",\"field\":\"created_at\"}}");
+    defer canonical.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 90 * 60 * std.time.ns_per_s), canonical.ttl_duration_ns);
+    try std.testing.expectEqualStrings("created_at", canonical.ttl_field);
+
+    var removed = try parseSchema(std.testing.allocator, "{\"ttl\":null}");
+    defer removed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 0), removed.ttl_duration_ns);
+    try std.testing.expectEqualStrings("_timestamp", removed.ttl_field);
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"ttl\":{\"duration\":\"0s\"}}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"ttl\":{\"duration\":\"1h\",\"unknown\":true}}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"ttl\":{\"duration\":\"1h\"},\"ttl_duration\":\"1h\"}"));
 }
 
 test "validate escaped ref tokens and direct fragment refs" {

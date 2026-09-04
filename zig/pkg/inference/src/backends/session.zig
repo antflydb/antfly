@@ -26,6 +26,13 @@ pub const ResidentInput = struct {
     shape: []const i64 = &.{},
 };
 
+pub const ResidentTextPooling = enum { mean, cls, max, last };
+
+pub const ResidentTextEmbeddingRequest = struct {
+    pooling: ResidentTextPooling,
+    normalize: bool,
+};
+
 pub const ResidentOutputs = struct {
     outputs: []ops.CT,
     backend: *const ops.ComputeBackend,
@@ -306,6 +313,7 @@ pub const Session = struct {
         close: *const fn (ptr: *anyopaque) void,
         runResident: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror!?ResidentOutputs = null,
         runResidentInputs: ?*const fn (ptr: *anyopaque, inputs: []const ResidentInput, allocator: std.mem.Allocator) anyerror!?ResidentOutputs = null,
+        runResidentTextEmbedding: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, request: ResidentTextEmbeddingRequest, allocator: std.mem.Allocator) anyerror!?ResidentOutputs = null,
     };
 
     /// Run a forward pass with the given input tensors.
@@ -369,6 +377,20 @@ pub const Session = struct {
         };
     }
 
+    /// Reserve tokenizer/preprocessing memory independently from the backend
+    /// execution workspace. Dynamic text encoders can hold this lease while
+    /// discovering the actual padded sequence length, then admit the backend
+    /// run using that length instead of the model's maximum context.
+    pub fn admitHostPreprocess(self: Session, host_scratch_bytes: usize) !RunPermit {
+        return .{
+            .session = self,
+            .lease = if (self.run_admission) |admission|
+                try admission.acquireAmounts(.{ .host_scratch_bytes = host_scratch_bytes })
+            else
+                null,
+        };
+    }
+
     pub fn inputInfo(self: Session) []const TensorInfo {
         return self.vtable.inputInfo(self.ptr);
     }
@@ -420,6 +442,11 @@ pub const Session = struct {
         }
         return null;
     }
+
+    pub fn runResidentTextEmbedding(self: Session, inputs: []const Tensor, request: ResidentTextEmbeddingRequest, allocator: std.mem.Allocator) !?ResidentOutputs {
+        const run_resident = self.vtable.runResidentTextEmbedding orelse return null;
+        return run_resident(self.ptr, inputs, request, allocator);
+    }
 };
 
 pub const RunPermit = struct {
@@ -453,6 +480,16 @@ pub const RunPermit = struct {
         return run_resident_inputs(self.session.ptr, inputs, allocator);
     }
 
+    pub fn runResidentTextEmbedding(
+        self: *RunPermit,
+        inputs: []const Tensor,
+        request: ResidentTextEmbeddingRequest,
+        allocator: std.mem.Allocator,
+    ) !?ResidentOutputs {
+        const run_resident = self.session.vtable.runResidentTextEmbedding orelse return null;
+        return run_resident(self.session.ptr, inputs, request, allocator);
+    }
+
     pub fn deinit(self: *RunPermit) void {
         if (self.lease) |*lease| lease.release();
         self.lease = null;
@@ -467,7 +504,7 @@ fn deinitTensorSlice(tensors: []Tensor, allocator: std.mem.Allocator) void {
 test "session vtable layout" {
     // Ensure the vtable has all required function pointers.
     const info = @typeInfo(Session.VTable);
-    try std.testing.expectEqual(@as(usize, 7), info.@"struct".fields.len);
+    try std.testing.expectEqual(@as(usize, 8), info.@"struct".fields.len);
 }
 
 const AdmissionProbeSession = struct {
@@ -598,6 +635,19 @@ test "run admission scales dynamic outputs and honors reserved backend workspace
         memory.AdmissionAmounts{},
         controller.snapshot(),
     );
+
+    var preprocess_permit = try admitted_session.admitHostPreprocess(128);
+    try std.testing.expectEqual(@as(usize, 128), controller.snapshot().host_scratch_bytes);
+    var execution_permit = try admitted_session.admit(.{
+        .batch = 2,
+        .sequence = 4,
+        .input_bytes = 64,
+    });
+    try std.testing.expect(controller.snapshot().host_scratch_bytes > 128);
+    execution_permit.deinit();
+    try std.testing.expectEqual(@as(usize, 128), controller.snapshot().host_scratch_bytes);
+    preprocess_permit.deinit();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
 
     const profiled = RunAdmission{
         .controller = &controller,

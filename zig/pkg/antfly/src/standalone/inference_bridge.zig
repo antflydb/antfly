@@ -20,7 +20,7 @@ const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
 
-pub const abi_version: u32 = 17;
+pub const abi_version: u32 = 18;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -169,6 +169,9 @@ pub const ProviderInvokeContext = extern struct {
     has_deadline: u8,
     out_response_handle: *?*anyopaque,
     out_response_json: *String,
+    /// Appended in ABI v18 so older layouts fail the strict size/version gate
+    /// rather than silently losing cooperative cancellation.
+    cancellation: http_abi.CancellationView = .{},
 };
 
 pub const RouteManifestEntry = extern struct {

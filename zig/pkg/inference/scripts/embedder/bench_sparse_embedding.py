@@ -2,7 +2,7 @@
 """Measure real sparse embedding batches without adding timing gates to tests.
 
 Example:
-  python3 pkg/inference/scripts/bench_sparse_embedding.py \
+  python3 pkg/inference/scripts/embedder/bench_sparse_embedding.py \
     /path/to/splade-model --repeats 5 --build-label ci-x86_64-baseline
 """
 
@@ -88,7 +88,7 @@ def run_once(args: argparse.Namespace, batch: int) -> tuple[int, int]:
 
 
 def main() -> None:
-    zig_root = Path(__file__).resolve().parents[3]
+    zig_root = Path(__file__).resolve().parents[4]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model_dir", type=Path)
     parser.add_argument(

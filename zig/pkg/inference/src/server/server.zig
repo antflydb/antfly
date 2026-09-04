@@ -49,6 +49,7 @@ const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
 const generation = @import("../pipelines/generation.zig");
 const multimodal_reranker = @import("../pipelines/multimodal_reranker.zig");
+const reranking_pipeline = @import("../pipelines/reranking.zig");
 const multimodal_qwen_adapter = @import("../pipelines/multimodal_qwen_adapter.zig");
 const document_classification = @import("../pipelines/document_classification.zig");
 const document_token_classification = @import("../pipelines/document_token_classification.zig");
@@ -3735,21 +3736,58 @@ pub const Node = struct {
         query: []const u8,
         documents: []const []const u8,
     ) ![]f32 {
+        return self.rerankTextsDirectWithContext(allocator, null, null, null, model_name, query, documents);
+    }
+
+    pub fn rerankTextsDirectWithContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: ?std.Io,
+        deadline_ns: ?u64,
+        upstream_control: ?reranking_pipeline.ExecutionControl,
+        model_name: []const u8,
+        query: []const u8,
+        documents: []const []const u8,
+    ) ![]f32 {
+        if (upstream_control) |control| try control.check();
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         if (documents.len == 0) return try allocator.alloc(f32, 0);
         try self.acquireAdmissionUnits(1);
         defer self.releaseAdmission();
+        if (upstream_control) |control| try control.check();
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         self.metrics.incRequest("rerank.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
+        var owned_io: ?std.Io.Threaded = if (io == null) std.Io.Threaded.init(allocator, .{}) else null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const request_io = io orelse owned_io.?.io();
 
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rerankers");
+        const model_path = try self.resolveModelPath(request_io, if (model_name.len > 0) model_name else null, "rerankers");
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         var model_handle = try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
         const model = model_handle.get();
         var pipeline = model.rerankingPipeline(allocator);
-        return try pipeline.rerank(query, documents);
+        const DeadlineControl = struct {
+            deadline_ns: ?u64,
+            upstream: ?reranking_pipeline.ExecutionControl,
+
+            fn check(raw: ?*anyopaque) !void {
+                const control: *const @This() = @ptrCast(@alignCast(raw.?));
+                if (control.upstream) |upstream| try upstream.check();
+                return ensureDirectEmbeddingDeadline(control.deadline_ns);
+            }
+        };
+        var deadline_control = DeadlineControl{ .deadline_ns = deadline_ns, .upstream = upstream_control };
+        pipeline.execution_control = .{
+            .ptr = &deadline_control,
+            .check_fn = DeadlineControl.check,
+        };
+        const scores = try pipeline.rerank(query, documents);
+        errdefer allocator.free(scores);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+        return scores;
     }
 
     pub fn generateTextDirect(
@@ -5258,8 +5296,10 @@ pub const Node = struct {
     /// Always returns memory owned by `self.allocator`; the caller must free it.
     pub fn resolveModelPath(self: *Node, io: std.Io, name: ?[]const u8, task_type: ?[]const u8) ![]const u8 {
         if (name) |raw| {
-            // Strip "hf:" prefix if present
-            const n = if (std.mem.startsWith(u8, raw, "hf:")) raw[3..] else raw;
+            // Resolve qualified production aliases before deriving the stable
+            // variant install path, then strip the optional Hub prefix.
+            const resolved_ref = registry_mod.resolveFriendlyRef(raw) orelse raw;
+            const n = if (std.mem.startsWith(u8, resolved_ref, "hf:")) resolved_ref[3..] else resolved_ref;
 
             // Explicit Hub variants installed by the registry live in stable,
             // variant-specific leaf directories. Resolve that identity before
@@ -16733,6 +16773,13 @@ test "HTTP model resolution is canonical and contained while trusted resolution 
     const explicit_variant_config = try std.fs.path.join(alloc, &.{ explicit_variant_root, "config.json" });
     defer alloc.free(explicit_variant_config);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = explicit_variant_config, .data = "{}" });
+    const bge_ref = try registry_mod.ModelRef.parse(registry_mod.bge_m3_pinned_ref);
+    const bge_variant_root = try registry_mod.modelInstallDirAlloc(alloc, models_root, bge_ref);
+    defer alloc.free(bge_variant_root);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, bge_variant_root);
+    const bge_variant_config = try std.fs.path.join(alloc, &.{ bge_variant_root, "config.json" });
+    defer alloc.free(bge_variant_config);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = bge_variant_config, .data = "{}" });
 
     var node: Node = undefined;
     node.config = .{ .models_dir = models_root };
@@ -16747,6 +16794,9 @@ test "HTTP model resolution is canonical and contained while trusted resolution 
     const explicit_resolved = try node.resolveRequestModelPath(request_allocator, std.testing.io, "owner/model:gguf:Q4_K_M", "generators");
     defer request_allocator.free(explicit_resolved);
     try std.testing.expectEqualStrings(explicit_variant_root, explicit_resolved);
+    const bge_resolved = try node.resolveRequestModelPath(request_allocator, std.testing.io, "BAAI/bge-m3", "embedders");
+    defer request_allocator.free(bge_resolved);
+    try std.testing.expectEqualStrings(bge_variant_root, bge_resolved);
     const trusted_resolved = try node.resolveModelPath(std.testing.io, model_root, "generators");
     defer alloc.free(trusted_resolved);
     try std.testing.expectEqualStrings(model_root, trusted_resolved);

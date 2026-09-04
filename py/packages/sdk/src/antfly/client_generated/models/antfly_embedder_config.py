@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.antfly_embedder_config_provider import AntflyEmbedderConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="AntflyEmbedderConfig")
@@ -32,16 +33,20 @@ class AntflyEmbedderConfig:
             {'provider': 'antfly', 'model': 'bge-base-en-v1.5', 'api_url': 'http://localhost:8082'}
 
         Attributes:
+            provider (AntflyEmbedderConfigProvider):
             model (str): The embedding model name (maps to models/embedders/{name}/ directory). Example: bge-base-en-v1.5.
             api_url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
                 environment variable. Example: http://localhost:8082.
     """
 
+    provider: AntflyEmbedderConfigProvider
     model: str
     api_url: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         api_url = self.api_url
@@ -50,6 +55,7 @@ class AntflyEmbedderConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -61,11 +67,14 @@ class AntflyEmbedderConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = AntflyEmbedderConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         api_url = d.pop("api_url", UNSET)
 
         antfly_embedder_config = cls(
+            provider=provider,
             model=model,
             api_url=api_url,
         )

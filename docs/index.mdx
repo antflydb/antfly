@@ -25,8 +25,8 @@ For AI Engineers we're also prioritizing telemetry, scaling and security. We kno
 
 ### Hybrid Search
 - **BM25 + Vector Similarity**: Full-text search with vector embeddings using Reciprocal Rank Fusion (RRF)
-- **Multimodal**: Index and search text, images, audio, and video
-- **Embedding Providers**: Ollama, OpenAI, AWS Bedrock, Google Gemini, Anthropic
+- **Multimodal**: Index and search text, images, and audio with native Antfly models or application-managed vectors
+- **Managed Index Embedders**: Antfly inference, Ollama, OpenAI, and AWS Bedrock
 - **Hardware Acceleration**: SIMD optimizations (AVX2/AVX-512 on x86, NEON on ARM) and SME (Scalable Matrix Extension) for ARM
 
 ### Distributed Consensus
@@ -63,7 +63,7 @@ For AI Engineers we're also prioritizing telemetry, scaling and security. We kno
 - **Index Types**: `full_text` (BM25), `embeddings` (vector with RaBitQ), `graph` (relationship traversal)
 - **Enrichers**: summaries, embeddings, chunking (async background processing)
 - **Query Processors**: `chunker` (semantic document splitting), `pruner` (result filtering), `reranker` (relevance re-scoring)
-- **Multimodal**: Vision model + embedder or native multimodal embeddings (Gemini)
+- **Multimodal**: Native ClipClap embeddings, durable extraction, or application-managed vectors
 - **Pluggable Architecture**: Easy to add custom index types via registry pattern
 
 ## Use Cases
