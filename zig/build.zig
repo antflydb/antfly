@@ -6571,6 +6571,8 @@ pub fn build(b: *std.Build) void {
             "targeted publication fence preserves only untouched siblings during catch up",
             "targeted publication fence waits for every overlapping owner",
             "targeted catch up hands off same incarnation serving authority",
+            "targeted publication rejects a completed stale incarnation until structural acknowledgement",
+            "targeted deletion hands off only after authoritative absence",
             "synthetic refresh cannot outrank targeted structural owner observation",
             "synthetic refresh preserves post-fence target facts before serving handoff",
             "table runtime snapshot cache lifecycle transition replaces and fences observations",

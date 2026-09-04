@@ -162,7 +162,12 @@ def _pack_f32_le(values: list[float]) -> str:
 
 
 def _ready_index(
-    stateful_api, table_name: str, index_name: str, *, expected_docs: int
+    stateful_api,
+    table_name: str,
+    index_name: str,
+    *,
+    expected_docs: int,
+    not_incarnation: str | None = None,
 ) -> dict | None:
     try:
         index_info = stateful_api.get_index(table_name, index_name)
@@ -170,6 +175,8 @@ def _ready_index(
         return None
     stats = ready_index_status(index_info, until="complete", require_query_fresh=True)
     if stats is None:
+        return None
+    if not_incarnation is not None and stats.get("incarnation") == not_incarnation:
         return None
     total_indexed = stats.get("total_indexed", stats.get("doc_count", 0))
     if total_indexed < expected_docs:
@@ -1071,7 +1078,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
         index_name,
         "embeddings",
     )
-    assert wait_until(
+    initial = wait_until(
         # A metadata snapshot can expose the index config before the table's
         # shard topology and runtime observation arrive. Do not begin the
         # rate-limit scenario from that config-only response: it has an empty
@@ -1080,6 +1087,8 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
         timeout_s=30.0,
         interval_s=0.5,
     )
+    assert initial is not None
+    initial_incarnation = initial["incarnation"]
 
     batch = stateful_api.batch_write(
         table_name,
@@ -1116,6 +1125,19 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
 
     rate_limited_openai_embedder.allow_all_requests()
 
+    # Make the dangerous predecessor state deterministic: the deleted
+    # incarnation is fully complete and therefore attractive to a status
+    # waiter if a late same-name publication is allowed to cross the recreate
+    # fence. Recovery must prove the newly created incarnation explicitly.
+    assert (
+        wait_until(
+            lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=3),
+            timeout_s=30.0,
+            interval_s=0.25,
+        )
+        is not None
+    )
+
     assert stateful_api.delete_index(table_name, index_name) == {}
     assert (
         wait_until(
@@ -1133,7 +1155,13 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
     )
 
     recovered = wait_until(
-        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=3),
+        lambda: _ready_index(
+            stateful_api,
+            table_name,
+            index_name,
+            expected_docs=3,
+            not_incarnation=initial_incarnation,
+        ),
         timeout_s=120.0,
         interval_s=0.5,
     )

@@ -14115,6 +14115,7 @@ pub const ProvisionedTableWriteSource = struct {
                 group_id,
                 .idle,
                 .consistent,
+                null,
                 db,
             ));
             startup_status_active = false;
@@ -22270,6 +22271,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 &cache.runtime_status_cache,
                 alloc,
                 table_name,
+                index_name,
                 group_id,
                 cached.db,
             );
@@ -22465,6 +22467,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 else => return err,
             };
             self.invalidateManagedWriteCache(table_name);
+            hosted_cache.runtime_status_cache.acknowledgeTargetedIndexAbsence(table_name, index_name);
             return;
         }
     }
@@ -27521,6 +27524,7 @@ fn publishRuntimeStatusSnapshot(
         group_id,
         .idle,
         .best_effort,
+        null,
         db,
     );
 }
@@ -27539,6 +27543,27 @@ fn publishRuntimeStatusSnapshotConsistent(
         group_id,
         .idle,
         .consistent,
+        null,
+        db,
+    );
+}
+
+fn publishTargetedRuntimeStatusSnapshotConsistent(
+    source: *ProvisionedTableWriteSource,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    index_name: []const u8,
+    group_id: u64,
+    db: *db_mod.DB,
+) !void {
+    try publishRuntimeStatusSnapshotWithStartupPhaseMode(
+        source,
+        alloc,
+        table_name,
+        group_id,
+        .idle,
+        .consistent,
+        index_name,
         db,
     );
 }
@@ -27557,7 +27582,7 @@ fn publishPostCommitIndexRuntimeStatusBestEffort(
     // restore, or another refresh may legitimately invalidate its publication
     // token while the snapshot is being collected. Never turn that expected
     // race (or another post-commit diagnostic failure) into a false DDL error.
-    publishRuntimeStatusSnapshotConsistent(source, alloc, table_name, group_id, db) catch |err| switch (err) {
+    publishTargetedRuntimeStatusSnapshotConsistent(source, alloc, table_name, index_name, group_id, db) catch |err| switch (err) {
         error.RuntimeStatusPublicationFenced => std.log.debug(
             "post-index-{s} runtime status publication deferred table={s} index={s} group_id={d} err={s}",
             .{ operation, table_name, index_name, group_id, @errorName(err) },
@@ -27729,6 +27754,7 @@ fn publishRuntimeStatusSnapshotConsistentIfAvailable(
         group_id,
         .idle,
         .consistent_if_available,
+        null,
         db,
     );
 }
@@ -27741,7 +27767,7 @@ fn publishRuntimeStatusSnapshotWithStartupPhase(
     phase: db_mod.types.StartupCatchUpPhase,
     db: *db_mod.DB,
 ) !void {
-    try publishRuntimeStatusSnapshotWithStartupPhaseMode(source, alloc, table_name, group_id, phase, .best_effort, db);
+    try publishRuntimeStatusSnapshotWithStartupPhaseMode(source, alloc, table_name, group_id, phase, .best_effort, null, db);
 }
 
 const RuntimeStatusSnapshotMode = enum {
@@ -27774,6 +27800,7 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
     group_id: u64,
     phase: db_mod.types.StartupCatchUpPhase,
     mode: RuntimeStatusSnapshotMode,
+    target_index_name: ?[]const u8,
     db: *db_mod.DB,
 ) !void {
     const repair_handoff_token = source.captureRepairHandoffPublicationTokenBestEffort(
@@ -27804,6 +27831,7 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
         phase,
         mode,
         .runtime,
+        target_index_name,
         db,
     );
     // The cache now contains an observation captured after the durable repair
@@ -27852,6 +27880,7 @@ fn publishTerminalStartupRuntimeStatusSnapshot(
         .idle,
         .consistent,
         .terminal_startup,
+        null,
         db,
     ) catch |err| switch (err) {
         error.RuntimeStatusPublicationFenced => return false,
@@ -27867,6 +27896,7 @@ fn publishRuntimeStatusSnapshotToCacheConsistent(
     snapshot_cache: *runtime_status.TableRuntimeSnapshotCache,
     alloc: std.mem.Allocator,
     table_name: []const u8,
+    index_name: []const u8,
     group_id: u64,
     db: *db_mod.DB,
 ) !void {
@@ -27881,6 +27911,7 @@ fn publishRuntimeStatusSnapshotToCacheConsistent(
         .idle,
         .consistent,
         .runtime,
+        index_name,
         db,
     );
 }
@@ -27895,6 +27926,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
     phase: db_mod.types.StartupCatchUpPhase,
     mode: RuntimeStatusSnapshotMode,
     publication_kind: RuntimeStatusPublicationKind,
+    target_index_name: ?[]const u8,
     db: *db_mod.DB,
 ) !void {
     const async_stats = db.snapshotAsyncIndexingStats();
@@ -27916,7 +27948,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
-            try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, status);
+            try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, target_index_name, status);
         } else {
             var status = runtime_status.LocalTableRuntimeStatus{
                 .group_id = group_id,
@@ -27927,7 +27959,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
-            try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, status);
+            try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, target_index_name, status);
         }
         return;
     }
@@ -28031,14 +28063,14 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         !statusHasRuntimeFactsIgnoringMetadataSource(status))
     {
         markClearedStartupRuntimeStatus(&status);
-        try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, status);
+        try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, target_index_name, status);
     } else {
         if (publication_kind == .terminal_startup)
             markStartupRuntimeStatus(&status, startup)
         else
             markRuntimeStatusFromDb(&status, phase);
         status.metadata.lsm_root_generation = lsm_root_generation;
-        try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, status);
+        try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, target_index_name, status);
     }
 }
 
@@ -28046,6 +28078,7 @@ fn publishRuntimeStatusGroupAfterObservation(
     snapshot_cache: *runtime_status.TableRuntimeSnapshotCache,
     publication_fence: runtime_status.TableRuntimeSnapshotCache.PublicationToken,
     table_name: []const u8,
+    target_index_name: ?[]const u8,
     status: runtime_status.LocalTableRuntimeStatus,
 ) !void {
     // The first token fences table invalidation while DB state is sampled. A
@@ -28063,7 +28096,11 @@ fn publishRuntimeStatusGroupAfterObservation(
     // writers, while only the token captured before DB sampling can prove
     // that no target-advance event raced the sampled durable sequence.
     completed.target_observation_revision = publication_fence.target_observation_revision;
-    try acceptRuntimeStatusPublication(try snapshot_cache.publishGroup(completed, table_name, status));
+    const result = if (target_index_name) |index_name|
+        try snapshot_cache.publishTargetedGroups(completed, table_name, index_name, &.{status})
+    else
+        try snapshot_cache.publishGroup(completed, table_name, status);
+    try acceptRuntimeStatusPublication(result);
     // Exercise and document the real concurrency boundary: lifecycle edges
     // may arrive after cache publication but before handoff settlement.
     runTestAfterRuntimeStatusPublishHook();
@@ -28739,7 +28776,7 @@ fn publishTerminalStartupCatchUpRuntimeStatus(
     var status = try syntheticStartupRuntimeStatusFromConfiguredIndexes(alloc, group_id, summary, terminal_startup, message);
     defer status.deinit(alloc);
     setRuntimeStatusMetadata(&status, .startup_catch_up, .stale);
-    publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, status) catch |publish_err| switch (publish_err) {
+    publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, null, status) catch |publish_err| switch (publish_err) {
         error.RuntimeStatusPublicationFenced => return false,
         else => return publish_err,
     };
@@ -28973,6 +29010,7 @@ fn catchUpManagedDb(
             group_id,
             .startup_catch_up,
             .consistent,
+            null,
             db,
         ));
         _ = try db.ensureGeneratedCoverageRecoveryIntents(alloc);
@@ -45246,7 +45284,7 @@ test "runtime status hook orders completed observation without crossing invalida
             .stats = .{ .source_doc_count = 0 },
         }),
     );
-    try publishRuntimeStatusGroupAfterObservation(&cache, hook_fence, "docs", .{
+    try publishRuntimeStatusGroupAfterObservation(&cache, hook_fence, "docs", null, .{
         .group_id = 7001,
         .stats = .{ .source_doc_count = 1 },
     });
@@ -45264,6 +45302,7 @@ test "runtime status hook orders completed observation without crossing invalida
         &cache,
         stale_epoch,
         "docs",
+        null,
         .{ .group_id = 7001, .stats = .{ .source_doc_count = 2 } },
     ));
 

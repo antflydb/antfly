@@ -209,6 +209,23 @@ pub const TableRuntimeSummary = struct {
 };
 
 const TargetedIndexPublicationFence = struct {
+    const Identity = struct {
+        incarnation: u64,
+        config_hash: u64,
+    };
+
+    const Expectation = union(enum) {
+        // A catalog mutation has crossed its visibility boundary, but the
+        // structural owner has not yet acknowledged the desired target. No
+        // same-name runtime observation may acquire authority in this state.
+        unknown,
+        // The authoritative structural observation proved that the target is
+        // no longer part of the desired index set.
+        absent,
+        // Only this durable catalog incarnation may acquire target authority.
+        exact: Identity,
+    };
+
     // Multiple mutation owners may overlap at hosted/public boundaries that
     // do not share the provisioned writer's structural activity queue.
     owner_count: usize = 1,
@@ -216,6 +233,7 @@ const TargetedIndexPublicationFence = struct {
     // authority back. This excludes the resident sibling snapshot deliberately
     // published between fencing and applying the target.
     accept_target_after_observation_generation: u64,
+    expectation: Expectation = .unknown,
     // Once the exact target publishes queryable state (or an exact failure),
     // it no longer remains stale. Keep the fence itself until the table is
     // fresh so later catch-up observations still preserve every index.
@@ -449,6 +467,7 @@ pub const TableRuntimeSnapshotCache = struct {
         if (state.targeted_index_fences.getPtr(index_name)) |fence| {
             fence.owner_count += 1;
             fence.accept_target_after_observation_generation = self.next_observation_generation;
+            fence.expectation = .unknown;
             fence.target_authority_handed_off = false;
             fence.release_after_observation_generation = null;
         } else {
@@ -489,6 +508,7 @@ pub const TableRuntimeSnapshotCache = struct {
         const state = self.tables.getPtr(table_name) orelse return;
         const fence = state.targeted_index_fences.getPtr(index_name) orelse return;
         fence.accept_target_after_observation_generation = self.next_observation_generation;
+        fence.expectation = .unknown;
         fence.target_authority_handed_off = false;
         var status_it = state.groups.valueIterator();
         while (status_it.next()) |status| {
@@ -515,6 +535,25 @@ pub const TableRuntimeSnapshotCache = struct {
         fence.owner_count -= 1;
         if (fence.owner_count != 0) return;
         fence.release_after_observation_generation = self.next_observation_generation;
+        self.advanceTargetedIndexAuthorityLocked(state);
+        self.settleReleasedTargetedIndexFencesLocked(state);
+    }
+
+    /// Records an authoritative structural acknowledgement that the named
+    /// target is absent from the desired catalog. This does not manufacture a
+    /// fresh observation: existing same-name runtime rows remain fenced until
+    /// a subsequent fresh publication also proves their absence.
+    pub fn acknowledgeTargetedIndexAbsence(
+        self: *@This(),
+        table_name: []const u8,
+        index_name: []const u8,
+    ) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.tables.getPtr(table_name) orelse return;
+        const fence = state.targeted_index_fences.getPtr(index_name) orelse return;
+        fence.expectation = .absent;
+        fence.target_authority_handed_off = false;
         self.advanceTargetedIndexAuthorityLocked(state);
         self.settleReleasedTargetedIndexFencesLocked(state);
     }
@@ -697,6 +736,16 @@ pub const TableRuntimeSnapshotCache = struct {
         try state.groups.ensureUnusedCapacity(self.alloc, @intCast(new_groups));
 
         const now_ns = platform_time.monotonicNs();
+        if (target_index_name) |name| {
+            // A whole-table invalidation clears both cached groups and their
+            // target fences. The current-epoch structural observation may
+            // still repopulate that empty table; there is no retained target
+            // authority to bind in that case.
+            if (state.targeted_index_fences.getPtr(name)) |fence| {
+                fence.expectation = try targetedIndexExpectation(statuses, name);
+                fence.target_authority_handed_off = false;
+            }
+        }
         var published = false;
         clean_all = false;
         for (owned, statuses) |*next, status| {
@@ -1213,16 +1262,19 @@ pub const TableRuntimeSnapshotCache = struct {
                 }
                 const target = findIndexStatusByName(status.stats.indexes, entry.key_ptr.*);
                 if (target) |item| {
-                    if (!targetObservationHandsOffAuthority(item, status.*)) {
+                    if (!targetObservationHandsOffAuthority(item, status.*, fence.expectation)) {
                         all_groups_authoritative = false;
                         break;
                     }
-                } else if (status.metadata.freshness != .fresh) {
+                } else if (!targetExpectationIsAbsent(fence.expectation) or status.metadata.freshness != .fresh) {
                     all_groups_authoritative = false;
                     break;
                 }
             }
-            if (!all_groups_authoritative) continue;
+            if (!all_groups_authoritative) {
+                markTargetObservationStaleLocked(state, entry.key_ptr.*);
+                continue;
+            }
             fence.target_authority_handed_off = true;
             var status_it = state.groups.valueIterator();
             while (status_it.next()) |status| {
@@ -1375,6 +1427,7 @@ fn preserveArtifactVisibilityOnReplayRegression(
             if (fences.get(dst.name)) |fence|
                 !fence.target_authority_handed_off and
                     incoming.cache_observation_generation >= fence.accept_target_after_observation_generation and
+                    targetFenceAcceptsIdentity(fence, dst.*) and
                     same_derived_incarnation and
                     same_runtime_root
             else
@@ -1582,7 +1635,16 @@ fn findIndexStatusByName(
 fn targetObservationHandsOffAuthority(
     item: db_mod.types.DBIndexStats,
     status: LocalTableRuntimeStatus,
+    expectation: TargetedIndexPublicationFence.Expectation,
 ) bool {
+    const expected = switch (expectation) {
+        .exact => |identity| identity,
+        .unknown, .absent => return false,
+    };
+    if (!item.coverage_identity_ready or
+        item.coverage_generation != expected.incarnation or
+        item.coverage_config_hash != expected.config_hash)
+        return false;
     if (item.load_error != null or status.metadata.freshness == .failed) return true;
     if (status.metadata.freshness == .fresh) return true;
     if (status.metadata.freshness != .opening and status.metadata.freshness != .catching_up) return false;
@@ -1592,6 +1654,69 @@ fn targetObservationHandsOffAuthority(
             indexHasPublishedGenerationVisibility(item);
     }
     return indexHasPublishedArtifactVisibility(item);
+}
+
+fn targetExpectationIsAbsent(expectation: TargetedIndexPublicationFence.Expectation) bool {
+    return switch (expectation) {
+        .absent => true,
+        .unknown, .exact => false,
+    };
+}
+
+fn targetFenceAcceptsIdentity(
+    fence: TargetedIndexPublicationFence,
+    item: db_mod.types.DBIndexStats,
+) bool {
+    const expected = switch (fence.expectation) {
+        .exact => |identity| identity,
+        .unknown, .absent => return false,
+    };
+    return item.coverage_identity_ready and
+        item.coverage_generation == expected.incarnation and
+        item.coverage_config_hash == expected.config_hash;
+}
+
+fn targetedIndexExpectation(
+    statuses: []const LocalTableRuntimeStatus,
+    index_name: []const u8,
+) !TargetedIndexPublicationFence.Expectation {
+    if (statuses.len == 0) return error.EmptyTargetedIndexObservation;
+    var expected: ?TargetedIndexPublicationFence.Identity = null;
+    var observed_absent = false;
+    for (statuses) |status| {
+        const item = findIndexStatusByName(status.stats.indexes, index_name) orelse {
+            observed_absent = true;
+            if (expected != null) return error.InconsistentTargetedIndexObservation;
+            continue;
+        };
+        if (observed_absent) return error.InconsistentTargetedIndexObservation;
+        if (!item.coverage_identity_ready) return error.MissingTargetedIndexIdentity;
+        const identity: TargetedIndexPublicationFence.Identity = .{
+            .incarnation = item.coverage_generation,
+            .config_hash = item.coverage_config_hash,
+        };
+        if (expected) |current| {
+            if (!std.meta.eql(current, identity)) return error.InconsistentTargetedIndexObservation;
+        } else {
+            expected = identity;
+        }
+    }
+    return if (expected) |identity| .{ .exact = identity } else .absent;
+}
+
+fn markTargetObservationStaleLocked(
+    state: *TableRuntimeSnapshotCache.TableState,
+    index_name: []const u8,
+) void {
+    var status_it = state.groups.valueIterator();
+    while (status_it.next()) |status| {
+        for (status.stats.indexes) |*item| {
+            if (!std.mem.eql(u8, item.name, index_name)) continue;
+            item.runtime_observation_stale = true;
+            item.runtime_observation_serviceable = false;
+            item.runtime_observation_targeted_sibling = false;
+        }
+    }
 }
 
 fn preserveIndexArtifactVisibility(dst: *db_mod.types.DBIndexStats, cached: db_mod.types.DBIndexStats) void {
@@ -1668,12 +1793,13 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
         // Retain those immutable facts across a synthetic refresh while the
         // fence continues to withhold serving authority. Pre-fence target
         // snapshots remain unusable and are intentionally omitted.
+        const cached = findMatchingIndexStatus(previous.stats.indexes, dst.name, dst.kind) orelse continue;
         const target_facts_current = if (target_fence) |fence|
-            previous.cache_observation_generation >= fence.accept_target_after_observation_generation
+            previous.cache_observation_generation >= fence.accept_target_after_observation_generation and
+                targetFenceAcceptsIdentity(fence, cached)
         else
             false;
         if (targeted and !target_facts_current) continue;
-        const cached = findMatchingIndexStatus(previous.stats.indexes, dst.name, dst.kind) orelse continue;
         const owned_name = dst.name;
         dst.* = cached;
         dst.name = owned_name;
@@ -3452,11 +3578,11 @@ test "targeted catch up hands off same incarnation serving authority" {
     }};
     try std.testing.expectEqual(
         TableRuntimeSnapshotCache.PublishResult.published,
-        try cache.publishGroup(catch_up_token, "docs", .{
+        try cache.publishTargetedGroups(catch_up_token, "docs", "thumbnail", &.{.{
             .group_id = 7,
             .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 9 },
             .stats = .{ .source_doc_count = 100, .index_count = 1, .indexes = catching_up_indexes[0..] },
-        }),
+        }}),
     );
 
     var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
@@ -3467,6 +3593,122 @@ test "targeted catch up hands off same incarnation serving authority" {
     try std.testing.expectEqual(@as(u64, 3), target.doc_count);
     try std.testing.expectEqual(@as(u64, 3), target.coverage_produced_count);
     try std.testing.expect(cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("thumbnail").?.target_authority_handed_off);
+}
+
+test "targeted publication rejects a completed stale incarnation until structural acknowledgement" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var old_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 3,
+        .serving_snapshot_ready = true,
+        .coverage_produced_count = 3,
+        .coverage_generation = 12,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(initial, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .source_doc_count = 3, .doc_count = 3, .index_count = 1, .indexes = old_indexes[0..] },
+        }),
+    );
+
+    cache.fenceTargetedIndexPublications("docs", "semantic_idx");
+    cache.armTargetedIndexPublications("docs", "semantic_idx");
+
+    // A retiring worker can complete after the catalog mutation boundary. Its
+    // post-fence timestamp does not make the deleted incarnation current.
+    const retiring_owner = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(retiring_owner, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .source_doc_count = 3, .doc_count = 3, .index_count = 1, .indexes = old_indexes[0..] },
+        }),
+    );
+    var fenced = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer fenced.deinit(alloc);
+    const stale = findIndexStatusByName(fenced.stats.indexes, "semantic_idx").?;
+    try std.testing.expect(stale.runtime_observation_stale);
+    try std.testing.expect(!stale.runtime_observation_serviceable);
+    try std.testing.expect(!cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("semantic_idx").?.target_authority_handed_off);
+
+    var new_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .serving_snapshot_ready = true,
+        .coverage_generation = 13,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const structural_owner = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishTargetedGroups(structural_owner, "docs", "semantic_idx", &.{.{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .source_doc_count = 3, .index_count = 1, .indexes = new_indexes[0..] },
+        }}),
+    );
+    var acknowledged = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer acknowledged.deinit(alloc);
+    const current = findIndexStatusByName(acknowledged.stats.indexes, "semantic_idx").?;
+    try std.testing.expectEqual(@as(u64, 13), current.coverage_generation);
+    try std.testing.expect(!current.runtime_observation_stale);
+    try std.testing.expect(cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("semantic_idx").?.target_authority_handed_off);
+}
+
+test "targeted deletion hands off only after authoritative absence" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .serving_snapshot_ready = true,
+        .coverage_generation = 12,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(initial, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = indexes[0..] },
+        }),
+    );
+
+    cache.fenceTargetedIndexPublications("docs", "semantic_idx");
+    cache.armTargetedIndexPublications("docs", "semantic_idx");
+    cache.acknowledgeTargetedIndexAbsence("docs", "semantic_idx");
+    try std.testing.expect(!cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("semantic_idx").?.target_authority_handed_off);
+
+    const absent = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(absent, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{},
+        }),
+    );
+    try std.testing.expect(cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("semantic_idx").?.target_authority_handed_off);
+    var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer observed.deinit(alloc);
+    try std.testing.expect(findIndexStatusByName(observed.stats.indexes, "semantic_idx") == null);
 }
 
 test "table runtime snapshot cache batch publication is table epoch atomic" {
@@ -3672,11 +3914,11 @@ test "synthetic refresh preserves post-fence target facts before serving handoff
     }};
     try std.testing.expectEqual(
         TableRuntimeSnapshotCache.PublishResult.published,
-        try cache.publishGroup(owner_token, "docs", .{
+        try cache.publishTargetedGroups(owner_token, "docs", "thumbnail", &.{.{
             .group_id = 7,
             .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 9 },
             .stats = .{ .source_doc_count = 100, .index_count = 1, .indexes = owner_indexes[0..] },
-        }),
+        }}),
     );
     try std.testing.expect(!cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("thumbnail").?.target_authority_handed_off);
     cache.releaseTargetedIndexPublications("docs", "thumbnail");
@@ -3702,7 +3944,7 @@ test "synthetic refresh preserves post-fence target facts before serving handoff
     try std.testing.expectEqual(@as(u64, 12), target.coverage_generation);
     try std.testing.expectEqual(@as(u64, 3), target.replay_applied_sequence);
     try std.testing.expectEqual(@as(u64, 100), target.replay_target_sequence);
-    try std.testing.expect(!target.runtime_observation_stale);
+    try std.testing.expect(target.runtime_observation_stale);
     try std.testing.expect(!target.runtime_observation_serviceable);
     try std.testing.expectEqual(RuntimeStatusFreshness.stale, observed.metadata.freshness);
 }
