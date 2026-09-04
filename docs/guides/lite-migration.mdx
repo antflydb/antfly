@@ -8,14 +8,16 @@ estimatedTime: "15 min"
 tags: [lite, migration, backup, restore, promotion]
 ---
 
-Antfly Lite and normal Antfly share the same logical backup and restore model.
-Use `.afb` archives for portable migrations, and use `.aflite` as the live Lite
-database file.
+Antfly Lite and normal Antfly share the same backup-bundle envelope. Use a
+portable AFB2 representation for cross-engine migrations, and use `.aflite` as
+the live Lite database file.
 
 ## File Roles
 
 - `.aflite` is a live embedded Lite database.
-- `.afb` is a portable Antfly backup archive.
+- `.afb` is an Antfly Backup Bundle. Its manifest explicitly identifies a
+  `portable` logical or `native` physical representation; Lite produces and
+  consumes the portable representation.
 
 Normal Antfly can restore directly from a Lite `.aflite` input, but that path is
 a convenience for promotion, not a reason to treat `.aflite` as the long-term
@@ -75,6 +77,9 @@ Create a portable backup from normal Antfly:
 ```bash
 antfly backup \
   --table docs \
+  --backup-id docs-export \
+  --connection archive-writer \
+  --format portable \
   --out docs.afb \
   --location file:///tmp/antfly_backups \
   --url http://localhost:8080
@@ -168,8 +173,10 @@ antfly lite snapshot app.aflite --out copy.aflite
 ```
 
 Use snapshots for local file copies, test fixtures, or application handoff where
-the destination is still Antfly Lite. Use `.afb` for archival backups, normal
-Antfly restore, object storage, and cross-version migration.
+the destination is still Antfly Lite. Use full `.afb` bundles for archival
+backups, normal Antfly restore, object-storage transfer, and cross-version
+migration. Choose the portable representation for Lite or cross-engine restore;
+choose native for fast restore into a compatible normal Antfly runtime.
 
 ## Version Policy
 
@@ -179,4 +186,4 @@ pre-release directories, LSM-container prototypes, or unknown file versions.
 
 If a pre-release Lite experiment needs to be preserved, export it with the
 matching development build before moving to v1, then restore the resulting
-portable `.afb`.
+portable AFB1 or AFB2 bundle.

@@ -702,6 +702,17 @@ pub const ProvisionedTableReadCache = struct {
     }
 
     pub fn beginExclusiveTableAccess(self: *ProvisionedTableReadCache, table_name: []const u8) !ExclusiveTableAccess {
+        return self.beginExclusiveTableAccessWithDeadline(
+            table_name,
+            platform_time.monotonicNs() +| exclusive_wait_timeout_ns,
+        );
+    }
+
+    pub fn beginExclusiveTableAccessWithDeadline(
+        self: *ProvisionedTableReadCache,
+        table_name: []const u8,
+        deadline_ns: u64,
+    ) !ExclusiveTableAccess {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         errdefer self.mutex.unlock(io);
@@ -724,14 +735,20 @@ pub const ProvisionedTableReadCache = struct {
             self.hasTableLocked(table_name) or
             self.hasRetiredEntryForTableLocked(table_name))
         {
-            const waited_ns = platform_time.monotonicNs() -| drain_started_ns;
-            if (waited_ns >= exclusive_wait_timeout_ns) {
+            const now_ns = platform_time.monotonicNs();
+            const waited_ns = now_ns -| drain_started_ns;
+            if (now_ns >= deadline_ns) {
                 const pending_opens = self.pendingOpenCountForTableLocked(table_name);
                 const retired_entries = self.retiredEntryCountForTableLocked(table_name);
                 const active_leases = self.activeLeaseCountForTableLocked(table_name);
                 self.releaseExclusiveTableAccessLocked(table_name);
                 self.ready.broadcast(io);
-                std.log.err("table read generation drain timed out table={s} pending_opens={} retired_entries={} active_leases={} wait_ms={}", .{
+                // The caller retains durable convergence ownership and may
+                // retry this bounded drain. Treat timeout as actionable
+                // repair pressure, not process corruption: strict test and
+                // production error-log gates reserve `err` for invariants
+                // that cannot recover without operator intervention.
+                std.log.warn("table read generation drain timed out table={s} pending_opens={} retired_entries={} active_leases={} wait_ms={}", .{
                     table_name,
                     pending_opens,
                     retired_entries,
@@ -741,7 +758,7 @@ pub const ProvisionedTableReadCache = struct {
                 return error.TableReadDrainTimeout;
             }
             self.mutex.unlock(io);
-            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, exclusive_wait_timeout_ns - waited_ns)), .awake) catch {};
+            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, deadline_ns - now_ns)), .awake) catch {};
             self.mutex.lockUncancelable(io);
         }
         self.mutex.unlock(io);
@@ -753,6 +770,17 @@ pub const ProvisionedTableReadCache = struct {
     }
 
     pub fn beginExclusiveGroupAccess(self: *ProvisionedTableReadCache, group_id: u64) !ExclusiveGroupAccess {
+        return self.beginExclusiveGroupAccessWithDeadline(
+            group_id,
+            platform_time.monotonicNs() +| exclusive_wait_timeout_ns,
+        );
+    }
+
+    pub fn beginExclusiveGroupAccessWithDeadline(
+        self: *ProvisionedTableReadCache,
+        group_id: u64,
+        deadline_ns: u64,
+    ) !ExclusiveGroupAccess {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         errdefer self.mutex.unlock(io);
@@ -766,16 +794,15 @@ pub const ProvisionedTableReadCache = struct {
         self.removeEntriesForGroupLocked(group_id);
         self.ready.broadcast(io);
 
-        const drain_started_ns = platform_time.monotonicNs();
         while (self.hasPendingOpenForGroupLocked(group_id) or self.hasGroupLocked(group_id) or self.hasRetiredEntryForGroupLocked(group_id)) {
-            const waited_ns = platform_time.monotonicNs() -| drain_started_ns;
-            if (waited_ns >= exclusive_wait_timeout_ns) {
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) {
                 self.releaseExclusiveGroupAccessLocked(group_id);
                 self.ready.broadcast(io);
                 return error.TableReadDrainTimeout;
             }
             self.mutex.unlock(io);
-            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, exclusive_wait_timeout_ns - waited_ns)), .awake) catch {};
+            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, deadline_ns - now_ns)), .awake) catch {};
             self.mutex.lockUncancelable(io);
         }
         self.mutex.unlock(io);
@@ -883,6 +910,17 @@ pub const ProvisionedTableReadCache = struct {
         table_name: []const u8,
     ) bool {
         return self.exclusive_table_access.get(table_name) != null;
+    }
+
+    pub fn testingExclusiveTableAccessActive(
+        self: *ProvisionedTableReadCache,
+        table_name: []const u8,
+    ) bool {
+        if (!builtin.is_test) @compileError("testingExclusiveTableAccessActive is test-only");
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.hasExclusiveTableAccessLocked(table_name);
     }
 
     fn hasExclusiveGroupAccessLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
@@ -2601,6 +2639,7 @@ pub const ProvisionedTableReadSource = struct {
 
     const PreparedSpanRead = struct {
         alloc: std.mem.Allocator,
+        routes: []table_catalog.CatalogGroupRoute,
         group_ids: []u64,
         topology_epoch: u64,
         activity: ?ReadPreparation.Activity,
@@ -2612,6 +2651,8 @@ pub const ProvisionedTableReadSource = struct {
 
         fn deinit(self: *PreparedSpanRead) void {
             self.releaseActivity();
+            self.alloc.free(self.routes);
+            self.routes = &.{};
             self.alloc.free(self.group_ids);
             self.group_ids = &.{};
         }
@@ -2872,11 +2913,15 @@ pub const ProvisionedTableReadSource = struct {
                     },
                     else => return err,
                 };
-                return .{ .group_id = route.group_id, .topology_epoch = route.topology_epoch, .activity = activity };
+                return .{
+                    .group_id = if (route.route) |group_route| group_route.group_id else null,
+                    .topology_epoch = route.topology_epoch,
+                    .activity = activity,
+                };
             }
 
             const route = try table_catalog.routedGroupSnapshot(alloc, self.catalog, table_name, key);
-            if (route.group_id) |id| try self.prepareGroupsForReadAdmission(alloc, &.{id}, request, consistency);
+            if (route.route) |group_route| try self.prepareGroupsForReadAdmission(alloc, &.{group_route.group_id}, request, consistency);
             var activity = self.beginPreparedRead(table_name, kind);
             errdefer if (activity) |*held| held.deinit();
             table_catalog.validatePinnedTopologyEpoch(alloc, self.catalog, table_name, route.topology_epoch) catch |err| switch (err) {
@@ -2888,7 +2933,11 @@ pub const ProvisionedTableReadSource = struct {
                 },
                 else => return err,
             };
-            return .{ .group_id = route.group_id, .topology_epoch = route.topology_epoch, .activity = activity };
+            return .{
+                .group_id = if (route.route) |group_route| group_route.group_id else null,
+                .topology_epoch = route.topology_epoch,
+                .activity = activity,
+            };
         }
         unreachable;
     }
@@ -2909,10 +2958,16 @@ pub const ProvisionedTableReadSource = struct {
                 var activity = self.beginPreparedRead(table_name, kind);
                 errdefer if (activity) |*held| held.deinit();
                 const route = try table_catalog.routedSpanSnapshot(alloc, self.catalog, table_name, from_key, to_key);
+                var routes = route.routes;
                 var group_ids = route.group_ids;
-                errdefer alloc.free(group_ids);
+                errdefer {
+                    alloc.free(routes);
+                    alloc.free(group_ids);
+                }
                 if (activity == null) table_catalog.validatePinnedTopologyEpoch(alloc, self.catalog, table_name, route.topology_epoch) catch |err| switch (err) {
                     error.TopologyChanged => {
+                        alloc.free(routes);
+                        routes = &.{};
                         alloc.free(group_ids);
                         group_ids = &.{};
                         if (activity) |*held| held.deinit();
@@ -2922,17 +2977,23 @@ pub const ProvisionedTableReadSource = struct {
                     },
                     else => return err,
                 };
-                return .{ .alloc = alloc, .group_ids = group_ids, .topology_epoch = route.topology_epoch, .activity = activity };
+                return .{ .alloc = alloc, .routes = routes, .group_ids = group_ids, .topology_epoch = route.topology_epoch, .activity = activity };
             }
 
             const route = try table_catalog.routedSpanSnapshot(alloc, self.catalog, table_name, from_key, to_key);
+            var routes = route.routes;
             var group_ids = route.group_ids;
-            errdefer alloc.free(group_ids);
+            errdefer {
+                alloc.free(routes);
+                alloc.free(group_ids);
+            }
             try self.prepareGroupsForReadAdmission(alloc, group_ids, request, consistency);
             var activity = self.beginPreparedRead(table_name, kind);
             errdefer if (activity) |*held| held.deinit();
             table_catalog.validatePinnedTopologyEpoch(alloc, self.catalog, table_name, route.topology_epoch) catch |err| switch (err) {
                 error.TopologyChanged => {
+                    alloc.free(routes);
+                    routes = &.{};
                     alloc.free(group_ids);
                     group_ids = &.{};
                     if (activity) |*held| held.deinit();
@@ -2942,7 +3003,7 @@ pub const ProvisionedTableReadSource = struct {
                 },
                 else => return err,
             };
-            return .{ .alloc = alloc, .group_ids = group_ids, .topology_epoch = route.topology_epoch, .activity = activity };
+            return .{ .alloc = alloc, .routes = routes, .group_ids = group_ids, .topology_epoch = route.topology_epoch, .activity = activity };
         }
         unreachable;
     }
@@ -27903,18 +27964,25 @@ test "hosted cross-range graph query expands explicit local start keys" {
     );
     _ = hosted.withIo(&io_impl);
 
+    const outgoing_graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "mentions",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "relations_graph",
+            .start_nodes = .{ .keys = &.{"zdoc:a"} },
+            .params = .{ .edge_types = &.{"mentions"}, .direction = .out, .max_results = 10 },
+        },
+    }};
     var response = (try hosted.source().query(alloc, "docs", .{
         .query = .{ .match_all = {} },
         .limit = 10,
-        .graph_queries = &.{.{
-            .name = "mentions",
-            .query = .{
-                .query_type = .neighbors,
-                .index_name = "relations_graph",
-                .start_nodes = .{ .keys = &.{"zdoc:a"} },
-                .params = .{ .edge_types = &.{"mentions"}, .direction = .out, .max_results = 10 },
-            },
-        }},
+        .graph_queries = &outgoing_graph_queries,
+        .graph_query_transport = .{
+            .dialect = .legacy,
+            .operations_json = "{\"mentions\":{\"index\":\"relations_graph\",\"traverse\":{\"start\":{\"keys\":[\"zdoc:a\"]}}}}",
+            .admitted_operations_ptr = @ptrCast(outgoing_graph_queries[0..].ptr),
+            .admitted_operations_len = outgoing_graph_queries.len,
+        },
     }, .read_index)).?;
     defer response.deinit(alloc);
 
@@ -27923,18 +27991,25 @@ test "hosted cross-range graph query expands explicit local start keys" {
     , response.json);
     try expectJsonStringPresence(alloc, response.json, "entity:ada", true);
 
+    const incoming_graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "mentioned_by",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "relations_graph",
+            .start_nodes = .{ .keys = &.{"entity:ada"} },
+            .params = .{ .edge_types = &.{"mentions"}, .direction = .in, .max_results = 10 },
+        },
+    }};
     var incoming_response = (try hosted.source().query(alloc, "docs", .{
         .query = .{ .match_all = {} },
         .limit = 10,
-        .graph_queries = &.{.{
-            .name = "mentioned_by",
-            .query = .{
-                .query_type = .neighbors,
-                .index_name = "relations_graph",
-                .start_nodes = .{ .keys = &.{"entity:ada"} },
-                .params = .{ .edge_types = &.{"mentions"}, .direction = .in, .max_results = 10 },
-            },
-        }},
+        .graph_queries = &incoming_graph_queries,
+        .graph_query_transport = .{
+            .dialect = .legacy,
+            .operations_json = "{\"mentioned_by\":{\"index\":\"relations_graph\",\"traverse\":{\"start\":{\"keys\":[\"entity:ada\"]}}}}",
+            .admitted_operations_ptr = @ptrCast(incoming_graph_queries[0..].ptr),
+            .admitted_operations_len = incoming_graph_queries.len,
+        },
     }, .read_index)).?;
     defer incoming_response.deinit(alloc);
 
@@ -28941,6 +29016,15 @@ test "provisioned read cache exclusive access drains active read leases" {
 
     var lease = try cache.getOrOpen(path, FakeCatalog.iface(), 7001, 1, "docs");
     try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+
+    try std.testing.expectError(
+        error.TableReadDrainTimeout,
+        cache.beginExclusiveTableAccessWithDeadline(
+            "docs",
+            platform_time.monotonicNs() + 5 * std.time.ns_per_ms,
+        ),
+    );
+    try std.testing.expect(!cache.hasExclusiveTableAccessLocked("docs"));
 
     var ctx = ExclusiveThread{ .cache = &cache };
     const thread = try std.Thread.spawn(.{}, ExclusiveThread.run, .{&ctx});

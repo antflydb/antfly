@@ -22,6 +22,7 @@ import (
 	"github.com/onsi/gomega/gstruct"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -2012,6 +2013,28 @@ type conflictOnceHAResultClient struct {
 	conflicts int
 }
 
+// staleHAClusterReadClient models the normal informer-cache window after a
+// successful status write: writes reach the API server immediately while the
+// cached AntflyCluster still exposes the preceding resource version.
+type staleHAClusterReadClient struct {
+	client.Client
+	stale *antflyv1.AntflyCluster
+}
+
+func (c *staleHAClusterReadClient) Get(
+	ctx context.Context,
+	key client.ObjectKey,
+	object client.Object,
+	opts ...client.GetOption,
+) error {
+	cluster, ok := object.(*antflyv1.AntflyCluster)
+	if ok && c.stale != nil && key == client.ObjectKeyFromObject(c.stale) {
+		c.stale.DeepCopyInto(cluster)
+		return nil
+	}
+	return c.Client.Get(ctx, key, object, opts...)
+}
+
 type concurrentHAReservationClient struct {
 	client.Client
 	conflicts int
@@ -3829,6 +3852,51 @@ func TestHADirectActionCheckpointsReservationBeforeDispatchAndStopsAfterOneSideE
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 }
 
+func TestHADirectActionResultBypassesStaleCacheAfterReservation(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+
+	cluster := durableHACreateSlotCluster("standby-a", 5)
+	apiClient := newHAControllerTestClient(t, s, cluster)
+	stale := &antflyv1.AntflyCluster{}
+	g.Expect(apiClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), stale)).To(Succeed())
+	cachedClient := &staleHAClusterReadClient{Client: apiClient, stale: stale}
+	requests := 0
+	reconciler := &AntflyClusterReconciler{
+		Client:         cachedClient,
+		BoundaryReader: apiClient,
+		Scheme:         s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests++
+			persisted := &antflyv1.AntflyCluster{}
+			g.Expect(apiClient.Get(req.Context(), client.ObjectKeyFromObject(cluster), persisted)).To(Succeed())
+			reserved := persisted.Status.HAStatus.PlannedActions[0]
+			g.Expect(reserved.InFlightAttempt).To(Equal(int32(1)))
+			g.Expect(reserved.AttemptID).NotTo(BeEmpty())
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(
+					haReplicationSlotActionResponseJSON("replication_slot_create", "create", "standby-a", "primary-a"),
+				)),
+			}, nil
+		})},
+	}
+
+	err := reconciler.reconcileHAAdminJobs(context.Background(), cluster)
+	g.Expect(err).To(MatchError(errHAStatusCheckpointed))
+	g.Expect(requests).To(Equal(1))
+	persisted := &antflyv1.AntflyCluster{}
+	g.Expect(apiClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), persisted)).To(Succeed())
+	completed := persisted.Status.HAStatus.PlannedActions[0]
+	g.Expect(completed.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(completed.InFlightAttempt).To(BeZero())
+	g.Expect(completed.AttemptID).To(BeEmpty())
+	g.Expect(completed.AdminResult).NotTo(BeNil())
+	g.Expect(completed.AdminResult.ActionState).To(Equal("applied"))
+}
+
 func TestHADirectActionReservationConflictNeverDispatchesUsingAnotherOwnersLease(t *testing.T) {
 	g := NewWithT(t)
 	s := runtime.NewScheme()
@@ -4567,11 +4635,13 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	s := runtime.NewScheme()
 	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
 	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+	g.Expect(coordinationv1.AddToScheme(s)).To(Succeed())
 
 	cluster := &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-cluster",
 			Namespace: "default",
+			UID:       types.UID("cluster-uid"),
 		},
 		Spec: antflyv1.AntflyClusterSpec{
 			HighAvailability: &antflyv1.HighAvailabilitySpec{
@@ -4588,10 +4658,23 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 					Epoch:            6,
 					CurrentPrimaryID: "primary-a",
 				},
+				AutomaticFailover: &antflyv1.HAAutomaticFailoverPolicy{
+					Enabled:          true,
+					FencingAuthority: antflyv1.HAFencingAuthorityKubernetesLease,
+				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					Role:   antflyv1.HARuntimeRolePrimary,
+					NodeID: "primary-a",
+					FencingLease: &antflyv1.HARuntimeFencingLeaseSpec{
+						Name:       "topology-ha-fence",
+						TopologyID: "topology-anchor-uid",
+					},
+				},
 			},
 		},
 		Status: antflyv1.AntflyClusterStatus{
 			HAStatus: &antflyv1.HAStatus{
+				PrimaryLSN: 12,
 				PlannedActions: []antflyv1.HAPlannedActionStatus{{
 					Kind:            string(haActionAcquireFence),
 					StandbyName:     "standby-a",
@@ -4610,6 +4693,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 					StandbyName:     "standby-a",
 					TargetLSN:       12,
 					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceHolder:     "standby-a",
 					FenceGeneration: 3,
 					FenceReason:     "LeaseAcquired",
 					AdminCommand:    []string{"promote", "assess", "--current-fence"},
@@ -4621,6 +4705,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 					StandbyName:     "standby-a",
 					TargetLSN:       12,
 					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceHolder:     "standby-a",
 					FenceGeneration: 3,
 					FenceReason:     "LeaseAcquired",
 					AdminCommand:    []string{"promote", "--current-fence"},
@@ -4631,10 +4716,15 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 		},
 	}
 	var observed []string
-	apiClient := newHAControllerTestClient(t, s, cluster)
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	lease := haFenceLease(cluster, now, 30, 3, "standby-a")
+	authorizeHandoffRenewalForTest(lease, cluster, "primary-a", 3)
+	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "11"
+	apiClient := newHAControllerTestClient(t, s, cluster, lease)
 	reconciler := &AntflyClusterReconciler{
 		Client: apiClient,
 		Scheme: s,
+		Now:    func() time.Time { return now },
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			observed = append(observed, req.Method+" "+req.URL.Path)
 			switch req.URL.Path {
@@ -4681,6 +4771,17 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 		})},
 	}
 
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
+	g.Expect(observed).To(Equal([]string{
+		"POST /admin/v1/ha/fence",
+		"POST /admin/v1/ha/promotion/assess",
+	}), "promotion must wait while the Lease carries only a weaker boundary")
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobPhase).To(Equal(haAdminJobPhaseWaitingDependency))
+
+	currentLease := &coordinationv1.Lease{}
+	g.Expect(apiClient.Get(context.Background(), client.ObjectKeyFromObject(lease), currentLease)).To(Succeed())
+	currentLease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "12"
+	g.Expect(apiClient.Update(context.Background(), currentLease)).To(Succeed())
 	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(observed).To(Equal([]string{
 		"POST /admin/v1/ha/fence",
@@ -5480,6 +5581,59 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 	g.Expect(jobs.Items).To(BeEmpty())
 }
 
+func TestHARejoinFenceReceiptSurvivesPromotionIdentityAdoption(t *testing.T) {
+	g := NewWithT(t)
+	promotion := &antflyv1.HAPromotionStatus{
+		ClusterID:         100,
+		ShardID:           10,
+		TableID:           20,
+		OldPrimaryID:      "primary-a",
+		PromotedStandbyID: "standby-a",
+		ParentTimelineID:  4,
+		ParentEpoch:       6,
+		NewTimelineID:     5,
+		NewEpoch:          7,
+		RequiredLSN:       12,
+		ObservedLSN:       13,
+		FenceGeneration:   3,
+		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceToken:        "ha-fence-token",
+		FenceReason:       "LeaseAcquired",
+	}
+	status := &antflyv1.HAStatus{LastPromotion: promotion}
+	identities := map[string]*antflyv1.HAReplicationIdentitySpec{
+		"parent": {
+			ClusterID: 100, ShardID: 10, TableID: 20,
+			TimelineID: 4, Epoch: 6, CurrentPrimaryID: "primary-a",
+		},
+		"adopted-child": {
+			ClusterID: 100, ShardID: 10, TableID: 20,
+			TimelineID: 5, Epoch: 7, CurrentPrimaryID: "standby-a",
+		},
+	}
+	for name, identity := range identities {
+		t.Run(name, func(t *testing.T) {
+			receipt, ok := haRejoinFenceReceipt(status, identity)
+			NewWithT(t).Expect(ok).To(BeTrue())
+			NewWithT(t).Expect(receipt.Identity.TimelineId).To(Equal(uint64(5)))
+			NewWithT(t).Expect(receipt.Identity.Epoch).To(Equal(uint64(7)))
+			NewWithT(t).Expect(receipt.OldPrimaryId).To(Equal("primary-a"))
+			NewWithT(t).Expect(receipt.PromotedNodeId).To(Equal("standby-a"))
+			NewWithT(t).Expect(receipt.Token).To(Equal("ha-fence-token"))
+		})
+	}
+
+	wrongTopology := identities["adopted-child"].DeepCopy()
+	wrongTopology.TableID++
+	_, ok := haRejoinFenceReceipt(status, wrongTopology)
+	g.Expect(ok).To(BeFalse())
+
+	staleChild := identities["adopted-child"].DeepCopy()
+	staleChild.TimelineID++
+	_, ok = haRejoinFenceReceipt(status, staleChild)
+	g.Expect(ok).To(BeFalse())
+}
+
 func TestReconcileHAAdminJobsRejectsDirectRejoinWorkflowMismatchedAssessment(t *testing.T) {
 	g := NewWithT(t)
 
@@ -5810,6 +5964,156 @@ func TestHAFormerPrimaryActionRequiresPromotionReceiptEvidence(t *testing.T) {
 	status.LastPromotion.Forced = false
 	status.LastPromotion.DataLossPossible = true
 	g.Expect(haFormerPrimaryActionSucceededWithPromotionEvidence(status, action)).To(BeFalse())
+}
+
+func TestHADemoteDependencySurvivesPromotionActionCompaction(t *testing.T) {
+	g := NewWithT(t)
+	status := &antflyv1.HAStatus{LastPromotion: &antflyv1.HAPromotionStatus{
+		OldPrimaryID:      "primary-a",
+		PromotedStandbyID: "standby-a",
+		ParentTimelineID:  1,
+		ParentEpoch:       1,
+		NewTimelineID:     2,
+		NewEpoch:          2,
+		RequiredLSN:       718,
+		ObservedLSN:       718,
+		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration:   2,
+		FenceToken:        "ha-fence-token",
+	}}
+	demote := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionDemoteFormerPrimary),
+		DependsOn:       string(haActionPromoteStandby),
+		StandbyName:     "primary-a",
+		AdminNodeID:     "primary-a",
+		TargetLSN:       718,
+		RouteFrom:       "primary-a",
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 2,
+		FenceHolder:     "standby-a",
+	}
+
+	// The transient PromoteStandby action has been compacted, but its exact
+	// durable receipt still authorizes the dependent assessment.
+	g.Expect(haPlannedActionDependenciesSucceededForStatus(status, []antflyv1.HAPlannedActionStatus{demote}, 0)).To(BeTrue())
+
+	for name, mutate := range map[string]func(*antflyv1.HAPlannedActionStatus, *antflyv1.HAPromotionStatus){
+		"old primary": func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) { a.StandbyName = "other" },
+		"admin node":  func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) { a.AdminNodeID = "standby-a" },
+		"fence authority": func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) {
+			a.FenceAuthority = antflyv1.HAFencingAuthorityExternal
+		},
+		"fence generation":   func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) { a.FenceGeneration++ },
+		"fence holder":       func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) { a.FenceHolder = "other" },
+		"promotion boundary": func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) { a.TargetLSN++ },
+		"route source":       func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) { a.RouteFrom = "other" },
+		"route target":       func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) { a.RouteTo = "other" },
+		"receipt token":      func(_ *antflyv1.HAPlannedActionStatus, p *antflyv1.HAPromotionStatus) { p.FenceToken = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := demote
+			promotion := *status.LastPromotion
+			mutate(&candidate, &promotion)
+			candidateStatus := &antflyv1.HAStatus{LastPromotion: &promotion}
+			NewWithT(t).Expect(haPlannedActionDependenciesSucceededForStatus(candidateStatus, []antflyv1.HAPlannedActionStatus{candidate}, 0)).To(BeFalse())
+		})
+	}
+
+	nonDemote := demote
+	nonDemote.Kind = string(haActionRewindFormerPrimary)
+	g.Expect(haPlannedActionDependenciesSucceededForStatus(status, []antflyv1.HAPlannedActionStatus{nonDemote}, 0)).To(BeFalse())
+}
+
+func TestHACompletedDemoteIsRestoredBeforeDispositionPlanning(t *testing.T) {
+	g := NewWithT(t)
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
+		ClusterID: 100, ShardID: 10, TableID: 20,
+		CurrentPrimaryID: "standby-a", TimelineID: 2, Epoch: 2,
+	}
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{Name: "primary-a"}}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN: 20,
+		Retention:  antflyv1.HARetentionStatus{OldestRestartLSN: 8},
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "primary-a",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  1,
+			ParentEpoch:       1,
+			NewTimelineID:     2,
+			NewEpoch:          2,
+			SwitchLSN:         13,
+			RequiredLSN:       12,
+			ObservedLSN:       12,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   2,
+			FenceToken:        "ha-fence-token",
+		},
+		// This is the promoted runtime's honest observation. It does not know
+		// the operator-owned assessment result recorded below.
+		FormerPrimary: &antflyv1.HAFormerPrimaryStatus{
+			NodeID:           "primary-a",
+			Fenced:           true,
+			FenceAuthority:   antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceHolder:      "standby-a",
+			FenceGeneration:  2,
+			ParentTimelineID: 1,
+			NewTimelineID:    2,
+			RejoinRequired:   true,
+			Action:           string(haActionDemoteFormerPrimary),
+			Reason:           "FormerPrimaryNotObserved",
+		},
+		PlannedActions: []antflyv1.HAPlannedActionStatus{{
+			Kind:                  string(haActionDemoteFormerPrimary),
+			Phase:                 string(haActionPhaseRejoin),
+			Executor:              string(haActionExecutorAdminAPI),
+			DependsOn:             string(haActionPromoteStandby),
+			StandbyName:           "primary-a",
+			AdminNodeID:           "primary-a",
+			AdminMethod:           "POST",
+			AdminPath:             haAdminRejoinAssessPath,
+			TargetLSN:             12,
+			RetainedFromLSN:       8,
+			RouteFrom:             "primary-a",
+			FenceAuthority:        antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceHolder:           "standby-a",
+			FenceGeneration:       2,
+			AdminJobName:          haAdminDirectAPIName,
+			AdminJobPhase:         haAdminJobPhaseSucceeded,
+			ExecutionStateVersion: 1,
+			AttemptCount:          1,
+			AdminResult: &antflyv1.HAAdminActionResultStatus{
+				SchemaVersion:    1,
+				ActionID:         "rejoin_assess:primary-a",
+				ActionKind:       "rejoin_assess",
+				ActionTarget:     "primary-a",
+				ActionState:      "assessed",
+				ActionNodeID:     "primary-a",
+				RejoinAction:     "rewind",
+				RejoinReason:     "parent_timeline_retained",
+				FormerNodeID:     "primary-a",
+				TargetTimelineID: 2,
+				TargetEpoch:      2,
+				ForkLSN:          12,
+				FormerLastLSN:    12,
+				RetainedFromLSN:  8,
+			},
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	g.Expect(haAdminActionSucceededWithEvidence(cluster.Status.HAStatus.PlannedActions[0])).To(BeTrue())
+	reconciler.updateHAFormerPrimaryFromAdminJobs(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.AssessedAction).To(Equal("rewind"))
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	assessment, found := haPlannedActionByKind(cluster.Status.HAStatus.PlannedActions, haActionDemoteFormerPrimary)
+	g.Expect(found).To(BeTrue())
+	g.Expect(assessment.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	rewind, found := haPlannedActionByKind(cluster.Status.HAStatus.PlannedActions, haActionRewindFormerPrimary)
+	g.Expect(found).To(BeTrue())
+	g.Expect(rewind.DependsOn).To(Equal(string(haActionFenceFormerPrimary)))
+	g.Expect(rewind.TargetLSN).To(Equal(uint64(12)))
 }
 
 func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
@@ -6329,6 +6633,23 @@ func TestHAPortableArtifactJobActionFreezesBothPVCsAndRejectsStaleTopology(t *te
 	g.Expect(bound.SourcePVCName).To(Equal("source-data"))
 	g.Expect(bound.SourcePVCUID).To(Equal("source-uid-1"))
 	g.Expect(bound.TargetPVCUID).To(Equal("target-uid-1"))
+
+	cluster.Spec.HighAvailability.Runtime = &antflyv1.HARuntimeSpec{StartupGate: &antflyv1.HAStartupGateSpec{
+		Policy: antflyv1.HAStartupGatePolicyRequireActivatedSeed, ReceiptMatchPolicy: antflyv1.HAReceiptMatchPolicyExact,
+		RequiredReceipt: &antflyv1.HARequiredSeedActivationReceipt{
+			TopologyID: "local-topology", TopologyGeneration: 1, NodeID: "promoted-primary", SlotName: "promoted-primary",
+			Generation: "initial-promoted-primary-1", TargetPVCName: "source-data", TargetPVCUID: "source-uid-1",
+		},
+	}}
+	_, ready, err = reconciler.haPortableArtifactJobAction(context.Background(), cluster, action)
+	g.Expect(err).NotTo(HaveOccurred(), "a promoted primary's local boot gate must not block repair of another PVC")
+	g.Expect(ready).To(BeTrue())
+
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCName = "target-data"
+	_, _, err = reconciler.haPortableArtifactJobAction(context.Background(), cluster, action)
+	g.Expect(err).To(MatchError(ContainSubstring("stale relative to the desired startup gate")),
+		"an action targeting the gated PVC must still match the complete receipt contract")
+	cluster.Spec.HighAvailability.Runtime = nil
 
 	staleTopology := action
 	staleTopology.TopologyGeneration = 6
@@ -6985,6 +7306,84 @@ func TestHAAdminJobArmsTTLOnlyAfterTerminalStatusWasCheckpointed(t *testing.T) {
 	g.Expect(*observed.Spec.TTLSecondsAfterFinished).To(Equal(int32(0)))
 }
 
+func TestDisabledHADeletesExactOwnedAdminJobs(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	controller := true
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "primary", Namespace: "default", UID: types.UID("cluster-uid"),
+		},
+		Status: antflyv1.AntflyClusterStatus{HAStatus: &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{
+			{AdminJobName: "active-ha-job"},
+			{AdminJobName: "terminal-ha-job"},
+			{AdminJobName: "newer-cluster-ha-job"},
+		}}},
+	}
+	owned := func(name string) *batchv1.Job {
+		return &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: cluster.Namespace, UID: types.UID(name + "-uid"),
+			Labels: map[string]string{
+				"app.kubernetes.io/component": "ha-admin",
+				"app.kubernetes.io/instance":  cluster.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster",
+				Name: cluster.Name, UID: cluster.UID, Controller: &controller,
+			}},
+		}}
+	}
+	active := owned("active-ha-job")
+	terminal := owned("terminal-ha-job")
+	unrelated := owned("newer-cluster-ha-job")
+	unrelated.OwnerReferences[0].UID = types.UID("newer-cluster-uid")
+	ownedPod := func(job *batchv1.Job) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: job.Name + "-pod", Namespace: job.Namespace, UID: types.UID(job.Name + "-pod-uid"),
+			Labels: map[string]string{
+				batchv1.ControllerUidLabel:    string(job.UID),
+				"app.kubernetes.io/component": "ha-admin",
+				"app.kubernetes.io/instance":  cluster.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: batchv1.SchemeGroupVersion.String(), Kind: "Job", Name: job.Name,
+				UID: job.UID, Controller: &controller,
+			}},
+		}}
+	}
+	activePod := ownedPod(active)
+	terminalPod := ownedPod(terminal)
+	unrelatedPod := ownedPod(unrelated)
+
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		cluster, active, terminal, unrelated, activePod, terminalPod, unrelatedPod,
+	).Build()
+	r := &AntflyClusterReconciler{Client: client, Scheme: s}
+	g.Expect(r.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+
+	for _, name := range []string{active.Name, terminal.Name} {
+		observed := &batchv1.Job{}
+		err := client.Get(context.Background(), types.NamespacedName{Name: name, Namespace: cluster.Namespace}, observed)
+		g.Expect(errors.IsNotFound(err)).To(BeTrue(), "disabled HA must cancel owned Job %s", name)
+	}
+	for _, name := range []string{activePod.Name, terminalPod.Name} {
+		observed := &corev1.Pod{}
+		err := client.Get(context.Background(), types.NamespacedName{Name: name, Namespace: cluster.Namespace}, observed)
+		g.Expect(errors.IsNotFound(err)).To(BeTrue(), "disabled HA must delete the exact Job Pod %s", name)
+	}
+	observed := &batchv1.Job{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{
+		Name: unrelated.Name, Namespace: cluster.Namespace,
+	}, observed)).To(Succeed(), "UID fencing must preserve a same-name cluster incarnation's Job")
+	g.Expect(client.Get(context.Background(), types.NamespacedName{
+		Name: unrelatedPod.Name, Namespace: cluster.Namespace,
+	}, &corev1.Pod{})).To(Succeed(), "UID fencing must preserve a different-incarnation Job Pod")
+}
+
 func TestActivationJobBindsReceiptToObservedTargetPVCInstance(t *testing.T) {
 	g := NewWithT(t)
 	s := runtime.NewScheme()
@@ -6995,8 +7394,11 @@ func TestActivationJobBindsReceiptToObservedTargetPVCInstance(t *testing.T) {
 	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
 		Name: "standby-a-data", Namespace: "default", UID: types.UID("pvc-uid-1"),
 	}}
+	portableTarget := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "primary-a-data", Namespace: "default", UID: types.UID("primary-pvc-uid-1"),
+	}}
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, pvc).Build(),
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, pvc, portableTarget).Build(),
 		Scheme: s,
 	}
 	action := antflyv1.HAPlannedActionStatus{
@@ -7017,6 +7419,17 @@ func TestActivationJobBindsReceiptToObservedTargetPVCInstance(t *testing.T) {
 	g.Expect(ready).To(BeTrue())
 	g.Expect(bound.AdminCommand).To(Equal(action.AdminCommand), "PVC preflight must validate, never mutate, the frozen activation request")
 	g.Expect(haAdminActionHash(bound)).To(Equal(haAdminActionHash(action)))
+
+	portableAction := action
+	portableAction.SlotName = "primary-a"
+	portableAction.SeedArtifactGeneration = "reseed-primary-a-11"
+	portableAction.TopologyGeneration = 4
+	portableAction.TopologyNodeID = "primary-a"
+	portableAction.TargetPVCName = portableTarget.Name
+	portableAction.TargetPVCUID = string(portableTarget.UID)
+	_, ready, err = reconciler.haActivationJobAction(context.Background(), cluster, portableAction)
+	g.Expect(err).NotTo(HaveOccurred(), "the source runtime's own boot gate must not constrain a different portable target PVC")
+	g.Expect(ready).To(BeTrue())
 
 	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCUID = "replacement-pvc"
 	_, ready, err = reconciler.haActivationJobAction(context.Background(), cluster, action)
@@ -7041,6 +7454,8 @@ func TestActivationReceiptCurrentTargetRejectsReplacementPVCAndTopologyGeneratio
 	action := antflyv1.HAPlannedActionStatus{
 		Kind: string(haActionActivateSeedArtifact), SlotName: "standby-a",
 		SeedArtifactGeneration: "prod-standby-a-10", AdminJobPhase: haAdminJobPhaseSucceeded,
+		TopologyID: "test-standalone", TopologyGeneration: 3, TopologyNodeID: "standby-a",
+		TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-2",
 		SeedCaptureReceiptSHA256: strings.Repeat("d", 64), TargetLocalNodeID: 1, TargetReplicaID: 1,
 		SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
 			FormatVersion: 2,
@@ -7063,6 +7478,44 @@ func TestActivationReceiptCurrentTargetRejectsReplacementPVCAndTopologyGeneratio
 	g.Expect(current).To(BeFalse())
 	action.SeedArtifactReceipt.TargetPVCUID = "pvc-uid-2"
 	action.SeedArtifactReceipt.TopologyGeneration = 2
+	current, err = reconciler.haActivationReceiptMatchesCurrentTarget(context.Background(), cluster, action)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(current).To(BeFalse())
+}
+
+func TestActivationReceiptCurrentTargetUsesPortableActionBindingOutsideLocalStartupGate(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	cluster := startupGatedStandaloneControllerCluster(true)
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "primary-a-data", Namespace: "default", UID: types.UID("primary-pvc-uid-1"),
+	}}
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, pvc).Build()}
+	digest := strings.Repeat("a", 64)
+	action := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionActivateSeedArtifact), SlotName: "primary-a",
+		SeedArtifactGeneration: "reseed-primary-a-11", AdminJobPhase: haAdminJobPhaseSucceeded,
+		TopologyID: "test-standalone", TopologyGeneration: 4, TopologyNodeID: "primary-a",
+		TargetPVCName: pvc.Name, TargetPVCUID: string(pvc.UID), TargetLocalNodeID: 1, TargetReplicaID: 1,
+		SeedCaptureReceiptSHA256: strings.Repeat("d", 64),
+		SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
+			FormatVersion: 4, TopologyID: "test-standalone", TopologyGeneration: 4,
+			NodeID: "primary-a", SlotName: "primary-a", Generation: "reseed-primary-a-11",
+			TargetPVCName: pvc.Name, TargetPVCUID: string(pvc.UID),
+			ManifestSHA256: digest, CaptureReceiptSHA256: strings.Repeat("d", 64),
+			MaterializedReceiptSHA256: strings.Repeat("e", 64), MaterializedAggregateSHA256: strings.Repeat("f", 64),
+			TargetLocalNodeID: 1, TargetReplicaID: 1,
+			GenerationPath: "live-generations/reseed-primary-a-11", RawGenerationPath: "generations/reseed-primary-a-11",
+		},
+	}
+
+	current, err := reconciler.haActivationReceiptMatchesCurrentTarget(context.Background(), cluster, action)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(current).To(BeTrue(), "portable evidence must be checked against its action target, not the source runtime's local boot gate")
+
+	action.SeedArtifactReceipt.TargetPVCUID = "replacement-pvc"
 	current, err = reconciler.haActivationReceiptMatchesCurrentTarget(context.Background(), cluster, action)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(current).To(BeFalse())
@@ -9061,6 +9514,22 @@ func TestHAAdminSDKActionResultsSatisfyOperatorEvidenceGates(t *testing.T) {
 	g.Expect(requireHADirectAdminActionResultStatus(&activateAction, activation)).To(Succeed())
 	g.Expect(activateAction.AdminResult.CheckpointLSN).To(Equal(uint64(7)))
 	g.Expect(activateAction.AdminResult.SeedArtifactGeneration).To(Equal("seed-standby-a-5"))
+	g.Expect(activateAction.AdminResult.SeedTimelineID).To(Equal(uint64(4)))
+	g.Expect(activateAction.AdminResult.TimelineID).To(Equal(uint64(4)))
+	encodedActivation, err := json.Marshal(activateAction.AdminResult)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(string(encodedActivation)).To(ContainSubstring(`"seedTimelineID":4`))
+	g.Expect(string(encodedActivation)).To(ContainSubstring(`"timelineID":4`))
+
+	encodedNoOpGC, err := json.Marshal(&antflyv1.HASeedArtifactReceiptStatus{
+		FormatVersion: 1,
+		Generation:    "seed-standby-a-5",
+		SlotName:      "standby-a",
+		RetainedCount: 1,
+		DeletedCount:  0,
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(string(encodedNoOpGC)).To(ContainSubstring(`"deletedCount":0`))
 
 	bootstrapAction := directPrimaryAction(haActionBootstrapStandbySeed)
 	bootstrapAction.AdminNodeID = "standby-a"
@@ -12422,6 +12891,124 @@ func TestRepairBlockedStatefulSetRolloutsDeletesStaleUnhealthyStandalonePod(t *t
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 }
 
+func TestRepairBlockedStatefulSetRolloutPreservesOnlyExactPromotedProcess(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		bindingUID     types.UID
+		standbyProcess bool
+		onDelete       bool
+		wantRepaired   bool
+	}{
+		{name: "exact receipt and Pod UID", bindingUID: types.UID("promoted-process-uid"), wantRepaired: false},
+		{name: "different Pod UID", bindingUID: types.UID("replaced-process-uid"), wantRepaired: true},
+		{
+			name:       "standby-shaped promoted process before binding cache convergence",
+			bindingUID: types.UID("replaced-process-uid"), standbyProcess: true, wantRepaired: false,
+		},
+		{
+			name:       "explicit OnDelete rollout",
+			bindingUID: types.UID("replaced-process-uid"), onDelete: true, wantRepaired: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			ctx := context.Background()
+			s := runtime.NewScheme()
+			g.Expect(corev1.AddToScheme(s)).To(Succeed())
+			g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+			g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+
+			receipt := strings.Repeat("a", 64)
+			cluster := &antflyv1.AntflyCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "default",
+					Annotations: map[string]string{
+						cloudHAPromotionReceiptAnnotation:   receipt,
+						cloudHATopologyGenerationAnnotation: "2",
+					},
+				},
+				Spec: antflyv1.AntflyClusterSpec{
+					Mode: antflyv1.ClusterModeStandalone,
+					HighAvailability: &antflyv1.HighAvailabilitySpec{
+						Mode: antflyv1.HAModeHotStandby,
+						Runtime: &antflyv1.HARuntimeSpec{
+							Role:   antflyv1.HARuntimeRolePrimary,
+							NodeID: "standby-a",
+						},
+					},
+				},
+			}
+			replicas := int32(1)
+			sts := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster-standalone",
+					Namespace: "default",
+					UID:       types.UID("standalone-sts-uid"),
+					Annotations: map[string]string{
+						haPromotedProcessBindingAnnotation: receipt + ":" + string(tc.bindingUID),
+					},
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Replicas: &replicas,
+					Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "antfly", Image: "antfly:new"}},
+					}},
+				},
+				Status: appsv1.StatefulSetStatus{UpdateRevision: "standalone-new"},
+			}
+			if tc.onDelete {
+				sts.Spec.UpdateStrategy.Type = appsv1.OnDeleteStatefulSetStrategyType
+			}
+			controller := true
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster-standalone-0",
+					Namespace: "default",
+					UID:       types.UID("promoted-process-uid"),
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: "apps/v1", Kind: "StatefulSet", Name: sts.Name,
+						UID: sts.UID, Controller: &controller,
+					}},
+					Labels: mergeStringMaps(
+						serviceSelectorLabels(cluster.Name, "standalone"),
+						map[string]string{"controller-revision-hash": "standalone-old"},
+					),
+					Annotations: map[string]string{haNodeIDAnnotation: "standby-a"},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "antfly", Image: "antfly:old"}}},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{{
+						Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ContainersNotReady",
+					}},
+				},
+			}
+			if tc.standbyProcess {
+				pod.Spec.Containers[0].Args = []string{
+					"exec /antfly standalone --ha-standby-log '/antflydb/ha/standby.wal'",
+				}
+			}
+			reconciler := &AntflyClusterReconciler{
+				Client: fake.NewClientBuilder().WithScheme(s).WithObjects(pod).Build(),
+				Scheme: s,
+			}
+
+			repaired, err := reconciler.repairBlockedStatefulSetRollout(ctx, cluster, sts, "standalone")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(repaired).To(Equal(tc.wantRepaired))
+			observed := &corev1.Pod{}
+			err = reconciler.Get(ctx, types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, observed)
+			if tc.wantRepaired {
+				g.Expect(errors.IsNotFound(err)).To(BeTrue())
+			} else {
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(observed.UID).To(Equal(pod.UID))
+			}
+		})
+	}
+}
+
 func TestRepairBlockedStatefulSetRolloutKeepsHealthyStalePod(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
@@ -14192,6 +14779,7 @@ func TestCreatePublicAPIService_DistributedTargetsMetadataAPI(t *testing.T) {
 	g.Expect(svc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "metadata"))
 	g.Expect(svc.Spec.Ports).To(HaveLen(1))
 	g.Expect(svc.Spec.Ports[0].TargetPort.IntValue()).To(Equal(12377))
+	g.Expect(svc.Spec.PublishNotReadyAddresses).To(BeFalse())
 }
 
 func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
@@ -14229,6 +14817,7 @@ func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
 	publicSvc := &corev1.Service{}
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
 	g.Expect(publicSvc.Spec.Selector).To(Equal(cluster.Spec.HighAvailability.Standbys[0].RouteSelector))
+	g.Expect(publicSvc.Spec.PublishNotReadyAddresses).To(BeTrue())
 	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue(haPrimaryRouteTargetAnnotation, "standby-a"))
 	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceAuthorityAnnotation, string(antflyv1.HAFencingAuthorityKubernetesLease)))
 	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceGenerationAnnotation, "7"))
@@ -14568,6 +15157,169 @@ func TestReconcileStandaloneStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	}))
 }
 
+func TestReconcileStandaloneStatefulSetPreservesExactLivePromotedProcess(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := baseStandaloneControllerCluster()
+	cluster.Labels = map[string]string{cloudHARoleLabel: "primary"}
+	cluster.Annotations = map[string]string{
+		cloudHAPromotionReceiptAnnotation:   strings.Repeat("a", 64),
+		cloudHATopologyGenerationAnnotation: "2",
+	}
+	cluster.Spec.HighAvailability = &antflyv1.HighAvailabilitySpec{
+		Mode: antflyv1.HAModeHotStandby,
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			ClusterID: 100, ShardID: 10, TableID: 20, TimelineID: 2, Epoch: 2,
+			CurrentPrimaryID: "standby-a",
+		},
+		Runtime: &antflyv1.HARuntimeSpec{
+			Role:   antflyv1.HARuntimeRolePrimary,
+			NodeID: "standby-a",
+		},
+	}
+	controller := true
+	statefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-standalone-standalone", Namespace: "default", UID: types.UID("sts-uid"),
+			Annotations: map[string]string{annotationStorageEngine: "local"},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: serviceSelectorLabels(cluster.Name, "standalone")},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      statefulSet.Name + "-0",
+			Namespace: statefulSet.Namespace,
+			UID:       types.UID("live-promoted-process-uid"),
+			Labels: map[string]string{
+				cloudHARoleLabel: cloudHAStandbyRole,
+			},
+			Annotations: map[string]string{haNodeIDAnnotation: "standby-a"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "StatefulSet", Name: statefulSet.Name,
+				UID: statefulSet.UID, Controller: &controller,
+			}},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: "antfly",
+			Args: []string{"exec /antfly standalone --ha-standby-log '/antflydb/ha/standby.wal'"},
+		}}},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue,
+		}}},
+	}
+	client := newHAControllerTestClient(t, s, cluster, statefulSet, pod)
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	observedStatefulSet := &appsv1.StatefulSet{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: statefulSet.Name, Namespace: statefulSet.Namespace}, observedStatefulSet)).To(Succeed())
+	g.Expect(observedStatefulSet.Spec.UpdateStrategy.Type).To(Equal(appsv1.OnDeleteStatefulSetStrategyType))
+	g.Expect(observedStatefulSet.Annotations).To(HaveKeyWithValue(
+		haPromotedProcessBindingAnnotation,
+		strings.Repeat("a", 64)+":"+string(pod.UID),
+	))
+	g.Expect(observedStatefulSet.Spec.Template.Labels).To(HaveKeyWithValue(cloudHARoleLabel, "primary"))
+	g.Expect(observedStatefulSet.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("--ha-primary-log"))
+	observedPod := &corev1.Pod{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, observedPod)).To(Succeed())
+	g.Expect(observedPod.UID).To(Equal(pod.UID))
+
+	// StatefulSet control may converge mutable Pod labels to the primary
+	// template even though the process and controller revision are unchanged.
+	// The immutable receipt/UID binding must continue to preserve that process.
+	observedPod.Labels[cloudHARoleLabel] = "primary"
+	g.Expect(client.Update(context.Background(), observedPod)).To(Succeed())
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: statefulSet.Name, Namespace: statefulSet.Namespace}, observedStatefulSet)).To(Succeed())
+	g.Expect(observedStatefulSet.Spec.UpdateStrategy.Type).To(Equal(appsv1.OnDeleteStatefulSetStrategyType))
+}
+
+func TestPromotedStandaloneRolloutRequiresExactReceiptAndOwnedPod(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.HighAvailability = &antflyv1.HighAvailabilitySpec{
+		Mode:    antflyv1.HAModeHotStandby,
+		Runtime: &antflyv1.HARuntimeSpec{Role: antflyv1.HARuntimeRolePrimary, NodeID: "standby-a"},
+	}
+	statefulSet := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "test-standalone-standalone", Namespace: "default", UID: types.UID("sts-uid")}}
+	controller := true
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: statefulSet.Name + "-0", Namespace: statefulSet.Namespace,
+		UID:             types.UID("promoted-process-uid"),
+		Labels:          map[string]string{cloudHARoleLabel: cloudHAStandbyRole},
+		Annotations:     map[string]string{haNodeIDAnnotation: "standby-a"},
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: statefulSet.Name, UID: statefulSet.UID, Controller: &controller}},
+	}, Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
+	client := newHAControllerTestClient(t, s, cluster, statefulSet, pod)
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	deferRollout, err := reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(deferRollout).To(BeFalse())
+
+	// Desired primary publication can race ahead of the exact promotion receipt.
+	// Hold the immutable standby process before that receipt arrives, even if a
+	// mutable role label has already converged to the desired primary template.
+	pod.Spec.Containers = []corev1.Container{{
+		Name: "antfly",
+		Args: []string{"exec /antfly standalone --ha-standby-log '/antflydb/ha/standby.wal'"},
+	}}
+	pod.Labels[cloudHARoleLabel] = "primary"
+	g.Expect(client.Update(context.Background(), pod)).To(Succeed())
+	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(deferRollout).To(BeTrue())
+	g.Expect(statefulSet.Annotations).NotTo(HaveKey(haPromotedProcessBindingAnnotation))
+
+	cluster.Annotations = map[string]string{
+		cloudHAPromotionReceiptAnnotation:   strings.Repeat("a", 64),
+		cloudHATopologyGenerationAnnotation: "2",
+	}
+	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(deferRollout).To(BeTrue())
+	g.Expect(statefulSet.Annotations).To(HaveKeyWithValue(
+		haPromotedProcessBindingAnnotation,
+		strings.Repeat("a", 64)+":"+string(pod.UID),
+	))
+
+	// Lease transfer deliberately makes readiness fail closed while the same
+	// process adopts its successor bootstrap receipt. That transient must not
+	// turn the primary template publication into a process replacement.
+	pod.Status.Conditions[0].Status = corev1.ConditionFalse
+	g.Expect(client.Status().Update(context.Background(), pod)).To(Succeed())
+	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(deferRollout).To(BeTrue())
+	pod.Labels[cloudHARoleLabel] = "primary"
+	g.Expect(client.Update(context.Background(), pod)).To(Succeed())
+	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(deferRollout).To(BeTrue())
+
+	cluster.Annotations[cloudHAPromotionReceiptAnnotation] = "not-a-canonical-receipt"
+	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(deferRollout).To(BeTrue(), "an invalid receipt cannot authorize promotion, but must not restart the live standby-shaped process")
+
+	cluster.Annotations[cloudHAPromotionReceiptAnnotation] = strings.Repeat("a", 64)
+	pod.OwnerReferences[0].UID = types.UID("different-statefulset-uid")
+	g.Expect(client.Update(context.Background(), pod)).To(Succeed())
+	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(deferRollout).To(BeFalse())
+}
+
 func TestReconcileStandaloneStatefulSetStartupGatePrecreatesTargetPVCAndStaysSuspended(t *testing.T) {
 	g := NewWithT(t)
 	s := runtime.NewScheme()
@@ -14680,6 +15432,125 @@ func TestReconcileStandaloneStatefulSetSuspendPolicyPreservesExistingStorageTopo
 	}))
 }
 
+func TestReconcileStandaloneStatefulSetHADisablePreservesActivatedSeedStorageTopology(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := startupGatedStandaloneControllerCluster(true)
+	digest := func(value string) string { return strings.Repeat(value, 64) }
+	cluster.Status.HAStatus = &antflyv1.HAStatus{StartupGate: &antflyv1.HAStartupGateStatus{
+		RuntimeEligible: true,
+		ActivationReceipt: &antflyv1.HASeedActivationReceiptStatus{
+			TopologyID: "test-standalone", TopologyGeneration: 3,
+			NodeID: "standby-a", SlotName: "standby-a", Generation: "prod-standby-a-10",
+			ClusterID: 100, TimelineID: 1, Epoch: 1,
+			ManifestID: "manifest-standby-a-10", ManifestSHA256: digest("a"),
+			AggregateSHA256: digest("b"), SeedReceiptSHA256: digest("c"),
+			CaptureReceiptSHA256: digest("d"), MaterializedReceiptSHA256: digest("e"),
+			MaterializedAggregateSHA256: digest("f"),
+			TargetPVCName:               "standby-a-data", TargetPVCUID: "pvc-uid-1",
+			TargetLocalNodeID: 1, TargetReplicaID: 1,
+			GenerationPath:    "live-generations/prod-standby-a-10",
+			RawGenerationPath: "generations/prod-standby-a-10",
+		},
+	}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "standby-a-data", Namespace: "default", UID: types.UID("pvc-uid-1"),
+	}}
+	testClient := newHAControllerTestClient(t, s, cluster, pvc)
+	reconciler := &AntflyClusterReconciler{Client: testClient, Scheme: s}
+	reenabledHA := cluster.Spec.HighAvailability.DeepCopy()
+
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	cluster.Spec.HighAvailability = nil
+	cluster.Status.HAStatus = nil
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+
+	sts := &appsv1.StatefulSet{}
+	g.Expect(testClient.Get(context.Background(), types.NamespacedName{
+		Name: "test-standalone-standalone", Namespace: "default",
+	}, sts)).To(Succeed())
+	g.Expect(sts.Spec.VolumeClaimTemplates).To(BeEmpty())
+	g.Expect(sts.Spec.Template.Spec.Volumes).To(ContainElement(corev1.Volume{
+		Name: "standalone-storage", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: "standby-a-data",
+		}},
+	}))
+	container := sts.Spec.Template.Spec.Containers[0]
+	for mountPath, leaf := range map[string]string{
+		"/antflydb/data": "data", "/antflydb/metadata": "metadata", "/antflydb/extensions": "extensions",
+	} {
+		g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
+			Name: "standalone-storage", MountPath: mountPath,
+			SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/" + leaf,
+		}))
+	}
+	g.Expect(container.Args[0]).NotTo(ContainSubstring("--ha-"), "disabling HA removes authority without relocating the database")
+	g.Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(haSeedTargetPVCUIDAnnotation, "pvc-uid-1"))
+	g.Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(haSeedGenerationAnnotation, "prod-standby-a-10"))
+
+	// Re-enabling HA on the retained promoted controller changes authority but
+	// not physical storage identity. The explicit activated PVC and its three
+	// generation-scoped data roots must remain intact; falling back to an
+	// immutable volumeClaimTemplate would either fail admission or fork data.
+	cluster.Spec.HighAvailability = reenabledHA
+	cluster.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRolePrimary
+	cluster.Spec.HighAvailability.Runtime.NodeID = "standby-a"
+	cluster.Spec.HighAvailability.Runtime.Standby = nil
+	cluster.Spec.HighAvailability.Runtime.Primary = &antflyv1.HAPrimaryRuntimeSpec{
+		LogPath: "/antflydb/ha/primary.wal", SlotsPath: "/antflydb/ha/slots",
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate = nil
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(testClient.Get(context.Background(), types.NamespacedName{
+		Name: "test-standalone-standalone", Namespace: "default",
+	}, sts)).To(Succeed())
+	g.Expect(sts.Spec.VolumeClaimTemplates).To(BeEmpty())
+	g.Expect(sts.Spec.Template.Spec.Volumes).To(ContainElement(corev1.Volume{
+		Name: "standalone-storage", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: "standby-a-data",
+		}},
+	}))
+	for mountPath, leaf := range map[string]string{
+		"/antflydb/data": "data", "/antflydb/metadata": "metadata", "/antflydb/extensions": "extensions",
+	} {
+		g.Expect(sts.Spec.Template.Spec.Containers[0].VolumeMounts).To(ContainElement(corev1.VolumeMount{
+			Name: "standalone-storage", MountPath: mountPath,
+			SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/" + leaf,
+		}))
+	}
+}
+
+func TestReconcileStandaloneStatefulSetHADisableRejectsIncompleteExplicitSeedBinding(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := baseStandaloneControllerCluster()
+	existing := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-standalone-standalone", Namespace: "default",
+			Annotations: map[string]string{annotationStorageEngine: "local"},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+				Name: "standalone-storage", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "seed-data"}},
+			}}}},
+		},
+	}
+	testClient := newHAControllerTestClient(t, s, cluster, existing)
+	reconciler := &AntflyClusterReconciler{Client: testClient, Scheme: s}
+
+	err := reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)
+	g.Expect(err).To(MatchError(ContainSubstring("without a complete activated-seed binding")))
+}
+
 func TestReconcileStandaloneStatefulSetStartupGateSuspendsLegacyControllerBeforeClaimHandoff(t *testing.T) {
 	g := NewWithT(t)
 	s := runtime.NewScheme()
@@ -14749,6 +15620,7 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 			"activationReceipt": {
 				"topologyID": "test-standalone", "topologyGeneration": 3,
 				"nodeID": "standby-a", "slotName": "standby-a", "generation": "prod-standby-a-10",
+				"clusterID": 100, "timelineID": 1, "epoch": 1,
 				"manifestID": "manifest-standby-a-10", "targetPVCName": "standby-a-data", "targetPVCUID": "pvc-uid-1",
 				"checkpointLSN": 12, "manifestSHA256": %q, "aggregateSHA256": %q, "seedReceiptSHA256": %q,
 				"captureReceiptSHA256": %q, "materializedReceiptSHA256": %q, "materializedAggregateSHA256": %q,
@@ -14778,10 +15650,15 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 	container := sts.Spec.Template.Spec.Containers[0]
 	g.Expect(container.Env).To(ContainElement(haPodUIDEnv()[0]))
 	runtimeArgs := container.Args[0]
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-standby-log '/antflydb/ha/standby-generations/prod-standby-a-10/receive.wal'`))
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-standby-progress '/antflydb/ha/standby-generations/prod-standby-a-10/progress.wal'`))
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-target-root '/antflydb/.antfly-ha/active'`))
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-topology-id 'test-standalone'`))
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-topology-generation '3'`))
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-generation 'prod-standby-a-10'`))
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-slot-name 'standby-a'`))
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-timeline-id '1'`))
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-epoch '1'`))
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-target-pvc-name 'standby-a-data'`))
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-target-pvc-uid 'pvc-uid-1'`))
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-seed-receipt-sha256 '` + strings.Repeat("c", 64) + `'`))
@@ -14791,8 +15668,26 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-target-local-node-id '1'`))
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-target-replica-id '1'`))
 	g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
-		Name: "ha-seed-generation", MountPath: "/antflydb/data", SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10",
+		Name: "standalone-storage", MountPath: "/antflydb/data", SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/data",
 	}))
+	g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
+		Name: "standalone-storage", MountPath: "/antflydb/metadata", SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/metadata",
+	}))
+	g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
+		Name: "standalone-storage", MountPath: "/antflydb/extensions", SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/extensions",
+	}))
+	var pvcVolumes []corev1.Volume
+	for _, volume := range sts.Spec.Template.Spec.Volumes {
+		if volume.PersistentVolumeClaim != nil {
+			pvcVolumes = append(pvcVolumes, volume)
+		}
+	}
+	g.Expect(pvcVolumes).To(Equal([]corev1.Volume{{
+		Name: "standalone-storage",
+		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: "standby-a-data",
+		}},
+	}}), "one PVC must have one Pod volume identity; duplicate names for the same claim can deadlock kubelet volume setup")
 
 	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TargetPVCUID = "stale-pvc-uid"
 	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
@@ -14803,6 +15698,74 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
 	g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
+
+	// The activation receipt remains exact storage provenance after this runtime
+	// becomes primary, while the promoted authority moves to a later boundary.
+	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TopologyGeneration = 3
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCUID = "pvc-uid-1"
+	cluster.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRolePrimary
+	cluster.Spec.HighAvailability.Runtime.NodeID = "standby-a"
+	cluster.Spec.HighAvailability.Runtime.Standby = nil
+	cluster.Spec.HighAvailability.Runtime.Primary = &antflyv1.HAPrimaryRuntimeSpec{
+		LogPath:   "/antflydb/ha/standby-generations/prod-standby-a-10/receive.wal",
+		SlotsPath: "/antflydb/ha/standby-generations/prod-standby-a-10/progress.wal.promoted-primary-slots",
+	}
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	cluster.Spec.HighAvailability.Identity.TimelineID = 2
+	cluster.Spec.HighAvailability.Identity.Epoch = 2
+	cluster.Spec.HighAvailability.Standbys = nil
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(*sts.Spec.Replicas).To(Equal(int32(1)), "a promoted primary must retain access to its activated volume")
+	runtimeArgs = sts.Spec.Template.Spec.Containers[0].Args[0]
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-primary-log '/antflydb/ha/standby-generations/prod-standby-a-10/receive.wal'`))
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-primary-slots '/antflydb/ha/standby-generations/prod-standby-a-10/progress.wal.promoted-primary-slots'`))
+
+	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TimelineID = 3
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)), "a receipt from a future or incomparable boundary must fail closed")
+}
+
+func TestFormerPrimaryIsolationReleaseRequiresExactActivatedStandby(t *testing.T) {
+	g := NewWithT(t)
+	cluster := startupGatedStandaloneControllerCluster(true)
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "standby-a-data", Namespace: "default", UID: types.UID("pvc-uid-1"),
+	}}
+	digest := func(value string) string { return strings.Repeat(value, 64) }
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCUID = "pvc-uid-1"
+	cluster.Status.HAStatus = &antflyv1.HAStatus{StartupGate: &antflyv1.HAStartupGateStatus{
+		RuntimeEligible: true,
+		ActivationReceipt: &antflyv1.HASeedActivationReceiptStatus{
+			TopologyID: "test-standalone", TopologyGeneration: 3,
+			NodeID: "standby-a", SlotName: "standby-a", Generation: "prod-standby-a-10",
+			TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-1",
+			ClusterID: 100, TimelineID: 1, Epoch: 1,
+			ManifestSHA256: digest("a"), AggregateSHA256: digest("b"), SeedReceiptSHA256: digest("c"),
+			CaptureReceiptSHA256: digest("d"), MaterializedReceiptSHA256: digest("e"),
+			MaterializedAggregateSHA256: digest("f"), TargetLocalNodeID: 1, TargetReplicaID: 1,
+			GenerationPath: "live-generations/prod-standby-a-10", RawGenerationPath: "generations/prod-standby-a-10",
+		},
+	}}
+
+	g.Expect(haFormerPrimaryIsolationReleasedByActivatedStandby(cluster, pvc)).To(BeTrue())
+
+	cluster.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRolePrimary
+	g.Expect(haFormerPrimaryIsolationReleasedByActivatedStandby(cluster, pvc)).To(BeFalse(),
+		"an exact seed receipt must never release the old-writer hold")
+	cluster.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRoleStandby
+	pvc.UID = types.UID("replacement-pvc-uid")
+	g.Expect(haFormerPrimaryIsolationReleasedByActivatedStandby(cluster, pvc)).To(BeFalse(),
+		"a replacement PVC must never inherit the old activation authority")
+	pvc.UID = types.UID("pvc-uid-1")
+	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TopologyGeneration = 2
+	g.Expect(haFormerPrimaryIsolationReleasedByActivatedStandby(cluster, pvc)).To(BeFalse(),
+		"a stale topology receipt must never release physical isolation")
+	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TopologyGeneration = 3
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = false
+	g.Expect(haFormerPrimaryIsolationReleasedByActivatedStandby(cluster, pvc)).To(BeFalse(),
+		"the observed receipt cannot override Colony's declarative suspension")
 }
 
 func TestUpdateHAStartupGateStatusUsesOnlyObservedActivationJobAndPVC(t *testing.T) {
@@ -14841,7 +15804,20 @@ func TestUpdateHAStartupGateStatusUsesOnlyObservedActivationJobAndPVC(t *testing
 	g.Expect(cluster.Status.HAStatus.StartupGate).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.StartupGate.RuntimeEligible).To(BeFalse())
 	g.Expect(cluster.Status.HAStatus.StartupGate.Reason).To(Equal("TargetGenerationGCNotObserved"))
+	g.Expect(cluster.Status.HAStatus.StartupGate.ActivationReceipt).To(BeNil(),
+		"partial activation must not authorize Colony to start the target-PVC consumer before target GC")
 
+	cluster.Status.HAStatus.PlannedActions = cluster.Status.HAStatus.PlannedActions[:1]
+	reconciler.updateHAStartupGateStatus(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.StartupGate.RuntimeEligible).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.StartupGate.Reason).To(Equal("TargetGenerationGCNotObserved"))
+	g.Expect(cluster.Status.HAStatus.StartupGate.ActivationReceipt).To(BeNil(),
+		"an incrementally planned chain must not expose activation authority before target GC exists")
+
+	cluster.Status.HAStatus.PlannedActions = append(cluster.Status.HAStatus.PlannedActions, antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionGCTargetSeedGenerations), StandbyName: "standby-a", SlotName: "standby-a",
+		SeedArtifactGeneration: "prod-standby-a-10", AdminJobPhase: haAdminJobPhasePending,
+	})
 	gc := &cluster.Status.HAStatus.PlannedActions[1]
 	gc.AdminJobPhase = haAdminJobPhaseSucceeded
 	gc.SeedArtifactReceipt = &antflyv1.HASeedArtifactReceiptStatus{
@@ -14903,6 +15879,27 @@ func TestUpdateHAStartupGateStatusObservesActivationReceiptFromPrimaryCR(t *test
 	g.Expect(target.Status.HAStatus.StartupGate.RuntimeEligible).To(BeTrue())
 	g.Expect(target.Status.HAStatus.StartupGate.ActivationReceipt).NotTo(BeNil())
 	g.Expect(target.Status.HAStatus.StartupGate.ActivationReceipt.TargetPVCUID).To(Equal("pvc-uid-1"))
+
+	// The primary bounds completed action history. Once this standby has
+	// validated the exact materialized receipt, losing the peer copy must not
+	// oscillate the declarative startup gate closed.
+	primaryWithoutActions := primary.DeepCopy()
+	primaryWithoutActions.Status.HAStatus.PlannedActions = nil
+	reconciler.Client = fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(target.DeepCopy(), primaryWithoutActions, pvc.DeepCopy()).
+		Build()
+	reconciler.updateHAStartupGateStatus(context.Background(), target)
+	g.Expect(target.Status.HAStatus.StartupGate.RuntimeEligible).To(BeTrue())
+	g.Expect(target.Status.HAStatus.StartupGate.Reason).To(Equal("ExactActivationReceiptMatched"))
+	g.Expect(target.Status.HAStatus.StartupGate.ActivationReceipt).NotTo(BeNil())
+
+	// A replacement volume never inherits the old receipt even when the logical
+	// PVC name is unchanged.
+	target.Status.HAStatus.StartupGate.ActivationReceipt.TargetPVCUID = "stale-pvc-uid"
+	reconciler.updateHAStartupGateStatus(context.Background(), target)
+	g.Expect(target.Status.HAStatus.StartupGate.RuntimeEligible).To(BeFalse())
+	g.Expect(target.Status.HAStatus.StartupGate.ActivationReceipt).To(BeNil())
 }
 
 func TestUpdateHAStartupGateStatusSkipsUnrelatedReceiptCollision(t *testing.T) {
@@ -14928,12 +15925,21 @@ func TestUpdateHAStartupGateStatusSkipsUnrelatedReceiptCollision(t *testing.T) {
 			GenerationPath: "live-generations/prod-standby-a-10", RawGenerationPath: "generations/prod-standby-a-10",
 		},
 	}
+	targetGC := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionGCTargetSeedGenerations), StandbyName: "standby-a", SlotName: "standby-a",
+		SeedArtifactGeneration: "prod-standby-a-10", AdminJobPhase: haAdminJobPhaseSucceeded,
+		SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
+			FormatVersion: 1, ActionKind: "gc_local_seed_generations", Scope: "target_activation",
+			Generation: "prod-standby-a-10", SlotName: "standby-a", CheckpointSHA256: strings.Repeat("d", 64),
+			RetainedCount: 2,
+		},
+	}
 	correct := target.DeepCopy()
 	correct.Name = "z-primary"
 	correct.Spec.HighAvailability.Runtime.StartupGate = nil
 	correct.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRolePrimary
 	correct.Spec.HighAvailability.Runtime.NodeID = "primary-a"
-	correct.Status.HAStatus = &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{action}}
+	correct.Status.HAStatus = &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{action, targetGC}}
 	unrelated := correct.DeepCopy()
 	unrelated.Name = "a-unrelated-primary"
 	unrelated.Spec.HighAvailability.Identity.ClusterID = 999
@@ -15001,13 +16007,37 @@ func TestStandaloneHAArgsOmitsRequiredForAllSyncPolicy(t *testing.T) {
 			Selection:    antflyv1.HAStandbySelectionAll,
 			StandbyNames: []string{"standby-a", "standby-b"},
 		},
-	})
+	}, "")
 
 	g.Expect(args).To(ContainSubstring(`--ha-sync-mode 'remote-apply'`))
 	g.Expect(args).To(ContainSubstring(`--ha-sync-selection 'all'`))
 	g.Expect(args).To(ContainSubstring(`--ha-sync-standby 'standby-a'`))
 	g.Expect(args).To(ContainSubstring(`--ha-sync-standby 'standby-b'`))
 	g.Expect(args).NotTo(ContainSubstring(`--ha-sync-required`))
+}
+
+func TestStandaloneHAArgsScopesDefaultStandbyProgressToActivatedGeneration(t *testing.T) {
+	g := NewWithT(t)
+	ha := &antflyv1.HighAvailabilitySpec{
+		Mode: antflyv1.HAModeHotStandby,
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			ClusterID: 100, TimelineID: 2, Epoch: 2, CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &antflyv1.HARuntimeSpec{
+			Role: antflyv1.HARuntimeRoleStandby, NodeID: "standby-a",
+			Standby: &antflyv1.HAStandbyRuntimeSpec{UpstreamURL: "http://primary:8080", SlotName: "standby-a"},
+		},
+	}
+
+	args := standaloneHAArgs(ha, "reseed-standby-a-topology-2")
+	g.Expect(args).To(ContainSubstring(`--ha-standby-log '/antflydb/ha/standby-generations/reseed-standby-a-topology-2/receive.wal'`))
+	g.Expect(args).To(ContainSubstring(`--ha-standby-progress '/antflydb/ha/standby-generations/reseed-standby-a-topology-2/progress.wal'`))
+
+	ha.Runtime.Standby.LogPath = "/antflydb/custom/receive.wal"
+	ha.Runtime.Standby.ProgressPath = "/antflydb/custom/progress.wal"
+	args = standaloneHAArgs(ha, "reseed-standby-a-topology-2")
+	g.Expect(args).To(ContainSubstring(`--ha-standby-log '/antflydb/custom/receive.wal'`))
+	g.Expect(args).To(ContainSubstring(`--ha-standby-progress '/antflydb/custom/progress.wal'`))
 }
 
 func TestStandaloneHAArgsShellQuotesRuntimeValues(t *testing.T) {
@@ -15030,7 +16060,7 @@ func TestStandaloneHAArgsShellQuotesRuntimeValues(t *testing.T) {
 			Mode:         antflyv1.HADurabilityModeRemoteWrite,
 			StandbyNames: []string{"standby-$(touch /tmp/pwned)"},
 		},
-	})
+	}, "")
 
 	g.Expect(args).To(ContainSubstring(`--ha-primary-node-id 'primary-$(touch /tmp/pwned)` + "`" + `x` + "`" + `'`))
 	g.Expect(args).To(ContainSubstring(`--ha-former-primary-log '/antflydb/ha/'\''former.wal'`))
@@ -15221,7 +16251,7 @@ func TestUpdateStatus_Standalone(t *testing.T) {
 		Scheme: s,
 	}
 
-	err = reconciler.updateStatus(context.Background(), cluster)
+	err = reconciler.updateStatusIfChanged(context.Background(), cluster, cluster.Status.DeepCopy())
 	g.Expect(err).NotTo(HaveOccurred())
 
 	updated := &antflyv1.AntflyCluster{}
@@ -15236,6 +16266,13 @@ func TestUpdateStatus_Standalone(t *testing.T) {
 	g.Expect(updated.Status.StandaloneStatus.PodName).To(Equal("test-standalone-standalone-0"))
 	g.Expect(updated.Status.StandaloneStatus.PodIP).To(Equal("10.0.0.10"))
 	g.Expect(updated.Status.StandaloneStatus.ObservedConfigHash).ToNot(BeEmpty())
+
+	reconciler.Client = statusUpdateRejectingClient{
+		Client: client,
+		err:    stderrors.New("unchanged status must not be written"),
+	}
+	err = reconciler.updateStatusIfChanged(context.Background(), updated, updated.Status.DeepCopy())
+	g.Expect(err).NotTo(HaveOccurred())
 }
 
 func TestDetectSidecarInjectionStatus_ScopedToClusterInstance(t *testing.T) {

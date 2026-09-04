@@ -316,6 +316,7 @@ pub const FilesystemClient = struct {
     }
 
     fn deleteObject(self: *FilesystemClient, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
+        if (opts.cancellation) |token| try token.check();
         if (opts.version_id != null) return error.VersioningUnsupported;
         const object_path = try objectPathAlloc(self.alloc, self.root_dir, bucket, key);
         defer self.alloc.free(object_path);
@@ -327,10 +328,12 @@ pub const FilesystemClient = struct {
             if (meta.etag == null or !std.mem.eql(u8, meta.etag.?, expected)) return error.PreconditionFailed;
         }
 
+        if (opts.cancellation) |token| try token.check();
         try deleteFile(self.io, object_path);
     }
 
     fn listObjects(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
+        if (opts.cancellation) |token| try token.check();
         const root = try objectRootAlloc(alloc, self.root_dir, bucket);
         defer alloc.free(root);
         if (!fileExists(self.io, root)) {
@@ -365,6 +368,7 @@ pub const FilesystemClient = struct {
         defer retained.deinit(alloc);
         const continuation = opts.continuation_token orelse opts.start_after;
         while (try walker.next(self.io)) |entry| {
+            if (opts.cancellation) |token| try token.check();
             if (entry.kind != .file) continue;
             if (!std.mem.startsWith(u8, entry.path, opts.prefix)) continue;
             var candidate_name: []const u8 = entry.path;
@@ -446,12 +450,14 @@ pub const FilesystemClient = struct {
         self.deinit();
     }
 
-    fn erasedBucketExists(ptr: *anyopaque, bucket: []const u8) !bool {
+    fn erasedBucketExists(ptr: *anyopaque, bucket: []const u8, opts: types.BucketOptions) !bool {
+        if (opts.cancellation) |token| try token.check();
         const self: *FilesystemClient = @ptrCast(@alignCast(ptr));
         return self.bucketExists(bucket);
     }
 
-    fn erasedMakeBucket(ptr: *anyopaque, bucket: []const u8) !void {
+    fn erasedMakeBucket(ptr: *anyopaque, bucket: []const u8, opts: types.BucketOptions) !void {
+        if (opts.cancellation) |token| try token.check();
         const self: *FilesystemClient = @ptrCast(@alignCast(ptr));
         try self.makeBucket(bucket);
     }
@@ -675,7 +681,16 @@ fn openFilePath(io: std.Io, path: []const u8) !std.Io.File {
         try std.Io.Dir.cwd().openFile(io, path, .{});
 }
 
-fn writeObjectAtomically(io: std.Io, path: []const u8, tmp_path: []const u8, body: []const u8, etag: []const u8, content_type: []const u8, cancellation: ?types.CancellationToken) !void {
+fn writeObjectAtomically(
+    io: std.Io,
+    path: []const u8,
+    tmp_path: []const u8,
+    body: []const u8,
+    etag: []const u8,
+    content_type: []const u8,
+    cancellation: ?types.CancellationToken,
+) !void {
+    if (cancellation) |token| try token.check();
     if (etag.len != 64 or content_type.len > max_content_type_bytes) return error.InvalidObjectMetadata;
 
     errdefer if (std.fs.path.isAbsolute(tmp_path))
@@ -703,16 +718,16 @@ fn writeObjectAtomically(io: std.Io, path: []const u8, tmp_path: []const u8, bod
         var offset: usize = 0;
         while (offset < body.len) {
             if (cancellation) |token| try token.check();
-            const len = @min(cancellation_chunk_bytes, body.len - offset);
-            try writer.interface.writeAll(body[offset..][0..len]);
-            offset += len;
+            const end = @min(body.len, offset + cancellation_chunk_bytes);
+            try writer.interface.writeAll(body[offset..end]);
+            offset = end;
         }
         try writer.end();
+        if (cancellation) |token| try token.check();
         try file.sync(io);
     }
 
     if (cancellation) |token| try token.check();
-
     if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.renameAbsolute(tmp_path, path, io)
     else
@@ -729,6 +744,7 @@ fn writeObjectFileAtomically(
     content_type: []const u8,
     cancellation: ?types.CancellationToken,
 ) ![]u8 {
+    if (cancellation) |token| try token.check();
     if (content_type.len > max_content_type_bytes) return error.InvalidObjectMetadata;
     const source = try openFilePath(source_io, src_path);
     defer source.close(source_io);
@@ -773,6 +789,7 @@ fn writeObjectFileAtomically(
     if (final_source_stat.size != source_stat.size or !std.meta.eql(final_source_stat.mtime, source_stat.mtime))
         return error.SourceFileChanged;
     try writer.end();
+    if (cancellation) |token| try token.check();
 
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
@@ -787,6 +804,7 @@ fn writeObjectFileAtomically(
     output.close(io);
     output_open = false;
 
+    if (cancellation) |token| try token.check();
     if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.renameAbsolute(tmp_path, path, io)
     else
@@ -1173,7 +1191,7 @@ test "filesystem whole-file download honors cancellation before publication" {
         fn isCancelled(raw: *const anyopaque) bool {
             const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
             self.checks += 1;
-            return self.checks >= 4;
+            return self.checks >= 5;
         }
     };
     var state = State{};
@@ -1182,8 +1200,40 @@ test "filesystem whole-file download honors cancellation before publication" {
     try std.testing.expectError(error.Canceled, client.getFile("bucket", "backup/segment", destination, .{
         .cancellation = types.CancellationToken.fromCallback(&state, State.isCancelled),
     }));
-    try std.testing.expect(state.checks >= 4);
+    try std.testing.expect(state.checks >= 5);
     try std.testing.expect(!fileExists(fs.io, destination));
+}
+
+test "filesystem upload cancellation prevents atomic publication" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "upload-cancellation");
+    defer cleanupTmp(path);
+
+    var fs = try FilesystemClient.init(alloc, std.mem.span(path));
+    var client = fs.client();
+    defer client.deinit();
+
+    const State = struct {
+        checks: usize = 0,
+
+        fn isCancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            return self.checks >= 4;
+        }
+    };
+    var state = State{};
+    try std.testing.expectError(error.Canceled, client.putObject(
+        "bucket",
+        "backup/segment",
+        "payload",
+        .{ .cancellation = types.CancellationToken.fromCallback(&state, State.isCancelled) },
+    ));
+    try std.testing.expect(state.checks >= 4);
+    const object_path = try objectPathAlloc(alloc, fs.root_dir, "bucket", "backup/segment");
+    defer alloc.free(object_path);
+    try std.testing.expect(!fileExists(fs.io, object_path));
 }
 
 test "filesystem client rejects paths that escape its root" {

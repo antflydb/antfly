@@ -2419,6 +2419,58 @@ pub const EnrichmentStats = struct {
     artifact_bytes_written: u64 = 0,
 };
 
+/// Volatile, incarnation-scoped work counters for one embeddings index. These
+/// counters never participate in readiness; they let status clients explain
+/// active generation between durable publication checkpoints. `epoch` changes
+/// whenever the owning enrichment runtime is recreated.
+pub const EmbeddingActivityPhase = enum {
+    idle,
+    preparing,
+    embedding,
+    publishing,
+    waiting_retry,
+};
+
+/// Owner activity is emitted every 30 seconds while idle. Retain two missed
+/// heartbeats plus scheduling jitter so a contended best-effort status read
+/// does not turn a live worker into `unavailable`.
+pub const embedding_activity_retention_ms: u64 = 90 * std.time.ms_per_s;
+
+pub const EmbeddingActivityStats = struct {
+    epoch: u64 = 0,
+    // Monotonic within `epoch` and incremented for every phase/counter change.
+    // This orders volatile samples independently from durable status snapshots.
+    sample_sequence: u64 = 0,
+    // Internal incarnation fence. API encoders omit internal fence fields.
+    index_generation: u64 = 0,
+    // Internal ownership fence. A failed supervised provider batch records
+    // its exact failure identity here; only the worker supervisor may promote
+    // that candidate to the public `retrying` state.
+    retry_fingerprint: u64 = 0,
+    // Exact, component-owned in-flight scopes. These are local aggregation
+    // inputs, not public counters: clients see only `effectivePhase()`.
+    active_preparations: u64 = 0,
+    active_publications: u64 = 0,
+    // A status received from another runtime is already an owner-derived
+    // observation. Local owners leave this null and expose their exact scopes;
+    // transport adapters set it so counters cannot reinterpret that phase.
+    reported_phase: ?EmbeddingActivityPhase = null,
+    chunks_created: u64 = 0,
+    embedding_batches_completed: u64 = 0,
+    embeddings_computed: u64 = 0,
+    active_batch_size: u64 = 0,
+    retrying: bool = false,
+    last_progress_at_ms: u64 = 0,
+    pub fn effectivePhase(self: @This()) EmbeddingActivityPhase {
+        if (self.reported_phase) |phase| return phase;
+        if (self.retrying) return .waiting_retry;
+        if (self.active_batch_size != 0) return .embedding;
+        if (self.active_publications != 0) return .publishing;
+        if (self.active_preparations != 0) return .preparing;
+        return .idle;
+    }
+};
+
 pub const ReplayStageStats = struct {
     enabled: bool = false,
     target_sequence: u64 = 0,
@@ -2703,6 +2755,10 @@ pub const VisibilityStats = struct {
 };
 
 pub const DBStats = struct {
+    /// Process-local identity of the resident DB owner that sampled this
+    /// status. Cache merge logic uses it only with an exact table root and
+    /// index incarnation; it is not part of the public status contract.
+    runtime_owner_id: u64 = 0,
     /// Process-local fingerprint of physical LSM/WAL publications. Runtime
     /// status uses it only to invalidate cached directory-byte observations.
     storage_change_token: u64 = 0,
@@ -3253,6 +3309,15 @@ pub const IndexSourceReplayStatus = struct {
     observation_count: u64 = 1,
 };
 
+/// Internal durable lifecycle class. This is carried with shard observations
+/// so API projection can distinguish ordinary materialization from recovery
+/// without interpreting repair trigger strings.
+pub const IndexLifecycleWorkClass = enum {
+    none,
+    initial_build,
+    repair,
+};
+
 pub const DBIndexStats = struct {
     name: []const u8,
     kind: IndexKind,
@@ -3278,9 +3343,29 @@ pub const DBIndexStats = struct {
     edge_count: u64 = 0,
     node_count: u64 = 0,
     root_node: u64 = 0,
+    // Exact physical artifact cardinality owned by this index incarnation.
+    // Unlike source coverage, this remains correct for chunked projections
+    // where one source document can publish multiple searchable vectors.
+    publication_target_count: u64 = 0,
+    publication_target_ready: bool = false,
+    // Authoritative O(1) projection of the resident search-admission gate for
+    // this exact dense incarnation. Zero members is still a valid snapshot.
+    serving_snapshot_ready: bool = false,
+    // Process-local immutable serving revision. It is ordered only when the
+    // enclosing DBStats observations have the same nonzero runtime_owner_id.
+    serving_snapshot_revision: u64 = 0,
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
+    // True when this pass directly observed the owner or retains its last
+    // unexpired exact-incarnation sample. False is unavailable, not idle.
+    // This controls local projection only.
+    embedding_activity_observed: bool = false,
+    // True only for a direct owner sample accepted during this status pass.
+    // Wire adapters use this bit so locally retained activity cannot refresh
+    // the next hop's TTL indefinitely. This is not part of the public API.
+    embedding_activity_sample_fresh: bool = false,
+    embedding_activity: EmbeddingActivityStats = .{},
     // Stable across shard-local marker generations for the same stored config.
     coverage_config_hash: u64 = 0,
     coverage_summary_ready: bool = true,
@@ -3297,6 +3382,7 @@ pub const DBIndexStats = struct {
     repair_issue_count_estimated: bool = false,
     repair_scan_issue_count: u64 = 0,
     index_repair_id: ?u128 = null,
+    index_lifecycle_work_class: IndexLifecycleWorkClass = .none,
     index_repair_trigger: []const u8 = "none",
     index_repair_phase: []const u8 = "none",
     index_repair_automation: []const u8 = "none",

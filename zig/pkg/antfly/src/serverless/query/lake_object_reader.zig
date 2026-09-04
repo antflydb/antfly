@@ -309,10 +309,10 @@ test "object storage range reader validates returned planned object metadata" {
         }
 
         fn deinit(_: Allocator, _: *anyopaque) void {}
-        fn bucketExists(_: *anyopaque, _: []const u8) !bool {
+        fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }
-        fn makeBucket(_: *anyopaque, _: []const u8) !void {}
+        fn makeBucket(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !void {}
         fn putObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: object_storage.PutOptions) !object_storage.PutResult {
             return error.UnsupportedOperation;
         }
@@ -413,10 +413,10 @@ test "lake object storage range reader validates full object checksums" {
         }
 
         fn deinit(_: Allocator, _: *anyopaque) void {}
-        fn bucketExists(_: *anyopaque, _: []const u8) !bool {
+        fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }
-        fn makeBucket(_: *anyopaque, _: []const u8) !void {}
+        fn makeBucket(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !void {}
         fn putObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: object_storage.PutOptions) !object_storage.PutResult {
             return error.UnsupportedOperation;
         }
@@ -574,10 +574,10 @@ test "object storage range reader retries transient planned reads only" {
         }
 
         fn deinit(_: Allocator, _: *anyopaque) void {}
-        fn bucketExists(_: *anyopaque, _: []const u8) !bool {
+        fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }
-        fn makeBucket(_: *anyopaque, _: []const u8) !void {}
+        fn makeBucket(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !void {}
         fn putObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: object_storage.PutOptions) !object_storage.PutResult {
             return error.UnsupportedOperation;
         }
@@ -671,10 +671,10 @@ test "object storage range reader does not retry stale object identity" {
         }
 
         fn deinit(_: Allocator, _: *anyopaque) void {}
-        fn bucketExists(_: *anyopaque, _: []const u8) !bool {
+        fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }
-        fn makeBucket(_: *anyopaque, _: []const u8) !void {}
+        fn makeBucket(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !void {}
         fn putObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: object_storage.PutOptions) !object_storage.PutResult {
             return error.UnsupportedOperation;
         }

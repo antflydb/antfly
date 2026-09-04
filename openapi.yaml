@@ -20349,6 +20349,7 @@ components:
         - load_failure
         - enrichment_failure
         - runtime_unavailable
+        - target_observation
         - shard_observation_incomplete
         - incarnation_pending
         - source_publication
@@ -20437,6 +20438,32 @@ components:
             indexes, in configuration order.
           items:
             $ref: '#/components/schemas/IndexSourceReadinessStatus'
+    IndexMilestoneStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - reached
+        - blockers
+      properties:
+        reached:
+          type: boolean
+          description: Whether this milestone is satisfied by the observed index incarnation.
+        blockers:
+          type: array
+          items:
+            type: string
+          description: Milestone-specific, machine-readable blockers. Empty whenever reached is true.
+    IndexMilestones:
+      type: object
+      additionalProperties: false
+      required:
+        - queryable
+        - complete
+      properties:
+        queryable:
+          $ref: '#/components/schemas/IndexMilestoneStatus'
+        complete:
+          $ref: '#/components/schemas/IndexMilestoneStatus'
     IndexRepairStatus:
       type: object
       description: Compact user-facing state for an automatic index repair. Detailed diagnostics are available
@@ -20483,6 +20510,23 @@ components:
           description: Discriminator for the index stats variant.
         readiness:
           $ref: '#/components/schemas/IndexReadinessStatus'
+          deprecated: true
+          description: Deprecated compatibility projection. Use milestones and revision fields.
+        incarnation:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Opaque identity of the desired index incarnation. Clients may compare it for equality
+            but must not interpret its contents.
+        target_revision:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        published_revision:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        milestones:
+          $ref: '#/components/schemas/IndexMilestones'
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -20676,6 +20720,7 @@ components:
       type: string
       enum:
         - runtime_unavailable
+        - target_observation
         - missing_group
         - unknown_group
         - remote_unknown_group
@@ -20684,6 +20729,135 @@ components:
         - config_mismatch
         - counter_mismatch
       description: A structured reason why the coverage projection cannot be treated as globally complete.
+    EmbeddingSourceCoverageStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - policy
+        - observation_complete
+        - observation_incomplete_reasons
+        - config_fingerprint
+        - total
+        - pending
+        - covered
+        - skipped
+        - failed
+        - complete
+        - healthy
+        - degraded
+      properties:
+        policy:
+          $ref: '#/components/schemas/DerivedCoverageStatusPolicy'
+        observation_complete:
+          type: boolean
+          description: Whether total and all outcome counts are exact across the expected shards.
+        observation_incomplete_reasons:
+          type: array
+          items:
+            $ref: '#/components/schemas/DerivedCoverageObservationIncompleteReason'
+        config_fingerprint:
+          type: string
+          pattern: ^[0-9a-f]{16}$
+          description: Semantic configuration fingerprint for the observed index incarnation.
+        total:
+          type: integer
+          format: uint64
+          description: Source documents in scope. This is a lower bound when observation_complete is false.
+        pending:
+          x-go-type-skip-optional-pointer: false
+          type: integer
+          format: uint64
+          nullable: true
+          description: Sources awaiting a terminal generation decision; null when the observation is incomplete.
+        covered:
+          type: integer
+          format: uint64
+          description: Sources that durably produced material for this index incarnation.
+        skipped:
+          type: integer
+          format: uint64
+          description: Sources intentionally producing no material after generation evaluated them.
+        failed:
+          type: integer
+          format: uint64
+          description: Sources whose generation reached a non-retryable failure.
+        complete:
+          type: boolean
+          description: Whether source outcomes satisfy the configured coverage policy. Replay and publication
+            are reported independently by revisions and milestones.
+        healthy:
+          type: boolean
+        degraded:
+          type: boolean
+    DenseVectorPublicationStatus:
+      type: object
+      additionalProperties: false
+      description: Exact dense-vector publication cardinality for the observed index incarnation.
+      required:
+        - target_vectors
+        - searchable_vectors
+        - complete
+      properties:
+        target_vectors:
+          type: integer
+          format: uint64
+          description: Exact durable vector target for the current dense-index incarnation.
+        searchable_vectors:
+          type: integer
+          format: uint64
+          description: Physical vectors currently visible to queries.
+        complete:
+          type: boolean
+          description: Whether searchable_vectors exactly equals target_vectors.
+    EmbeddingIndexActivityPhase:
+      type: string
+      enum:
+        - preparing
+        - embedding
+        - publishing
+        - waiting_retry
+        - idle
+    EmbeddingIndexActivity:
+      type: object
+      additionalProperties: false
+      description: Volatile index-incarnation activity. It explains motion but never participates in readiness.
+      required:
+        - epoch
+        - phase
+        - chunks_created
+        - embedding_batches_completed
+        - embeddings_computed
+        - active_batch_size
+        - last_progress_at
+      properties:
+        epoch:
+          type: string
+          description: Opaque worker-and-index-incarnation identity. Rates are valid only between samples
+            with the same epoch.
+        phase:
+          $ref: '#/components/schemas/EmbeddingIndexActivityPhase'
+        chunks_created:
+          type: integer
+          format: uint64
+          description: Chunks created for this index during the activity epoch.
+        embedding_batches_completed:
+          type: integer
+          format: uint64
+        embeddings_computed:
+          type: integer
+          format: uint64
+          description: Embedding vectors successfully computed for this index during the activity epoch.
+        active_batch_size:
+          type: integer
+          format: uint64
+          description: Items currently submitted to an embedding provider for this index.
+        last_progress_at:
+          x-go-type-skip-optional-pointer: false
+          type: string
+          format: date-time
+          nullable: true
+          description: Completion time of the latest successful embedding batch, or null before the first
+            batch.
     DerivedCoverageStatus:
       type: object
       additionalProperties: false
@@ -20955,6 +21129,42 @@ components:
           description: Discriminator for the index stats variant.
         readiness:
           $ref: '#/components/schemas/IndexReadinessStatus'
+          deprecated: true
+          description: Deprecated compatibility projection. Use milestones and the explicit status dimensions.
+        incarnation:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Opaque identity of the desired index incarnation. Clients may compare it for equality
+            but must not interpret its contents.
+        target_revision:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        published_revision:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        milestones:
+          $ref: '#/components/schemas/IndexMilestones'
+        source_coverage:
+          $ref: '#/components/schemas/EmbeddingSourceCoverageStatus'
+        searchable_vectors:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Physical vectors or sparse entries visible to queries; chunked indexes may exceed
+            source coverage.
+        publication:
+          $ref: '#/components/schemas/DenseVectorPublicationStatus'
+          description: Dense-only exact publication status; absent for sparse indexes and when the target
+            proof is unavailable.
+        activity:
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/EmbeddingIndexActivity'
+          description: Fresh owner-reported activity, or null when no heartbeat for this index incarnation
+            is available.
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -21341,6 +21551,23 @@ components:
           description: Discriminator for the index stats variant.
         readiness:
           $ref: '#/components/schemas/IndexReadinessStatus'
+          deprecated: true
+          description: Deprecated compatibility projection. Use milestones and revision fields.
+        incarnation:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Opaque identity of the desired index incarnation. Clients may compare it for equality
+            but must not interpret its contents.
+        target_revision:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        published_revision:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        milestones:
+          $ref: '#/components/schemas/IndexMilestones'
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -21567,6 +21794,23 @@ components:
           description: Discriminator for the index stats variant.
         readiness:
           $ref: '#/components/schemas/IndexReadinessStatus'
+          deprecated: true
+          description: Deprecated compatibility projection. Use milestones and revision fields.
+        incarnation:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Opaque identity of the desired index incarnation. Clients may compare it for equality
+            but must not interpret its contents.
+        target_revision:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        published_revision:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        milestones:
+          $ref: '#/components/schemas/IndexMilestones'
         error:
           x-go-type-skip-optional-pointer: true
           type: string

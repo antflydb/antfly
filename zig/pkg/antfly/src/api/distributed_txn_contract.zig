@@ -20,6 +20,13 @@ pub const pre_decision_not_proposed_v1 = "not-proposed-v1";
 pub const pre_decision_remaining_ms_header = "X-Antfly-Txn-Pre-Decision-Remaining-Ms";
 pub const max_pre_decision_server_budget_ms: u32 = 5_000;
 pub const pre_decision_server_response_reserve_ms: u32 = 50;
+/// Relative budget for a linearizable participant-status observation. The
+/// receiving leader applies this same budget to its quorum read barrier.
+pub const status_remaining_ms_header = "X-Antfly-Txn-Status-Remaining-Ms";
+pub const max_status_server_budget_ms: u32 = 5_000;
+/// Time retained by the caller after the server's read-barrier budget for
+/// response encoding, scheduling, and transport back to the coordinator.
+pub const status_server_response_reserve_ms: u32 = 50;
 
 /// Process-local execution context established by the receiving node. This is
 /// never serialized directly across the wire.

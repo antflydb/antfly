@@ -27,6 +27,7 @@ const StorageRecorder = struct {
     persist_calls: usize = 0,
     persisted_entries: usize = 0,
     persisted_snapshots: usize = 0,
+    persist_failures_remaining: usize = 0,
     compact_failures_remaining: usize = 0,
     compact_failure_group: ?core.types.GroupId = null,
     compact_successes: usize = 0,
@@ -57,6 +58,10 @@ const StorageRecorder = struct {
         const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
         const store = self.stores.get(group_id) orelse return error.UnknownGroup;
         self.persist_calls += 1;
+        if (self.persist_failures_remaining > 0) {
+            self.persist_failures_remaining -= 1;
+            return error.InjectedReadyPersistenceFailure;
+        }
         self.persisted_entries += ready.entries.len;
         if (ready.snapshot != null) self.persisted_snapshots += 1;
 
@@ -123,6 +128,49 @@ const FailingRemovalCatalog = struct {
 
     fn listReplicas(_: *anyopaque, alloc: std.mem.Allocator) ![]runtime.ReplicaRecord {
         return try alloc.alloc(runtime.ReplicaRecord, 0);
+    }
+};
+
+const ReadOnlyVersionedCatalog = struct {
+    record: *const runtime.ReplicaRecord,
+    upsert_calls: usize = 0,
+
+    fn iface(self: *@This()) runtime.replica_catalog_iface.ReplicaCatalog {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .capabilities = capabilities,
+                .upsert_replica = upsertReplica,
+                .remove_replica = removeReplica,
+                .list_replicas = listReplicas,
+            },
+        };
+    }
+
+    fn capabilities(_: *anyopaque) runtime.replica_catalog_iface.CatalogCapabilities {
+        return .{
+            .max_read_record_version = 2,
+            .max_write_record_version = 1,
+            .writes_explicit_snapshot_format = false,
+        };
+    }
+
+    fn upsertReplica(ptr: *anyopaque, _: runtime.ReplicaRecord) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.upsert_calls += 1;
+        return error.ReadOnlyVersionedCatalog;
+    }
+
+    fn removeReplica(_: *anyopaque, _: core.types.GroupId) !bool {
+        return false;
+    }
+
+    fn listReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) ![]runtime.ReplicaRecord {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const records = try alloc.alloc(runtime.ReplicaRecord, 1);
+        errdefer alloc.free(records);
+        records[0] = try self.record.clone(alloc);
+        return records;
     }
 };
 
@@ -460,18 +508,54 @@ const TransportRecorder = struct {
 };
 
 const SnapshotTransportRecorder = struct {
+    submit_calls: usize = 0,
+    deferrals_remaining: usize = 0,
+    retry_after_ms: u64 = 0,
     send_calls: usize = 0,
     sent_bytes: usize = 0,
     last_group_id: core.types.GroupId = 0,
+    last_incarnation: u64 = 0,
     last_to: core.types.NodeId = 0,
+    cancellations: usize = 0,
+    last_cancelled: ?runtime.snapshot_transport_iface.SnapshotAttemptKey = null,
 
     fn iface(self: *SnapshotTransportRecorder) runtime.snapshot_transport_iface.SnapshotTransport {
         return .{
             .ptr = self,
-            .vtable = &.{
-                .send_snapshot = sendSnapshot,
-            },
+            .sender = .{ .asynchronous = .{
+                .submit_snapshot = submitSnapshot,
+                .drain_completions = drainCompletions,
+                .cancel_submission = cancelSubmission,
+            } },
+            .vtable = &.{},
         };
+    }
+
+    fn submitSnapshot(
+        ptr: *anyopaque,
+        req: runtime.snapshot_transport_iface.SnapshotSendRequest,
+    ) !runtime.snapshot_transport_iface.AsyncSnapshotSubmitResult {
+        const self: *SnapshotTransportRecorder = @ptrCast(@alignCast(ptr));
+        self.submit_calls += 1;
+        if (self.deferrals_remaining > 0) {
+            self.deferrals_remaining -= 1;
+            return .{ .retry_later = .{ .retry_after_ms = self.retry_after_ms } };
+        }
+        try sendSnapshot(ptr, req);
+        return .accepted;
+    }
+
+    fn drainCompletions(_: *anyopaque, _: []runtime.snapshot_transport_iface.SnapshotCompletion) usize {
+        return 0;
+    }
+
+    fn cancelSubmission(
+        ptr: *anyopaque,
+        key: runtime.snapshot_transport_iface.SnapshotAttemptKey,
+    ) void {
+        const self: *SnapshotTransportRecorder = @ptrCast(@alignCast(ptr));
+        self.cancellations += 1;
+        self.last_cancelled = key;
     }
 
     fn sendSnapshot(ptr: *anyopaque, req: runtime.snapshot_transport_iface.SnapshotSendRequest) !void {
@@ -479,6 +563,7 @@ const SnapshotTransportRecorder = struct {
         self.send_calls += 1;
         self.sent_bytes += req.snapshot.data.len;
         self.last_group_id = req.group_id;
+        self.last_incarnation = req.incarnation;
         self.last_to = req.to;
     }
 };
@@ -1612,9 +1697,11 @@ test "multi raft routes outbound snapshots through snapshot transport" {
     try storage_recorder.registerStore(94, &store);
 
     var transport_recorder = TransportRecorder{ .alloc = std.testing.allocator };
-    var snapshot_transport = SnapshotTransportRecorder{};
+    var snapshot_transport = SnapshotTransportRecorder{ .deferrals_remaining = 1 };
 
-    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .snapshot_transport_completion_timeout_ms = 0,
+    }, .{
         .group_storage = storage_recorder.iface(),
         .transport = transport_recorder.iface(),
         .snapshot_transport = snapshot_transport.iface(),
@@ -1648,6 +1735,9 @@ test "multi raft routes outbound snapshots through snapshot transport" {
     transport_recorder.peer_batch_calls = 0;
     transport_recorder.batched_peer_count = 0;
     transport_recorder.batched_group_count = 0;
+    snapshot_transport.submit_calls = 0;
+    snapshot_transport.send_calls = 0;
+    snapshot_transport.deferrals_remaining = 1;
 
     const grp = host.group(94).?;
     grp.raw_node.raft.progress[1] = .{
@@ -1669,11 +1759,37 @@ test "multi raft routes outbound snapshots through snapshot transport" {
     });
 
     try std.testing.expectEqual(true, try host.processReady(94));
+    try std.testing.expectEqual(@as(usize, 0), snapshot_transport.send_calls);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().pending_outbound_messages);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().transport_snapshot_submission_deferrals);
+
+    // A normal capacity wake-up/next runtime turn retries the retained entry;
+    // Raft does not need to regenerate the snapshot Ready.
+    try std.testing.expectEqual(false, try host.processReady(94));
     try std.testing.expectEqual(@as(usize, 1), snapshot_transport.send_calls);
+    try std.testing.expectEqual(@as(usize, 2), snapshot_transport.submit_calls);
     try std.testing.expectEqual(@as(core.types.GroupId, 94), snapshot_transport.last_group_id);
+    try std.testing.expect(snapshot_transport.last_incarnation != 0);
     try std.testing.expectEqual(@as(core.types.NodeId, 2), snapshot_transport.last_to);
     try std.testing.expectEqual(@as(usize, 0), transport_recorder.sent_messages);
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().transport_snapshot_sends);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_outbound_messages);
+
+    // An accepted asynchronous attempt is a bounded lease. A transport that
+    // never completes it is cancelled by exact identity and Raft is released
+    // to generate a fresh attempt instead of hanging in snapshot state.
+    snapshot_transport.deferrals_remaining = std.math.maxInt(usize);
+    _ = try host.processReady(94);
+    try std.testing.expectEqual(@as(usize, 1), snapshot_transport.cancellations);
+    const cancelled = snapshot_transport.last_cancelled.?;
+    try std.testing.expectEqual(@as(core.types.GroupId, 94), cancelled.group_id);
+    try std.testing.expectEqual(snapshot_transport.last_incarnation, cancelled.incarnation);
+    try std.testing.expectEqual(@as(core.types.NodeId, 2), cancelled.to);
+    try std.testing.expectEqual(@as(core.types.Index, 11), cancelled.snapshot_index);
+    const metrics = host.metricsSnapshot();
+    try std.testing.expectEqual(@as(usize, 1), metrics.transport_snapshot_completion_timeouts);
+    try std.testing.expectEqual(@as(usize, 1), metrics.transport_snapshot_cancellations);
+    try std.testing.expectEqual(@as(usize, 0), metrics.transport_snapshot_owned_attempts);
 }
 
 test "multi raft fetches snapshot through snapshot transport and steps it into the group" {
@@ -1756,7 +1872,11 @@ test "multi raft ensureReplica creates persisted replica and can remove it" {
         .commit_index = 2,
     });
 
-    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{});
+    var catalog = runtime.MemoryReplicaCatalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
+        .replica_catalog = catalog.catalog(),
+    });
     defer host.deinit();
 
     var peers = [_]core.types.NodeId{1};
@@ -1778,6 +1898,28 @@ test "multi raft ensureReplica creates persisted replica and can remove it" {
     });
     try std.testing.expect(result.created);
     try std.testing.expectEqual(@as(core.types.Index, 2), host.group(131).?.status().hard.commit_index);
+
+    var mismatched_peers = [_]core.types.NodeId{2};
+    try std.testing.expectError(error.LocalNodeIdMismatch, host.ensureReplica(.{
+        .group = .{
+            .group_id = 131,
+            .local_node_id = 2,
+            .raft_config = .{
+                .id = 2,
+                .group_id = 131,
+                .peers = mismatched_peers[0..],
+            },
+            .storage = store.storage(),
+        },
+        .bootstrap = .persisted,
+    }));
+    const persisted = try catalog.catalog().listReplicas(std.testing.allocator);
+    defer {
+        for (persisted) |*persisted_record| persisted_record.deinit(std.testing.allocator);
+        std.testing.allocator.free(persisted);
+    }
+    try std.testing.expectEqual(@as(usize, 1), persisted.len);
+    try std.testing.expectEqual(@as(core.types.NodeId, 1), persisted[0].local_node_id);
 
     try host.removeReplica(131);
     try std.testing.expect(host.group(131) == null);
@@ -1846,8 +1988,62 @@ test "multi raft ensureReplica can fetch snapshot bootstrap" {
     try std.testing.expect(result.created);
     try std.testing.expect(result.fetched_snapshot);
     try std.testing.expect(host.group(132).?.hasReady());
+    try std.testing.expectEqual(
+        @as(usize, "ensure-snapshot".len),
+        host.metricsSnapshot().pending_snapshot_bytes,
+    );
     try std.testing.expectEqual(true, try host.processReady(132));
     try std.testing.expectEqual(@as(core.types.Index, 15), store.snapshot_state.metadata.index);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_snapshot_bytes);
+}
+
+test "multi raft rejects snapshot bootstrap above aggregate ownership budget" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    const root_dir = "/tmp/antflydb-raft-runtime-reject-fetch-snapshot";
+    var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
+    defer snapshot_transport.deinit();
+    var voters = [_]core.types.NodeId{ 1, 2 };
+    const payload = try std.testing.allocator.dupe(u8, "over-budget-snapshot");
+    defer std.testing.allocator.free(payload);
+    try snapshot_transport.transport().sendSnapshot(.{
+        .group_id = 133,
+        .to = 2,
+        .term = 6,
+        .snapshot = .{
+            .metadata = .{ .index = 15, .term = 6, .conf_state = .{ .voters = voters[0..] } },
+            .data = payload,
+        },
+        .locator = .{ .snapshot_id = "over-budget" },
+    });
+
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .max_pending_snapshot_bytes = payload.len - 1,
+    }, .{ .snapshot_transport = snapshot_transport.transport() });
+    defer host.deinit();
+    try std.testing.expectError(error.SnapshotAdmissionBackpressure, host.ensureReplica(.{
+        .group = .{
+            .group_id = 133,
+            .local_node_id = 2,
+            .raft_config = .{
+                .id = 2,
+                .group_id = 133,
+                .peers = voters[0..],
+                .election_tick = 10,
+                .heartbeat_tick = 1,
+                .pre_vote = false,
+            },
+            .storage = store.storage(),
+        },
+        .bootstrap = .{ .fetch_snapshot = .{
+            .from = 1,
+            .term = 6,
+            .locator = .{ .snapshot_id = "over-budget" },
+        } },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_snapshot_bytes);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().snapshot_admission_denials);
 }
 
 test "multi raft backpressure can defer ready processing" {
@@ -2086,6 +2282,48 @@ test "multi raft transport queue denial leaves ready pending" {
     try std.testing.expect(host.group(154).?.hasReady());
 }
 
+test "multi raft drainReady admits one oversized outbound ready only into an empty queue" {
+    var store1 = core.MemoryStorage.init(std.testing.allocator);
+    defer store1.deinit();
+    var store2 = core.MemoryStorage.init(std.testing.allocator);
+    defer store2.deinit();
+
+    var transport = TransportRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .max_pending_outbound_messages = 8,
+        .max_pending_outbound_bytes = 1,
+        .max_single_outbound_ready_bytes = 4096,
+        .max_transport_messages_per_round = 0,
+    }, .{ .transport = transport.iface() });
+    defer host.deinit();
+
+    var peers = [_]core.types.NodeId{ 1, 2 };
+    for ([_]struct { id: u64, store: *core.MemoryStorage }{
+        .{ .id = 253, .store = &store1 },
+        .{ .id = 254, .store = &store2 },
+    }) |item| {
+        try host.addGroup(.{
+            .group_id = item.id,
+            .local_node_id = 1,
+            .raft_config = .{
+                .id = 1,
+                .group_id = item.id,
+                .peers = peers[0..],
+                .election_tick = 5,
+                .heartbeat_tick = 1,
+                .pre_vote = false,
+            },
+            .storage = item.store.storage(),
+        });
+        try host.campaignGroup(item.id);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), (try host.drainReady(8)).processed_ready_steps);
+    try std.testing.expect(host.metricsSnapshot().pending_outbound_bytes > 1);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().transport_queue_denials);
+    try std.testing.expect(host.group(254).?.hasReady());
+}
+
 test "multi raft apply queue drains with per-round budget" {
     var store1 = core.MemoryStorage.init(std.testing.allocator);
     defer store1.deinit();
@@ -2118,6 +2356,266 @@ test "multi raft apply queue drains with per-round budget" {
     try std.testing.expectEqual(@as(usize, 0), (try host.drainReady(0)).processed_ready_steps);
     try std.testing.expectEqual(@as(usize, 2), apply_recorder.applied_entries);
     try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_apply_tasks);
+}
+
+test "multi raft drainReady admits one oversized apply ready only into an empty queue" {
+    var store1 = core.MemoryStorage.init(std.testing.allocator);
+    defer store1.deinit();
+    var store2 = core.MemoryStorage.init(std.testing.allocator);
+    defer store2.deinit();
+
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(255, &store1);
+    try storage_recorder.registerStore(256, &store2);
+    var apply_recorder = ApplyRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .max_pending_apply_tasks = 8,
+        .max_pending_apply_bytes = 1,
+        .max_single_apply_ready_bytes = 4096,
+        .max_apply_tasks_per_round = 0,
+    }, .{
+        .group_storage = storage_recorder.iface(),
+        .state_machine = apply_recorder.iface(),
+    });
+    defer host.deinit();
+
+    try addSingleNodeGroup(&host, 255, &store1, false);
+    try addSingleNodeGroup(&host, 256, &store2, false);
+    try host.campaignGroup(255);
+    try host.campaignGroup(256);
+
+    try std.testing.expectEqual(@as(usize, 1), (try host.drainReady(8)).processed_ready_steps);
+    try std.testing.expect(host.metricsSnapshot().pending_apply_bytes > 1);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().apply_queue_denials);
+    try std.testing.expect(host.group(256).?.hasReady());
+}
+
+test "multi raft drainReady always makes progress on one oversized Ready" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(257, &store);
+    var apply_recorder = ApplyRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .max_pending_outbound_bytes = 1,
+        .max_pending_apply_bytes = 1,
+    }, .{
+        .group_storage = storage_recorder.iface(),
+        .state_machine = apply_recorder.iface(),
+    });
+    defer host.deinit();
+
+    try addSingleNodeGroup(&host, 257, &store, false);
+    try host.campaignGroup(257);
+
+    try std.testing.expectEqual(@as(usize, 1), (try host.drainReady(1)).processed_ready_steps);
+    try std.testing.expect(!host.group(257).?.hasReady());
+}
+
+test "multi raft empty drain remains allocation free after group admission" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var store = core.MemoryStorage.init(alloc);
+    defer store.deinit();
+    var host = runtime.MultiRaft.init(alloc, .{}, .{});
+    defer host.deinit();
+
+    try addSingleNodeGroup(&host, 262, &store, false);
+    _ = try host.drainReady(8);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    const drained = try host.drainReady(8);
+    try std.testing.expectEqual(@as(usize, 0), drained.processed_ready_steps);
+}
+
+test "multi raft drainReady quarantines an impossible outbound Ready hard ceiling" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .max_pending_outbound_bytes = 1,
+        .max_single_outbound_ready_bytes = 1,
+    }, .{});
+    defer host.deinit();
+
+    var peers = [_]core.types.NodeId{ 1, 2 };
+    try host.addGroup(.{
+        .group_id = 258,
+        .local_node_id = 1,
+        .raft_config = .{
+            .id = 1,
+            .group_id = 258,
+            .peers = peers[0..],
+            .election_tick = 5,
+            .heartbeat_tick = 1,
+            .pre_vote = false,
+        },
+        .storage = store.storage(),
+    });
+    try host.campaignGroup(258);
+
+    try std.testing.expectEqual(@as(usize, 0), (try host.drainReady(1)).processed_ready_steps);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_outbound_bytes);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().transport_queue_denials);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().oversized_outbound_ready_rejections);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().quarantined_group_count);
+    try std.testing.expect(host.isGroupQuiesced(258));
+    const quarantine = host.groupQuarantine(258).?;
+    try std.testing.expectEqual(runtime.QuarantineReason.outbound_ready_too_large, quarantine.reason);
+    try std.testing.expect(quarantine.observed_bytes > quarantine.configured_limit);
+    try std.testing.expect(host.group(258).?.hasReady());
+    // A quarantined group is not reconsidered every round, avoiding warning
+    // and counter storms while preserving its Ready for operator recovery.
+    try std.testing.expectError(error.GroupHardQuarantined, host.campaignGroup(258));
+    try std.testing.expectError(error.GroupHardQuarantined, host.resumeGroup(258));
+    try std.testing.expectEqual(@as(usize, 0), (try host.drainReady(1)).processed_ready_steps);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().oversized_outbound_ready_rejections);
+    try std.testing.expectError(error.QuarantineIncidentChanged, host.resumeQuarantinedGroup(258, .{
+        .expected_incident_id = quarantine.incident_id + 1,
+        .new_limit_bytes = quarantine.observed_bytes,
+    }));
+    try host.resumeQuarantinedGroup(258, .{
+        .expected_incident_id = quarantine.incident_id,
+        .new_limit_bytes = quarantine.observed_bytes,
+    });
+    try std.testing.expect(!host.isGroupQuiesced(258));
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().quarantined_group_count);
+    try std.testing.expectEqual(@as(?runtime.GroupQuarantine, null), host.groupQuarantine(258));
+    try std.testing.expectEqual(@as(usize, 2), host.metricsSnapshot().quarantine_resume_attempts);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().quarantine_resume_successes);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().quarantine_resume_conflicts);
+    // The permit is scoped to the retained Ready and consumed when it
+    // advances; the process-wide one-byte ceiling remains unchanged.
+    try std.testing.expectEqual(@as(usize, 1), (try host.drainReady(1)).processed_ready_steps);
+    try host.campaignGroup(258);
+    try std.testing.expectEqual(@as(usize, 0), (try host.drainReady(1)).processed_ready_steps);
+    const next_incident = host.groupQuarantine(258).?;
+    try std.testing.expectEqual(@as(usize, 1), next_incident.configured_limit);
+    try std.testing.expect(next_incident.incident_id != quarantine.incident_id);
+}
+
+test "multi raft drainReady quarantines an impossible apply Ready hard ceiling" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(259, &store);
+    var apply_recorder = ApplyRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .max_pending_apply_bytes = 1,
+        .max_single_apply_ready_bytes = 1,
+    }, .{
+        .group_storage = storage_recorder.iface(),
+        .state_machine = apply_recorder.iface(),
+    });
+    defer host.deinit();
+
+    try addSingleNodeGroup(&host, 259, &store, false);
+    try host.campaignGroup(259);
+
+    try std.testing.expectEqual(@as(usize, 0), (try host.drainReady(1)).processed_ready_steps);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_apply_bytes);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().apply_queue_denials);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().oversized_apply_ready_rejections);
+    try std.testing.expect(host.isGroupQuiesced(259));
+    try std.testing.expectEqual(
+        runtime.QuarantineReason.apply_ready_too_large,
+        host.groupQuarantine(259).?.reason,
+    );
+    try std.testing.expect(host.group(259).?.hasReady());
+}
+
+test "multi raft recovery permit is consumed by a failed processing attempt" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(263, &store);
+
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .max_single_outbound_ready_bytes = 1,
+    }, .{ .group_storage = storage_recorder.iface() });
+    defer host.deinit();
+    var peers = [_]core.types.NodeId{ 1, 2 };
+    try host.addGroup(.{
+        .group_id = 263,
+        .local_node_id = 1,
+        .raft_config = .{
+            .id = 1,
+            .group_id = 263,
+            .peers = peers[0..],
+            .election_tick = 5,
+            .heartbeat_tick = 1,
+            .pre_vote = false,
+        },
+        .storage = store.storage(),
+    });
+    try host.campaignGroup(263);
+    _ = try host.drainReady(1);
+    const first = host.groupQuarantine(263).?;
+    try host.resumeQuarantinedGroup(263, .{
+        .expected_incident_id = first.incident_id,
+        .new_limit_bytes = first.observed_bytes,
+    });
+
+    storage_recorder.persist_failures_remaining = 1;
+    try std.testing.expectError(error.InjectedReadyPersistenceFailure, host.drainReady(1));
+
+    // The failed attempt crossed the permit's processing boundary. Retrying
+    // without a newly fenced operator action must quarantine the retained
+    // oversized Ready instead of reusing the old allowance.
+    _ = try host.drainReady(1);
+    const second = host.groupQuarantine(263).?;
+    try std.testing.expect(second.incident_id != first.incident_id);
+}
+
+test "multi raft oversized Ready isolation still flushes healthy groups in the batch" {
+    var healthy_store = core.MemoryStorage.init(std.testing.allocator);
+    defer healthy_store.deinit();
+    var oversized_store = core.MemoryStorage.init(std.testing.allocator);
+    defer oversized_store.deinit();
+
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(260, &healthy_store);
+    try storage_recorder.registerStore(261, &oversized_store);
+    var apply_recorder = ApplyRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .max_single_outbound_ready_bytes = 1,
+    }, .{
+        .group_storage = storage_recorder.iface(),
+        .state_machine = apply_recorder.iface(),
+    });
+    defer host.deinit();
+
+    try addSingleNodeGroup(&host, 260, &healthy_store, false);
+    var peers = [_]core.types.NodeId{ 1, 2 };
+    try host.addGroup(.{
+        .group_id = 261,
+        .local_node_id = 1,
+        .raft_config = .{
+            .id = 1,
+            .group_id = 261,
+            .peers = peers[0..],
+            .election_tick = 5,
+            .heartbeat_tick = 1,
+            .pre_vote = false,
+        },
+        .storage = oversized_store.storage(),
+    });
+    try host.campaignGroup(260);
+    try host.campaignGroup(261);
+
+    const drained = try host.drainReady(8);
+    try std.testing.expectEqual(@as(usize, 1), drained.processed_ready_steps);
+    try std.testing.expect(apply_recorder.applied_entries > 0);
+    try std.testing.expect(!host.group(260).?.hasReady());
+    try std.testing.expect(host.isGroupQuiesced(261));
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().oversized_outbound_ready_rejections);
 }
 
 test "multi raft removal drops pending applies and retires replica storage" {
@@ -2335,6 +2833,173 @@ test "multi raft restoreReplicasFromCatalog reconstructs persisted replica" {
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().restored_replicas);
 }
 
+test "multi raft validates catalog admission before durability and fences config replacement" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var catalog = runtime.MemoryReplicaCatalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
+        .replica_catalog = catalog.catalog(),
+    });
+    defer host.deinit();
+
+    const empty_peers = [_]core.types.NodeId{};
+    try std.testing.expectError(error.EmptyPeerSet, host.ensureReplica(.{
+        .group = .{
+            .group_id = 146,
+            .local_node_id = 1,
+            .raft_config = .{
+                .id = 1,
+                .group_id = 146,
+                .peers = empty_peers[0..],
+            },
+            .storage = store.storage(),
+        },
+    }));
+    try std.testing.expect(!catalog.contains(146));
+
+    var peers = [_]core.types.NodeId{1};
+    _ = try host.ensureReplica(.{
+        .group = .{
+            .group_id = 146,
+            .local_node_id = 1,
+            .raft_config = .{
+                .id = 1,
+                .group_id = 146,
+                .peers = peers[0..],
+            },
+            .storage = store.storage(),
+        },
+    });
+    // Explicit and implicit defaults describe the same admission and must be
+    // idempotent across mixed-version descriptor producers.
+    _ = try host.ensureReplica(.{
+        .group = .{
+            .group_id = 146,
+            .local_node_id = 1,
+            .raft_config = .{
+                .id = 1,
+                .group_id = 146,
+                .peers = peers[0..],
+                .max_committed_size_per_ready = std.math.maxInt(usize),
+                .max_inflight_bytes = std.math.maxInt(usize),
+            },
+            .storage = store.storage(),
+        },
+    });
+    // Transport reachability and desired membership may expand while the live
+    // replica remains installed. Admission must remain idempotent and, just as
+    // importantly, must not smuggle that topology into observed ConfState.
+    var relocation_peers = [_]core.types.NodeId{ 1, 2 };
+    _ = try host.ensureReplica(.{
+        .group = .{
+            .group_id = 146,
+            .local_node_id = 1,
+            .raft_config = .{
+                .id = 1,
+                .group_id = 146,
+                .peers = relocation_peers[0..],
+            },
+            .storage = store.storage(),
+        },
+    });
+    try std.testing.expectEqualSlices(
+        core.types.NodeId,
+        &.{1},
+        host.group(146).?.status().conf_state.voters,
+    );
+
+    const policy_conflict_descriptor: runtime.ReplicaDescriptor = .{
+        .group = .{
+            .group_id = 146,
+            .local_node_id = 1,
+            .raft_config = .{
+                .id = 1,
+                .group_id = 146,
+                .peers = peers[0..],
+                .election_tick = 11,
+            },
+            .storage = store.storage(),
+        },
+    };
+    const conflict = host.replicaAdmissionConflict(policy_conflict_descriptor) orelse
+        return error.ExpectedReplicaAdmissionConflict;
+    switch (conflict) {
+        .runtime_policy => |policy_conflict| try std.testing.expectEqual(
+            runtime.group.ReplicaRuntimePolicyField.election_tick,
+            policy_conflict.field,
+        ),
+        .local_node_id => return error.UnexpectedReplicaIdentityConflict,
+    }
+    try std.testing.expectError(
+        error.ReplicaRuntimePolicyMismatch,
+        host.ensureReplica(policy_conflict_descriptor),
+    );
+    const records = try catalog.catalog().listReplicas(std.testing.allocator);
+    defer {
+        for (records) |*record| record.deinit(std.testing.allocator);
+        std.testing.allocator.free(records);
+    }
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(@as(u32, 10), records[0].raft.election_tick);
+}
+
+test "multi raft restore is read-only across decoder-first catalog upgrades" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = runtime.MemoryReplicaFactory.init(std.testing.allocator);
+    defer factory.deinit();
+    try factory.registerStore(144, &store);
+
+    var peers = [_]core.types.NodeId{1};
+    const record: runtime.ReplicaRecord = .{
+        .group_id = 144,
+        .local_node_id = 1,
+        .raft = .{ .peers = peers[0..] },
+        .bootstrap = .{ .fetch_snapshot = .{
+            .from = 2,
+            .locator = .{
+                .snapshot_id = "decoder-first",
+                .format = .chunked_manifest_v2,
+            },
+            .fetch_immediately = false,
+        } },
+    };
+    var catalog = ReadOnlyVersionedCatalog{ .record = &record };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
+        .replica_catalog = catalog.iface(),
+        .replica_factory = factory.factory(),
+    });
+    defer host.deinit();
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try host.restoreReplicasFromCatalog(std.testing.allocator),
+    );
+    try std.testing.expect(host.group(144) != null);
+    try std.testing.expectEqual(@as(usize, 0), catalog.upsert_calls);
+
+    // New admission is still rejected before any runtime or catalog side
+    // effect until this catalog activates the v2 writer.
+    var second_store = core.MemoryStorage.init(std.testing.allocator);
+    defer second_store.deinit();
+    try std.testing.expectError(error.ReplicaCatalogRecordUnsupported, host.ensureReplica(.{
+        .group = .{
+            .group_id = 145,
+            .local_node_id = 1,
+            .raft_config = .{
+                .id = 1,
+                .group_id = 145,
+                .peers = peers[0..],
+            },
+            .storage = second_store.storage(),
+        },
+        .bootstrap = record.bootstrap,
+    }));
+    try std.testing.expect(host.group(145) == null);
+    try std.testing.expectEqual(@as(usize, 0), catalog.upsert_calls);
+}
+
 test "runtime control plane restore_replicas can rejoin via snapshot bootstrap" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
@@ -2409,7 +3074,12 @@ test "runtime control plane restore_replicas can rejoin via snapshot bootstrap" 
 }
 
 test "multi raft restoreReplicasFromCatalog works with file replica catalog" {
-    const path = "/tmp/antflydb-raft-runtime-file-catalog.bin";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_path);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "replica-catalog.bin" });
+    defer std.testing.allocator.free(path);
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
     store.setHardState(.{

@@ -319,6 +319,18 @@ fn compileFiltersWithAnchors(
     return filters[0..count];
 }
 
+fn addAntflyTestRunArtifact(
+    b: *std.Build,
+    tests: *std.Build.Step.Compile,
+) *std.Build.Step.Run {
+    if (tests.test_runner == null) {
+        const runner_path = b.path("pkg/antfly/src/test_runner.zig");
+        tests.test_runner = .{ .path = runner_path, .mode = .simple };
+        runner_path.addStepDependencies(&tests.step);
+    }
+    return b.addRunArtifact(tests);
+}
+
 /// Zig's compile-time filters can retain imported anonymous tests needed for
 /// semantic analysis. Give every filtered artifact the exact-filter runner and
 /// apply the caller's independently selected runtime filters so compile-only
@@ -328,12 +340,7 @@ fn addFilteredTestRunArtifactWithRuntimeFilters(
     tests: *std.Build.Step.Compile,
     runtime_filters: []const []const u8,
 ) *std.Build.Step.Run {
-    if (tests.test_runner == null) {
-        const runner_path = b.path("pkg/antfly/src/test_runner.zig");
-        tests.test_runner = .{ .path = runner_path, .mode = .simple };
-        runner_path.addStepDependencies(&tests.step);
-    }
-    const run = b.addRunArtifact(tests);
+    const run = addAntflyTestRunArtifact(b, tests);
     addRuntimeTestFilters(b, run, runtime_filters);
     return run;
 }
@@ -3047,11 +3054,33 @@ pub fn build(b: *std.Build) void {
         .root_module = portable_backup_test_mod,
         .filters = &.{
             "export and import documents round trip",
+            "portable AFB2 delta resolves exact base and deduplicates physical blobs",
             "file import restores Go cross-backend portable fixture",
             "file import restores production Go portable fixture",
             "file import rejects oversized portable blocks before allocation",
+            "import preflights full portable envelope before mutating destination",
+            "export and import documents preserve timestamps",
+            "export and import chunk artifacts round trip with public artifact ids",
+            "export and import asset artifacts round trip with public artifact ids",
+            "export and import resolution artifacts round trip with public artifact ids",
             "portable graph conversion accepts generation-less v1 edge artifacts",
             "document batch round-trip",
+            "AFB2 manifest separates representation from snapshot mode",
+            "AFB2 manifest rejects ambiguous delta and traversal paths",
+            "AFB2 delta base binds inventory and identity to one canonical manifest",
+            "AFB2 readers fail closed on declared unsupported payload features",
+            "AFB2 trailer locates the footer without scanning payloads",
+            "AFB2 native directory round trips through staged extraction",
+            "AFB2 native delta requires and resolves the exact parent manifest",
+            "repository manifest is a complete canonical materialized inventory",
+            "repository inventory preserves logical paths while deduplicating bytes",
+            "repository manifest parsing is bounded before allocation",
+            "repository ref publication is compare and swap",
+            "incremental plan uploads only blobs absent from complete parent",
+            "repository incremental upload streams only blobs absent from exact parent",
+            "repository publishes resolves and materializes one complete deduplicated snapshot",
+            "repository epoch fences GC and active publication leases retain candidates",
+            "repository reachability fails closed while an active lease manifest is missing",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3624,6 +3653,7 @@ pub fn build(b: *std.Build) void {
     };
     const unit_progress_skip_filters = root_test_skip_filters;
     const lib_unit_default_filters = [_][]const u8{
+        "boundary dispatcher preserves local calls and maps cross-unit calls",
         "bedrock provider request helpers",
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
@@ -3655,6 +3685,12 @@ pub fn build(b: *std.Build) void {
         "managed embedder deadlines bound provider pacing and transport",
         "managed embedder dimension probe validation modes",
         "managed embedder rejects malformed provider vectors",
+        "managed embedder artifact backed embedding translation",
+        "managed embedder binds execution to catalog semantic producer identity",
+        "managed embedder reuses an executable owner for producerless artifact consumers",
+        "managed embedder catalog ownership rejects orphaned semantic producers",
+        "catalog ownership rejects duplicate executable owners and endpoint mismatches",
+        "metadata http client preserves artifact dependency conflicts",
         "managed embedder preserves coverage policy in storage config",
         "semantic query planning reuses equivalent embeddings",
         "batch parser preserves oversized value errors",
@@ -3724,6 +3760,7 @@ pub fn build(b: *std.Build) void {
         "actionable repair remains visible while retained generation stays queryable",
         "serviceable full text replacement remains queryable while rebuilding",
         "progressive embeddings readiness exposes a queryable partial generation",
+        "missing target observation preserves serving snapshot and blocks only completion",
         "create table raw parser merges default full text with quickstart embedding index",
         "create table raw parser accepts its canonical full text output",
         "table contract rejects unsupported index kinds before admission",
@@ -3734,6 +3771,14 @@ pub fn build(b: *std.Build) void {
         "table contract treats nullable nested index fields as omitted",
         "table contract preserves artifact-backed public full text indexes",
         "table contract rejects invalid inline artifact enrichments before admission",
+        "table contract normalizes public artifact enrichment request",
+        "restore admission rejects an embedding artifact catalog without an executable producer",
+        "extension lifecycle rejects artifact embedding consumers without executable producers",
+        "extension lifecycle rejects duplicate executable artifact owners",
+        "extension lifecycle requires stable identity for executable artifact owners",
+        "managed embedding catalog normalization persists stable producer identity",
+        "exact replacement protects only changed extension-owned state",
+        "authoritative catalog mutation boundaries reject orphaned semantic producers",
         "public enrichment validation rejects invalid execution and producer config",
         "provisioned primary lookup lease fails on identity namespace mismatch",
         "inference pull recognizes help before model resolution",
@@ -4093,6 +4138,12 @@ pub fn build(b: *std.Build) void {
         "api http public sort capability gate validates mapped sortable fields",
         "api http public sort capability gate fails closed for uncovered observed dynamic fields",
         "api http server create table with local writes waits for projected presence without lifecycle",
+        "api http server rejects oversized table definitions before parsing across public and MCP",
+        "api http server reports exhausted table mutation authority consistently",
+        "api http server marks every proven table mutation pre-admission failure",
+        "api http server retries only pre-admission public table drop failures",
+        "ambiguous mutation response is explicitly non-retryable",
+        "routed table mutation preserves hop budget for provably unsent request",
         "api http server create index installs exact visible config and defers lagging projection",
         "status source reports an absent linearizable read capability without failing",
         "status source rejects every partial routing capability",
@@ -4328,7 +4379,7 @@ pub fn build(b: *std.Build) void {
             "replica catalog rejects invalid backup restore authority and integrity bindings",
             "restore binding pins the authenticated native generation manifest",
             "prepared native restore repair reuses target backend admission",
-            "backup restore bootstrap deduplicates exact content across source aliases while a reader is resident",
+            "backup restore bootstrap adopts an exact imported generation while repair holds a reader",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4343,7 +4394,9 @@ pub fn build(b: *std.Build) void {
             "multi raft drainReady continues async pipeline without starving peer",
             "multi raft drainReady does not retry a no-progress frontier",
             "multi raft drainReady reserves continuations for productive groups",
+            "multi raft empty drain remains allocation free after group admission",
             "multi raft backpressure rejects async ready before cloning messages",
+            "multi raft routes outbound snapshots through snapshot transport",
         },
     });
     const run_raft_ready_continuation_tests = addFilteredTestRunArtifact(b, raft_ready_continuation_tests);
@@ -4353,6 +4406,26 @@ pub fn build(b: *std.Build) void {
         .filters = &.{ "raft integration module compiles", "raft.transport." },
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
+
+    // Snapshot artifact storage has its own root because Zig does not collect
+    // tests from the implementation behind the transport compatibility alias.
+    // Keep the target component-wide rather than naming an individual policy
+    // regression so new storage contracts are discovered automatically.
+    const raft_storage_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/raft_storage_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, raft_storage_test_mod, true, true);
+    const raft_storage_tests = b.addTest(.{
+        .root_module = raft_storage_test_mod,
+        .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_raft_storage_tests = addFilteredTestRunArtifact(b, raft_storage_tests);
 
     // Keep this as the stable behavioral suffix of the declaration rather
     // than duplicating its descriptive worker-model prefix. The exact-filter
@@ -4600,6 +4673,7 @@ pub fn build(b: *std.Build) void {
         "data runtime local group status does not open roots owned by transitions",
         "data runtime local group status provider collects and caches group statuses",
         "data runtime storage ownership fingerprint excludes transient placement progress",
+        "data runtime retries storage ownership invalidation before publishing fingerprint",
         "data descriptor factory separates bootstrap voters from transport peers",
         "data descriptor factory restores persisted voters before metadata peer discovery",
         "data runtime remote admin snapshot clone owns parser-backed slices",
@@ -4648,6 +4722,8 @@ pub fn build(b: *std.Build) void {
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
+        "remote metadata mutation failover preserves ambiguous and deterministic outcomes",
+        "remote metadata mutation discovery preserves forwarding budget for the configured leader",
         "remote metadata source retains mutation authority across cache invalidation",
         "remote metadata source installs fenced snapshot without comparing epoch domains",
         "remote metadata source rejects fenced snapshot across mutation invalidation",
@@ -4666,6 +4742,7 @@ pub fn build(b: *std.Build) void {
         "data runtime retries incomplete split provisioning projections",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "data runtime heartbeat cache cannot regress to an older full report",
+        "data runtime activity-only snapshots reuse the durable status generation",
         "idle cached runtime status stays fresh only for the published root generation",
         "runtime status disk usage cache is scoped to one root generation",
         "runtime status disk scan retries across a reallocation fence and group invalidation remains scoped",
@@ -4717,6 +4794,8 @@ pub fn build(b: *std.Build) void {
         "data server resumes HA standby replication from durable progress after restart",
         "data runtime records and backs off HA standby replication round failures",
         "data runtime HA replication HTTP budget covers base64 apply envelope",
+        "data runtime HA apply window remains bounded for control-plane liveness",
+        "data runtime HA apply window does not report caught up with pending or deferred WAL",
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
     };
@@ -4727,10 +4806,10 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        // The broad macOS ReleaseFast runtime root has measured at 11.37 GiB.
+        // The broad macOS ReleaseFast runtime root has measured at 12.12 GiB.
         // Keep normal aggregate parallelism while giving the scheduler an
         // honest reservation instead of forcing this root through -j1.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
     });
     const run_lib_data_runtime_tests = addFilteredTestRunArtifact(b, lib_data_runtime_tests);
     const lib_data_runtime_test_step = b.step("lib-data-runtime-test", "Run focused data runtime tests");
@@ -4853,7 +4932,8 @@ pub fn build(b: *std.Build) void {
             "alternating pipeline errors exhaust one durable retry budget",
             "pipeline failures retain their retry budget across replay pass reset",
             "pipeline failure replaces stale request retry identity",
-            "mixed request and pipeline failures exhaust one no-progress budget",
+            "request-owned retries do not inherit unrelated pipeline debt",
+            "idle generated coverage gap becomes durable paged recovery debt",
             "durable enrichment retry progress preserves unrelated request debt across restart",
             "ordinary startup target preserves restored retry debt",
             "enrichment terminal failure envelope remains conservative across sparse durable debt",
@@ -5416,6 +5496,7 @@ pub fn build(b: *std.Build) void {
         "managed startup catch-up uses provided indexes json without catalog fetch",
         "managed startup catch-up marks FileNotFound index open terminal degraded",
         "managed startup catch-up preserves restore repair debt while index load is terminal",
+        "managed startup catch-up defers while shared bulk ingest state is active",
         "idle startup runtime status preserves live empty cached status",
         "idle startup completion cannot downgrade a superseding live index status",
         "api http server serves table batch transforms",
@@ -5458,14 +5539,13 @@ pub fn build(b: *std.Build) void {
         "api http server rejects restore before persistence without an asynchronous worker",
         "configured api http server attaches durable restore job persistence",
         "restore job list paginates after authorization filtering",
-        "restore metadata intent topology accepts interrupted prefixes and rejects foreign ranges",
         "restore job list bounds authorization scans with an empty continuation page",
         "api http server backs up and restores a table through public routes",
         "api http server cluster overwrite restores from read-only repository without dropping live table",
         "api http server durability-pending restore preserves committed metadata",
         "api http server cluster restore rehydrates extension metadata",
         "api http server prefers metadata-owned restore over inline write-source restore",
-        "api http server retries stale metadata table-exists restore race",
+        "api http server does not retry authoritative metadata table-exists conflict",
         "api http server retries interrupted metadata restore publication",
         "public API request body limit matches Go linear merge contract",
         "api query contract parses direct JSON-pointer path aliases",
@@ -5554,6 +5634,7 @@ pub fn build(b: *std.Build) void {
         "stored term filters preserve JSON scalar kinds",
         "api http invalid filter query response names the offending node",
         "api http unsupported filter query response names the offending node",
+        "api http server drop table observes metadata absence before local cleanup",
         "public api smoke e2e creates table inserts and queries documents",
         "provisioned table write source routes batch writes across ranges",
         "public api e2e recreates managed embeddings index after corrupt artifact",
@@ -5617,7 +5698,7 @@ pub fn build(b: *std.Build) void {
         "continuous HA freezes pre-existing restore workers and resumption",
         "continuous HA allows a configured RemoteApply batch write",
         "api http server document scan requires table read permission",
-        "api http server returns retryable not leader when local reconcile lease is lost",
+        "api http server does not replay create when local reconcile lease is lost",
         "api http server returns retryable not leader when metadata proposal is dropped",
         "api http server returns retryable not leader through public table adapter mutation",
         "api http server returns retryable not leader when cluster backup read barrier times out",
@@ -5866,6 +5947,7 @@ pub fn build(b: *std.Build) void {
             "table backup cleanup removes the forwarded artifact envelope before payload",
             "cluster backup retains its fenced attempt after an ambiguous table outcome",
             "table backup retry preserves the retained ambiguous generation",
+            "table backup retry reclaims an eligible reservation and admits the new generation",
             "cluster backup attempt markers reject overlapping cleanup identities",
             "stale owned cluster backup attempt retains generation fences and retires authoritative head",
             "expired recovery preserves an oversized remote commit record",
@@ -6231,6 +6313,7 @@ pub fn build(b: *std.Build) void {
             "stable distributed transaction retry resumes a durable commit decision",
             "distributed txn retries an ambiguous coordinator decision under the same id",
             "distributed txn bounds unresolved coordinator decision retries",
+            "distributed txn propagates one absolute deadline through ambiguous decision recovery",
             "distributed txn participant fanout is bounded and concurrent",
             "distributed txn coordinator never aborts after durable commit decision",
             "distributed txn coordinator never restarts a transaction id on topology change",
@@ -6245,6 +6328,7 @@ pub fn build(b: *std.Build) void {
             "resident writer repair state distinguishes clean and metadata-pending writers",
             "api http client preserves group doc identity conflicts",
             "api http client transports txn resolve cancellation and visibility reason",
+            "resolve group routes uses one router-owned snapshot callback for fanout",
             "api http client preserves public batch retry safety classifications",
             "api http client forwards bounded raft batch routing context without allocation",
             "api http client preserves committed visibility outcomes for forwarded raft batches",
@@ -6276,7 +6360,8 @@ pub fn build(b: *std.Build) void {
             "write cache local mutation reuses live stale-generation writer",
             "write cache structural local mutation finishes auto bulk before reuse",
             "write cache local mutation preempts stale startup writer",
-            "hosted runtime status prefers live writer over stale hosted snapshot",
+            "hosted runtime status reads owner snapshot without inspecting live writer",
+            "HA seed preflight drains writer released after promotion cache clear before capture freeze",
             "runtime status collection leaves active stale write lease live",
             "resident DB lease adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
@@ -6308,15 +6393,17 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up uses provided indexes json without catalog fetch",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
+            "managed startup catch-up defers while shared bulk ingest state is active",
+            "clean generated startup inspection does not retain a resident writer",
             "table runtime snapshot cache clones stored status",
             "table runtime snapshot cache rejects a late stale live observation",
             "table runtime snapshot cache replacement preserves a newer live observation",
             "structural reconcile reconfigures retained writer before managed dense writes",
             "provisioned managed replay tails converge and publish without later traffic",
-            "provisioned runtime status overlays live writer replay target without republishing stats",
-            "provisioned runtime status live replay overlay preserves cold dense visibility refresh",
-            "provisioned runtime status live replay overlay clears ambiguous replay-only backfill",
-            "provisioned runtime status live replay overlay preserves non-replay backfill",
+            "provisioned owner publication advances exact index replay target",
+            "provisioned owner publication fills cold dense visibility",
+            "provisioned owner publication clears ambiguous replay-only backfill",
+            "provisioned owner publication preserves non-replay backfill",
             "managed source status-only open drains stale pending close before retry",
             "hosted status-only open drains stale pending close before retry",
             "write cache HA gate clear drains inactive pending closes before returning",
@@ -6521,7 +6608,11 @@ pub fn build(b: *std.Build) void {
             "derived coverage evaluation is policy exact and observation gated",
             "settled terminal enrichment debt is degraded rather than rebuilding",
             "derived coverage source totals ignore derived index fan out",
+            "dense publication target requires every expected shard observation",
             "derived coverage aggregation rejects mixed config observations",
+            "derived coverage embedding activity aggregation is order independent and phase authoritative",
+            "chunked dense completion follows the physical publication target",
+            "runtime status best effort overlay cannot clear readiness under apply contention",
             "index status exposes compact repair state without internal diagnostics",
             "index status aggregation preserves actionable repair diagnostics for the requested incarnation",
             "rebuild quarantine remains an explicit failed public index status",
@@ -6531,37 +6622,47 @@ pub fn build(b: *std.Build) void {
             "derived coverage rejects unknown freshness for aggregate and shard views",
             "cached all-skipped coverage observation is a runtime fact",
             "live writer artifact regression keeps authoritative source deletions",
+            "same owner stale serving revision cannot regress an exact incarnation",
+            "owner replacement cannot regress serving facts at the same accepted source target",
             "table runtime snapshot cache clones stored status",
             "table runtime snapshot cache batch publication is table epoch atomic",
             "table runtime snapshot cache publication fence preserves the last snapshot",
             "targeted publication fence preserves only untouched siblings during catch up",
             "targeted publication fence waits for every overlapping owner",
+            "targeted catch up hands off same incarnation serving authority",
+            "synthetic refresh cannot outrank targeted structural owner observation",
+            "synthetic refresh preserves post-fence target facts before serving handoff",
             "table runtime snapshot cache lifecycle transition replaces and fences observations",
             "table runtime snapshot cache batch preserves newer group observations",
             "runtime status cache stable absence removal retires the old table epoch",
             "partial coverage embeddings readiness counts skipped source units",
             "partial coverage embeddings readiness does not mask pending enrichment",
             "complete partial embeddings coverage is ready after active generation proof",
+            "runnable repair owns its load error without becoming a terminal aggregate failure",
             "actionable repair remains visible while retained generation stays queryable",
             "serviceable full text replacement remains queryable while rebuilding",
             "progressive embeddings readiness exposes a queryable partial generation",
+            "missing target observation preserves serving snapshot and blocks only completion",
             "stale in-place status preserves an incarnation-scoped serviceability proof",
             "identity-proven embeddings stay current during sibling startup catch-up",
-            "opening embeddings observation cannot publish cached queryability",
-            "stale embeddings observation cannot publish cached queryability",
+            "opening embeddings observation requires explicit serviceability authority",
+            "cached owner observation preserves serving authority without convergence authority",
+            "single group synthetic publication preserves owner runtime authority",
             "target-scoped stale full text observation cannot publish old readiness",
             "targeted full text sibling remains authoritative during table catch up",
             "managed embedder preserves atomic publication policy",
             "derived coverage reasons deduplicate overlapping freshness signals",
             "managed embeddings readiness ignores finalizing catch-up after rate-limit recovery",
             "single embeddings index encoder keeps retrying coverage gaps catch-up coherent",
+            "single embeddings index encoder scopes isolated enrichment failure to one index",
+            "published embeddings snapshot remains queryable after isolated source failure",
             "multi-source embedding enrichments receive a shared semantic producer identity",
             "source readiness isolates terminal enrichment failures",
             "source readiness distinguishes durable repair debt from runtime enrichment failure",
             "managed embeddings skipped terminal sources complete backfill without fabricating replay debt",
             "repair-free embeddings aggregate retains live dense catch-up",
             "serviceable repair preserves sibling shard dense catch-up fallback",
-            "serviceable repair cannot mask sibling shard serving failures",
+            "serviceable repair cannot mask sibling shard load failure",
             "index encoders preserve sibling replay debt during serviceable repair",
             "enrichment aggregation preserves telemetry and fences mixed checkpoint identity",
             "table storage status indexes one distributed snapshot by table and owner",
@@ -6606,6 +6707,7 @@ pub fn build(b: *std.Build) void {
             "provisioned writer cache starts DB workers after stable entry installation",
             "table write source restore acquires lifecycle unless caller reserves it",
             "provisioned native backup restore repeats through shared read and write owners",
+            "native backup coordinator quiescence retry is bounded",
             "native backup reclaims crash-left snapshot attempts from durable markers",
             "native backup reclaims a crash marker before snapshot root creation",
             "native backup never reclaims an old attempt with a live lease",
@@ -6614,7 +6716,8 @@ pub fn build(b: *std.Build) void {
             "provisioned create reuses a generation opened by startup reconciliation",
             "provisioned owner clone snapshot preserves retired runtime counters",
             "provisioned create installs managed enrichment despite a matching stale fingerprint",
-            "runtime status refreshes aged live writer publications",
+            "provisioned create index enqueues target-fenced cached-writer activation",
+            "cached runtime status is independent of writer lock and target observation",
             "provisioned table write source runtime status serves cached snapshot during active same-table work",
             "provisioned table write source runtime status still serves unrelated table snapshot while source mutex is busy",
             "provisioned table write source best effort publish does not advertise lock contention as an empty table",
@@ -6623,13 +6726,28 @@ pub fn build(b: *std.Build) void {
             "provisioned table restore retry repairs exact incomplete restore state through active writer",
             "provisioned table restore preparation blocks writes and competing structural mutation",
             "provisioned table restore preparation blocks writes while allowing reads",
+            "resident group write releases queued reads before remote completion",
             "provisioned table transition activity excludes writers but preserves reads",
             "provisioned table transition waiter queues ahead of later writers",
             "provisioned table transition waiter queues ahead of later readers",
             "provisioned table write source read request permits replicated apply activity",
             "provisioned table group operation waiter queues ahead of later readers",
             "provisioned table write source drop table cancels index repair before structural admission",
+            "dropped table quarantine path keeps valid API names in one portable component",
+            "malformed recovery intent is durably removed from the active queue and counted",
+            "transient recovery intent read failure retains active work and retries successfully",
+            "dropped table recovery drains a wake coalesced during the active scan",
+            "dropped table recovery watchdog repairs a failed durable enqueue",
+            "provisioned table drop persists cleanup intent before filesystem failure and recovers after restart",
+            "provisioned table drop retains repair intent until catalog ownership clears",
+            "replica retirement journal distinguishes active retained and committed removal",
+            "replica retirement journal batches preserve every group phase",
+            "replica retirement batch identity is canonical and rejects duplicate groups",
+            "replica retirement recovery discards a legacy orphan whose catalog removal aborted",
+            "hosted source publication recovers durable dropped-table intent",
+            "hosted background writes carry the selected catalog fence through routed Raft admission",
             "provisioned table write source drop table retires old publication authority",
+            "provisioned table write source drop table does not hold local db mutex during background delete",
             "provisioned table write request queues structural reconcile ahead of later writes",
             "structural reconcile reservation defers metadata group refresh without blocking admitted work",
             "queued structural reconcile reserves write admission before its worker starts",
@@ -6638,6 +6756,9 @@ pub fn build(b: *std.Build) void {
             "targeted repair visibility edge preserves exact sibling cache authority",
             "unrelated repair visibility edge invalidates during targeted reconciliation",
             "repair edge after target authority release fails closed",
+            "initial build edge after target authority release preserves runtime observation",
+            "fenced blocking status publication preserves accepted serving snapshot",
+            "ownerless blocking publication preserves serving facts and fences convergence",
             "targeted index cache update retains the published sibling snapshot through handoff",
             "index reconciliation request enqueues a catalog-deleted target without create admission",
             "structural reconcile retry backoff is bounded",
@@ -6649,6 +6770,7 @@ pub fn build(b: *std.Build) void {
             "structural repair handoff keeps status fenced through final shard visibility",
             "repair handoff status settles after authoritative cached publication",
             "live repair final audit excludes concurrent group mutation through publication",
+            "live repair validates resident writer against current catalog not queued metadata",
             "terminal repair publication settles handoff or retains one fenced retry",
             "managed create publication handoff releases on converged owner publication",
             "managed dense publication handoff releases when its incarnation is superseded",
@@ -6661,10 +6783,13 @@ pub fn build(b: *std.Build) void {
             "structural reconcile production catalog fails closed without table publication fence",
             "structural reconcile fences incarnation initialization and discards empty topology",
             "provisioned structural reconcile blocks table write admission",
+            "provisioned source quiesce closes cleanup admission and drains accepted owner jobs",
             "provisioned schema reconcile keeps reads and status available",
             "busy startup open preserves fresh writer runtime status",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
+            "managed startup catch-up defers while shared bulk ingest state is active",
+            "clean generated startup inspection does not retain a resident writer",
             "managed startup catch-up allocation failure preserves bounded retry",
             "managed startup catch-up quarantines repeated zero progress with bounded backoff",
             "standby HA replay reconciles managed indexes without opening the public write gate",
@@ -6672,9 +6797,11 @@ pub fn build(b: *std.Build) void {
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
             "managed structural catch-up leaves pending enrichment with the asynchronous owner",
             "managed structural catch-up does not delegate an empty producer handoff",
+            "standalone managed structural catch-up owns admitted enrichment progress",
             "managed catch-up reaches durable generation repair when dense replay needs an artifact rebuild",
             "managed create publication handoff ignores unrelated index debt",
             "db managed vector admission captures writes while durable repair is pending",
+            "db managed repair scheduler defers canonical worker until shadow activation",
             "index repair inspection window is bounded and rotates fairly",
             "resident index repair scheduler skips deferred prefixes with bounded fair quanta",
             "resident index repair scheduler maintains exact aggregate wake precedence",
@@ -6687,6 +6814,7 @@ pub fn build(b: *std.Build) void {
             "db failed activated dense generation rolls back to retained predecessor",
             "repair admission revisions stay fail closed and reject delayed publishers",
             "db progressive managed admission serves a checkpointed partial generation",
+            "db completed managed admission emits an initial build clear edge",
             "db removing one repair pin preserves pressure gate for another index",
             "db dense replay failure upgrades a preflight validation intent",
             "db durable repair classification emits exact admission and action edges",
@@ -6702,10 +6830,15 @@ pub fn build(b: *std.Build) void {
             "managed repair visibility edges retire cached readers and runtime status",
             "repair visibility progress does not churn readers without an admission edge",
             "table runtime snapshot cache invalidation fences a stale observed publisher",
+            "targeted structural publication cannot regress an untouched sibling generation",
             "runtime status hook orders completed observation without crossing invalidation",
+            "provisioned owner publication advances exact index replay target",
             "structural repair publication advances the table lifecycle epoch",
             "targeted repair publication preserves sibling authority fence",
+            "status publication fence does not suppress structural work re-drive",
             "table runtime snapshot cache live publication does not starve structural refresh",
+            "runtime owner retirement preserves serving snapshot and fences convergence",
+            "synthetic refresh preserves post-fence target facts before serving handoff",
             "table runtime snapshot cache preserves live completion over regressing persisted projection",
             "catching up observation preserves same-incarnation published visibility",
             "catching up observation cannot preserve a same-config replacement incarnation",
@@ -6725,11 +6858,14 @@ pub fn build(b: *std.Build) void {
             "forwarded write sources use the local writer owner dirty lifecycle",
             "HA ownership transition invalidates cached visibility and dirty identities",
             "HA ownership transition serializes with active writer cache mutation",
+            "HA seed request admission drains accepted writes and closes the preflight race",
             "startup cache clear retires dirty identity without a serving owner",
             "dirty auto bulk writer publishes runtime status without closing the cached writer",
             "split transition auto bulk publication retries while a writer lease is active",
             "median key lookup reuses startup writer instead of reopening its root",
             "write cache retirement is allocation-free after entry installation",
+            "provider shutdown barrier closes cached dbs and remains idempotent",
+            "provider shutdown barrier joins an in-flight generated embedding call",
             "writer cache metric pin batch release compacts retired entries once",
             "writer cache bulk transition fences only its table",
             "db runtime relabel cannot reuse cached index serviceability",
@@ -6744,6 +6880,11 @@ pub fn build(b: *std.Build) void {
             "generation publication marker parsing preserves allocator exhaustion",
             "manual generation runtime uses an explicit filesystem io authority",
         },
+        // This intentionally broad lifecycle root compiles the storage,
+        // provider, and public-write surfaces together and peaks near 10.6
+        // GiB on macOS. The claim is scheduler capacity, not a product runtime
+        // budget; Linux retains the measured aggregate default.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_api_table_writes_production_regression_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
     const run_api_table_writes_production_regression_unit_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
@@ -6882,12 +7023,31 @@ pub fn build(b: *std.Build) void {
         .root_module = api_backup_restore_test_mod,
         .filters = &.{
             "public api standalone-like e2e backs up drops and restores a table",
+            "public table backup handler exposes non-retryable fenced outcomes",
             "api restore rollback preserves a concurrently replaced table definition",
             "api http server cluster overwrite restores from read-only repository without dropping live table",
             "api http server rejects an empty cluster backup without publishing a manifest",
             "backup manifest validation rejects ambiguous or unbound artifacts",
+            "canonical repository file adapter streams blobs and compare-and-swaps refs",
+            "remote repository coordinator fences a resumed stale owner",
+            "repository remote verification accepts only full-object SHA-256 proofs",
+            "backup manifest cancellation prevents late publication",
+            "backup root publication cancellation leaves no visible control record",
+            "unpublished table cleanup retains its retry address until writer state retires",
+            "unpublished table cleanup preserves its reservation on writer owner mismatch",
+            "unpublished table cleanup exposes bounded resumable progress",
+            "stale table reclaim reports a concurrently replaced generation",
+            "stale table reclaim honors cancellation before storage mutation",
+            "table backup collision commit check is bounded and exact",
+            "standalone stale reclaim bounds foreground native artifact deletion",
+            "table backup retry preserves the retained ambiguous generation",
+            "table backup retry reclaims an eligible reservation and admits the new generation",
+            "table backup lease conflict retains the retry address and live writer fence",
+            "backup maintenance target coalesces exact table reclaim intent",
+            "table backup reclaim retry uses exact future eligibility",
             "cluster backup manifest rejects incomplete coverage",
             "restore source identities are bounded and canonical",
+            "filesystem backup location returns the canonical authorized identity",
             "portable backup integrity rejects changed staged bytes",
             "native artifact copy observes cancellation between io chunks",
             "native backup directory copy preserves nested files",
@@ -6926,10 +7086,30 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "metadata service ",
+            "cdc work permit ",
             "metadata proposal receipt ",
+            "metadata reconciliation plan uses one terminal receipt for ordered apply",
+            "table workflow cancellation stops before reconciliation lease work",
             "table workflow can drive real metadata service topology and split setup",
             "table workflow can drive placement intents through the real metadata control loop",
             "metadata http service catalog cache is independent from volatile projection traffic",
+            "metadata.table mutation routing forwards only to a routable remote leader",
+            "metadata http client forwards table create and drop to the internal route",
+            "metadata http client rejects invalid forwarded table names before I/O",
+            "metadata http client surfaces typed rejection for forwarded table mutations only with non-admission proof",
+            "metadata http client preserves transport ambiguity for forwarded table mutations",
+            "metadata http client preserves extension ownership across forwarding",
+            "metadata http client preserves unrecognized server outcomes for forwarded table mutations",
+            "metadata http client does not replay unmarked table mutation rejection proof",
+            "metadata http client round-trips server endpoints",
+            "routed table mutation",
+            "forwarded create body limit",
+            "table mutation names preserve the public contract",
+            "stored create table encoding",
+            "raft mutation ",
+            "table topology mutation ",
+            "metadata http server preserves extension-owned table drop conflicts",
+            "extension lifecycle proposal",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -7330,7 +7510,9 @@ pub fn build(b: *std.Build) void {
     const lib_template_tests = b.addTest(.{
         .root_module = template_test_mod,
     });
-    const run_lib_template_tests = b.addRunArtifact(lib_template_tests);
+    // template_remote imports Antfly runtime ABI tests, whose intentional
+    // error paths use the repository runner's expected-log accounting.
+    const run_lib_template_tests = addAntflyTestRunArtifact(b, lib_template_tests);
     const lib_template_test_step = b.step("lib-template-test", "Run template rendering tests");
     lib_template_test_step.dependOn(&run_lib_template_tests.step);
 
@@ -7478,6 +7660,7 @@ pub fn build(b: *std.Build) void {
             "standalone runtime parses experimental flag",
             "standalone runtime antfarm path guards keep api routes reserved",
             "standalone startup checkpoint readiness requires applied and safe-read progress",
+            "standalone activated seed bootstraps exact standby checkpoint and rejects older progress",
             "parse cli accepts config path",
             "parse cli accepts secret store path",
             "parse cli accepts ARD identity flags",
@@ -7485,6 +7668,7 @@ pub fn build(b: *std.Build) void {
             "parse cli preserves registry variants and recognizes explicit preload backends",
             "parse cli accepts HA primary runtime flags",
             "parse cli accepts HA primary sync policy flags",
+            "promoted HA primary retains exact predecessor startup provenance",
             "parse cli accepts HA standby runtime flags",
             "standalone HA standby replication flags require upstream and slot",
             "standalone HA string classifier distinguishes missing padded and valid values",
@@ -7515,6 +7699,7 @@ pub fn build(b: *std.Build) void {
             "standalone linked inference ABI validates the supported function-table prefix",
             "linked inference ABI rejects mismatched context and function-table prefixes",
             "standalone local inference lifetime distinguishes deadline from upstream cancellation",
+            "embedded provider lifetime rejects new calls and joins admitted calls",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",
@@ -7527,6 +7712,7 @@ pub fn build(b: *std.Build) void {
             "standalone metadata rejects corrupt catalog without double-freeing owned paths",
             "standalone metadata finalizes schema migration from resident runtime evidence",
             "standalone unified server lifecycle propagates startup failure",
+            "runtime lease watchdog publishes active self-fenced proof from exact expired lease",
             "runtime lease watchdog fetch and validation failures publish no bootstrap capability",
             "runtime lease watchdog retains a bounded Kubernetes response budget",
             "runtime lease watchdog prefers a DNS-verified Kubernetes API host and retains the injected port",
@@ -7550,6 +7736,7 @@ pub fn build(b: *std.Build) void {
     raft_test_step.dependOn(&run_raft_restore_tests.step);
     raft_test_step.dependOn(&run_raft_library_tests.step);
     raft_test_step.dependOn(&run_raft_ready_continuation_tests.step);
+    raft_test_step.dependOn(&run_raft_storage_tests.step);
 
     const raft_runtime_test_step = b.step("raft-runtime-test", "Run focused managed Raft runtime tests");
     raft_runtime_test_step.dependOn(&run_raft_runtime_tests.step);
@@ -7560,6 +7747,9 @@ pub fn build(b: *std.Build) void {
 
     const raft_transport_test_step = b.step("raft-transport-test", "Run raft transport unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
+
+    const raft_storage_test_step = b.step("raft-storage-test", "Run Raft snapshot artifact storage tests");
+    raft_storage_test_step.dependOn(&run_raft_storage_tests.step);
 
     unit_test_step.dependOn(&run_lib_regex_tests.step);
     unit_test_step.dependOn(&run_raft_library_tests.step);
@@ -7876,6 +8066,7 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_matcher", matcher_mod);
     index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
+    index_manager_test_mod.addImport("antfly-json", json_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     index_manager_test_mod.addImport("antfly_reader_config", reader_config_mod);
     index_manager_test_mod.addImport("structlog", structlog_mod);
@@ -8497,7 +8688,10 @@ pub fn build(b: *std.Build) void {
             "storage.backend_erased.",
             "storage.backend_types.",
             "storage.background_runtime.",
+            "storage.backup_bundle.",
+            "storage.backup_bundle_io.",
             "storage.backup_codec.",
+            "storage.backup_repository.",
             "storage.coverage_identity.",
             "storage.derived_log_test_root.",
             "storage.docstore.",
@@ -10982,16 +11176,25 @@ pub fn build(b: *std.Build) void {
                 // automatically schedules only the subset that fits.
                 // aarch64-macOS ReleaseFast codegen reached 9.95 GB with
                 // platform frameworks. Linux ARM64 reached 4.99 GB in the
-                // v0.2.1-rc0 release build, so reserve 6 GiB rather than
-                // forcing the scheduler to discard a completed 4 GiB claim.
-                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 6) * 1024 * 1024 * 1024,
-                // Before the serverless split, clean aarch64-macOS ReleaseFast
-                // storage codegen reached 17.42 GB (16.23 GiB). Keep the old
-                // conservative reservations until both release runners have
-                // measured the smaller storage-only closure.
-                .distributed => @as(usize, if (target.result.os.tag == .macos) 18 else 8) * 1024 * 1024 * 1024,
+                // v0.2.1-rc0 release build, while the integrated HA API kernel
+                // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
+                // build. Reserve 10 GiB so the scheduler serializes competing
+                // roots instead of discarding a successful production build.
+                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
+                // Clean aarch64-macOS ReleaseFast storage codegen reached
+                // 17.42 GB (16.23 GiB) with the platform frameworks enabled.
+                // A clean native aarch64-linux-musl production container build
+                // reached 19.89 GB (18.52 GiB) for the current production
+                // graph. Reserve 20 GiB on Linux so Zig's scheduler does
+                // not discard a successfully compiled production artifact.
+                // Use the same Linux-target claim for native and cross builds;
+                // the target artifact determines the dominant codegen shape.
+                .distributed => @as(usize, if (target.result.os.tag == .macos)
+                    18
+                else
+                    20) * 1024 * 1024 * 1024,
                 // This is deliberately a separate non-PIC product unit. The
-                // Its cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
+                // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
                 // the 10 GiB reservation keeps it serialized with the macOS
                 // storage kernel until both release runners confirm that.
                 .serverless => 10 * 1024 * 1024 * 1024,

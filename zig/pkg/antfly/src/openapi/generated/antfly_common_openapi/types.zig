@@ -139,6 +139,34 @@ pub const AwsCredentialConfig = struct {
     }
 };
 
+/// Operator-owned limits for backup execution.
+pub const BackupConfig = struct {
+    /// End-to-end ceiling for one table or cluster backup. Increase this for exceptionally large datasets; cleanup fencing remains independent.
+    operation_timeout_seconds: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "operation_timeout_seconds", "operation_timeout_seconds", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.operation_timeout_seconds) |value| {
+            try jw.objectField("operation_timeout_seconds");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const CdcConnectionConfig = struct {
     /// CDC provider type. Initially postgres.
     provider: []const u8,
@@ -264,6 +292,7 @@ pub const Config = struct {
     admission: ?AdmissionConfig = null,
     graph_execution: ?GraphExecutionConfig = null,
     mcp: ?McpConfig = null,
+    backup: ?BackupConfig = null,
     storage: ?StorageConfig = null,
     transaction_sessions: ?TransactionSessionConfig = null,
     metadata: ?MetadataInfo = null,
@@ -319,6 +348,7 @@ pub const Config = struct {
         .{ "admission", "admission", true },
         .{ "graph_execution", "graph_execution", true },
         .{ "mcp", "mcp", true },
+        .{ "backup", "backup", true },
         .{ "storage", "storage", true },
         .{ "transaction_sessions", "transaction_sessions", true },
         .{ "metadata", "metadata", true },
@@ -386,6 +416,10 @@ pub const Config = struct {
         }
         if (self.mcp) |value| {
             try jw.objectField("mcp");
+            try jw.write(value);
+        }
+        if (self.backup) |value| {
+            try jw.objectField("backup");
             try jw.write(value);
         }
         if (self.storage) |value| {

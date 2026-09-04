@@ -126,11 +126,195 @@ code and applies bounded replay windows through a shared derived-index policy.
 Dense keeps its HBC-specific begin/finish implementation, but bounded catch-up
 scheduling is no longer dense-only.
 
+Generated replay also bounds source preparation separately from its larger
+derived-record window. By default it prepares at most 64 deferred provider
+requests, executes full provider batches, publishes that partial output
+durably, and releases the request/chunk caches before inspecting more source
+documents. `ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS` can tune this quantum.
+The separate bound keeps provider batching efficient while making memory and
+time to the first queryable publication independent of corpus size. On restart,
+a clean partial publication remains searchable from its incarnation-scoped
+physical publication certificate; the live artifact target may already be
+ahead without invalidating that last safe snapshot. An interrupted unpublished
+window is replayed idempotently and exposes fresh preparation activity rather
+than blocking startup on a corpus or posting-tree scan.
+
+Each durably published preparation window also advances a replay cursor keyed
+by `(base applied sequence, source sequence, document key)`. The base fence
+prevents a cursor from crossing a rewind or later replay epoch. On restart the
+worker resumes after the exact last published document instead of replaying the
+beginning of a large ingestion batch; a missing, stale, or corrupt cursor is
+discarded and safely repeats work from the authoritative applied sequence.
+
+Lazy HBC posting centroid and quantized-payload freshness is a separate,
+bounded maintenance concern. Dirty posting caches remain exactly searchable by
+falling back to member scoring/recomputation and drain through the background
+maintenance lane. They must be observable in diagnostics, but must not become
+readiness blockers, startup rebuild intents, or repair admission gates. Actual
+generation corruption and incomplete physical publication remain fail-closed.
+
 It also separates dense bulk-session deferral from non-dense executor progress.
 When an external dense bulk session is open, weak sync levels defer dense worker
 notification but still wake full-text, sparse, graph, and enrichment-derived
 workers. `.full_text` remains target-specific and does not wait behind dense
 bulk work.
+
+### Embeddings Lifecycle Status
+
+Managed embeddings expose three independent status dimensions. They must not be
+collapsed into one generic progress percentage:
+
+- Serving authority is incarnation-scoped and comes from the immutable
+  published snapshot used by query admission. It alone determines
+  `milestones.queryable`.
+- Convergence authority proves that coverage and publication targets were
+  observed after the latest accepted table target. A commit clears that proof;
+  the runtime owner restores it in its next atomic status publication. A
+  cache-local monotonic target revision prevents an observation captured before
+  the commit from racing in afterward and restoring the proof.
+- Activity freshness describes only whether the current owner heartbeat is
+  recent. Losing it sets `activity` to `null` without changing serving or
+  convergence facts.
+
+- `source_coverage` is generation-scoped durable outcome accounting. `total` is
+  the source-document population; every source is exactly one of `pending`,
+  `covered`, `skipped`, or `failed` once the observation is complete. A missing
+  generated artifact remains `pending` until the enrichment worker records a
+  terminal produced, intentional-skip, or non-retryable-failure decision.
+- `searchable_vectors` is the number of physical dense or sparse entries in the
+  query-visible publication. It can exceed source coverage when one source
+  produces multiple chunks, and it may lag generated work until publication.
+- Dense status exposes `publication.target_vectors` as the durable physical
+  target for the current incarnation and `publication.searchable_vectors` as
+  the visible count; `publication.complete` requires exact equality. The
+  object is absent for sparse indexes or when its distributed proof is
+  unavailable, so completion fails closed without a scan on the status path.
+- `activity` is volatile, per-index and per-incarnation work telemetry:
+  `chunks_created`, `embedding_batches_completed`, `embeddings_computed`,
+  `active_batch_size`, and `last_progress_at`. Its opaque `epoch` changes when
+  the worker process or index incarnation changes. Rates are meaningful only
+  between samples carrying the same epoch. The `waiting_retry` phase means the
+  enrichment supervisor owns a scheduled retry for that exact index; a failed
+  synchronous request or an unscheduled provider error does not imply it.
+  `activity` is `null` when no current-incarnation owner heartbeat exists; an
+  absent observation is never synthesized as idle or embedding.
+
+Readiness is expressed as explicit `queryable` and `complete` milestones with
+milestone-specific blockers. Only durable coverage, publication, repair,
+incarnation, topology, and failure facts participate in those milestones.
+Activity explains why counters are moving; it never proves readiness or
+failure, and losing volatile activity state on restart must not make an index
+less queryable.
+
+A terminal failure for one source is coverage health, not query-admission
+failure. It can prevent `complete` under the configured coverage policy, but an
+exact, already published snapshot remains queryable and can satisfy a
+`searchable-artifacts` threshold. Only an incarnation-wide runtime/load failure
+or a query-blocking repair fence revokes that serving proof.
+
+Status HTTP reads clone the immutable cache and never inspect the resident DB
+or acquire its writer-cache mutex. While convergence is awaiting the next owner
+publication, the last safe incarnation and counts remain visible and
+queryable; `complete` is blocked by `target_observation` in addition to any
+coverage/publication debt.
+
+Initial materialization and corruption recovery share a crash-resumable,
+bounded generation scheduler, but remain distinct durable work classes. A
+normal initial build is exposed through backfill, coverage, publication, and
+activity; it must not manufacture `repair` or `ArtifactRepairRequired`
+diagnostics. Those are reserved for damaged or operator-rebuilt generations.
+Before the first safe publication, query admission still fails closed.
+
+Plain dense embedding backoff is scoped to the exact provider/config work key.
+A retryable failure yields that key for the current quantum while independent
+index keys continue and publish their successful artifacts. The durable source
+prefix does not advance past the failed request, so replay retries it after
+bounded backoff without losing ordering, idempotence, or crash recovery. This
+prevents one throttled embeddings index from head-of-line blocking live
+activation of another index in the same group.
+
+Live index activation is a control-plane handoff, not a request to drain the
+current corpus window. Once consensus commits the definition, a provisioned
+request acknowledges an incarnation-fenced activation job; it never joins an
+in-flight inference call. That job owns its repair-scheduler cancellation lease
+from enqueue through final runtime acknowledgement. Leases are reference-counted
+per group so overlapping activations cannot release one another. The repair
+scheduler checks the lease before opening the resident writer, retains its
+durable cursor, and resumes after activation releases the lease. Remote template
+HTTP/S3 fetches and embedding transports also receive cooperative cancellation,
+while native model kernels observe it at safe operation boundaries rather than
+being unsafely preempted. Runtime shutdown closes admission first and then
+drains the authoritative single-flight replay owner before destroying provider
+or allocator state; a non-preemptible native kernel may therefore delay
+teardown, but can never outlive it. The structural owner installs the new
+producer runtime paused, commits the exact index incarnation and durable build intent,
+then starts that replacement once. This makes API latency independent of corpus
+size and native or remote inference latency, avoids starting and immediately
+stopping a replacement worker, and preserves any previously published serving
+generation while the new incarnation begins backfill. Embedded/manual owners
+without a background activation lane retain their synchronous installation
+contract.
+
+`index wait` exposes outcome predicates instead of treating the internal
+`queryable` safety milestone as proof that useful results exist. It prints
+`source_coverage`, `publication`, `searchable_vectors`, and optional activity/chunk counters; it does not emit a
+generic `progress` percentage that could read as complete while publication is
+still pending. Blockers are labeled for the milestone they gate
+(`queryable_blockers` or `complete_blockers`). `--until searchable-artifacts=N`
+normalizes each index type's published result-bearing unit (vectors/chunks for
+embeddings and query-visible documents for document indexes), and requires
+query admission for the same incarnation. `--until source-covered=N%` uses
+covered source documents only; skipped outcomes never inflate the percentage.
+When dense publication exposes an exact target, the coverage threshold also
+waits for that target to be query-visible.
+
+The work owner, rather than coverage debt, controls the activity phase:
+claim/preparation sets `preparing`, a provider batch sets `embedding`, durable
+artifact publication sets `publishing`, a supervised retry sets
+`waiting_retry`, and releasing the last owned operation sets `idle`. Aggregation
+uses `waiting_retry > embedding > publishing > preparing > idle` only across
+observed owners. Each observation's reported phase is authoritative and is
+reduced independently of its counters, so an active batch on one shard cannot
+mask a retry owned by another. Counters sum, timestamps take the maximum, and
+rates require a stable epoch.
+
+Activity heartbeat protocol v2 is separate from durable runtime status. Each
+owner report and each per-index sample has its own monotonic sequence, while
+durable status generation advances only when a durable fact changes. Data nodes
+coalesce counter updates to at most once per second while reporting phase edges
+promptly. The metadata leader keeps matching store/index-incarnation
+observations for 90 seconds. A cached liveness heartbeat carries no activity
+observation and therefore cannot refresh that TTL. Independent report and
+sample fences reject reordered activity-only reports even though they
+intentionally do not advance durable Raft state;
+the local DB status adapter applies the same retention rule, so one contended
+best-effort sample cannot erase a fresh owner observation in standalone mode.
+Retained local samples are not forwarded as fresh observations and therefore
+cannot extend the metadata cache's TTL.
+An authoritative owner/incarnation change clears immediately, and leadership
+changes still make activity temporarily unavailable without changing
+readiness. Shared enrichment
+producers may fan one completed batch out to every exact consumer index, but
+activity from an unrelated index, table, or stale incarnation must never be
+attributed to the requested index.
+
+Coverage decisions are committed by the component that owns the terminal
+result. Synchronous precompute records its produced/skipped/failed decision in
+the same primary transaction as the document and artifacts. For a materialized
+source chain, absence is not terminal: precompute consumes the work only when
+the upstream manifest proves intentional no-output or permanent failure;
+otherwise the request remains durable replay debt. This prevents an unfinished
+upstream producer from being projected as `skipped` and makes `full_index` an
+exact coverage fence.
+
+The durable runtime-status codec has two negotiated profiles, not a numeric
+feature ladder. It reads and writes the exact v12 profile released by v0.2.0,
+and reads and writes current v15. Every other numeric version is an unreleased
+development artifact and is rejected. Reporter fences, repair state,
+artifact-source replay/failure facts, native-generation restore identity, and
+the group convergence-authority watermark form one mandatory v15 admission-
+safety profile and wait until every current metadata voter supports v15.
+Activity never enters that codec.
 
 ## Full-Text Routing From Enrichments
 
@@ -560,6 +744,22 @@ The first migration slice implemented here is narrower:
 This keeps replay bounded to stable identities and removes the previous
 "second payload store" behavior for generated chunk/dense/sparse work.
 
+The reconstructed request carries an explicit embedding input contract:
+`document`, `inline_chunks`, or `materialized_chunks`. The catalog planner owns
+that classification because it can distinguish an embedding output name from a
+registered chunk producer and a durable upstream artifact. Runtime, retry, and
+precompute paths must not infer chunk semantics from a non-empty
+`artifact_name`; that field names an output for document embeddings and an
+input for chunk-backed embeddings.
+
+Managed index admission also keeps corpus discovery out of the structural DDL
+critical section. A durable repair intent pages the primary document range,
+appends generated replay debt, and checkpoints a separate source-replay cursor
+after each bounded page. Its final replay target is the producer fence before
+the artifact-scoped shadow build begins. A crash may repeat an idempotent page,
+but cannot skip source rows; an exact page-sized corpus may require one final
+empty page to certify completion.
+
 Tradeoff in this migration slice:
 
 - replay reconstruction uses the current catalog, not a historical snapshot of
@@ -732,7 +932,8 @@ The production shape is a per-table checkpoint file beside the table store:
 - maintain the latest watermarks in memory for live status and sync waits
 - coalesce pending updates by index name
 - periodically or forcefully write a complete checkpoint file containing only
-  the latest sequence per derived consumer
+  the latest sequence, incarnation/config identity, lifecycle status, and any
+  physical publication certificate per derived consumer
 - write to a temp file, fsync the file, then atomically rename it over the old
   checkpoint
 - on open, read the checkpoint file and fall back to the legacy LSM metadata row
@@ -747,8 +948,10 @@ O(number of documents, vectors, postings, or LSM tables).
 
 The checkpoint file must remain outside the index durability contract. It may
 only advance after the owning index has durably published the corresponding
-state. Losing the latest checkpoint can increase restart replay; it must never
-cause replay to skip unpublished index work.
+state. A physical certificate is valid only at that exact sequence and
+incarnation; advancing either without a replacement certificate clears it.
+Losing the latest checkpoint can increase restart replay; it must never cause
+replay to skip unpublished index work.
 
 Stronger sync levels still wait for derived visibility through the derived
 runtime, but the index kind remains responsible for making its own state

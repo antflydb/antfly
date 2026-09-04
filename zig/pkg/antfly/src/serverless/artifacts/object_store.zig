@@ -853,12 +853,12 @@ test "serverless objectstore verification caches immutable provider identities" 
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn bucketExists(ptr: *anyopaque, bucket: []const u8) !bool {
-            return try from(ptr).inner.bucketExists(bucket);
+        fn bucketExists(ptr: *anyopaque, bucket: []const u8, options: objectstore.BucketOptions) !bool {
+            return try from(ptr).inner.bucketExistsWithOptions(bucket, options);
         }
 
-        fn makeBucket(ptr: *anyopaque, bucket: []const u8) !void {
-            try from(ptr).inner.makeBucket(bucket);
+        fn makeBucket(ptr: *anyopaque, bucket: []const u8, options: objectstore.BucketOptions) !void {
+            try from(ptr).inner.makeBucketWithOptions(bucket, options);
         }
 
         fn putObject(ptr: *anyopaque, _: std.mem.Allocator, bucket: []const u8, key: []const u8, body: []const u8, options: objectstore.PutOptions) !objectstore.PutResult {

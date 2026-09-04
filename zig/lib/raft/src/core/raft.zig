@@ -78,6 +78,46 @@ pub const Config = struct {
     read_only_option: types.ReadOnlyOption = .safe,
     logger: ?logger_mod.Logger = null,
     trace_logger: ?logger_mod.TraceLogger = null,
+
+    /// Performs every deterministic admission check without consulting
+    /// storage or allocating. Callers that publish durable desired state must
+    /// run this before the catalog write so invalid configuration can never
+    /// become permanent reconciliation debt.
+    pub fn withNormalizedDefaults(self: Config) Config {
+        var effective = self;
+        if (effective.max_committed_size_per_ready == 0)
+            effective.max_committed_size_per_ready = effective.max_size_per_msg;
+        if (effective.max_uncommitted_entries_size == 0)
+            effective.max_uncommitted_entries_size = std.math.maxInt(usize);
+        if (effective.max_inflight_bytes == 0)
+            effective.max_inflight_bytes = std.math.maxInt(usize);
+        return effective;
+    }
+
+    pub fn validate(self: Config) !void {
+        const normalized = self.withNormalizedDefaults();
+
+        if (normalized.id == 0) return error.InvalidNodeId;
+        if (message.isLocalStorageThread(normalized.id)) return error.InvalidLocalNodeId;
+        if (normalized.heartbeat_tick == 0) return error.InvalidHeartbeatTick;
+        if (normalized.election_tick <= normalized.heartbeat_tick) return error.InvalidElectionTick;
+        if (normalized.peers.len == 0) return error.EmptyPeerSet;
+        if (normalized.max_inflight_msgs == 0) return error.InvalidMaxInflightMsgs;
+        if (normalized.max_inflight_bytes < normalized.max_size_per_msg)
+            return error.InvalidMaxInflightBytes;
+        if (normalized.read_only_option == .lease_based and !normalized.check_quorum)
+            return error.LeaseBasedReadRequiresCheckQuorum;
+
+        var local_found = false;
+        for (normalized.peers, 0..) |peer, index| {
+            if (peer == 0 or message.isLocalStorageThread(peer)) return error.InvalidPeerNodeId;
+            if (peer == normalized.id) local_found = true;
+            for (normalized.peers[0..index]) |previous| {
+                if (peer == previous) return error.DuplicatePeerNodeId;
+            }
+        }
+        if (!local_found) return error.LocalNodeNotInPeerSet;
+    }
 };
 
 pub const Raft = struct {
@@ -105,6 +145,7 @@ pub const Raft = struct {
     conf_state: types.ConfState,
     pending_snapshot: ?types.Snapshot = null,
     snapshot_in_progress: bool = false,
+    next_snapshot_attempt_generation: u64 = 1,
     uncommitted_size: usize = 0,
     read_sequence: u64 = 0,
     pending_reads: std.ArrayListUnmanaged(PendingRead) = .empty,
@@ -112,36 +153,15 @@ pub const Raft = struct {
     messages: std.ArrayListUnmanaged(message.Message) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, cfg: Config, storage: storage_mod.Storage) !Raft {
-        var normalized_cfg = cfg;
-        if (normalized_cfg.id == 0) return error.InvalidNodeId;
-        if (message.isLocalStorageThread(normalized_cfg.id)) return error.InvalidLocalNodeId;
-        if (normalized_cfg.heartbeat_tick == 0) return error.InvalidHeartbeatTick;
-        if (normalized_cfg.election_tick <= normalized_cfg.heartbeat_tick) return error.InvalidElectionTick;
-        if (normalized_cfg.max_committed_size_per_ready == 0) {
-            normalized_cfg.max_committed_size_per_ready = normalized_cfg.max_size_per_msg;
-        }
-        if (normalized_cfg.max_uncommitted_entries_size == 0) {
-            normalized_cfg.max_uncommitted_entries_size = std.math.maxInt(usize);
-        }
-        if (normalized_cfg.max_inflight_bytes == 0) {
-            normalized_cfg.max_inflight_bytes = std.math.maxInt(usize);
-        }
+        var normalized_cfg = cfg.withNormalizedDefaults();
         if (normalized_cfg.logger == null) {
             normalized_cfg.logger = logger_mod.defaultLogger();
         }
-
-        if (normalized_cfg.peers.len == 0) return error.EmptyPeerSet;
-        if (normalized_cfg.max_inflight_msgs == 0) return error.InvalidMaxInflightMsgs;
-        if (normalized_cfg.max_inflight_bytes < normalized_cfg.max_size_per_msg) {
-            return error.InvalidMaxInflightBytes;
-        }
-        if (normalized_cfg.read_only_option == .lease_based and !normalized_cfg.check_quorum) {
-            return error.LeaseBasedReadRequiresCheckQuorum;
-        }
+        try normalized_cfg.validate();
 
         var peers = try alloc.dupe(types.NodeId, normalized_cfg.peers);
         errdefer alloc.free(peers);
-        if (peerIndex(peers, normalized_cfg.id) == null) return error.LocalNodeNotInPeerSet;
+        std.debug.assert(peerIndex(peers, normalized_cfg.id) != null);
 
         var raft_log = try log_mod.RaftLog.init(alloc, storage);
         errdefer raft_log.deinit();
@@ -298,6 +318,7 @@ pub const Raft = struct {
                         self.abortLeaderTransfer();
                     }
                 }
+                self.tickSnapshotAcknowledgments();
                 self.heartbeat_elapsed += 1;
                 if (self.heartbeat_elapsed >= self.cfg.heartbeat_tick) {
                     self.heartbeat_elapsed = 0;
@@ -451,6 +472,64 @@ pub const Raft = struct {
         if (self.lead_transferee != null) return error.LeaderTransferInProgress;
         accepted_index.* = try self.appendLocalEntryOfType(.normal, data);
         self.trace(.replicate, null);
+        _ = self.maybeCommit();
+        try self.bcastAppend();
+    }
+
+    /// Appends a complete local proposal batch in one leader term and exposes
+    /// its contiguous index range. Unlike follower proposal forwarding, this
+    /// API is an exact admission contract: no entry is appended on a
+    /// pre-admission failure, while both indexes remain populated if message
+    /// construction fails after the whole batch entered the local log.
+    pub fn proposeBatchWithReceipt(
+        self: *Raft,
+        payloads: []const []const u8,
+        accepted_first_index: *?types.Index,
+        accepted_last_index: *?types.Index,
+    ) !void {
+        accepted_first_index.* = null;
+        accepted_last_index.* = null;
+        if (payloads.len == 0) return error.EmptyProposalBatch;
+        if (self.soft_state.role != .leader) return error.NotLeader;
+        if (self.lead_transferee != null) return error.LeaderTransferInProgress;
+
+        const self_idx = try self.localAppendPeerIndex();
+        const first_index = std.math.add(types.Index, self.log.lastIndex(), 1) catch
+            return error.ProposalIndexOverflow;
+        const last_candidate = std.math.add(
+            types.Index,
+            first_index,
+            @as(types.Index, @intCast(payloads.len - 1)),
+        ) catch
+            return error.ProposalIndexOverflow;
+        _ = std.math.add(types.Index, last_candidate, 1) catch
+            return error.ProposalIndexOverflow;
+
+        const entries = try self.alloc.alloc(types.Entry, payloads.len);
+        defer self.alloc.free(entries);
+        for (entries) |*entry| entry.* = .{};
+        defer for (entries) |*entry| {
+            if (entry.data.len > 0) entry.deinit(self.alloc);
+        };
+        for (payloads, 0..) |payload, i| {
+            entries[i] = .{
+                .term = self.hard_state.current_term,
+                .index = first_index + @as(types.Index, @intCast(i)),
+                .entry_type = .normal,
+                .data = try self.alloc.dupe(u8, payload),
+            };
+        }
+
+        if (!self.increaseUncommittedSizeEntries(entries)) return error.ProposalDropped;
+        const last_index = self.log.appendOwnedEntries(entries) catch |err| {
+            self.reduceUncommittedSizeEntries(entries);
+            return err;
+        };
+        accepted_first_index.* = first_index;
+        accepted_last_index.* = last_index;
+        self.progress[self_idx].match_index = last_index;
+        self.progress[self_idx].next_index = last_index + 1;
+        for (payloads) |_| self.trace(.replicate, null);
         _ = self.maybeCommit();
         try self.bcastAppend();
     }
@@ -944,6 +1023,16 @@ pub const Raft = struct {
         if (self.soft_state.role != .leader) return;
         const idx = peerIndex(self.peers, msg.from) orelse return;
 
+        if (self.progress[idx].pending_snapshot_attempt) |pending| {
+            // Append responses emitted before snapshot admission cannot reject
+            // or supersede the active transfer. A success at or beyond the
+            // snapshot boundary is sufficient proof that the transfer is no
+            // longer needed; all other stale responses are ignored.
+            if (msg.reject or msg.log_index < pending.snapshot_index) return;
+            self.progress[idx].pending_snapshot_attempt = null;
+            self.progress[idx].probe_sent = false;
+        }
+
         if (msg.reject) {
             self.progress[idx].state = .probe;
             self.progress[idx].probe_sent = false;
@@ -998,8 +1087,15 @@ pub const Raft = struct {
     fn handleHeartbeatResponse(self: *Raft, msg: message.Message) !void {
         if (self.soft_state.role != .leader) return;
         if (peerIndex(self.peers, msg.from)) |idx| {
-            self.progress[idx].probe_sent = false;
-            if (self.progress[idx].state == .probe and self.isReplicationTarget(msg.from)) {
+            // A dedicated snapshot attempt remains authoritative until its
+            // transport completion fails or the follower acknowledges it.
+            // Heartbeats must not mint duplicate multi-gigabyte attempts.
+            if (self.progress[idx].pending_snapshot_attempt == null)
+                self.progress[idx].probe_sent = false;
+            if (!self.progress[idx].probe_sent and
+                self.progress[idx].state == .probe and
+                self.isReplicationTarget(msg.from))
+            {
                 try self.sendAppend(msg.from);
             }
         }
@@ -1069,8 +1165,13 @@ pub const Raft = struct {
     fn handleSnapshotResponse(self: *Raft, msg: message.Message) !void {
         if (self.soft_state.role != .leader) return;
         const idx = peerIndex(self.peers, msg.from) orelse return;
+        const pending = self.progress[idx].pending_snapshot_attempt orelse return;
+        // A delayed response for an older snapshot must not release a newer
+        // probe. Retries of the exact same snapshot remain safely idempotent.
+        if (msg.log_index != pending.snapshot_index) return;
 
         self.progress[idx].probe_sent = false;
+        self.progress[idx].pending_snapshot_attempt = null;
         self.clearInflights(idx);
         if (msg.reject) return;
 
@@ -1237,6 +1338,7 @@ pub const Raft = struct {
         const idx = peerIndex(self.peers, to) orelse return;
         const next_index = self.progress[idx].next_index;
         if (next_index < self.log.firstIndex()) {
+            if (self.progress[idx].pending_snapshot_attempt != null) return;
             self.progress[idx].probe_sent = false;
             try self.sendSnapshot(to);
             return;
@@ -1282,6 +1384,7 @@ pub const Raft = struct {
                 }) catch unreachable;
             } else {
                 self.progress[idx].probe_sent = true;
+                self.progress[idx].pending_snapshot_attempt = null;
             }
         }
     }
@@ -1294,18 +1397,104 @@ pub const Raft = struct {
 
         var snapshot = try self.storage.snapshot(self.alloc);
         errdefer snapshot.deinit(self.alloc);
+        // Snapshot transport is permitted to outlive this Ready turn. Promote
+        // the immutable payload before the message is cloned so asynchronous
+        // delivery retains only a reference instead of copying potentially
+        // gigabytes once per queue boundary.
+        try snapshot.shareOwnedData(self.alloc, null);
+        const snapshot_index = snapshot.metadata.index;
+        const snapshot_term = snapshot.metadata.term;
+        const attempt_generation = self.next_snapshot_attempt_generation;
 
         try self.send(.{
             .msg_type = .snapshot,
             .from = self.cfg.id,
             .to = to,
             .term = self.hard_state.current_term,
-            .log_index = snapshot.metadata.index,
-            .log_term = snapshot.metadata.term,
+            .log_index = snapshot_index,
+            .log_term = snapshot_term,
             .snapshot = snapshot,
+            .snapshot_attempt_generation = attempt_generation,
         });
 
+        self.next_snapshot_attempt_generation +%= 1;
+        if (self.next_snapshot_attempt_generation == 0)
+            self.next_snapshot_attempt_generation = 1;
         self.progress[idx].probe_sent = true;
+        self.progress[idx].pending_snapshot_attempt = .{
+            .leader_term = self.hard_state.current_term,
+            .snapshot_index = snapshot_index,
+            .snapshot_term = snapshot_term,
+            .generation = attempt_generation,
+        };
+    }
+
+    /// Releases a failed asynchronous snapshot probe so the next heartbeat
+    /// response can immediately drive another snapshot attempt. Successful
+    /// publication remains paused until the follower acknowledges progress.
+    pub fn reportSnapshotFailure(
+        self: *Raft,
+        to: types.NodeId,
+        leader_term: types.Term,
+        snapshot_index: types.Index,
+        snapshot_term: types.Term,
+        attempt_generation: u64,
+    ) bool {
+        if (self.soft_state.role != .leader) return false;
+        const idx = peerIndex(self.peers, to) orelse return false;
+        const progress = &self.progress[idx];
+        const pending = progress.pending_snapshot_attempt orelse return false;
+        if (progress.state != .probe or !progress.probe_sent or
+            self.hard_state.current_term != leader_term or
+            pending.leader_term != leader_term or
+            pending.snapshot_index != snapshot_index or
+            pending.snapshot_term != snapshot_term or
+            pending.generation != attempt_generation)
+            return false;
+        progress.probe_sent = false;
+        progress.pending_snapshot_attempt = null;
+        return true;
+    }
+
+    /// Marks exact-attempt transport delivery without treating it as proof
+    /// that the follower durably applied the snapshot. If the Raft response is
+    /// lost, the acknowledgment watchdog eventually releases the probe.
+    pub fn reportSnapshotDelivered(
+        self: *Raft,
+        to: types.NodeId,
+        leader_term: types.Term,
+        snapshot_index: types.Index,
+        snapshot_term: types.Term,
+        attempt_generation: u64,
+    ) bool {
+        if (self.soft_state.role != .leader) return false;
+        const idx = peerIndex(self.peers, to) orelse return false;
+        const progress = &self.progress[idx];
+        const pending = if (progress.pending_snapshot_attempt) |*attempt| attempt else return false;
+        if (progress.state != .probe or !progress.probe_sent or
+            self.hard_state.current_term != leader_term or
+            pending.leader_term != leader_term or
+            pending.snapshot_index != snapshot_index or
+            pending.snapshot_term != snapshot_term or
+            pending.generation != attempt_generation)
+            return false;
+        pending.delivery_confirmed = true;
+        pending.acknowledgment_elapsed_ticks = 0;
+        return true;
+    }
+
+    fn tickSnapshotAcknowledgments(self: *Raft) void {
+        for (self.progress) |*progress| {
+            const expired = if (progress.pending_snapshot_attempt) |*pending| blk: {
+                if (!pending.delivery_confirmed) break :blk false;
+                pending.acknowledgment_elapsed_ticks +|= 1;
+                break :blk pending.acknowledgment_elapsed_ticks >= self.cfg.election_tick;
+            } else false;
+            if (expired) {
+                progress.pending_snapshot_attempt = null;
+                progress.probe_sent = false;
+            }
+        }
     }
 
     fn maybeCommit(self: *Raft) bool {
@@ -1364,19 +1553,24 @@ pub const Raft = struct {
 
     fn increaseUncommittedSizeEntry(self: *Raft, entry_type: types.EntryType, data: []const u8) bool {
         const size = types.payloadSizeForEntry(entry_type, data);
-        if (self.uncommitted_size > 0 and size > 0 and self.uncommitted_size + size > self.cfg.max_uncommitted_entries_size) {
+        const increased = std.math.add(usize, self.uncommitted_size, size) catch return false;
+        if (self.uncommitted_size > 0 and size > 0 and increased > self.cfg.max_uncommitted_entries_size) {
             return false;
         }
-        self.uncommitted_size += size;
+        self.uncommitted_size = increased;
         return true;
     }
 
     fn increaseUncommittedSizeEntries(self: *Raft, entries: []const types.Entry) bool {
-        const size = types.entriesPayloadSize(entries);
-        if (self.uncommitted_size > 0 and size > 0 and self.uncommitted_size + size > self.cfg.max_uncommitted_entries_size) {
+        var size: usize = 0;
+        for (entries) |entry| {
+            size = std.math.add(usize, size, types.entryPayloadSize(entry)) catch return false;
+        }
+        const increased = std.math.add(usize, self.uncommitted_size, size) catch return false;
+        if (self.uncommitted_size > 0 and size > 0 and increased > self.cfg.max_uncommitted_entries_size) {
             return false;
         }
-        self.uncommitted_size += size;
+        self.uncommitted_size = increased;
         return true;
     }
 
