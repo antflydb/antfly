@@ -206,6 +206,8 @@ pub const TableRuntimeSummary = struct {
     max_index_replay_backlog: u64 = 0,
     text_merge: db_mod.types.TextMergeStats = .{},
     async_indexing: db_mod.types.AsyncIndexingStats = .{},
+    lsm_storage: LsmStorageStats = .{},
+    lsm_storage_observed: usize = 0,
 };
 
 const TargetedIndexPublicationFence = struct {
@@ -1038,6 +1040,22 @@ pub const TableRuntimeSnapshotCache = struct {
                 result.group_count += 1;
                 db_mod.types.accumulateTextMergeStats(&result.text_merge, status.stats.text_merge);
                 db_mod.types.accumulateAsyncIndexingStats(&result.async_indexing, status.stats.async_indexing);
+                if (status.lsm_storage_stats) |lsm_storage| {
+                    result.lsm_storage_observed += 1;
+                    lsm_backend.Backend.accumulateMaintenanceStats(
+                        &result.lsm_storage.maintenance,
+                        lsm_storage.maintenance,
+                    );
+                    lsm_backend.Backend.accumulateWriteStats(
+                        &result.lsm_storage.write,
+                        lsm_storage.write,
+                    );
+                    result.lsm_storage.maintenance_score = @max(
+                        result.lsm_storage.maintenance_score,
+                        lsm_storage.maintenance_score,
+                    );
+                    result.lsm_storage.maintenance_debt_hint +|= lsm_storage.maintenance_debt_hint;
+                }
                 var group_has_replay_debt = false;
                 result.index_count += status.stats.indexes.len;
                 for (status.stats.indexes) |index| {
@@ -2254,8 +2272,8 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .doc_identity = stats.doc_identity,
         .doc_set_planning = stats.doc_set_planning,
         .enrichment = stats.enrichment,
-        .resolution = stats.resolution,
-        .promotion = stats.promotion,
+        .resolution = cloneReplayStageStats(stats.resolution),
+        .promotion = cloneReplayStageStats(stats.promotion),
         .resolver_replay = resolver_replay,
         .ttl_cleanup = stats.ttl_cleanup,
         .transaction_recovery = stats.transaction_recovery,
@@ -2264,6 +2282,41 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .term_doc_freq_cache_misses = stats.term_doc_freq_cache_misses,
         .async_indexing = stats.async_indexing,
     };
+}
+
+fn cloneReplayStageStats(stats: db_mod.types.ReplayStageStats) db_mod.types.ReplayStageStats {
+    var cloned = stats;
+    // Replay reasons are a bounded status vocabulary produced as static
+    // literals by the storage runtime. JSON parsing temporarily points these
+    // slices into the response buffer, so re-intern them before that buffer is
+    // released. Unknown values remain safe and explicit across rolling
+    // versions without inventing ownership inside the base DBStats contract.
+    cloned.blocked_reason = if (stats.blocked_reason.len == 0)
+        ""
+    else if (std.mem.eql(u8, stats.blocked_reason, "not_source_group_leader"))
+        "not_source_group_leader"
+    else if (std.mem.eql(u8, stats.blocked_reason, "missing_entity_sink"))
+        "missing_entity_sink"
+    else
+        "unrecognized_replay_block";
+    return cloned;
+}
+
+test "cloned runtime status stabilizes replay blocked reasons" {
+    const alloc = std.testing.allocator;
+    const resolution_reason = try alloc.dupe(u8, "not_source_group_leader");
+    defer alloc.free(resolution_reason);
+    const promotion_reason = try alloc.dupe(u8, "missing_entity_sink");
+    defer alloc.free(promotion_reason);
+    const cloned = try cloneDBStats(alloc, .{
+        .resolution = .{ .blocked = true, .blocked_reason = resolution_reason },
+        .promotion = .{ .blocked = true, .blocked_reason = promotion_reason },
+    });
+    @memset(resolution_reason, 0xaa);
+    @memset(promotion_reason, 0xaa);
+    defer db_mod.types.freeDBStats(alloc, cloned);
+    try std.testing.expectEqualStrings("not_source_group_leader", cloned.resolution.blocked_reason);
+    try std.testing.expectEqualStrings("missing_entity_sink", cloned.promotion.blocked_reason);
 }
 
 fn publishGroupForTest(
@@ -2674,6 +2727,18 @@ test "table runtime snapshot cache replaces snapshots while preserving one group
     const docs_items = try std.testing.allocator.alloc(LocalTableRuntimeStatus, 1);
     docs_items[0] = .{
         .group_id = 7,
+        .lsm_storage_stats = .{
+            .maintenance = .{
+                .mutable_entries = 11,
+                .total_runs = 2,
+            },
+            .write = .{
+                .flushes = 3,
+                .table_file_compression_codec_mask = 0b001,
+            },
+            .maintenance_score = 7,
+            .maintenance_debt_hint = 5,
+        },
         .stats = .{
             .doc_count = 11,
             .index_count = 1,
@@ -4939,6 +5004,18 @@ test "table runtime snapshot cache summarizes replay debt" {
     };
     docs_items[1] = .{
         .group_id = 8,
+        .lsm_storage_stats = .{
+            .maintenance = .{
+                .mutable_entries = 6,
+                .total_runs = 4,
+            },
+            .write = .{
+                .flushes = 2,
+                .table_file_compression_codec_mask = 0b100,
+            },
+            .maintenance_score = 9,
+            .maintenance_debt_hint = 8,
+        },
         .stats = .{
             .doc_count = 6,
             .index_count = 1,
@@ -4988,4 +5065,11 @@ test "table runtime snapshot cache summarizes replay debt" {
     try std.testing.expectEqual(@as(usize, 2), summary.indexes_with_replay_debt);
     try std.testing.expectEqual(@as(u64, 6), summary.outstanding_replay_sequences);
     try std.testing.expectEqual(@as(u64, 3), summary.max_index_replay_backlog);
+    try std.testing.expectEqual(@as(usize, 2), summary.lsm_storage_observed);
+    try std.testing.expectEqual(@as(u64, 17), summary.lsm_storage.maintenance.mutable_entries);
+    try std.testing.expectEqual(@as(u64, 6), summary.lsm_storage.maintenance.total_runs);
+    try std.testing.expectEqual(@as(u64, 5), summary.lsm_storage.write.flushes);
+    try std.testing.expectEqual(@as(u64, 0b101), summary.lsm_storage.write.table_file_compression_codec_mask);
+    try std.testing.expectEqual(@as(u64, 9), summary.lsm_storage.maintenance_score);
+    try std.testing.expectEqual(@as(u64, 13), summary.lsm_storage.maintenance_debt_hint);
 }

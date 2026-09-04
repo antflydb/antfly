@@ -92,6 +92,7 @@ pub const documentExtractionStoredUnitFingerprintAlloc = @import("db.zig").docum
 pub const DocumentArtifactChildRangeApplyBatch = @import("db.zig").DocumentArtifactChildRangeApplyBatch;
 pub const DocumentArtifactChildRangeDispatch = @import("db.zig").DocumentArtifactChildRangeDispatch;
 pub const DocumentArtifactChildRangeDispatcher = @import("db.zig").DocumentArtifactChildRangeDispatcher;
+pub const CommittedBatchEffectsObserver = @import("db.zig").CommittedBatchEffectsObserver;
 pub const OpenOptions = @import("db.zig").OpenOptions;
 pub const NativeRestoreOpenPlan = @import("db.zig").NativeRestoreOpenPlan;
 pub const OpenMode = @import("db.zig").OpenMode;
@@ -128,11 +129,15 @@ pub const TextFieldStats = distributed_stats.TextFieldStats;
 pub const TermDocFreq = distributed_stats.TermDocFreq;
 
 pub fn preflightRuntimeAlloc(alloc: std.mem.Allocator, runtime: RuntimePreflight) !RuntimePreflightSummary {
-    return try query_search.preflightRuntimeAlloc(alloc, runtime);
+    return try @import("runtime_preflight.zig").preflightRuntimeAlloc(alloc, .{
+        .has_full_text_results = runtime.has_full_text_results,
+        .embedding_result_names = runtime.embedding_result_names,
+        .graph_queries = runtime.graph_queries,
+    });
 }
 
 pub fn preflightSearchRequestAlloc(alloc: std.mem.Allocator, req: types.SearchRequest) !RuntimePreflightSummary {
-    return try query_search.preflightSearchRequestAlloc(alloc, req);
+    return try @import("runtime_preflight.zig").preflightSearchRequestAlloc(alloc, req);
 }
 
 pub fn deriveRuntimePreflightEstimates(summary: *RuntimePreflightSummary) void {
@@ -155,7 +160,7 @@ pub fn validateStructuredFilterValueAlloc(
     alloc: std.mem.Allocator,
     value: std.json.Value,
 ) !void {
-    return query_search.validateStructuredFilterValueAlloc(alloc, value);
+    return @import("query/structured_filter_validation.zig").validateStructuredFilterValueAlloc(alloc, value);
 }
 
 pub fn requestHasVectorScoreOrderOnly(req: types.SearchRequest) bool {

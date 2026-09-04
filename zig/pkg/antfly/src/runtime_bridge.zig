@@ -16,6 +16,10 @@ pub const Bytes = extern struct {
         return .{ .ptr = if (value.len == 0) null else value.ptr, .len = value.len };
     }
 
+    pub fn fromSlice(value: []const u8) Bytes {
+        return init(value);
+    }
+
     pub fn slice(self: Bytes) []const u8 {
         if (self.len == 0) return "";
         return self.ptr.?[0..self.len];
@@ -63,6 +67,21 @@ pub const Context = extern struct {
         }
         return true;
     }
+};
+
+pub const BorrowedBytes = Bytes;
+
+/// Reverse link used only when physical Lite administration is compiled in
+/// the storage kernel but `lite serve` enters the distributed standalone unit.
+pub const LiteServeContext = extern struct {
+    init: *const anyopaque,
+    path: BorrowedBytes,
+    host: BorrowedBytes,
+    extra_args: ?[*]const BorrowedBytes = null,
+    extra_args_len: usize = 0,
+    port: u16,
+    fsync: u8,
+    _reserved0: [5]u8 = @splat(0),
 };
 
 test "runtime process context is C-layout and rejects malformed views" {

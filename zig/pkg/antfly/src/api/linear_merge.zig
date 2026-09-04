@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const api_operation = @import("operation.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const document_content_hash = @import("../storage/db/document_content_hash.zig");
 const raft_mod = @import("../raft/mod.zig");
 const table_reads = @import("table_read_source.zig");

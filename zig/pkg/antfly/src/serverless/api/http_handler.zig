@@ -38,7 +38,14 @@ const tables_api = @import("../../api/tables.zig");
 const table_writes = @import("../../api/table_writes.zig");
 const analysis_mod = @import("../../search/analysis.zig");
 const shared_vector = @import("antfly_vector").vector;
-const db_mod = @import("../../storage/db/mod.zig");
+const storage_source_options = @import("storage_source_options");
+const control_only_storage_sources = storage_source_options.control_only;
+const db_mod = @import("../../storage/db/selected_root.zig").db;
+const aggregation_contract = @import("../../storage/db/aggregations_contract.zig");
+const kernel_owner_client = if (control_only_storage_sources)
+    @import("../../storage/kernel_owner_client.zig")
+else
+    struct {};
 const db_transform = @import("../../storage/db/transform.zig");
 const db_types = @import("../../storage/db/types.zig");
 const db_query_graph = @import("../../storage/db/query/graph_exec.zig");
@@ -1780,20 +1787,75 @@ pub const HttpHandler = struct {
         const db_hits = try allocDbAggregationHitsAlloc(self.alloc, &execution.session.?, source_hits);
         defer freeDbSearchHits(self.alloc, db_hits);
 
+        const total_hits: u32 = @intCast(@min(source_hits.len, std.math.maxInt(u32)));
         return .{
-            .total_hits = @intCast(@min(source_hits.len, std.math.maxInt(u32))),
+            .total_hits = total_hits,
             .requests = requests,
-            .results = try db_mod.aggregations.computeSearchAggregations(
-                self.alloc,
-                requests,
-                .{
-                    .alloc = self.alloc,
-                    .hits = db_hits,
-                    .total_hits = @intCast(@min(source_hits.len, std.math.maxInt(u32))),
-                },
-                ctx_owned.ctx,
-            ),
+            .results = if (comptime control_only_storage_sources)
+                try computeServerlessAggregationsThroughKernel(
+                    self.alloc,
+                    aggregations_json,
+                    total_hits,
+                    db_hits,
+                    ctx_owned.ctx,
+                )
+            else
+                try db_mod.aggregations.computeSearchAggregations(
+                    self.alloc,
+                    requests,
+                    .{
+                        .alloc = self.alloc,
+                        .hits = db_hits,
+                        .total_hits = total_hits,
+                    },
+                    ctx_owned.ctx,
+                ),
         };
+    }
+
+    fn computeServerlessAggregationsThroughKernel(
+        alloc: Allocator,
+        aggregations_json: []const u8,
+        total_hits: u32,
+        db_hits: []const db_types.SearchHit,
+        ctx: db_mod.aggregations.Context,
+    ) ![]db_mod.aggregations.SearchAggregationResult {
+        const hits = try alloc.alloc(kernel_owner_client.AggregationHit, db_hits.len);
+        defer if (hits.len > 0) alloc.free(hits);
+        for (db_hits, 0..) |hit, i| hits[i] = .{
+            .stored_data = .fromSlice(hit.stored_data orelse ""),
+        };
+
+        const context_json = try std.json.Stringify.valueAlloc(alloc, aggregation_contract.ComputeContextWire{
+            .text_analysis = if (ctx.text_analysis) |value| value.* else null,
+            .distributed_text_stats = ctx.distributed_text_stats,
+            .distributed_background_text_stats = ctx.distributed_background_text_stats,
+        }, .{});
+        defer alloc.free(context_json);
+
+        var response = try kernel_owner_client.aggregate(.{
+            .total_hits = total_hits,
+            .aggregations_json = .fromSlice(aggregations_json),
+            .context_json = .fromSlice(context_json),
+            .hits = if (hits.len == 0) null else hits.ptr,
+            .hit_count = @intCast(hits.len),
+        });
+        defer response.deinit();
+        const results = std.json.parseFromSliceLeaky(
+            []db_mod.aggregations.SearchAggregationResult,
+            alloc,
+            response.bytes(),
+            .{},
+        ) catch return error.StorageKernelFailure;
+        for (results) |*aggregation| markServerlessAggregationLabelsOwned(aggregation);
+        return results;
+    }
+
+    fn markServerlessAggregationLabelsOwned(result: *db_mod.aggregations.SearchAggregationResult) void {
+        result.owns_labels = true;
+        for (result.buckets) |*bucket| {
+            for (bucket.aggregations) |*child| markServerlessAggregationLabelsOwned(child);
+        }
     }
 
     fn allocDbAggregationHitsAlloc(
@@ -9348,6 +9410,60 @@ test "http handler join parser accepts foreign source maps" {
 
     try std.testing.expectEqualStrings("customers", parsed.join.right_table);
     try std.testing.expect(parsed.foreign_sources.contains("pg_customers"));
+}
+
+test "serverless local table query routes a foreign right join before plain search" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"limit":10,"fields":["customer_id","product"],"full_text_search":{"query":"body:order"},"join":{"right_table":"pg_customers","join_type":"left","on":{"left_field":"customer_id","right_field":"customer_id","operator":"eq"},"right_fields":["name","email","tier"]},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"postgres://db","postgres_table":"customers"}}}
+    ;
+    var raw = try ant_json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer raw.deinit();
+
+    var handler: HttpHandler = .{
+        .alloc = alloc,
+        .api = undefined,
+        .catalog = undefined,
+        .manifests = undefined,
+        .progress = undefined,
+        .query = undefined,
+        .runtime_status = undefined,
+        .foreign_registry = null,
+    };
+    try std.testing.expect((try handler.executeForeignPublicTableQueryJsonValueAlloc(
+        "orders",
+        body,
+        raw.value,
+        .none,
+    )) == null);
+
+    var parsed_join = (try parseSupportedJoinRequestValueAlloc(alloc, body, raw.value)).?;
+    defer parsed_join.deinit(alloc);
+    try std.testing.expect(parsed_join.foreign_sources.contains("pg_customers"));
+
+    const rewrite = try distributed_join.rewriteJoinedBaseQueryBodyAlloc(
+        alloc,
+        body,
+        parsed_join.join.left_field,
+    );
+    defer alloc.free(rewrite.body);
+    var rewritten = try ant_json.parseFromSlice(std.json.Value, alloc, rewrite.body, .{});
+    defer rewritten.deinit();
+    try query_contract.validatePublicQueryEnvelopeValueAlloc(alloc, rewritten.value);
+    try std.testing.expect(rewritten.value.object.get("join") == null);
+    try std.testing.expect(rewritten.value.object.get("foreign_sources") == null);
+    try std.testing.expect(rewritten.value.object.get("merge_config") == null);
+    try std.testing.expect(rewritten.value.object.get("reranker") == null);
+    try std.testing.expect(rewritten.value.object.get("graph_queries") == null);
+    try std.testing.expect(rewritten.value.object.get("pruner") == null);
+
+    var plan = try query_mod.parseSearchPlanAlloc(
+        alloc,
+        rewrite.body,
+        search_sources.defaultPublishedSearchSources(),
+    );
+    defer plan.deinit(alloc);
+    try std.testing.expect(plan.usesTextLane());
 }
 
 test "http handler join parser accepts projected foreign joins over full text" {

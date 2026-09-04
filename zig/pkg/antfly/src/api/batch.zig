@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const document_mapper = @import("../storage/db/document_mapper.zig");
 const public_limits = @import("public_limits.zig");
 
@@ -28,6 +28,8 @@ pub const OwnedBatchRequest = struct {
     writes: []db_mod.types.BatchWrite = &.{},
     deletes: [][]const u8 = &.{},
     transforms: []db_mod.types.DocumentTransform = &.{},
+    graph_writes: []db_mod.types.GraphEdgeWrite = &.{},
+    graph_deletes: []db_mod.types.GraphEdgeDelete = &.{},
     predicates: []db_mod.types.TransactionVersionPredicate = &.{},
     transaction_participants: [][]const u8 = &.{},
     split_checkpoint_range_start: ?[]u8 = null,
@@ -52,6 +54,8 @@ pub const OwnedBatchRequest = struct {
             if (transform.operations.len > 0) alloc.free(transform.operations);
         }
         if (self.transforms.len > 0) alloc.free(self.transforms);
+        freeGraphWrites(alloc, self.graph_writes);
+        freeGraphDeletes(alloc, self.graph_deletes);
         for (self.predicates) |predicate| alloc.free(@constCast(predicate.key));
         if (self.predicates.len > 0) alloc.free(self.predicates);
         for (self.transaction_participants) |participant| alloc.free(participant);
@@ -140,6 +144,26 @@ fn parseBatchRequestWithOptions(
     };
     errdefer freeTransforms(alloc, transforms);
 
+    const graph_writes: []db_mod.types.GraphEdgeWrite = graph_writes: {
+        const value = root.get("_graph_writes") orelse break :graph_writes &.{};
+        if (!allow_internal) return error.InvalidBatchRequest;
+        if (value == .null) break :graph_writes &.{};
+        const parsed_graph_writes = try parseGraphWrites(alloc, value);
+        errdefer freeGraphWrites(alloc, parsed_graph_writes);
+        break :graph_writes parsed_graph_writes;
+    };
+    errdefer freeGraphWrites(alloc, graph_writes);
+
+    const graph_deletes: []db_mod.types.GraphEdgeDelete = graph_deletes: {
+        const value = root.get("_graph_deletes") orelse break :graph_deletes &.{};
+        if (!allow_internal) return error.InvalidBatchRequest;
+        if (value == .null) break :graph_deletes &.{};
+        const parsed_graph_deletes = try parseGraphDeletes(alloc, value);
+        errdefer freeGraphDeletes(alloc, parsed_graph_deletes);
+        break :graph_deletes parsed_graph_deletes;
+    };
+    errdefer freeGraphDeletes(alloc, graph_deletes);
+
     const predicates: []db_mod.types.TransactionVersionPredicate = predicates: {
         const value = root.get("_predicates") orelse break :predicates &.{};
         if (!allow_internal or value != .array) return error.InvalidBatchRequest;
@@ -179,6 +203,12 @@ fn parseBatchRequestWithOptions(
         const value = root.get("_timestamp_ns") orelse break :timestamp 0;
         if (!allow_internal) return error.InvalidBatchRequest;
         break :timestamp try parseInternalU64(value);
+    };
+
+    const reject_graph_transform_projections = reject: {
+        const value = root.get("_reject_graph_transform_projections") orelse break :reject false;
+        if (!allow_internal or value != .bool) return error.InvalidBatchRequest;
+        break :reject value.bool;
     };
 
     var checkpoint_start: ?[]u8 = null;
@@ -377,6 +407,7 @@ fn parseBatchRequestWithOptions(
 
     if (split_transition != null and
         (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or
+            graph_writes.len != 0 or graph_deletes.len != 0 or
             predicates.len != 0 or split_checkpoint != null or split_replication != null or transaction != null))
     {
         return error.InvalidBatchRequest;
@@ -392,6 +423,7 @@ fn parseBatchRequestWithOptions(
     };
     if (split_checkpoint != null and split_checkpoint.?.kind == .source_ack and
         (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or
+            graph_writes.len != 0 or graph_deletes.len != 0 or
             split_replication != null))
     {
         return error.InvalidBatchRequest;
@@ -401,6 +433,8 @@ fn parseBatchRequestWithOptions(
         .writes = writes,
         .deletes = deletes,
         .transforms = transforms,
+        .graph_writes = graph_writes,
+        .graph_deletes = graph_deletes,
         .predicates = predicates,
         .transaction_participants = transaction_participants,
         .split_checkpoint_range_start = checkpoint_start,
@@ -410,9 +444,12 @@ fn parseBatchRequestWithOptions(
             .writes = writes,
             .deletes = deletes,
             .transforms = transforms,
+            .graph_writes = graph_writes,
+            .graph_deletes = graph_deletes,
             .predicates = predicates,
             .timestamp_ns = timestamp_ns,
             .sync_level = sync_level,
+            .reject_graph_transform_projections = reject_graph_transform_projections,
             .split_checkpoint = split_checkpoint,
             .split_replication = split_replication,
             .split_transition = split_transition,
@@ -431,11 +468,12 @@ pub fn encodeBatchResponse(alloc: std.mem.Allocator, result: BatchResult) ![]u8 
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
-    if (req.graph_writes.len > 0 or req.graph_deletes.len > 0 or (req.predicates.len > 0 and req.transaction == null)) {
+    if (req.predicates.len > 0 and req.transaction == null) {
         return error.UnsupportedBatchRequestEncoding;
     }
     if (req.split_transition != null and
         (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
             req.predicates.len != 0 or req.split_checkpoint != null or req.split_replication != null or req.transaction != null))
     {
         return error.InvalidBatchRequest;
@@ -472,7 +510,7 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             for (transform.operations, 0..) |op, op_index| {
                 if (op_index != 0) try writer.writeByte(',');
                 try writer.print("{{\"op\":{f},\"path\":{f}", .{
-                    std.json.fmt(db_mod.transform.transformOpText(op.op), .{}),
+                    std.json.fmt(db_mod.types.transformOpText(op.op), .{}),
                     std.json.fmt(op.path, .{}),
                 });
                 if (op.value_json) |value_json| {
@@ -486,6 +524,36 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             try writer.writeByte('}');
         }
         try writer.writeAll("]");
+    }
+    if (req.graph_writes.len > 0) {
+        try writer.writeAll(",\"_graph_writes\":[");
+        for (req.graph_writes, 0..) |write, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{{\"index_name\":{f},\"source\":{f},\"target\":{f},\"edge_type\":{f},\"weight\":{d},\"created_at\":\"{d}\",\"updated_at\":\"{d}\",\"metadata_json\":{f}}}", .{
+                std.json.fmt(write.index_name, .{}),
+                std.json.fmt(write.source, .{}),
+                std.json.fmt(write.target, .{}),
+                std.json.fmt(write.edge_type, .{}),
+                write.weight,
+                write.created_at,
+                write.updated_at,
+                std.json.fmt(write.metadata_json, .{}),
+            });
+        }
+        try writer.writeByte(']');
+    }
+    if (req.graph_deletes.len > 0) {
+        try writer.writeAll(",\"_graph_deletes\":[");
+        for (req.graph_deletes, 0..) |delete, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{{\"index_name\":{f},\"source\":{f},\"target\":{f},\"edge_type\":{f}}}", .{
+                std.json.fmt(delete.index_name, .{}),
+                std.json.fmt(delete.source, .{}),
+                std.json.fmt(delete.target, .{}),
+                std.json.fmt(delete.edge_type, .{}),
+            });
+        }
+        try writer.writeByte(']');
     }
     if (req.predicates.len > 0) {
         try writer.writeAll(",\"_predicates\":[");
@@ -535,6 +603,12 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             std.json.fmt(transition.split_key, .{}),
         });
     }
+    if (req.timestamp_ns != 0) {
+        try writer.print(",\"_timestamp_ns\":\"{d}\"", .{req.timestamp_ns});
+    }
+    if (req.reject_graph_transform_projections) {
+        try writer.writeAll(",\"_reject_graph_transform_projections\":true");
+    }
     if (req.transaction) |mutation| {
         try writer.writeAll(",\"_transaction\":{");
         switch (mutation) {
@@ -573,9 +647,6 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             },
         }
         try writer.writeByte('}');
-    }
-    if (req.timestamp_ns != 0) {
-        try writer.print(",\"_timestamp_ns\":\"{d}\"", .{req.timestamp_ns});
     }
     try writer.print(",\"sync_level\":\"{s}\"}}", .{syncLevelName(req.sync_level)});
     return try out.toOwnedSlice();
@@ -654,13 +725,102 @@ fn parseDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
     return deletes;
 }
 
+fn requiredObjectString(object: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    const value = object.get(name) orelse return error.InvalidBatchRequest;
+    if (value != .string) return error.InvalidBatchRequest;
+    return value.string;
+}
+
+fn optionalObjectU64(object: std.json.ObjectMap, name: []const u8) !u64 {
+    const value = object.get(name) orelse return 0;
+    return try parseInternalU64(value);
+}
+
+fn optionalObjectF64(object: std.json.ObjectMap, name: []const u8, default: f64) !f64 {
+    const value = object.get(name) orelse return default;
+    return switch (value) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| number,
+        .number_string, .string => |text| std.fmt.parseFloat(f64, text) catch error.InvalidBatchRequest,
+        else => error.InvalidBatchRequest,
+    };
+}
+
+fn parseGraphWrites(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.GraphEdgeWrite {
+    if (value != .array) return error.InvalidBatchRequest;
+    const writes = try alloc.alloc(db_mod.types.GraphEdgeWrite, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeGraphWriteElements(alloc, writes[0..initialized]);
+        alloc.free(writes);
+    }
+    for (value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidBatchRequest;
+        const metadata_json = if (item.object.get("metadata_json")) |metadata| blk: {
+            if (metadata != .string) return error.InvalidBatchRequest;
+            break :blk metadata.string;
+        } else "";
+        const index_name = try alloc.dupe(u8, try requiredObjectString(item.object, "index_name"));
+        errdefer alloc.free(index_name);
+        const source = try alloc.dupe(u8, try requiredObjectString(item.object, "source"));
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, try requiredObjectString(item.object, "target"));
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, try requiredObjectString(item.object, "edge_type"));
+        errdefer alloc.free(edge_type);
+        const owned_metadata_json = try alloc.dupe(u8, metadata_json);
+        errdefer alloc.free(owned_metadata_json);
+        writes[i] = .{
+            .index_name = index_name,
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
+            .weight = try optionalObjectF64(item.object, "weight", 1.0),
+            .created_at = try optionalObjectU64(item.object, "created_at"),
+            .updated_at = try optionalObjectU64(item.object, "updated_at"),
+            .metadata_json = owned_metadata_json,
+        };
+        initialized += 1;
+    }
+    return writes;
+}
+
+fn parseGraphDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.GraphEdgeDelete {
+    if (value != .array) return error.InvalidBatchRequest;
+    const deletes = try alloc.alloc(db_mod.types.GraphEdgeDelete, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeGraphDeleteElements(alloc, deletes[0..initialized]);
+        alloc.free(deletes);
+    }
+    for (value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidBatchRequest;
+        const index_name = try alloc.dupe(u8, try requiredObjectString(item.object, "index_name"));
+        errdefer alloc.free(index_name);
+        const source = try alloc.dupe(u8, try requiredObjectString(item.object, "source"));
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, try requiredObjectString(item.object, "target"));
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, try requiredObjectString(item.object, "edge_type"));
+        errdefer alloc.free(edge_type);
+        deletes[i] = .{
+            .index_name = index_name,
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
+        };
+        initialized += 1;
+    }
+    return deletes;
+}
+
 fn parseTransforms(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.DocumentTransform {
     if (value != .array) return error.InvalidBatchRequest;
     const values = value.array.items;
     const transforms = try alloc.alloc(db_mod.types.DocumentTransform, values.len);
     var initialized: usize = 0;
     errdefer {
-        freeTransforms(alloc, transforms[0..initialized]);
+        freeTransformElements(alloc, transforms[0..initialized]);
         alloc.free(transforms);
     }
 
@@ -763,9 +923,43 @@ fn freeDeletes(alloc: std.mem.Allocator, deletes: [][]const u8) void {
 }
 
 fn freeTransforms(alloc: std.mem.Allocator, transforms: []db_mod.types.DocumentTransform) void {
+    freeTransformElements(alloc, transforms);
+    if (transforms.len > 0) alloc.free(transforms);
+}
+
+fn freeTransformElements(alloc: std.mem.Allocator, transforms: []db_mod.types.DocumentTransform) void {
     for (transforms) |transform| {
         alloc.free(@constCast(transform.key));
         freeTransformOps(alloc, transform.operations);
+    }
+}
+
+fn freeGraphWrites(alloc: std.mem.Allocator, writes: []db_mod.types.GraphEdgeWrite) void {
+    freeGraphWriteElements(alloc, writes);
+    if (writes.len > 0) alloc.free(writes);
+}
+
+fn freeGraphWriteElements(alloc: std.mem.Allocator, writes: []db_mod.types.GraphEdgeWrite) void {
+    for (writes) |write| {
+        alloc.free(@constCast(write.index_name));
+        alloc.free(@constCast(write.source));
+        alloc.free(@constCast(write.target));
+        alloc.free(@constCast(write.edge_type));
+        alloc.free(@constCast(write.metadata_json));
+    }
+}
+
+fn freeGraphDeletes(alloc: std.mem.Allocator, deletes: []db_mod.types.GraphEdgeDelete) void {
+    freeGraphDeleteElements(alloc, deletes);
+    if (deletes.len > 0) alloc.free(deletes);
+}
+
+fn freeGraphDeleteElements(alloc: std.mem.Allocator, deletes: []db_mod.types.GraphEdgeDelete) void {
+    for (deletes) |delete| {
+        alloc.free(@constCast(delete.index_name));
+        alloc.free(@constCast(delete.source));
+        alloc.free(@constCast(delete.target));
+        alloc.free(@constCast(delete.edge_type));
     }
 }
 
@@ -844,6 +1038,42 @@ test "internal batch parser owns and round trips split checkpoint" {
     try std.testing.expectEqual(@as(u64, 7), reparsed.req.split_checkpoint.?.delta_sequence);
 }
 
+test "internal batch parser owns and round trips graph mutations" {
+    const alloc = std.testing.allocator;
+    const request: db_mod.types.BatchRequest = .{
+        .graph_writes = &.{.{
+            .index_name = "relations_graph",
+            .source = "doc:a",
+            .target = "doc:b",
+            .edge_type = "mentions",
+            .weight = 0.75,
+            .created_at = 11,
+            .updated_at = 12,
+            .metadata_json = "{\"target_table\":\"entities\"}",
+        }},
+        .graph_deletes = &.{.{
+            .index_name = "relations_graph",
+            .source = "doc:c",
+            .target = "doc:d",
+            .edge_type = "mentions",
+        }},
+    };
+    const encoded = try encodeBatchRequest(alloc, request);
+    defer alloc.free(encoded);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+
+    var parsed = try parseInternalBatchRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.graph_writes.len);
+    try std.testing.expectEqualStrings("relations_graph", parsed.req.graph_writes[0].index_name);
+    try std.testing.expectEqualStrings("doc:b", parsed.req.graph_writes[0].target);
+    try std.testing.expectEqual(@as(f64, 0.75), parsed.req.graph_writes[0].weight);
+    try std.testing.expectEqual(@as(u64, 11), parsed.req.graph_writes[0].created_at);
+    try std.testing.expectEqualStrings("{\"target_table\":\"entities\"}", parsed.req.graph_writes[0].metadata_json);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.graph_deletes.len);
+    try std.testing.expectEqualStrings("doc:d", parsed.req.graph_deletes[0].target);
+}
+
 test "internal batch parser requires source acknowledgements to be metadata-only" {
     const mixed =
         \\{"inserts":{"doc:m":{}},"_split_checkpoint":{"kind":"source_ack","transition_id":40,"attempt_epoch":1,"source_group_id":41,"destination_group_id":42,"delta_sequence":7}}
@@ -881,6 +1111,27 @@ test "internal batch codec preserves timestamps and rejects public injection" {
             \\{"inserts":{},"_timestamp_ns":"123"}
         ),
     );
+}
+
+test "internal batch codec preserves graph transform projection rejection" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeBatchRequest(alloc, .{
+        .transforms = &.{.{
+            .key = "doc:a",
+            .operations = &.{.{
+                .op = .push,
+                .path = "$._edges.graph_idx.knows",
+                .value_json = "{\"target\":\"doc:b\"}",
+            }},
+        }},
+        .reject_graph_transform_projections = true,
+    });
+    defer alloc.free(encoded);
+
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+    var decoded = try parseInternalBatchRequest(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expect(decoded.req.reject_graph_transform_projections);
 }
 
 test "internal batch parser rejects public split replication identity" {

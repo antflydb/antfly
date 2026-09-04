@@ -596,7 +596,7 @@ pub const ManagedHttpHostService = struct {
     pub fn beginDataApplyGroupTransition(
         self: *ManagedHttpHostService,
         group_ids: []const u64,
-    ) !?data.RaftApplyStore.ActiveGroupTransition {
+    ) !?managed_host.DataApplyStore.ActiveGroupTransition {
         return try self.host.beginDataApplyGroupTransition(group_ids);
     }
 

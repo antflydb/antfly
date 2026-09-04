@@ -591,7 +591,7 @@ test "gemini provider sends api key and generates content" {
 test "vertex request serialization includes max output tokens" {
     const alloc = std.testing.allocator;
     const messages = [_]inference.ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
-    const body = try vertexGenerateRequestJsonAlloc(alloc, &messages, 256);
+    const body = try vertexGenerateRequestJsonAlloc(alloc, &messages, .{ .max_tokens = 256 });
     defer alloc.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"generationConfig\":{\"maxOutputTokens\":256}") != null);
 }

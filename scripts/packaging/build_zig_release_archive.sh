@@ -133,9 +133,9 @@ work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${target}"
 prefix="${work_root}/zig-out"
 stage="${work_root}/stage"
 local_cache="${work_root}/zig-cache"
-cache_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/zig-cache"
+cache_root="${ANTFLY_ZIG_CACHE_ROOT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/zig-cache}"
 
-if [ -d /mnt/cache ] && [ -w /mnt/cache ]; then
+if [ -z "${ANTFLY_ZIG_CACHE_ROOT:-}" ] && [ -d /mnt/cache ] && [ -w /mnt/cache ]; then
   cache_root=/mnt/cache/zig
 fi
 
@@ -253,9 +253,11 @@ run_zig_build_steps_with_retry() {
 
 (
   cd "$repo_root/zig"
-  # The runtime libraries carry measured max-RSS claims, so the build runner
-  # overlaps only the API, storage, serverless, inference, and CLI units that
-  # fit within its bounded memory group.
+  # Physical storage and distributed control form the initial bounded-memory
+  # group. The split storage kernel gives physical codegen its own archive
+  # and an 18 GiB Darwin scheduler claim, so the 20 GiB release budget cannot
+  # admit another compiler unit beside it. Downstream units retain overlap once
+  # the storage claim is released.
   run_zig_build_steps_with_retry archive antfly capi
 )
 

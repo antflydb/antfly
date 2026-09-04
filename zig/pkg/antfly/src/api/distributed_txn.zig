@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const platform_time = @import("antfly_platform").time;
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const transactions_mod = @import("../storage/transactions.zig");
 const tracing = @import("../tracing/antfly_trace_writer.zig");
 const http_common = @import("../raft/transport/http_common.zig");
@@ -3036,7 +3036,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
             const encoded_op = try std.fmt.allocPrint(
                 alloc,
                 "{{\"op\":{f},\"path\":{f}",
-                .{ std.json.fmt(db_mod.transform.transformOpText(op.op), .{}), std.json.fmt(op.path, .{}) },
+                .{ std.json.fmt(db_mod.types.transformOpText(op.op), .{}), std.json.fmt(op.path, .{}) },
             );
             defer alloc.free(encoded_op);
             try out.appendSlice(alloc, encoded_op);

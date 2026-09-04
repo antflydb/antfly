@@ -39,7 +39,7 @@ from port_reservations import LoopbackPortReservations
 
 pytestmark = pytest.mark.standalone_integration
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
 DEFAULT_INFERENCE_MODELS_DIR = Path("~/.antfly/inference/models").expanduser()
 DEFAULT_INFERENCE_MODEL_NAME = "ggml-org/gemma-4-e2b-it-gguf"

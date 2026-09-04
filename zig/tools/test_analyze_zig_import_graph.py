@@ -3,6 +3,7 @@
 import importlib.util
 import io
 import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -32,12 +33,78 @@ class ImportGraphTest(unittest.TestCase):
         path.write_text(contents, encoding="utf-8")
         return path.resolve()
 
+    def write_elf_object(self, name: str, sections: list[tuple[str, int, int]]) -> Path:
+        names = bytearray(b"\0.shstrtab\0")
+        name_offsets = {"": 0, ".shstrtab": 1}
+        for section_name, _, _ in sections:
+            name_offsets[section_name] = len(names)
+            names.extend(section_name.encode())
+            names.append(0)
+        string_offset = 64
+        section_offset = (string_offset + len(names) + 7) & ~7
+        section_count = 2 + len(sections)
+        header = struct.pack(
+            "<16sHHIQQQIHHHHHH",
+            b"\x7fELF" + bytes((2, 1, 1)) + bytes(9),
+            1,
+            183,
+            1,
+            0,
+            0,
+            section_offset,
+            0,
+            64,
+            0,
+            0,
+            64,
+            section_count,
+            1,
+        )
+        section_headers = [bytes(64)]
+        section_headers.append(
+            struct.pack(
+                "<IIQQQQIIQQ",
+                name_offsets[".shstrtab"],
+                3,
+                0,
+                0,
+                string_offset,
+                len(names),
+                0,
+                0,
+                1,
+                0,
+            )
+        )
+        for section_name, size, flags in sections:
+            section_headers.append(
+                struct.pack(
+                    "<IIQQQQIIQQ",
+                    name_offsets[section_name],
+                    1,
+                    flags,
+                    0,
+                    0,
+                    size,
+                    0,
+                    0,
+                    1,
+                    0,
+                )
+            )
+        payload = header + names + bytes(section_offset - string_offset - len(names)) + b"".join(section_headers)
+        path = self.root / name
+        path.write_bytes(payload)
+        return path
+
     def write_codegen_boundaries(self):
         for name in {
             source for source, _ in analyzer.CODEGEN_BOUNDARIES
         } | {
             target for _, target in analyzer.CODEGEN_BOUNDARIES
-        }:
+        } | set(analyzer.CONTROL_WAL_CONSUMERS) | {
+            analyzer.NATIVE_WAL_IMPLEMENTATION,
+        } | {source for source, _ in analyzer.INFERENCE_ABI_FORBIDDEN_TOKENS}:
             path = self.root / name
             if not path.exists():
                 self.write(name, "pub const value = 1;\n")
@@ -73,6 +140,123 @@ class ImportGraphTest(unittest.TestCase):
         graph = analyzer.ImportGraph(self.root)
 
         self.assertEqual([entry, left, target], graph.shortest_path(entry, target))
+
+    def test_compiled_storage_boundary_accepts_control_only_report(self):
+        control = self.write("storage/db/control_root.zig", "pub const value = 1;\n")
+        distributed = analyzer.TimeReport(
+            "distributed",
+            self.root / "distributed.json",
+            {},
+            frozenset({control}),
+            True,
+        )
+        serverless = analyzer.TimeReport(
+            "serverless",
+            self.root / "serverless.json",
+            {},
+            frozenset({control}),
+            True,
+        )
+        api = analyzer.TimeReport(
+            "api",
+            self.root / "api.json",
+            {},
+            frozenset({control}),
+            True,
+        )
+
+        self.assertTrue(
+            analyzer.check_compiled_storage_boundary(
+                {"distributed": distributed, "api": api, "serverless": serverless}, self.root
+            )
+        )
+
+    def test_compiled_storage_boundary_rejects_physical_db_report(self):
+        physical = self.write("storage/db/db.zig", "pub const value = 1;\n")
+        report = analyzer.TimeReport(
+            "distributed",
+            self.root / "distributed.json",
+            {},
+            frozenset({physical}),
+            True,
+        )
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            clean = analyzer.check_compiled_storage_boundary(
+                {"distributed": report}, self.root
+            )
+
+        self.assertFalse(clean)
+        self.assertIn("distributed analyzes storage/db/db.zig", diagnostics.getvalue())
+
+    def test_compiled_storage_boundary_rejects_physical_serverless_report(self):
+        control = self.write("storage/db/control_root.zig", "pub const value = 1;\n")
+        physical = self.write("storage/db/db.zig", "pub const value = 1;\n")
+        distributed = analyzer.TimeReport(
+            "distributed",
+            self.root / "distributed.json",
+            {},
+            frozenset({control}),
+            True,
+        )
+        serverless = analyzer.TimeReport(
+            "serverless",
+            self.root / "serverless.json",
+            {},
+            frozenset({physical}),
+            True,
+        )
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            clean = analyzer.check_compiled_storage_boundary(
+                {"distributed": distributed, "serverless": serverless}, self.root
+            )
+
+        self.assertFalse(clean)
+        self.assertIn("serverless analyzes storage/db/db.zig", diagnostics.getvalue())
+
+    def test_compiled_storage_boundary_rejects_physical_api_report(self):
+        control = self.write("storage/db/control_root.zig", "pub const value = 1;\n")
+        physical = self.write("storage/db/db.zig", "pub const value = 1;\n")
+        reports = {
+            "distributed": analyzer.TimeReport(
+                "distributed", self.root / "distributed.json", {}, frozenset({control}), True
+            ),
+            "api": analyzer.TimeReport(
+                "api", self.root / "api.json", {}, frozenset({physical}), True
+            ),
+        }
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            clean = analyzer.check_compiled_storage_boundary(reports, self.root)
+
+        self.assertFalse(clean)
+        self.assertIn("api analyzes storage/db/db.zig", diagnostics.getvalue())
+
+    def write_ha_seed_failure_fixture(self, registry: str, activation: str) -> None:
+        self.write("runtime_failure_identity.zig", registry)
+        for relative in analyzer.HA_SEED_FAILURE_SOURCE_FILES:
+            self.write(relative, activation if relative.endswith("seed_activation.zig") else "")
+
+    def test_ha_seed_failure_registry_accepts_exact_mapping(self):
+        self.write_ha_seed_failure_fixture(
+            ".{ .status = .invalid_staging_root, .err = error.InvalidStagingRoot },\n",
+            "fn validate() !void { return error.InvalidStagingRoot; }\n",
+        )
+
+        self.assertTrue(analyzer.check_ha_seed_failure_registry(self.root))
+
+    def test_ha_seed_failure_registry_rejects_unmapped_domain_error(self):
+        self.write_ha_seed_failure_fixture(
+            "",
+            "fn validate() !void { return error.NewLifecycleFailure; }\n",
+        )
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            clean = analyzer.check_ha_seed_failure_registry(self.root)
+
+        self.assertFalse(clean)
+        self.assertIn("error.NewLifecycleFailure has no stable status", diagnostics.getvalue())
 
     def test_resolve_source_rejects_escape(self):
         self.write("entry.zig", "pub const value = 1;\n")
@@ -116,6 +300,49 @@ class ImportGraphTest(unittest.TestCase):
             self.assertFalse(analyzer.check_codegen_boundary(graph))
         self.assertIn(
             "standalone/inference_host.zig -> standalone/runtime.zig",
+            diagnostics.getvalue(),
+        )
+
+    def test_codegen_boundary_rejects_raw_inference_provider_export(self):
+        self.write_codegen_boundaries()
+        self.write(
+            "standalone/inference_bridge.zig",
+            "pub const ProviderContext = extern struct {};\n",
+        )
+        graph = analyzer.ImportGraph(self.root)
+
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            self.assertFalse(analyzer.check_codegen_boundary(graph))
+        self.assertIn("removed raw inference ABI token ProviderContext", diagnostics.getvalue())
+
+    def test_codegen_boundary_accepts_control_wal_runtime_selector(self):
+        self.write_codegen_boundaries()
+        self.write(
+            "storage/ha/replication_log.zig",
+            'const wal = @import("../wal_runtime.zig");\n',
+        )
+        self.write(
+            "storage/wal_runtime.zig",
+            'const native = @import("wal.zig");\n',
+        )
+        graph = analyzer.ImportGraph(self.root)
+
+        self.assertTrue(analyzer.check_codegen_boundary(graph))
+
+    def test_codegen_boundary_rejects_direct_native_wal_import(self):
+        self.write_codegen_boundaries()
+        self.write(
+            "storage/ha/replication_log.zig",
+            'const wal = @import("../wal.zig");\n',
+        )
+        graph = analyzer.ImportGraph(self.root)
+
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            self.assertFalse(analyzer.check_codegen_boundary(graph))
+        self.assertIn(
+            "storage/ha/replication_log.zig directly imports storage/wal.zig",
             diagnostics.getvalue(),
         )
 
@@ -216,6 +443,75 @@ class ImportGraphTest(unittest.TestCase):
         report = analyzer.TimeReport("old", self.root / "old.json", {}, frozenset(), False)
 
         self.assertFalse(analyzer.aggregate_overlap_stats([report])["available"])
+
+    def test_object_report_attributes_alloc_sections_to_longest_source_module(self):
+        source_root = self.root / "src"
+        (source_root / "storage/db").mkdir(parents=True)
+        (source_root / "storage/db.zig").write_text("pub const root = true;\n")
+        (source_root / "storage/db/db.zig").write_text("pub const implementation = true;\n")
+        object_path = self.write_elf_object(
+            "candidate.o",
+            [
+                (".text..Lstorage.db.db.DB.open.412", 64, 0x6),
+                (".rodata..Lstorage.db.db.DB.open", 16, 0x2),
+                (".debug_info", 4096, 0),
+            ],
+        )
+
+        report = analyzer.load_object_report("candidate", object_path, source_root)
+
+        self.assertEqual(80, report.alloc_bytes)
+        self.assertEqual(64, report.text_bytes)
+        self.assertEqual(0, report.unassigned_bytes)
+        self.assertEqual(
+            analyzer.ModuleEmission(bytes=80, text_bytes=64, sections=2),
+            report.modules["storage.db.db"],
+        )
+        self.assertEqual(
+            analyzer.SectionEmission(module="storage.db.db", bytes=64, text_bytes=64),
+            report.named_sections[".text..Lstorage.db.db.DB.open"],
+        )
+
+    def test_object_overlap_separates_same_module_from_repeated_named_sections(self):
+        one = analyzer.ObjectReport(
+            "one",
+            self.root / "one.o",
+            {"storage.db.db": analyzer.ModuleEmission(100, 80, 2)},
+            100,
+            80,
+            0,
+            {
+                ".text..Lstorage.db.db.DB.open": analyzer.SectionEmission("storage.db.db", 80, 80),
+                ".rodata..Lstorage.db.db.onlyOne": analyzer.SectionEmission("storage.db.db", 20, 0),
+            },
+        )
+        two = analyzer.ObjectReport(
+            "two",
+            self.root / "two.o",
+            {
+                "storage.db.db": analyzer.ModuleEmission(90, 70, 2),
+                "api.query": analyzer.ModuleEmission(20, 15, 1),
+            },
+            110,
+            85,
+            0,
+            {
+                ".text..Lstorage.db.db.DB.open": analyzer.SectionEmission("storage.db.db", 70, 70),
+                ".text..Lstorage.db.db.onlyTwo": analyzer.SectionEmission("storage.db.db", 20, 0),
+                ".text..Lapi.query.parse": analyzer.SectionEmission("api.query", 20, 15),
+            },
+        )
+
+        stats = analyzer.aggregate_object_overlap_stats([one, two])
+
+        self.assertEqual(1, stats["coemitted_modules"])
+        self.assertEqual(90, stats["coemitted_module_bytes"])
+        self.assertEqual(1, stats["duplicated_sections"])
+        self.assertEqual(70, stats["duplicate_bytes"])
+        self.assertEqual(70, stats["duplicate_text_bytes"])
+        self.assertEqual("storage.db.db", stats["modules"][0]["name"])
+        self.assertEqual(1, stats["modules"][0]["duplicated_sections"])
+
 
 if __name__ == "__main__":
     unittest.main()

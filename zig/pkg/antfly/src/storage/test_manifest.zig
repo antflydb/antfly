@@ -19,7 +19,9 @@ comptime {
     _ = @import("backup_bundle_io.zig");
     _ = @import("backup_repository.zig");
     _ = @import("coverage_identity.zig");
+    _ = @import("data_raft_projection_wire.zig");
     _ = @import("db/aggregations.zig");
+    _ = @import("db/aggregations_contract.zig");
     _ = @import("db/algebraic/adaptive.zig");
     _ = @import("db/algebraic/algebra.zig");
     _ = @import("db/algebraic/cylinder.zig");
@@ -27,6 +29,7 @@ comptime {
     _ = @import("db/algebraic/fact.zig");
     _ = @import("db/algebraic/hll.zig");
     _ = @import("db/algebraic/index.zig");
+    _ = @import("db/algebraic/index_config.zig");
     _ = @import("db/algebraic/ir.zig");
     _ = @import("db/algebraic/join.zig");
     _ = @import("db/algebraic/law.zig");
@@ -94,12 +97,14 @@ comptime {
     _ = @import("db/mod.zig");
     _ = @import("db/native_backup.zig");
     _ = @import("db/ownership.zig");
+    _ = @import("db/planning_bindings.zig");
     _ = @import("db/planning_stats.zig");
     _ = @import("db/promotion_runtime.zig");
     _ = @import("db/query/graph_exec.zig");
     _ = @import("db/query/projection.zig");
     _ = @import("db/query/result_shape.zig");
     _ = @import("db/query/search_exec.zig");
+    _ = @import("db/query/structured_filter_validation.zig");
     _ = @import("db/query_metrics.zig");
     _ = @import("db/range_state.zig");
     _ = @import("db/resolution_handoff.zig");
@@ -108,6 +113,7 @@ comptime {
     _ = @import("db/snapshot_admission.zig");
     _ = @import("db/template_remote_stub.zig");
     _ = @import("db/template_stub.zig");
+    _ = @import("db/text_memory_stats.zig");
     _ = @import("db/transform.zig");
     _ = @import("db/typed_doc_values_coverage.zig");
     _ = @import("db/types.zig");
@@ -160,6 +166,8 @@ comptime {
     _ = @import("hbc_adapter.zig");
     _ = @import("hierarchy_navigation.zig");
     _ = @import("internal_keys.zig");
+    _ = @import("kernel_owner_client.zig");
+    _ = @import("kernel_wal_wire.zig");
     _ = @import("lite/backend.zig");
     _ = @import("lite/bridge.zig");
     _ = @import("lite/conformance_test.zig");

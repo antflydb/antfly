@@ -21,14 +21,10 @@ const State = struct {
     staged: restore_staging.StagedRestore,
 };
 
-pub fn create(context: *const bridge.CreateContext) callconv(.c) bridge.Status {
-    if (context.abi_version != bridge.abi_version)
-        return bridge.statusFromError(error.UnsupportedVersion);
-    // This compilation unit creates and destroys the staging state. Keeping
-    // its allocator local avoids transporting std.mem.Allocator's Zig vtable
-    // across the CLI/distributed boundary.
-    const allocator = std.heap.c_allocator;
-    const state = allocator.create(State) catch |err| return bridge.statusFromError(err);
+pub fn create(context: *const bridge.CreateContext) callconv(.c) c_int {
+    const allocator_ptr: *const std.mem.Allocator = @ptrCast(@alignCast(context.allocator));
+    const allocator = allocator_ptr.*;
+    const state = allocator.create(State) catch return bridge.Status.out_of_memory;
     errdefer allocator.destroy(state);
 
     const input_path = context.input_path_ptr[0..context.input_path_len];
@@ -37,8 +33,11 @@ pub fn create(context: *const bridge.CreateContext) callconv(.c) bridge.Status {
     const location = context.location_ptr[0..context.location_len];
     state.* = .{
         .allocator = allocator,
-        .staged = restore_staging.stageInputRestoreBackup(allocator, input_path, table_name, backup_id, location) catch |err|
-            return bridge.statusFromError(err),
+        .staged = restore_staging.stageInputRestoreBackup(allocator, input_path, table_name, backup_id, location) catch |err| switch (err) {
+            error.OutOfMemory => return bridge.Status.out_of_memory,
+            error.InvalidArguments => return bridge.Status.invalid_arguments,
+            else => return bridge.Status.failed,
+        },
     };
 
     context.result.* = .{
@@ -52,7 +51,7 @@ pub fn create(context: *const bridge.CreateContext) callconv(.c) bridge.Status {
         .table_name_ptr = state.staged.table_name.ptr,
         .table_name_len = state.staged.table_name.len,
     };
-    return .ok;
+    return bridge.Status.ok;
 }
 
 pub fn destroy(handle: *anyopaque) callconv(.c) void {

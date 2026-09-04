@@ -19,6 +19,7 @@ const std = @import("std");
 const db_mod = struct {
     pub const types = @import("../storage/db/types.zig");
     pub const DocumentArtifactChildRangeApplyBatch = @import("../storage/db/document_artifact_child_range.zig").ApplyBatch;
+    pub const TextMemoryAttributionStats = @import("../storage/db/text_memory_stats.zig").TextMemoryAttributionStats;
 };
 const backend_types = @import("../storage/backend_types.zig");
 const table_create_contract = @import("table_create_contract.zig");
@@ -29,6 +30,45 @@ const runtime_status = @import("runtime_status.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const runtime_error_abi = @import("../runtime_error_abi.zig");
 const runtime_native_abi = @import("../runtime_native_abi.zig");
+
+pub const LocalStructuralReconcileState = enum {
+    complete,
+    repair_pending,
+    busy,
+    degraded,
+    restore_repair_pending,
+};
+
+pub const LocalStructuralReconcileResult = struct {
+    state: LocalStructuralReconcileState = .complete,
+    indexes_added: u64 = 0,
+    indexes_removed: u64 = 0,
+    indexes_pending: u64 = 0,
+    repair_discovered: u64 = 0,
+    repair_attempted: u64 = 0,
+    repair_repaired: u64 = 0,
+    repair_remaining: u64 = 0,
+    repair_terminal: u64 = 0,
+    repair_busy: u64 = 0,
+    repair_disk_waits: u64 = 0,
+    next_retry_at_ms: u64 = 0,
+    restore_repair_attempted: u64 = 0,
+    restore_repair_progressed: u64 = 0,
+    restore_repair_pending: u64 = 0,
+};
+
+/// One exact structural observation captured before a transient compiled
+/// owner is retired. The control plane publishes `runtime_status` under the
+/// same table epoch that admitted the reconcile operation.
+pub const LocalStructuralReconcileObservation = struct {
+    result: LocalStructuralReconcileResult,
+    runtime_status: ?runtime_status.LocalTableRuntimeStatus = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.runtime_status) |*status| status.deinit(alloc);
+        self.* = undefined;
+    }
+};
 
 pub const TableWriteSource = struct {
     ptr: *anyopaque,
@@ -83,6 +123,13 @@ pub const TableWriteSource = struct {
         backup_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
+            table_name: []const u8,
+            plan: backup_contract.TableBackupPlan,
+        ) anyerror!?[]backup_contract.ShardSnapshot = null,
+        backup_table_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
             table_name: []const u8,
             plan: backup_contract.TableBackupPlan,
         ) anyerror!?[]backup_contract.ShardSnapshot = null,
@@ -160,6 +207,22 @@ pub const TableWriteSource = struct {
             ptr: *anyopaque,
             table_name: []const u8,
         ) void = null,
+        begin_bulk_ingest_group_local: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+        ) anyerror!?void = null,
+        finish_bulk_ingest_group_local: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+            options: backend_types.BulkIngestFinishOptions,
+        ) anyerror!?void = null,
+        abort_bulk_ingest_group_local: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+        ) void = null,
         batch_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -216,6 +279,14 @@ pub const TableWriteSource = struct {
         corrupt_embedding_artifact: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            index_name: []const u8,
+        ) anyerror!?void = null,
+        corrupt_embedding_artifact_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
             table_name: []const u8,
             doc_key: []const u8,
             index_name: []const u8,
@@ -331,6 +402,26 @@ pub const TableWriteSource = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
         ) anyerror!?runtime_status.LocalTableRuntimeStatuses = null,
+        text_memory_attribution_stats_best_effort: ?*const fn (
+            ptr: *anyopaque,
+        ) db_mod.TextMemoryAttributionStats = null,
+        preflight_write_admission_group_local: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+        ) anyerror!?void = null,
+        prepare_ha_seed_snapshot_group_local: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+            deadline_ns: u64,
+        ) anyerror!?void = null,
+        find_median_key_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+        ) anyerror!?[]u8 = null,
         request_table_structural_reconcile: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -341,6 +432,25 @@ pub const TableWriteSource = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
             index_name: []const u8,
+        ) anyerror!?void = null,
+        reconcile_table_group_local: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+            target_index_name: ?[]const u8,
+            advance_index_repair: bool,
+        ) anyerror!?LocalStructuralReconcileResult = null,
+        reconcile_table_group_local_transient: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+            target_index_name: ?[]const u8,
+            advance_index_repair: bool,
+        ) anyerror!?LocalStructuralReconcileResult = null,
+        retire_table_group_local: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
         ) anyerror!?void = null,
         /// Tail extensions retain the established vtable prefix. Cancellation
         /// tokens are transport-neutral borrowed callbacks and are valid over
@@ -402,6 +512,20 @@ pub const TableWriteSource = struct {
             req: db_mod.types.TransactionIntentRequest,
             context: distributed_txn.PreDecisionContext,
         ) anyerror!?void = null,
+        reconcile_table_group_local_transient_observed: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            target_index_name: ?[]const u8,
+            advance_index_repair: bool,
+        ) anyerror!?LocalStructuralReconcileObservation = null,
+        local_runtime_status_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+        ) anyerror!?runtime_status.LocalTableRuntimeStatus = null,
         /// Routes a transaction decision observation to the current Raft
         /// leader and orders it behind a quorum read barrier.
         txn_status_group_linearizable: ?*const fn (
@@ -467,6 +591,34 @@ pub const TableWriteSource = struct {
     pub fn abortBulkIngest(self: TableWriteSource, table_name: []const u8) void {
         const fn_ptr = self.vtable.abort_bulk_ingest orelse return;
         fn_ptr(self.ptr, table_name);
+    }
+
+    pub fn beginBulkIngestGroupLocal(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.begin_bulk_ingest_group_local orelse return null;
+        return try BoundaryAbi.call("begin_bulk_ingest_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name });
+    }
+
+    pub fn finishBulkIngestGroupLocal(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+        options: backend_types.BulkIngestFinishOptions,
+    ) !?void {
+        const fn_ptr = self.vtable.finish_bulk_ingest_group_local orelse return null;
+        return try BoundaryAbi.call("finish_bulk_ingest_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, options });
+    }
+
+    pub fn abortBulkIngestGroupLocal(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) void {
+        const fn_ptr = self.vtable.abort_bulk_ingest_group_local orelse return;
+        fn_ptr(self.ptr, group_id, table_name);
     }
 
     pub fn createTable(
@@ -549,12 +701,21 @@ pub const TableWriteSource = struct {
     ) !?[]backup_contract.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table orelse return null;
         var owner_plan = plan;
-        // std.Io contains runtime-owned state and function pointers. It is safe
-        // to borrow for an in-unit callback, but it must never cross into an
-        // independently generated archive. A null override makes the storage
-        // owner select or create its own I/O runtime.
         if (self.boundary_dispatch != BoundaryAbi.local_dispatch) owner_plan.io = null;
         return try BoundaryAbi.call("backup_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, owner_plan });
+    }
+
+    pub fn backupTableGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        plan: backup_contract.TableBackupPlan,
+    ) !?[]backup_contract.ShardSnapshot {
+        const fn_ptr = self.vtable.backup_table_group_local orelse return null;
+        var owner_plan = plan;
+        if (self.boundary_dispatch != BoundaryAbi.local_dispatch) owner_plan.io = null;
+        return try BoundaryAbi.call("backup_table_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, owner_plan });
     }
 
     pub fn backupTableToLocation(
@@ -882,6 +1043,18 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("corrupt_embedding_artifact", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, doc_key, index_name });
     }
 
+    pub fn corruptEmbeddingArtifactGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        index_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.corrupt_embedding_artifact_group_local orelse return null;
+        return try BoundaryAbi.call("corrupt_embedding_artifact_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, doc_key, index_name });
+    }
+
     pub fn reprocessDocumentArtifact(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -1059,6 +1232,28 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("local_runtime_statuses", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
     }
 
+    pub fn localRuntimeStatusGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?runtime_status.LocalTableRuntimeStatus {
+        const fn_ptr = self.vtable.local_runtime_status_group_local orelse return null;
+        return try BoundaryAbi.call("local_runtime_status_group_local", self.boundary_dispatch, fn_ptr, .{
+            self.ptr,
+            alloc,
+            group_id,
+            table_name,
+        });
+    }
+
+    pub fn textMemoryAttributionStatsBestEffort(
+        self: TableWriteSource,
+    ) db_mod.TextMemoryAttributionStats {
+        const fn_ptr = self.vtable.text_memory_attribution_stats_best_effort orelse return .{};
+        return fn_ptr(self.ptr);
+    }
+
     pub fn requestTableStructuralReconcile(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -1066,6 +1261,35 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.request_table_structural_reconcile orelse return null;
         return try BoundaryAbi.call("request_table_structural_reconcile", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
+    }
+
+    pub fn preflightWriteAdmissionGroupLocal(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.preflight_write_admission_group_local orelse return null;
+        return try BoundaryAbi.call("preflight_write_admission_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name });
+    }
+
+    pub fn prepareHASeedSnapshotGroupLocal(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+        deadline_ns: u64,
+    ) !?void {
+        const fn_ptr = self.vtable.prepare_ha_seed_snapshot_group_local orelse return null;
+        return try BoundaryAbi.call("prepare_ha_seed_snapshot_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, deadline_ns });
+    }
+
+    pub fn findMedianKeyGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?[]u8 {
+        const fn_ptr = self.vtable.find_median_key_group_local orelse return null;
+        return try BoundaryAbi.call("find_median_key_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name });
     }
 
     pub fn requestTableIndexStructuralReconcile(
@@ -1076,6 +1300,72 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.request_table_index_structural_reconcile orelse return try self.requestTableStructuralReconcile(alloc, table_name);
         return try BoundaryAbi.call("request_table_index_structural_reconcile", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name });
+    }
+
+    pub fn reconcileTableGroupLocal(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+        advance_index_repair: bool,
+    ) !?LocalStructuralReconcileResult {
+        const fn_ptr = self.vtable.reconcile_table_group_local orelse return null;
+        return try BoundaryAbi.call("reconcile_table_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, target_index_name, advance_index_repair });
+    }
+
+    /// Reconcile through a resident owner when one already exists, but do not
+    /// turn a cold startup inspection into a long-lived writer owner.
+    pub fn reconcileTableGroupLocalTransient(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+        advance_index_repair: bool,
+    ) !?LocalStructuralReconcileResult {
+        const fn_ptr = self.vtable.reconcile_table_group_local_transient orelse
+            return try self.reconcileTableGroupLocal(
+                group_id,
+                table_name,
+                target_index_name,
+                advance_index_repair,
+            );
+        return try BoundaryAbi.call("reconcile_table_group_local_transient", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, target_index_name, advance_index_repair });
+    }
+
+    pub fn reconcileTableGroupLocalTransientObserved(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+        advance_index_repair: bool,
+    ) !?LocalStructuralReconcileObservation {
+        const fn_ptr = self.vtable.reconcile_table_group_local_transient_observed orelse {
+            const result = (try self.reconcileTableGroupLocalTransient(
+                group_id,
+                table_name,
+                target_index_name,
+                advance_index_repair,
+            )) orelse return null;
+            return .{ .result = result };
+        };
+        return try BoundaryAbi.call("reconcile_table_group_local_transient_observed", self.boundary_dispatch, fn_ptr, .{
+            self.ptr,
+            alloc,
+            group_id,
+            table_name,
+            target_index_name,
+            advance_index_repair,
+        });
+    }
+
+    pub fn retireTableGroupLocal(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.retire_table_group_local orelse return null;
+        return try BoundaryAbi.call("retire_table_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name });
     }
 };
 

@@ -12,9 +12,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const storage_source_options = @import("storage_source_options");
 pub const raft_apply_store = @import("raft_apply_store.zig");
-pub const RaftApplyStore = raft_apply_store.RaftApplyStore;
-pub const RaftApplyStoreConfig = raft_apply_store.RaftApplyStoreConfig;
+const raft_apply_client = @import("../../storage/metadata_raft_apply_client.zig");
+pub const RaftApplyStore = if (storage_source_options.control_only) raft_apply_client.RaftApplyStore else raft_apply_store.RaftApplyStore;
+pub const RaftApplyStoreConfig = if (storage_source_options.control_only) raft_apply_client.RaftApplyStoreConfig else raft_apply_store.RaftApplyStoreConfig;
 pub const AppliedMetadataBatch = raft_apply_store.AppliedMetadataBatch;
 pub const TransitionCommand = raft_apply_store.TransitionCommand;
 pub const ExtensionLifecycleDelta = raft_apply_store.ExtensionLifecycleDelta;

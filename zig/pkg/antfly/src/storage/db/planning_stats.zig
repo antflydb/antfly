@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const planning_bindings = @import("planning_bindings.zig");
 const query_search = @import("query/search_exec.zig");
 const distributed_stats = @import("../../search/distributed_stats.zig");
 const types = @import("types.zig");
@@ -211,13 +212,6 @@ pub fn collectSearchRequestStatsAlloc(
     return summary;
 }
 
-fn preflightRequestNeedsPrimaryTextIndex(req: types.SearchRequest) bool {
-    return req.full_text != null or
-        req.filter_query_json.len > 0 or
-        req.exclusion_query_json.len > 0 or
-        (!query_search.isDefaultMatchAll(req.query) and query_search.isTextQuery(req.query));
-}
-
 fn collectTextIndexEstimatesAlloc(
     alloc: std.mem.Allocator,
     collector: PlanningStatsCollector,
@@ -229,10 +223,15 @@ fn collectTextIndexEstimatesAlloc(
         items.deinit(alloc);
     }
 
-    if (preflightRequestNeedsPrimaryTextIndex(req)) {
-        var estimate = try collector.resolveTextIndexEstimate(alloc, req.index_name, req) orelse return error.IndexNotFound;
-        errdefer estimate.deinit(alloc);
-        try appendUniqueTextIndexEstimate(alloc, &items, &estimate);
+    const primary_requirement = planning_bindings.primaryTextIndexRequirement(req);
+    if (primary_requirement != .none) {
+        if (try collector.resolveTextIndexEstimate(alloc, req.index_name, req)) |resolved| {
+            var estimate = resolved;
+            errdefer estimate.deinit(alloc);
+            try appendUniqueTextIndexEstimate(alloc, &items, &estimate);
+        } else if (primary_requirement == .required) {
+            return error.IndexNotFound;
+        }
     }
     for (req.full_text_queries) |query| {
         var estimate = try collector.resolveTextIndexEstimate(alloc, query.index_name, req) orelse return error.IndexNotFound;

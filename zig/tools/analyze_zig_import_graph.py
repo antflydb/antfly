@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Report potential and compiler-analyzed reachability in Antfly's Zig graph.
+"""Report potential, analyzed, and emitted reachability in Antfly's Zig graph.
 
 The source graph follows literal relative ``@import("*.zig")`` edges. It makes
 accidental barrel imports and surprising paths visible, but includes imports in
 lazy declarations and tests. A Zig ``--time-report`` JSON is the authoritative
-view of files that a particular compiler invocation actually analyzed. Passing
-multiple reports also ranks duplicate analyzed/code-generated source groups.
+view of files that a particular compiler invocation loaded and declarations it
+analyzed. A cross-compiled ELF object is the authoritative view of emitted
+machine-code/data sections. Passing multiple reports ranks lazy file overlap,
+same-module co-emission, and repeated named codegen sections separately.
 """
 
 from __future__ import annotations
@@ -14,8 +16,9 @@ import argparse
 import collections
 import json
 import re
+import struct
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -24,6 +27,7 @@ SCRIPT = Path(__file__).resolve()
 REPO_ROOT = SCRIPT.parents[2]
 DEFAULT_SOURCE_ROOT = REPO_ROOT / "zig/pkg/antfly/src"
 IMPORT_RE = re.compile(r'@import\(\s*"([^"]+)"\s*\)')
+GENERATED_SECTION_ID_RE = re.compile(r"\.\d+$")
 
 DEFAULT_ROOTS = {
     "data": "data/mod.zig",
@@ -57,7 +61,29 @@ CODEGEN_BOUNDARIES = (
     ("standalone/inference_host.zig", "standalone/runtime.zig"),
     ("standalone/inference_host.zig", "data/runtime.zig"),
     ("standalone/inference_host.zig", "metadata/runtime.zig"),
+    ("standalone/inference_client.zig", "standalone/inference_host.zig"),
+    ("standalone/inference_client.zig", "inference_runtime/runtime.zig"),
 )
+
+INFERENCE_ABI_FORBIDDEN_TOKENS = (
+    ("standalone/inference_bridge.zig", "ProviderContext"),
+    ("standalone/inference_bridge.zig", "antfly_standalone_inference_provider"),
+    ("runtime_artifact_lib.zig", "antfly_standalone_inference_provider"),
+    ("standalone/runtime.zig", "antfly_standalone_inference_provider"),
+)
+
+# Control-plane consumers must use the storage-free WAL facade.  The facade
+# itself selects the native implementation when it is compiled into the
+# storage owner, so lexical transitive reachability is intentional; only a
+# direct import of the physical WAL bypasses the compiled ownership boundary.
+CONTROL_WAL_CONSUMERS = (
+    "storage/ha/replication_log.zig",
+    "storage/ha/standby.zig",
+    "storage/ha/fencing.zig",
+    "storage/ha/slot_store.zig",
+    "raft/storage/wal_replica_state.zig",
+)
+NATIVE_WAL_IMPLEMENTATION = "storage/wal.zig"
 
 # These files form the source-level ABI between the separately code-generated
 # API and distributed runtime units. Keep their direct imports data-only. The
@@ -65,8 +91,11 @@ CODEGEN_BOUNDARIES = (
 # is performed against an API compiler time report when one is supplied.
 API_KERNEL_CONTRACTS = (
     "api/kernel_exports.zig",
+    "api/storage_snapshot_source.zig",
     "api/table_read_source.zig",
     "api/table_write_source.zig",
+    "storage/data_raft_apply_client.zig",
+    "storage/data_raft_projection_wire.zig",
 )
 API_KERNEL_IMPLEMENTATIONS = (
     "api/table_reads.zig",
@@ -76,6 +105,42 @@ API_KERNEL_IMPLEMENTATIONS = (
     "storage/docstore.zig",
     "storage/lmdb.zig",
     "storage/lmdb_backend.zig",
+)
+
+# Authoritative compiler-report gate for the linked distributed/control unit.
+# These modules own physical local storage and must be compiled only by the
+# storage unit. Lexical reachability is intentionally not enough here because
+# Zig source selectors and lazy declarations make the compiler's `all_files`
+# set the relevant evidence.
+DISTRIBUTED_FORBIDDEN_STORAGE_FILES = (
+    "storage/db/db.zig",
+    "storage/db/core.zig",
+    "storage/db/catalog/index_manager.zig",
+    "storage/db/enrichment/enrichment_runtime.zig",
+    "storage/ha/seed_activation.zig",
+    "storage/ha/seed_materialization.zig",
+    "storage/persistent.zig",
+)
+
+HA_SEED_FAILURE_SOURCE_FILES = (
+    "storage/ha/seed_activation.zig",
+    "storage/ha/seed_materialization.zig",
+    "storage/ha/seed_topology.zig",
+    "storage/ha/seed_artifact.zig",
+    "storage/ha/local_generation_gc.zig",
+    "storage/ha/lifecycle_receipt_ledger.zig",
+)
+
+# Deliberate test-only failures must remain unexpected provider defects rather
+# than becoming stable production ABI statuses.
+HA_SEED_TEST_ONLY_ERRORS = frozenset(
+    {
+        "InjectedActivationFailure",
+        "InjectedArtifactFailure",
+        "InjectedLocalGCFailure",
+        "InjectedPairedLocalGCFailure",
+        "TestExpectedEqual",
+    }
 )
 
 
@@ -92,6 +157,31 @@ class TimeReport:
     raw: dict[str, object]
     repo_files: frozenset[Path]
     has_file_list: bool
+
+
+@dataclass(frozen=True)
+class ModuleEmission:
+    bytes: int
+    text_bytes: int
+    sections: int
+
+
+@dataclass(frozen=True)
+class SectionEmission:
+    module: str
+    bytes: int
+    text_bytes: int
+
+
+@dataclass(frozen=True)
+class ObjectReport:
+    name: str
+    path: Path
+    modules: dict[str, ModuleEmission]
+    alloc_bytes: int
+    text_bytes: int
+    unassigned_bytes: int
+    named_sections: dict[str, SectionEmission] = field(default_factory=dict)
 
 
 class ImportGraph:
@@ -223,6 +313,14 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="summarize a Zig --time-report JSON; may be repeated",
     )
     parser.add_argument(
+        "--object",
+        action="append",
+        type=parse_named_root,
+        default=[],
+        metavar="NAME=PATH",
+        help="summarize emitted modules in an ELF Zig object; may be repeated",
+    )
+    parser.add_argument(
         "--compare",
         action="append",
         type=parse_comparison,
@@ -252,6 +350,22 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "fail on direct storage/table implementation imports from API ABI files"
+        ),
+    )
+    parser.add_argument(
+        "--check-compiled-storage-boundary",
+        action="store_true",
+        help=(
+            "fail if the distributed compiler time report analyzes physical "
+            "storage implementation files"
+        ),
+    )
+    parser.add_argument(
+        "--check-ha-seed-failure-registry",
+        action="store_true",
+        help=(
+            "fail if an HA seed lifecycle error lacks a stable runtime failure "
+            "status and inverse mapping"
         ),
     )
     parser.add_argument("--largest", type=int, default=0, metavar="N", help="show the N largest files per graph")
@@ -290,6 +404,133 @@ def load_time_report(name: str, path: Path, repo_root: Path = REPO_ROOT) -> Time
         if candidate.suffix == ".zig":
             repo_files.add(candidate)
     return TimeReport(name, path, raw, frozenset(repo_files), has_file_list)
+
+
+def elf_sections(path: Path) -> list[tuple[str, int, int]]:
+    """Return ``(name, size, flags)`` for an ELF64 little-endian object."""
+
+    data = path.read_bytes()
+    if len(data) < 64 or data[:4] != b"\x7fELF":
+        raise ValueError(f"object is not ELF: {path}")
+    if data[4] != 2 or data[5] != 1:
+        raise ValueError(f"object must be ELF64 little-endian: {path}")
+    header = struct.unpack_from("<16sHHIQQQIHHHHHH", data)
+    section_offset = header[6]
+    section_entry_size = header[11]
+    section_count = header[12]
+    string_table_index = header[13]
+    if section_entry_size < 64 or section_count == 0 or string_table_index >= section_count:
+        raise ValueError(f"unsupported ELF section table: {path}")
+    section_table_end = section_offset + section_entry_size * section_count
+    if section_table_end > len(data):
+        raise ValueError(f"truncated ELF section table: {path}")
+
+    headers = [
+        struct.unpack_from("<IIQQQQIIQQ", data, section_offset + index * section_entry_size)
+        for index in range(section_count)
+    ]
+    strings_header = headers[string_table_index]
+    strings_offset = strings_header[4]
+    strings_size = strings_header[5]
+    strings_end = strings_offset + strings_size
+    if strings_end > len(data):
+        raise ValueError(f"truncated ELF section-name table: {path}")
+    strings = data[strings_offset:strings_end]
+
+    def section_name(offset: int) -> str:
+        if offset >= len(strings):
+            return ""
+        end = strings.find(b"\0", offset)
+        if end < 0:
+            end = len(strings)
+        return strings[offset:end].decode("utf-8", errors="replace")
+
+    return [(section_name(item[0]), item[5], item[2]) for item in headers]
+
+
+def source_module_tokens(source_root: Path) -> tuple[str, ...]:
+    tokens = []
+    for path in source_root.rglob("*.zig"):
+        token = path.relative_to(source_root).with_suffix("").as_posix().replace("/", ".")
+        # One-segment module names are indistinguishable from dependencies with
+        # the same package name in stripped section symbols. Leave them
+        # unassigned instead of claiming false Antfly ownership.
+        if "." in token:
+            tokens.append(token)
+    return tuple(sorted(tokens, key=lambda value: (-len(value), value)))
+
+
+def section_source_module(section_name: str, module_tokens: Iterable[str]) -> str | None:
+    for token in module_tokens:
+        if token in section_name:
+            return token
+    return None
+
+
+def normalized_codegen_section_name(section_name: str) -> str:
+    """Remove only Zig's compilation-local trailing declaration identifier."""
+
+    return GENERATED_SECTION_ID_RE.sub("", section_name)
+
+
+def load_object_report(name: str, path: Path, source_root: Path = DEFAULT_SOURCE_ROOT) -> ObjectReport:
+    module_tokens = source_module_tokens(source_root.resolve())
+    mutable: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0, 0])
+    mutable_sections: dict[str, list[object]] = {}
+    ambiguous_section_names: set[str] = set()
+    alloc_bytes = 0
+    text_bytes = 0
+    unassigned_bytes = 0
+    for section_name, size, flags in elf_sections(path):
+        # SHF_ALLOC: the linker may retain this section in a runtime artifact.
+        if not flags & 0x2 or size == 0:
+            continue
+        alloc_bytes += size
+        is_text = section_name.startswith(".text")
+        if is_text:
+            text_bytes += size
+        module = section_source_module(section_name, module_tokens)
+        if module is None:
+            unassigned_bytes += size
+            continue
+        row = mutable[module]
+        row[0] += size
+        row[1] += size if is_text else 0
+        row[2] += 1
+        normalized_name = normalized_codegen_section_name(section_name)
+        if normalized_name in ambiguous_section_names:
+            continue
+        section_row = mutable_sections.setdefault(normalized_name, [module, 0, 0])
+        # A normalized name must continue to resolve to the same source module.
+        # If Zig ever violates that assumption, retaining neither attribution is
+        # safer than manufacturing cross-module overlap.
+        if section_row[0] != module:
+            mutable_sections.pop(normalized_name, None)
+            ambiguous_section_names.add(normalized_name)
+            continue
+        section_row[1] = int(section_row[1]) + size
+        section_row[2] = int(section_row[2]) + (size if is_text else 0)
+    modules = {
+        module: ModuleEmission(bytes=row[0], text_bytes=row[1], sections=row[2])
+        for module, row in mutable.items()
+    }
+    named_sections = {
+        section_name: SectionEmission(
+            module=str(row[0]),
+            bytes=int(row[1]),
+            text_bytes=int(row[2]),
+        )
+        for section_name, row in mutable_sections.items()
+    }
+    return ObjectReport(
+        name,
+        path,
+        modules,
+        alloc_bytes,
+        text_bytes,
+        unassigned_bytes,
+        named_sections,
+    )
 
 
 def integer(value: object) -> int:
@@ -420,6 +661,159 @@ def print_aggregate_overlap(reports: Iterable[TimeReport], top_groups: int) -> N
         )
 
 
+def object_report_stats(report: ObjectReport) -> dict[str, object]:
+    return {
+        "alloc_bytes": report.alloc_bytes,
+        "text_bytes": report.text_bytes,
+        "assigned_bytes": sum(item.bytes for item in report.modules.values()),
+        "unassigned_bytes": report.unassigned_bytes,
+        "emitting_modules": len(report.modules),
+        "modules": [
+            {
+                "name": name,
+                "bytes": emission.bytes,
+                "text_bytes": emission.text_bytes,
+                "sections": emission.sections,
+            }
+            for name, emission in sorted(
+                report.modules.items(),
+                key=lambda item: (-item[1].bytes, item[0]),
+            )
+        ],
+    }
+
+
+def aggregate_object_overlap_stats(reports: Iterable[ObjectReport]) -> dict[str, object]:
+    materialized = tuple(reports)
+    module_occurrences: dict[str, list[ModuleEmission]] = collections.defaultdict(list)
+    for report in materialized:
+        for module, emission in report.modules.items():
+            module_occurrences[module].append(emission)
+    coemitted_modules = {
+        module: emissions
+        for module, emissions in module_occurrences.items()
+        if len(emissions) > 1
+    }
+    coemitted_rows = []
+    for module, emissions in coemitted_modules.items():
+        total_bytes = sum(item.bytes for item in emissions)
+        total_text_bytes = sum(item.text_bytes for item in emissions)
+        coemitted_rows.append(
+            {
+                "name": module,
+                "instances": len(emissions),
+                "total_bytes": total_bytes,
+                "coemitted_bytes": total_bytes - max(item.bytes for item in emissions),
+                "coemitted_text_bytes": total_text_bytes - max(item.text_bytes for item in emissions),
+            }
+        )
+    coemitted_rows.sort(key=lambda row: (-int(row["coemitted_bytes"]), str(row["name"])))
+
+    section_occurrences: dict[str, list[SectionEmission]] = collections.defaultdict(list)
+    for report in materialized:
+        for section_name, emission in report.named_sections.items():
+            section_occurrences[section_name].append(emission)
+    duplicated_sections = {
+        section_name: emissions
+        for section_name, emissions in section_occurrences.items()
+        if len(emissions) > 1
+    }
+    section_rows = []
+    module_rows: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0, 0])
+    for section_name, emissions in duplicated_sections.items():
+        total_bytes = sum(item.bytes for item in emissions)
+        total_text_bytes = sum(item.text_bytes for item in emissions)
+        duplicate_bytes = total_bytes - max(item.bytes for item in emissions)
+        duplicate_text_bytes = total_text_bytes - max(item.text_bytes for item in emissions)
+        modules = {item.module for item in emissions}
+        module = next(iter(modules)) if len(modules) == 1 else "<ambiguous>"
+        section_rows.append(
+            {
+                "name": section_name,
+                "module": module,
+                "instances": len(emissions),
+                "total_bytes": total_bytes,
+                "duplicate_bytes": duplicate_bytes,
+                "duplicate_text_bytes": duplicate_text_bytes,
+            }
+        )
+        module_row = module_rows[module]
+        module_row[0] += duplicate_bytes
+        module_row[1] += duplicate_text_bytes
+        module_row[2] += 1
+    section_rows.sort(key=lambda row: (-int(row["duplicate_bytes"]), str(row["name"])))
+    rows = sorted(
+        (
+            {
+                "name": module,
+                "duplicate_bytes": values[0],
+                "duplicate_text_bytes": values[1],
+                "duplicated_sections": values[2],
+            }
+            for module, values in module_rows.items()
+        ),
+        key=lambda row: (-int(row["duplicate_bytes"]), str(row["name"])),
+    )
+    return {
+        "available": bool(materialized),
+        "report_count": len(materialized),
+        "module_instances": sum(len(items) for items in module_occurrences.values()),
+        "unique_modules": len(module_occurrences),
+        "coemitted_modules": len(coemitted_modules),
+        "coemitted_module_bytes": sum(int(row["coemitted_bytes"]) for row in coemitted_rows),
+        "coemitted_module_text_bytes": sum(int(row["coemitted_text_bytes"]) for row in coemitted_rows),
+        "coemitted_module_groups": coemitted_rows,
+        "section_instances": sum(len(items) for items in section_occurrences.values()),
+        "unique_sections": len(section_occurrences),
+        "duplicated_sections": len(duplicated_sections),
+        "duplicate_bytes": sum(int(row["duplicate_bytes"]) for row in rows),
+        "duplicate_text_bytes": sum(int(row["duplicate_text_bytes"]) for row in rows),
+        "modules": rows,
+        "sections": section_rows,
+    }
+
+
+def print_object_report(report: ObjectReport, top_groups: int) -> None:
+    stats = object_report_stats(report)
+    print(f"\nobject report {report.name}: {report.path}")
+    print(f"alloc section bytes\t{stats['alloc_bytes']}")
+    print(f"text section bytes\t{stats['text_bytes']}")
+    print(f"assigned Antfly bytes\t{stats['assigned_bytes']}")
+    print(f"unassigned bytes\t{stats['unassigned_bytes']}")
+    print(f"emitting Antfly modules\t{stats['emitting_modules']}")
+    print("top emitting modules\tbytes\ttext bytes\tsections")
+    modules = stats["modules"]
+    assert isinstance(modules, list)
+    for row in modules[:top_groups]:
+        assert isinstance(row, dict)
+        print(f"{row['name']}\t{row['bytes']}\t{row['text_bytes']}\t{row['sections']}")
+
+
+def print_aggregate_object_overlap(reports: Iterable[ObjectReport], top_groups: int) -> None:
+    stats = aggregate_object_overlap_stats(reports)
+    if not stats["available"] or int(stats["report_count"]) < 2:
+        return
+    print(f"\naggregate emitted overlap ({stats['report_count']} objects)")
+    print(f"module instances\t{stats['module_instances']}")
+    print(f"unique modules\t{stats['unique_modules']}")
+    print(f"co-emitted modules\t{stats['coemitted_modules']}")
+    print(f"co-emitted module alloc-byte lower bound\t{stats['coemitted_module_bytes']}")
+    print(f"named section instances\t{stats['section_instances']}")
+    print(f"unique named sections\t{stats['unique_sections']}")
+    print(f"repeated named sections\t{stats['duplicated_sections']}")
+    print(f"repeated named-section alloc bytes\t{stats['duplicate_bytes']}")
+    print(f"repeated named-section text bytes\t{stats['duplicate_text_bytes']}")
+    print("top repeated-section modules\tsections\tduplicate bytes\tduplicate text bytes")
+    modules = stats["modules"]
+    assert isinstance(modules, list)
+    for row in modules[:top_groups]:
+        assert isinstance(row, dict)
+        print(
+            f"{row['name']}\t{row['duplicated_sections']}\t"
+            f"{row['duplicate_bytes']}\t{row['duplicate_text_bytes']}"
+        )
+
+
 def print_time_report(report: TimeReport, top_groups: int) -> None:
     stats = report_stats(report)
     print(f"\ntime report {report.name}: {report.path}")
@@ -513,6 +907,7 @@ def json_report(
     graph: ImportGraph,
     graphs: dict[str, set[Path]],
     time_reports: Iterable[TimeReport] = (),
+    object_reports: Iterable[ObjectReport] = (),
     comparisons: Iterable[tuple[TimeReport, TimeReport]] = (),
 ) -> dict[str, object]:
     report: dict[str, object] = {
@@ -530,6 +925,8 @@ def json_report(
     report["server_role_union"] = {"files": union_stats.files, "lines": union_stats.lines}
     report["time_reports"] = {item.name: report_stats(item) for item in time_reports}
     report["aggregate_compiler_overlap"] = aggregate_overlap_stats(time_reports)
+    report["object_reports"] = {item.name: object_report_stats(item) for item in object_reports}
+    report["aggregate_emitted_overlap"] = aggregate_object_overlap_stats(object_reports)
     report["comparisons"] = [comparison_stats(base, candidate) for base, candidate in comparisons]
     return report
 
@@ -605,6 +1002,28 @@ def check_codegen_boundary(graph: ImportGraph) -> bool:
         clean = False
         rendered = " -> ".join(graph.relative_name(item) for item in path)
         print(f"codegen boundary violation: {rendered}", file=sys.stderr)
+
+    for source_name, token in INFERENCE_ABI_FORBIDDEN_TOKENS:
+        source = graph.resolve_source(source_name)
+        if token not in source.read_text(encoding="utf-8"):
+            continue
+        clean = False
+        print(
+            f"codegen boundary violation: {source_name} contains removed raw inference ABI token {token}",
+            file=sys.stderr,
+        )
+
+    native_wal = graph.resolve_source(NATIVE_WAL_IMPLEMENTATION)
+    for source_name in CONTROL_WAL_CONSUMERS:
+        source = graph.resolve_source(source_name)
+        if native_wal not in graph.relative_edges(source):
+            continue
+        clean = False
+        print(
+            f"codegen boundary violation: {source_name} directly imports "
+            f"{NATIVE_WAL_IMPLEMENTATION}; import storage/wal_runtime.zig instead",
+            file=sys.stderr,
+        )
     return clean
 
 
@@ -635,6 +1054,67 @@ def check_api_kernel_boundary(graph: ImportGraph) -> bool:
     return clean
 
 
+def check_compiled_storage_boundary(
+    reports: dict[str, TimeReport],
+    source_root: Path = DEFAULT_SOURCE_ROOT,
+) -> bool:
+    distributed = reports.get("distributed")
+    if distributed is None:
+        print(
+            "compiled storage boundary check requires --time-report distributed=PATH",
+            file=sys.stderr,
+        )
+        return False
+    candidates = [distributed]
+    for name in ("api", "serverless"):
+        if report := reports.get(name):
+            candidates.append(report)
+    for report in candidates:
+        if report.has_file_list:
+            continue
+        print(
+            f"{report.name} compiler report has no authoritative all_files list",
+            file=sys.stderr,
+        )
+        return False
+
+    forbidden = {
+        (source_root / relative).resolve(): relative
+        for relative in DISTRIBUTED_FORBIDDEN_STORAGE_FILES
+    }
+    clean = True
+    for report in candidates:
+        leaked = sorted(
+            forbidden[path] for path in report.repo_files if path in forbidden
+        )
+        for relative in leaked:
+            clean = False
+            print(
+                f"compiled storage boundary violation: {report.name} analyzes {relative}",
+                file=sys.stderr,
+            )
+    return clean
+
+
+def check_ha_seed_failure_registry(source_root: Path = DEFAULT_SOURCE_ROOT) -> bool:
+    error_pattern = re.compile(r"\berror\.([A-Za-z][A-Za-z0-9_]*)")
+    mapping_pattern = re.compile(
+        r"\.err\s*=\s*error\.([A-Za-z][A-Za-z0-9_]*)"
+    )
+    registry_path = source_root / "runtime_failure_identity.zig"
+    registered = set(mapping_pattern.findall(registry_path.read_text()))
+    required: set[str] = set()
+    for relative in HA_SEED_FAILURE_SOURCE_FILES:
+        required.update(error_pattern.findall((source_root / relative).read_text()))
+    missing = sorted(required - registered - HA_SEED_TEST_ONLY_ERRORS)
+    for name in missing:
+        print(
+            f"HA seed failure registry violation: error.{name} has no stable status mapping",
+            file=sys.stderr,
+        )
+    return not missing
+
+
 def main(argv: list[str] | None = None) -> int:
     args = arguments(argv)
     try:
@@ -644,6 +1124,10 @@ def main(argv: list[str] | None = None) -> int:
         reports = {
             name: load_time_report(name, Path(path))
             for name, path in args.time_report
+        }
+        objects = {
+            name: load_object_report(name, Path(path), graph.source_root)
+            for name, path in args.object
         }
         comparisons: list[tuple[TimeReport, TimeReport]] = []
         for base_name, candidate_name in args.compare:
@@ -656,7 +1140,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             print(
                 json.dumps(
-                    json_report(graph, graphs, reports.values(), comparisons),
+                    json_report(graph, graphs, reports.values(), objects.values(), comparisons),
                     indent=2,
                     sort_keys=True,
                 )
@@ -666,6 +1150,9 @@ def main(argv: list[str] | None = None) -> int:
             for report in reports.values():
                 print_time_report(report, args.top_groups)
             print_aggregate_overlap(reports.values(), args.top_groups)
+            for report in objects.values():
+                print_object_report(report, args.top_groups)
+            print_aggregate_object_overlap(objects.values(), args.top_groups)
             for base, candidate in comparisons:
                 print_comparison(base, candidate, args.top_groups)
         if args.show_path:
@@ -675,6 +1162,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.check_codegen_boundary and not check_codegen_boundary(graph):
             return 1
         if args.check_api_kernel_boundary and not check_api_kernel_boundary(graph):
+            return 1
+        if args.check_compiled_storage_boundary and not check_compiled_storage_boundary(
+            reports, graph.source_root
+        ):
+            return 1
+        if args.check_ha_seed_failure_registry and not check_ha_seed_failure_registry(
+            graph.source_root
+        ):
             return 1
         return 0
     except ValueError as error:

@@ -13,12 +13,30 @@
 // limitations.
 
 const std = @import("std");
+const raft_engine = @import("raft_engine");
 const antfly = @import("antfly_storage_root");
 const vector_mod = @import("antfly_vector").vector;
 const capi = @import("types.zig");
 const search_wire = @import("search_wire.zig");
+const kernel_owner_abi = @import("kernel_owner_abi");
+const kernel_error_identity = @import("kernel_error_identity");
+const local_query_client = @import("local_query_client");
+const capi_build_options = @import("capi_build_options");
+const kernel_wal_owner = antfly.kernel_wal_owner;
+
+pub const storageWalOpen = kernel_wal_owner.open;
+pub const storageWalClose = kernel_wal_owner.close;
+pub const storageWalAppend = kernel_wal_owner.append;
+pub const storageWalSync = kernel_wal_owner.sync;
+pub const storageWalTruncatePrefix = kernel_wal_owner.truncatePrefix;
+pub const storageWalTruncateSuffix = kernel_wal_owner.truncateSuffix;
+pub const storageWalIterate = kernel_wal_owner.iterate;
+pub const storageWalRead = kernel_wal_owner.read;
+pub const storageWalStatsSnapshot = kernel_wal_owner.statsSnapshot;
+pub const storageWalLastLsn = kernel_wal_owner.lastLsn;
 
 const db_mod = antfly.db;
+const backend_types = antfly.storage_backend;
 const raft_mod = antfly.raft;
 const hbc = antfly.hbc;
 const graph_mod = antfly.graph;
@@ -26,8 +44,10 @@ const traversal_mod = antfly.traversal;
 const paths_mod = antfly.paths;
 const graph_query_mod = antfly.graph_query;
 const graph_pattern_mod = antfly.graph_pattern;
+const ha_seed_activation = antfly.ha_seed_activation;
 const transactions_mod = antfly.transactions;
 const aggregations_mod = db_mod.aggregations;
+const aggregations_contract = aggregations_mod.contract;
 const search_agg_mod = antfly.aggregation;
 const geo_mod = antfly.geo;
 const lite_backend = antfly.lite.backend;
@@ -36,9 +56,545 @@ const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
 const batch_api = antfly.public_api.batch;
 const query_api = antfly.public_api.query;
+const tables_api = antfly.public_api.tables;
+const table_reads_api = antfly.public_api.table_reads;
+const distributed_graph = antfly.public_api.distributed_graph;
+const runtime_status = antfly.public_api.runtime_status;
+const shard_state_store = antfly.data_snapshot;
+const data_raft_apply = antfly.data_raft_apply;
+const metadata_raft_apply = antfly.metadata_raft_apply;
+const metadata_table_manager = antfly.metadata_table_manager;
+const metadata_table_provisioner = antfly.metadata_table_provisioner;
+const data_raft_projection_wire = antfly.data_raft_projection_wire;
+const backups_api = antfly.public_api.backups;
+const backup_restore = antfly.raft.storage.backup_restore;
+const common_config = antfly.common_config;
+const common_secrets = antfly.common_secrets;
+const scraping = antfly.scraping;
+const inference_provider_client = antfly.inference_provider_client;
+const managed_embedder = antfly.managed_embedder;
+const raft_catalog = antfly.raft_catalog;
 const Allocator = std.mem.Allocator;
 
 const lite_abi_version: u32 = 1;
+
+const StorageOwnerContext = struct {
+    alloc: Allocator,
+    resources: antfly.public_api.provisioned_storage.PhysicalStorageResources,
+    backend_runtime: db_mod.background_runtime.BackendRuntimeHandle,
+    inference_handle: ?*anyopaque = null,
+    remote_content_security: ?std.json.Parsed(scraping.ContentSecurityConfig) = null,
+    remote_content: scraping.RemoteContentConfig = .{},
+    lite_backend: ?lite_backend.Handle = null,
+    auth_backend: ?antfly.lsm_backend.BackendHandle = null,
+    auth_users_store: ?antfly.storage_backend_erased.Store = null,
+    auth_casbin_store: ?antfly.storage_backend_erased.Store = null,
+    mutex: std.atomic.Mutex = .unlocked,
+    active_owners: usize = 0,
+
+    fn init(alloc: Allocator) !StorageOwnerContext {
+        var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+        errdefer backend_runtime.deinit();
+        return .{
+            .alloc = alloc,
+            .resources = .init(alloc),
+            .backend_runtime = backend_runtime,
+        };
+    }
+
+    fn lock(self: *StorageOwnerContext) void {
+        antfly.platform_sync.lockYielding(&self.mutex);
+    }
+
+    fn acquire(self: *StorageOwnerContext) void {
+        self.lock();
+        defer self.mutex.unlock();
+        self.active_owners += 1;
+    }
+
+    fn release(self: *StorageOwnerContext) void {
+        self.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.active_owners > 0);
+        self.active_owners -= 1;
+    }
+
+    fn antflyProvider(self: *StorageOwnerContext) ?managed_embedder.AntflyProvider {
+        return inference_provider_client.provider(self.inference_handle orelse return null);
+    }
+
+    fn remoteContent(self: *const StorageOwnerContext) ?*const scraping.RemoteContentConfig {
+        return if (self.remote_content_security != null) &self.remote_content else null;
+    }
+
+    fn deinitIfIdle(self: *StorageOwnerContext) bool {
+        self.lock();
+        if (self.active_owners != 0) {
+            self.mutex.unlock();
+            return false;
+        }
+        self.mutex.unlock();
+        if (self.auth_casbin_store) |*store| store.deinit();
+        if (self.auth_users_store) |*store| store.deinit();
+        if (self.auth_backend) |*backend| backend.close();
+        if (self.lite_backend) |*backend| backend.deinit();
+        if (self.remote_content_security) |*parsed| parsed.deinit();
+        self.backend_runtime.deinit();
+        self.resources.deinit();
+        const alloc = self.alloc;
+        self.* = undefined;
+        alloc.destroy(self);
+        return true;
+    }
+};
+
+const SystemStoreHandle = struct {
+    store: *antfly.storage_backend_erased.Store,
+    context: *StorageOwnerContext,
+};
+
+const SystemReadTxnHandle = struct {
+    alloc: Allocator,
+    txn: antfly.storage_backend_erased.ReadTxn,
+};
+
+const SystemCurrentScanTxnHandle = struct {
+    alloc: Allocator,
+    txn: antfly.storage_backend_erased.CurrentScanTxn,
+};
+
+const SystemWriteTxnHandle = struct {
+    alloc: Allocator,
+    txn: antfly.storage_backend_erased.WriteTxn,
+};
+
+const SystemCursorHandle = struct {
+    alloc: Allocator,
+    cursor: antfly.storage_backend_erased.Cursor,
+};
+
+const DataApplyStoreHandle = struct {
+    alloc: Allocator,
+    store: data_raft_apply.RaftApplyStore,
+    context: ?*StorageOwnerContext,
+};
+
+const MetadataApplyStoreHandle = struct {
+    alloc: Allocator,
+    store: metadata_raft_apply.RaftApplyStore,
+    context: ?*StorageOwnerContext,
+    listener_bridges: std.ArrayListUnmanaged(*MetadataListenerBridge) = .empty,
+};
+
+const MetadataPreparedSnapshotHandle = struct {
+    source: raft_engine.runtime.storage_iface.SnapshotSource,
+};
+
+const MetadataListenerBridge = struct {
+    request: kernel_owner_abi.MetadataListenerRequest,
+
+    const projection_vtable = metadata_raft_apply.ProjectionListener.VTable{
+        .on_projection_signal = onProjection,
+    };
+    const projection_barrier_vtable = metadata_raft_apply.ProjectionListener.VTable{
+        .on_projection_signal = onProjection,
+        .before_projection_commit = beforeProjectionCommit,
+        .after_projection_commit = afterProjectionCommit,
+    };
+    const committed_key_vtable = metadata_raft_apply.CommittedKeyListener.VTable{
+        .matches_key = matchesKey,
+        .on_committed_key = onCommittedKey,
+    };
+
+    fn projectionKindToAbi(kind: metadata_raft_apply.ProjectionSignalKind) kernel_owner_abi.MetadataProjectionSignalKind {
+        return switch (kind) {
+            .metadata_incarnation => .metadata_incarnation,
+            .table => .table,
+            .range => .range,
+            .store => .store,
+            .placement_intent => .placement_intent,
+            .reconcile_lease => .reconcile_lease,
+            .shuffle_join_lease => .shuffle_join_lease,
+            .split_transition => .split_transition,
+            .merge_transition => .merge_transition,
+            .schema_progress => .schema_progress,
+            .restore_progress => .restore_progress,
+            .restore_job => .restore_job,
+            .replication_source_status => .replication_source_status,
+        };
+    }
+
+    fn projectionKindFromAbi(kind: kernel_owner_abi.MetadataProjectionSignalKind) metadata_raft_apply.ProjectionSignalKind {
+        return switch (kind) {
+            .metadata_incarnation => .metadata_incarnation,
+            .table => .table,
+            .range => .range,
+            .store => .store,
+            .placement_intent => .placement_intent,
+            .reconcile_lease => .reconcile_lease,
+            .shuffle_join_lease => .shuffle_join_lease,
+            .split_transition => .split_transition,
+            .merge_transition => .merge_transition,
+            .schema_progress => .schema_progress,
+            .restore_progress => .restore_progress,
+            .restore_job => .restore_job,
+            .replication_source_status => .replication_source_status,
+        };
+    }
+
+    fn onProjection(ptr: *anyopaque, signal: metadata_raft_apply.ProjectionSignal) void {
+        const self: *MetadataListenerBridge = @ptrCast(@alignCast(ptr));
+        const callback = self.request.projection_fn orelse return;
+        const value = kernel_owner_abi.MetadataProjectionSignal{
+            .kind = projectionKindToAbi(signal.kind),
+            .metadata_group_id = signal.metadata_group_id,
+            .table_name = .fromSlice(signal.table_name orelse ""),
+            .table_id = signal.table_id,
+            .group_id = signal.group_id,
+            .store_id = signal.store_id,
+            .node_id = signal.node_id,
+        };
+        callback(self.request.context, &value);
+    }
+
+    fn beforeProjectionCommit(ptr: *anyopaque) void {
+        const self: *MetadataListenerBridge = @ptrCast(@alignCast(ptr));
+        if (self.request.before_projection_commit_fn) |callback| callback(self.request.context);
+    }
+
+    fn afterProjectionCommit(ptr: *anyopaque) void {
+        const self: *MetadataListenerBridge = @ptrCast(@alignCast(ptr));
+        if (self.request.after_projection_commit_fn) |callback| callback(self.request.context);
+    }
+
+    fn matchesKey(_: *anyopaque, _: metadata_raft_apply.CommittedKeySignal) bool {
+        return true;
+    }
+
+    fn onCommittedKey(ptr: *anyopaque, signal: metadata_raft_apply.CommittedKeySignal) void {
+        const self: *MetadataListenerBridge = @ptrCast(@alignCast(ptr));
+        const callback = self.request.committed_key_fn orelse return;
+        callback(self.request.context, signal.metadata_group_id, .fromSlice(signal.key));
+    }
+};
+
+const DataApplyGroupTransitionHandle = struct {
+    transition: data_raft_apply.RaftApplyStore.ActiveGroupTransition,
+    active: bool = true,
+};
+
+const DataApplyPreparedSnapshotHandle = struct {
+    prepared: *data_raft_apply.RaftApplyStore.PreparedSnapshot,
+    materialized: bool = false,
+};
+
+const StorageOwnerTransactionRecovery = struct {
+    alloc: Allocator,
+    config: kernel_owner_abi.TransactionRecoveryConfig,
+    owner_id: []u8,
+
+    fn init(
+        alloc: Allocator,
+        config: kernel_owner_abi.TransactionRecoveryConfig,
+    ) !StorageOwnerTransactionRecovery {
+        return .{
+            .alloc = alloc,
+            .config = config,
+            .owner_id = try alloc.dupe(u8, config.owner_id.slice()),
+        };
+    }
+
+    fn deinit(self: *StorageOwnerTransactionRecovery) void {
+        self.alloc.free(self.owner_id);
+        self.* = undefined;
+    }
+
+    fn callbackStatus(status: kernel_owner_abi.Status) !void {
+        return kernel_error_identity.statusToError(status);
+    }
+
+    fn resolveParticipant(
+        ptr: *anyopaque,
+        txn_id: transactions_mod.TxnId,
+        participant: []const u8,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.config.resolve_participant_fn orelse return error.MissingParticipantResolver;
+        const abi_txn_id = kernel_owner_abi.TxnId{ .bytes = txn_id };
+        try callbackStatus(callback(
+            self.config.callback_ctx,
+            &abi_txn_id,
+            .fromSlice(participant),
+            switch (status) {
+                .pending => .pending,
+                .committed => .committed,
+                .aborted => .aborted,
+            },
+            commit_version,
+        ));
+    }
+
+    fn ownsRecovery(ptr: *anyopaque, owner_participant: []const u8) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.config.owns_recovery_fn orelse return false;
+        return callback(self.config.callback_ctx, .fromSlice(owner_participant)) != 0;
+    }
+
+    fn acknowledgeParticipant(
+        ptr: *anyopaque,
+        txn_id: transactions_mod.TxnId,
+        owner_participant: []const u8,
+        participant: []const u8,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.config.acknowledge_participant_fn orelse return error.MissingReplicatedRecoveryHooks;
+        const abi_txn_id = kernel_owner_abi.TxnId{ .bytes = txn_id };
+        try callbackStatus(callback(
+            self.config.callback_ctx,
+            &abi_txn_id,
+            .fromSlice(owner_participant),
+            .fromSlice(participant),
+        ));
+    }
+
+    fn cleanupTransaction(
+        ptr: *anyopaque,
+        txn_id: transactions_mod.TxnId,
+        owner_participant: []const u8,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.config.cleanup_transaction_fn orelse return error.MissingReplicatedRecoveryHooks;
+        const abi_txn_id = kernel_owner_abi.TxnId{ .bytes = txn_id };
+        try callbackStatus(callback(
+            self.config.callback_ctx,
+            &abi_txn_id,
+            .fromSlice(owner_participant),
+            cutoff_timestamp,
+            retained_cutoff_timestamp,
+        ));
+    }
+
+    fn dbConfig(self: *StorageOwnerTransactionRecovery) db_mod.transaction_runtime.Config {
+        return .{
+            .enabled = true,
+            .lease_owned = self.config.lease_owned != 0,
+            .owner_id = self.owner_id,
+            .interval_ms = self.config.interval_ms,
+            .cutoff_ns = self.config.cutoff_ns,
+            .resolver_ctx = self,
+            .resolve_participant_fn = resolveParticipant,
+            .replicated_metadata = self.config.replicated_metadata != 0,
+            .owns_recovery_fn = if (self.config.replicated_metadata != 0) ownsRecovery else null,
+            .acknowledge_participant_fn = if (self.config.replicated_metadata != 0) acknowledgeParticipant else null,
+            .cleanup_transaction_fn = if (self.config.replicated_metadata != 0) cleanupTransaction else null,
+        };
+    }
+};
+
+const StorageOwnerRuntimeHooks = struct {
+    config: kernel_owner_abi.RuntimeHooksConfig,
+    group_id: u64,
+
+    const CandidateCapture = struct {
+        alloc: Allocator,
+        value: ?[]u8 = null,
+
+        fn consume(
+            ptr: ?*anyopaque,
+            _: kernel_owner_abi.BorrowedBytes,
+            value: kernel_owner_abi.BorrowedBytes,
+        ) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+            if (self.value != null) return .invalid_argument;
+            self.value = self.alloc.dupe(u8, value.slice()) catch return .out_of_memory;
+            return .ok;
+        }
+    };
+
+    const CandidateConsumerBridge = struct {
+        ctx: *anyopaque,
+        consume: db_mod.CandidateSource.Consume,
+
+        fn forward(
+            ptr: ?*anyopaque,
+            entity_key: kernel_owner_abi.BorrowedBytes,
+            value: kernel_owner_abi.BorrowedBytes,
+        ) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+            self.consume(self.ctx, entity_key.slice(), value.slice()) catch |err|
+                return kernel_error_identity.statusFromError(err);
+            return .ok;
+        }
+    };
+
+    fn candidateSource(self: *StorageOwnerRuntimeHooks) ?db_mod.CandidateSource {
+        if (self.config.resolution_candidates.get_fn == null) return null;
+        return .{ .ptr = self, .vtable = &candidate_vtable };
+    }
+
+    const candidate_vtable = db_mod.CandidateSource.VTable{
+        .get = candidateGet,
+        .scan_prefix = candidateScanPrefix,
+        .nearest = candidateNearest,
+    };
+
+    fn candidateGet(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        table: []const u8,
+        key: []const u8,
+    ) anyerror!?[]u8 {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.resolution_candidates.get_fn orelse return error.MissingResolutionCandidateSource;
+        var capture = CandidateCapture{ .alloc = alloc };
+        const status = callback(
+            self.config.resolution_candidates.callback_ctx,
+            .fromSlice(table),
+            .fromSlice(key),
+            &capture,
+            CandidateCapture.consume,
+        );
+        if (status == .not_found) return null;
+        try kernel_error_identity.statusToError(status);
+        return capture.value orelse return error.InvalidArgument;
+    }
+
+    fn candidateScanPrefix(
+        ptr: *anyopaque,
+        _: Allocator,
+        table: []const u8,
+        prefix: []const u8,
+        opts: db_mod.CandidateSource.ScanOptions,
+        ctx: *anyopaque,
+        consume: db_mod.CandidateSource.Consume,
+    ) anyerror!void {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.resolution_candidates.scan_prefix_fn orelse return error.ScanUnsupported;
+        var bridge = CandidateConsumerBridge{ .ctx = ctx, .consume = consume };
+        try kernel_error_identity.statusToError(callback(
+            self.config.resolution_candidates.callback_ctx,
+            .fromSlice(table),
+            .fromSlice(prefix),
+            @intCast(opts.limit),
+            &bridge,
+            CandidateConsumerBridge.forward,
+        ));
+    }
+
+    fn candidateNearest(
+        ptr: *anyopaque,
+        _: Allocator,
+        table: []const u8,
+        query: db_mod.CandidateSource.NearestQuery,
+        ctx: *anyopaque,
+        consume: db_mod.CandidateSource.Consume,
+    ) anyerror!void {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.resolution_candidates.nearest_fn orelse return error.NearestUnsupported;
+        var bridge = CandidateConsumerBridge{ .ctx = ctx, .consume = consume };
+        try kernel_error_identity.statusToError(callback(
+            self.config.resolution_candidates.callback_ctx,
+            .fromSlice(table),
+            .fromSlice(query.index_name),
+            if (query.embedding.len == 0) null else query.embedding.ptr,
+            @intCast(query.embedding.len),
+            @intCast(query.k),
+            &bridge,
+            CandidateConsumerBridge.forward,
+        ));
+    }
+
+    fn entitySink(self: *StorageOwnerRuntimeHooks) ?db_mod.EntitySink {
+        if (self.config.entity_sink.upsert_fn == null) return null;
+        return .{ .ptr = self, .vtable = &entity_sink_vtable };
+    }
+
+    const entity_sink_vtable = db_mod.EntitySink.VTable{
+        .upsert = entityUpsert,
+        .upsert_batch = entityUpsertBatch,
+    };
+
+    fn entityUpsert(
+        ptr: *anyopaque,
+        _: Allocator,
+        table: []const u8,
+        key: []const u8,
+        doc_json: []const u8,
+    ) anyerror!void {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.entity_sink.upsert_fn orelse return error.MissingEntitySink;
+        try kernel_error_identity.statusToError(callback(
+            self.config.entity_sink.callback_ctx,
+            .fromSlice(table),
+            .fromSlice(key),
+            .fromSlice(doc_json),
+        ));
+    }
+
+    fn entityUpsertBatch(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        entries: []const db_mod.EntityUpsert,
+    ) anyerror!void {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.entity_sink.upsert_batch_fn orelse {
+            for (entries) |entry| try entityUpsert(ptr, alloc, entry.table, entry.key, entry.doc_json);
+            return;
+        };
+        const encoded = try alloc.alloc(kernel_owner_abi.EntityUpsert, entries.len);
+        defer alloc.free(encoded);
+        for (entries, encoded) |source, *destination| destination.* = .{
+            .table = .fromSlice(source.table),
+            .key = .fromSlice(source.key),
+            .doc_json = .fromSlice(source.doc_json),
+        };
+        try kernel_error_identity.statusToError(callback(
+            self.config.entity_sink.callback_ctx,
+            if (encoded.len == 0) null else encoded.ptr,
+            @intCast(encoded.len),
+        ));
+    }
+
+    fn promotionOwner(self: *StorageOwnerRuntimeHooks) ?db_mod.PromotionOwner {
+        if (self.config.promotion_owner_fn == null) return null;
+        return .{ .ptr = self, .vtable = &promotion_owner_vtable };
+    }
+
+    const promotion_owner_vtable = db_mod.PromotionOwner.VTable{ .is_local_owner = isLocalPromotionOwner };
+
+    fn isLocalPromotionOwner(ptr: *anyopaque) bool {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.promotion_owner_fn orelse return true;
+        return callback(self.config.promotion_owner_ctx, self.group_id) != 0;
+    }
+};
+
+test "storage-owner reverse callbacks preserve semantic error identity" {
+    try std.testing.expectError(
+        error.WouldBlock,
+        StorageOwnerTransactionRecovery.callbackStatus(.would_block),
+    );
+    try std.testing.expectError(
+        error.StorageBusy,
+        StorageOwnerTransactionRecovery.callbackStatus(.busy),
+    );
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        StorageOwnerTransactionRecovery.callbackStatus(.resource_budget_exceeded),
+    );
+    try std.testing.expectError(
+        error.Canceled,
+        StorageOwnerTransactionRecovery.callbackStatus(.canceled),
+    );
+    try std.testing.expectError(
+        error.Cancelled,
+        StorageOwnerTransactionRecovery.callbackStatus(.cancelled),
+    );
+}
 
 fn monotonicNowNs() u64 {
     return antfly.platform_time.monotonicNs();
@@ -73,6 +629,12 @@ const Handle = struct {
     owned_lite_backend: ?lite_backend.Handle = null,
     lite_profile: ?lite_backend.Profile = null,
     lite_inference_status: ?lite_backend.InferenceStatus = null,
+    storage_owner_path: ?[]u8 = null,
+    storage_owner_table_name: ?[]u8 = null,
+    storage_owner_group_id: u64 = 0,
+    storage_owner_context: ?*StorageOwnerContext = null,
+    storage_owner_transaction_recovery: ?*StorageOwnerTransactionRecovery = null,
+    storage_owner_runtime_hooks: ?*StorageOwnerRuntimeHooks = null,
 
     fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
         const hook = self.readable_lease_hook orelse return;
@@ -115,16 +677,48 @@ const Handle = struct {
     }
 };
 
+const StorageSnapshot = struct {
+    alloc: Allocator,
+    preparation: db_mod.generation_lifecycle.PreparationTransition,
+    staged: db_mod.generation_lifecycle.StagedGeneration,
+    transition: ?db_mod.generation_lifecycle.ExclusiveTransition = null,
+    restore_live_path: ?[]u8 = null,
+    promoted: bool = false,
+    published: bool = false,
+    finalized: bool = false,
+
+    fn deinit(self: *StorageSnapshot) void {
+        self.staged.deinit();
+        if (self.transition) |*transition| transition.deinit();
+        self.preparation.deinit();
+        if (self.restore_live_path) |path| self.alloc.free(path);
+        const alloc = self.alloc;
+        self.* = undefined;
+        alloc.destroy(self);
+    }
+};
+
 fn closeHandle(handle: *Handle) void {
+    const storage_owner_context = handle.storage_owner_context;
+    const storage_owner_transaction_recovery = handle.storage_owner_transaction_recovery;
+    const storage_owner_runtime_hooks = handle.storage_owner_runtime_hooks;
     if (handle.owned_lite_backend != null and liteOpenModeCanWrite(handle.open_mode)) {
         handle.db.sync(true) catch {};
         handle.db.syncIndexes(true) catch {};
     }
     handle.db.close();
+    if (storage_owner_transaction_recovery) |recovery| {
+        recovery.deinit();
+        handle.alloc.destroy(recovery);
+    }
+    if (storage_owner_runtime_hooks) |runtime_hooks| handle.alloc.destroy(runtime_hooks);
     if (handle.owned_lite_backend) |*backend| {
         backend.deinit();
     }
+    if (handle.storage_owner_path) |path| handle.alloc.free(path);
+    if (handle.storage_owner_table_name) |table_name| handle.alloc.free(table_name);
     handle.alloc.destroy(handle);
+    if (storage_owner_context) |context| context.release();
 }
 
 fn liteOpenModeCanWrite(open_mode: db_mod.OpenOptions.OpenMode) bool {
@@ -140,6 +734,53 @@ fn currentIdentityReadGenerationForHandle(handle: *Handle, requested: ?u64) !u64
 
 fn stampSearchRequestIdentityGeneration(handle: *Handle, req: *db_mod.types.SearchRequest) !void {
     req.identity_read_generation = try currentIdentityReadGenerationForHandle(handle, req.identity_read_generation);
+}
+
+fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_mod.types.SearchResult {
+    if (comptime capi_build_options.storage_kernel_experiment) {
+        const request_json = try table_reads_api.encodeStorageKernelQueryRequest(handle.alloc, req);
+        defer handle.alloc.free(request_json);
+        var failure: kernel_owner_abi.FailureIdentity = .{};
+        var cancellation = req.cancellation;
+        const response = try local_query_client.executeJsonAlloc(
+            handle.alloc,
+            @ptrCast(&handle.db),
+            "docs",
+            request_json,
+            .internal,
+            .{
+                .enabled = 1,
+                .include_stored = @intFromBool(req.include_stored),
+                .return_mode = switch (req.return_mode) {
+                    .parent => .parent,
+                    .chunk => .chunk,
+                    .parent_with_chunks => .parent_with_chunks,
+                    .unit => .unit,
+                    .unit_with_chunks => .unit_with_chunks,
+                    .member => .member,
+                },
+                .max_chunks_per_parent = req.max_chunks_per_parent,
+                .dense_k = if (req.dense) |query| query.k else 0,
+                .sparse_k = if (req.sparse) |query| query.k else 0,
+            },
+            if (cancellation != null) @ptrCast(&cancellation.?) else null,
+            if (cancellation != null) cancellationTokenRequested else null,
+            &failure,
+        );
+        defer handle.alloc.free(response.json);
+        var result = table_reads_api.parseStorageKernelSearchResult(handle.alloc, response.json) catch |err| {
+            std.log.err("local query returned an invalid response wire error={s}", .{@errorName(err)});
+            return error.InvalidBoundaryQueryResponse;
+        };
+        result.identity_read_generation = response.identity_read_generation;
+        return result;
+    }
+    return try handle.db.search(handle.alloc, req);
+}
+
+fn cancellationTokenRequested(ctx: ?*anyopaque) callconv(.c) u8 {
+    const token: *const db_mod.types.CancellationToken = @ptrCast(@alignCast(ctx orelse return 0));
+    return @intFromBool(token.isCancelled());
 }
 
 const ReadableLeaseHookFn = *const fn (
@@ -1612,6 +2253,3892 @@ pub export fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) ca
     return .ok;
 }
 
+fn asStorageOwnerContext(ptr: ?*anyopaque) ?*StorageOwnerContext {
+    const raw = ptr orelse return null;
+    return @ptrCast(@alignCast(raw));
+}
+
+pub fn storageOwnerContextCreate(
+    request: *const kernel_owner_abi.ContextRequest,
+    out_context: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_context.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const alloc = std.heap.c_allocator;
+    const context = alloc.create(StorageOwnerContext) catch return .out_of_memory;
+    errdefer alloc.destroy(context);
+    context.* = StorageOwnerContext.init(alloc) catch |err| return storageOwnerStatusFromError(err);
+    errdefer context.backend_runtime.deinit();
+    errdefer context.resources.deinit();
+    context.resources.attachResourceManager();
+    switch (request.storage_kind) {
+        .directory => if (request.storage_path.len != 0) return .invalid_argument,
+        .lite => {
+            const path = request.storage_path.slice();
+            if (path.len == 0) return .invalid_argument;
+            context.lite_backend = lite_backend.Handle.openOrCreate(alloc, path, .{
+                .no_sync = request.no_sync != 0,
+                .resource_manager = &context.resources.resource_manager,
+            }) catch |err| return storageOwnerStatusFromError(err);
+        },
+    }
+    errdefer if (context.lite_backend) |*backend| backend.deinit();
+    const auth_storage_path = request.auth_storage_path.slice();
+    if (auth_storage_path.len != 0) {
+        context.auth_backend = antfly.lsm_backend.BackendHandle.open(alloc, auth_storage_path, .{}) catch |err|
+            return storageOwnerStatusFromError(err);
+        errdefer context.auth_backend.?.close();
+        context.auth_users_store = context.auth_backend.?.backend.runtimeStore(
+            alloc,
+            .{ .name = "usermgr_users" },
+        ) catch |err| return storageOwnerStatusFromError(err);
+        errdefer context.auth_users_store.?.deinit();
+        context.auth_casbin_store = context.auth_backend.?.backend.runtimeStore(
+            alloc,
+            .{ .name = "usermgr_casbin" },
+        ) catch |err| return storageOwnerStatusFromError(err);
+    }
+    out_context.* = context;
+    return .ok;
+}
+
+pub fn storageOwnerContextDestroy(context: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const owner_context = asStorageOwnerContext(context) orelse return .ok;
+    return if (owner_context.deinitIfIdle()) .ok else .busy;
+}
+
+pub fn storageContextAttachInferenceProvider(
+    context: ?*anyopaque,
+    inference_handle: ?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    const handle = inference_handle orelse return .invalid_argument;
+    owner_context.lock();
+    defer owner_context.mutex.unlock();
+    if (owner_context.active_owners != 0) return .busy;
+    owner_context.inference_handle = handle;
+    return .ok;
+}
+
+pub fn storageOwnerContextConfigureRemoteContentSecurity(
+    context: ?*anyopaque,
+    security_json: kernel_owner_abi.BorrowedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    const encoded = security_json.slice();
+    var parsed: ?std.json.Parsed(scraping.ContentSecurityConfig) = if (encoded.len == 0)
+        null
+    else
+        std.json.parseFromSlice(scraping.ContentSecurityConfig, owner_context.alloc, encoded, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = false,
+        }) catch return .invalid_argument;
+
+    owner_context.lock();
+    if (owner_context.active_owners != 0) {
+        owner_context.mutex.unlock();
+        if (parsed) |*value| value.deinit();
+        return .busy;
+    }
+    var previous = owner_context.remote_content_security;
+    owner_context.remote_content_security = parsed;
+    owner_context.remote_content.security = if (owner_context.remote_content_security) |*value| value.value else null;
+    owner_context.mutex.unlock();
+    if (previous) |*value| value.deinit();
+    return .ok;
+}
+
+fn storageOwnerContextCacheKindStats(stats: anytype) kernel_owner_abi.ContextCacheKindStats {
+    return .{
+        .hits = stats.hits,
+        .misses = stats.misses,
+        .inserts = stats.inserts,
+        .evictions = stats.evictions,
+        .invalidations = stats.invalidations,
+        .waits = stats.waits,
+        .used_bytes = @intCast(stats.used_bytes),
+    };
+}
+
+pub fn storageOwnerContextMetrics(
+    context: ?*anyopaque,
+    out_result: *kernel_owner_abi.ContextMetricsResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    const stats = owner_context.resources.lsm_cache.snapshotStats();
+    out_result.* = .{
+        .lsm_cache_used_bytes = @intCast(stats.used_bytes),
+        .lsm_cache_entry_count = @intCast(stats.entry_count),
+        .lsm_run_state = storageOwnerContextCacheKindStats(stats.run_state),
+        .lsm_run_table_raw = storageOwnerContextCacheKindStats(stats.run_table_raw),
+        .lsm_run_table_index = storageOwnerContextCacheKindStats(stats.run_table_index),
+        .lsm_run_table_block = storageOwnerContextCacheKindStats(stats.run_table_block),
+        .lsm_run_table_physical_block = storageOwnerContextCacheKindStats(stats.run_table_physical_block),
+    };
+    return .ok;
+}
+
+pub fn storageOwnerContextInvalidateCaches(context: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    // Generation publication is rare and can replace every inode below one
+    // table root. Cache implementations retain active borrowers safely while
+    // making all subsequent lookups miss, so invalidating the process-wide
+    // context does not disturb owners of unrelated groups.
+    owner_context.resources.lsm_cache.invalidatePrefix("");
+    owner_context.resources.hbc_cache.clear();
+    return .ok;
+}
+
+fn asSystemStore(ptr: ?*anyopaque) ?*SystemStoreHandle {
+    return @ptrCast(@alignCast(ptr orelse return null));
+}
+
+fn asSystemReadTxn(ptr: ?*anyopaque) ?*SystemReadTxnHandle {
+    return @ptrCast(@alignCast(ptr orelse return null));
+}
+
+fn asSystemCurrentScanTxn(ptr: ?*anyopaque) ?*SystemCurrentScanTxnHandle {
+    return @ptrCast(@alignCast(ptr orelse return null));
+}
+
+fn asSystemWriteTxn(ptr: ?*anyopaque) ?*SystemWriteTxnHandle {
+    return @ptrCast(@alignCast(ptr orelse return null));
+}
+
+fn asSystemCursor(ptr: ?*anyopaque) ?*SystemCursorHandle {
+    return @ptrCast(@alignCast(ptr orelse return null));
+}
+
+pub fn storageContextSystemStoreOpen(
+    context_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.SystemStoreOpenRequest,
+    out_store: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_store.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const context = asStorageOwnerContext(context_ptr) orelse return .invalid_argument;
+    const namespace = request.namespace.slice();
+    if (namespace.len == 0) return .invalid_argument;
+    const store = if (std.mem.eql(u8, namespace, "system/auth-users"))
+        if (context.auth_users_store) |*value| value else return .invalid_argument
+    else if (std.mem.eql(u8, namespace, "system/auth-casbin"))
+        if (context.auth_casbin_store) |*value| value else return .invalid_argument
+    else blk: {
+        const backend = if (context.lite_backend) |*value| value else return .invalid_argument;
+        break :blk backend.runtimeStoreForNamespace(namespace) catch |err|
+            return storageOwnerStatusFromError(err);
+    };
+    const handle = context.alloc.create(SystemStoreHandle) catch return .out_of_memory;
+    context.acquire();
+    handle.* = .{ .store = store, .context = context };
+    out_store.* = handle;
+    return .ok;
+}
+
+pub fn storageSystemStoreClose(store_ptr: ?*anyopaque) callconv(.c) void {
+    const handle = asSystemStore(store_ptr) orelse return;
+    const context = handle.context;
+    context.alloc.destroy(handle);
+    context.release();
+}
+
+pub fn storageSystemStoreSync(store_ptr: ?*anyopaque, force: u8) callconv(.c) kernel_owner_abi.Status {
+    const handle = asSystemStore(store_ptr) orelse return .invalid_argument;
+    handle.store.sync(force != 0) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageSystemStoreBeginRead(
+    store_ptr: ?*anyopaque,
+    out_txn: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_txn.* = null;
+    const handle = asSystemStore(store_ptr) orelse return .invalid_argument;
+    const txn = handle.store.beginRead() catch |err| return storageOwnerStatusFromError(err);
+    const wrapper = handle.context.alloc.create(SystemReadTxnHandle) catch {
+        var owned = txn;
+        owned.abort();
+        return .out_of_memory;
+    };
+    wrapper.* = .{ .alloc = handle.context.alloc, .txn = txn };
+    out_txn.* = wrapper;
+    return .ok;
+}
+
+pub fn storageSystemStoreBeginCurrentScan(
+    store_ptr: ?*anyopaque,
+    out_txn: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_txn.* = null;
+    const handle = asSystemStore(store_ptr) orelse return .invalid_argument;
+    const txn = handle.store.beginCurrentScan() catch |err| return storageOwnerStatusFromError(err);
+    const wrapper = handle.context.alloc.create(SystemCurrentScanTxnHandle) catch {
+        var owned = txn;
+        owned.abort();
+        return .out_of_memory;
+    };
+    wrapper.* = .{ .alloc = handle.context.alloc, .txn = txn };
+    out_txn.* = wrapper;
+    return .ok;
+}
+
+pub fn storageSystemStoreBeginWrite(
+    store_ptr: ?*anyopaque,
+    out_txn: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_txn.* = null;
+    const handle = asSystemStore(store_ptr) orelse return .invalid_argument;
+    const txn = handle.store.beginWrite() catch |err| return storageOwnerStatusFromError(err);
+    const wrapper = handle.context.alloc.create(SystemWriteTxnHandle) catch {
+        var owned = txn;
+        owned.abort();
+        return .out_of_memory;
+    };
+    wrapper.* = .{ .alloc = handle.context.alloc, .txn = txn };
+    out_txn.* = wrapper;
+    return .ok;
+}
+
+pub fn storageSystemReadGet(
+    txn_ptr: ?*anyopaque,
+    key: kernel_owner_abi.BorrowedBytes,
+    out_value: *kernel_owner_abi.BorrowedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_value.* = .{};
+    const handle = asSystemReadTxn(txn_ptr) orelse return .invalid_argument;
+    const value = handle.txn.get(key.slice()) catch |err| return storageOwnerStatusFromError(err);
+    out_value.* = .fromSlice(value);
+    return .ok;
+}
+
+pub fn storageSystemReadOpenCursor(
+    txn_ptr: ?*anyopaque,
+    out_cursor: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_cursor.* = null;
+    const handle = asSystemReadTxn(txn_ptr) orelse return .invalid_argument;
+    const cursor = handle.txn.openCursor() catch |err| return storageOwnerStatusFromError(err);
+    const wrapper = handle.alloc.create(SystemCursorHandle) catch {
+        var owned = cursor;
+        owned.close();
+        return .out_of_memory;
+    };
+    wrapper.* = .{ .alloc = handle.alloc, .cursor = cursor };
+    out_cursor.* = wrapper;
+    return .ok;
+}
+
+pub fn storageSystemReadAbort(txn_ptr: ?*anyopaque) callconv(.c) void {
+    const handle = asSystemReadTxn(txn_ptr) orelse return;
+    const alloc = handle.alloc;
+    handle.txn.abort();
+    alloc.destroy(handle);
+}
+
+pub fn storageSystemCurrentScanOpenCursor(
+    txn_ptr: ?*anyopaque,
+    out_cursor: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_cursor.* = null;
+    const handle = asSystemCurrentScanTxn(txn_ptr) orelse return .invalid_argument;
+    const cursor = handle.txn.openCursor() catch |err| return storageOwnerStatusFromError(err);
+    const wrapper = handle.txn.allocator.create(SystemCursorHandle) catch {
+        var owned = cursor;
+        owned.close();
+        return .out_of_memory;
+    };
+    wrapper.* = .{ .alloc = handle.alloc, .cursor = cursor };
+    out_cursor.* = wrapper;
+    return .ok;
+}
+
+pub fn storageSystemCurrentScanAbort(txn_ptr: ?*anyopaque) callconv(.c) void {
+    const handle = asSystemCurrentScanTxn(txn_ptr) orelse return;
+    const alloc = handle.alloc;
+    handle.txn.abort();
+    alloc.destroy(handle);
+}
+
+pub fn storageSystemWriteGet(
+    txn_ptr: ?*anyopaque,
+    key: kernel_owner_abi.BorrowedBytes,
+    out_value: *kernel_owner_abi.BorrowedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_value.* = .{};
+    const handle = asSystemWriteTxn(txn_ptr) orelse return .invalid_argument;
+    const value = handle.txn.get(key.slice()) catch |err| return storageOwnerStatusFromError(err);
+    out_value.* = .fromSlice(value);
+    return .ok;
+}
+
+pub fn storageSystemWritePut(
+    txn_ptr: ?*anyopaque,
+    key: kernel_owner_abi.BorrowedBytes,
+    value: kernel_owner_abi.BorrowedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    const handle = asSystemWriteTxn(txn_ptr) orelse return .invalid_argument;
+    handle.txn.put(key.slice(), value.slice()) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageSystemWriteDelete(
+    txn_ptr: ?*anyopaque,
+    key: kernel_owner_abi.BorrowedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    const handle = asSystemWriteTxn(txn_ptr) orelse return .invalid_argument;
+    handle.txn.delete(key.slice()) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageSystemWriteCommit(txn_ptr: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const handle = asSystemWriteTxn(txn_ptr) orelse return .invalid_argument;
+    const alloc = handle.alloc;
+    handle.txn.commit() catch |err| return storageOwnerStatusFromError(err);
+    alloc.destroy(handle);
+    return .ok;
+}
+
+pub fn storageSystemWriteAbort(txn_ptr: ?*anyopaque) callconv(.c) void {
+    const handle = asSystemWriteTxn(txn_ptr) orelse return;
+    const alloc = handle.alloc;
+    handle.txn.abort();
+    alloc.destroy(handle);
+}
+
+pub fn storageSystemCursorMove(
+    cursor_ptr: ?*anyopaque,
+    operation: kernel_owner_abi.SystemCursorSeek,
+    key: kernel_owner_abi.BorrowedBytes,
+    out_entry: *kernel_owner_abi.SystemEntryResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_entry.* = .{};
+    const handle = asSystemCursor(cursor_ptr) orelse return .invalid_argument;
+    const entry = switch (operation) {
+        .first => handle.cursor.first(),
+        .last => handle.cursor.last(),
+        .next => handle.cursor.next(),
+        .previous => handle.cursor.prev(),
+        .at_or_after => handle.cursor.seekAtOrAfter(key.slice()),
+        .at_or_before => handle.cursor.seekAtOrBefore(key.slice()),
+    } catch |err| return storageOwnerStatusFromError(err);
+    if (entry) |row| out_entry.* = .{
+        .key = .fromSlice(row.key),
+        .value = .fromSlice(row.value),
+        .present = 1,
+    };
+    return .ok;
+}
+
+pub fn storageSystemCursorClose(cursor_ptr: ?*anyopaque) callconv(.c) void {
+    const handle = asSystemCursor(cursor_ptr) orelse return;
+    const alloc = handle.alloc;
+    handle.cursor.close();
+    alloc.destroy(handle);
+}
+
+fn contextLiteBackend(context_ptr: ?*anyopaque) ?*lite_backend.Handle {
+    const context = asStorageOwnerContext(context_ptr) orelse return null;
+    return if (context.lite_backend) |*backend| backend else null;
+}
+
+pub fn storageContextLiteAdoptionProbe(
+    context_ptr: ?*anyopaque,
+    out_result: *kernel_owner_abi.LiteAdoptionProbeResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    const backend = contextLiteBackend(context_ptr) orelse return .invalid_argument;
+    out_result.* = .{
+        .is_embedded_artifact = @intFromBool(backend.isEmbeddedArtifact() catch |err|
+            return storageOwnerStatusFromError(err)),
+        .embedded_root_has_user_documents = @intFromBool(backend.embeddedRootHasUserDocuments() catch |err|
+            return storageOwnerStatusFromError(err)),
+    };
+    return .ok;
+}
+
+pub fn storageContextLiteAdoptAndVerify(
+    context_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.LiteAdoptionRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const context = asStorageOwnerContext(context_ptr) orelse return .invalid_argument;
+    const backend = if (context.lite_backend) |*value| value else return .invalid_argument;
+    const namespace = request.namespace.slice();
+    if (namespace.len == 0) return .invalid_argument;
+    const target_identity = db_mod.DocIdentityNamespace{
+        .table_id = request.identity_table_id,
+        .shard_id = request.identity_shard_id,
+        .range_id = request.identity_range_id,
+    };
+    if (!target_identity.eql(antfly.lite.connection.embeddedRootIdentity()))
+        return .identity_namespace_mismatch;
+    backend.adoptEmbeddedRootAsNamespace(namespace) catch |err| return storageOwnerStatusFromError(err);
+    var db_opts = db_mod.OpenOptions{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .identity_namespace = target_identity,
+    };
+    backend.configureDbOpenOptionsForNamespace(&db_opts, namespace) catch |err|
+        return storageOwnerStatusFromError(err);
+    var adopted_db = db_mod.DB.open(context.alloc, namespace, db_opts) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer adopted_db.close();
+    if (!adopted_db.core.identity_namespace.eql(target_identity)) return .identity_namespace_mismatch;
+    return .ok;
+}
+
+pub fn storageContextLiteMarkStandalone(context_ptr: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const backend = contextLiteBackend(context_ptr) orelse return .invalid_argument;
+    backend.markStandaloneArtifact() catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageContextMaintenanceStatus(
+    context_ptr: ?*anyopaque,
+    out_result: *kernel_owner_abi.ContextMaintenanceStatus,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    const backend = contextLiteBackend(context_ptr) orelse {
+        out_result.* = .{ .engine = .fromSlice("local") };
+        return .ok;
+    };
+    const status = backend.maintenanceSource().status();
+    out_result.* = .{
+        .check = @intFromBool(status.maintenance.check),
+        .compact = @intFromBool(status.maintenance.compact),
+        .vacuum = @intFromBool(status.maintenance.vacuum),
+        .online = @intFromBool(status.maintenance.online),
+        .asynchronous = @intFromBool(status.maintenance.asynchronous),
+        .has_fsync = @intFromBool(status.fsync != null),
+        .fsync = @intFromBool(status.fsync orelse false),
+        .engine = .fromSlice(status.engine),
+        .format = .fromSlice(status.format orelse ""),
+    };
+    return .ok;
+}
+
+pub fn storageContextMaintenanceRun(
+    context_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.ContextMaintenanceRequest,
+    out_result: *kernel_owner_abi.ContextMaintenanceResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const backend = contextLiteBackend(context_ptr) orelse return .invalid_argument;
+    var local_cancel: antfly.storage_maintenance.CancelToken = .{};
+    const cancel: *const antfly.storage_maintenance.CancelToken = if (request.cancel_token) |raw|
+        @ptrCast(@alignCast(raw))
+    else
+        &local_cancel;
+    const result = backend.maintenanceSource().run(switch (request.operation) {
+        .check => .check,
+        .compact => .compact,
+        .vacuum => .vacuum,
+    }, cancel) catch |err| return storageOwnerStatusFromError(err);
+    var present_mask: u16 = 0;
+    if (result.file_size != null) present_mask |= 1 << 0;
+    if (result.valid_prefix_size != null) present_mask |= 1 << 1;
+    if (result.reclaimable_bytes != null) present_mask |= 1 << 2;
+    if (result.before_size != null) present_mask |= 1 << 3;
+    if (result.after_size != null) present_mask |= 1 << 4;
+    if (result.reclaimed_bytes != null) present_mask |= 1 << 5;
+    if (result.live_file_count != null) present_mask |= 1 << 6;
+    if (result.live_bytes != null) present_mask |= 1 << 7;
+    out_result.* = .{
+        .has_valid = @intFromBool(result.valid != null),
+        .valid = @intFromBool(result.valid orelse false),
+        .issue = .fromSlice(result.issue orelse ""),
+        .file_size = result.file_size orelse 0,
+        .valid_prefix_size = result.valid_prefix_size orelse 0,
+        .reclaimable_bytes = result.reclaimable_bytes orelse 0,
+        .before_size = result.before_size orelse 0,
+        .after_size = result.after_size orelse 0,
+        .reclaimed_bytes = result.reclaimed_bytes orelse 0,
+        .live_file_count = result.live_file_count orelse 0,
+        .live_bytes = result.live_bytes orelse 0,
+        .present_mask = present_mask,
+    };
+    return .ok;
+}
+
+fn asDataApplyStore(ptr: ?*anyopaque) ?*DataApplyStoreHandle {
+    return @ptrCast(@alignCast(ptr orelse return null));
+}
+
+fn asMetadataApplyStore(ptr: ?*anyopaque) ?*MetadataApplyStoreHandle {
+    return @ptrCast(@alignCast(ptr orelse return null));
+}
+
+fn asMetadataPreparedSnapshot(ptr: ?*anyopaque) ?*MetadataPreparedSnapshotHandle {
+    return @ptrCast(@alignCast(ptr orelse return null));
+}
+
+fn asDataApplyGroupTransition(ptr: ?*anyopaque) ?*DataApplyGroupTransitionHandle {
+    return @ptrCast(@alignCast(ptr orelse return null));
+}
+
+fn asDataApplyPreparedSnapshot(ptr: ?*anyopaque) ?*DataApplyPreparedSnapshotHandle {
+    return @ptrCast(@alignCast(ptr orelse return null));
+}
+
+fn metadataProjectionJson(
+    alloc: Allocator,
+    out_json: *kernel_owner_abi.OwnedBytes,
+    value: anytype,
+) kernel_owner_abi.Status {
+    const encoded = std.json.Stringify.valueAlloc(alloc, value, .{}) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_json.* = .{
+        .ptr = if (encoded.len == 0) null else encoded.ptr,
+        .len = @intCast(encoded.len),
+    };
+    return .ok;
+}
+
+fn metadataProjectionStatusFromError(err: anyerror) kernel_owner_abi.Status {
+    if (err == error.InvalidDerivedCatalogIndex)
+        return storageOwnerStatusFromError(error.InvalidArgument);
+    return storageOwnerStatusFromError(err);
+}
+
+pub fn metadataApplyStoreOpen(
+    request: *const kernel_owner_abi.MetadataApplyOpenRequest,
+    out_store: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_store.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const root_dir = request.root_dir.slice();
+    if (root_dir.len == 0) return .invalid_argument;
+    const alloc = std.heap.c_allocator;
+    const context = asStorageOwnerContext(request.context);
+    if (context) |value| value.acquire();
+    var context_borrowed = context != null;
+    defer if (context_borrowed) context.?.release();
+    var store = metadata_raft_apply.RaftApplyStore.init(alloc, .{
+        .root_dir = root_dir,
+        .no_sync = request.no_sync != 0,
+        .read_only = request.read_only != 0,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    errdefer store.deinit();
+    const handle = alloc.create(MetadataApplyStoreHandle) catch return .out_of_memory;
+    handle.* = .{ .alloc = alloc, .store = store, .context = context };
+    context_borrowed = false;
+    out_store.* = handle;
+    return .ok;
+}
+
+pub fn metadataApplyStoreClose(store_ptr: ?*anyopaque) callconv(.c) void {
+    const handle = asMetadataApplyStore(store_ptr) orelse return;
+    const alloc = handle.alloc;
+    const context = handle.context;
+    handle.store.deinit();
+    for (handle.listener_bridges.items) |bridge| alloc.destroy(bridge);
+    handle.listener_bridges.deinit(alloc);
+    handle.* = undefined;
+    alloc.destroy(handle);
+    if (context) |value| value.release();
+}
+
+pub fn metadataApplyStoreApplyBatch(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.MetadataApplyBatchRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
+    handle.store.snapshotBuilder().applyBatch(.{
+        .group_id = request.group_id,
+        .commit_index = request.commit_index,
+        .entries_bytes = request.entries.slice(),
+    }) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn metadataApplyStoreBuildSnapshot(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.MetadataApplyGroupRequest,
+    out_snapshot: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_snapshot.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
+    const snapshot = handle.store.snapshotBuilder().buildSnapshot(handle.alloc, request.group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_snapshot.* = .{ .ptr = if (snapshot.len == 0) null else snapshot.ptr, .len = @intCast(snapshot.len) };
+    return .ok;
+}
+
+pub fn metadataApplyStoreInstallSnapshot(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.MetadataApplySnapshotRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
+    const installed = handle.store.snapshotBuilder().installSnapshot(
+        handle.alloc,
+        request.group_id,
+        request.commit_index,
+        request.snapshot.slice(),
+    ) catch |err| return storageOwnerStatusFromError(err);
+    return if (installed) .ok else .internal;
+}
+
+pub fn metadataApplyStorePrepareSnapshot(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.MetadataApplyPrepareSnapshotRequest,
+    out_prepared: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_prepared.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
+    const source = handle.store.snapshotBuilder().prepareSnapshot(request.group_id, request.applied_index) catch |err|
+        return storageOwnerStatusFromError(err);
+    const value = source orelse return .ok;
+    const prepared = handle.alloc.create(MetadataPreparedSnapshotHandle) catch {
+        value.deinit();
+        return .out_of_memory;
+    };
+    prepared.* = .{ .source = value };
+    out_prepared.* = prepared;
+    return .ok;
+}
+
+pub fn metadataApplyPreparedSnapshotMaterialize(
+    prepared_ptr: ?*anyopaque,
+    out_snapshot: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_snapshot.* = .{};
+    const prepared = asMetadataPreparedSnapshot(prepared_ptr) orelse return .invalid_argument;
+    const alloc = std.heap.c_allocator;
+    var materialized = prepared.source.materialize(alloc) catch |err| return storageOwnerStatusFromError(err);
+    switch (materialized) {
+        .bytes => |bytes| {
+            out_snapshot.* = .{ .ptr = if (bytes.len == 0) null else bytes.ptr, .len = @intCast(bytes.len) };
+            materialized = undefined;
+        },
+        .artifact => |artifact| {
+            const bytes = artifact.readAll(alloc) catch |err| {
+                materialized.deinit(alloc);
+                return storageOwnerStatusFromError(err);
+            };
+            materialized.deinit(alloc);
+            out_snapshot.* = .{ .ptr = if (bytes.len == 0) null else bytes.ptr, .len = @intCast(bytes.len) };
+        },
+    }
+    return .ok;
+}
+
+pub fn metadataApplyPreparedSnapshotCancel(prepared_ptr: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const prepared = asMetadataPreparedSnapshot(prepared_ptr) orelse return .invalid_argument;
+    prepared.source.cancel();
+    return .ok;
+}
+
+pub fn metadataApplyPreparedSnapshotDestroy(prepared_ptr: ?*anyopaque) callconv(.c) void {
+    const prepared = asMetadataPreparedSnapshot(prepared_ptr) orelse return;
+    prepared.source.deinit();
+    std.heap.c_allocator.destroy(prepared);
+}
+
+pub fn metadataApplyStoreAddListeners(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.MetadataListenerRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request.projection_fn == null and request.committed_key_fn == null) return .invalid_argument;
+    if (request.has_commit_barrier_kind > 1) return .invalid_argument;
+    const has_commit_barrier = request.has_commit_barrier_kind != 0;
+    if ((request.before_projection_commit_fn != null) != has_commit_barrier or
+        (request.after_projection_commit_fn != null) != has_commit_barrier or
+        (has_commit_barrier and request.projection_fn == null)) return .invalid_argument;
+    const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
+    handle.listener_bridges.ensureUnusedCapacity(handle.alloc, 1) catch return .out_of_memory;
+    const bridge = handle.alloc.create(MetadataListenerBridge) catch return .out_of_memory;
+    errdefer handle.alloc.destroy(bridge);
+    bridge.* = .{ .request = request.* };
+    const projection = metadata_raft_apply.ProjectionListener{
+        .ptr = bridge,
+        .vtable = if (has_commit_barrier)
+            &MetadataListenerBridge.projection_barrier_vtable
+        else
+            &MetadataListenerBridge.projection_vtable,
+        .commit_barrier_kind = if (has_commit_barrier)
+            MetadataListenerBridge.projectionKindFromAbi(request.commit_barrier_kind)
+        else
+            null,
+    };
+    const committed = metadata_raft_apply.CommittedKeyListener{
+        .ptr = bridge,
+        .vtable = &MetadataListenerBridge.committed_key_vtable,
+    };
+    if (request.projection_fn != null and request.committed_key_fn != null)
+        handle.store.addLifecycleListeners(projection, committed) catch |err| return storageOwnerStatusFromError(err)
+    else if (request.projection_fn != null)
+        handle.store.addProjectionListener(projection) catch |err| return storageOwnerStatusFromError(err)
+    else
+        handle.store.addCommittedKeyListener(committed) catch |err| return storageOwnerStatusFromError(err);
+    handle.listener_bridges.appendAssumeCapacity(bridge);
+    return .ok;
+}
+
+pub fn metadataApplyStoreProjection(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.MetadataProjectionRequest,
+    out_json: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_json.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
+    const alloc = handle.alloc;
+    return switch (request.kind) {
+        .latest_batch => blk: {
+            const value = handle.store.latestBatch(request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .metadata_incarnation => blk: {
+            const value = handle.store.getMetadataIncarnation(request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .runtime_status_protocol_activation_version => blk: {
+            const value = handle.store.getRuntimeStatusProtocolActivationVersion(request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .split_transitions => blk: {
+            const value = handle.store.listSplitTransitions(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeSplitTransitions(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .placement_intents => blk: {
+            const value = handle.store.listPlacementIntents(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freePlacementIntents(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .placement_version_fences => blk: {
+            const value = handle.store.listPlacementVersionFences(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer alloc.free(value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .local_placement_intents => blk: {
+            const value = handle.store.listLocalPlacementIntents(alloc, request.group_id, request.arg0) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freePlacementIntents(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .nodes => blk: {
+            const value = handle.store.listNodes(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeNodes(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .stores => blk: {
+            const value = handle.store.listStores(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeStores(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .merge_transitions => blk: {
+            const value = handle.store.listMergeTransitions(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeMergeTransitions(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .tables => blk: {
+            const value = handle.store.listTables(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeTables(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .catalog_projection => blk: {
+            const value = handle.store.captureCatalogProjection(
+                alloc,
+                request.group_id,
+                if (request.arg0 == 0) null else request.arg0,
+            ) catch |err| break :blk if (err == error.CatalogRoutingSnapshotTimeout)
+                .timeout
+            else
+                storageOwnerStatusFromError(err);
+            defer handle.store.freeTables(alloc, value.tables);
+            defer handle.store.freeRanges(alloc, value.ranges);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .catalog_cursor => blk: {
+            const value = handle.store.captureCatalogCursor(request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .table => blk: {
+            const value = handle.store.getTable(alloc, request.group_id, request.arg0) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer if (value) |record| metadata_table_manager.freeTable(alloc, record);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .range => blk: {
+            const value = handle.store.getRange(alloc, request.group_id, request.arg0) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer if (value) |record| metadata_table_manager.freeRange(alloc, record);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .table_drop_projection => blk: {
+            var value = handle.store.captureTableDropProjection(
+                alloc,
+                request.group_id,
+                request.key.slice(),
+            ) catch |err| break :blk metadataProjectionStatusFromError(err);
+            defer if (value) |*projection| projection.deinit(alloc);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .table_create_generation => blk: {
+            const value = handle.store.captureTableCreateGeneration(
+                alloc,
+                request.group_id,
+                request.arg0,
+            ) catch |err| break :blk metadataProjectionStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .table_restore_admission => blk: {
+            var parsed = std.json.parseFromSlice(
+                metadata_table_manager.TableRecord,
+                alloc,
+                request.key.slice(),
+                .{},
+            ) catch |err| break :blk switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                else => .invalid_argument,
+            };
+            defer parsed.deinit();
+            const value = handle.store.captureTableRestoreAdmission(
+                alloc,
+                request.group_id,
+                parsed.value,
+            ) catch |err| break :blk metadataProjectionStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .verify_table_create_projection => blk: {
+            const Payload = struct {
+                table: metadata_table_manager.TableRecord,
+                ranges: []const metadata_table_manager.RangeRecord,
+            };
+            var parsed = std.json.parseFromSlice(Payload, alloc, request.key.slice(), .{}) catch |err|
+                break :blk switch (err) {
+                    error.OutOfMemory => .out_of_memory,
+                    else => .invalid_argument,
+                };
+            defer parsed.deinit();
+            handle.store.verifyTableCreateProjectionExact(
+                alloc,
+                request.group_id,
+                parsed.value.table,
+                parsed.value.ranges,
+            ) catch |err| break :blk metadataProjectionStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
+        .table_transition_fence => blk: {
+            const value = handle.store.getTableTransitionFence(request.group_id, request.arg0) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .schema_progress => blk: {
+            const value = handle.store.listSchemaProgress(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeSchemaProgress(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .restore_progress => blk: {
+            const value = handle.store.listRestoreProgress(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeRestoreProgress(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .active_restore_ranges => blk: {
+            const value = handle.store.listActiveRestoreRanges(alloc, request.group_id) catch |err|
+                break :blk metadataProjectionStatusFromError(err);
+            defer handle.store.freeRanges(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .ensure_derived_catalog_indexes => blk: {
+            handle.store.ensureDerivedCatalogIndexes(request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
+        .rebuild_derived_catalog_indexes => blk: {
+            handle.store.rebuildDerivedCatalogIndexes(request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
+        .replication_source_statuses => blk: {
+            const value = handle.store.listReplicationSourceStatuses(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeReplicationSourceStatuses(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .replication_source_status => blk: {
+            const ordinal = std.math.cast(u32, request.arg1) orelse break :blk .invalid_argument;
+            const value = handle.store.getReplicationSourceStatus(alloc, request.group_id, request.arg0, ordinal) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer if (value) |record| metadata_table_manager.freeReplicationSourceStatus(alloc, record);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .extension_packages => blk: {
+            const value = handle.store.listExtensionPackages(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeExtensionPackages(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .installed_extensions => blk: {
+            const value = handle.store.listInstalledExtensions(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeInstalledExtensions(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .extension_members => blk: {
+            const value = handle.store.listExtensionMembers(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeExtensionMembers(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .extension_dependencies => blk: {
+            const value = handle.store.listExtensionDependencies(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeExtensionDependencies(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .extension_lifecycle_delta_applied => blk: {
+            var parsed = std.json.parseFromSlice(
+                metadata_raft_apply.ExtensionLifecycleDelta,
+                alloc,
+                request.key.slice(),
+                .{},
+            ) catch |err| break :blk switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                else => .invalid_argument,
+            };
+            defer parsed.deinit();
+            const applied = handle.store.extensionLifecycleDeltaApplied(
+                alloc,
+                request.group_id,
+                parsed.value,
+            ) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, applied);
+        },
+        .shuffle_join_leases => blk: {
+            const value = handle.store.listShuffleJoinLeases(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeShuffleJoinLeases(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .ranges => blk: {
+            const value = handle.store.listRanges(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeRanges(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .reconcile_lease => blk: {
+            const value = handle.store.getReconcileLease(request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .reallocation_request => blk: {
+            const value = handle.store.getReallocationRequest(request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .shuffle_join_lease => blk: {
+            const value = handle.store.getShuffleJoinLease(request.group_id, request.arg0) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .restore_job_rows => blk: {
+            const value = handle.store.listRestoreJobRows(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer handle.store.freeRestoreJobRows(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .restore_job_value => blk: {
+            const value = handle.store.getRestoreJobValue(alloc, request.group_id, request.key.slice()) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer if (value) |bytes| alloc.free(bytes);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .maintenance_stats => blk: {
+            const stats = handle.store.snapshotMaintenanceStats();
+            break :blk metadataProjectionJson(alloc, out_json, .{
+                .mutable_bytes = stats.mutable_bytes,
+                .immutable_bytes = stats.immutable_bytes,
+                .total_run_bytes = stats.total_run_bytes,
+                .wal_retained_bytes = stats.wal_retained_bytes,
+                .wal_retained_segments = stats.wal_retained_segments,
+                .active_readers = stats.active_readers,
+                .obsolete_paths = stats.obsolete_paths,
+                .obsolete_paths_pinned_by_readers = stats.obsolete_paths_pinned_by_readers,
+                .obsolete_paths_pinned_by_versions = stats.obsolete_paths_pinned_by_versions,
+                .bulk_ingest_current_scan_clone_active_bytes = stats.bulk_ingest_current_scan_clone_active_bytes,
+            });
+        },
+    };
+}
+
+pub fn metadataReconcileReplicaRoot(
+    request: *const kernel_owner_abi.MetadataReplicaRootReconcileRequest,
+    out_summary: *kernel_owner_abi.MetadataProvisionSummary,
+) callconv(.c) kernel_owner_abi.Status {
+    out_summary.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const replica_root_dir = request.replica_root_dir.slice();
+    if (replica_root_dir.len == 0 or request.request_json.len == 0) return .invalid_argument;
+    const context = if (request.context) |_| asStorageOwnerContext(request.context) orelse return .invalid_argument else null;
+    if (context) |value| value.acquire();
+    defer if (context) |value| value.release();
+
+    const Payload = struct {
+        group_ids: []const u64,
+        tables: []const metadata_table_manager.TableRecord,
+        ranges: []const metadata_table_manager.RangeRecord,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const payload = std.json.parseFromSliceLeaky(Payload, alloc, request.request_json.slice(), .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => .out_of_memory,
+        else => .invalid_argument,
+    };
+    const summary = metadata_table_provisioner.reconcileReplicaRoot(
+        alloc,
+        replica_root_dir,
+        request.metadata_group_id,
+        payload.group_ids,
+        payload.tables,
+        payload.ranges,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    out_summary.* = .{
+        .groups_considered = @intCast(summary.groups_considered),
+        .dbs_opened = @intCast(summary.dbs_opened),
+        .indexes_added = @intCast(summary.indexes_added),
+        .indexes_removed = @intCast(summary.indexes_removed),
+        .indexes_pending = @intCast(summary.indexes_pending),
+        .enrichments_added = @intCast(summary.enrichments_added),
+        .enrichments_updated = @intCast(summary.enrichments_updated),
+        .enrichments_removed = @intCast(summary.enrichments_removed),
+        .resolvers_added = @intCast(summary.resolvers_added),
+        .resolvers_updated = @intCast(summary.resolvers_updated),
+        .resolvers_removed = @intCast(summary.resolvers_removed),
+    };
+    return .ok;
+}
+
+pub fn dataApplyStoreOpen(
+    request: *const kernel_owner_abi.DataApplyOpenRequest,
+    out_store: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_store.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const root_dir = request.root_dir.slice();
+    if (root_dir.len == 0) return .invalid_argument;
+    const alloc = std.heap.c_allocator;
+    const context = asStorageOwnerContext(request.context);
+    if (context) |value| value.acquire();
+    var context_borrowed = context != null;
+    defer if (context_borrowed) context.?.release();
+    var store = data_raft_apply.RaftApplyStore.init(alloc, .{
+        .root_dir = root_dir,
+        .no_sync = request.no_sync != 0,
+        .read_only = request.read_only != 0,
+        .resource_manager = if (context) |value| &value.resources.resource_manager else null,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    errdefer store.deinit();
+    const handle = alloc.create(DataApplyStoreHandle) catch return .out_of_memory;
+    handle.* = .{
+        .alloc = alloc,
+        .store = store,
+        .context = context,
+    };
+    context_borrowed = false;
+    out_store.* = handle;
+    return .ok;
+}
+
+pub fn dataApplyStoreClose(store_ptr: ?*anyopaque) callconv(.c) void {
+    const handle = asDataApplyStore(store_ptr) orelse return;
+    const alloc = handle.alloc;
+    const context = handle.context;
+    handle.store.deinit();
+    handle.* = undefined;
+    alloc.destroy(handle);
+    if (context) |value| value.release();
+}
+
+pub fn dataApplyStoreApplyBatch(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyBatchRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    handle.store.snapshotBuilder().applyBatch(.{
+        .group_id = request.group_id,
+        .commit_index = request.commit_index,
+        .entries_bytes = request.entries.slice(),
+    }) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn dataApplyStoreBuildSnapshot(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyGroupRequest,
+    out_snapshot: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_snapshot.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const snapshot = handle.store.snapshotBuilder().buildSnapshot(handle.alloc, request.group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_snapshot.* = .{
+        .ptr = if (snapshot.len == 0) null else snapshot.ptr,
+        .len = @intCast(snapshot.len),
+    };
+    return .ok;
+}
+
+pub fn dataApplyStoreInstallSnapshot(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplySnapshotRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const installed = handle.store.snapshotBuilder().installSnapshot(
+        handle.alloc,
+        request.group_id,
+        request.commit_index,
+        request.snapshot.slice(),
+    ) catch |err| return storageOwnerStatusFromError(err);
+    if (!installed) return .internal;
+    return .ok;
+}
+
+pub fn dataApplyStorePrepareSnapshot(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyPrepareSnapshotRequest,
+    out_prepared: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_prepared.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const prepared = handle.store.prepareSnapshotHandle(request.group_id, request.applied_index) catch |err|
+        return storageOwnerStatusFromError(err);
+    const value = prepared orelse return .ok;
+    const owned = handle.alloc.create(DataApplyPreparedSnapshotHandle) catch {
+        value.destroy();
+        return .out_of_memory;
+    };
+    owned.* = .{ .prepared = value };
+    out_prepared.* = owned;
+    return .ok;
+}
+
+pub fn dataApplyPreparedSnapshotMaterialize(
+    prepared_ptr: ?*anyopaque,
+    out_result: *kernel_owner_abi.DataApplyPreparedSnapshotResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    const handle = asDataApplyPreparedSnapshot(prepared_ptr) orelse return .invalid_argument;
+    if (handle.materialized) return .invalid_argument;
+    const materialized = handle.prepared.materializeFile(std.heap.c_allocator) catch |err|
+        return storageOwnerStatusFromError(err);
+    handle.materialized = true;
+    out_result.* = .{
+        .path = .{
+            .ptr = if (materialized.path.len == 0) null else materialized.path.ptr,
+            .len = @intCast(materialized.path.len),
+        },
+        .size = materialized.size,
+    };
+    return .ok;
+}
+
+pub fn dataApplyPreparedSnapshotCancel(prepared_ptr: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const handle = asDataApplyPreparedSnapshot(prepared_ptr) orelse return .invalid_argument;
+    handle.prepared.cancel();
+    return .ok;
+}
+
+pub fn dataApplyPreparedSnapshotDestroy(prepared_ptr: ?*anyopaque) callconv(.c) void {
+    const handle = asDataApplyPreparedSnapshot(prepared_ptr) orelse return;
+    handle.prepared.destroy();
+    std.heap.c_allocator.destroy(handle);
+}
+
+pub fn dataApplyStoreLatest(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyGroupRequest,
+    out_result: *kernel_owner_abi.DataApplyLatestResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const latest = handle.store.latestBatch(request.group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    const value = latest orelse return .ok;
+    out_result.* = .{
+        .present = 1,
+        .commit_index = value.commit_index,
+        .entry_count = @intCast(value.entry_count),
+        .normal_entry_count = @intCast(value.normal_entry_count),
+        .admin_entry_count = @intCast(value.admin_entry_count),
+        .last_entry_term = value.last_entry_term,
+        .last_entry_index = value.last_entry_index,
+    };
+    return .ok;
+}
+
+pub fn dataApplyStoreLatestForTransition(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyGroupRequest,
+    out_result: *kernel_owner_abi.DataApplyLatestResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const latest = handle.store.latestBatchForTransition(request.group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_result.* = dataApplyLatestResult(latest);
+    return .ok;
+}
+
+pub fn dataApplyStoreRaftBatchProtocolVersion(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyGroupRequest,
+    out_version: *u16,
+) callconv(.c) kernel_owner_abi.Status {
+    out_version.* = 0;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    out_version.* = handle.store.raftBatchProtocolVersionForRequest(request.group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn dataApplyStoreProjection(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyProjectionRequest,
+    out_result: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request.expected.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const alloc = handle.alloc;
+    const encoded = switch (request.kind) {
+        .observe_split_control => blk: {
+            var observation = handle.store.observeSplitControl(alloc, request.group_id) catch |err|
+                return storageOwnerStatusFromError(err);
+            defer observation.deinit(alloc);
+            break :blk data_raft_projection_wire.encodeSplitControlAlloc(alloc, observation) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+        .current_range => blk: {
+            const byte_range = handle.store.currentRange(alloc, request.group_id) catch |err|
+                return storageOwnerStatusFromError(err);
+            defer {
+                if (byte_range.start.len > 0) alloc.free(@constCast(byte_range.start));
+                if (byte_range.end.len > 0) alloc.free(@constCast(byte_range.end));
+            }
+            break :blk data_raft_projection_wire.encodeRangeAlloc(alloc, byte_range) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+        .group_state_page => blk: {
+            const max_entries = std.math.cast(usize, request.max_entries) orelse return .invalid_argument;
+            const max_bytes = std.math.cast(usize, request.max_bytes) orelse return .invalid_argument;
+            if (max_entries == 0 or max_bytes == 0) return .invalid_argument;
+            var page = handle.store.groupStatePageInRange(
+                alloc,
+                request.group_id,
+                .{ .start = request.range_start.slice(), .end = request.range_end.slice() },
+                if (request.after_key.len == 0) null else request.after_key.slice(),
+                max_entries,
+                max_bytes,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            defer page.deinit(alloc);
+            break :blk data_raft_projection_wire.encodeGroupStatePageAlloc(alloc, page) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+        .split_deltas_page => blk: {
+            const max_entries = std.math.cast(usize, request.max_entries) orelse return .invalid_argument;
+            const max_bytes = std.math.cast(usize, request.max_bytes) orelse return .invalid_argument;
+            if (max_entries == 0 or max_bytes == 0) return .invalid_argument;
+            const deltas = handle.store.listSplitDeltasPage(
+                alloc,
+                request.group_id,
+                request.after_sequence,
+                request.through_sequence,
+                max_entries,
+                max_bytes,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            defer antfly.shard.freeDeltas(alloc, deltas);
+            break :blk data_raft_projection_wire.encodeSplitDeltasAlloc(alloc, deltas) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+        .capture_verified_handoff_metadata => blk: {
+            const expected = (dataApplyExpectedBatch(request.expected) catch return .invalid_argument) orelse
+                return .invalid_argument;
+            const root_incarnation = std.mem.readInt(u128, &request.root_incarnation_le, .little);
+            const handoff = handle.store.captureVerifiedSplitHandoffMetadataAtRootIncarnation(
+                alloc,
+                request.group_id,
+                expected,
+                root_incarnation,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            const value = handoff orelse return .not_found;
+            defer antfly.data_snapshot.freeHandoffMetadata(alloc, value);
+            break :blk data_raft_projection_wire.encodeHandoffMetadataAlloc(alloc, value) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+    };
+    out_result.* = .{
+        .ptr = if (encoded.len == 0) null else encoded.ptr,
+        .len = @intCast(encoded.len),
+    };
+    return .ok;
+}
+
+pub fn dataApplyStoreReconcileOwner(
+    store_ptr: ?*anyopaque,
+    owner_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyReconcileRequest,
+    out_result: *kernel_owner_abi.DataApplyReconcileResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version or
+        request.expected.version != kernel_owner_abi.abi_version)
+        return .invalid_abi;
+    const apply_handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const owner = asHandle(owner_ptr) orelse return .invalid_argument;
+    if (owner.storage_owner_group_id != request.group_id) return .invalid_argument;
+    const max_entries = std.math.cast(usize, request.max_page_entries) orelse return .invalid_argument;
+    const max_bytes = std.math.cast(usize, request.max_page_bytes) orelse return .invalid_argument;
+    if (max_entries == 0 or max_bytes == 0) return .invalid_argument;
+    if (request.capture_handoff > 1) return .invalid_argument;
+    const capture_handoff = request.capture_handoff != 0;
+    const expected = dataApplyExpectedBatch(request.expected) catch return .invalid_argument;
+    if (capture_handoff and expected == null) return .invalid_argument;
+    if (owner.db.hasTopologySensitiveTransactions() catch |err| return storageOwnerStatusFromError(err))
+        return .busy;
+    const root_incarnation = owner.db.durableRootIncarnation() catch |err|
+        return storageOwnerStatusFromError(err);
+    const alloc = apply_handle.alloc;
+
+    if (capture_handoff) {
+        const handoff = apply_handle.store.captureVerifiedSplitHandoffMetadataAtRootIncarnation(
+            alloc,
+            request.group_id,
+            expected.?,
+            root_incarnation,
+        ) catch |err| return storageOwnerStatusFromError(err);
+        if (handoff) |value| {
+            defer antfly.data_snapshot.freeHandoffMetadata(alloc, value);
+            const encoded = data_raft_projection_wire.encodeHandoffMetadataAlloc(alloc, value) catch |err|
+                return storageOwnerStatusFromError(err);
+            out_result.* = .{
+                .state = .handoff,
+                .handoff_metadata = .{
+                    .ptr = if (encoded.len == 0) null else encoded.ptr,
+                    .len = @intCast(encoded.len),
+                },
+            };
+            return .ok;
+        }
+    }
+
+    const active_split = apply_handle.store.currentSplitState(alloc, request.group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer if (active_split) |state| antfly.data_snapshot.freeSplitState(alloc, state);
+    var projected_range: ?data_raft_apply.AppliedDataRange = null;
+    defer if (projected_range) |range| {
+        if (range.start.len > 0) alloc.free(@constCast(range.start));
+        if (range.end.len > 0) alloc.free(@constCast(range.end));
+    };
+    const byte_range = if (active_split) |state| blk: {
+        const current = apply_handle.store.currentRange(alloc, request.group_id) catch |err|
+            return storageOwnerStatusFromError(err);
+        projected_range = current;
+        break :blk data_raft_apply.AppliedDataRange{
+            .start = current.start,
+            .end = state.original_range_end,
+        };
+    } else owner.db.getRange();
+
+    if (expected) |watermark| {
+        const reconciled = apply_handle.store.reconcileGroupSnapshotFromAuthoritativeStoreAtRootIncarnation(
+            alloc,
+            request.group_id,
+            watermark,
+            root_incarnation,
+            byte_range,
+            owner.db.core.store,
+            max_entries,
+            max_bytes,
+        ) catch |err| return storageOwnerStatusFromError(err);
+        if (!reconciled) {
+            out_result.state = .advanced;
+            return .ok;
+        }
+        if (!capture_handoff) {
+            out_result.state = .reconciled;
+            return .ok;
+        }
+        const handoff = apply_handle.store.captureVerifiedSplitHandoffMetadataAtRootIncarnation(
+            alloc,
+            request.group_id,
+            watermark,
+            root_incarnation,
+        ) catch |err| return storageOwnerStatusFromError(err);
+        const value = handoff orelse {
+            out_result.state = .advanced;
+            return .ok;
+        };
+        defer antfly.data_snapshot.freeHandoffMetadata(alloc, value);
+        const encoded = data_raft_projection_wire.encodeHandoffMetadataAlloc(alloc, value) catch |err|
+            return storageOwnerStatusFromError(err);
+        out_result.* = .{
+            .state = .handoff,
+            .handoff_metadata = .{
+                .ptr = if (encoded.len == 0) null else encoded.ptr,
+                .len = @intCast(encoded.len),
+            },
+        };
+        return .ok;
+    }
+    const seeded = apply_handle.store.seedGroupSnapshotFromAuthoritativeStoreIfAbsent(
+        alloc,
+        request.group_id,
+        root_incarnation,
+        byte_range,
+        owner.db.core.store,
+        max_entries,
+        max_bytes,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    out_result.state = if (seeded) .reconciled else .advanced;
+    return .ok;
+}
+
+fn dataApplyLatestResult(latest: ?data_raft_apply.AppliedDataBatch) kernel_owner_abi.DataApplyLatestResult {
+    const value = latest orelse return .{};
+    return .{
+        .present = 1,
+        .commit_index = value.commit_index,
+        .entry_count = @intCast(value.entry_count),
+        .normal_entry_count = @intCast(value.normal_entry_count),
+        .admin_entry_count = @intCast(value.admin_entry_count),
+        .last_entry_term = value.last_entry_term,
+        .last_entry_index = value.last_entry_index,
+    };
+}
+
+fn dataApplyExpectedBatch(value: kernel_owner_abi.DataApplyLatestResult) !?data_raft_apply.AppliedDataBatch {
+    if (value.present == 0) return null;
+    if (value.present != 1) return error.InvalidArgument;
+    return .{
+        .commit_index = value.commit_index,
+        .entry_count = std.math.cast(usize, value.entry_count) orelse return error.InvalidArgument,
+        .normal_entry_count = std.math.cast(usize, value.normal_entry_count) orelse return error.InvalidArgument,
+        .admin_entry_count = std.math.cast(usize, value.admin_entry_count) orelse return error.InvalidArgument,
+        .last_entry_term = value.last_entry_term,
+        .last_entry_index = value.last_entry_index,
+    };
+}
+
+pub fn dataApplyStoreRetainGroups(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyGroupsRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const groups = request.slice() orelse return .invalid_argument;
+    handle.store.retainActiveGroups(groups) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn dataApplyStoreBeginGroupTransition(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyGroupsRequest,
+    out_transition: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_transition.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const groups = request.slice() orelse return .invalid_argument;
+    var transition = handle.store.beginActiveGroupTransition(groups) catch |err|
+        return storageOwnerStatusFromError(err);
+    errdefer transition.deinit();
+    const owned = handle.alloc.create(DataApplyGroupTransitionHandle) catch return .out_of_memory;
+    owned.* = .{ .transition = transition };
+    out_transition.* = owned;
+    return .ok;
+}
+
+pub fn dataApplyStoreCommitGroupTransition(
+    transition_ptr: ?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    const handle = asDataApplyGroupTransition(transition_ptr) orelse return .invalid_argument;
+    if (!handle.active) return .invalid_argument;
+    handle.transition.commit();
+    handle.active = false;
+    return .ok;
+}
+
+pub fn dataApplyStoreAbortGroupTransition(
+    transition_ptr: ?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    const handle = asDataApplyGroupTransition(transition_ptr) orelse return .invalid_argument;
+    if (!handle.active) return .ok;
+    handle.transition.abort();
+    handle.active = false;
+    return .ok;
+}
+
+pub fn dataApplyStoreDestroyGroupTransition(transition_ptr: ?*anyopaque) callconv(.c) void {
+    const handle = asDataApplyGroupTransition(transition_ptr) orelse return;
+    if (handle.active) handle.transition.abort();
+    handle.transition.deinit();
+    std.heap.c_allocator.destroy(handle);
+}
+
+fn releaseBorrowedTransitionOwner(_: *anyopaque) void {}
+
+fn validateLocalTransitionOwner(
+    handle: *const Handle,
+    group_id: u64,
+    table_name: []const u8,
+    table_id: u64,
+    shard_id: u64,
+    range_id: u64,
+    allow_same_table_identity: bool,
+) !void {
+    if (handle.storage_owner_group_id != group_id or
+        !std.mem.eql(u8, handle.storage_owner_table_name orelse return error.InvalidArgument, table_name) or
+        handle.storage_owner_path == null)
+    {
+        return error.InvalidArgument;
+    }
+    const identity = handle.db.core.identity_namespace;
+    if (identity.table_id != table_id) return error.DocIdentityNamespaceMismatch;
+    if (!allow_same_table_identity and
+        (identity.shard_id != shard_id or identity.range_id != range_id))
+    {
+        return error.DocIdentityNamespaceMismatch;
+    }
+}
+
+fn localTransitionIdentity(
+    request: *const kernel_owner_abi.LocalTransitionRequest,
+    target: bool,
+) db_mod.DocIdentityNamespace {
+    return .{
+        .table_id = request.table_id,
+        .shard_id = if (target) request.target_identity_shard_id else request.source_identity_shard_id,
+        .range_id = if (target) request.target_identity_range_id else request.source_identity_range_id,
+    };
+}
+
+fn localTransitionSplitResult(status: anytype) kernel_owner_abi.LocalTransitionResult {
+    return .{
+        .kind = .split,
+        .phase = @enumFromInt(@intFromEnum(status.phase)),
+        .has_source_split_phase = @intFromBool(status.source_split_phase != null),
+        .source_split_phase = if (status.source_split_phase) |phase| @intFromEnum(phase) else 0,
+        .bootstrapped = @intFromBool(status.bootstrapped),
+        .replay_required = @intFromBool(status.replay_required),
+        .replay_caught_up = @intFromBool(status.replay_caught_up),
+        .cutover_ready = @intFromBool(status.cutover_ready),
+        .peer_ready_for_reads = @intFromBool(status.destination_ready_for_reads),
+        .primary_delta_sequence = status.source_delta_sequence,
+        .secondary_delta_sequence = status.dest_delta_sequence,
+    };
+}
+
+fn localTransitionMergeResult(status: anytype) kernel_owner_abi.LocalTransitionResult {
+    return .{
+        .kind = .merge,
+        .phase = @enumFromInt(@intFromEnum(status.phase)),
+        .bootstrapped = @intFromBool(status.bootstrapped),
+        .replay_required = @intFromBool(status.replay_required),
+        .replay_caught_up = @intFromBool(status.replay_caught_up),
+        .cutover_ready = @intFromBool(status.cutover_ready),
+        .peer_ready_for_reads = @intFromBool(status.receiver_ready_for_reads),
+        .receiver_accepts_donor_range = @intFromBool(status.receiver_accepts_donor_range),
+        .allow_doc_identity_reassignment = @intFromBool(status.allow_doc_identity_reassignment),
+        .primary_group_id = status.donor_group_id,
+        .secondary_group_id = status.receiver_group_id,
+        .primary_delta_sequence = status.donor_delta_sequence,
+        .secondary_delta_sequence = status.receiver_delta_sequence,
+        .receiver_identity_table_id = status.receiver_identity_reassignment_namespace_table_id,
+        .receiver_identity_shard_id = status.receiver_identity_reassignment_namespace_shard_id,
+        .receiver_identity_range_id = status.receiver_identity_reassignment_namespace_range_id,
+    };
+}
+
+/// Execute one complete local transition phase against two resident opaque DB
+/// owners. No database, backend, or per-record representation crosses the ABI.
+pub fn storageOwnerLocalTransition(
+    primary_owner_ptr: ?*anyopaque,
+    secondary_owner_ptr: ?*anyopaque,
+    apply_store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.LocalTransitionRequest,
+    out_result: *kernel_owner_abi.LocalTransitionResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request.transition_id == 0 or request.primary_group_id == 0 or
+        request.secondary_group_id == 0 or request.primary_group_id == request.secondary_group_id or
+        request.table_id == 0 or request.table_name.slice().len == 0 or
+        request.indexes_json.slice().len == 0 or request.allow_doc_identity_reassignment > 1 or
+        request.has_source_range_end > 1)
+    {
+        return .invalid_argument;
+    }
+    const primary = asHandle(primary_owner_ptr) orelse return .invalid_argument;
+    const secondary = asHandle(secondary_owner_ptr) orelse return .invalid_argument;
+    const table_name = request.table_name.slice();
+    const is_merge = switch (request.action) {
+        .observe_merge,
+        .accept_merge_receiver,
+        .catch_up_merge_receiver,
+        .finalize_merge,
+        .rollback_merge,
+        => true,
+        else => false,
+    };
+    validateLocalTransitionOwner(
+        primary,
+        request.primary_group_id,
+        table_name,
+        request.table_id,
+        request.source_identity_shard_id,
+        request.source_identity_range_id,
+        false,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    validateLocalTransitionOwner(
+        secondary,
+        request.secondary_group_id,
+        table_name,
+        request.table_id,
+        request.target_identity_shard_id,
+        request.target_identity_range_id,
+        is_merge and request.allow_doc_identity_reassignment != 0,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    if ((primary.db.hasTopologySensitiveTransactions() catch |err|
+        return storageOwnerStatusFromError(err)) or
+        (secondary.db.hasTopologySensitiveTransactions() catch |err|
+            return storageOwnerStatusFromError(err)))
+    {
+        return .busy;
+    }
+    const primary_path = primary.storage_owner_path.?;
+    const secondary_path = secondary.storage_owner_path.?;
+    const apply_store = if (apply_store_ptr != null)
+        &(asDataApplyStore(apply_store_ptr) orelse return .invalid_argument).store
+    else
+        null;
+    const alloc = std.heap.c_allocator;
+
+    switch (request.action) {
+        .observe_split,
+        .prepare_split_source,
+        .start_split_source,
+        .bootstrap_split_destination,
+        .catch_up_split_destination,
+        .finalize_split_source,
+        .rollback_split,
+        => {
+            if (request.attempt_epoch == 0 or request.allow_doc_identity_reassignment != 0)
+                return .invalid_argument;
+            var runtime = raft_mod.SplitCoordinatorRuntime.init(alloc, .{
+                .transition_id = request.transition_id,
+                .attempt_epoch = request.attempt_epoch,
+                .source_root_dir = primary_path,
+                .dest_root_dir = secondary_path,
+                .source_group_id = request.primary_group_id,
+                .dest_group_id = request.secondary_group_id,
+                .source_store = apply_store,
+                .source_lease = .{
+                    .db = &primary.db,
+                    .ctx = primary,
+                    .release_fn = releaseBorrowedTransitionOwner,
+                },
+                .dest = .{
+                    .root_dir = secondary_path,
+                    .db = .{ .identity_namespace = localTransitionIdentity(request, true) },
+                },
+                .dest_lease = .{
+                    .db = &secondary.db,
+                    .ctx = secondary,
+                    .release_fn = releaseBorrowedTransitionOwner,
+                },
+            }) catch |err| return storageOwnerStatusFromError(err);
+            defer runtime.deinit();
+            const transition = runtime.runtime();
+            switch (request.action) {
+                .observe_split => {
+                    const status = transition.observeStatus(
+                        request.transition_id,
+                        request.attempt_epoch,
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                    out_result.* = localTransitionSplitResult(status);
+                },
+                .prepare_split_source => _ = transition.prepareSource(
+                    request.transition_id,
+                    request.attempt_epoch,
+                    request.primary_group_id,
+                    request.secondary_group_id,
+                    request.split_key.slice(),
+                    if (request.has_source_range_end != 0) request.source_range_end.slice() else null,
+                ) catch |err| return storageOwnerStatusFromError(err),
+                .start_split_source => _ = transition.startSource(
+                    request.transition_id,
+                    request.attempt_epoch,
+                    request.primary_group_id,
+                    request.secondary_group_id,
+                ) catch |err| return storageOwnerStatusFromError(err),
+                .bootstrap_split_destination => _ = transition.bootstrapDestination(
+                    request.transition_id,
+                    request.attempt_epoch,
+                    request.primary_group_id,
+                    request.secondary_group_id,
+                ) catch |err| return storageOwnerStatusFromError(err),
+                .catch_up_split_destination => _ = transition.catchUpDestination(
+                    request.transition_id,
+                    request.attempt_epoch,
+                    request.primary_group_id,
+                    request.secondary_group_id,
+                ) catch |err| return storageOwnerStatusFromError(err),
+                .finalize_split_source => _ = transition.finalizeSource(
+                    request.transition_id,
+                    request.attempt_epoch,
+                    request.primary_group_id,
+                    request.secondary_group_id,
+                ) catch |err| return storageOwnerStatusFromError(err),
+                .rollback_split => _ = transition.rollbackSource(
+                    request.transition_id,
+                    request.attempt_epoch,
+                    request.primary_group_id,
+                    request.secondary_group_id,
+                ) catch |err| return storageOwnerStatusFromError(err),
+                else => unreachable,
+            }
+        },
+        .observe_merge,
+        .accept_merge_receiver,
+        .catch_up_merge_receiver,
+        .finalize_merge,
+        .rollback_merge,
+        => {
+            var runtime = raft_mod.MergeCoordinatorRuntime.init(alloc, .{
+                .donor_root_dir = primary_path,
+                .receiver_root_dir = secondary_path,
+                .donor_group_id = request.primary_group_id,
+                .receiver_group_id = request.secondary_group_id,
+                .donor_store = apply_store,
+                .donor_lease = .{
+                    .db = &primary.db,
+                    .ctx = primary,
+                    .release_fn = releaseBorrowedTransitionOwner,
+                },
+                .receiver = .{
+                    .root_dir = secondary_path,
+                    .db = .{
+                        .identity_namespace = localTransitionIdentity(request, true),
+                        .prefer_existing_identity_namespace = true,
+                    },
+                },
+                .receiver_lease = .{
+                    .db = &secondary.db,
+                    .ctx = secondary,
+                    .release_fn = releaseBorrowedTransitionOwner,
+                },
+                .receiver_identity_reassignment_namespace = localTransitionIdentity(request, true),
+            }) catch |err| return storageOwnerStatusFromError(err);
+            defer runtime.deinit();
+            const transition = runtime.runtime();
+            switch (request.action) {
+                .observe_merge => {
+                    const status = transition.observeStatus(
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                    out_result.* = localTransitionMergeResult(status);
+                },
+                .accept_merge_receiver => {
+                    if (request.allow_doc_identity_reassignment != 0) transition.recordDocIdentityReassignment(
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                    transition.acceptReceiver(
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                },
+                .catch_up_merge_receiver => {
+                    if (request.allow_doc_identity_reassignment != 0) transition.recordDocIdentityReassignment(
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                    _ = transition.catchUpReceiver(
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                },
+                .finalize_merge => {
+                    if (request.allow_doc_identity_reassignment != 0) transition.recordDocIdentityReassignment(
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                    _ = transition.finalizeMerge(
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                },
+                .rollback_merge => _ = transition.rollbackMerge(
+                    request.primary_group_id,
+                    request.secondary_group_id,
+                ) catch |err| return storageOwnerStatusFromError(err),
+                else => unreachable,
+            }
+        },
+    }
+    return .ok;
+}
+
+pub fn storageOwnerOpen(
+    request: *const kernel_owner_abi.OpenRequest,
+    out_owner: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_owner.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const path = request.path.slice();
+    const table_name = request.table_name.slice();
+    if (path.len == 0 or table_name.len == 0) return .invalid_argument;
+
+    const identity_namespace: ?db_mod.DocIdentityNamespace = if (request.has_identity_namespace != 0)
+        .{
+            .table_id = request.identity_table_id,
+            .shard_id = request.identity_shard_id,
+            .range_id = request.identity_range_id,
+        }
+    else
+        null;
+    const alloc = std.heap.c_allocator;
+    const recovery_config = request.transaction_recovery;
+    if (recovery_config.enabled != 0) {
+        if (recovery_config.callback_ctx == null or recovery_config.resolve_participant_fn == null)
+            return .invalid_argument;
+        if (recovery_config.replicated_metadata != 0 and
+            (recovery_config.owns_recovery_fn == null or
+                recovery_config.acknowledge_participant_fn == null or
+                recovery_config.cleanup_transaction_fn == null))
+            return .invalid_argument;
+    }
+    const runtime_hooks_config = request.runtime_hooks;
+    const candidate_configured = runtime_hooks_config.resolution_candidates.get_fn != null or
+        runtime_hooks_config.resolution_candidates.scan_prefix_fn != null or
+        runtime_hooks_config.resolution_candidates.nearest_fn != null;
+    if (candidate_configured and
+        (runtime_hooks_config.resolution_candidates.callback_ctx == null or
+            runtime_hooks_config.resolution_candidates.get_fn == null))
+        return .invalid_argument;
+    const entity_sink_configured = runtime_hooks_config.entity_sink.upsert_fn != null or
+        runtime_hooks_config.entity_sink.upsert_batch_fn != null;
+    if (entity_sink_configured and
+        (runtime_hooks_config.entity_sink.callback_ctx == null or
+            runtime_hooks_config.entity_sink.upsert_fn == null))
+        return .invalid_argument;
+    if ((runtime_hooks_config.promotion_owner_ctx == null) !=
+        (runtime_hooks_config.promotion_owner_fn == null))
+        return .invalid_argument;
+    var recovery: ?*StorageOwnerTransactionRecovery = null;
+    if (recovery_config.enabled != 0) {
+        recovery = alloc.create(StorageOwnerTransactionRecovery) catch return .out_of_memory;
+        recovery.?.* = StorageOwnerTransactionRecovery.init(alloc, recovery_config) catch {
+            alloc.destroy(recovery.?);
+            return .out_of_memory;
+        };
+    }
+    errdefer if (recovery) |value| {
+        value.deinit();
+        alloc.destroy(value);
+    };
+    var runtime_hooks: ?*StorageOwnerRuntimeHooks = null;
+    if (candidate_configured or entity_sink_configured or runtime_hooks_config.promotion_owner_fn != null) {
+        runtime_hooks = alloc.create(StorageOwnerRuntimeHooks) catch return .out_of_memory;
+        runtime_hooks.?.* = .{ .config = runtime_hooks_config, .group_id = request.group_id };
+    }
+    errdefer if (runtime_hooks) |value| alloc.destroy(value);
+    const owner_context = asStorageOwnerContext(request.context);
+    if (owner_context) |context| context.acquire();
+    var context_borrowed = owner_context != null;
+    defer if (context_borrowed) owner_context.?.release();
+    var open_options = db_mod.OpenOptions{
+        .lsm_cache = if (owner_context) |context| &context.resources.lsm_cache else null,
+        .hbc_cache = if (owner_context) |context| &context.resources.hbc_cache else null,
+        .lsm_root_generation = request.lsm_root_generation,
+        .resource_manager = if (owner_context) |context| &context.resources.resource_manager else null,
+        .backend_runtime = if (owner_context) |context| context.backend_runtime.ptr() else null,
+        .identity_namespace = identity_namespace,
+        .prefer_existing_identity_namespace = identity_namespace != null,
+        .transaction_recovery = if (recovery) |value| value.dbConfig() else .{},
+        .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() else null,
+        .entity_sink = if (runtime_hooks) |value| value.entitySink() else null,
+        .promotion_owner = if (runtime_hooks) |value| value.promotionOwner() else null,
+        .remote_content = if (owner_context) |context| context.remoteContent() else null,
+    };
+    if (owner_context) |context| if (context.lite_backend) |*backend|
+        backend.configureDbOpenOptionsForNamespace(&open_options, path) catch |err|
+            return storageOwnerStatusFromError(err);
+    var db = db_mod.DB.open(alloc, path, open_options) catch |err| return storageOwnerStatusFromError(err);
+    errdefer db.close();
+    antfly.public_api.table_writes.configureStorageKernelOwnerDb(
+        alloc,
+        &db,
+        request.schema_json.slice(),
+        request.indexes_json.slice(),
+        if (owner_context) |context| context.backend_runtime.ptr() else null,
+        if (owner_context) |context| context.antflyProvider() else null,
+        if (owner_context) |context| context.remoteContent() else null,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    const owned_path = alloc.dupe(u8, path) catch return .out_of_memory;
+    errdefer alloc.free(owned_path);
+    const owned_table_name = alloc.dupe(u8, table_name) catch return .out_of_memory;
+    errdefer alloc.free(owned_table_name);
+    const handle = alloc.create(Handle) catch return .out_of_memory;
+    handle.* = .{
+        .alloc = alloc,
+        .db = db,
+        .storage_owner_path = owned_path,
+        .storage_owner_table_name = owned_table_name,
+        .storage_owner_group_id = request.group_id,
+        .storage_owner_context = owner_context,
+        .storage_owner_transaction_recovery = recovery,
+        .storage_owner_runtime_hooks = runtime_hooks,
+    };
+    out_owner.* = handle;
+    context_borrowed = false;
+    return .ok;
+}
+
+pub fn storageOwnerClose(owner: ?*anyopaque) callconv(.c) void {
+    antfly_db_close(owner);
+}
+
+pub fn storageOwnerConfigure(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ConfigureRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    antfly.public_api.table_writes.configureStorageKernelOwnerDb(
+        handle.alloc,
+        &handle.db,
+        request.schema_json.slice(),
+        request.indexes_json.slice(),
+        if (handle.storage_owner_context) |context| context.backend_runtime.ptr() else null,
+        if (handle.storage_owner_context) |context| context.antflyProvider() else null,
+        if (handle.storage_owner_context) |context| context.remoteContent() else null,
+    ) catch |err| {
+        std.log.err("storage owner configure failed table={s} err={s}", .{
+            handle.storage_owner_table_name orelse "",
+            @errorName(err),
+        });
+        return storageOwnerStatusFromError(err);
+    };
+    return .ok;
+}
+
+pub fn storageOwnerReconcile(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ReconcileRequest,
+    out_result: *kernel_owner_abi.ReconcileResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const reconciled = antfly.public_api.table_writes.reconcileStorageKernelOwnerDb(
+        handle.alloc,
+        &handle.db,
+        request.schema_json.slice(),
+        request.indexes_json.slice(),
+        if (request.target_index_name.slice().len == 0) null else request.target_index_name.slice(),
+        request.advance_index_repair != 0,
+        if (handle.storage_owner_context) |context| context.backend_runtime.ptr() else null,
+        if (handle.storage_owner_context) |context| context.antflyProvider() else null,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    out_result.* = .{
+        .state = switch (reconciled.state) {
+            .complete => .complete,
+            .repair_pending => .repair_pending,
+            .busy => .busy,
+            .degraded => .degraded,
+            .restore_repair_pending => .restore_repair_pending,
+        },
+        .indexes_added = @intCast(reconciled.indexes_added),
+        .indexes_removed = @intCast(reconciled.indexes_removed),
+        .indexes_pending = @intCast(reconciled.indexes_pending),
+        .repair_discovered = @intCast(reconciled.repair_discovered),
+        .repair_attempted = @intCast(reconciled.repair_attempted),
+        .repair_repaired = @intCast(reconciled.repair_repaired),
+        .repair_remaining = @intCast(reconciled.repair_remaining),
+        .repair_terminal = @intCast(reconciled.repair_terminal),
+        .repair_busy = @intCast(reconciled.repair_busy),
+        .repair_disk_waits = @intCast(reconciled.repair_disk_waits),
+        .next_retry_at_ms = reconciled.next_retry_at_ms,
+        .restore_repair_attempted = @intCast(reconciled.restore_repair_attempted),
+        .restore_repair_progressed = @intCast(reconciled.restore_repair_progressed),
+        .restore_repair_pending = @intCast(reconciled.restore_repair_pending),
+    };
+    return .ok;
+}
+
+pub fn storageOwnerPreflightWriteAdmission(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.TableRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    return if (handle.db.denseRepairWriteBackpressured()) .dense_repair_backpressure else .ok;
+}
+
+pub fn storageOwnerFindMedianKey(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.TableRequest,
+    out_key: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_key.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const key = handle.db.findMedianKey(handle.alloc) catch |err| switch (err) {
+        error.NotFound => return .not_found,
+        else => return storageOwnerStatusFromError(err),
+    };
+    out_key.* = .{ .ptr = key.ptr, .len = @intCast(key.len) };
+    return .ok;
+}
+
+const StorageOwnerBulkCallbacks = struct {
+    request: *const kernel_owner_abi.BulkFinishRequest,
+
+    fn progress(ptr: *anyopaque, progress_value: backend_types.BulkIngestFinishOptions.Progress) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.request.progress_fn orelse return;
+        const abi_progress = kernel_owner_abi.BulkProgress{
+            .phase = switch (progress_value.phase) {
+                .begin => .begin,
+                .split => .split,
+                .publish => .publish,
+                .complete => .complete,
+            },
+            .publish_window = progress_value.publish_window,
+            .split_steps = progress_value.split_steps,
+            .deferred_leaf_splits = progress_value.deferred_leaf_splits,
+            .elapsed_ns = progress_value.elapsed_ns,
+        };
+        callback(self.request.callback_ctx, &abi_progress);
+    }
+
+    fn admission(ptr: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.request.admission_fn orelse return;
+        return kernel_error_identity.statusToError(callback(self.request.callback_ctx));
+    }
+};
+
+pub fn storageOwnerBulkBegin(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.TableRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    handle.db.beginBulkIngestSession() catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerBulkFinish(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.BulkFinishRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const max_deferred_l0_runs = if (request.has_max_deferred_l0_runs != 0)
+        std.math.cast(usize, request.max_deferred_l0_runs) orelse return .invalid_argument
+    else
+        null;
+    const max_foreground_compaction_steps = std.math.cast(usize, request.max_foreground_compaction_steps) orelse
+        return .invalid_argument;
+    const max_deferred_hbc_leaf_splits_per_publish = if (request.has_max_deferred_hbc_leaf_splits_per_publish != 0)
+        std.math.cast(usize, request.max_deferred_hbc_leaf_splits_per_publish) orelse return .invalid_argument
+    else
+        null;
+    const max_deferred_hbc_leaf_split_members_per_publish = if (request.has_max_deferred_hbc_leaf_split_members_per_publish != 0)
+        std.math.cast(usize, request.max_deferred_hbc_leaf_split_members_per_publish) orelse return .invalid_argument
+    else
+        null;
+    const bulk_rebuild_hbc_leaf_min_members = if (request.has_bulk_rebuild_hbc_leaf_min_members != 0)
+        std.math.cast(usize, request.bulk_rebuild_hbc_leaf_min_members) orelse return .invalid_argument
+    else
+        null;
+    var callbacks = StorageOwnerBulkCallbacks{ .request = request };
+    handle.db.finishBulkIngestSessionWithOptions(.{
+        .compact = request.compact != 0,
+        .flush = request.flush != 0,
+        .max_deferred_l0_runs = max_deferred_l0_runs,
+        .max_foreground_compaction_steps = max_foreground_compaction_steps,
+        .max_foreground_compaction_input_bytes = if (request.has_max_foreground_compaction_input_bytes != 0)
+            request.max_foreground_compaction_input_bytes
+        else
+            null,
+        .max_foreground_compaction_ns = if (request.has_max_foreground_compaction_ns != 0)
+            request.max_foreground_compaction_ns
+        else
+            null,
+        .max_deferred_hbc_leaf_splits_per_publish = max_deferred_hbc_leaf_splits_per_publish,
+        .max_deferred_hbc_leaf_split_members_per_publish = max_deferred_hbc_leaf_split_members_per_publish,
+        .bulk_rebuild_hbc_leaf_min_members = bulk_rebuild_hbc_leaf_min_members,
+        .progress_ctx = if (request.progress_fn != null) &callbacks else null,
+        .progress_fn = if (request.progress_fn != null) StorageOwnerBulkCallbacks.progress else null,
+        .admission_ctx = if (request.admission_fn != null) &callbacks else null,
+        .admission_fn = if (request.admission_fn != null) StorageOwnerBulkCallbacks.admission else null,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerBulkAbort(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.TableRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    handle.db.abortBulkIngestSession();
+    return .ok;
+}
+
+fn storageOwnerOperationTableName(
+    handle: *const Handle,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+) ?[]const u8 {
+    return storageOwnerTableName(handle, request.table_name);
+}
+
+fn storageHASeedFailure(
+    err: anyerror,
+    operation: kernel_owner_abi.HASeedOperation,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) kernel_owner_abi.Status {
+    out_failure.* = kernel_error_identity.failureFromError(
+        err,
+        .storage_owner,
+        kernel_owner_abi.abi_version,
+        @intFromEnum(operation),
+    );
+    return out_failure.status;
+}
+
+fn validateHASeedRequest(
+    request: *const kernel_owner_abi.HASeedJsonRequest,
+    expected_operation: kernel_owner_abi.HASeedOperation,
+) ![]const u8 {
+    if (request.version != kernel_owner_abi.abi_version)
+        return error.InvalidAbiVersion;
+    if (request.operation != expected_operation)
+        return error.InvalidArgument;
+    const json = request.request_json.slice();
+    if (json.len == 0) return error.InvalidArgument;
+    return json;
+}
+
+pub fn storageHASeedActivateJson(
+    request: *const kernel_owner_abi.HASeedJsonRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    const operation = kernel_owner_abi.HASeedOperation.activate;
+    const request_json = validateHASeedRequest(request, operation) catch |err|
+        return storageHASeedFailure(err, operation, out_failure);
+    const alloc = std.heap.c_allocator;
+    var parsed = std.json.parseFromSlice(ha_seed_activation.ActivateRequest, alloc, request_json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
+    defer parsed.deinit();
+    var result = ha_seed_activation.activate(alloc, parsed.value) catch |err|
+        return storageHASeedFailure(err, operation, out_failure);
+    alloc.free(result.generation_path);
+    const response = result.active_receipt_json;
+    result = undefined;
+    out_response.* = .{
+        .ptr = if (response.len == 0) null else response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
+pub fn storageHASeedValidateJson(
+    request: *const kernel_owner_abi.HASeedJsonRequest,
+    out_result: *kernel_owner_abi.HASeedValidationResult,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    out_failure.* = .{};
+    const operation = kernel_owner_abi.HASeedOperation.validate_activated_generation;
+    const request_json = validateHASeedRequest(request, operation) catch |err|
+        return storageHASeedFailure(err, operation, out_failure);
+    const alloc = std.heap.c_allocator;
+    var parsed = std.json.parseFromSlice(ha_seed_activation.StartupExpectation, alloc, request_json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
+    defer parsed.deinit();
+    out_result.checkpoint_lsn = ha_seed_activation.validateActivatedGeneration(alloc, parsed.value) catch |err|
+        return storageHASeedFailure(err, operation, out_failure);
+    return .ok;
+}
+
+pub fn storageHASeedPruneJson(
+    request: *const kernel_owner_abi.HASeedJsonRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    const operation = kernel_owner_abi.HASeedOperation.prune_activated_generations;
+    const request_json = validateHASeedRequest(request, operation) catch |err|
+        return storageHASeedFailure(err, operation, out_failure);
+    const alloc = std.heap.c_allocator;
+    var parsed = std.json.parseFromSlice(ha_seed_activation.ActivatedGenerationGCRequest, alloc, request_json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
+    defer parsed.deinit();
+    var result = ha_seed_activation.pruneActivatedGenerations(alloc, parsed.value) catch |err|
+        return storageHASeedFailure(err, operation, out_failure);
+    const response = result.result_json;
+    result = undefined;
+    out_response.* = .{
+        .ptr = if (response.len == 0) null else response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
+test "storage HA seed boundary preserves status and exact failure identity" {
+    var response: kernel_owner_abi.OwnedBytes = .{};
+    var failure: kernel_owner_abi.FailureIdentity = .{};
+    const status = storageHASeedActivateJson(&.{
+        .version = 0,
+        .operation = .activate,
+        .request_json = .fromSlice("{}"),
+    }, &response, &failure);
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_abi, status);
+    try std.testing.expectEqual(status, failure.status);
+    try std.testing.expectEqual(kernel_owner_abi.FailureBoundary.storage_owner, failure.boundary);
+    try std.testing.expectEqual(@intFromEnum(kernel_owner_abi.HASeedOperation.activate), failure.operation);
+    try std.testing.expectEqualStrings("InvalidAbiVersion", failure.errorName());
+    try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+}
+
+const StorageOwnerDocumentChildRangeDispatch = struct {
+    callback_ctx: ?*anyopaque,
+    callback_fn: kernel_owner_abi.DocumentChildRangeDispatchFn,
+
+    fn dispatcher(self: *@This()) db_mod.DocumentArtifactChildRangeDispatcher {
+        return .{ .ptr = self, .apply = apply };
+    }
+
+    fn apply(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        dispatch: db_mod.DocumentArtifactChildRangeDispatch,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const request_json = try antfly.public_api.table_writes.encodeStorageKernelArtifactChildRangeBatchRequest(
+            alloc,
+            dispatch.doc_key,
+            dispatch.artifact_name,
+            dispatch.child_batch,
+        );
+        defer alloc.free(request_json);
+        try storageOwnerCallbackStatusToError(self.callback_fn(
+            self.callback_ctx,
+            dispatch.owner_group_id,
+            .fromSlice(request_json),
+        ));
+    }
+};
+
+const StorageOwnerCommittedBatchEffects = struct {
+    callback_ctx: ?*anyopaque,
+    callback_fn: kernel_owner_abi.CommittedBatchEffectsFn,
+
+    fn observer(self: *@This()) db_mod.CommittedBatchEffectsObserver {
+        return .{ .ptr = self, .apply = apply };
+    }
+
+    fn apply(ptr: *anyopaque, replay_payload: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try storageOwnerCallbackStatusToError(self.callback_fn(
+            self.callback_ctx,
+            .fromSlice(replay_payload),
+        ));
+    }
+};
+
+fn storageOwnerCallbackStatusToError(status: kernel_owner_abi.Status) !void {
+    return kernel_error_identity.statusToError(status);
+}
+
+fn storageOwnerTableName(handle: *const Handle, table_name: kernel_owner_abi.BorrowedBytes) ?[]const u8 {
+    const requested = table_name.slice();
+    const owned = handle.storage_owner_table_name orelse return null;
+    if (!std.mem.eql(u8, requested, owned)) return null;
+    return requested;
+}
+
+pub fn storageOwnerBatchJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.BatchJsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if ((request.document_child_range_dispatch_ctx == null) !=
+        (request.document_child_range_dispatch_fn == null)) return .invalid_argument;
+    if ((request.committed_batch_effects_ctx == null) !=
+        (request.committed_batch_effects_fn == null)) return .invalid_argument;
+    var dispatch = if (request.document_child_range_dispatch_fn) |callback_fn|
+        StorageOwnerDocumentChildRangeDispatch{
+            .callback_ctx = request.document_child_range_dispatch_ctx,
+            .callback_fn = callback_fn,
+        }
+    else
+        null;
+    var committed_effects = if (request.committed_batch_effects_fn) |callback_fn|
+        StorageOwnerCommittedBatchEffects{
+            .callback_ctx = request.committed_batch_effects_ctx,
+            .callback_fn = callback_fn,
+        }
+    else
+        null;
+    var response: capi.Buffer = .{};
+    const status = batchStorageKernelJson(handle, .{
+        .ptr = request.request_json.ptr,
+        .len = @intCast(request.request_json.len),
+    }, if (dispatch) |*value| value.dispatcher() else null, if (committed_effects) |*value| value.observer() else null, &response);
+    if (status != .ok) return status;
+    out_response.* = .{
+        .ptr = response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
+pub fn storageOwnerReplicatedBatchJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+    var response: capi.Buffer = .{};
+    const status = replicatedBatchStorageKernelJson(handle, .{
+        .ptr = request.request_json.ptr,
+        .len = @intCast(request.request_json.len),
+    }, &response);
+    if (status != .ok) return status;
+    out_response.* = .{
+        .ptr = response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
+pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (request.raft_term == 0 or request.raft_index == 0) return .invalid_argument;
+    var response: capi.Buffer = .{};
+    const status = replicatedBatchStorageKernelJsonAtRaftEntry(handle, .{
+        .ptr = request.request_json.ptr,
+        .len = @intCast(request.request_json.len),
+    }, .{
+        .term = request.raft_term,
+        .index = request.raft_index,
+    }, &response);
+    if (status != .ok) return status;
+    out_response.* = .{
+        .ptr = response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
+pub fn storageOwnerTransactionStatus(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.TransactionStatusRequest,
+    out_result: *kernel_owner_abi.TransactionStatusResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const status = handle.db.getTransactionStatus(request.txn_id.bytes) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_result.status = switch (status) {
+        .pending => .pending,
+        .committed => .committed,
+        .aborted => .aborted,
+    };
+    return .ok;
+}
+
+pub fn storageOwnerWaitForSync(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.SyncRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const sync_level: db_mod.types.SyncLevel = switch (request.sync_level) {
+        @intFromEnum(kernel_owner_abi.SyncLevel.propose) => .propose,
+        @intFromEnum(kernel_owner_abi.SyncLevel.write) => .write,
+        @intFromEnum(kernel_owner_abi.SyncLevel.full_text) => .full_text,
+        @intFromEnum(kernel_owner_abi.SyncLevel.enrichments) => .enrichments,
+        @intFromEnum(kernel_owner_abi.SyncLevel.full_index) => .full_index,
+        else => return .invalid_argument,
+    };
+    switch (sync_level) {
+        .propose, .write => return .ok,
+        .full_text, .enrichments, .full_index => {},
+    }
+    handle.db.waitForCurrentSyncLevel(sync_level) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerApplyHAReplicationRecord(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.HAReplicationRecordRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    handle.db.applyHAReplicationRecord(.{
+        .kind = @enumFromInt(request.record_kind),
+        .payload_codec = @enumFromInt(request.payload_codec),
+        .flags = request.flags,
+        .cluster_id = request.cluster_id,
+        .shard_id = request.shard_id,
+        .table_id = request.table_id,
+        .timeline_id = request.timeline_id,
+        .epoch = request.epoch,
+        .lsn = request.lsn,
+        .previous_lsn = request.previous_lsn,
+        .commit_timestamp_ns = request.commit_timestamp_ns,
+        .payload = request.payload.slice(),
+    }) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerBackupJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.BackupRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const format: kernel_owner_abi.BackupFormat = switch (request.format) {
+        @intFromEnum(kernel_owner_abi.BackupFormat.native) => .native,
+        @intFromEnum(kernel_owner_abi.BackupFormat.portable) => .portable,
+        else => return .invalid_argument,
+    };
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const path = handle.storage_owner_path orelse return .invalid_argument;
+    if (request.backup_root.slice().len == 0 or request.backup_id.slice().len == 0)
+        return .invalid_argument;
+    const shards = antfly.public_api.table_writes.backupStorageKernelOwnerDb(
+        handle.alloc,
+        &handle.db,
+        path,
+        handle.storage_owner_group_id,
+        request.backup_root.slice(),
+        request.backup_id.slice(),
+        switch (format) {
+            .native => .native,
+            .portable => .portable,
+        },
+    ) catch |err| return storageOwnerStatusFromError(err);
+    defer antfly.public_api.table_writes.freeStorageKernelBackupShards(handle.alloc, shards);
+    const response = std.json.Stringify.valueAlloc(handle.alloc, shards, .{
+        .emit_null_optional_fields = false,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
+const RestoreRequestScope = struct {
+    alloc: Allocator,
+    manifest: std.json.Parsed(backups_api.TableBackupManifest),
+    local_location: []u8,
+
+    fn init(alloc: Allocator, request: *const kernel_owner_abi.RestorePrepareRequest) !RestoreRequestScope {
+        const path = request.path.slice();
+        const table_name = request.table_name.slice();
+        const backup_root = request.backup_root.slice();
+        if (path.len == 0 or table_name.len == 0 or backup_root.len == 0 or
+            request.group_id == 0 or request.backup_id.slice().len == 0 or
+            request.artifact_backup_id.slice().len == 0 or
+            request.source_identity.slice().len == 0 or
+            request.snapshot_path.slice().len == 0 or
+            request.manifest_json.slice().len == 0)
+        {
+            return error.InvalidArgument;
+        }
+        var manifest = try std.json.parseFromSlice(
+            backups_api.TableBackupManifest,
+            alloc,
+            request.manifest_json.slice(),
+            .{ .allocate = .alloc_always },
+        );
+        errdefer manifest.deinit();
+        const local_location = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root});
+        return .{
+            .alloc = alloc,
+            .manifest = manifest,
+            .local_location = local_location,
+        };
+    }
+
+    fn source(
+        self: *const RestoreRequestScope,
+        request: *const kernel_owner_abi.RestorePrepareRequest,
+    ) backup_restore.RestoreSource {
+        return .{
+            .backup_id = request.backup_id.slice(),
+            .artifact_backup_id = request.artifact_backup_id.slice(),
+            .location = self.local_location,
+            .identity_location = request.source_identity.slice(),
+            .snapshot_path = request.snapshot_path.slice(),
+            .authority = .staged_local,
+            .expected_artifact_size_bytes = request.expected_artifact_size_bytes,
+            .expected_artifact_sha256 = request.expected_artifact_sha256.slice(),
+            .expected_native_manifest_size_bytes = request.expected_native_manifest_size_bytes,
+            .expected_native_manifest_sha256 = request.expected_native_manifest_sha256.slice(),
+            .manifest = &self.manifest.value,
+        };
+    }
+
+    fn deinit(self: *RestoreRequestScope) void {
+        self.alloc.free(self.local_location);
+        self.manifest.deinit();
+        self.* = undefined;
+    }
+};
+
+fn prepareStorageRestore(
+    request: *const kernel_owner_abi.RestorePrepareRequest,
+) !?*StorageSnapshot {
+    const alloc = std.heap.c_allocator;
+    var scope = try RestoreRequestScope.init(alloc, request);
+    defer scope.deinit();
+    const restore_source = scope.source(request);
+    const path = request.path.slice();
+    const identity_namespace: ?db_mod.DocIdentityNamespace = if (request.has_identity_namespace != 0)
+        .{
+            .table_id = request.identity_table_id,
+            .shard_id = request.identity_shard_id,
+            .range_id = request.identity_range_id,
+        }
+    else
+        null;
+
+    var preparation = try db_mod.generation_lifecycle.beginProcessPreparationWithRuntime(path, null);
+    var preparation_owned = true;
+    errdefer if (preparation_owned) preparation.deinit();
+    var staged = (try backup_restore.prepareRestoreSnapshotToPathWithPreparation(
+        &preparation,
+        alloc,
+        path,
+        request.group_id,
+        restore_source,
+        .{
+            .expected_table_name = request.table_name.slice(),
+            .expected_identity_namespace = identity_namespace,
+        },
+    )) orelse {
+        preparation.deinit();
+        preparation_owned = false;
+        return null;
+    };
+    var staged_owned = true;
+    errdefer if (staged_owned) staged.deinit();
+
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
+        .backend = .io_threaded,
+    });
+    defer backend_runtime.deinit();
+    var db = try antfly.public_api.table_writes.openStorageKernelRestoreDb(
+        alloc,
+        staged.path(),
+        scope.manifest.value.indexes_json,
+        request.lsm_root_generation,
+        backend_runtime.ptr(),
+        identity_namespace,
+        &staged,
+    );
+    var db_open = true;
+    defer if (db_open) db.close();
+    try antfly.public_api.table_writes.repairStorageKernelRestoreDb(
+        alloc,
+        &db,
+        request.group_id,
+        scope.manifest.value.schema_json,
+        scope.manifest.value.indexes_json,
+    );
+    db.close();
+    db_open = false;
+
+    // The first owner proves the generation it has in memory. Reopen the
+    // isolated candidate before sealing so publication is authorized by the
+    // files a new process actually observes. A fresh owner can also repair
+    // reopen-only dense debt (for example an incomplete HBC publication), but
+    // its result must itself survive one more reopen.
+    var durability_verified = false;
+    for (0..3) |verification_attempt| {
+        var verify_db = try antfly.public_api.table_writes.openStorageKernelRestoreDb(
+            alloc,
+            staged.path(),
+            scope.manifest.value.indexes_json,
+            request.lsm_root_generation,
+            backend_runtime.ptr(),
+            identity_namespace,
+            &staged,
+        );
+        defer verify_db.close();
+        if (!try verify_db.prepareRestoreDurabilityRetryIfNeeded(alloc)) {
+            durability_verified = true;
+            break;
+        }
+        std.log.info("storage-kernel restore durability retry group_id={} attempt={}", .{
+            request.group_id,
+            verification_attempt + 1,
+        });
+        try antfly.public_api.table_writes.repairStorageKernelRestoreDb(
+            alloc,
+            &verify_db,
+            request.group_id,
+            scope.manifest.value.schema_json,
+            scope.manifest.value.indexes_json,
+        );
+    }
+    if (!durability_verified) return error.RestoreDenseArtifactRebuildIncomplete;
+    try staged.seal();
+
+    const restore_live_path = try alloc.dupe(u8, path);
+    errdefer alloc.free(restore_live_path);
+    const snapshot = try alloc.create(StorageSnapshot);
+    snapshot.* = .{
+        .alloc = alloc,
+        .preparation = preparation,
+        .staged = staged.takeStagedGeneration(),
+        .restore_live_path = restore_live_path,
+    };
+    preparation_owned = false;
+    staged_owned = false;
+    return snapshot;
+}
+
+pub fn storageRestorePrepare(
+    request: *const kernel_owner_abi.RestorePrepareRequest,
+    out_result: *kernel_owner_abi.RestorePrepareResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const snapshot = prepareStorageRestore(request) catch |err| {
+        std.log.err("storage-kernel restore prepare failed group_id={} class={s}", .{
+            request.group_id,
+            @errorName(err),
+        });
+        return storageOwnerStatusFromError(err);
+    };
+    if (snapshot) |value| {
+        out_result.* = .{ .state = .prepared, .snapshot = value };
+    } else {
+        out_result.* = .{ .state = .already_imported };
+    }
+    return .ok;
+}
+
+pub fn storageRestoreReconcile(
+    request: *const kernel_owner_abi.RestorePrepareRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const alloc = std.heap.c_allocator;
+    var scope = RestoreRequestScope.init(alloc, request) catch |err| return storageOwnerStatusFromError(err);
+    defer scope.deinit();
+    var transition = db_mod.generation_lifecycle.beginProcessExclusive(request.path.slice()) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer transition.deinit();
+    backup_restore.reconcileCommittedRestoreWithExclusiveTransition(
+        &transition,
+        alloc,
+        request.path.slice(),
+        request.group_id,
+        scope.source(request),
+    ) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageRestoreApplyBootstrap(
+    request: *const kernel_owner_abi.RestoreBootstrapRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request.replica_root_dir.slice().len == 0 or request.group_id == 0)
+        return .invalid_argument;
+
+    const secret_store: ?*common_secrets.FileStore = if (request.secret_store) |ptr|
+        @ptrCast(@alignCast(ptr))
+    else
+        null;
+    const node_config: ?*const common_config.Config = if (request.node_config) |ptr|
+        @ptrCast(@alignCast(ptr))
+    else
+        null;
+    const restore = raft_catalog.BackupRestoreBootstrapRecord{
+        .backup_id = request.backup_id.slice(),
+        .artifact_backup_id = request.artifact_backup_id.slice(),
+        .location = request.location.slice(),
+        .snapshot_path = request.snapshot_path.slice(),
+        .connection = request.connection.slice(),
+        .artifact_size_bytes = request.artifact_size_bytes,
+        .artifact_sha256 = request.artifact_sha256.slice(),
+        .native_manifest_size_bytes = request.native_manifest_size_bytes,
+        .native_manifest_sha256 = request.native_manifest_sha256.slice(),
+    };
+    backup_restore.applyBackupRestoreFromRecordWithOptions(
+        std.heap.c_allocator,
+        request.replica_root_dir.slice(),
+        request.group_id,
+        restore,
+        .{
+            .secret_store = secret_store,
+            .node_config = node_config,
+            .required_capability = request.required_capability.slice(),
+        },
+    ) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerRestoreRepair(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.RestorePrepareRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const path = handle.storage_owner_path orelse return .invalid_argument;
+    if (!std.mem.eql(u8, path, request.path.slice()) or
+        handle.storage_owner_group_id != request.group_id)
+    {
+        return .invalid_argument;
+    }
+    var scope = RestoreRequestScope.init(handle.alloc, request) catch |err| return storageOwnerStatusFromError(err);
+    defer scope.deinit();
+    backup_restore.validateImportedRestoreIdentity(
+        handle.alloc,
+        path,
+        request.group_id,
+        scope.source(request),
+    ) catch |err| return storageOwnerStatusFromError(err);
+    antfly.public_api.table_writes.repairStorageKernelRestoreDb(
+        handle.alloc,
+        &handle.db,
+        request.group_id,
+        "",
+        "",
+    ) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+fn prepareStorageSnapshot(request: *const kernel_owner_abi.SnapshotPrepareRequest) !*StorageSnapshot {
+    const alloc = std.heap.c_allocator;
+    const path = request.path.slice();
+    const table_name = request.table_name.slice();
+    if (path.len == 0 or table_name.len == 0 or request.group_id == 0) return error.InvalidArgument;
+
+    const state = try shard_state_store.GroupStateSnapshotStream.init(request.encoded_snapshot.slice());
+    try shard_state_store.validateGroupStateSnapshotStream(alloc, request.group_id, state);
+
+    var preparation = try db_mod.generation_lifecycle.beginProcessPreparationWithRuntime(path, null);
+    var preparation_owned = true;
+    errdefer if (preparation_owned) preparation.deinit();
+    var staged = try preparation.beginStaging();
+    var staged_owned = true;
+    errdefer if (staged_owned) staged.deinit();
+
+    var db = try db_mod.DB.open(alloc, staged.path(), .{
+        .lsm_root_generation = request.lsm_root_generation,
+        .staged_generation = &staged,
+        .identity_namespace = .{
+            .table_id = request.identity_table_id,
+            .shard_id = request.identity_shard_id,
+            .range_id = request.identity_range_id,
+        },
+        .prefer_existing_identity_namespace = true,
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+    try antfly.public_api.table_writes.configureStorageKernelOwnerDb(
+        alloc,
+        &db,
+        request.schema_json.slice(),
+        request.indexes_json.slice(),
+        null,
+        null,
+        null,
+    );
+
+    var parsed_schema: ?tables_api.ParsedTableSchema = null;
+    if (request.schema_json.len > 0)
+        parsed_schema = try tables_api.parseValidatedTableSchema(alloc, request.schema_json.slice());
+    defer if (parsed_schema) |*schema| schema.deinit(alloc);
+
+    const max_chunk_entries = 512;
+    const max_chunk_payload_bytes = 4 * 1024 * 1024;
+    var writes_buffer: [max_chunk_entries]db_mod.types.BatchWrite = undefined;
+    var entries = state.entries();
+    var exhausted = false;
+    while (!exhausted) {
+        var chunk_len: usize = 0;
+        var chunk_payload_bytes: usize = 0;
+        while (chunk_len < writes_buffer.len) {
+            var candidate_entries = entries;
+            const entry = (try candidate_entries.next()) orelse {
+                exhausted = true;
+                break;
+            };
+            const entry_bytes = std.math.add(usize, entry.key.len, entry.value.len) catch return error.SnapshotTooLarge;
+            if (chunk_len > 0 and entry_bytes > max_chunk_payload_bytes -| chunk_payload_bytes) break;
+            entries = candidate_entries;
+            writes_buffer[chunk_len] = .{ .key = entry.key, .value = entry.value };
+            chunk_len += 1;
+            chunk_payload_bytes = std.math.add(usize, chunk_payload_bytes, entry_bytes) catch return error.SnapshotTooLarge;
+        }
+        if (chunk_len == 0) break;
+        const writes = writes_buffer[0..chunk_len];
+        if (parsed_schema) |schema| try tables_api.validateWritesAgainstTableSchema(alloc, schema, writes);
+        try db.appendRaftDocumentSnapshotChunk(&staged, state.byte_range, writes);
+    }
+    try db.finishRaftDocumentSnapshot(&staged, state.byte_range);
+    try db.sync(true);
+    try db.syncIndexes(true);
+    db.close();
+    db_open = false;
+    try staged.seal();
+
+    const snapshot = try alloc.create(StorageSnapshot);
+    snapshot.* = .{
+        .alloc = alloc,
+        .preparation = preparation,
+        .staged = staged,
+    };
+    preparation_owned = false;
+    staged_owned = false;
+    return snapshot;
+}
+
+pub fn storageSnapshotPrepare(
+    request: *const kernel_owner_abi.SnapshotPrepareRequest,
+    out_snapshot: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_snapshot.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const snapshot = prepareStorageSnapshot(request) catch |err| return storageOwnerStatusFromError(err);
+    out_snapshot.* = snapshot;
+    return .ok;
+}
+
+pub fn storageSnapshotPublishPrepared(
+    snapshot_handle: ?*anyopaque,
+    out_result: *kernel_owner_abi.SnapshotPublishResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    const snapshot: *StorageSnapshot = @ptrCast(@alignCast(snapshot_handle orelse return .invalid_argument));
+    if (!snapshot.promoted or snapshot.published or snapshot.finalized) return .invalid_argument;
+    const outcome = snapshot.staged.publishPrepared() catch |err| return storageOwnerStatusFromError(err);
+    snapshot.published = true;
+    out_result.durability_uncertain = @intFromBool(outcome == .durability_uncertain);
+    return .ok;
+}
+
+pub fn storageSnapshotPromote(snapshot_handle: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const snapshot: *StorageSnapshot = @ptrCast(@alignCast(snapshot_handle orelse return .invalid_argument));
+    if (snapshot.promoted or snapshot.published or snapshot.finalized) return .invalid_argument;
+    snapshot.transition = snapshot.preparation.promote() catch |err| return storageOwnerStatusFromError(err);
+    snapshot.promoted = true;
+    return .ok;
+}
+
+pub fn storageSnapshotCommit(snapshot_handle: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const snapshot: *StorageSnapshot = @ptrCast(@alignCast(snapshot_handle orelse return .invalid_argument));
+    if (!snapshot.published or snapshot.finalized) return .invalid_argument;
+    snapshot.staged.commitPublication() catch |err| return storageOwnerStatusFromError(err);
+    if (snapshot.restore_live_path) |path|
+        backup_restore.cleanupSnapshotsForPublishedRestore(snapshot.alloc, path);
+    snapshot.finalized = true;
+    return .ok;
+}
+
+pub fn storageSnapshotRollback(snapshot_handle: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const snapshot: *StorageSnapshot = @ptrCast(@alignCast(snapshot_handle orelse return .invalid_argument));
+    if (!snapshot.published or snapshot.finalized) return .invalid_argument;
+    snapshot.staged.rollbackPublication() catch |err| return storageOwnerStatusFromError(err);
+    snapshot.finalized = true;
+    return .ok;
+}
+
+pub fn storageSnapshotDestroy(snapshot_handle: ?*anyopaque) callconv(.c) void {
+    const snapshot: *StorageSnapshot = @ptrCast(@alignCast(snapshot_handle orelse return));
+    snapshot.deinit();
+}
+
+fn batchStorageKernelJson(
+    handle: *Handle,
+    request_json: capi.Slice,
+    document_child_range_dispatcher: ?db_mod.DocumentArtifactChildRangeDispatcher,
+    committed_batch_effects_observer: ?db_mod.CommittedBatchEffectsObserver,
+    out_buf: *capi.Buffer,
+) kernel_owner_abi.Status {
+    // The group-local owner accepts the internal batch dialect so split
+    // replication state and the caller's requested sync level survive the
+    // compiled boundary. Public CAPI parsing remains intentionally narrower.
+    var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer owned.deinit(handle.alloc);
+
+    if (committed_batch_effects_observer) |observer|
+        handle.db.batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(
+            owned.req,
+            document_child_range_dispatcher,
+            observer,
+        ) catch |err| return storageOwnerStatusFromError(err)
+    else if (document_child_range_dispatcher) |dispatcher|
+        handle.db.batchWithDocumentArtifactChildRangeDispatcher(owned.req, dispatcher) catch |err|
+            return storageOwnerStatusFromError(err)
+    else
+        handle.db.batch(owned.req) catch |err| return storageOwnerStatusFromError(err);
+    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_buf.* = .{
+        .ptr = response.ptr,
+        .len = response.len,
+    };
+    return .ok;
+}
+
+fn replicatedBatchStorageKernelJson(
+    handle: *Handle,
+    request_json: capi.Slice,
+    out_buf: *capi.Buffer,
+) kernel_owner_abi.Status {
+    var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer owned.deinit(handle.alloc);
+
+    antfly.public_api.table_writes.applyStorageKernelReplicatedBatch(
+        handle.alloc,
+        &handle.db,
+        handle.storage_owner_table_name orelse return .invalid_argument,
+        handle.storage_owner_group_id,
+        owned.req,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_buf.* = .{
+        .ptr = response.ptr,
+        .len = response.len,
+    };
+    return .ok;
+}
+
+fn replicatedBatchStorageKernelJsonAtRaftEntry(
+    handle: *Handle,
+    request_json: capi.Slice,
+    raft_entry: db_mod.RaftAppliedEntryIdentity,
+    out_buf: *capi.Buffer,
+) kernel_owner_abi.Status {
+    var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer owned.deinit(handle.alloc);
+
+    antfly.public_api.table_writes.applyStorageKernelReplicatedBatchAtRaftEntry(
+        handle.alloc,
+        &handle.db,
+        handle.storage_owner_table_name orelse return .invalid_argument,
+        handle.storage_owner_group_id,
+        owned.req,
+        raft_entry,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_buf.* = .{
+        .ptr = response.ptr,
+        .len = response.len,
+    };
+    return .ok;
+}
+
+pub fn storageOwnerQueryJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.QueryOwnedResponse,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerOperationTableName(handle, request) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const request_slice: capi.Slice = .{
+        .ptr = request.request_json.ptr,
+        .len = @intCast(request.request_json.len),
+    };
+    const status = searchStorageKernelQueryJson(
+        handle,
+        table_name,
+        request_slice,
+        out_response,
+        out_failure,
+    );
+    return status;
+}
+
+pub fn storageOwnerLookupJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.VersionedOwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+
+    var parsed = std.json.parseFromSlice(
+        table_reads_api.StorageKernelLookupWireRequest,
+        handle.alloc,
+        request.request_json.slice(),
+        .{},
+    ) catch return .invalid_argument;
+    defer parsed.deinit();
+    const opts: db_mod.types.LookupOptions = .{
+        .fields = parsed.value.fields,
+        .include_all_fields = parsed.value.include_all_fields,
+    };
+    handle.prepareLookupRequest(parsed.value.key, opts) catch |err| return storageOwnerStatusFromError(err);
+    var result = (handle.db.getDocument(handle.alloc, parsed.value.key, opts) catch |err| return storageOwnerStatusFromError(err)) orelse return .not_found;
+    defer result.deinit(handle.alloc);
+    const version = handle.db.getTimestamp(handle.alloc, parsed.value.key) catch |err| return storageOwnerStatusFromError(err);
+    const response = dupBytes(result.json) catch return .out_of_memory;
+    out_response.* = .{
+        .buffer = .{
+            .ptr = response.ptr,
+            .len = @intCast(response.len),
+        },
+        .version = version,
+    };
+    return .ok;
+}
+
+pub fn storageOwnerScanNdjson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+
+    var parsed = std.json.parseFromSlice(
+        table_reads_api.StorageKernelScanWireRequest,
+        handle.alloc,
+        request.request_json.slice(),
+        .{},
+    ) catch return .invalid_argument;
+    defer parsed.deinit();
+    const opts: db_mod.types.ScanOptions = .{
+        .inclusive_from = parsed.value.inclusive_from,
+        .exclusive_to = parsed.value.exclusive_to,
+        .include_documents = parsed.value.include_documents,
+        .limit = parsed.value.limit,
+        .fields = parsed.value.fields,
+        .include_all_fields = parsed.value.include_all_fields,
+        .filter_query_json = parsed.value.filter_query_json,
+        .include_content_hashes = parsed.value.include_content_hashes,
+    };
+    handle.prepareScanRequest(parsed.value.from_key, parsed.value.to_key, opts) catch |err| return storageOwnerStatusFromError(err);
+    var result = handle.db.scan(handle.alloc, parsed.value.from_key, parsed.value.to_key, opts) catch |err| return storageOwnerStatusFromError(err);
+    defer result.deinit(handle.alloc);
+    const ndjson = table_reads_api.encodeStorageKernelScanNdjson(handle.alloc, result, opts.include_documents) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{
+        .ptr = ndjson.ptr,
+        .len = @intCast(ndjson.len),
+    };
+    return .ok;
+}
+
+pub fn storageOwnerPreflightJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerOperationTableName(handle, request) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    return executeStorageOwnerCompiledQueryOperation(
+        handle,
+        table_name,
+        request.request_json.slice(),
+        .preflight,
+        .preflight,
+        out_response,
+        out_failure,
+    );
+}
+
+pub fn storageOwnerTextStatsJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerOperationTableName(handle, request) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    return executeStorageOwnerCompiledQueryOperation(
+        handle,
+        table_name,
+        request.request_json.slice(),
+        .text_stats,
+        .text_stats,
+        out_response,
+        out_failure,
+    );
+}
+
+pub fn storageOwnerAlgebraicPartialsJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerOperationTableName(handle, request) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    return executeStorageOwnerCompiledQueryOperation(
+        handle,
+        table_name,
+        request.request_json.slice(),
+        .algebraic_partials,
+        .algebraic_partials,
+        out_response,
+        out_failure,
+    );
+}
+
+fn executeStorageOwnerCompiledQueryOperation(
+    handle: *Handle,
+    table_name: []const u8,
+    request_json: []const u8,
+    kind: kernel_owner_abi.LocalQueryKind,
+    outer_operation: kernel_owner_abi.LocalQueryOperation,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) kernel_owner_abi.Status {
+    const response = local_query_client.executeControlledJsonAlloc(
+        std.heap.c_allocator,
+        kind,
+        @ptrCast(&handle.db),
+        table_name,
+        request_json,
+        null,
+        null,
+        null,
+        out_failure,
+    ) catch |err| {
+        if (out_failure.status != .ok) return out_failure.status;
+        return storageOwnerQueryFailure(err, outer_operation, out_failure);
+    };
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
+pub fn storageAggregateJson(
+    request: *const kernel_owner_abi.AggregationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .parse_aggregation, out_failure);
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var wire = std.json.parseFromSliceLeaky(
+        aggregations_contract.ComputeContextWire,
+        arena,
+        request.context_json.slice(),
+        .{},
+    ) catch |err| return storageOwnerQueryFailure(err, .parse_aggregation, out_failure);
+
+    const requests = query_api.parseAggregationRequestsJson(
+        std.heap.c_allocator,
+        request.aggregations_json.slice(),
+    ) catch |err| return storageOwnerQueryFailure(err, .parse_aggregation, out_failure);
+    defer query_api.freeAggregationRequests(std.heap.c_allocator, requests);
+
+    if (request.hit_count > std.math.maxInt(usize))
+        return storageOwnerQueryFailure(error.InvalidArgument, .parse_aggregation, out_failure);
+    const hit_count: usize = @intCast(request.hit_count);
+    const borrowed_hits = if (hit_count == 0)
+        @as([]const kernel_owner_abi.AggregationHit, &.{})
+    else if (request.hits) |ptr|
+        ptr[0..hit_count]
+    else
+        return storageOwnerQueryFailure(error.InvalidArgument, .parse_aggregation, out_failure);
+    const hits = arena.alloc(db_mod.types.SearchHit, hit_count) catch |err|
+        return storageOwnerQueryFailure(err, .execute_aggregation, out_failure);
+    for (borrowed_hits, 0..) |hit, i| hits[i] = .{
+        .id = @constCast(""),
+        .stored_data = if (hit.stored_data.len == 0) null else @constCast(hit.stored_data.slice()),
+    };
+    const result: db_mod.types.SearchResult = .{
+        .alloc = arena,
+        .hits = hits,
+        .total_hits = request.total_hits,
+    };
+    const aggregation_results = aggregations_mod.computeSearchAggregations(
+        std.heap.c_allocator,
+        requests,
+        result,
+        .{
+            .text_analysis = if (wire.text_analysis) |*value| value else null,
+            .distributed_text_stats = wire.distributed_text_stats,
+            .distributed_background_text_stats = wire.distributed_background_text_stats,
+        },
+    ) catch |err| return storageOwnerQueryFailure(err, .execute_aggregation, out_failure);
+    defer aggregations_mod.deinitResults(std.heap.c_allocator, aggregation_results);
+
+    const response = std.json.Stringify.valueAlloc(
+        std.heap.c_allocator,
+        aggregation_results,
+        .{},
+    ) catch |err| return storageOwnerQueryFailure(err, .encode_aggregation, out_failure);
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
+pub fn storageOwnerGraphExpandJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerTableName(handle, request.table_name) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    return executeStorageOwnerCompiledGraph(
+        handle,
+        table_name,
+        request,
+        .graph_expand,
+        .encode_graph_expand,
+        out_response,
+        out_failure,
+    );
+}
+
+pub fn storageOwnerGraphHydrateJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerTableName(handle, request.table_name) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    return executeStorageOwnerCompiledGraph(
+        handle,
+        table_name,
+        request,
+        .graph_hydrate,
+        .encode_graph_hydrate,
+        out_response,
+        out_failure,
+    );
+}
+
+pub fn storageOwnerGraphEdgesJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerTableName(handle, request.table_name) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    return executeStorageOwnerCompiledGraph(
+        handle,
+        table_name,
+        request,
+        .graph_edges,
+        .encode_graph_edges,
+        out_response,
+        out_failure,
+    );
+}
+
+fn executeStorageOwnerCompiledGraph(
+    handle: *Handle,
+    table_name: []const u8,
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+    kind: kernel_owner_abi.LocalQueryKind,
+    outer_operation: kernel_owner_abi.LocalQueryOperation,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) kernel_owner_abi.Status {
+    const response = local_query_client.executeControlledJsonAlloc(
+        std.heap.c_allocator,
+        kind,
+        @ptrCast(&handle.db),
+        table_name,
+        request.request_json.slice(),
+        if (request.has_execution_deadline != 0) request.execution_deadline_ns else null,
+        request.cancellation_ctx,
+        request.cancellation_fn,
+        out_failure,
+    ) catch |err| {
+        // A valid nested provider failure retains its local-query origin and
+        // operation. Only consumer-side allocation/protocol work receives a
+        // new storage-owner identity.
+        if (out_failure.status != .ok) return out_failure.status;
+        return storageOwnerQueryFailure(err, outer_operation, out_failure);
+    };
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
+pub fn storageOwnerDocumentArtifactManifestJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(
+        table_reads_api.StorageKernelDocumentArtifactManifestWireRequest,
+        handle.alloc,
+        request.request_json.slice(),
+        .{},
+    ) catch return .invalid_argument;
+    defer parsed.deinit();
+    var manifest = (handle.db.getDocumentArtifactManifest(
+        handle.alloc,
+        parsed.value.doc_key,
+        parsed.value.artifact_name,
+    ) catch |err| return storageOwnerStatusFromError(err)) orelse return .not_found;
+    defer manifest.deinit(handle.alloc);
+    const response = table_reads_api.encodeStorageKernelDocumentArtifactManifestResponse(
+        handle.alloc,
+        manifest,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
+pub fn storageOwnerDocumentArtifactManifestsJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(
+        table_reads_api.StorageKernelDocumentArtifactManifestsWireRequest,
+        handle.alloc,
+        request.request_json.slice(),
+        .{},
+    ) catch return .invalid_argument;
+    defer parsed.deinit();
+    var manifests = handle.db.listDocumentArtifactManifests(
+        handle.alloc,
+        parsed.value.doc_key,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    defer manifests.deinit(handle.alloc);
+    const response = table_reads_api.encodeStorageKernelDocumentArtifactManifestsResponse(
+        handle.alloc,
+        manifests,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
+const StorageOwnerArtifactCancellation = struct {
+    request: *const kernel_owner_abi.ArtifactOperationRequest,
+
+    fn requested(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.request.cancellation_fn orelse return false;
+        return callback(self.request.cancellation_ctx) != 0;
+    }
+};
+
+fn storageOwnerArtifactJsonResponse(
+    alloc: std.mem.Allocator,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    value: anytype,
+) kernel_owner_abi.Status {
+    const response = std.json.Stringify.valueAlloc(alloc, value, .{
+        .emit_null_optional_fields = false,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
+pub fn storageOwnerArtifactOperationJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ArtifactOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const operation: kernel_owner_abi.ArtifactOperation = switch (request.operation) {
+        0...@intFromEnum(kernel_owner_abi.ArtifactOperation.apply_child_range_batch) => @enumFromInt(request.operation),
+        else => return .invalid_argument,
+    };
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+
+    switch (operation) {
+        .corrupt_embedding => {
+            var parsed = std.json.parseFromSlice(
+                antfly.public_api.table_writes.StorageKernelEmbeddingCorruptionRequest,
+                handle.alloc,
+                request.request_json.slice(),
+                .{},
+            ) catch return .invalid_argument;
+            defer parsed.deinit();
+            const handled = antfly.public_api.table_writes.corruptEmbeddingArtifactInDb(
+                handle.alloc,
+                &handle.db,
+                parsed.value.doc_key,
+                parsed.value.index_name,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            if (!handled) return .not_found;
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, .{ .handled = true });
+        },
+        .reprocess_document => {
+            var parsed = std.json.parseFromSlice(
+                antfly.public_api.table_writes.StorageKernelArtifactDocumentRequest,
+                handle.alloc,
+                request.request_json.slice(),
+                .{},
+            ) catch return .invalid_argument;
+            defer parsed.deinit();
+            const handled = handle.db.reprocessDocumentArtifact(
+                handle.alloc,
+                parsed.value.doc_key,
+                parsed.value.artifact_name,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, .{ .handled = handled });
+        },
+        .reprocess_document_range => {
+            var parsed = std.json.parseFromSlice(
+                antfly.public_api.table_writes.StorageKernelArtifactRangeRequest,
+                handle.alloc,
+                request.request_json.slice(),
+                .{},
+            ) catch return .invalid_argument;
+            defer parsed.deinit();
+            var result = handle.db.reprocessDocumentArtifactRange(
+                handle.alloc,
+                parsed.value.artifact_name,
+                parsed.value.request,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            defer result.deinit(handle.alloc);
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, result);
+        },
+        .list_repair_issues => {
+            var parsed = std.json.parseFromSlice(
+                db_mod.types.ArtifactRepairListRequest,
+                handle.alloc,
+                request.request_json.slice(),
+                .{},
+            ) catch return .invalid_argument;
+            defer parsed.deinit();
+            var result = handle.db.listArtifactRepairIssuesPage(
+                handle.alloc,
+                parsed.value,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            defer result.deinit(handle.alloc);
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, result);
+        },
+        .repair_issues => {
+            var parsed = std.json.parseFromSlice(
+                db_mod.types.ArtifactRepairRunRequest,
+                handle.alloc,
+                request.request_json.slice(),
+                .{},
+            ) catch return .invalid_argument;
+            defer parsed.deinit();
+            var cancellation = StorageOwnerArtifactCancellation{ .request = request };
+            var result = handle.db.repairArtifactIssuesWithRequestOptions(
+                handle.alloc,
+                parsed.value,
+                .{
+                    .cancel_check = if (request.cancellation_fn != null) .{
+                        .ptr = &cancellation,
+                        .is_requested = StorageOwnerArtifactCancellation.requested,
+                    } else null,
+                    .defer_durable_index_repair_execution = request.defer_durable_index_repair_execution != 0,
+                },
+            ) catch |err| return storageOwnerStatusFromError(err);
+            defer result.deinit(handle.alloc);
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, result);
+        },
+        .update_child_range_placement => {
+            var parsed = std.json.parseFromSlice(
+                antfly.public_api.table_writes.StorageKernelArtifactPlacementRequest,
+                handle.alloc,
+                request.request_json.slice(),
+                .{},
+            ) catch return .invalid_argument;
+            defer parsed.deinit();
+            const handled = handle.db.updateDocumentArtifactChildRangePlacement(
+                handle.alloc,
+                parsed.value.doc_key,
+                parsed.value.artifact_name,
+                parsed.value.update,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, .{ .handled = handled });
+        },
+        .apply_child_range_batch => {
+            var parsed = std.json.parseFromSlice(
+                antfly.public_api.table_writes.StorageKernelArtifactChildRangeBatchRequest,
+                handle.alloc,
+                request.request_json.slice(),
+                .{},
+            ) catch return .invalid_argument;
+            defer parsed.deinit();
+            const sequence = handle.db.applyDocumentArtifactChildRangeBatch(parsed.value.batch) catch |err|
+                return storageOwnerStatusFromError(err);
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, .{ .sequence = sequence });
+        },
+    }
+}
+
+pub fn storageOwnerRuntimeStatusJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+
+    var status = runtime_status.LocalTableRuntimeStatus{
+        .group_id = handle.storage_owner_group_id,
+        .created_at_millis = (handle.db.getGroupCreatedAtMillis(
+            handle.alloc,
+            handle.storage_owner_group_id,
+        ) catch null) orelse 0,
+        // Runtime status is a periodic observation, not a foreground
+        // consistency barrier. Never retain the shared owner lease while
+        // waiting for an apply writer: structural reconciliation may need its
+        // exclusive lease to advance the exact work holding that writer.
+        .stats = (handle.db.runtimeStatusStatsConsistentIfAvailable(handle.alloc) catch |err|
+            return storageOwnerStatusFromError(err)) orelse return .busy,
+        .lsm_storage_stats = .{
+            .maintenance = handle.db.snapshotLsmMaintenanceStats(),
+            .write = handle.db.snapshotLsmWriteStats(),
+            .maintenance_score = handle.db.lsmMaintenanceScore(),
+            .maintenance_debt_hint = handle.db.lsmMaintenanceDebtHint(),
+        },
+    };
+    defer status.deinit(handle.alloc);
+    const response = std.json.Stringify.valueAlloc(handle.alloc, status, .{
+        .emit_null_optional_fields = false,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{
+        .ptr = response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
+test "storage owner runtime status does not wait behind apply writer" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "storage-owner-runtime-status-busy");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+
+    var handle = Handle{
+        .alloc = alloc,
+        .db = try db_mod.DB.open(alloc, path, .{}),
+        .storage_owner_table_name = @constCast("docs"),
+        .storage_owner_group_id = 7,
+    };
+    defer handle.db.close();
+
+    handle.db.core.lockApplyExclusive();
+    defer handle.db.core.unlockApplyExclusive();
+    var response: kernel_owner_abi.OwnedBytes = .{};
+    try std.testing.expectEqual(
+        kernel_owner_abi.Status.busy,
+        storageOwnerRuntimeStatusJson(
+            &handle,
+            &.{ .table_name = .fromSlice("docs") },
+            &response,
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+}
+
+const StorageOwnerObservationCancellation = struct {
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+
+    fn requested(ptr: *const anyopaque) bool {
+        const self: *const StorageOwnerObservationCancellation = @ptrCast(@alignCast(ptr));
+        const callback = self.request.cancellation_fn orelse return false;
+        return callback(self.request.cancellation_ctx) != 0;
+    }
+};
+
+pub fn storageOwnerObservedDynamicFieldCapabilitySetsJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+
+    var parsed = std.json.parseFromSlice(
+        table_reads_api.StorageKernelDynamicFieldObservationWireRequest,
+        handle.alloc,
+        request.request_json.slice(),
+        .{},
+    ) catch return .invalid_argument;
+    defer parsed.deinit();
+    var cancellation = StorageOwnerObservationCancellation{ .request = request };
+    const observation: table_reads_api.DynamicFieldObservationQuery = .{
+        .index_name = parsed.value.index_name,
+        .fields = parsed.value.fields,
+        .coverage_read_mode = parsed.value.coverage_read_mode,
+        .execution_deadline_ns = if (request.has_execution_deadline != 0)
+            request.execution_deadline_ns
+        else
+            null,
+        .cancellation = if (request.cancellation_fn != null) .{
+            .ptr = &cancellation,
+            .is_cancelled_fn = StorageOwnerObservationCancellation.requested,
+        } else null,
+    };
+    const sets = handle.db.observedDynamicFieldCapabilitySetsAlloc(handle.alloc, observation) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer table_reads_api.freeObservedDynamicFieldCapabilitySets(handle.alloc, sets);
+    const response = std.json.Stringify.valueAlloc(handle.alloc, sets, .{}) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
+pub fn storageOwnerRestoreStateJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+    const path = handle.storage_owner_path orelse return .invalid_argument;
+    var state = (db_mod.DB.readRestoreStateForPath(handle.alloc, path) catch |err|
+        return storageOwnerStatusFromError(err)) orelse return .not_found;
+    defer state.deinit(handle.alloc);
+    const wire = antfly.restore_state_contract.State{
+        .backup_id = state.backup_id,
+        .location = state.location,
+        .artifact_sha256 = state.artifact_sha256,
+        .native_manifest_size_bytes = state.native_manifest_size_bytes,
+        .native_manifest_sha256 = state.native_manifest_sha256,
+        .snapshot_path = state.snapshot_path,
+        .group_id = state.group_id,
+        .phase = state.phase,
+        .primary_restored = state.primary_restored,
+        .runtime_repair_complete = state.runtime_repair_complete,
+        .last_error = state.last_error,
+    };
+    const response = std.json.Stringify.valueAlloc(handle.alloc, wire, .{}) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = response.len };
+    return .ok;
+}
+
+pub fn storageOwnerTextMemoryJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.TableRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const stats = handle.db.trySnapshotTextMemoryAttributionStats() orelse return .busy;
+    const response = std.json.Stringify.valueAlloc(handle.alloc, stats, .{}) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_response.* = .{
+        .ptr = response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
+pub fn storageOwnerMaintenance(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.MaintenanceRequest,
+    out_result: *kernel_owner_abi.MaintenanceResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const action = std.enums.fromInt(kernel_owner_abi.MaintenanceAction, request.action) orelse
+        return .invalid_argument;
+
+    switch (action) {
+        .inspect, .inspect_best_effort => {},
+        .lsm_step => {
+            out_result.progressed = @intFromBool(handle.db.runLsmMaintenanceStep() catch |err|
+                return storageOwnerStatusFromError(err));
+        },
+        .lsm_step_best_effort => {
+            out_result.progressed = @intFromBool(handle.db.runLsmMaintenanceStepBestEffort() catch |err|
+                return storageOwnerStatusFromError(err));
+        },
+        .dense_posting_idle => {
+            const steps = handle.db.runDensePostingMaintenanceForIdle() catch |err|
+                return storageOwnerStatusFromError(err);
+            out_result.dense_steps = @intCast(steps);
+            out_result.progressed = @intFromBool(steps != 0);
+        },
+        .prepare_ha_seed_snapshot => {
+            if (request.deadline_ns == 0) return .invalid_argument;
+            handle.db.prepareHASeedSnapshot(request.deadline_ns) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+    }
+
+    out_result.maintenance_score = switch (action) {
+        .inspect, .lsm_step, .prepare_ha_seed_snapshot => @max(
+            handle.db.lsmMaintenanceScore(),
+            handle.db.lsmMaintenanceDebtHint(),
+        ),
+        .inspect_best_effort, .lsm_step_best_effort, .dense_posting_idle => handle.db.lsmMaintenanceDebtHint(),
+    };
+    if (handle.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+        out_result.has_next_wake_delay = 1;
+        out_result.next_wake_delay_ns = delay_ns;
+    }
+    return .ok;
+}
+
+pub fn storageOwnerBufferDestroy(buffer: *kernel_owner_abi.OwnedBytes) callconv(.c) void {
+    antfly_db_buffer_free(buffer.ptr, @intCast(buffer.len));
+    buffer.* = .{};
+}
+
+fn storageOwnerStatusFromError(err: anyerror) kernel_owner_abi.Status {
+    return kernel_error_identity.statusFromError(err);
+}
+
 fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
     const alloc = std.heap.c_allocator;
     var db = try db_mod.DB.open(alloc, path, .{});
@@ -2344,18 +6871,18 @@ fn restorePortableBackupToLiteFile(
     if (backup.len == 0) return error.InvalidArgument;
     try portable_backup.validatePortable(alloc, backup);
 
-    const dest_exists = liteCapiPathExists(io, dest_path);
+    const dest_exists = capiPathExists(io, dest_path);
     if (dest_exists and !replace) return error.PathAlreadyExists;
 
     var dest_lock = try antfly.lite.native.lockWriterPath(alloc, dest_path);
     defer dest_lock.close();
 
-    if (!dest_exists and !replace and liteCapiPathExists(io, dest_path)) return error.PathAlreadyExists;
+    if (!dest_exists and !replace and capiPathExists(io, dest_path)) return error.PathAlreadyExists;
 
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.restore-tmp.aflite", .{dest_path});
     defer alloc.free(tmp_path);
-    try liteCapiDeleteFileIfExists(io, tmp_path);
-    errdefer liteCapiDeleteFilePath(io, tmp_path) catch {};
+    try capiDeleteFileIfExists(io, tmp_path);
+    errdefer capiDeleteFilePath(io, tmp_path) catch {};
 
     {
         var backend = try lite_backend.Handle.create(alloc, tmp_path, true);
@@ -2372,13 +6899,13 @@ fn restorePortableBackupToLiteFile(
         try lite_restore_staging.importPortableIntoLiteDb(alloc, &db, backup);
     }
 
-    liteCapiRenameFilePath(io, tmp_path, dest_path) catch |err| {
-        liteCapiDeleteFilePath(io, tmp_path) catch {};
+    capiRenameFilePath(io, tmp_path, dest_path) catch |err| {
+        capiDeleteFilePath(io, tmp_path) catch {};
         return err;
     };
 }
 
-fn liteCapiPathExists(io: std.Io, path: []const u8) bool {
+fn capiPathExists(io: std.Io, path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
         std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
     } else {
@@ -2387,14 +6914,14 @@ fn liteCapiPathExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-fn liteCapiDeleteFileIfExists(io: std.Io, path: []const u8) !void {
-    liteCapiDeleteFilePath(io, path) catch |err| switch (err) {
+fn capiDeleteFileIfExists(io: std.Io, path: []const u8) !void {
+    capiDeleteFilePath(io, path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
 }
 
-fn liteCapiRenameFilePath(io: std.Io, old_path: []const u8, new_path: []const u8) !void {
+fn capiRenameFilePath(io: std.Io, old_path: []const u8, new_path: []const u8) !void {
     if (std.fs.path.isAbsolute(old_path) or std.fs.path.isAbsolute(new_path)) {
         try std.Io.Dir.renameAbsolute(old_path, new_path, io);
     } else {
@@ -2402,7 +6929,7 @@ fn liteCapiRenameFilePath(io: std.Io, old_path: []const u8, new_path: []const u8
     }
 }
 
-fn liteCapiDeleteFilePath(io: std.Io, path: []const u8) !void {
+fn capiDeleteFilePath(io: std.Io, path: []const u8) !void {
     if (std.fs.path.isAbsolute(path)) {
         try std.Io.Dir.deleteFileAbsolute(io, path);
     } else {
@@ -3023,7 +7550,7 @@ fn searchDenseOwnedProfiled(
     };
 
     const fallback_start = monotonicNowNs();
-    var result = try handle.db.search(handle.alloc, req);
+    var result = try executeLocalSearch(handle, req);
     defer result.deinit();
     const fallback_end = monotonicNowNs();
 
@@ -3164,7 +7691,7 @@ fn searchTextOwned(
     };
 
     try handle.prepareSearchRequest(req);
-    var result = try handle.db.search(handle.alloc, req);
+    var result = try executeLocalSearch(handle, req);
     defer result.deinit();
 
     const ids = try handle.alloc.alloc([]const u8, result.hits.len);
@@ -3929,11 +8456,123 @@ fn requestLooksLikePublicQueryJson(bytes: []const u8) bool {
         std.mem.indexOf(u8, bytes, "\"query\"") != null;
 }
 
-fn searchPublicQueryJson(handle: *Handle, request_json: capi.Slice, out_buf: *capi.Buffer) capi.ErrorCode {
+fn searchStorageKernelQueryJson(
+    handle: *Handle,
+    table_name: []const u8,
+    request_json: capi.Slice,
+    out_response: *kernel_owner_abi.QueryOwnedResponse,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) kernel_owner_abi.Status {
+    out_failure.* = .{};
+    if (comptime capi_build_options.storage_kernel_experiment) {
+        handle.prepareSearchRequest(.{}) catch |err|
+            return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
+        const response = local_query_client.executeJsonAlloc(
+            std.heap.c_allocator,
+            @ptrCast(&handle.db),
+            table_name,
+            request_json.bytes(),
+            .internal,
+            .{},
+            null,
+            null,
+            out_failure,
+        ) catch |err| {
+            // A valid provider failure already carries the exact envelope.
+            // Consumer-side allocation/protocol failures originate in this
+            // outer operation and receive their own identity.
+            if (out_failure.status != .ok) return out_failure.status;
+            return storageOwnerQueryFailure(err, .encode_internal_response, out_failure);
+        };
+        out_response.* = .{
+            .buffer = .{ .ptr = response.json.ptr, .len = @intCast(response.json.len) },
+            .identity_read_generation = response.identity_read_generation orelse 0,
+            .has_identity_read_generation = @intFromBool(response.identity_read_generation != null),
+        };
+        return .ok;
+    }
+
+    // The distributed adapter sends the same resolved/internal query dialect
+    // used by remote group routes. It must not be reparsed as a public request:
+    // fields such as `_filter_query_json` are deliberately internal.
+    var owned = query_api.parseQueryRequest(
+        handle.alloc,
+        null,
+        table_name,
+        request_json.bytes(),
+    ) catch |err| return storageOwnerQueryFailure(err, .parse_internal_request, out_failure);
+    defer owned.deinit(handle.alloc);
+
+    stampSearchRequestIdentityGeneration(handle, &owned.req) catch |err|
+        return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
+    handle.prepareSearchRequest(owned.req) catch |err|
+        return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
+
+    var result = handle.db.search(handle.alloc, owned.req) catch |err|
+        return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
+    defer result.deinit();
+
+    var response = query_api.encodeQueryResponses(
+        handle.alloc,
+        table_name,
+        owned.req,
+        .{},
+        result,
+    ) catch |err| return storageOwnerQueryFailure(err, .encode_internal_response, out_failure);
+    defer response.deinit(handle.alloc);
+
+    const buffer = dupBytes(response.json) catch |err|
+        return storageOwnerQueryFailure(err, .encode_internal_response, out_failure);
+    out_response.* = .{
+        .buffer = .{ .ptr = buffer.ptr, .len = @intCast(buffer.len) },
+        .identity_read_generation = response.identity_read_generation orelse 0,
+        .has_identity_read_generation = @intFromBool(response.identity_read_generation != null),
+    };
+    return .ok;
+}
+
+fn storageOwnerQueryFailure(
+    err: anyerror,
+    operation: kernel_owner_abi.LocalQueryOperation,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) kernel_owner_abi.Status {
+    out_failure.* = kernel_error_identity.failureFromError(
+        err,
+        .storage_owner,
+        kernel_owner_abi.abi_version,
+        @intFromEnum(operation),
+    );
+    return out_failure.status;
+}
+
+fn searchPublicQueryJson(
+    handle: *Handle,
+    table_name: []const u8,
+    request_json: capi.Slice,
+    out_buf: *capi.Buffer,
+) capi.ErrorCode {
+    if (comptime capi_build_options.storage_kernel_experiment) {
+        handle.prepareSearchRequest(.{}) catch |err| return capi.mapError(err);
+        var failure: kernel_owner_abi.FailureIdentity = .{};
+        const response = local_query_client.executeJsonAlloc(
+            std.heap.c_allocator,
+            @ptrCast(&handle.db),
+            table_name,
+            request_json.bytes(),
+            .public,
+            .{},
+            null,
+            null,
+            &failure,
+        ) catch |err| return capi.mapError(err);
+        out_buf.* = .{ .ptr = response.json.ptr, .len = response.json.len };
+        return .ok;
+    }
+
     var owned = query_api.parsePublicQueryRequest(
         handle.alloc,
         null,
-        "docs",
+        table_name,
         request_json.bytes(),
     ) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
@@ -3946,7 +8585,7 @@ fn searchPublicQueryJson(handle: *Handle, request_json: capi.Slice, out_buf: *ca
 
     var response = query_api.encodeQueryResponses(
         handle.alloc,
-        "docs",
+        table_name,
         owned.req,
         .{},
         result,
@@ -3964,7 +8603,7 @@ pub export fn antfly_db_search_json(
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (requestLooksLikePublicQueryJson(request_json.bytes())) {
-        return searchPublicQueryJson(handle, request_json, out_buf);
+        return searchPublicQueryJson(handle, "docs", request_json, out_buf);
     }
     const Request = struct {
         mode: []const u8,
@@ -4054,7 +8693,7 @@ pub export fn antfly_db_search_json(
 
     stampSearchRequestIdentityGeneration(handle, &req) catch |err| return capi.mapError(err);
     handle.prepareSearchRequest(req) catch |err| return capi.mapError(err);
-    var result = handle.db.search(handle.alloc, req) catch |err| return capi.mapError(err);
+    var result = executeLocalSearch(handle, req) catch |err| return capi.mapError(err);
     defer result.deinit();
 
     var aggregation_results: []JsonSearchAggregationResult = &.{};
@@ -4071,7 +8710,7 @@ pub export fn antfly_db_search_json(
             agg_req.offset = 0;
             agg_req.limit = if (result.total_hits == 0) 1 else result.total_hits;
             agg_req.include_stored = true;
-            full_result = handle.db.search(handle.alloc, agg_req) catch |err| return capi.mapError(err);
+            full_result = executeLocalSearch(handle, agg_req) catch |err| return capi.mapError(err);
             agg_source_is_full = true;
         }
         const source = if (full_result) |*value| value else &result;
@@ -4436,7 +9075,7 @@ pub export fn antfly_db_search_hits_json(
 
     stampSearchRequestIdentityGeneration(handle, &req) catch |err| return capi.mapError(err);
     handle.prepareSearchRequest(req) catch |err| return capi.mapError(err);
-    var result = handle.db.search(handle.alloc, req) catch |err| return capi.mapError(err);
+    var result = executeLocalSearch(handle, req) catch |err| return capi.mapError(err);
     defer result.deinit();
     if (result.graph_results.len > 0) return .invalid_argument;
 
@@ -7487,8 +12126,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     {
         var io_impl = std.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
-        try std.testing.expect(!liteCapiPathExists(io_impl.io(), locked_restore_path));
-        try std.testing.expect(!liteCapiPathExists(io_impl.io(), locked_restore_tmp_path));
+        try std.testing.expect(!capiPathExists(io_impl.io(), locked_restore_path));
+        try std.testing.expect(!capiPathExists(io_impl.io(), locked_restore_tmp_path));
     }
 
     var restore_existing: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
@@ -7509,7 +12148,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     {
         var io_impl = std.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
-        try std.testing.expect(!liteCapiPathExists(io_impl.io(), restore_malformed_path));
+        try std.testing.expect(!capiPathExists(io_impl.io(), restore_malformed_path));
     }
 
     var readonly_handle: ?*anyopaque = null;

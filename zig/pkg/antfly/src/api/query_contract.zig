@@ -15,7 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ant_json = @import("antfly-json");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const document_query = @import("../storage/db/document_query.zig");
 const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
 const graph_edge_type = @import("../graph/edge_type.zig");
@@ -29,7 +29,7 @@ const graph_mod = @import("../graph/graph.zig");
 const graph_node_identity = @import("../graph/node_identity.zig");
 const rfc3339 = @import("../common/rfc3339.zig");
 const fusion_mod = @import("../search/fusion.zig");
-const aggregations_mod = @import("../storage/db/aggregations.zig");
+const aggregations_mod = @import("../storage/db/aggregations_contract.zig");
 const public_search_request_mod = @import("public_search_request.zig");
 const public_text_query_mod = @import("public_text_query.zig");
 const public_query_string_mod = @import("public_query_string.zig");
@@ -3354,6 +3354,8 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
         "\"hierarchy\"",
         "\"_filter_query_json\"",
         "\"_exclusion_query_json\"",
+        "\"_index_name\"",
+        "\"_primary_text_index_name\"",
         db_mod.doc_filter_wire.field_name,
     };
     for (disallowed) |needle| {
@@ -12364,7 +12366,10 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_index_name",
+        "_primary_text_index_name",
         "_defer_hierarchy_child_hydration",
+        "_require_algebraic_filter_resolution",
         db_mod.doc_filter_wire.field_name,
         "_filter_doc_ids",
         "_filter_doc_ids_positive",
@@ -12699,7 +12704,10 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_index_name",
+        "_primary_text_index_name",
         "_defer_hierarchy_child_hydration",
+        "_require_algebraic_filter_resolution",
         db_mod.doc_filter_wire.field_name,
         "_filter_doc_ids",
         "_filter_doc_ids_positive",
@@ -13101,6 +13109,18 @@ fn parseInternalDocIdConstraintsAlloc(
         }
         req.identity_read_generation = generation;
     }
+    if (parsed.value.object.get("_index_name")) |value| {
+        if (value != .string or value.string.len == 0 or req.index_name != null) {
+            return error.InvalidQueryRequest;
+        }
+        req.index_name = try alloc.dupe(u8, value.string);
+    }
+    if (parsed.value.object.get("_primary_text_index_name")) |value| {
+        if (value != .string or value.string.len == 0 or req.primary_text_index_name != null) {
+            return error.InvalidQueryRequest;
+        }
+        req.primary_text_index_name = try alloc.dupe(u8, value.string);
+    }
     if (parsed.value.object.get("_defer_hierarchy_child_hydration")) |value| {
         const is_unit_group = req.hierarchy_group_level == .unit and
             (req.return_mode == .unit or req.return_mode == .unit_with_chunks);
@@ -13108,6 +13128,10 @@ fn parseInternalDocIdConstraintsAlloc(
             return error.InvalidQueryRequest;
         }
         req.defer_hierarchy_child_hydration = true;
+    }
+    if (parsed.value.object.get("_require_algebraic_filter_resolution")) |value| {
+        if (value != .bool or !value.bool) return error.InvalidQueryRequest;
+        req.require_algebraic_filter_resolution = true;
     }
 }
 

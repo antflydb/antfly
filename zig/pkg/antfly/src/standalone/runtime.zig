@@ -30,6 +30,11 @@ const inference_bridge = @import("inference_bridge.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
 const runtime_http_abi = @import("../runtime_http_abi.zig");
+const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
+const storage_source_options = @import("storage_source_options");
+const control_only_storage_sources = storage_source_options.control_only;
+const LegacyLiteHandle = if (control_only_storage_sources) struct {} else antfly.lite.backend.Handle;
+const LegacyAuthBackend = if (control_only_storage_sources) struct {} else antfly.lsm_backend.BackendHandle;
 const inline_inference_codegen = builtin.is_test;
 const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
 
@@ -46,6 +51,7 @@ const LocalInferenceConnectionContext = struct {
 
 const LocalSchemaProgressProvider = struct {
     ptr: *anyopaque,
+    shard_db_adapter: ?antfly.metadata.ShardDbAdapter = null,
     collect: *const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -1173,6 +1179,44 @@ const LocalStandaloneMetadata = struct {
         try mutation.commit(self);
     }
 
+    fn adoptEmbeddedLiteRootFromKernelIfNeeded(
+        self: *LocalStandaloneMetadata,
+        context: *kernel_owner_client.Context,
+    ) !void {
+        const existing = try self.manager.listTables(self.alloc);
+        defer self.manager.freeTables(self.alloc, existing);
+        if (existing.len != 0) return;
+        const probe = try context.liteAdoptionProbe();
+        if (probe.is_embedded_artifact == 0 and probe.embedded_root_has_user_documents == 0) return;
+
+        const table = try deriveStandaloneTableRecord(.lite, "default", .{});
+        const ranges = try antfly.public_api.tables.deriveInitialRanges(self.alloc, table);
+        defer {
+            for (ranges) |record| antfly.metadata.table_manager.freeRange(self.alloc, record);
+            self.alloc.free(ranges);
+        }
+        if (ranges.len != 1) return error.InvalidCreateTableRequest;
+        const namespace = try std.fmt.allocPrint(self.alloc, "group-{d}/table-db", .{ranges[0].group_id});
+        defer self.alloc.free(namespace);
+
+        try context.liteAdoptAndVerify(.{
+            .namespace = .fromSlice(namespace),
+            .identity_table_id = table.table_id,
+            .identity_shard_id = ranges[0].group_id,
+            .identity_range_id = ranges[0].range_id,
+        });
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.findTableByNameLocked("default") != null) return;
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
+        try self.manager.upsertTable(table);
+        for (ranges) |range| try self.manager.upsertRange(range);
+        self.epoch +|= 1;
+        try mutation.commit(self);
+    }
+
     fn replaceTableDefinition(ptr: *anyopaque, expected: antfly.metadata.TableRecord, replacement: antfly.metadata.TableRecord) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
@@ -1566,14 +1610,23 @@ const LocalStandaloneMetadata = struct {
         defer if (runtime_progress) |*progress| progress.deinit(self.alloc);
         var filesystem_progress: ?[]antfly.metadata.SchemaProgressRecord = null;
         defer if (filesystem_progress) |progress| self.alloc.free(progress);
+        var shard_db_adapter: ?antfly.metadata.ShardDbAdapter = null;
         const progress: []const antfly.metadata.SchemaProgressRecord = progress: {
             if (self.local_schema_progress_provider) |provider| {
+                shard_db_adapter = provider.shard_db_adapter;
                 runtime_progress = try provider.collect(provider.ptr, self.alloc, snapshot.tables, snapshot.ranges);
                 if (runtime_progress.?.records.len != 0) break :progress runtime_progress.?.records;
                 // A complete runtime observation is authoritative even while
                 // not ready. Do not contend with its live writer by reopening
                 // the same root through the filesystem fallback.
                 if (runtime_progress.?.runtime_coverage_complete) return;
+            }
+            // A control-only process has no legal filesystem fallback. If its
+            // live data-server adapter is not installed yet, retain the
+            // migration and retry on the next metadata round instead of
+            // terminating the standalone runtime.
+            if (comptime control_only_storage_sources) {
+                if (shard_db_adapter == null) return;
             }
             filesystem_progress = try antfly.metadata.table_provisioner.collectLocalSchemaProgressWithOptions(
                 self.alloc,
@@ -1585,6 +1638,7 @@ const LocalStandaloneMetadata = struct {
                 snapshot.ranges,
                 .{
                     .backend_runtime = self.backend_runtime,
+                    .shard_db_adapter = shard_db_adapter,
                 },
             );
             break :progress filesystem_progress.?;
@@ -1891,6 +1945,21 @@ pub fn runFromIterator(
     try ensureParent(setup_io.io(), resolved.secret_store_path);
     try ensureDirPath(setup_io.io(), resolved.auth_store_root_dir);
 
+    const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
+    var storage_kernel_context = kernel_owner_client.Context{};
+    defer if (control_only_storage_sources) storage_kernel_context.deinit();
+    if (comptime control_only_storage_sources) {
+        try storage_kernel_context.ensureWith(.{
+            .storage_kind = if (lite_path != null) .lite else .directory,
+            .no_sync = @intFromBool(!lite_fsync),
+            .storage_path = .fromSlice(lite_path orelse ""),
+            .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+        });
+        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
+        defer alloc.free(security_json);
+        try storage_kernel_context.configureRemoteContentSecurity(security_json);
+    }
+
     var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer node_backend_runtime.deinit();
     // The linked inference archive retains std.Io for its full node lifetime.
@@ -1898,13 +1967,17 @@ pub fn runFromIterator(
     var inference_lane_lease = try node_backend_runtime.ptr().acquireInferenceLane();
     defer inference_lane_lease.release();
     const inference_io = inference_lane_lease.io();
-    var lite_backend: ?antfly.lite.backend.Handle = if (lite_path) |path|
-        try antfly.lite.backend.Handle.openOrCreate(alloc, path, .{ .no_sync = !lite_fsync })
-    else
-        null;
-    defer if (lite_backend) |*backend| backend.deinit();
-    if (lite_backend) |*backend| {
-        node_backend_runtime.ptr().db_open_configurator = backend.dbOpenConfigurator();
+    var lite_backend: ?LegacyLiteHandle = null;
+    if (comptime !control_only_storage_sources) {
+        if (lite_path) |path| lite_backend = try antfly.lite.backend.Handle.openOrCreate(
+            alloc,
+            path,
+            .{ .no_sync = !lite_fsync },
+        );
+    }
+    defer if (comptime !control_only_storage_sources) if (lite_backend) |*backend| backend.deinit();
+    if (comptime !control_only_storage_sources) {
+        if (lite_backend) |*backend| node_backend_runtime.ptr().db_open_configurator = backend.dbOpenConfigurator();
     }
 
     // Restore jobs are storage-engine state. Local standalone keeps them in a
@@ -1926,10 +1999,13 @@ pub fn runFromIterator(
     else
         null;
     defer if (local_restore_job_store) |*store| store.deinit();
-    const restore_job_store = if (lite_backend) |*backend|
-        try backend.runtimeStoreForNamespace("system/api-restore-jobs")
-    else
-        &local_restore_job_store.?;
+    var restore_job_store: ?*antfly.storage_backend_erased.Store = null;
+    if (comptime !control_only_storage_sources) {
+        restore_job_store = if (lite_backend) |*backend|
+            try backend.runtimeStoreForNamespace("system/api-restore-jobs")
+        else
+            &local_restore_job_store.?;
+    }
     // Incoming reverse-route observations are an exact, fenced directory, not
     // disposable cache state: retain one latest generation per logical graph
     // key so restarts and L1 eviction do not reintroduce all-shard probes.
@@ -1948,13 +2024,20 @@ pub fn runFromIterator(
     else
         null;
     defer if (local_incoming_graph_route_store) |*store| store.deinit();
-    const incoming_graph_route_store = if (lite_backend) |*backend|
+    const incoming_graph_route_store = if (comptime control_only_storage_sources)
+        &local_incoming_graph_route_store.?
+    else if (lite_backend) |*backend|
         try backend.runtimeStoreForNamespace("system/incoming-graph-routes")
     else
         &local_incoming_graph_route_store.?;
     var storage_maintenance = try antfly.storage_maintenance.Coordinator.init(
         alloc,
-        if (lite_backend) |*backend| backend.maintenanceSource() else antfly.storage_maintenance.localSource,
+        if (comptime control_only_storage_sources)
+            storage_kernel_context.maintenanceSource()
+        else if (lite_backend) |*backend|
+            backend.maintenanceSource()
+        else
+            antfly.storage_maintenance.localSource,
         node_backend_runtime.ptr(),
     );
     defer storage_maintenance.deinit();
@@ -2094,6 +2177,11 @@ pub fn runFromIterator(
         else
             linkedInferenceApiInfallible().destroy(antfly_node);
     };
+    // Attach before opening any context-backed auth/system stores. Those
+    // handles intentionally retain the storage context for their lifetime;
+    // attaching afterward is rejected as a live-owner configuration mutation.
+    if (comptime control_only_storage_sources)
+        try storage_kernel_context.attachInferenceProvider(antfly_node);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -2125,19 +2213,35 @@ pub fn runFromIterator(
         };
     }
 
-    const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
-    var auth_backend: ?antfly.lsm_backend.BackendHandle = null;
+    var auth_backend: ?LegacyAuthBackend = null;
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var kernel_auth_users_store: ?antfly.storage_backend_erased.Store = null;
+    var kernel_auth_casbin_store: ?antfly.storage_backend_erased.Store = null;
+    var kernel_auth_users_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var kernel_auth_casbin_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
     var auth_user_store: ?antfly.usermgr.StorageUserStore = null;
     var auth_casbin_store: ?antfly.usermgr.StorageCasbinAdapter = null;
     var user_manager: ?antfly.usermgr.UserManager = null;
     if (auth_enabled) {
-        auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
-        errdefer if (auth_backend) |*backend| backend.close();
-        auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
-        errdefer if (auth_runtime) |*runtime| runtime.deinit();
-        auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
-        auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        if (comptime control_only_storage_sources) {
+            kernel_auth_users_store = try storage_kernel_context.systemStore(alloc, "system/auth-users");
+            errdefer kernel_auth_users_store.?.deinit();
+            kernel_auth_casbin_store = try storage_kernel_context.systemStore(alloc, "system/auth-casbin");
+            errdefer kernel_auth_casbin_store.?.deinit();
+            kernel_auth_users_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_users_store.?, "usermgr_users");
+            errdefer kernel_auth_users_runtime.?.deinit();
+            kernel_auth_casbin_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_casbin_store.?, "usermgr_casbin");
+            errdefer kernel_auth_casbin_runtime.?.deinit();
+            auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, kernel_auth_users_runtime.?);
+            auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, kernel_auth_casbin_runtime.?);
+        } else {
+            auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
+            errdefer if (auth_backend) |*backend| backend.close();
+            auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
+            errdefer if (auth_runtime) |*runtime| runtime.deinit();
+            auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
+            auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        }
         user_manager = try antfly.usermgr.UserManager.init(
             alloc,
             auth_user_store.?.iface(),
@@ -2162,7 +2266,11 @@ pub fn runFromIterator(
     }
     defer if (user_manager) |*manager| manager.deinit();
     defer if (auth_runtime) |*runtime| runtime.deinit();
-    defer if (auth_backend) |*backend| backend.close();
+    defer if (comptime !control_only_storage_sources) if (auth_backend) |*backend| backend.close();
+    defer if (kernel_auth_users_store) |*store| store.deinit();
+    defer if (kernel_auth_casbin_store) |*store| store.deinit();
+    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
+    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
 
     const public_listener = resolvePublicListener(cli);
     const local_node_id = cli.local_node_id orelse 1;
@@ -2173,6 +2281,12 @@ pub fn runFromIterator(
     );
     defer alloc.free(public_api_url);
 
+    var kernel_catalog_store: ?antfly.storage_backend_erased.Store = null;
+    if (comptime control_only_storage_sources) {
+        if (lite_path != null) kernel_catalog_store = try storage_kernel_context.systemStore(alloc, "system/metadata");
+    }
+    defer if (kernel_catalog_store) |*store| store.deinit();
+
     var local_metadata = LocalStandaloneMetadata.init(
         alloc,
         local_node_id,
@@ -2181,24 +2295,54 @@ pub fn runFromIterator(
         resolved.replica_root_dir,
         resolved.local_metadata_catalog_path,
         node_backend_runtime.ptr(),
-        if (lite_backend) |*backend| try backend.runtimeStoreForNamespace("system/metadata") else null,
+        if (comptime control_only_storage_sources)
+            if (kernel_catalog_store) |*store| store else null
+        else if (lite_backend) |*backend|
+            try backend.runtimeStoreForNamespace("system/metadata")
+        else
+            null,
         storage_engine,
     ) catch |err| {
         std.log.err("standalone startup failed step=local_metadata_init err={}", .{err});
         return err;
     };
     defer local_metadata.deinit();
-    if (lite_backend) |*backend| {
-        try local_metadata.adoptEmbeddedLiteRootIfNeeded(backend);
-        // Mark only after embedded adoption and metadata publication succeed.
-        // Offline root-only backup must reject every standalone artifact, not
-        // merely artifacts that originated in the embedded profile.
-        try backend.markStandaloneArtifact();
+    if (lite_path != null) {
+        if (comptime control_only_storage_sources) {
+            try local_metadata.adoptEmbeddedLiteRootFromKernelIfNeeded(&storage_kernel_context);
+            try storage_kernel_context.liteMarkStandalone();
+        } else if (lite_backend) |*backend| {
+            try local_metadata.adoptEmbeddedLiteRootIfNeeded(backend);
+            try backend.markStandaloneArtifact();
+        }
     }
     // API transaction sessions are engine state, not a sidecar. Keeping them
     // in a reserved Lite namespace makes a copied/reopened .aflite file a
     // complete database and preserves staged multi-request transactions.
-    var lite_session_store = if (lite_backend) |*backend|
+    var kernel_session_backend: ?antfly.storage_backend_erased.Store = null;
+    var kernel_restore_job_backend: ?antfly.storage_backend_erased.Store = null;
+    if (comptime control_only_storage_sources) {
+        if (lite_path != null) {
+            kernel_session_backend = try storage_kernel_context.systemStore(alloc, "system/api-transaction-sessions");
+            kernel_restore_job_backend = try storage_kernel_context.systemStore(alloc, "system/api-restore-jobs");
+        }
+    }
+    defer if (kernel_session_backend) |*store| store.deinit();
+    defer if (kernel_restore_job_backend) |*store| store.deinit();
+    if (comptime control_only_storage_sources) {
+        restore_job_store = if (kernel_restore_job_backend) |*store|
+            store
+        else if (local_restore_job_store) |*store|
+            store
+        else
+            null;
+    }
+    var lite_session_store = if (comptime control_only_storage_sources)
+        if (kernel_session_backend) |*store|
+            antfly.public_api.transactions.DurableSessionStore.initRuntime(alloc, store)
+        else
+            null
+    else if (lite_backend) |*backend|
         antfly.public_api.transactions.DurableSessionStore.initRuntime(
             alloc,
             try backend.runtimeStoreForNamespace("system/api-transaction-sessions"),
@@ -2218,13 +2362,20 @@ pub fn runFromIterator(
 
     try validateHAPathsUnderRoot(cli, data_dir);
     const ha_startup_expectation = try haStartupExpectationFromCli(cli);
-    const ha_startup_checkpoint_lsn = if (ha_startup_expectation) |expectation|
-        antfly.ha.seed_activation.validateActivatedGeneration(alloc, expectation) catch |err| {
+    const ha_startup_checkpoint_lsn = if (ha_startup_expectation) |expectation| blk: {
+        if (comptime control_only_storage_sources) {
+            const request_json = try std.json.Stringify.valueAlloc(alloc, expectation, .{});
+            defer alloc.free(request_json);
+            break :blk kernel_owner_client.haSeedValidateActivatedGeneration(request_json) catch |err| {
+                std.log.err("standalone startup failed step=validate_ha_active_generation err={}", .{err});
+                return err;
+            };
+        }
+        break :blk antfly.ha.seed_activation.validateActivatedGeneration(alloc, expectation) catch |err| {
             std.log.err("standalone startup failed step=validate_ha_active_generation err={}", .{err});
             return err;
-        }
-    else
-        null;
+        };
+    } else null;
     // A reseed may rotate a persisted Lease fence only after the complete,
     // immutable activation chain on this exact target volume has validated.
     // A generic checkpoint or caller-selected startup generation never reaches
@@ -2320,6 +2471,7 @@ pub fn runFromIterator(
         .replica_root_dir = resolved.replica_root_dir,
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
+        .storage_kernel_context_handle = if (control_only_storage_sources) storage_kernel_context.handle else null,
         .process_memory_limit_bytes = process_memory_limit_bytes,
         .process_memory_limit_source = storageMemoryLimitSource(process_memory_resolution.effective_source),
         .store_registration = .{
@@ -3574,6 +3726,7 @@ fn localReplicaRootReconcileHook(data_server: *antfly.data.runtime.DataServer) a
 fn localSchemaProgressProvider(data_server: *antfly.data.runtime.DataServer) LocalSchemaProgressProvider {
     return .{
         .ptr = data_server,
+        .shard_db_adapter = data_server.localShardDbAdapter(),
         .collect = collectLocalSchemaProgress,
     };
 }
@@ -5189,8 +5342,8 @@ fn inferenceProviderEmbedSparseTexts(
     alloc: std.mem.Allocator,
     model: []const u8,
     texts: []const []const u8,
-) anyerror![]antfly.db.embedder.SparseEmbedding {
-    return try invokeInferenceProvider([]antfly.db.embedder.SparseEmbedding, alloc, handle, .embed_sparse_texts, .{
+) anyerror![]antfly.inference.managed_embedder.SparseEmbedding {
+    return try invokeInferenceProvider([]antfly.inference.managed_embedder.SparseEmbedding, alloc, handle, .embed_sparse_texts, .{
         .model = model,
         .texts = texts,
     }, null);
@@ -8154,6 +8307,100 @@ test "standalone metadata finalizes schema migration from resident runtime evide
     };
 
     try metadata.finalizeReadySchemaMigrations();
+    const table = metadata.findTableByNameLocked("docs") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", table.read_schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "full_text_index_v0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "full_text_index_v1") != null);
+}
+
+test "standalone metadata finalizes schema migration through split shard adapter fallback" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, catalog_path),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+    try metadata.manager.upsertTable(.{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":1}",
+        .read_schema_json = "{\"version\":0}",
+        .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+    });
+    try metadata.manager.upsertRange(.{
+        .group_id = 70,
+        .table_id = 7,
+        .start_key = "",
+    });
+
+    const Provider = struct {
+        fn collect(
+            _: *anyopaque,
+            provider_alloc: std.mem.Allocator,
+            _: []const antfly.metadata.TableRecord,
+            _: []const antfly.metadata.RangeRecord,
+        ) !antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot {
+            return .{
+                .records = try provider_alloc.alloc(antfly.metadata.SchemaProgressRecord, 0),
+                .runtime_coverage_complete = false,
+            };
+        }
+    };
+    const Adapter = struct {
+        calls: usize = 0,
+
+        fn fetchMedianKey(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+
+        fn schemaIndexReady(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            group_id: u64,
+            schema_version: u32,
+            read_schema_version: u32,
+        ) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(u64, 70), group_id);
+            try std.testing.expectEqual(@as(u32, 1), schema_version);
+            try std.testing.expectEqual(@as(u32, 0), read_schema_version);
+            return true;
+        }
+    };
+    var adapter = Adapter{};
+    metadata.local_schema_progress_provider = .{
+        .ptr = undefined,
+        .collect = Provider.collect,
+        .shard_db_adapter = .{
+            .ptr = &adapter,
+            .vtable = &.{
+                .fetch_median_key = Adapter.fetchMedianKey,
+                .schema_index_ready = Adapter.schemaIndexReady,
+            },
+        },
+    };
+
+    try metadata.finalizeReadySchemaMigrations();
+
+    try std.testing.expectEqual(@as(usize, 1), adapter.calls);
     const table = metadata.findTableByNameLocked("docs") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("", table.read_schema_json);
     try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "full_text_index_v0") == null);

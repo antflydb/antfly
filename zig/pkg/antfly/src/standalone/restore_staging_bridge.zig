@@ -18,19 +18,22 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const error_abi = @import("../runtime_error_abi.zig");
-const direct_codegen = builtin.is_test;
+const runtime_options = @import("standalone_runtime_options");
 
-const direct_impl = if (direct_codegen)
+const use_direct_implementation = builtin.is_test or !runtime_options.linked_runtime_boundaries;
+const direct_impl = if (use_direct_implementation)
     @import("../storage/lite/restore_staging.zig")
 else
     struct {};
 
 pub const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;
 
-pub const abi_version = error_abi.abi_version;
-pub const Status = error_abi.Status;
-pub const statusFromError = error_abi.statusFromError;
+pub const Status = struct {
+    pub const ok: c_int = 0;
+    pub const out_of_memory: c_int = 1;
+    pub const invalid_arguments: c_int = 2;
+    pub const failed: c_int = 3;
+};
 
 pub const Result = extern struct {
     handle: ?*anyopaque = null,
@@ -45,7 +48,7 @@ pub const Result = extern struct {
 };
 
 pub const CreateContext = extern struct {
-    abi_version: u32,
+    allocator: *const anyopaque,
     input_path_ptr: [*]const u8,
     input_path_len: usize,
     table_name_ptr: [*]const u8,
@@ -57,7 +60,7 @@ pub const CreateContext = extern struct {
     result: *Result,
 };
 
-extern fn antfly_restore_staging_create(context: *const CreateContext) callconv(.c) Status;
+extern fn antfly_restore_staging_create(context: *const CreateContext) callconv(.c) c_int;
 extern fn antfly_restore_staging_destroy(handle: *anyopaque) callconv(.c) void;
 
 pub const StagedRestore = struct {
@@ -68,7 +71,7 @@ pub const StagedRestore = struct {
     table_name: []const u8,
 
     pub fn deinit(self: *StagedRestore, allocator: std.mem.Allocator) void {
-        if (comptime direct_codegen) {
+        if (comptime use_direct_implementation) {
             const state: *DirectState = @ptrCast(@alignCast(self.handle));
             state.staged.deinit(allocator);
             allocator.destroy(state);
@@ -79,7 +82,7 @@ pub const StagedRestore = struct {
     }
 };
 
-const DirectState = if (direct_codegen)
+const DirectState = if (use_direct_implementation)
     struct { staged: direct_impl.StagedRestore }
 else
     opaque {};
@@ -108,7 +111,7 @@ pub fn stageInputRestoreBackup(
     backup_id: []const u8,
     location: []const u8,
 ) !StagedRestore {
-    if (comptime direct_codegen) {
+    if (comptime use_direct_implementation) {
         const state = try allocator.create(DirectState);
         errdefer allocator.destroy(state);
         state.* = .{ .staged = try direct_impl.stageInputRestoreBackup(allocator, input_path, table_name, backup_id, location) };
@@ -121,9 +124,10 @@ pub fn stageInputRestoreBackup(
         };
     }
 
+    var allocator_copy = allocator;
     var result = Result{};
     const status = antfly_restore_staging_create(&.{
-        .abi_version = abi_version,
+        .allocator = &allocator_copy,
         .input_path_ptr = input_path.ptr,
         .input_path_len = input_path.len,
         .table_name_ptr = table_name.ptr,
@@ -134,7 +138,12 @@ pub fn stageInputRestoreBackup(
         .location_len = location.len,
         .result = &result,
     });
-    if (!status.isOk()) return error_abi.errorFromStatus(status);
+    switch (status) {
+        Status.ok => {},
+        Status.out_of_memory => return error.OutOfMemory,
+        Status.invalid_arguments => return error.InvalidArguments,
+        else => return error.RestoreStagingFailed,
+    }
     return .{
         .handle = result.handle orelse return error.RestoreStagingFailed,
         .backup_id = result.backup_id_ptr[0..result.backup_id_len],

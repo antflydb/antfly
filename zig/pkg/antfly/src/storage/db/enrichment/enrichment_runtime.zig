@@ -40,6 +40,11 @@ const enrichment_state = @import("enrichment_state.zig");
 const embedder_mod = @import("embedder.zig");
 const asset_producer_mod = @import("asset_producer.zig");
 const document_extraction_mod = @import("document_extraction.zig");
+const kernel_owner_abi = @import("kernel_owner_abi");
+const document_extraction_client = if (!builtin.is_test and build_options.storage_kernel_experiment)
+    @import("document_extraction_client.zig")
+else
+    struct {};
 const document_unit_fingerprint = @import("document_unit_fingerprint.zig");
 const artifact_ids = @import("../artifact_ids.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
@@ -2793,6 +2798,33 @@ fn getOrCreateRequestChunks(
     return cache.items[cache.items.len - 1].chunks;
 }
 
+fn inheritProcessTelemetryUnlocked(runtime: anytype, previous: types.EnrichmentStats) void {
+    runtime.processed_requests = @max(runtime.processed_requests, previous.processed_requests);
+    runtime.error_count = @max(runtime.error_count, previous.error_count);
+    runtime.retryable_error_count = @max(runtime.retryable_error_count, previous.retryable_error_count);
+    runtime.fatal_error_count = @max(runtime.fatal_error_count, previous.fatal_error_count);
+    runtime.skip_by_hash_count = @max(runtime.skip_by_hash_count, previous.skip_by_hash_count);
+    runtime.skipped_source_count = @max(runtime.skipped_source_count, previous.skipped_source_count);
+    runtime.codec_decode_failures = @max(runtime.codec_decode_failures, previous.codec_decode_failures);
+    runtime.embed_batches_started = @max(runtime.embed_batches_started, previous.embed_batches_started);
+    runtime.embed_batches_completed = @max(runtime.embed_batches_completed, previous.embed_batches_completed);
+    runtime.embed_items_started = @max(runtime.embed_items_started, previous.embed_items_started);
+    runtime.embed_items_completed = @max(runtime.embed_items_completed, previous.embed_items_completed);
+    if (previous.embed_batches_completed != 0 and
+        previous.last_embed_batch_completed_ms >= runtime.last_embed_batch_completed_ms)
+    {
+        runtime.last_embed_batch_items = previous.last_embed_batch_items;
+        runtime.last_embed_batch_bytes = previous.last_embed_batch_bytes;
+        runtime.last_embed_batch_max_bytes = previous.last_embed_batch_max_bytes;
+        runtime.last_embed_batch_completed_ms = previous.last_embed_batch_completed_ms;
+        runtime.last_embed_batch_ns = previous.last_embed_batch_ns;
+    }
+    runtime.total_embed_ns = @max(runtime.total_embed_ns, previous.total_embed_ns);
+    runtime.dense_artifact_bytes_written = @max(runtime.dense_artifact_bytes_written, previous.dense_artifact_bytes_written);
+    runtime.sparse_artifact_bytes_written = @max(runtime.sparse_artifact_bytes_written, previous.sparse_artifact_bytes_written);
+    runtime.chunk_artifact_bytes_written = @max(runtime.chunk_artifact_bytes_written, previous.chunk_artifact_bytes_written);
+}
+
 pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     alloc: Allocator,
     store: backend_erased.Store,
@@ -3198,6 +3230,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .chunk_artifact_bytes_written = self.chunk_artifact_bytes_written,
             .artifact_bytes_written = self.dense_artifact_bytes_written + self.sparse_artifact_bytes_written + self.chunk_artifact_bytes_written,
         };
+    }
+
+    pub fn inheritProcessTelemetry(self: *@This(), previous: types.EnrichmentStats) void {
+        inheritProcessTelemetryUnlocked(self, previous);
     }
 
     pub fn indexHasIsolatedFailure(self: *@This(), index_name: []const u8) bool {
@@ -3842,6 +3878,16 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .chunk_artifact_bytes_written = self.chunk_artifact_bytes_written,
             .artifact_bytes_written = self.dense_artifact_bytes_written + self.sparse_artifact_bytes_written + self.chunk_artifact_bytes_written,
         };
+    }
+
+    /// Reconfiguration replaces the provider/runtime object without replacing
+    /// the owning DB. Keep cumulative process telemetry monotonic across that
+    /// handoff; durable replay state is reloaded separately before this call.
+    pub fn inheritProcessTelemetry(self: *EnrichmentRuntime, previous: types.EnrichmentStats) void {
+        const maybe_io = if (self.io_impl) |io_impl| io_impl.io() else null;
+        if (maybe_io) |io| self.mutex.lockUncancelable(io);
+        defer if (maybe_io) |io| self.mutex.unlock(io);
+        inheritProcessTelemetryUnlocked(self, previous);
     }
 
     pub fn indexHasIsolatedFailure(self: *EnrichmentRuntime, index_name: []const u8) bool {
@@ -5724,7 +5770,8 @@ fn processDocumentExtractionAsset(
         .generated_units = &generated_units,
     };
     defer collect_ctx.deinit();
-    document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, collect_ctx.sink()) catch |raw_err| {
+    var collect_failure: kernel_owner_abi.FailureIdentity = .{};
+    extractDocumentDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, config_json, raw_doc, collect_ctx.sink(), &collect_failure) catch |raw_err| {
         try resource_tracker.releasePdfDecodeWorkingSet();
         config.pdf_decode_limits = configured_pdf_decode_limits;
         const err: anyerror = if (raw_err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
@@ -5739,7 +5786,7 @@ fn processDocumentExtractionAsset(
             source_url,
             source_fingerprint,
             if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type,
-            @errorName(err),
+            if (err == raw_err) boundaryFailureErrorName(&collect_failure, err) else @errorName(err),
             "document extraction failed",
             document_extraction_mod.failureStage(err, "document_extraction"),
             manifest_key,
@@ -5966,7 +6013,8 @@ fn processDocumentExtractionAsset(
         config.pdf_decode_limits.max_working_set_bytes = decode_budget;
         config.pdf_decode_limits.max_decoded_stream_bytes = @min(configured_pdf_decode_limits.max_decoded_stream_bytes, decode_budget);
     }
-    document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, store_ctx.sink()) catch |err| {
+    var store_failure: kernel_owner_abi.FailureIdentity = .{};
+    extractDocumentDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, config_json, raw_doc, store_ctx.sink(), &store_failure) catch |err| {
         try resource_tracker.releasePdfDecodeWorkingSet();
         config.pdf_decode_limits = configured_pdf_decode_limits;
         if (shouldYieldRequestError(runtime, err)) return err;
@@ -5977,7 +6025,7 @@ fn processDocumentExtractionAsset(
             source_url,
             source_fingerprint,
             collect_ctx.info.content_type,
-            @errorName(err),
+            boundaryFailureErrorName(&store_failure, err),
             "document extraction materialization failed",
             document_extraction_mod.failureStage(err, "document_materialization"),
             manifest_key,
@@ -6070,7 +6118,8 @@ fn processDocumentExtractionAsset(
         config.pdf_decode_limits.max_working_set_bytes = decode_budget;
         config.pdf_decode_limits.max_decoded_stream_bytes = @min(configured_pdf_decode_limits.max_decoded_stream_bytes, decode_budget);
     }
-    document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, replay_ctx.sink()) catch |err| {
+    var replay_failure: kernel_owner_abi.FailureIdentity = .{};
+    extractDocumentDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, config_json, raw_doc, replay_ctx.sink(), &replay_failure) catch |err| {
         try resource_tracker.releasePdfDecodeWorkingSet();
         config.pdf_decode_limits = configured_pdf_decode_limits;
         return err;
@@ -6085,6 +6134,65 @@ fn processDocumentExtractionAsset(
         try finalizeEmptyDocumentExtractionCoverage(runtime, window, request, manifest);
     }
     try flushGeneratedReplayWindow(runtime, window);
+}
+
+fn extractDocumentDownloadedStreaming(
+    alloc: Allocator,
+    downloaded: anytype,
+    source_url: []const u8,
+    config: document_extraction_mod.Config,
+    config_json: []const u8,
+    raw_document_json: []const u8,
+    sink: document_extraction_mod.UnitSink,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) !void {
+    out_failure.* = .{};
+    if (comptime !builtin.is_test and build_options.storage_kernel_experiment) {
+        return document_extraction_client.extractDownloadedStreamingWithLimitsWithFailure(
+            alloc,
+            downloaded,
+            source_url,
+            config_json,
+            raw_document_json,
+            config.pdf_decode_limits,
+            sink,
+            out_failure,
+        );
+    }
+    return document_extraction_mod.extractDownloadedStreaming(alloc, downloaded, source_url, config, sink);
+}
+
+fn renderDocumentPdfPagePngAdaptiveAlloc(
+    alloc: Allocator,
+    decoder_alloc: Allocator,
+    pdf_bytes: []const u8,
+    page_number: usize,
+    config: document_extraction_mod.Config,
+    max_pixels: u64,
+    max_dimension: u32,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) !document_extraction_mod.RenderedPdfPage {
+    out_failure.* = .{};
+    if (comptime !builtin.is_test and build_options.storage_kernel_experiment) {
+        return document_extraction_client.renderPdfPagePngAdaptiveAllocWithFailure(
+            alloc,
+            pdf_bytes,
+            page_number,
+            config.ocr_render_dpi,
+            max_pixels,
+            max_dimension,
+            config.pdf_decode_limits.max_decoded_stream_bytes,
+            config.pdf_decode_limits.max_working_set_bytes,
+            out_failure,
+        );
+    }
+    var session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(decoder_alloc, pdf_bytes, config.pdf_decode_limits);
+    defer session.deinit();
+    return session.renderPagePngAdaptiveAlloc(alloc, page_number, config.ocr_render_dpi, max_pixels, max_dimension);
+}
+
+fn boundaryFailureErrorName(failure: *const kernel_owner_abi.FailureIdentity, fallback: anyerror) []const u8 {
+    return if (failure.error_name_len > 0) failure.errorName() else @errorName(fallback);
 }
 
 fn writeDocumentExtractionFailureManifest(
@@ -6474,18 +6582,25 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
     }
 
     var batch_bytes: usize = 0;
+    const split_pdf_render = !builtin.is_test and build_options.storage_kernel_experiment;
     var owned_pdf_session: ?document_extraction_mod.PdfRenderSession = null;
-    defer if (owned_pdf_session) |*session| session.deinit();
+    defer {
+        if (comptime !split_pdf_render) {
+            if (owned_pdf_session) |*session| session.deinit();
+        }
+    }
     var pdf_session: ?*document_extraction_mod.PdfRenderSession = null;
     var pdf_render_deadline: ?document_extraction_mod.PdfRenderDeadline = null;
     if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
-        // The reader and decoded stream graph consume the pre-reserved decoder
-        // credit. The RGBA canvas, PNG encoder, and serialized OCR request are
-        // additional live bytes and remain on the independently charged
-        // working allocator below.
-        pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
-        owned_pdf_session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimitsAndCancellation(decoder_alloc, source_bytes, config.pdf_decode_limits, pdf_render_deadline.?.probe());
-        pdf_session = &owned_pdf_session.?;
+        if (comptime !split_pdf_render) {
+            // The reader and decoded stream graph consume the pre-reserved decoder
+            // credit. The RGBA canvas, PNG encoder, and serialized OCR request are
+            // additional live bytes and remain on the independently charged
+            // working allocator below.
+            pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
+            owned_pdf_session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimitsAndCancellation(decoder_alloc, source_bytes, config.pdf_decode_limits, pdf_render_deadline.?.probe());
+            pdf_session = &owned_pdf_session.?;
+        }
     }
     for (units, 0..) |unit, idx| {
         if (unit.extraction_status == null or !std.mem.eql(u8, unit.extraction_status.?, pending_status)) continue;
@@ -6495,12 +6610,14 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             units[idx].ocr_attempted = true;
             if (std.mem.eql(u8, route_type, "pdf")) {
                 units[idx].ocr_render_dpi = config.ocr_render_dpi;
-                // Parsing and each page receive independent wall-clock
-                // budgets. All size retries for one page share that deadline,
-                // preventing oversized output from multiplying the timeout.
-                pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
-                pdf_session.?.setCancellationProbe(pdf_render_deadline.?.probe());
                 const render_started_ns = runtime.config.clock.nowRealtimeNs();
+                // Parsing and each page receive independent wall-clock
+                // budgets. All size retries for one in-process page share that
+                // deadline, preventing oversized output from multiplying it.
+                if (comptime !split_pdf_render) {
+                    pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
+                    pdf_session.?.setCancellationProbe(pdf_render_deadline.?.probe());
+                }
                 const inline_png_budget = ocrInlinePngBudget(batch_policy.max_bytes, config_json.len);
                 var render_max_dimension = config.ocr_max_rendered_dimension;
                 var maybe_rendered_page: ?document_extraction_mod.RenderedPdfPage = null;
@@ -6509,11 +6626,33 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                     render_attempts += 1;
                     const dimension_pixels = @as(u64, render_max_dimension) * @as(u64, render_max_dimension);
                     const render_max_pixels = @min(config.ocr_max_rendered_pixels, dimension_pixels);
-                    const candidate = pdf_session.?.renderPagePngAdaptiveAlloc(working_alloc, unit.page_number orelse 1, config.ocr_render_dpi, render_max_pixels, render_max_dimension) catch |err| {
-                        logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, null, null, null, null, render_started_ns, @errorName(err));
-                        if (!shouldIsolateOcrPageRenderFailure(err)) return err;
+                    var render_failure: kernel_owner_abi.FailureIdentity = .{};
+                    const candidate = render: {
+                        if (comptime split_pdf_render) {
+                            break :render renderDocumentPdfPagePngAdaptiveAlloc(
+                                working_alloc,
+                                decoder_alloc,
+                                source_bytes,
+                                unit.page_number orelse 1,
+                                config,
+                                render_max_pixels,
+                                render_max_dimension,
+                                &render_failure,
+                            );
+                        }
+                        break :render pdf_session.?.renderPagePngAdaptiveAlloc(
+                            working_alloc,
+                            unit.page_number orelse 1,
+                            config.ocr_render_dpi,
+                            render_max_pixels,
+                            render_max_dimension,
+                        );
+                    } catch |err| {
+                        const error_name = boundaryFailureErrorName(&render_failure, err);
+                        logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, null, null, null, null, render_started_ns, error_name);
+                        if (shouldYieldRequestError(runtime, err) or !shouldIsolateOcrPageRenderFailure(err)) return err;
                         try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "render");
-                        try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, err);
+                        try markRuntimeGeneratedUnitTextFailureNamed(alloc, &units[idx], method, kind, error_name, isRetryableEnrichmentError(err));
                         break :render_loop;
                     };
                     if (candidate.png.len <= inline_png_budget) {
@@ -7005,11 +7144,22 @@ fn markRuntimeGeneratedUnitTextFailure(
     kind: RuntimeGeneratedUnitTextKind,
     err: anyerror,
 ) !void {
+    return markRuntimeGeneratedUnitTextFailureNamed(alloc, unit, method, kind, @errorName(err), isRetryableEnrichmentError(err));
+}
+
+fn markRuntimeGeneratedUnitTextFailureNamed(
+    alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    method: []const u8,
+    kind: RuntimeGeneratedUnitTextKind,
+    error_name: []const u8,
+    retryable: bool,
+) !void {
     const failed_status = switch (kind) {
         .ocr => "failed_ocr",
         .transcript => "failed_transcription",
     };
-    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, @errorName(err) });
+    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, error_name });
     errdefer alloc.free(warning);
     const owned_method = try alloc.dupe(u8, if (kind == .ocr and !std.mem.eql(u8, unit.unit_type, "image")) "pdf_text" else method);
     errdefer alloc.free(owned_method);
@@ -7029,7 +7179,7 @@ fn markRuntimeGeneratedUnitTextFailure(
             unit.ocr_used = false;
             unit.ocr_confidence = null;
             unit.ocr_bbox = null;
-            unit.ocr_failure_retryable = isRetryableEnrichmentError(err);
+            unit.ocr_failure_retryable = retryable;
             if (std.mem.eql(u8, unit.unit_type, "image")) {
                 alloc.free(unit.text);
                 unit.text = try alloc.dupe(u8, "");

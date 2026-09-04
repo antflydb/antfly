@@ -14,21 +14,38 @@
 
 const std = @import("std");
 const batch_api = @import("../api/batch.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
+const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const internal_batch_forwarding = @import("../api/internal_batch_forwarding.zig");
 
 pub const protocol_version = internal_batch_forwarding.raft_batch_protocol_version;
 pub const timestamp_protocol_version = internal_batch_forwarding.raft_batch_timestamp_protocol_version;
 pub const activation_barrier_protocol_version = internal_batch_forwarding.raft_batch_activation_barrier_protocol_version;
 
+pub const OwnedStorageOwnerDescriptor = struct {
+    descriptor: descriptor_contract.Descriptor,
+
+    pub fn view(self: *const OwnedStorageOwnerDescriptor) descriptor_contract.Descriptor {
+        return self.descriptor;
+    }
+
+    pub fn deinit(self: *OwnedStorageOwnerDescriptor, alloc: std.mem.Allocator) void {
+        alloc.free(self.descriptor.schema_json);
+        alloc.free(self.descriptor.indexes_json);
+        self.* = undefined;
+    }
+};
+
 pub const OwnedReplicatedBatch = struct {
     table_name: []u8,
     batch: batch_api.OwnedBatchRequest,
+    storage_owner_descriptor: ?OwnedStorageOwnerDescriptor = null,
     protocol_barrier_version: ?u16 = null,
 
     pub fn deinit(self: *OwnedReplicatedBatch, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         self.batch.deinit(alloc);
+        if (self.storage_owner_descriptor) |*descriptor| descriptor.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -52,13 +69,26 @@ pub fn encodeProtocolBarrier(
 }
 
 pub fn encode(alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.BatchRequest) ![]u8 {
+    return try encodeWithStorageOwnerDescriptor(alloc, table_name, req, null);
+}
+
+pub fn encodeWithStorageOwnerDescriptor(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: db_mod.types.BatchRequest,
+    descriptor: ?descriptor_contract.Descriptor,
+) ![]u8 {
     const batch_json = try batch_api.encodeBatchRequest(alloc, req);
     defer alloc.free(batch_json);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
-    try writer.print("{{\"table\":{f},\"batch\":", .{std.json.fmt(table_name, .{})});
+    try writer.print("{{\"table\":{f}", .{std.json.fmt(table_name, .{})});
+    if (descriptor) |value| {
+        try writer.print(",\"storage_owner\":{f}", .{std.json.fmt(value, .{})});
+    }
+    try writer.writeAll(",\"batch\":");
     try writer.writeAll(batch_json);
     try writer.writeByte('}');
     return try out.toOwnedSlice();
@@ -69,6 +99,20 @@ pub fn looksLikeEnvelope(payload: []const u8) bool {
     if (!std.mem.startsWith(u8, trimmed, "{")) return false;
     return std.mem.indexOf(u8, trimmed, "\"table\"") != null and
         std.mem.indexOf(u8, trimmed, "\"batch\"") != null;
+}
+
+fn cloneStorageOwnerDescriptor(
+    alloc: std.mem.Allocator,
+    descriptor: descriptor_contract.Descriptor,
+) !OwnedStorageOwnerDescriptor {
+    const schema_json = try alloc.dupe(u8, descriptor.schema_json);
+    errdefer alloc.free(schema_json);
+    return .{ .descriptor = .{
+        .lsm_root_generation = descriptor.lsm_root_generation,
+        .identity = descriptor.identity,
+        .schema_json = schema_json,
+        .indexes_json = try alloc.dupe(u8, descriptor.indexes_json),
+    } };
 }
 
 pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBatch {
@@ -102,9 +146,23 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
     var batch = try batch_api.parseInternalBatchRequest(alloc, batch_json);
     errdefer batch.deinit(alloc);
 
+    var storage_owner_descriptor: ?OwnedStorageOwnerDescriptor = null;
+    errdefer if (storage_owner_descriptor) |*descriptor| descriptor.deinit(alloc);
+    if (root.get("storage_owner")) |descriptor_value| {
+        var parsed_descriptor = try std.json.parseFromValue(
+            descriptor_contract.Descriptor,
+            alloc,
+            descriptor_value,
+            .{},
+        );
+        defer parsed_descriptor.deinit();
+        storage_owner_descriptor = try cloneStorageOwnerDescriptor(alloc, parsed_descriptor.value);
+    }
+
     return .{
         .table_name = table_name,
         .batch = batch,
+        .storage_owner_descriptor = storage_owner_descriptor,
     };
 }
 
@@ -218,6 +276,30 @@ test "raft batch round trips internal split replication identity" {
     try std.testing.expectEqual(@as(u64, 41), replication.source_group_id);
     try std.testing.expectEqual(@as(u64, 42), replication.destination_group_id);
     try std.testing.expect(replication.identity_namespace.eql(namespace));
+}
+
+test "raft batch round trips deterministic storage owner descriptor" {
+    const descriptor = descriptor_contract.Descriptor{
+        .lsm_root_generation = 9,
+        .identity = .{ .table_id = 7, .shard_id = 42, .range_id = 4200 },
+        .schema_json = "{\"fields\":{\"title\":{\"type\":\"string\"}}}",
+        .indexes_json = "{\"title\":{\"type\":\"full_text\"}}",
+    };
+    const encoded = try encodeWithStorageOwnerDescriptor(
+        std.testing.allocator,
+        "docs",
+        .{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }} },
+        descriptor,
+    );
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = try decode(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    const actual = decoded.storage_owner_descriptor orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(descriptor.lsm_root_generation, actual.descriptor.lsm_root_generation);
+    try std.testing.expect(actual.descriptor.identity.eql(descriptor.identity));
+    try std.testing.expectEqualStrings(descriptor.schema_json, actual.descriptor.schema_json);
+    try std.testing.expectEqualStrings(descriptor.indexes_json, actual.descriptor.indexes_json);
 }
 
 test "raft batch round trips deterministic transaction begin" {

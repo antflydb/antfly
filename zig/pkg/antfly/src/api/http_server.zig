@@ -19,6 +19,7 @@ const builtin = @import("builtin");
 const test_runtime_support = if (builtin.is_test) @import("http_test_runtime.zig") else struct {};
 const platform = @import("antfly_platform");
 const build_options = @import("build_options");
+const storage_source_options = @import("storage_source_options");
 const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
@@ -71,7 +72,7 @@ const db_mod = struct {
     pub const types = @import("../storage/db/types.zig");
     pub const RuntimePreflightSummary = @import("../storage/db/runtime_preflight.zig").RuntimePreflightSummary;
     pub const background_runtime = @import("../storage/background_runtime.zig");
-    pub const aggregations = @import("../storage/db/aggregations.zig");
+    pub const aggregations = @import("../storage/db/aggregations_contract.zig");
     pub const SortRejectionDiagnostic = db_query_search.SortRejectionDiagnostic;
 
     pub const resetLastSortRejectionDiagnostic = db_query_search.resetLastSortRejectionDiagnostic;
@@ -81,7 +82,7 @@ const db_mod = struct {
 };
 const graph_mod = @import("../graph/graph.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
-const db_query_search = @import("../storage/db/query/search_exec.zig");
+const db_query_search = @import("../storage/db/runtime_preflight.zig");
 const storage_schema = @import("../storage/schema.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const table_catalog = @import("table_catalog.zig");
@@ -4570,16 +4571,17 @@ pub const ApiHttpServer = struct {
         return .{ .items = try items.toOwnedSlice(self.alloc) };
     }
 
-    fn indexHasDenseVisibilityFacts(item: db_mod.types.DBIndexStats) bool {
-        return item.doc_count > 0 or item.term_count > 0 or item.edge_count > 0 or item.node_count > 0 or item.root_node > 0;
-    }
-
     fn runtimeStatusNeedsDenseVisibilityRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
         if (status.stats.repair_degraded or status.stats.repair_issue_count != 0) return false;
         const has_primary_facts = status.stats.doc_identity.live_ordinals != 0 or status.stats.doc_count != 0;
         for (status.stats.indexes) |item| {
             if (item.kind != .dense_vector) continue;
-            if (indexHasDenseVisibilityFacts(item)) continue;
+            // A newly created HBC index has a structural root/node before it
+            // contains any documents. Those topology counters do not prove
+            // that a retained read snapshot includes a later write. Require
+            // document or replay progress before allowing it to suppress the
+            // resident writer refresh.
+            if (item.doc_count != 0) continue;
             if (item.replay_applied_sequence != 0 or item.replay_target_sequence != 0) continue;
             if (has_primary_facts) return true;
             return status.metadata.source == .live_writer_publish;
@@ -4588,6 +4590,11 @@ pub const ApiHttpServer = struct {
     }
 
     fn runtimeStatusNeedsOwnerSnapshot(status: runtime_status.LocalTableRuntimeStatus) bool {
+        // Synthetic configuration can carry conservative repair/backfill
+        // placeholders so public status remains fail-closed. Those fields are
+        // not runtime facts and must never suppress an explicit writer
+        // refresh after restart.
+        if (status.metadata.source == .synthetic_config) return status.stats.indexes.len != 0;
         if (runtimeStatusNeedsDenseVisibilityRefresh(status)) return true;
         if (runtime_status.statusHasRuntimeFacts(status)) return false;
         if (status.metadata.source == .live_writer_publish) return false;
@@ -4635,6 +4642,15 @@ pub const ApiHttpServer = struct {
                 std.mem.eql(u8, index.index_repair_phase, "terminal"))
             {
                 return false;
+            }
+            // A retained query snapshot can already contain every visible
+            // vector while still lacking the writer's per-source publication
+            // observation and enrichment metrics. Public readiness derives
+            // `source_observation_incomplete` from these counters, so refresh
+            // the requested index until each configured source has at least
+            // one authoritative observation.
+            for (index.source_replay) |source| {
+                if (source.observation_count == 0) return true;
             }
             // Refresh only for an incomplete proof attached to the requested
             // index. Table-level degradation may belong to another index, and
@@ -10646,7 +10662,10 @@ pub const ApiHttpServer = struct {
         try ensureRequestDeadline(request_deadline_ns);
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
-            error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
+            // Foreign-source capability validation is part of the public
+            // request contract. Keep its historical 400 classification;
+            // exact-sort rejection is already carried by its distinct error.
+            error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.ModelNotFound => return error.ModelNotFound,
@@ -22011,6 +22030,7 @@ test "api http unsupported count ordered page response exposes stable sort reaso
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,
+        message: []const u8,
         reason: []const u8,
         sort_rejection_reason: []const u8,
         sort_rejection_detail: []const u8,
@@ -22020,6 +22040,7 @@ test "api http unsupported count ordered page response exposes stable sort reaso
 
     try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
     try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
     try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.reason);
     try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_reason);
     try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_detail);
@@ -37241,6 +37262,8 @@ test "api index status refreshes synthetic configured index status from write so
     const synthetic_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "vec",
         .kind = .dense_vector,
+        .repair_degraded = true,
+        .repair_summary_ready = false,
     }};
     const synthetic_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 10,
@@ -37248,6 +37271,7 @@ test "api index status refreshes synthetic configured index status from write so
         .stats = .{
             .index_count = synthetic_indexes.len,
             .indexes = @constCast(synthetic_indexes[0..]),
+            .repair_degraded = true,
         },
     }};
     try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshot(synthetic_statuses[0..]));
@@ -37265,6 +37289,53 @@ test "api index status refreshes synthetic configured index status from write so
         },
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedOwnerSnapshot(live_statuses[0..]));
+
+    // An empty dense index already owns an HBC root node. That structural
+    // topology must not make a retained pre-write snapshot authoritative when
+    // it has no document or replay progress.
+    const structural_dense_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "vec",
+        .kind = .dense_vector,
+        .node_count = 1,
+        .root_node = 1,
+    }};
+    const structural_dense_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{
+            .index_count = structural_dense_indexes.len,
+            .indexes = @constCast(structural_dense_indexes[0..]),
+        },
+    }};
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshot(structural_dense_statuses[0..]));
+
+    const incomplete_source_replay = [_]db_mod.types.IndexSourceReplayStatus{.{
+        .artifact_name = "chunk_embedding",
+        .published_sequence = 3,
+        .target_sequence = 3,
+        .observation_count = 0,
+    }};
+    const source_incomplete_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "vec",
+        .kind = .dense_vector,
+        .doc_count = 2,
+        .coverage_summary_ready = true,
+        .repair_summary_ready = true,
+        .source_replay = @constCast(incomplete_source_replay[0..]),
+    }};
+    const source_incomplete_status = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 2,
+            .index_count = source_incomplete_indexes.len,
+            .indexes = @constCast(source_incomplete_indexes[0..]),
+        },
+    };
+    try std.testing.expect(ApiHttpServer.runtimeStatusTargetNeedsOwnerSnapshot(
+        source_incomplete_status,
+        .{ .name = "vec", .identity = null },
+    ));
 }
 
 test "api index status refreshes writer when read snapshot omits requested index" {

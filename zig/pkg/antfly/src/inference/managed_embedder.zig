@@ -49,6 +49,8 @@ const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const enrichment_types = @import("../storage/db/enrichment/enrichment_types.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 
+pub const SparseEmbedding = db_embedder.SparseEmbedding;
+
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
     return std.c.getenv(name);

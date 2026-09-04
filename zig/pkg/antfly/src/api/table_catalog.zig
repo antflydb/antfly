@@ -1828,6 +1828,155 @@ fn listTableRangesWithBudget(
     return ranges;
 }
 
+pub const TableGroupDescriptorProjection = struct {
+    table_id: u64,
+    doc_identity_shard_id: u64,
+    doc_identity_range_id: u64,
+    schema_json: []u8,
+    indexes_json: []u8,
+
+    pub fn deinit(self: *TableGroupDescriptorProjection, alloc: std.mem.Allocator) void {
+        alloc.free(self.schema_json);
+        alloc.free(self.indexes_json);
+        self.* = undefined;
+    }
+};
+
+/// Resolve the catalog-owned physical contract for one table group from the
+/// atomically paired table/range projection. Storage owner lifecycle must not
+/// depend on the much larger administrative status snapshot, whose unrelated
+/// runtime projections may legitimately be busy during foreground writes.
+pub fn tableGroupDescriptorProjection(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    deadline_ns: ?u64,
+) !?TableGroupDescriptorProjection {
+    // Catalog-wide routing intentionally strips schema and index payloads.
+    // A first-party point projection is bounded to one table and therefore
+    // carries the complete physical definition needed by the storage owner.
+    // Sources without that capability (including rolling-upgrade peers and
+    // simple fixtures) fall through to the coherent admin projection below;
+    // never manufacture an owner descriptor from compact routing fields.
+    if (catalog.vtable.table_routing_snapshot) |capture| {
+        if (catalog.vtable.free_routing_snapshot == unsupportedFreeRoutingSnapshot)
+            return error.CatalogRoutingUnavailable;
+        var snapshot = try capture(catalog.ptr, table_name, deadline_ns);
+        defer catalog.vtable.free_routing_snapshot(catalog.ptr, &snapshot);
+        if (try descriptorProjectionFromRoutingSnapshot(alloc, snapshot, table_name, group_id)) |projection|
+            return projection;
+    }
+    // A positive route may already be known while the eventual metadata
+    // replica serving this descriptor request is still applying it. Confirm a
+    // point miss through the read-index capability before consulting broader
+    // lifecycle state; this keeps owner creation free of cache-timing races.
+    if (catalog.vtable.linearizable_table_routing_snapshot) |capture| {
+        if (catalog.vtable.free_routing_snapshot == unsupportedFreeRoutingSnapshot)
+            return error.CatalogRoutingUnavailable;
+        var snapshot = try capture(catalog.ptr, table_name, deadline_ns);
+        defer catalog.vtable.free_routing_snapshot(catalog.ptr, &snapshot);
+        if (try descriptorProjectionFromRoutingSnapshot(alloc, snapshot, table_name, group_id)) |projection|
+            return projection;
+    }
+
+    // A split destination does not become an active routing range until
+    // cutover, but its immutable descriptor is already captured in the
+    // replicated transition contract. Consult the full lifecycle projection
+    // only on this compact-routing miss; ordinary owner opens stay independent
+    // of the much larger administrative/runtime status snapshot.
+    var admin = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&admin);
+    if (findTableByName(admin.tables, table_name)) |table| {
+        for (admin.ranges) |range| {
+            if (range.table_id != table.table_id or range.group_id != group_id) continue;
+            return try descriptorProjectionFromValues(
+                alloc,
+                table.table_id,
+                metadata_table_manager.rangeDocIdentityShardId(range),
+                metadata_table_manager.rangeDocIdentityRangeId(range),
+                table.schema_json,
+                table.indexes_json,
+            );
+        }
+    }
+    for (admin.split_transitions) |transition| {
+        if ((transition.source_group_id != group_id and transition.destination_group_id != group_id) or
+            !std.mem.eql(u8, transition.table_contract.table_name, table_name)) continue;
+        try transition.table_contract.validateForSplit();
+        const identity = if (transition.destination_group_id == group_id)
+            transition.table_contract.target_identity
+        else
+            transition.table_contract.source_identity;
+        return try descriptorProjectionFromValues(
+            alloc,
+            transition.table_contract.table_id,
+            identity.shard_id,
+            identity.range_id,
+            transition.table_contract.schema_json,
+            transition.table_contract.indexes_json,
+        );
+    }
+    for (admin.merge_transitions) |transition| {
+        if ((transition.donor_group_id != group_id and transition.receiver_group_id != group_id) or
+            !std.mem.eql(u8, transition.table_contract.table_name, table_name)) continue;
+        try transition.table_contract.validateForMerge(transition.allow_doc_identity_reassignment);
+        const identity = if (transition.receiver_group_id == group_id)
+            transition.table_contract.target_identity
+        else
+            transition.table_contract.source_identity;
+        return try descriptorProjectionFromValues(
+            alloc,
+            transition.table_contract.table_id,
+            identity.shard_id,
+            identity.range_id,
+            transition.table_contract.schema_json,
+            transition.table_contract.indexes_json,
+        );
+    }
+    return null;
+}
+
+fn descriptorProjectionFromRoutingSnapshot(
+    alloc: std.mem.Allocator,
+    snapshot: metadata_api.CatalogRoutingSnapshot,
+    table_name: []const u8,
+    group_id: u64,
+) !?TableGroupDescriptorProjection {
+    const table = findTableByName(snapshot.tables, table_name) orelse return null;
+    for (snapshot.ranges) |range| {
+        if (range.table_id != table.table_id or range.group_id != group_id) continue;
+        return try descriptorProjectionFromValues(
+            alloc,
+            table.table_id,
+            metadata_table_manager.rangeDocIdentityShardId(range),
+            metadata_table_manager.rangeDocIdentityRangeId(range),
+            table.schema_json,
+            table.indexes_json,
+        );
+    }
+    return null;
+}
+
+fn descriptorProjectionFromValues(
+    alloc: std.mem.Allocator,
+    table_id: u64,
+    doc_identity_shard_id: u64,
+    doc_identity_range_id: u64,
+    schema_json: []const u8,
+    indexes_json: []const u8,
+) !TableGroupDescriptorProjection {
+    const owned_schema_json = try alloc.dupe(u8, schema_json);
+    errdefer alloc.free(owned_schema_json);
+    return .{
+        .table_id = table_id,
+        .doc_identity_shard_id = doc_identity_shard_id,
+        .doc_identity_range_id = doc_identity_range_id,
+        .schema_json = owned_schema_json,
+        .indexes_json = try alloc.dupe(u8, indexes_json),
+    };
+}
+
 pub fn resolveGroupsForSpan(
     alloc: std.mem.Allocator,
     catalog: CatalogSource,
@@ -3130,6 +3279,160 @@ test "span routing uses compact catalog snapshot when available" {
         null,
     );
     try std.testing.expectEqual(ResolveGroupsResult.not_found, not_found);
+}
+
+test "descriptor projection never sources physical config from compact routing records" {
+    const State = struct { admin_calls: usize = 0, routing_calls: usize = 0 };
+    const FakeCatalog = struct {
+        const full_tables = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = "{\"type\":\"object\"}",
+            .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
+            .placement_role = "data",
+        }};
+        const compact_tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
+        const ranges = [_]metadata_table_manager.RangeRecord{.{
+            .group_id = 7001,
+            .table_id = 7,
+            .range_id = 71,
+            .start_key = "",
+            .end_key = null,
+            .doc_identity_shard_id = 17,
+            .doc_identity_range_id = 71,
+        }};
+
+        fn iface(state: *State) CatalogSource {
+            return .{ .ptr = state, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = routingSnapshot,
+                .linearizable_routing_snapshot = routingSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
+            } };
+        }
+
+        fn routingSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.routing_calls += 1;
+            return .{
+                .tables = @constCast(compact_tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.admin_calls += 1;
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(full_tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var state: State = .{};
+    var projection = (try tableGroupDescriptorProjection(
+        std.testing.allocator,
+        FakeCatalog.iface(&state),
+        "docs",
+        7001,
+        null,
+    )).?;
+    defer projection.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), state.admin_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.routing_calls);
+    try std.testing.expectEqualStrings("{\"type\":\"object\"}", projection.schema_json);
+    try std.testing.expectEqualStrings(
+        "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
+        projection.indexes_json,
+    );
+    try std.testing.expectEqual(@as(u64, 17), projection.doc_identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 71), projection.doc_identity_range_id);
+}
+
+test "descriptor projection resolves a staged split destination from its transition contract" {
+    const FakeCatalog = struct {
+        const tables = [_]metadata_table_manager.TableRecord{
+            .{ .table_id = 7, .name = "docs", .schema_json = "{\"type\":\"object\"}", .indexes_json = "{}", .placement_role = "data" },
+        };
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+        };
+        const split_transitions = [_]metadata_transition_state.SplitTransitionRecord{.{
+            .transition_id = 99,
+            .attempt_epoch = 1,
+            .source_group_id = 7001,
+            .destination_group_id = 7002,
+            .table_contract = .{
+                .table_id = 7,
+                .table_name = "docs",
+                .schema_json = "{\"type\":\"object\"}",
+                .indexes_json = "{}",
+                .source_identity = .{ .shard_id = 71, .range_id = 72 },
+                .target_identity = .{ .shard_id = 71, .range_id = 72 },
+            },
+        }};
+
+        fn iface() CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = routingSnapshot,
+                    .linearizable_routing_snapshot = routingSnapshot,
+                    .free_routing_snapshot = freeRoutingSnapshot,
+                },
+            };
+        }
+
+        fn routingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast(split_transitions[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var projection = (try tableGroupDescriptorProjection(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        "docs",
+        7002,
+        null,
+    )).?;
+    defer projection.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 7), projection.table_id);
+    try std.testing.expectEqual(@as(u64, 71), projection.doc_identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 72), projection.doc_identity_range_id);
+    try std.testing.expectEqualStrings("{\"type\":\"object\"}", projection.schema_json);
+    try std.testing.expectEqualStrings("{}", projection.indexes_json);
 }
 
 test "routing session pins every table without consulting admin state" {

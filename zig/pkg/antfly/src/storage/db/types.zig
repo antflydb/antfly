@@ -105,6 +105,27 @@ pub const TransformOpType = enum {
     rename,
 };
 
+/// Canonical public wire spelling for document transform operations. Keep the
+/// representation beside the value contract so routing/serialization code
+/// does not need to import the physical transform executor.
+pub fn transformOpText(op: TransformOpType) []const u8 {
+    return switch (op) {
+        .set => "$set",
+        .set_on_insert => "$setOnInsert",
+        .unset => "$unset",
+        .inc => "$inc",
+        .push => "$push",
+        .pull => "$pull",
+        .add_to_set => "$addToSet",
+        .pop => "$pop",
+        .mul => "$mul",
+        .min => "$min",
+        .max => "$max",
+        .current_date => "$currentDate",
+        .rename => "$rename",
+    };
+}
+
 pub const TransformOp = struct {
     op: TransformOpType,
     path: []const u8,
@@ -2870,6 +2891,29 @@ pub const ArtifactRepairRunOptions = struct {
         if (self.cancel_check) |check| return check.requested();
         return false;
     }
+};
+
+/// Authoritative owner wake decision. A tagged state prevents `0` from
+/// ambiguously meaning both "run now" and "nothing runnable" at scheduler
+/// boundaries while remaining available to the control-only compiler unit.
+pub const IndexRepairWake = union(enum) {
+    immediate,
+    at_realtime_ms: u64,
+    parked,
+    empty,
+
+    pub fn retryAtMs(self: @This()) u64 {
+        return switch (self) {
+            .at_realtime_ms => |deadline| deadline,
+            .immediate, .parked, .empty => 0,
+        };
+    }
+};
+
+/// Exact data-Raft entry persisted atomically with one document mutation.
+pub const RaftAppliedEntryIdentity = struct {
+    term: u64,
+    index: u64,
 };
 
 pub const ArtifactRepairResult = struct {

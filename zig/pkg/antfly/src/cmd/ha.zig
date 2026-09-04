@@ -14,12 +14,16 @@
 
 const std = @import("std");
 const antfly = @import("../cli_root.zig");
+const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
+const seed_activation_contract = @import("../storage/ha/seed_activation_contract.zig");
+const storage_source_options = @import("storage_source_options");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const admin_api = antfly.admin;
 const ha = antfly.ha;
 const ha_validation = ha.validation;
 const http_common = antfly.common.http.http_common;
+const control_only_storage_sources = storage_source_options.control_only;
 
 var test_path_counter: u64 = 0;
 
@@ -298,7 +302,7 @@ const ActivationBindingOptions = struct {
             self.target_pvc_name != null or self.target_pvc_uid != null;
     }
 
-    fn finish(self: ActivationBindingOptions) !?ha.seed_activation.ActivationBinding {
+    fn finish(self: ActivationBindingOptions) !?seed_activation_contract.ActivationBinding {
         if (!self.requested()) return null;
         return .{
             .topology_id = self.topology_id orelse return error.TopologyIdMissing,
@@ -429,7 +433,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             const target_replica_id = options.target_replica_id orelse return error.TargetReplicaIdMissing;
             if (target_local_node_id == 0) return error.InvalidTargetLocalNodeId;
             if (target_replica_id == 0) return error.InvalidTargetReplicaId;
-            var result = try ha.seed_activation.activate(alloc, .{
+            const request = seed_activation_contract.ActivateRequest{
                 .staging_root = staging_root,
                 .target_root = target_root,
                 .expected = .{
@@ -446,9 +450,18 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
                     .target_replica_id = target_replica_id,
                 },
                 .pod_uid = try resolveHAPodUID(),
-            });
-            defer result.deinit(alloc);
-            try writeArtifactResult(io, result.active_receipt_json);
+            };
+            if (comptime control_only_storage_sources) {
+                const request_json = try std.json.Stringify.valueAlloc(alloc, request, .{});
+                defer alloc.free(request_json);
+                var response = try kernel_owner_client.haSeedActivate(request_json);
+                defer response.deinit();
+                try writeArtifactResult(io, response.bytes());
+            } else {
+                var result = try ha.seed_activation.activate(alloc, request);
+                defer result.deinit(alloc);
+                try writeArtifactResult(io, result.active_receipt_json);
+            }
         },
         .prune => {
             const generation = options.generation orelse return error.SeedGenerationMissing;
@@ -494,14 +507,23 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             const target_root = options.target_root orelse return error.SeedActivationTargetMissing;
             const receipt_path = options.slot_activation_receipt_path orelse
                 return error.SeedActivationCheckpointMissing;
-            var result = try ha.seed_activation.pruneActivatedGenerations(alloc, .{
+            const request = seed_activation_contract.ActivatedGenerationGCRequest{
                 .target_root = target_root,
                 .slot_activation_receipt_path = receipt_path,
                 .protected_generations = options.protected_generations,
                 .retain_generations = options.retain_generations,
-            });
-            defer result.deinit(alloc);
-            try writeArtifactResult(io, result.result_json);
+            };
+            if (comptime control_only_storage_sources) {
+                const request_json = try std.json.Stringify.valueAlloc(alloc, request, .{});
+                defer alloc.free(request_json);
+                var response = try kernel_owner_client.haSeedPruneActivatedGenerations(request_json);
+                defer response.deinit();
+                try writeArtifactResult(io, response.bytes());
+            } else {
+                var result = try ha.seed_activation.pruneActivatedGenerations(alloc, request);
+                defer result.deinit(alloc);
+                try writeArtifactResult(io, result.result_json);
+            }
         },
         .delete_prefix => {
             const request = try options.cleanup.finish(options.location);

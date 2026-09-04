@@ -194,7 +194,7 @@ fn hashInteger(hash: *u64, comptime value: anytype) void {
 }
 
 pub fn assertUniqueMethodIds(comptime VTable: type) void {
-    @setEvalBranchQuota(100_000);
+    @setEvalBranchQuota(1_000_000);
     const fields = std.meta.fields(VTable);
     inline for (fields, 0..) |left, left_index| {
         inline for (fields[left_index + 1 ..]) |right| {

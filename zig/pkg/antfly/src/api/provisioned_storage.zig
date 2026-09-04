@@ -26,6 +26,14 @@ const scraping = @import("antfly_scraping");
 const table_catalog = @import("table_catalog.zig");
 const table_reads = @import("table_reads.zig");
 const table_writes = @import("table_writes.zig");
+const storage_source_options = @import("storage_source_options");
+
+const storage_kernel_experiment = storage_source_options.control_only;
+
+const ProvisionedLsmCache = if (storage_kernel_experiment) void else lsm_backend.Cache;
+const ProvisionedHbcCache = if (storage_kernel_experiment) void else hbc_mod.Cache;
+const ProvisionedReadCache = if (storage_kernel_experiment) void else table_reads.ProvisionedTableReadCache;
+const ProvisionedWriteCache = if (storage_kernel_experiment) void else table_writes.ProvisionedTableWriteCache;
 
 const MiB: u64 = 1024 * 1024;
 const GiB: u64 = 1024 * MiB;
@@ -249,6 +257,40 @@ fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     };
 }
 
+/// Process-wide physical resources shared by every resident storage owner.
+/// This deliberately excludes API read/write/status caches so the compiled
+/// storage ABI can reuse admission and decoded-index state without pulling
+/// control-plane cache composition into its public CAPI artifact.
+pub const PhysicalStorageResources = struct {
+    alloc: std.mem.Allocator,
+    resource_manager: resource_manager_mod.ResourceManager,
+    lsm_cache: lsm_backend.Cache,
+    hbc_cache: hbc_mod.Cache,
+
+    pub fn init(alloc: std.mem.Allocator) PhysicalStorageResources {
+        const budgets = smartResourceBudgets(0);
+        return .{
+            .alloc = alloc,
+            .resource_manager = resource_manager_mod.ResourceManager.init(budgets.options),
+            .lsm_cache = lsm_backend.Cache.init(alloc, budgets.lsm_cache_budget_bytes),
+            .hbc_cache = hbc_mod.Cache.init(alloc),
+        };
+    }
+
+    /// Call after the resources reach their final stable address.
+    pub fn attachResourceManager(self: *PhysicalStorageResources) void {
+        self.lsm_cache.attachResourceManager(&self.resource_manager);
+        self.hbc_cache.attachResourceManager(&self.resource_manager);
+    }
+
+    pub fn deinit(self: *PhysicalStorageResources) void {
+        self.hbc_cache.deinit();
+        self.lsm_cache.deinit();
+        self.resource_manager.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
 pub const ProvisionedGroupStorage = struct {
     const VisibleRootGeneration = struct {
         generation: u64 = table_reads.backend_current_root_generation,
@@ -260,13 +302,13 @@ pub const ProvisionedGroupStorage = struct {
     group_visible_root_generations: std.AutoHashMapUnmanaged(u64, VisibleRootGeneration) = .empty,
     resource_manager: resource_manager_mod.ResourceManager,
     filesystem_capacity_probe: ?filesystem_capacity.Probe = null,
-    lsm_cache: lsm_backend.Cache,
-    hbc_cache: hbc_mod.Cache,
+    lsm_cache: ProvisionedLsmCache,
+    hbc_cache: ProvisionedHbcCache,
     runtime_status_cache: runtime_status.TableRuntimeSnapshotCache,
-    read_cache: table_reads.ProvisionedTableReadCache,
+    read_cache: ProvisionedReadCache,
     write_cache_state_mutex: std.atomic.Mutex = .unlocked,
-    write_cache: table_writes.ProvisionedTableWriteCache,
-    startup_write_cache: table_writes.ProvisionedTableWriteCache,
+    write_cache: ProvisionedWriteCache,
+    startup_write_cache: ProvisionedWriteCache,
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
     effective_memory_limit_bytes: u64 = 0,
     memory_limit_source: MemoryLimitSource = .unavailable,
@@ -298,23 +340,25 @@ pub const ProvisionedGroupStorage = struct {
             .resource_manager = resource_manager_mod.ResourceManager.init(manager_options),
             .effective_memory_limit_bytes = budgets.effective_memory_limit_bytes,
             .memory_limit_source = budgets.memory_limit_source,
-            .lsm_cache = lsm_backend.Cache.init(alloc, budgets.lsm_cache_budget_bytes),
-            .hbc_cache = hbc_mod.Cache.init(alloc),
+            .lsm_cache = if (storage_kernel_experiment) {} else lsm_backend.Cache.init(alloc, budgets.lsm_cache_budget_bytes),
+            .hbc_cache = if (storage_kernel_experiment) {} else hbc_mod.Cache.init(alloc),
             .runtime_status_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc),
-            .read_cache = table_reads.ProvisionedTableReadCache.init(alloc),
-            .write_cache = table_writes.ProvisionedTableWriteCache.init(alloc),
-            .startup_write_cache = table_writes.ProvisionedTableWriteCache.init(alloc),
+            .read_cache = if (storage_kernel_experiment) {} else table_reads.ProvisionedTableReadCache.init(alloc),
+            .write_cache = if (storage_kernel_experiment) {} else table_writes.ProvisionedTableWriteCache.init(alloc),
+            .startup_write_cache = if (storage_kernel_experiment) {} else table_writes.ProvisionedTableWriteCache.init(alloc),
         };
     }
 
     pub fn deinit(self: *ProvisionedGroupStorage) void {
         self.group_visible_root_generations.deinit(self.alloc);
-        self.startup_write_cache.deinit();
-        self.write_cache.deinit();
-        self.read_cache.deinit();
+        if (comptime !storage_kernel_experiment) {
+            self.startup_write_cache.deinit();
+            self.write_cache.deinit();
+            self.read_cache.deinit();
+            self.hbc_cache.deinit();
+            self.lsm_cache.deinit();
+        }
         self.runtime_status_cache.deinit();
-        self.hbc_cache.deinit();
-        self.lsm_cache.deinit();
         self.resource_manager.deinit(self.alloc);
         self.* = undefined;
     }
@@ -324,6 +368,7 @@ pub const ProvisionedGroupStorage = struct {
     /// no new cache lease can appear while this barrier holds the shared state
     /// mutex. The cache containers remain valid for the ordinary final deinit.
     pub fn quiesceExternalProviderUsers(self: *ProvisionedGroupStorage) !void {
+        if (comptime storage_kernel_experiment) return;
         lockAtomic(&self.write_cache_state_mutex);
         defer self.write_cache_state_mutex.unlock();
         try self.startup_write_cache.closeAllDbsLocked();
@@ -334,6 +379,7 @@ pub const ProvisionedGroupStorage = struct {
     /// alive. Call this after attached write sources are quiescent and before
     /// either the sources or this storage are destroyed.
     pub fn detachWriteSourceRuntimeHooks(self: *ProvisionedGroupStorage) void {
+        if (comptime storage_kernel_experiment) return;
         self.startup_write_cache.detachRuntimeHooks();
         self.write_cache.detachRuntimeHooks();
         self.startup_write_cache.table_eviction_hook = null;
@@ -362,6 +408,13 @@ pub const ProvisionedGroupStorage = struct {
         if (self.backend_runtime) |runtime| {
             read_source.backend_runtime = runtime;
             write_source.backend_runtime = runtime;
+        }
+        if (comptime storage_kernel_experiment) {
+            read_source.runtime_status_cache = &self.runtime_status_cache;
+            _ = read_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
+            write_source.runtime_status_cache = &self.runtime_status_cache;
+            _ = write_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
+            return;
         }
         self.lsm_cache.attachResourceManager(&self.resource_manager);
         self.hbc_cache.attachResourceManager(&self.resource_manager);
@@ -412,6 +465,11 @@ pub const ProvisionedGroupStorage = struct {
         write_source: *table_writes.ProvisionedTableWriteSource,
     ) void {
         self.backend_runtime = runtime;
+        if (comptime storage_kernel_experiment) {
+            read_source.backend_runtime = runtime;
+            write_source.backend_runtime = runtime;
+            return;
+        }
         self.read_cache.backend_runtime = runtime;
         self.write_cache.backend_runtime = runtime;
         self.startup_write_cache.backend_runtime = runtime;
@@ -430,6 +488,7 @@ pub const ProvisionedGroupStorage = struct {
     /// root generation must remain stable: advancing it would fence the one
     /// live writer even though no root replacement occurred.
     pub fn invalidateInPlaceMetadataReconcileCaches(self: *ProvisionedGroupStorage) void {
+        if (comptime storage_kernel_experiment) return;
         self.read_cache.clear();
         self.hbc_cache.clear();
     }
