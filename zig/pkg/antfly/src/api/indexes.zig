@@ -2197,6 +2197,255 @@ const IndexObservationAuthority = struct {
     coverage_authoritative: bool,
 };
 
+const IndexReadinessObservation = struct {
+    expected_source_observations: u64,
+    observation_available: bool,
+    observation_fresh: bool,
+    target_observation_complete: bool,
+    topology_complete: bool,
+    incarnation_current: bool,
+    sources_complete: bool,
+
+    fn completionFencesClear(self: @This()) bool {
+        return self.observation_fresh and
+            self.target_observation_complete and
+            self.topology_complete and
+            self.incarnation_current and
+            self.sources_complete;
+    }
+};
+
+const IndexCompletionFences = struct {
+    observation: IndexReadinessObservation,
+    backfill_active: bool,
+    repair_blocks_complete: bool,
+    replay_catch_up_required: bool,
+    catch_up_active: bool,
+    publication_pending: bool,
+    coverage_pending: bool,
+
+    fn blocked(self: @This()) bool {
+        if (!self.observation.completionFencesClear()) return true;
+        if (self.backfill_active) return true;
+        if (self.repair_blocks_complete) return true;
+        if (self.replay_catch_up_required) return true;
+        if (self.catch_up_active) return true;
+        if (self.publication_pending) return true;
+        return self.coverage_pending;
+    }
+};
+
+const IndexReadinessState = enum {
+    failed,
+    queryable_partial,
+    pending,
+    ready,
+};
+
+const IndexReadinessEvaluation = struct {
+    completion_blocked: bool,
+    pending: bool,
+    queryable_partial: bool,
+    queryable: bool,
+    complete: bool,
+    state: IndexReadinessState,
+
+    fn evaluate(input: struct {
+        completion_fences: IndexCompletionFences,
+        failed: bool,
+        serving_failed: bool,
+        partial_generation_serviceable: bool,
+        stale_generation_serviceable: bool,
+    }) @This() {
+        const completion_blocked = input.completion_fences.blocked();
+        const pending = !input.failed and completion_blocked;
+        const complete = !input.failed and !completion_blocked;
+        const observation = input.completion_fences.observation;
+        const queryable_partial = !input.serving_failed and (completion_blocked or input.failed) and
+            input.partial_generation_serviceable and
+            ((observation.observation_fresh and observation.topology_complete and observation.incarnation_current) or
+                input.stale_generation_serviceable);
+        const state: IndexReadinessState = if (input.failed)
+            .failed
+        else if (queryable_partial)
+            .queryable_partial
+        else if (pending)
+            .pending
+        else
+            .ready;
+        return .{
+            .completion_blocked = completion_blocked,
+            .pending = pending,
+            .queryable_partial = queryable_partial,
+            .queryable = queryable_partial or complete,
+            .complete = complete,
+            .state = state,
+        };
+    }
+};
+
+/// Produce the observation/topology portion of readiness once. Progress,
+/// readiness state, milestones, and pending reasons must not reconstruct this
+/// independently or a partial cluster observation can look 100% complete.
+fn indexReadinessObservation(
+    item: anytype,
+    authority: IndexObservationAuthority,
+    coverage_generation: u64,
+) IndexReadinessObservation {
+    const Item = @TypeOf(item);
+    const expected_source_observations: u64 = if (@hasField(Item, "fresh_group_count"))
+        @max(1, item.fresh_group_count)
+    else
+        1;
+    const topology_complete = if (@hasField(Item, "expected_group_count") and @hasField(Item, "fresh_group_count"))
+        item.expected_group_count == item.fresh_group_count
+    else
+        true;
+    const observation_fresh = authority.freshness_authoritative;
+    const sources_complete = if (@hasField(Item, "source_replay")) blk: {
+        const sources = if (@hasField(Item, "source_replay_count"))
+            item.source_replay[0..item.source_replay_count]
+        else
+            item.source_replay;
+        break :blk indexSourcesComplete(sources, observation_fresh, topology_complete, expected_source_observations);
+    } else true;
+    return .{
+        .expected_source_observations = expected_source_observations,
+        .observation_available = authority.facts_authoritative,
+        .observation_fresh = observation_fresh,
+        .target_observation_complete = authority.convergence_authoritative,
+        .topology_complete = topology_complete,
+        .incarnation_current = coverage_generation != 0 and authority.incarnation_current,
+        .sources_complete = sources_complete,
+    };
+}
+
+test "readiness observation completion requires convergence and full topology" {
+    const authority = IndexObservationAuthority{
+        .runtime_present = true,
+        .incarnation_current = true,
+        .facts_authoritative = true,
+        .freshness_authoritative = true,
+        .readiness_authoritative = true,
+        .convergence_authoritative = true,
+        .coverage_authoritative = true,
+    };
+    const partial = AggregatedIndexStatus{
+        .expected_group_count = 2,
+        .fresh_group_count = 1,
+    };
+    try std.testing.expect(!indexReadinessObservation(partial, authority, 42).completionFencesClear());
+
+    var unconverged = authority;
+    unconverged.convergence_authoritative = false;
+    const complete_topology = AggregatedIndexStatus{
+        .expected_group_count = 2,
+        .fresh_group_count = 2,
+    };
+    try std.testing.expect(!indexReadinessObservation(complete_topology, unconverged, 42).completionFencesClear());
+    try std.testing.expect(indexReadinessObservation(complete_topology, authority, 42).completionFencesClear());
+}
+
+test "readiness evaluation cannot complete while convergence work remains" {
+    var completion_fences = IndexCompletionFences{
+        .observation = .{
+            .expected_source_observations = 1,
+            .observation_available = true,
+            .observation_fresh = true,
+            .target_observation_complete = false,
+            .topology_complete = true,
+            .incarnation_current = true,
+            .sources_complete = true,
+        },
+        .backfill_active = true,
+        .repair_blocks_complete = false,
+        .replay_catch_up_required = false,
+        .catch_up_active = false,
+        .publication_pending = true,
+        .coverage_pending = true,
+    };
+    const partial = IndexReadinessEvaluation.evaluate(.{
+        .completion_fences = completion_fences,
+        .failed = false,
+        .serving_failed = false,
+        .partial_generation_serviceable = true,
+        .stale_generation_serviceable = true,
+    });
+
+    try std.testing.expect(partial.completion_blocked);
+    try std.testing.expect(partial.pending);
+    try std.testing.expect(partial.queryable_partial);
+    try std.testing.expect(partial.queryable);
+    try std.testing.expect(!partial.complete);
+    try std.testing.expectEqual(IndexReadinessState.queryable_partial, partial.state);
+
+    completion_fences.observation.target_observation_complete = true;
+    completion_fences.backfill_active = false;
+    completion_fences.publication_pending = false;
+    completion_fences.coverage_pending = false;
+    const ready = IndexReadinessEvaluation.evaluate(.{
+        .completion_fences = completion_fences,
+        .failed = false,
+        .serving_failed = false,
+        .partial_generation_serviceable = true,
+        .stale_generation_serviceable = true,
+    });
+
+    try std.testing.expect(!ready.completion_blocked);
+    try std.testing.expect(!ready.pending);
+    try std.testing.expect(!ready.queryable_partial);
+    try std.testing.expect(ready.queryable);
+    try std.testing.expect(ready.complete);
+    try std.testing.expectEqual(IndexReadinessState.ready, ready.state);
+}
+
+test "readiness completion fences include every observation dimension" {
+    const clear = IndexReadinessObservation{
+        .expected_source_observations = 1,
+        .observation_available = true,
+        .observation_fresh = true,
+        .target_observation_complete = true,
+        .topology_complete = true,
+        .incarnation_current = true,
+        .sources_complete = true,
+    };
+    var stale = clear;
+    stale.observation_fresh = false;
+    var unconverged = clear;
+    unconverged.target_observation_complete = false;
+    var partial_topology = clear;
+    partial_topology.topology_complete = false;
+    var stale_incarnation = clear;
+    stale_incarnation.incarnation_current = false;
+    var incomplete_sources = clear;
+    incomplete_sources.sources_complete = false;
+
+    for ([_]IndexReadinessObservation{ stale, unconverged, partial_topology, stale_incarnation, incomplete_sources }) |observation| {
+        const evaluation = IndexReadinessEvaluation.evaluate(.{
+            .completion_fences = .{
+                .observation = observation,
+                .backfill_active = false,
+                .repair_blocks_complete = false,
+                .replay_catch_up_required = false,
+                .catch_up_active = false,
+                .publication_pending = false,
+                .coverage_pending = false,
+            },
+            .failed = false,
+            .serving_failed = false,
+            .partial_generation_serviceable = false,
+            .stale_generation_serviceable = false,
+        });
+
+        try std.testing.expect(evaluation.completion_blocked);
+        try std.testing.expect(evaluation.pending);
+        try std.testing.expect(!evaluation.queryable_partial);
+        try std.testing.expect(!evaluation.queryable);
+        try std.testing.expect(!evaluation.complete);
+        try std.testing.expectEqual(IndexReadinessState.pending, evaluation.state);
+    }
+}
+
 fn indexObservationIsDerived(item: anytype) bool {
     const Item = @TypeOf(item);
     if (!@hasField(Item, "kind")) return false;
@@ -5583,6 +5832,25 @@ fn appendSingleIndexRuntimeStatus(
     const terminal_enrichment_failure = enrichment_degraded or
         (if (visible_enrichment) |stats| stats.worker_failed else false);
     const terminal_load_failure = load_error != null and raw_load_error_matches_desired_incarnation;
+    const readiness_observation = indexReadinessObservation(item, authority, coverage_generation);
+    // Progress is a completion fraction, not merely a pulse from an active
+    // worker. Full-text runtime snapshots can legitimately retain their last
+    // cursor value after the worker settles; once the exact incarnation is
+    // authoritative and every lifecycle fence is clear, expose the completed
+    // state as 1.0. This keeps `ready`, indexed cardinality, and progress
+    // mutually consistent for CLI/UI consumers.
+    if (index_type == .full_text and
+        readiness_observation.completionFencesClear() and
+        !backfill_active and
+        !replay_catch_up_required and
+        replay_applied_sequence >= replay_target_sequence and
+        !catch_up_active and
+        catch_up_applied_sequence >= catch_up_target_sequence and
+        load_error == null and
+        !repair_blocks_readiness)
+    {
+        backfill_progress = 1.0;
+    }
     var source_coverage_complete_for_readiness = index_type != .embeddings;
     var artifact_publish_pending = false;
 
@@ -6002,23 +6270,18 @@ fn appendIndexReadinessStatus(
     artifact_publish_pending: bool,
 ) !void {
     const Item = @TypeOf(item);
-    const expected_source_observations: u64 = if (@hasField(Item, "fresh_group_count"))
-        @max(1, item.fresh_group_count)
-    else
-        1;
-    const observation_available = authority.facts_authoritative;
-    const observation_fresh = authority.freshness_authoritative;
-    const target_observation_complete = authority.convergence_authoritative;
-    const topology_complete = if (@hasField(Item, "expected_group_count") and @hasField(Item, "fresh_group_count"))
-        item.expected_group_count == item.fresh_group_count
-    else
-        true;
+    const observation = indexReadinessObservation(item, authority, coverage_generation);
+    const expected_source_observations = observation.expected_source_observations;
+    const observation_available = observation.observation_available;
+    const observation_fresh = observation.observation_fresh;
+    const target_observation_complete = observation.target_observation_complete;
+    const topology_complete = observation.topology_complete;
     // Incarnation fencing is common to every public index kind. The catalog
     // assigns one identity per semantic definition and storage reports the
     // exact identity it installed; accepting a same-name observation without
     // comparing both would let a replaced full-text, graph, or algebraic index
     // satisfy a wait with stale cardinality.
-    const incarnation_current = coverage_generation != 0 and authority.incarnation_current;
+    const incarnation_current = observation.incarnation_current;
     const repair_failed = repair_state != null and repair_action_required;
     const failed = terminal_load_failure or repair_failed or terminal_enrichment_failure;
     const globally_failed = terminal_load_failure or repair_failed or terminal_enrichment_global_failure;
@@ -6044,16 +6307,7 @@ fn appendIndexReadinessStatus(
             !serving_snapshot_ready);
     const coverage_pending = index_type == .embeddings and embeddings_coverage_policy != .external and
         !source_coverage_complete;
-    const sources_complete = if (@hasField(Item, "source_replay")) blk: {
-        const sources = if (@hasField(Item, "source_replay_count"))
-            item.source_replay[0..item.source_replay_count]
-        else
-            item.source_replay;
-        break :blk indexSourcesComplete(sources, observation_fresh, topology_complete, expected_source_observations);
-    } else true;
-    const pending = !failed and (!observation_fresh or !target_observation_complete or !topology_complete or !incarnation_current or !sources_complete or
-        backfill_active or repair_blocks_complete or replay_catch_up_required or catch_up_active or
-        publication_pending or coverage_pending);
+    const sources_complete = observation.sources_complete;
     const stale_generation_serviceable = active_generation_serviceable and incarnation_current and
         if (@hasField(Item, "repair_observation_count") and @hasField(Item, "expected_group_count"))
             item.expected_group_count > 0 and item.repair_observation_count == item.expected_group_count
@@ -6066,20 +6320,22 @@ fn appendIndexReadinessStatus(
         serving_snapshot_ready
     else
         active_generation_serviceable;
-    const queryable_partial = !serving_failed and (pending or failed) and
-        partial_generation_serviceable and
-        ((observation_fresh and topology_complete and incarnation_current) or
-            stale_generation_serviceable);
-    const readiness_state = if (failed)
-        "failed"
-    else if (queryable_partial)
-        "queryable_partial"
-    else if (pending)
-        "pending"
-    else
-        "ready";
-    const queryable = queryable_partial or !pending and !failed;
-    const complete = !pending and !failed;
+    const completion_fences = IndexCompletionFences{
+        .observation = observation,
+        .backfill_active = backfill_active,
+        .repair_blocks_complete = repair_blocks_complete,
+        .replay_catch_up_required = replay_catch_up_required,
+        .catch_up_active = catch_up_active,
+        .publication_pending = publication_pending,
+        .coverage_pending = coverage_pending,
+    };
+    const readiness = IndexReadinessEvaluation.evaluate(.{
+        .completion_fences = completion_fences,
+        .failed = failed,
+        .serving_failed = serving_failed,
+        .partial_generation_serviceable = partial_generation_serviceable,
+        .stale_generation_serviceable = stale_generation_serviceable,
+    });
 
     if (coverage_generation != 0) {
         const incarnation = try std.fmt.allocPrint(alloc, "g-{x:0>16}", .{coverage_generation});
@@ -6105,10 +6361,10 @@ fn appendIndexReadinessStatus(
         }
     }.run;
     try out.appendSlice(alloc, ",\"milestones\":{\"queryable\":{\"reached\":");
-    try out.appendSlice(alloc, if (queryable) "true" else "false");
+    try out.appendSlice(alloc, if (readiness.queryable) "true" else "false");
     try out.appendSlice(alloc, ",\"blockers\":[");
     var queryable_blocker_emitted = false;
-    if (!queryable) {
+    if (!readiness.queryable) {
         if (serving_failed) try appendBlocker(alloc, out, "failure", &queryable_blocker_emitted);
         if (!observation_available) try appendBlocker(alloc, out, "runtime_observation", &queryable_blocker_emitted);
         if (!topology_complete) try appendBlocker(alloc, out, "shard_observation", &queryable_blocker_emitted);
@@ -6121,10 +6377,10 @@ fn appendIndexReadinessStatus(
         }
     }
     try out.appendSlice(alloc, "]},\"complete\":{\"reached\":");
-    try out.appendSlice(alloc, if (complete) "true" else "false");
+    try out.appendSlice(alloc, if (readiness.complete) "true" else "false");
     try out.appendSlice(alloc, ",\"blockers\":[");
     var complete_blocker_emitted = false;
-    if (!complete) {
+    if (!readiness.complete) {
         if (failed) try appendBlocker(alloc, out, "failure", &complete_blocker_emitted);
         if (!observation_available) try appendBlocker(alloc, out, "runtime_observation", &complete_blocker_emitted);
         if (!target_observation_complete) try appendBlocker(alloc, out, "target_observation", &complete_blocker_emitted);
@@ -6138,11 +6394,11 @@ fn appendIndexReadinessStatus(
     try out.appendSlice(alloc, "]}}");
 
     try out.appendSlice(alloc, ",\"readiness\":{\"state\":");
-    try appendJsonString(alloc, out, readiness_state);
+    try appendJsonString(alloc, out, @tagName(readiness.state));
     try out.appendSlice(alloc, ",\"queryable\":");
-    try out.appendSlice(alloc, if (queryable) "true" else "false");
+    try out.appendSlice(alloc, if (readiness.queryable) "true" else "false");
     try out.appendSlice(alloc, ",\"complete\":");
-    try out.appendSlice(alloc, if (complete) "true" else "false");
+    try out.appendSlice(alloc, if (readiness.complete) "true" else "false");
     if (coverage_generation != 0) {
         const incarnation = try std.fmt.allocPrint(alloc, "g-{x:0>16}", .{coverage_generation});
         defer alloc.free(incarnation);
@@ -8041,6 +8297,58 @@ test "full text aggregate preserves explicit current backfill state" {
     try std.testing.expect(aggregate.replay_catch_up_required);
     try std.testing.expect(aggregate.backfill_active);
     try std.testing.expectEqual(@as(f64, 0.0), aggregate.backfill_progress);
+}
+
+test "derived coverage ready full text status reports complete progress" {
+    const alloc = std.testing.allocator;
+    const config_json = "{\"type\":\"full_text\"}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexRuntimeIdentity(alloc, "search_idx", parsed_config.value)).?;
+
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "search_idx",
+        .kind = .full_text,
+        .doc_count = 10_000,
+        .term_count = 42_000,
+        .backfill_active = false,
+        // A settled worker may retain an old/default cursor estimate. The
+        // public lifecycle must normalize this when readiness is complete.
+        .backfill_progress = 0.0,
+        .replay_applied_sequence = 10_000,
+        .replay_target_sequence = 10_000,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
+    }};
+    var local_items = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .source_doc_count = 10_000, .doc_count = 10_000, .index_count = 1, .indexes = indexes[0..] },
+    }};
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items[0..] };
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"search_idx\":" ++ config_json ++ "}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "search_idx", &local_status)).?;
+    defer alloc.free(encoded);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"status\":{\"total_indexed\":10000,\"backfill_progress\":1.0,\"readiness\":{\"state\":\"ready\",\"queryable\":true,\"complete\":true}}}",
+        encoded,
+    );
 }
 
 test "index status keeps generic catch-up lag pending when replay sequence is equal" {

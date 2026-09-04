@@ -107,6 +107,12 @@ export function useAnswerStream() {
           onFollowup: (question) => {
             setFollowUpQuestions((prev) => [...prev, question]);
           },
+          onRetrievalAgentResult: (result) => {
+            setAnswer(result.generation ?? "");
+            setHits(result.hits ?? []);
+            setClassification(result.classification ?? null);
+            setFollowUpQuestions(result.followup_questions ?? []);
+          },
           onComplete: () => {
             setIsStreaming(false);
           },

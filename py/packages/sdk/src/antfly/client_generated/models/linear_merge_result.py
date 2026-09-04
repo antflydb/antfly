@@ -21,34 +21,32 @@ T = TypeVar("T", bound="LinearMergeResult")
 class LinearMergeResult:
     """
     Attributes:
-        status (LinearMergePageStatus): Status of a linear merge page operation:
-            - "success": All records in batch processed successfully
-            - "partial": Processing stopped at shard boundary, client should retry with next_cursor
-            - "error": Fatal error occurred, no records processed successfully
+        status (LinearMergePageStatus): Status of a completed linear merge page. Successful responses are atomic
+            and use "success"; failures are returned as non-2xx HTTP responses.
         upserted (int): Records inserted or updated (0 if dry_run=true)
         skipped (int): Records skipped because content hash matched (unchanged)
         deleted (int): Records deleted or would be deleted (if dry_run=true)
+        failed (list[FailedOperation]):
         next_cursor (str): ID of last record in this batch (use for next request)
+        took (int):
         deleted_ids (list[str] | Unset): IDs that were deleted (or would be deleted if dry_run=true). Only included if
             dry_run=true.
-        failed (list[FailedOperation] | Unset):
         key_range (KeyRange | Unset): Key range processed in this request
         keys_scanned (int | Unset): Total number of keys scanned from Antfly during range query
         message (str | Unset): Additional information (e.g., "stopped at shard boundary", "dry run - no changes made")
-        took (int | Unset):
     """
 
     status: LinearMergePageStatus
     upserted: int
     skipped: int
     deleted: int
+    failed: list[FailedOperation]
     next_cursor: str
+    took: int
     deleted_ids: list[str] | Unset = UNSET
-    failed: list[FailedOperation] | Unset = UNSET
     key_range: KeyRange | Unset = UNSET
     keys_scanned: int | Unset = UNSET
     message: str | Unset = UNSET
-    took: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -60,18 +58,18 @@ class LinearMergeResult:
 
         deleted = self.deleted
 
+        failed = []
+        for failed_item_data in self.failed:
+            failed_item = failed_item_data.to_dict()
+            failed.append(failed_item)
+
         next_cursor = self.next_cursor
+
+        took = self.took
 
         deleted_ids: list[str] | Unset = UNSET
         if not isinstance(self.deleted_ids, Unset):
             deleted_ids = self.deleted_ids
-
-        failed: list[dict[str, Any]] | Unset = UNSET
-        if not isinstance(self.failed, Unset):
-            failed = []
-            for failed_item_data in self.failed:
-                failed_item = failed_item_data.to_dict()
-                failed.append(failed_item)
 
         key_range: dict[str, Any] | Unset = UNSET
         if not isinstance(self.key_range, Unset):
@@ -81,8 +79,6 @@ class LinearMergeResult:
 
         message = self.message
 
-        took = self.took
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -91,21 +87,19 @@ class LinearMergeResult:
                 "upserted": upserted,
                 "skipped": skipped,
                 "deleted": deleted,
+                "failed": failed,
                 "next_cursor": next_cursor,
+                "took": took,
             }
         )
         if deleted_ids is not UNSET:
             field_dict["deleted_ids"] = deleted_ids
-        if failed is not UNSET:
-            field_dict["failed"] = failed
         if key_range is not UNSET:
             field_dict["key_range"] = key_range
         if keys_scanned is not UNSET:
             field_dict["keys_scanned"] = keys_scanned
         if message is not UNSET:
             field_dict["message"] = message
-        if took is not UNSET:
-            field_dict["took"] = took
 
         return field_dict
 
@@ -123,18 +117,18 @@ class LinearMergeResult:
 
         deleted = d.pop("deleted")
 
+        failed = []
+        _failed = d.pop("failed")
+        for failed_item_data in _failed:
+            failed_item = FailedOperation.from_dict(failed_item_data)
+
+            failed.append(failed_item)
+
         next_cursor = d.pop("next_cursor")
 
+        took = d.pop("took")
+
         deleted_ids = cast(list[str], d.pop("deleted_ids", UNSET))
-
-        _failed = d.pop("failed", UNSET)
-        failed: list[FailedOperation] | Unset = UNSET
-        if _failed is not UNSET:
-            failed = []
-            for failed_item_data in _failed:
-                failed_item = FailedOperation.from_dict(failed_item_data)
-
-                failed.append(failed_item)
 
         _key_range = d.pop("key_range", UNSET)
         key_range: KeyRange | Unset
@@ -147,20 +141,18 @@ class LinearMergeResult:
 
         message = d.pop("message", UNSET)
 
-        took = d.pop("took", UNSET)
-
         linear_merge_result = cls(
             status=status,
             upserted=upserted,
             skipped=skipped,
             deleted=deleted,
-            next_cursor=next_cursor,
-            deleted_ids=deleted_ids,
             failed=failed,
+            next_cursor=next_cursor,
+            took=took,
+            deleted_ids=deleted_ids,
             key_range=key_range,
             keys_scanned=keys_scanned,
             message=message,
-            took=took,
         )
 
         linear_merge_result.additional_properties = d

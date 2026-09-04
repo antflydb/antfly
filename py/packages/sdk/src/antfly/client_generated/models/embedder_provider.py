@@ -6,7 +6,6 @@ class EmbedderProvider(StrEnum):
     BEDROCK = "bedrock"
     COHERE = "cohere"
     GEMINI = "gemini"
-    MOCK = "mock"
     OLLAMA = "ollama"
     OPENAI = "openai"
     OPENROUTER = "openrouter"

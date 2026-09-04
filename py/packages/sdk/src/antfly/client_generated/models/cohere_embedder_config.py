@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.cohere_embedder_config_input_type import CohereEmbedderConfigInputType
+from ..models.cohere_embedder_config_provider import CohereEmbedderConfigProvider
 from ..models.cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
 from ..types import UNSET, Unset
 
@@ -27,6 +28,7 @@ class CohereEmbedderConfig:
             {'provider': 'cohere', 'model': 'embed-english-v3.0', 'input_type': 'search_document'}
 
         Attributes:
+            provider (CohereEmbedderConfigProvider):
             model (str): The name of the Cohere embedding model to use. Default: 'embed-english-v3.0'. Example: embed-
                 english-v3.0.
             api_key (str | Unset): The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
@@ -36,6 +38,7 @@ class CohereEmbedderConfig:
                 CohereEmbedderConfigTruncate.END.
     """
 
+    provider: CohereEmbedderConfigProvider
     model: str = "embed-english-v3.0"
     api_key: str | Unset = UNSET
     input_type: CohereEmbedderConfigInputType | Unset = CohereEmbedderConfigInputType.SEARCH_DOCUMENT
@@ -43,6 +46,8 @@ class CohereEmbedderConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         api_key = self.api_key
@@ -59,6 +64,7 @@ class CohereEmbedderConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -74,6 +80,8 @@ class CohereEmbedderConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = CohereEmbedderConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         api_key = d.pop("api_key", UNSET)
@@ -93,6 +101,7 @@ class CohereEmbedderConfig:
             truncate = CohereEmbedderConfigTruncate(_truncate)
 
         cohere_embedder_config = cls(
+            provider=provider,
             model=model,
             api_key=api_key,
             input_type=input_type,

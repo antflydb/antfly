@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.antfly_generator_config_provider import AntflyGeneratorConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="AntflyGeneratorConfig")
@@ -16,6 +17,7 @@ class AntflyGeneratorConfig:
     """Configuration for the Antfly inference generative AI provider.
 
     Attributes:
+        provider (AntflyGeneratorConfigProvider):
         model (str): The name of the generator model. Example: onnxruntime/Gemma-3-ONNX.
         api_url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
             environment variable.
@@ -26,6 +28,7 @@ class AntflyGeneratorConfig:
         timeout (int | Unset): HTTP response timeout in seconds for Inference API calls.
     """
 
+    provider: AntflyGeneratorConfigProvider
     model: str
     api_url: str | Unset = UNSET
     temperature: float | Unset = UNSET
@@ -36,6 +39,8 @@ class AntflyGeneratorConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         api_url = self.api_url
@@ -54,6 +59,7 @@ class AntflyGeneratorConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -75,6 +81,8 @@ class AntflyGeneratorConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = AntflyGeneratorConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         api_url = d.pop("api_url", UNSET)
@@ -90,6 +98,7 @@ class AntflyGeneratorConfig:
         timeout = d.pop("timeout", UNSET)
 
         antfly_generator_config = cls(
+            provider=provider,
             model=model,
             api_url=api_url,
             temperature=temperature,

@@ -33,6 +33,7 @@ import type {
   DocumentArtifactTableReprocessRequest,
   DocumentArtifactTableReprocessResponse,
   EnrichmentConfig,
+  GlobalQueryRequest,
   IndexStatus,
   LinearMergeRequest,
   LinearMergeResult,
@@ -51,6 +52,7 @@ import type {
   RetrievalAgentResult,
   RetrievalAgentStreamCallbacks,
   ScanKeysRequest,
+  Table,
   TableArtifactEnrichmentList,
   TableQueryRequest,
   TableSchema,
@@ -73,6 +75,15 @@ function validateTableQueryRequest(request: QueryRequest, tableName: string, ind
   throw new Error(
     `Table query ${requestLabel}.table must be omitted; the route already selects table ${JSON.stringify(tableName)}`
   );
+}
+
+function validateGlobalQueryRequest(
+  request: QueryRequest,
+  index?: number
+): asserts request is GlobalQueryRequest {
+  if (typeof request.table === "string" && request.table.length > 0) return;
+  const requestLabel = index === undefined ? "request" : `requests[${index}]`;
+  throw new Error(`Global query ${requestLabel}.table must be a non-empty string`);
 }
 
 export interface RestoreJobListOptions {
@@ -603,6 +614,7 @@ export class AntflyClient {
       validateGraphQueryResponses(data as QueryResponses, [request], tableName);
       return data as QueryResponses;
     } else {
+      validateGlobalQueryRequest(request);
       const { data, error, response } = await this.client.POST("/db/v1/query", {
         body: request,
         ...(options?.signal ? { signal: options.signal } : {}),
@@ -657,7 +669,7 @@ export class AntflyClient {
    * Global query operations
    */
   async query(
-    request: QueryRequest,
+    request: GlobalQueryRequest,
     options?: QueryExecutionOptions
   ): Promise<QueryResult | undefined> {
     const data = await this.performQuery("/db/v1/query", request, undefined, options);
@@ -668,7 +680,8 @@ export class AntflyClient {
   /**
    * Execute multiple queries in a single request
    */
-  async multiquery(requests: QueryRequest[]): Promise<QueryResponses | undefined> {
+  async multiquery(requests: GlobalQueryRequest[]): Promise<QueryResponses | undefined> {
+    for (const [index, request] of requests.entries()) validateGlobalQueryRequest(request, index);
     return this.performMultiquery("/db/v1/query", requests);
   }
 
@@ -765,16 +778,6 @@ export class AntflyClient {
                         callbacks.onReasoning(JSON.parse(data));
                       }
                       break;
-                    case "filter_applied":
-                      if (callbacks.onFilterApplied) {
-                        callbacks.onFilterApplied(JSON.parse(data));
-                      }
-                      break;
-                    case "search_executed":
-                      if (callbacks.onSearchExecuted) {
-                        callbacks.onSearchExecuted(JSON.parse(data));
-                      }
-                      break;
                     case "hit":
                       if (callbacks.onHit) {
                         callbacks.onHit(JSON.parse(data));
@@ -800,9 +803,9 @@ export class AntflyClient {
                         callbacks.onStepCompleted(JSON.parse(data));
                       }
                       break;
-                    case "confidence":
-                      if (callbacks.onConfidence) {
-                        callbacks.onConfidence(JSON.parse(data));
+                    case "tool_mode":
+                      if (callbacks.onToolMode) {
+                        callbacks.onToolMode(JSON.parse(data));
                       }
                       break;
                     case "followup":
@@ -815,11 +818,23 @@ export class AntflyClient {
                         callbacks.onEvalResult(JSON.parse(data));
                       }
                       break;
-                    case "done":
+                    case "done": {
+                      const result = JSON.parse(data);
+                      if (
+                        callbacks.onConfidence &&
+                        typeof result.generation_confidence === "number" &&
+                        typeof result.context_relevance === "number"
+                      ) {
+                        callbacks.onConfidence({
+                          generation_confidence: result.generation_confidence,
+                          context_relevance: result.context_relevance,
+                        });
+                      }
                       if (callbacks.onDone) {
-                        callbacks.onDone(JSON.parse(data));
+                        callbacks.onDone(result);
                       }
                       return;
+                    }
                     case "error": {
                       const parsed = JSON.parse(data);
                       const message =
@@ -850,18 +865,45 @@ export class AntflyClient {
   }
 
   /**
-   * Retrieval Agent - Unified retrieval pipeline with optional classification, generation, and eval
-   * Supports pipeline mode (structured queries) and agentic mode (tool-calling with LLM)
-   * Configure steps.classification, steps.answer, steps.eval to enable additional pipeline stages
-   * @param request - Retrieval agent request with query, mode, and optional step configs
-   * @param callbacks - Optional callbacks for SSE events (classification, reasoning, hit, answer, citation, confidence, followup_question, eval, done, error)
-   * @returns Promise with RetrievalAgentResult (JSON) or AbortController (when streaming)
+   * Run the retrieval agent and return one complete JSON result.
+   *
+   * Use streamRetrievalAgent when incremental events are required. Keeping the
+   * two response modes separate avoids runtime shape checks on the result.
    */
+  async retrievalAgent(request: RetrievalAgentRequest): Promise<RetrievalAgentResult>;
+  /**
+   * @deprecated Use streamRetrievalAgent(request, callbacks). This overload is
+   * retained for source compatibility and will be removed in a future major release.
+   */
+  async retrievalAgent(
+    request: RetrievalAgentRequest,
+    callbacks: RetrievalAgentStreamCallbacks
+  ): Promise<AbortController>;
   async retrievalAgent(
     request: RetrievalAgentRequest,
     callbacks?: RetrievalAgentStreamCallbacks
   ): Promise<RetrievalAgentResult | AbortController> {
-    return this.performRetrievalAgent(request, callbacks);
+    if (callbacks) return this.streamRetrievalAgent(request, callbacks);
+    const result = await this.performRetrievalAgent({ ...request, stream: false });
+    if (result instanceof AbortController) {
+      result.abort();
+      throw new Error("Retrieval agent returned a stream for a JSON request");
+    }
+    return result;
+  }
+
+  /** Run the retrieval agent as an SSE stream. */
+  async streamRetrievalAgent(
+    request: RetrievalAgentRequest,
+    callbacks: RetrievalAgentStreamCallbacks
+  ): Promise<AbortController> {
+    const result = await this.performRetrievalAgent({ ...request, stream: true }, callbacks);
+    if (result instanceof AbortController) return result;
+
+    // A proxy or older server may still answer with JSON. Preserve the complete
+    // result rather than dropping it, while keeping the streaming return shape.
+    callbacks.onDone?.(result);
+    return new AbortController();
   }
 
   /**
@@ -932,16 +974,13 @@ export class AntflyClient {
         },
       };
 
-      const abortController = (await this.performRetrievalAgent(
-        request,
-        wrappedCallbacks
-      )) as AbortController;
+      const abortController = await this.streamRetrievalAgent(request, wrappedCallbacks);
 
       return { abortController, messages: messagesPromise };
     }
 
     // Non-streaming mode
-    const result = (await this.performRetrievalAgent(request)) as RetrievalAgentResult;
+    const result = await this.retrievalAgent(request);
 
     // Use server-provided messages or build from response
     const updatedMessages: ChatMessage[] = result.messages?.length
@@ -1081,15 +1120,57 @@ export class AntflyClient {
       return true;
     },
 
-    /**
-     * Update schema for a table
-     */
-    updateSchema: async (tableName: string, config: TableSchema) => {
+    /** Replace the complete schema for a table. */
+    replaceSchema: async (
+      tableName: string,
+      config: TableSchema,
+      options?: { expectedVersion?: number }
+    ): Promise<Table | undefined> => {
       const { data, error } = await this.client.PUT("/db/v1/tables/{tableName}/schema", {
         params: { path: { tableName } },
         body: config,
+        headers:
+          options?.expectedVersion === undefined
+            ? undefined
+            : { "If-Match": `"schema-${options.expectedVersion}"` },
       });
-      if (error) throw new Error(`Failed to update table schema: ${error.error}`);
+      if (error) throw new Error(`Failed to replace table schema: ${error.error}`);
+      return data;
+    },
+
+    /** Apply an RFC 7396 JSON Merge Patch without replacing unrelated fields. */
+    patchSchema: async (
+      tableName: string,
+      patch: Record<string, unknown>,
+      options?: { expectedVersion?: number }
+    ): Promise<Table | undefined> => {
+      const { data, error } = await this.client.PATCH("/db/v1/tables/{tableName}/schema", {
+        params: { path: { tableName } },
+        body: patch,
+        headers:
+          options?.expectedVersion === undefined
+            ? undefined
+            : { "If-Match": `"schema-${options.expectedVersion}"` },
+      });
+      if (error) throw new Error(`Failed to patch table schema: ${error.error}`);
+      return data;
+    },
+
+    /** @deprecated Use replaceSchema for explicit full-replacement semantics. */
+    updateSchema: async (
+      tableName: string,
+      config: TableSchema,
+      options?: { expectedVersion?: number }
+    ): Promise<Table | undefined> => {
+      const { data, error } = await this.client.PUT("/db/v1/tables/{tableName}/schema", {
+        params: { path: { tableName } },
+        body: config,
+        headers:
+          options?.expectedVersion === undefined
+            ? undefined
+            : { "If-Match": `"schema-${options.expectedVersion}"` },
+      });
+      if (error) throw new Error(`Failed to replace table schema: ${error.error}`);
       return data;
     },
 
