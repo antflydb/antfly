@@ -99,23 +99,31 @@ jobs:
           toolchain: ${{ steps.policy.outputs.rust_version }}
           components: rustfmt
 
+      # setup-zig extracts an .xz archive, so xz-utils must exist before that
+      # action runs on a clean ARC image. The SDK also needs native build tools
+      # for Go's race detector and Rust dependencies.
+      - name: Install native test dependencies
+        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memoryaf == 'true' || steps.scopes.outputs.format_zig == 'true' || steps.scopes.outputs.release == 'true'
+        env:
+          NEED_BUILD_TOOLS: ${{ steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memoryaf == 'true' }}
+        run: |
+          sudo_cmd=""
+          if command -v sudo >/dev/null 2>&1; then
+            sudo_cmd="sudo"
+          fi
+          packages=(xz-utils)
+          if [[ "$NEED_BUILD_TOOLS" == "true" ]]; then
+            packages+=(build-essential cmake pkg-config)
+          fi
+          $sudo_cmd apt-get update
+          $sudo_cmd apt-get install --yes --no-install-recommends "${packages[@]}"
+
       - name: Set up Zig
         if: steps.scopes.outputs.format_zig == 'true' || steps.scopes.outputs.release == 'true'
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.policy.outputs.zig_version }}
           use-cache: false
-
-      - name: Install native test dependencies
-        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memoryaf == 'true' || steps.scopes.outputs.release == 'true'
-        run: |
-          sudo_cmd=""
-          if command -v sudo >/dev/null 2>&1; then
-            sudo_cmd="sudo"
-          fi
-          $sudo_cmd apt-get update
-          $sudo_cmd apt-get install --yes --no-install-recommends \
-            build-essential cmake pkg-config xz-utils
 
       - name: Install Python tooling
         if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.format_python == 'true'
