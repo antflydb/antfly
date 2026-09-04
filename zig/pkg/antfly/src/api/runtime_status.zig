@@ -208,7 +208,7 @@ pub const TableRuntimeSummary = struct {
     async_indexing: db_mod.types.AsyncIndexingStats = .{},
 };
 
-const TargetedIndexPublicationFence = struct {
+const TargetedIndexAuthority = struct {
     const Identity = struct {
         incarnation: u64,
         config_hash: u64,
@@ -226,6 +226,10 @@ const TargetedIndexPublicationFence = struct {
         exact: Identity,
     };
 
+    // This record survives transition settlement. Retaining the accepted
+    // desired identity (or deletion tombstone) prevents an arbitrarily late
+    // same-name publisher from resurrecting a superseded incarnation.
+    transition_active: bool = true,
     // Multiple mutation owners may overlap at hosted/public boundaries that
     // do not share the provisioned writer's structural activity queue.
     owner_count: usize = 1,
@@ -234,9 +238,13 @@ const TargetedIndexPublicationFence = struct {
     // published between fencing and applying the target.
     accept_target_after_observation_generation: u64,
     expectation: Expectation = .unknown,
+    // The observation generation which bound `expectation`. A delayed
+    // targeted publication may never roll desired authority backwards.
+    expectation_observation_generation: u64 = 0,
     // Once the exact target publishes queryable state (or an exact failure),
-    // it no longer remains stale. Keep the fence itself until the table is
-    // fresh so later catch-up observations still preserve every index.
+    // it no longer remains stale. The active transition still waits for a
+    // fresh post-release table observation; the accepted identity then
+    // remains as a persistent watermark.
     target_authority_handed_off: bool = false,
     // Structural ownership may finish before the target's async generation
     // catch-up. Retain the fence until a later fresh table publication
@@ -311,19 +319,23 @@ pub const TableRuntimeSnapshotCache = struct {
         // Latest commit watermark that each group must have observed before
         // its coverage may be treated as current.
         required_target_observation_revisions: std.AutoHashMapUnmanaged(u64, TargetObservationRequirement) = .empty,
-        // Exact index names whose in-place catalog reconciliation is still in
-        // flight. Publications may replace the target, but an opening/catch-up
-        // observation cannot revoke authority from an untouched sibling.
-        targeted_index_fences: std.StringHashMapUnmanaged(TargetedIndexPublicationFence) = .empty,
+        // Current catalog authority by index name. Settled identities and
+        // absence tombstones remain here so delayed same-name publishers
+        // cannot regain serving authority. Whole-table invalidation is the
+        // garbage-collection boundary for names that are no longer relevant.
+        index_authorities: std.StringHashMapUnmanaged(TargetedIndexAuthority) = .empty,
+        // Keep the normal publication path O(indexes in the observation), not
+        // O(historical index names), when no structural transition is active.
+        active_index_transition_count: usize = 0,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             var it = self.groups.valueIterator();
             while (it.next()) |status| status.deinit(alloc);
             self.groups.deinit(alloc);
             self.required_target_observation_revisions.deinit(alloc);
-            var fence_it = self.targeted_index_fences.keyIterator();
+            var fence_it = self.index_authorities.keyIterator();
             while (fence_it.next()) |name| alloc.free(@constCast(name.*));
-            self.targeted_index_fences.deinit(alloc);
+            self.index_authorities.deinit(alloc);
             self.* = undefined;
         }
     };
@@ -370,7 +382,7 @@ pub const TableRuntimeSnapshotCache = struct {
             return;
         };
         self.clearGroupsLocked(state);
-        self.clearTargetedIndexFencesLocked(state);
+        self.clearIndexAuthoritiesLocked(state);
         state.epoch.invalidation_epoch = self.next_invalidation_epoch;
         state.epoch.root_generation +%= 1;
         if (state.epoch.root_generation == 0) state.epoch.root_generation = 1;
@@ -420,7 +432,7 @@ pub const TableRuntimeSnapshotCache = struct {
             self.invalidateTableStateLocked(state);
             return false;
         };
-        const fence = state.targeted_index_fences.getPtr(target) orelse {
+        const fence = state.index_authorities.getPtr(target) orelse {
             self.invalidateTableStateLocked(state);
             return false;
         };
@@ -430,6 +442,8 @@ pub const TableRuntimeSnapshotCache = struct {
         // otherwise an edge racing reservation release can leave the target's
         // formerly-authoritative snapshot visible until an unrelated refresh.
         fence.accept_target_after_observation_generation = self.next_observation_generation;
+        if (!fence.transition_active) state.active_index_transition_count += 1;
+        fence.transition_active = true;
         fence.target_authority_handed_off = false;
         if (fence.owner_count == 0) {
             fence.release_after_observation_generation = self.next_observation_generation;
@@ -464,28 +478,37 @@ pub const TableRuntimeSnapshotCache = struct {
             self.advanceInvalidationEpochLocked();
             return;
         };
-        if (state.targeted_index_fences.getPtr(index_name)) |fence| {
-            fence.owner_count += 1;
+        if (state.index_authorities.getPtr(index_name)) |fence| {
+            if (fence.transition_active) {
+                fence.owner_count += 1;
+            } else {
+                fence.owner_count = 1;
+                state.active_index_transition_count += 1;
+            }
+            fence.transition_active = true;
             fence.accept_target_after_observation_generation = self.next_observation_generation;
             fence.expectation = .unknown;
+            fence.expectation_observation_generation = self.next_observation_generation;
             fence.target_authority_handed_off = false;
             fence.release_after_observation_generation = null;
         } else {
             const owned_name = self.alloc.dupe(u8, index_name) catch {
                 self.clearGroupsLocked(state);
-                self.clearTargetedIndexFencesLocked(state);
+                self.clearIndexAuthoritiesLocked(state);
                 state.epoch.invalidation_epoch = self.next_invalidation_epoch;
                 return;
             };
-            state.targeted_index_fences.put(self.alloc, owned_name, .{
+            state.index_authorities.put(self.alloc, owned_name, .{
                 .accept_target_after_observation_generation = self.next_observation_generation,
+                .expectation_observation_generation = self.next_observation_generation,
             }) catch {
                 self.alloc.free(owned_name);
                 self.clearGroupsLocked(state);
-                self.clearTargetedIndexFencesLocked(state);
+                self.clearIndexAuthoritiesLocked(state);
                 state.epoch.invalidation_epoch = self.next_invalidation_epoch;
                 return;
             };
+            state.active_index_transition_count += 1;
         }
         var status_it = state.groups.valueIterator();
         while (status_it.next()) |status| {
@@ -506,9 +529,11 @@ pub const TableRuntimeSnapshotCache = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const state = self.tables.getPtr(table_name) orelse return;
-        const fence = state.targeted_index_fences.getPtr(index_name) orelse return;
+        const fence = state.index_authorities.getPtr(index_name) orelse return;
+        if (!fence.transition_active) return;
         fence.accept_target_after_observation_generation = self.next_observation_generation;
         fence.expectation = .unknown;
+        fence.expectation_observation_generation = self.next_observation_generation;
         fence.target_authority_handed_off = false;
         var status_it = state.groups.valueIterator();
         while (status_it.next()) |status| {
@@ -530,13 +555,14 @@ pub const TableRuntimeSnapshotCache = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const state = self.tables.getPtr(table_name) orelse return;
-        const fence = state.targeted_index_fences.getPtr(index_name) orelse return;
+        const fence = state.index_authorities.getPtr(index_name) orelse return;
+        if (!fence.transition_active) return;
         std.debug.assert(fence.owner_count > 0);
         fence.owner_count -= 1;
         if (fence.owner_count != 0) return;
         fence.release_after_observation_generation = self.next_observation_generation;
         self.advanceTargetedIndexAuthorityLocked(state);
-        self.settleReleasedTargetedIndexFencesLocked(state);
+        self.settleReleasedIndexAuthoritiesLocked(state);
     }
 
     /// Records an authoritative structural acknowledgement that the named
@@ -551,11 +577,13 @@ pub const TableRuntimeSnapshotCache = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const state = self.tables.getPtr(table_name) orelse return;
-        const fence = state.targeted_index_fences.getPtr(index_name) orelse return;
+        const fence = state.index_authorities.getPtr(index_name) orelse return;
+        if (!fence.transition_active) return;
         fence.expectation = .absent;
+        fence.expectation_observation_generation = self.next_observation_generation;
         fence.target_authority_handed_off = false;
         self.advanceTargetedIndexAuthorityLocked(state);
-        self.settleReleasedTargetedIndexFencesLocked(state);
+        self.settleReleasedIndexAuthoritiesLocked(state);
     }
 
     /// Captures the table lifecycle before a DB is opened or inspected.
@@ -658,15 +686,17 @@ pub const TableRuntimeSnapshotCache = struct {
                 previous,
                 &owned,
                 now_ns,
-                &state.targeted_index_fences,
+                &state.index_authorities,
+                state.active_index_transition_count != 0,
             );
             previous.deinit(self.alloc);
             previous.* = owned;
         } else {
             try state.groups.put(self.alloc, status.group_id, owned);
         }
+        self.enforceIndexAuthoritiesLocked(state);
         self.advanceTargetedIndexAuthorityLocked(state);
-        self.settleReleasedTargetedIndexFencesLocked(state);
+        self.settleReleasedIndexAuthoritiesLocked(state);
         return .published;
     }
 
@@ -741,9 +771,38 @@ pub const TableRuntimeSnapshotCache = struct {
             // target fences. The current-epoch structural observation may
             // still repopulate that empty table; there is no retained target
             // authority to bind in that case.
-            if (state.targeted_index_fences.getPtr(name)) |fence| {
-                fence.expectation = try targetedIndexExpectation(statuses, name);
-                fence.target_authority_handed_off = false;
+            if (state.index_authorities.getPtr(name)) |authority| {
+                if (authority.transition_active and
+                    token.observation_generation >= authority.accept_target_after_observation_generation and
+                    token.observation_generation >= authority.expectation_observation_generation)
+                {
+                    // Decide publication eligibility before mutating the
+                    // authority registry. A delayed structural observation
+                    // whose every group has already been superseded cannot
+                    // become the first writer of desired catalog identity.
+                    const observed_expectation = (try targetedIndexExpectationForPublishableGroups(
+                        state,
+                        statuses,
+                        name,
+                        token.observation_generation,
+                    )) orelse return .stale_observation;
+                    switch (authority.expectation) {
+                        .unknown => {
+                            authority.expectation = observed_expectation;
+                            authority.expectation_observation_generation = token.observation_generation;
+                            authority.target_authority_handed_off = false;
+                        },
+                        .absent, .exact => {
+                            // Desired authority is write-once within one
+                            // transition. A different later observation is
+                            // evidence from a superseded owner, not a new
+                            // catalog intent.
+                            if (!targetExpectationsEqual(authority.expectation, observed_expectation)) {
+                                return .stale_observation;
+                            }
+                        },
+                    }
+                }
             }
         }
         var published = false;
@@ -766,7 +825,8 @@ pub const TableRuntimeSnapshotCache = struct {
                     self.alloc,
                     previous.*,
                     next,
-                    &state.targeted_index_fences,
+                    &state.index_authorities,
+                    state.active_index_transition_count != 0,
                     target_index_name,
                 );
                 previous.deinit(self.alloc);
@@ -777,8 +837,9 @@ pub const TableRuntimeSnapshotCache = struct {
             next.* = undefined;
             published = true;
         }
+        self.enforceIndexAuthoritiesLocked(state);
         self.advanceTargetedIndexAuthorityLocked(state);
-        self.settleReleasedTargetedIndexFencesLocked(state);
+        self.settleReleasedIndexAuthoritiesLocked(state);
         return if (published or statuses.len == 0) .published else .stale_observation;
     }
 
@@ -842,7 +903,7 @@ pub const TableRuntimeSnapshotCache = struct {
         state.groups = replacement;
         replacement = .empty;
         replacement_owned = false;
-        self.clearTargetedIndexFencesLocked(state);
+        self.clearIndexAuthoritiesLocked(state);
         self.mutex.unlock();
 
         var retired_it = retired.valueIterator();
@@ -1048,7 +1109,8 @@ pub const TableRuntimeSnapshotCache = struct {
         previous: ?*LocalTableRuntimeStatus,
         status: *LocalTableRuntimeStatus,
         now_ns: u64,
-        targeted_index_fences: *const std.StringHashMapUnmanaged(TargetedIndexPublicationFence),
+        index_authorities: *const std.StringHashMapUnmanaged(TargetedIndexAuthority),
+        has_active_index_transition: bool,
     ) !void {
         const cached = previous orelse return;
         if (cached.cache_observation_generation > status.cache_observation_generation) {
@@ -1063,13 +1125,21 @@ pub const TableRuntimeSnapshotCache = struct {
                 cached.*,
                 status.*,
                 now_ns,
-                targeted_index_fences,
+                index_authorities,
+                has_active_index_transition,
             );
             status.deinit(self.alloc);
             status.* = merged;
             return;
         }
-        try preserveArtifactVisibilityOnReplayRegression(self.alloc, cached.*, status, targeted_index_fences, null);
+        try preserveArtifactVisibilityOnReplayRegression(
+            self.alloc,
+            cached.*,
+            status,
+            index_authorities,
+            has_active_index_transition,
+            null,
+        );
     }
 
     pub fn summary(self: *@This()) TableRuntimeSummary {
@@ -1148,7 +1218,8 @@ pub const TableRuntimeSnapshotCache = struct {
                 state.groups.getPtr(owned.group_id),
                 owned,
                 now_ns,
-                &state.targeted_index_fences,
+                &state.index_authorities,
+                state.active_index_transition_count != 0,
             );
             if (replacement.getPtr(owned.group_id)) |duplicate| {
                 duplicate.deinit(self.alloc);
@@ -1160,8 +1231,9 @@ pub const TableRuntimeSnapshotCache = struct {
 
         var old_groups = state.groups;
         state.groups = replacement;
+        self.enforceIndexAuthoritiesLocked(state);
         self.advanceTargetedIndexAuthorityLocked(state);
-        self.settleReleasedTargetedIndexFencesLocked(state);
+        self.settleReleasedIndexAuthoritiesLocked(state);
         var old_it = old_groups.valueIterator();
         while (old_it.next()) |status| status.deinit(self.alloc);
         old_groups.deinit(self.alloc);
@@ -1172,11 +1244,18 @@ pub const TableRuntimeSnapshotCache = struct {
         previous: ?*LocalTableRuntimeStatus,
         incoming: LocalTableRuntimeStatus,
         now_ns: u64,
-        targeted_index_fences: *const std.StringHashMapUnmanaged(TargetedIndexPublicationFence),
+        index_authorities: *const std.StringHashMapUnmanaged(TargetedIndexAuthority),
+        has_active_index_transition: bool,
     ) !LocalTableRuntimeStatus {
         var owned = incoming;
         errdefer owned.deinit(self.alloc);
-        try self.mergeRefreshStatusLocked(previous, &owned, now_ns, targeted_index_fences);
+        try self.mergeRefreshStatusLocked(
+            previous,
+            &owned,
+            now_ns,
+            index_authorities,
+            has_active_index_transition,
+        );
         return owned;
     }
 
@@ -1202,25 +1281,29 @@ pub const TableRuntimeSnapshotCache = struct {
 
     fn invalidateTableStateLocked(self: *@This(), state: *TableState) void {
         self.clearGroupsLocked(state);
-        self.clearTargetedIndexFencesLocked(state);
+        self.clearIndexAuthoritiesLocked(state);
         state.epoch.invalidation_epoch = self.next_invalidation_epoch;
         state.epoch.root_generation +%= 1;
         if (state.epoch.root_generation == 0) state.epoch.root_generation = 1;
     }
 
-    fn clearTargetedIndexFencesLocked(self: *@This(), state: *TableState) void {
-        var it = state.targeted_index_fences.keyIterator();
+    fn clearIndexAuthoritiesLocked(self: *@This(), state: *TableState) void {
+        var it = state.index_authorities.keyIterator();
         while (it.next()) |name| self.alloc.free(@constCast(name.*));
-        state.targeted_index_fences.clearRetainingCapacity();
+        state.index_authorities.clearRetainingCapacity();
+        state.active_index_transition_count = 0;
     }
 
-    fn settleReleasedTargetedIndexFencesLocked(self: *@This(), state: *TableState) void {
-        if (state.groups.count() == 0 or state.targeted_index_fences.count() == 0) return;
+    fn settleReleasedIndexAuthoritiesLocked(self: *@This(), state: *TableState) void {
+        _ = self;
+        if (state.groups.count() == 0 or state.active_index_transition_count == 0) return;
         while (true) {
             var settled_name: ?[]const u8 = null;
-            var fence_it = state.targeted_index_fences.iterator();
+            var fence_it = state.index_authorities.iterator();
             while (fence_it.next()) |entry| {
+                if (!entry.value_ptr.transition_active) continue;
                 if (entry.value_ptr.owner_count != 0) continue;
+                if (!entry.value_ptr.target_authority_handed_off) continue;
                 const release_generation = entry.value_ptr.release_after_observation_generation orelse continue;
                 var all_groups_authoritative = true;
                 var group_it = state.groups.valueIterator();
@@ -1238,17 +1321,21 @@ pub const TableRuntimeSnapshotCache = struct {
                 }
             }
             const name = settled_name orelse return;
-            const removed = state.targeted_index_fences.fetchRemove(name).?;
-            self.alloc.free(@constCast(removed.key));
+            const authority = state.index_authorities.getPtr(name).?;
+            authority.transition_active = false;
+            authority.release_after_observation_generation = null;
+            std.debug.assert(state.active_index_transition_count > 0);
+            state.active_index_transition_count -= 1;
         }
     }
 
     fn advanceTargetedIndexAuthorityLocked(self: *@This(), state: *TableState) void {
         _ = self;
-        if (state.groups.count() == 0 or state.targeted_index_fences.count() == 0) return;
-        var fence_it = state.targeted_index_fences.iterator();
+        if (state.groups.count() == 0 or state.active_index_transition_count == 0) return;
+        var fence_it = state.index_authorities.iterator();
         while (fence_it.next()) |entry| {
             const fence = entry.value_ptr;
+            if (!fence.transition_active) continue;
             if (fence.target_authority_handed_off) continue;
             var all_groups_authoritative = true;
             var group_it = state.groups.valueIterator();
@@ -1284,6 +1371,28 @@ pub const TableRuntimeSnapshotCache = struct {
                     item.runtime_observation_serviceable = true;
                     item.runtime_observation_targeted_sibling = true;
                 }
+            }
+        }
+    }
+
+    /// Applies the persistent catalog watermark independently of transition
+    /// ownership. Settling a fence must not make a deleted or superseded
+    /// incarnation eligible for a later generic status publication.
+    fn enforceIndexAuthoritiesLocked(self: *@This(), state: *TableState) void {
+        _ = self;
+        if (state.index_authorities.count() == 0) return;
+        var status_it = state.groups.valueIterator();
+        while (status_it.next()) |status| {
+            for (status.stats.indexes) |*item| {
+                const authority = state.index_authorities.get(item.name) orelse continue;
+                const accepted = switch (authority.expectation) {
+                    .unknown, .absent => false,
+                    .exact => targetAuthorityAcceptsIdentity(authority, item.*),
+                };
+                if (accepted) continue;
+                item.runtime_observation_stale = true;
+                item.runtime_observation_serviceable = false;
+                item.runtime_observation_targeted_sibling = false;
             }
         }
     }
@@ -1345,7 +1454,8 @@ fn preserveArtifactVisibilityOnReplayRegression(
     alloc: std.mem.Allocator,
     previous: LocalTableRuntimeStatus,
     incoming: *LocalTableRuntimeStatus,
-    targeted_index_fences: ?*const std.StringHashMapUnmanaged(TargetedIndexPublicationFence),
+    index_authorities: ?*const std.StringHashMapUnmanaged(TargetedIndexAuthority),
+    has_active_index_transition: bool,
     structural_target_index_name: ?[]const u8,
 ) !void {
     var preserved_visibility = false;
@@ -1355,6 +1465,15 @@ fn preserveArtifactVisibilityOnReplayRegression(
         dst.runtime_observation_serviceable = false;
         dst.runtime_observation_targeted_sibling = false;
         const cached = findMatchingIndexStatus(previous.stats.indexes, dst.name, dst.kind) orelse continue;
+        const accepted_authority_continuity = if (index_authorities) |authorities|
+            if (authorities.get(dst.name)) |authority|
+                (!authority.transition_active or authority.target_authority_handed_off) and
+                    targetAuthorityAcceptsIdentity(authority, cached) and
+                    !targetAuthorityAcceptsIdentity(authority, dst.*)
+            else
+                false
+        else
+            false;
         const derived_index = dst.kind == .dense_vector or dst.kind == .sparse_vector;
         const same_runtime_root = incoming.metadata.lsm_root_generation == previous.metadata.lsm_root_generation;
         const same_derived_incarnation = derived_index and
@@ -1403,9 +1522,12 @@ fn preserveArtifactVisibilityOnReplayRegression(
             dst.projection_checkpoint_applied_sequence < cached.projection_checkpoint_applied_sequence;
         const previous_observation_serviceable = previous.metadata.freshness == .fresh or
             cached.runtime_observation_serviceable;
-        const untouched_targeted_sibling = if (targeted_index_fences) |fences|
-            fences.count() > 0 and
-                (if (fences.get(dst.name)) |fence| fence.target_authority_handed_off else true)
+        const untouched_targeted_sibling = if (index_authorities) |authorities|
+            has_active_index_transition and
+                (if (authorities.get(dst.name)) |authority|
+                    !authority.transition_active or authority.target_authority_handed_off
+                else
+                    true)
         else
             false;
         // A named in-place mutation cannot change a sibling incarnation or
@@ -1423,11 +1545,12 @@ fn preserveArtifactVisibilityOnReplayRegression(
             previous_observation_serviceable and
             !cached.runtime_observation_stale and
             dst.load_error == null;
-        const target_fence_accepts_same_incarnation = if (targeted_index_fences) |fences|
-            if (fences.get(dst.name)) |fence|
-                !fence.target_authority_handed_off and
-                    incoming.cache_observation_generation >= fence.accept_target_after_observation_generation and
-                    targetFenceAcceptsIdentity(fence, dst.*) and
+        const target_fence_accepts_same_incarnation = if (index_authorities) |authorities|
+            if (authorities.get(dst.name)) |authority|
+                authority.transition_active and
+                    !authority.target_authority_handed_off and
+                    incoming.cache_observation_generation >= authority.accept_target_after_observation_generation and
+                    targetAuthorityAcceptsIdentity(authority, dst.*) and
                     same_derived_incarnation and
                     same_runtime_root
             else
@@ -1441,7 +1564,9 @@ fn preserveArtifactVisibilityOnReplayRegression(
             (!cached.runtime_observation_stale or target_fence_accepts_same_incarnation) and
             cached.coverage_summary_ready and
             indexHasPublishedGenerationVisibility(cached);
-        const serviceable_continuity = serviceable_catch_up_continuity or targeted_sibling_continuity;
+        const serviceable_continuity = serviceable_catch_up_continuity or
+            targeted_sibling_continuity or
+            accepted_authority_continuity;
         dst.runtime_observation_serviceable = serviceable_continuity;
         dst.runtime_observation_targeted_sibling = targeted_sibling_continuity;
         const visibility_regressed_without_newer_replay = serviceable_continuity and
@@ -1449,6 +1574,7 @@ fn preserveArtifactVisibilityOnReplayRegression(
             !indexHasPublishedGenerationVisibility(dst.*) and
             dst.replay_applied_sequence <= cached.replay_applied_sequence;
         if (!targeted_sibling_continuity and
+            !accepted_authority_continuity and
             !serving_visibility_regressed and
             !applied_regressed and
             !projection_regressed and
@@ -1456,10 +1582,12 @@ fn preserveArtifactVisibilityOnReplayRegression(
 
         preserveIndexArtifactVisibility(dst, cached);
         if (targeted_sibling_continuity or
+            accepted_authority_continuity or
             projection_regressed or
             visibility_regressed_without_newer_replay or
             (same_accepted_source_target and serving_cardinality_regressed))
             try preserveIndexProjectionLifecycle(alloc, dst, cached);
+        if (accepted_authority_continuity) dst.runtime_observation_stale = false;
         dst.replay_applied_sequence = @max(dst.replay_applied_sequence, cached.replay_applied_sequence);
         dst.replay_target_sequence = @max(dst.replay_target_sequence, cached.replay_target_sequence);
         dst.catch_up_applied_sequence = @max(dst.catch_up_applied_sequence, cached.catch_up_applied_sequence);
@@ -1635,7 +1763,7 @@ fn findIndexStatusByName(
 fn targetObservationHandsOffAuthority(
     item: db_mod.types.DBIndexStats,
     status: LocalTableRuntimeStatus,
-    expectation: TargetedIndexPublicationFence.Expectation,
+    expectation: TargetedIndexAuthority.Expectation,
 ) bool {
     const expected = switch (expectation) {
         .exact => |identity| identity,
@@ -1656,18 +1784,32 @@ fn targetObservationHandsOffAuthority(
     return indexHasPublishedArtifactVisibility(item);
 }
 
-fn targetExpectationIsAbsent(expectation: TargetedIndexPublicationFence.Expectation) bool {
+fn targetExpectationIsAbsent(expectation: TargetedIndexAuthority.Expectation) bool {
     return switch (expectation) {
         .absent => true,
         .unknown, .exact => false,
     };
 }
 
-fn targetFenceAcceptsIdentity(
-    fence: TargetedIndexPublicationFence,
+fn targetExpectationsEqual(
+    lhs: TargetedIndexAuthority.Expectation,
+    rhs: TargetedIndexAuthority.Expectation,
+) bool {
+    return switch (lhs) {
+        .unknown => rhs == .unknown,
+        .absent => rhs == .absent,
+        .exact => |identity| switch (rhs) {
+            .exact => |other| std.meta.eql(identity, other),
+            .unknown, .absent => false,
+        },
+    };
+}
+
+fn targetAuthorityAcceptsIdentity(
+    authority: TargetedIndexAuthority,
     item: db_mod.types.DBIndexStats,
 ) bool {
-    const expected = switch (fence.expectation) {
+    const expected = switch (authority.expectation) {
         .exact => |identity| identity,
         .unknown, .absent => return false,
     };
@@ -1676,14 +1818,21 @@ fn targetFenceAcceptsIdentity(
         item.coverage_config_hash == expected.config_hash;
 }
 
-fn targetedIndexExpectation(
+fn targetedIndexExpectationForPublishableGroups(
+    state: *const TableRuntimeSnapshotCache.TableState,
     statuses: []const LocalTableRuntimeStatus,
     index_name: []const u8,
-) !TargetedIndexPublicationFence.Expectation {
+    observation_generation: u64,
+) !?TargetedIndexAuthority.Expectation {
     if (statuses.len == 0) return error.EmptyTargetedIndexObservation;
-    var expected: ?TargetedIndexPublicationFence.Identity = null;
+    var expected: ?TargetedIndexAuthority.Identity = null;
     var observed_absent = false;
+    var has_publishable_group = false;
     for (statuses) |status| {
+        if (state.groups.get(status.group_id)) |cached| {
+            if (cached.cache_observation_generation > observation_generation) continue;
+        }
+        has_publishable_group = true;
         const item = findIndexStatusByName(status.stats.indexes, index_name) orelse {
             observed_absent = true;
             if (expected != null) return error.InconsistentTargetedIndexObservation;
@@ -1691,7 +1840,7 @@ fn targetedIndexExpectation(
         };
         if (observed_absent) return error.InconsistentTargetedIndexObservation;
         if (!item.coverage_identity_ready) return error.MissingTargetedIndexIdentity;
-        const identity: TargetedIndexPublicationFence.Identity = .{
+        const identity: TargetedIndexAuthority.Identity = .{
             .incarnation = item.coverage_generation,
             .config_hash = item.coverage_config_hash,
         };
@@ -1701,6 +1850,7 @@ fn targetedIndexExpectation(
             expected = identity;
         }
     }
+    if (!has_publishable_group) return null;
     return if (expected) |identity| .{ .exact = identity } else .absent;
 }
 
@@ -1739,17 +1889,21 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
     previous: LocalTableRuntimeStatus,
     placeholder: LocalTableRuntimeStatus,
     now_ns: u64,
-    targeted_index_fences: ?*const std.StringHashMapUnmanaged(TargetedIndexPublicationFence),
+    index_authorities: ?*const std.StringHashMapUnmanaged(TargetedIndexAuthority),
+    has_active_index_transition: bool,
 ) !LocalTableRuntimeStatus {
     if (placeholder.stats.indexes.len == 0) {
         var cloned = try previous.clone(alloc);
         cloned.replaceMetadata(cachedSnapshotMetadata(previous.metadata, placeholder.metadata, now_ns));
-        if (targeted_index_fences) |fences| {
+        if (index_authorities) |authorities| {
             for (cloned.stats.indexes) |*item| {
-                const targeted = if (fences.get(item.name)) |fence| !fence.target_authority_handed_off else false;
+                const targeted = if (authorities.get(item.name)) |authority|
+                    authority.transition_active and !authority.target_authority_handed_off
+                else
+                    false;
                 if (targeted) {
                     item.runtime_observation_stale = true;
-                } else if (fences.count() > 0) {
+                } else if (has_active_index_transition) {
                     item.runtime_observation_serviceable = true;
                     item.runtime_observation_targeted_sibling = true;
                 }
@@ -1786,7 +1940,7 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
     merged.replaceMetadata(cachedSnapshotMetadata(previous.metadata, placeholder.metadata, now_ns));
 
     for (merged.stats.indexes) |*dst| {
-        const target_fence = if (targeted_index_fences) |fences| fences.get(dst.name) else null;
+        const target_fence = if (index_authorities) |authorities| authorities.get(dst.name) else null;
         const targeted = if (target_fence) |fence| !fence.target_authority_handed_off else false;
         // A post-fence owner observation already belongs to the new target
         // incarnation even when it has not published a serviceable artifact.
@@ -1796,7 +1950,7 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
         const cached = findMatchingIndexStatus(previous.stats.indexes, dst.name, dst.kind) orelse continue;
         const target_facts_current = if (target_fence) |fence|
             previous.cache_observation_generation >= fence.accept_target_after_observation_generation and
-                targetFenceAcceptsIdentity(fence, cached)
+                targetAuthorityAcceptsIdentity(fence, cached)
         else
             false;
         if (targeted and !target_facts_current) continue;
@@ -1823,17 +1977,17 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
             dst.runtime_observation_targeted_sibling = false;
         }
     }
-    if (targeted_index_fences) |fences| {
+    if (index_authorities) |authorities| {
         for (merged.stats.indexes) |*dst| {
-            const target_fence = fences.get(dst.name);
+            const target_fence = authorities.get(dst.name);
             const targeted = if (target_fence) |fence|
-                !fence.target_authority_handed_off and
+                fence.transition_active and !fence.target_authority_handed_off and
                     previous.cache_observation_generation < fence.accept_target_after_observation_generation
             else
                 false;
             if (targeted) {
                 dst.runtime_observation_stale = true;
-            } else if (target_fence == null and fences.count() > 0) {
+            } else if (target_fence == null and has_active_index_transition) {
                 dst.runtime_observation_serviceable = true;
                 dst.runtime_observation_targeted_sibling = true;
             }
@@ -3471,7 +3625,7 @@ test "targeted publication fence preserves only untouched siblings during catch 
     try std.testing.expect(!thumbnail.runtime_observation_targeted_sibling);
 
     cache.releaseTargetedIndexPublications("docs", "thumbnail");
-    try std.testing.expectEqual(@as(usize, 1), cache.tables.getPtr("docs").?.targeted_index_fences.count());
+    try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.transition_active);
     var fresh_indexes = [_]db_mod.types.DBIndexStats{
         .{
             .name = "semantic_idx",
@@ -3506,7 +3660,19 @@ test "targeted publication fence preserves only untouched siblings during catch 
             .stats = .{ .source_doc_count = 2, .doc_count = 2, .index_count = fresh_indexes.len, .indexes = &fresh_indexes },
         }),
     );
-    try std.testing.expectEqual(@as(usize, 0), cache.tables.getPtr("docs").?.targeted_index_fences.count());
+    // Freshness alone cannot retire an unknown desired target. Only the
+    // structural publication may bind the incarnation and complete handoff.
+    try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.transition_active);
+    const structural_token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishTargetedGroups(structural_token, "docs", "thumbnail", &.{.{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .source_doc_count = 2, .doc_count = 2, .index_count = fresh_indexes.len, .indexes = &fresh_indexes },
+        }}),
+    );
+    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.transition_active);
 }
 
 test "targeted publication fence waits for every overlapping owner" {
@@ -3515,17 +3681,17 @@ test "targeted publication fence waits for every overlapping owner" {
 
     cache.fenceTargetedIndexPublications("docs", "thumbnail");
     cache.fenceTargetedIndexPublications("docs", "thumbnail");
-    var fence = cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("thumbnail").?;
+    var fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expectEqual(@as(usize, 2), fence.owner_count);
     try std.testing.expectEqual(@as(?u64, null), fence.release_after_observation_generation);
 
     cache.releaseTargetedIndexPublications("docs", "thumbnail");
-    fence = cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("thumbnail").?;
+    fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expectEqual(@as(usize, 1), fence.owner_count);
     try std.testing.expectEqual(@as(?u64, null), fence.release_after_observation_generation);
 
     cache.releaseTargetedIndexPublications("docs", "thumbnail");
-    fence = cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("thumbnail").?;
+    fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expectEqual(@as(usize, 0), fence.owner_count);
     try std.testing.expect(fence.release_after_observation_generation != null);
 
@@ -3533,7 +3699,7 @@ test "targeted publication fence waits for every overlapping owner" {
     // not allowed to settle the newly observed durable repair edge.
     const racing_token = try cache.capturePublicationToken("docs");
     try std.testing.expect(cache.fenceIndexRepairPublications("docs", "thumbnail"));
-    fence = cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("thumbnail").?;
+    fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expect(!fence.target_authority_handed_off);
     try std.testing.expect(fence.accept_target_after_observation_generation > racing_token.observation_generation);
 }
@@ -3592,7 +3758,92 @@ test "targeted catch up hands off same incarnation serving authority" {
     try std.testing.expect(target.runtime_observation_serviceable);
     try std.testing.expectEqual(@as(u64, 3), target.doc_count);
     try std.testing.expectEqual(@as(u64, 3), target.coverage_produced_count);
-    try std.testing.expect(cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("thumbnail").?.target_authority_handed_off);
+    try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.target_authority_handed_off);
+}
+
+test "target authority settles only after every group acknowledges the exact incarnation" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var old_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .coverage_generation = 12,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .serving_snapshot_ready = true,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroups(initial, "docs", &.{
+            .{
+                .group_id = 7,
+                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+                .stats = .{ .index_count = 1, .indexes = old_indexes[0..] },
+            },
+            .{
+                .group_id = 8,
+                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+                .stats = .{ .index_count = 1, .indexes = old_indexes[0..] },
+            },
+        }),
+    );
+
+    cache.fenceTargetedIndexPublications("docs", "thumbnail");
+    cache.armTargetedIndexPublications("docs", "thumbnail");
+    var desired_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .coverage_generation = 13,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .serving_snapshot_ready = true,
+    }};
+    const first_group = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishTargetedGroups(first_group, "docs", "thumbnail", &.{.{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = desired_indexes[0..] },
+        }}),
+    );
+    cache.releaseTargetedIndexPublications("docs", "thumbnail");
+    var authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    try std.testing.expect(authority.transition_active);
+    try std.testing.expect(!authority.target_authority_handed_off);
+
+    const final_group = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(final_group, "docs", .{
+            .group_id = 8,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = desired_indexes[0..] },
+        }),
+    );
+    authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    try std.testing.expect(authority.target_authority_handed_off);
+    try std.testing.expect(authority.transition_active);
+
+    // Exact identity handoff and transition settlement are separate gates:
+    // every group must also publish once after the last mutation owner exits.
+    const post_release_first_group = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(post_release_first_group, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = desired_indexes[0..] },
+        }),
+    );
+    authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    try std.testing.expect(!authority.transition_active);
+    try std.testing.expectEqual(@as(usize, 0), cache.tables.getPtr("docs").?.active_index_transition_count);
 }
 
 test "targeted publication rejects a completed stale incarnation until structural acknowledgement" {
@@ -3640,7 +3891,7 @@ test "targeted publication rejects a completed stale incarnation until structura
     const stale = findIndexStatusByName(fenced.stats.indexes, "semantic_idx").?;
     try std.testing.expect(stale.runtime_observation_stale);
     try std.testing.expect(!stale.runtime_observation_serviceable);
-    try std.testing.expect(!cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("semantic_idx").?.target_authority_handed_off);
+    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?.target_authority_handed_off);
 
     var new_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = @constCast("semantic_idx"),
@@ -3665,7 +3916,211 @@ test "targeted publication rejects a completed stale incarnation until structura
     const current = findIndexStatusByName(acknowledged.stats.indexes, "semantic_idx").?;
     try std.testing.expectEqual(@as(u64, 13), current.coverage_generation);
     try std.testing.expect(!current.runtime_observation_stale);
-    try std.testing.expect(cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("semantic_idx").?.target_authority_handed_off);
+    try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?.target_authority_handed_off);
+}
+
+test "settled target authority preserves the accepted incarnation against late publishers" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var old_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 3,
+        .serving_snapshot_ready = true,
+        .coverage_produced_count = 3,
+        .coverage_generation = 12,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(initial, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .source_doc_count = 3, .doc_count = 3, .index_count = 1, .indexes = old_indexes[0..] },
+        }),
+    );
+
+    cache.fenceTargetedIndexPublications("docs", "semantic_idx");
+    cache.armTargetedIndexPublications("docs", "semantic_idx");
+    var new_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .serving_snapshot_ready = true,
+        .coverage_produced_count = 1,
+        .coverage_generation = 13,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const structural = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishTargetedGroups(structural, "docs", "semantic_idx", &.{.{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .source_doc_count = 3, .doc_count = 1, .index_count = 1, .indexes = new_indexes[0..] },
+        }}),
+    );
+    cache.releaseTargetedIndexPublications("docs", "semantic_idx");
+    const settle = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(settle, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .source_doc_count = 3, .doc_count = 1, .index_count = 1, .indexes = new_indexes[0..] },
+        }),
+    );
+    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?.transition_active);
+
+    // The retiring owner can publish indefinitely late. The registry keeps
+    // the accepted generation serviceable instead of forgetting the fence.
+    const late = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(late, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .source_doc_count = 3, .doc_count = 3, .index_count = 1, .indexes = old_indexes[0..] },
+        }),
+    );
+    var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer observed.deinit(alloc);
+    const current = findIndexStatusByName(observed.stats.indexes, "semantic_idx").?;
+    try std.testing.expectEqual(@as(u64, 13), current.coverage_generation);
+    try std.testing.expectEqual(@as(u64, 1), current.doc_count);
+    try std.testing.expect(!current.runtime_observation_stale);
+    try std.testing.expect(current.runtime_observation_serviceable);
+}
+
+test "targeted authority binding is monotonic under reversed publication order" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    cache.fenceTargetedIndexPublications("docs", "semantic_idx");
+    cache.armTargetedIndexPublications("docs", "semantic_idx");
+    const older_token = try cache.capturePublicationToken("docs");
+    const newer_token = try cache.capturePublicationToken("docs");
+    var older_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_generation = 12,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+    }};
+    var newer_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_generation = 13,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+    }};
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishTargetedGroups(newer_token, "docs", "semantic_idx", &.{.{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = newer_indexes[0..] },
+        }}),
+    );
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.stale_observation,
+        try cache.publishTargetedGroups(older_token, "docs", "semantic_idx", &.{.{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = older_indexes[0..] },
+        }}),
+    );
+    const late_old_token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.stale_observation,
+        try cache.publishTargetedGroups(late_old_token, "docs", "semantic_idx", &.{.{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = older_indexes[0..] },
+        }}),
+    );
+    const authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?;
+    switch (authority.expectation) {
+        .exact => |identity| try std.testing.expectEqual(@as(u64, 13), identity.incarnation),
+        .unknown, .absent => return error.TestUnexpectedResult,
+    }
+}
+
+test "wholly stale targeted publication cannot bind unknown authority" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var old_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_generation = 12,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(initial, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = old_indexes[0..] },
+        }),
+    );
+
+    cache.fenceTargetedIndexPublications("docs", "semantic_idx");
+    cache.armTargetedIndexPublications("docs", "semantic_idx");
+    const delayed_structural = try cache.capturePublicationToken("docs");
+    const newer_owner = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(newer_owner, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = old_indexes[0..] },
+        }),
+    );
+
+    var desired_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_generation = 13,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+    }};
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.stale_observation,
+        try cache.publishTargetedGroups(delayed_structural, "docs", "semantic_idx", &.{.{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = desired_indexes[0..] },
+        }}),
+    );
+    var authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?;
+    try std.testing.expect(authority.expectation == .unknown);
+
+    const current_structural = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishTargetedGroups(current_structural, "docs", "semantic_idx", &.{.{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = desired_indexes[0..] },
+        }}),
+    );
+    authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?;
+    switch (authority.expectation) {
+        .exact => |identity| try std.testing.expectEqual(@as(u64, 13), identity.incarnation),
+        .unknown, .absent => return error.TestUnexpectedResult,
+    }
 }
 
 test "targeted deletion hands off only after authoritative absence" {
@@ -3694,7 +4149,8 @@ test "targeted deletion hands off only after authoritative absence" {
     cache.fenceTargetedIndexPublications("docs", "semantic_idx");
     cache.armTargetedIndexPublications("docs", "semantic_idx");
     cache.acknowledgeTargetedIndexAbsence("docs", "semantic_idx");
-    try std.testing.expect(!cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("semantic_idx").?.target_authority_handed_off);
+    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?.target_authority_handed_off);
+    cache.releaseTargetedIndexPublications("docs", "semantic_idx");
 
     const absent = try cache.capturePublicationToken("docs");
     try std.testing.expectEqual(
@@ -3705,10 +4161,29 @@ test "targeted deletion hands off only after authoritative absence" {
             .stats = .{},
         }),
     );
-    try std.testing.expect(cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("semantic_idx").?.target_authority_handed_off);
+    const authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?;
+    try std.testing.expect(authority.target_authority_handed_off);
+    try std.testing.expect(!authority.transition_active);
     var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
     defer observed.deinit(alloc);
     try std.testing.expect(findIndexStatusByName(observed.stats.indexes, "semantic_idx") == null);
+
+    // A deleted name retains an absence watermark. A retiring writer may be
+    // observed for diagnostics, but it can never regain serving authority.
+    const late = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(late, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = indexes[0..] },
+        }),
+    );
+    var resurrected = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer resurrected.deinit(alloc);
+    const stale = findIndexStatusByName(resurrected.stats.indexes, "semantic_idx").?;
+    try std.testing.expect(stale.runtime_observation_stale);
+    try std.testing.expect(!stale.runtime_observation_serviceable);
 }
 
 test "table runtime snapshot cache batch publication is table epoch atomic" {
@@ -3890,7 +4365,7 @@ test "synthetic refresh cannot outrank targeted structural owner observation" {
     try std.testing.expect(!target.runtime_observation_stale);
     try std.testing.expect(target.runtime_observation_serviceable);
     try std.testing.expectEqual(@as(u64, 1), target.doc_count);
-    try std.testing.expect(cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("thumbnail").?.target_authority_handed_off);
+    try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.target_authority_handed_off);
 }
 
 test "synthetic refresh preserves post-fence target facts before serving handoff" {
@@ -3920,7 +4395,7 @@ test "synthetic refresh preserves post-fence target facts before serving handoff
             .stats = .{ .source_doc_count = 100, .index_count = 1, .indexes = owner_indexes[0..] },
         }}),
     );
-    try std.testing.expect(!cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("thumbnail").?.target_authority_handed_off);
+    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.target_authority_handed_off);
     cache.releaseTargetedIndexPublications("docs", "thumbnail");
 
     const synthetic_token = try cache.capturePublicationToken("docs");
@@ -4345,7 +4820,7 @@ test "live writer artifact regression keeps authoritative source deletions" {
         },
     };
 
-    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.source_doc_count);
     try std.testing.expectEqual(@as(u64, 1), incoming.stats.doc_count);
 }
@@ -4391,7 +4866,7 @@ test "catching up observation preserves same-incarnation published visibility" {
         },
     };
 
-    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
     try std.testing.expectEqual(@as(u64, 2), incoming.stats.doc_count);
     try std.testing.expectEqual(@as(u64, 2), incoming.stats.indexes[0].doc_count);
     try std.testing.expectEqual(@as(u64, 1), incoming.stats.indexes[0].node_count);
@@ -4450,7 +4925,7 @@ test "projection continuity preserves lifecycle classification as one bundle" {
         .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
     };
 
-    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
     const retained = incoming.stats.indexes[0];
     try std.testing.expectEqual(@as(?u128, 91), retained.index_repair_id);
     try std.testing.expectEqual(db_mod.types.IndexLifecycleWorkClass.initial_build, retained.index_lifecycle_work_class);
@@ -4500,7 +4975,7 @@ test "catching up observation cannot preserve a same-config replacement incarnat
         },
     };
 
-    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.doc_count);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.indexes[0].doc_count);
     try std.testing.expectEqual(@as(u64, 43), incoming.stats.indexes[0].coverage_generation);
@@ -4537,7 +5012,7 @@ test "catching up observation cannot preserve across an lsm root change" {
         .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
     };
 
-    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.doc_count);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.indexes[0].doc_count);
     try std.testing.expect(!incoming.stats.indexes[0].runtime_observation_serviceable);
@@ -4572,7 +5047,7 @@ test "unpublished embeddings incarnation cannot mint catch up serviceability" {
         .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
     };
 
-    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
     try std.testing.expect(!incoming.stats.indexes[0].runtime_observation_serviceable);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.source_doc_count);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.indexes[0].coverage_produced_count);
@@ -4608,7 +5083,7 @@ test "empty embeddings incarnation preserves serviceability during catch up" {
         .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
     };
 
-    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
     try std.testing.expect(incoming.stats.indexes[0].runtime_observation_serviceable);
     try std.testing.expect(incoming.stats.indexes[0].serving_snapshot_ready);
     try std.testing.expect(incoming.stats.indexes[0].coverage_identity_ready);
@@ -4645,7 +5120,7 @@ test "synthetic relabel cannot reuse cached catch up serviceability" {
             .stats = .{ .index_count = 1, .indexes = placeholder_indexes[0..] },
         };
 
-        var merged = try mergeCachedStatusWithSyntheticPlaceholder(std.testing.allocator, previous, placeholder, 100, null);
+        var merged = try mergeCachedStatusWithSyntheticPlaceholder(std.testing.allocator, previous, placeholder, 100, null, false);
         defer merged.deinit(std.testing.allocator);
         try std.testing.expectEqual(freshness, merged.metadata.freshness);
         try std.testing.expect(!merged.stats.indexes[0].runtime_observation_serviceable);
@@ -4683,7 +5158,7 @@ test "all-skipped embeddings incarnation preserves logical publication during ca
         .stats = .{ .source_doc_count = 2, .index_count = 1, .indexes = incoming_indexes[0..] },
     };
 
-    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
     try std.testing.expect(incoming.stats.indexes[0].runtime_observation_serviceable);
     try std.testing.expect(incoming.stats.indexes[0].serving_snapshot_ready);
     try std.testing.expectEqual(@as(u64, 2), incoming.stats.indexes[0].coverage_skipped_count);

@@ -41406,7 +41406,7 @@ test "unrelated repair visibility edge invalidates during targeted reconciliatio
     try std.testing.expectEqual(@as(usize, 1), handoff_pending);
 }
 
-test "repair edge after target authority release fails closed" {
+test "repair edge after target release retains target authority until handoff" {
     const alloc = std.testing.allocator;
     var cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
     defer cache.deinit();
@@ -41442,7 +41442,9 @@ test "repair edge after target authority release fails closed" {
             .stats = .{ .index_count = indexes.len, .indexes = &indexes },
         }),
     );
-    try std.testing.expectEqual(@as(usize, 0), cache.tables.getPtr("docs").?.targeted_index_fences.count());
+    const pending_authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    try std.testing.expect(pending_authority.transition_active);
+    try std.testing.expect(!pending_authority.target_authority_handed_off);
 
     ProvisionedTableWriteSource.onManagedDerivedVisibilityEvent(
         &source,
@@ -41460,7 +41462,12 @@ test "repair edge after target authority release fails closed" {
             },
         },
     );
-    try std.testing.expect((try cache.snapshot(alloc, "docs")) == null);
+    var observed = (try cache.snapshot(alloc, "docs")).?;
+    defer observed.deinit(alloc);
+    const search = observed.items[0].stats.indexes[0];
+    const thumbnail = observed.items[0].stats.indexes[1];
+    try std.testing.expect(!search.runtime_observation_stale);
+    try std.testing.expect(thumbnail.runtime_observation_stale);
 }
 
 test "initial build edge after target authority release preserves runtime observation" {
@@ -45534,6 +45541,7 @@ test "targeted repair publication preserves sibling authority fence" {
             .kind = .dense_vector,
             .doc_count = 1,
             .node_count = 1,
+            .serving_snapshot_ready = true,
             .coverage_produced_count = 1,
             .coverage_skipped_count = 1,
             .coverage_config_hash = 77,
