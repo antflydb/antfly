@@ -51,17 +51,20 @@ test {
     _ = download;
 }
 
-/// Friendly short names accepted by user-facing commands (chat) in place of a
-/// full HuggingFace `owner/name[:variant]` reference. The blessed sources are
-/// Google's official QAT q4_0 GGUF conversions — the checkpoints production
-/// workflows already run on. Each repo carries a single decoder GGUF plus an
-/// mmproj sidecar, so the plain `:gguf` variant resolves unambiguously.
+/// Friendly short names accepted by user-facing commands in place of a full
+/// HuggingFace `owner/name[:variant]` reference. Every entry selects a qualified
+/// production artifact explicitly rather than relying on repository contents
+/// to remain unambiguous.
 pub const FriendlyAlias = struct {
     alias: []const u8,
     ref: []const u8,
 };
 
+pub const bge_m3_pinned_revision = "84790c1a606f60d06c6932e4ecdd174b466d84ac";
+pub const bge_m3_pinned_ref = "BAAI/bge-m3:safetensors@" ++ bge_m3_pinned_revision;
+
 pub const friendly_aliases = [_]FriendlyAlias{
+    .{ .alias = "bge-m3", .ref = bge_m3_pinned_ref },
     .{ .alias = "gemma4-e2b", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma-4-e2b", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma4-e2b-it", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
@@ -74,6 +77,11 @@ pub const friendly_aliases = [_]FriendlyAlias{
 /// Returns null when the name is not a known alias (callers then treat it as
 /// a raw model reference or path).
 pub fn resolveFriendlyRef(name: []const u8) ?[]const u8 {
+    const without_hf = if (std.mem.startsWith(u8, name, "hf:")) name[3..] else name;
+    // BGE-M3 main currently publishes framework weights but no safetensors.
+    // Resolve the canonical repo reference to the qualified official commit so
+    // pull, local chat, and server lookup all share one immutable cache key.
+    if (std.ascii.eqlIgnoreCase(without_hf, "BAAI/bge-m3")) return bge_m3_pinned_ref;
     for (friendly_aliases) |entry| {
         if (std.ascii.eqlIgnoreCase(entry.alias, name)) return entry.ref;
     }
@@ -92,12 +100,20 @@ test "resolveFriendlyRef resolves gemma4 aliases case-insensitively" {
     try std.testing.expect(resolveFriendlyRef("ggml-org/gemma-4-e2b-it-gguf") == null);
 }
 
-test "friendly alias refs parse as model refs" {
+test "resolveFriendlyRef pins BGE-M3 to the qualified safetensors commit" {
+    try std.testing.expectEqualStrings(bge_m3_pinned_ref, resolveFriendlyRef("bge-m3").?);
+    try std.testing.expectEqualStrings(bge_m3_pinned_ref, resolveFriendlyRef("BAAI/bge-m3").?);
+    try std.testing.expectEqualStrings(bge_m3_pinned_ref, resolveFriendlyRef("hf:BAAI/bge-m3").?);
+    const ref = try ModelRef.parse(bge_m3_pinned_ref);
+    try std.testing.expectEqualStrings("safetensors@" ++ bge_m3_pinned_revision, ref.variant);
+}
+
+test "friendly alias refs parse as explicit model refs" {
     for (friendly_aliases) |entry| {
         const ref = try ModelRef.parse(entry.ref);
         try std.testing.expect(ref.owner.len > 0);
         try std.testing.expect(ref.name.len > 0);
-        try std.testing.expectEqualStrings("gguf", ref.variant);
+        try std.testing.expect(!std.mem.eql(u8, "auto", ref.variant));
     }
 }
 
@@ -426,7 +442,8 @@ pub const ModelRegistry = struct {
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
     ) !void {
-        const ref = try ModelRef.parse(ref_str);
+        const resolved_ref = resolveFriendlyRef(ref_str) orelse ref_str;
+        const ref = try ModelRef.parse(resolved_ref);
         const resolved_models_dir = try resolveModelsDirForWriteAlloc(self.allocator, io, self.models_dir);
         defer self.allocator.free(resolved_models_dir);
 
