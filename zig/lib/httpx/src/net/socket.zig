@@ -151,6 +151,7 @@ pub const Socket = struct {
     io: Io,
     recv_timeout_ms: ?u64 = null,
     send_timeout_ms: ?u64 = null,
+    native_timeouts: bool = false,
     request_deadline_ms: ?i64 = null,
     request_cancel_cb: ?*const fn (context: ?*anyopaque) bool = null,
     request_cancel_ctx: ?*anyopaque = null,
@@ -165,7 +166,11 @@ pub const Socket = struct {
     /// Connects to the given address and returns a connected TCP socket.
     pub fn connect(addr: Address, io: Io) !Self {
         const stream = try addr.connect(io, .{ .mode = .stream });
-        return .{ .handle = stream.socket.handle, .io = io };
+        return .{
+            .handle = stream.socket.handle,
+            .io = io,
+            .native_timeouts = isThreadedNetworkIo(io),
+        };
     }
 
     /// Resolves a host and tries each concrete address in resolver order.
@@ -220,7 +225,11 @@ pub const Socket = struct {
 
     /// Creates a socket from a raw handle (e.g. from accept).
     pub fn fromHandle(handle: net.Socket.Handle, io: Io) Self {
-        return .{ .handle = handle, .io = io };
+        return .{
+            .handle = handle,
+            .io = io,
+            .native_timeouts = isThreadedNetworkIo(io),
+        };
     }
 
     /// Closes the socket.
@@ -408,6 +417,13 @@ pub const Socket = struct {
     }
 
     fn netReadWithTimeout(self: *Self, buffer: []u8, timeout_ms: ?u64) !usize {
+        if (self.native_timeouts and !is_windows) {
+            if (timeout_ms) |timeout| try self.setNativeTimeout(posix.SO.RCVTIMEO, timeout);
+            return posix.read(self.handle, buffer) catch |err| switch (err) {
+                error.WouldBlock => error.Timeout,
+                else => err,
+            };
+        }
         const timeout = timeout_ms orelse return self.netRead(buffer);
         const Outcome = union(enum) {
             operation: void,
@@ -433,6 +449,10 @@ pub const Socket = struct {
     }
 
     fn netWriteWithTimeout(self: *Self, data: []const u8, timeout_ms: ?u64) !usize {
+        if (self.native_timeouts and !is_windows) {
+            if (timeout_ms) |timeout| try self.setNativeTimeout(posix.SO.SNDTIMEO, timeout);
+            return sendPosixOnce(self.handle, data);
+        }
         const timeout = timeout_ms orelse return self.netWrite(data);
         const Outcome = union(enum) {
             operation: void,
@@ -475,12 +495,36 @@ pub const Socket = struct {
 
     /// Sets the receive timeout in milliseconds.
     pub fn setRecvTimeout(self: *Self, ms: u64) !void {
+        if (self.native_timeouts) return self.setNativeTimeout(posix.SO.RCVTIMEO, ms);
         self.recv_timeout_ms = if (ms == 0) null else ms;
     }
 
     /// Sets the send timeout in milliseconds.
     pub fn setSendTimeout(self: *Self, ms: u64) !void {
+        if (self.native_timeouts) return self.setNativeTimeout(posix.SO.SNDTIMEO, ms);
         self.send_timeout_ms = if (ms == 0) null else ms;
+    }
+
+    /// Select native socket timeout options only when the owner has proven the
+    /// handle belongs to the host backend. Reads and writes still use std.Io;
+    /// virtual handles retain the logical Select-based timeout path.
+    pub fn enableNativeTimeouts(self: *Self) void {
+        self.native_timeouts = true;
+        self.recv_timeout_ms = null;
+        self.send_timeout_ms = null;
+    }
+
+    fn setNativeTimeout(self: *Self, opt: u32, ms: u64) !void {
+        if (is_windows) {
+            const value_ms: u32 = @intCast(@min(ms, @as(u64, std.math.maxInt(u32))));
+            try setSocketOption(self.handle, posix.SOL.SOCKET, opt, std.mem.asBytes(&value_ms));
+        } else {
+            const tv = posix.timeval{
+                .sec = @intCast(ms / 1000),
+                .usec = @intCast((ms % 1000) * 1000),
+            };
+            try setSocketOption(self.handle, posix.SOL.SOCKET, opt, std.mem.asBytes(&tv));
+        }
     }
 
     fn setSocketOption(fd: net.Socket.Handle, level: i32, optname: u32, opt: []const u8) !void {
@@ -1515,9 +1559,12 @@ test "Socket recv timeout returns error.Timeout" {
     var accepted = try listener.accept();
     defer accepted.socket.close();
 
-    // Keep deadline behavior inside std.Io. Kernel SO_RCVTIMEO turns an
-    // otherwise blocking Threaded netRead into EAGAIN, which Zig 0.16 treats
-    // as a programmer error instead of a timeout result.
+    // Host Threaded sockets use the kernel deadline rather than consuming two
+    // executor tasks to race every read against a sleeping timer. Besides
+    // avoiding per-operation scheduling overhead, this keeps a saturated
+    // async lane from running the timer eagerly before the read is submitted.
+    try std.testing.expect(client.native_timeouts);
+    try std.testing.expect(accepted.socket.native_timeouts);
     try accepted.socket.setRecvTimeout(50);
 
     var recv_buf: [8]u8 = undefined;

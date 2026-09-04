@@ -11920,6 +11920,31 @@ pub const ProvisionedTableWriteSource = struct {
         allow_bulk_session: bool,
         managed_open_options: ManagedDbOpenOptions,
     ) !ProvisionedTableWriteCache.CachedDb {
+        return try self.getOrOpenCachedDbForLocalMutationWithOptionsAndMetadata(
+            alloc,
+            cache,
+            path,
+            group_id,
+            lsm_root_generation,
+            table_name,
+            allow_bulk_session,
+            managed_open_options,
+            null,
+        );
+    }
+
+    fn getOrOpenCachedDbForLocalMutationWithOptionsAndMetadata(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        cache: *ProvisionedTableWriteCache,
+        path: []const u8,
+        group_id: u64,
+        lsm_root_generation: u64,
+        table_name: []const u8,
+        allow_bulk_session: bool,
+        managed_open_options: ManagedDbOpenOptions,
+        preloaded_metadata: ?StartupCatchUpMetadata,
+    ) !ProvisionedTableWriteCache.CachedDb {
         if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
         cache.antfly_provider = self.antfly_provider;
         cache.inference_api_url = self.inference_api_url;
@@ -11948,7 +11973,7 @@ pub const ProvisionedTableWriteSource = struct {
                 return validated;
             }
             self.local_db_mutex.unlock();
-            return self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, null, managed_open_options) catch |err| {
+            return self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, preloaded_metadata, managed_open_options) catch |err| {
                 if (!isTransientWriterOpenConflict(err)) return err;
                 if (!managed_open_options.retry_transient_writer_open) return err;
                 const now_ns = platform_time.monotonicNs();
@@ -18045,7 +18070,7 @@ pub const ProvisionedTableWriteSource = struct {
 
                     const visible_generation = self.visibleRootGeneration(group_id);
                     {
-                        var cached = self.getOrOpenCachedDbForLocalMutationWithOptions(
+                        var cached = self.getOrOpenCachedDbForLocalMutationWithOptionsAndMetadata(
                             alloc,
                             cache,
                             path,
@@ -18053,7 +18078,15 @@ pub const ProvisionedTableWriteSource = struct {
                             visible_generation,
                             table_name,
                             false,
-                            .{ .identity_namespace_override = identity_namespace },
+                            .{
+                                .identity_namespace_override = identity_namespace,
+                                .reuse_cached_writer_for_metadata_reconcile = true,
+                            },
+                            .{
+                                .indexes_json = indexes_json,
+                                .schema_json = schema_json,
+                                .identity_namespace = identity_namespace,
+                            },
                         ) catch |err| {
                             if (err == error.LsmRootWriterAlreadyOpen) {
                                 if (structural_attempt < create_structural_publication_retry_limit) continue :cached_retry;
@@ -51456,6 +51489,25 @@ test "provisioned table write source create table provisions local indexes and s
 
     const Catalog = struct {
         var indexes_json: []const u8 = tables_api.default_indexes_json;
+        var schema: []const u8 = schema_json;
+        var admin_snapshot_calls: usize = 0;
+        var admin_snapshot_call_limit: ?usize = null;
+        var tables = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .description = "docs table",
+            .schema_json = schema_json,
+            .read_schema_json = "",
+            .indexes_json = tables_api.default_indexes_json,
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        }};
+        var ranges = [_]metadata_table_manager.RangeRecord{.{
+            .group_id = 7001,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        }};
 
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -51471,24 +51523,16 @@ test "provisioned table write source create table provisions local indexes and s
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            admin_snapshot_calls += 1;
+            if (admin_snapshot_call_limit) |limit| {
+                if (admin_snapshot_calls > limit) return error.UnexpectedCatalogReentry;
+            }
+            tables[0].indexes_json = indexes_json;
+            tables[0].schema_json = schema;
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .description = "docs table",
-                    .schema_json = schema_json,
-                    .read_schema_json = "",
-                    .indexes_json = indexes_json,
-                    .replication_sources_json = "[]",
-                    .placement_role = "data",
-                }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
-                    .group_id = 7001,
-                    .table_id = 7,
-                    .start_key = "",
-                    .end_key = null,
-                }})[0..]),
+                .tables = tables[0..],
+                .ranges = ranges[0..],
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -51506,12 +51550,21 @@ test "provisioned table write source create table provisions local indexes and s
     defer source.deinit();
     source.write_cache = &write_cache;
     Catalog.indexes_json = tables_api.default_indexes_json;
+    Catalog.schema = schema_json;
+    Catalog.admin_snapshot_calls = 0;
+    // The committed create already owns its table contract and routing
+    // capability. Its local writer open must not re-enter the catalog after
+    // the one routing projection.
+    Catalog.admin_snapshot_call_limit = 1;
+    defer Catalog.admin_snapshot_call_limit = null;
     var req = tables_api.CreateTableRequest{
         .schema_json = try alloc.dupe(u8, schema_json),
     };
     defer req.deinit(alloc);
 
     _ = try source.source().createTable(alloc, "docs", req);
+    try std.testing.expectEqual(@as(usize, 1), Catalog.admin_snapshot_calls);
+    Catalog.admin_snapshot_call_limit = null;
 
     {
         lockAtomic(&source.local_db_mutex);
@@ -51524,6 +51577,7 @@ test "provisioned table write source create table provisions local indexes and s
     const updated_schema_json =
         "{\"version\":1,\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"}}}}}}";
     Catalog.indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}";
+    Catalog.schema = updated_schema_json;
     _ = try source.source().updateSchema(alloc, "docs", updated_schema_json);
 
     {

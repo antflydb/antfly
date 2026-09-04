@@ -6799,6 +6799,7 @@ pub fn build(b: *std.Build) void {
             "native backup reclaims crash-left snapshot attempts from durable markers",
             "native backup reclaims a crash marker before snapshot root creation",
             "native backup never reclaims an old attempt with a live lease",
+            "provisioned table write source create table provisions local indexes and schema",
             "provisioned create succeeds when post-commit runtime status is fenced",
             "provisioned create retries a retired cache lease before structural publication",
             "provisioned create reuses a generation opened by startup reconciliation",
@@ -6983,7 +6984,10 @@ pub fn build(b: *std.Build) void {
     api_table_writes_production_regression_step.dependOn(&run_api_table_writes_production_regression_tests.step);
     const api_create_structural_retry_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
-        .filters = &.{"provisioned create retries a retired cache lease before structural publication"},
+        .filters = &.{
+            "provisioned table write source create table provisions local indexes and schema",
+            "provisioned create retries a retired cache lease before structural publication",
+        },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -6992,7 +6996,7 @@ pub fn build(b: *std.Build) void {
     const run_api_create_structural_retry_tests = addFilteredTestRunArtifact(b, api_create_structural_retry_tests);
     const api_create_structural_retry_step = b.step(
         "api-create-structural-retry-test",
-        "Run the isolated create structural-publication cache race regression",
+        "Run isolated create metadata and structural-publication regressions",
     );
     api_create_structural_retry_step.dependOn(&run_api_create_structural_retry_tests.step);
     const api_table_writes_restore_repeat_tests = b.addTest(.{
