@@ -1,5 +1,5 @@
 ---
-title: Search Images by What's in Them
+title: Build Image Search
 order: 8
 description: "An index over your images that answers a plain-language description, or another image, with the pictures that match"
 ---
@@ -12,7 +12,7 @@ description: "An index over your images that answers a plain-language descriptio
 - What does coverage_policy partial do?
 </Questions>
 
-By the end of this guide, "map of a country" returns the articles whose thumbnails are maps, and an image URL returns the pictures that look like it. No captioning step, no vision model in the middle: one embedding model places text and images in the same space, and it runs on Antfly Inference inside your instance. The examples run against the Wikipedia table from the [Quickstart](/docs/guides/quickstart), whose articles carry a `thumbnail_url` field:
+By the end of this guide, "map of a country" returns the articles whose thumbnails are maps, and an image URL returns the pictures that look like it. One embedding model places text and images in the same space, so there is no captioning step and no vision model in the middle, and it runs on Antfly Inference inside your instance. The examples run against the Wikipedia table from the [Quickstart](/docs/guides/quickstart), whose articles carry a `thumbnail_url` field:
 
 ```bash
 antfly query --table wikipedia --full-text-search 'title:Iceland' --fields title,thumbnail_url --limit 1
@@ -49,7 +49,6 @@ antfly query --table wikipedia \
 }
 ```
 
-Four steps get you there.
 
 ## 1. Pull the Model
 
@@ -143,9 +142,9 @@ A base64 data URI works the same way with `{{media url=this}}`. Mix text and ima
 
 ## Why One Model Sees Both
 
-The older way to search images was to caption them first: run a vision model over every picture, store the caption, embed the caption. Search then matched your words against the captioner's words, and the captioner decided in advance which details were worth a sentence.
+The older way to search images was to caption them first: run a vision model over every picture, store the caption, embed the caption. Search then matched your words against the captioner's words, so any detail the captioner left out was unsearchable.
 
-A multimodal embedder skips the sentence. Text and images land in one vector space, so "map of a country" and a picture of a map sit near each other with no description in between, and a query image compares directly against indexed images. That is also why the image index is a separate index rather than a field folded into the text index: the two spaces are different, and a query names which one it is asking. When you want text and picture weighed together, put both in one template (`{{title}} {{remoteMedia url=thumbnail_url}}`) and the model embeds the pair as one item.
+A multimodal embedder needs no caption. Text and images land in one vector space, so "map of a country" and a picture of a map sit near each other with no description in between, and a query image compares directly against indexed images. That is also why the image index is a separate index rather than a field folded into the text index: the two spaces are different, and a query names which one it is asking. When you want text and picture weighed together, put both in one template (`{{title}} {{remoteMedia url=thumbnail_url}}`) and the model embeds the pair as one item.
 
 `coverage_policy: partial` is the other decision. The default, `strict`, requires one embedding per source document. Image fields are usually optional, so `partial` counts a document whose template rendered nothing as a deliberate skip, and the index still reaches `complete`. `best_effort` goes one step further and treats outright failures (a dead URL, an oversized file) as complete too, while reporting the index unhealthy.
 

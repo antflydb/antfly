@@ -11,7 +11,7 @@ order: 4
 - How do I keep PostgreSQL as the system of record while adding retrieval?
 </Questions>
 
-By the end of this guide, every ticket written to your Postgres `tickets` table arrives in Antfly on its own, and one call returns the team that should own it, chosen from the resolved tickets that look most like it. Postgres stays the system of record. Nothing migrates and nothing gets exported. You need Antfly running, a Postgres with `wal_level = logical`, and its connection string stored as a secret:
+By the end of this guide, every ticket written to your Postgres `tickets` table arrives in Antfly on its own, and one call returns the team that should own it, chosen from the resolved tickets that look most like it. Postgres stays the system of record throughout, with no migration and no export job. You need Antfly running, a Postgres with `wal_level = logical`, and its connection string stored as a secret:
 
 ```bash
 curl -X PUT http://localhost:8080/db/v1/secrets/pg_dsn \
@@ -76,7 +76,6 @@ curl -X POST http://localhost:8080/db/v1/agents/retrieval \
 }
 ```
 
-Four steps get you there.
 
 ## 1. Stream Tickets from PostgreSQL
 
@@ -149,13 +148,13 @@ When the neighbors disagree, let the retrieval agent make the call in the same r
 
 ## 4. Close the Loop
 
-Because Postgres is the source and replication is always on, the loop closes itself. When a person corrects a route and the row updates, the corrected ticket flows back into Antfly and becomes evidence for the next decision. Routing accuracy improves as resolved history grows, with no retraining step and no export job.
+Because Postgres is the source and replication is always on, corrections feed back in without any extra step. When a person corrects a route and the row updates, the corrected ticket flows back into Antfly and becomes evidence for the next decision. Routing accuracy improves as resolved history grows, with no retraining step and no export job.
 
 ## Why the Pruner Decides Who Gets a Human
 
 A misrouted ticket is almost always a retrieval failure: the wrong history reached the classifier. The pruner is where you set how much evidence a decision needs. With `min_score_ratio: 0.6`, a ticket unlike anything resolved before comes back with few or no neighbors, and that is the signal to send it to a triage queue instead of guessing.
 
-Keep that floor. An agent that routes only when it has strong evidence is one you can trust with the easy cases, which are most of them. Tighten the ratio if you see confident misroutes; loosen it if too much lands in triage while good neighbors are being cut.
+An agent that routes only when it has strong evidence is one you can trust with the easy cases, which are most of them, so keep that floor in place. Tighten the ratio if you see confident misroutes; loosen it if too much lands in triage while good neighbors are being cut.
 
 ## Let Your Agent Drive
 

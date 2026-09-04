@@ -13,7 +13,7 @@ order: 3
 
 By the end of this guide, an n8n AI Agent answers chat messages from your Antfly table. n8n keeps owning the parts around the answer (the trigger, the ticket it opens, the CRM row it updates) and Antfly supplies what the agent knows, as one more tool on the canvas. You need an Antfly Cloud instance with an indexed table (the examples use `docs` with an embeddings index `docs_vectors` and a text field `text`) and an n8n workspace.
 
-There is no application code in this setup. Nothing normalizes a malformed tool call or retries a bad query shape, so the discipline the retrieval needs lives in the agent's system message, written out in full. Step 3 gives you that message. Four steps get you there.
+There is no application code in this setup. Nothing normalizes a malformed tool call or retries a bad query shape, so the discipline the retrieval needs lives in the agent's system message, written out in full; step 3 gives you that message.
 
 ## 1. Create a Read-Only Instance Key
 

@@ -172,7 +172,7 @@ antfly query --table wikipedia \
 | Do both, and you have not tuned anything yet | Hybrid with RRF (the default) |
 | Need fusion scores a pruner can read | Hybrid with RSF |
 | Need the top results to be right, not just present | Add the reranker |
-| Feed results to a model that will believe them | Add the reranker and the pruner |
+| Pass results to a model as answer context | Add the reranker and the pruner |
 
 Start with the default and add stages when you can name what each one fixes. Every stage is optional and independent, and the query still returns results when a later stage has nothing to do.
 

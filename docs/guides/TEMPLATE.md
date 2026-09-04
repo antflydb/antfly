@@ -24,6 +24,11 @@ believes what it retrieves").
 - No em-dashes, and no double-hyphen stand-ins. Recast with a period, colon, comma, or
   parentheses.
 - No hype, no pain exaggeration, no rhetorical-question hooks, no "simply" or "just".
+- No copywriting rhythm. The tells: a clipped fragment landing a paragraph ("Nothing
+  leaves it."), an aphorism standing in for an explanation ("Write to Postgres; query
+  Antfly."), the "not X. Y." reversal, a repeated device across pages ("Three steps get
+  you there."), and a cute closer on a technical point. If a sentence would read as a
+  pull quote, rewrite it as a plain statement or delete it.
 - "Antfly", never "AntflyDB". "Antfly Inference" for the built-in model runtime.
   "standalone mode" for `antfly standalone`.
 - Roadmap never appears as shipped. No "coming soon", no "future enhancements".
@@ -58,8 +63,7 @@ Target 120 to 200 lines. In this order:
 3. **The result first.** Show the finished artifact before step one: the final request
    and a trimmed real response, or the finished component, under a sentence like "Here
    is the call you'll be making by the end." This is what lets the reader decide in ten
-   seconds whether the page is for them. Then a one-line bridge into the steps ("Three
-   steps get you there.").
+   seconds whether the page is for them. Step one follows directly; no bridge line.
 
 4. **Numbered steps.** Each ends in something runnable with visible output. Real
    commands against `http://localhost:8080`, real JSON, no `{{PLACEHOLDER}}` blocks. Use

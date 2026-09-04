@@ -19,7 +19,6 @@ curl -s http://localhost:8080/db/v1/tables/docs | head -c 300
 ollama pull gemma3:4b
 ```
 
-Four steps get you there.
 
 ## 1. Install the Packages
 
@@ -159,11 +158,11 @@ Type into the search box and watch the results and facet counts move. Then ask a
 
 ## Why the Answer Box Gets Its Own Input
 
-Running both off one box is tempting: type once, see results and an answer. The library will not do it, and the restriction is the good part.
+Running both off one box is tempting: type once, see results and an answer. The library does not allow it.
 
 `AnswerResults` reacts only to submissions. In `mode="live"` a keystroke updates the search value but never sets a submitted timestamp, so the answer agent stays idle. Live search is a cheap indexed lookup and can run on every keystroke. An answer is retrieval plus reranking plus token generation, and running that on `h`, `ho`, `how`, `how ` spends your generation budget on prefixes of a question nobody has finished asking.
 
-It also matches how people read. Someone scanning results wants the list to move with them. Someone asking a question has composed a full sentence and expects a pause. Two inputs make the pause deliberate.
+It also matches how people read. Someone scanning results wants the list to move with them. Someone asking a question has composed a full sentence and expects a pause before the answer, and a separate submit makes that pause explicit.
 
 To feed a follow-up question back into the ask box, set the `QueryBox` `initialValue` to the question, add `autoSubmit`, and bump `submitSignal`; the changing signal re-fires the submit even when the same question is clicked twice.
 
