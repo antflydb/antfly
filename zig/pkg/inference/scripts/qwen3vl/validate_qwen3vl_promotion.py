@@ -240,10 +240,18 @@ def required_matrix() -> set[tuple[str, str]]:
 
 
 def safe_regular_file(root: Path, raw: object, label: str) -> tuple[str, Path]:
-    if not isinstance(raw, str) or not raw or "\\" in raw or ":" in raw or "\x00" in raw:
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or "\\" in raw
+        or ":" in raw
+        or "\x00" in raw
+    ):
         raise PromotionError(f"unsafe {label} path: {raw!r}")
     relative = PurePosixPath(raw)
-    if relative.is_absolute() or any(part in ("", ".", "..") for part in relative.parts):
+    if relative.is_absolute() or any(
+        part in ("", ".", "..") for part in relative.parts
+    ):
         raise PromotionError(f"unsafe {label} path: {raw!r}")
     path = root / raw
     try:
@@ -288,7 +296,9 @@ def require_maximum(metrics: dict[str, Any], name: str, maximum: float) -> float
     return float(value)
 
 
-def validate_scenario_metrics(model: str, scenario: str, metrics: dict[str, Any]) -> None:
+def validate_scenario_metrics(
+    model: str, scenario: str, metrics: dict[str, Any]
+) -> None:
     if scenario == "transformers_parity":
         require_number(metrics, "fixture_count", 6)
     elif scenario == "single_image_2mp":
@@ -339,7 +349,9 @@ def validate_scenario_metrics(model: str, scenario: str, metrics: dict[str, Any]
         require_maximum(metrics, "max_logit_abs", 0.10)
     elif scenario == "quantized_conversion":
         if metrics.get("quantization") != MODEL_CONTRACTS[model]["quantization"]:
-            raise PromotionError("reranker conversion evidence is not the calibrated Q8 artifact")
+            raise PromotionError(
+                "reranker conversion evidence is not the calibrated Q8 artifact"
+            )
         require_number(metrics, "independent_conversion_passes", 2)
     elif scenario == "retrieval_quality":
         require_number(metrics, "query_count", 100)
@@ -357,12 +369,21 @@ def validate_gates(raw: object, label: str) -> int:
     if isinstance(raw, dict) and raw:
         gates = list(raw.items())
         for name, gate in gates:
-            if not isinstance(name, str) or not name or not isinstance(gate, dict) or gate.get("pass") is not True:
+            if (
+                not isinstance(name, str)
+                or not name
+                or not isinstance(gate, dict)
+                or gate.get("pass") is not True
+            ):
                 raise PromotionError(f"failed or malformed gate in {label}: {name!r}")
         return len(gates)
     if isinstance(raw, list) and raw:
         for gate in raw:
-            if not isinstance(gate, dict) or not isinstance(gate.get("name"), str) or gate.get("pass") is not True:
+            if (
+                not isinstance(gate, dict)
+                or not isinstance(gate.get("name"), str)
+                or gate.get("pass") is not True
+            ):
                 raise PromotionError(f"failed or malformed gate in {label}")
         return len(raw)
     raise PromotionError(f"{label} has no gates")
@@ -373,7 +394,11 @@ def validate_resources(raw: object, label: str) -> None:
         raise PromotionError(f"{label} has no resource measurements")
     require_number(raw, "sample_count", 1)
     swap_growth = raw.get("swapout_growth_mib")
-    if not isinstance(swap_growth, (int, float)) or isinstance(swap_growth, bool) or swap_growth != 0:
+    if (
+        not isinstance(swap_growth, (int, float))
+        or isinstance(swap_growth, bool)
+        or swap_growth != 0
+    ):
         raise PromotionError(f"{label} observed non-zero or invalid swap growth")
     violations = raw.get("threshold_violations")
     if violations != []:
@@ -392,11 +417,17 @@ def validate_artifact_refs(
     for item in raw:
         if not isinstance(item, dict):
             raise PromotionError(f"malformed artifact reference in {report_path}")
-        relative, path = safe_regular_file(campaign_root, item.get("path"), "evidence artifact")
+        relative, path = safe_regular_file(
+            campaign_root, item.get("path"), "evidence artifact"
+        )
         if relative == report_path:
-            raise PromotionError(f"evidence report cannot cite itself as its only proof: {report_path}")
+            raise PromotionError(
+                f"evidence report cannot cite itself as its only proof: {report_path}"
+            )
         if relative in seen:
-            raise PromotionError(f"duplicate artifact reference in {report_path}: {relative}")
+            raise PromotionError(
+                f"duplicate artifact reference in {report_path}: {relative}"
+            )
         seen.add(relative)
         expected = require_digest(item.get("sha256"), relative)
         actual = sha256_file(path)
@@ -404,7 +435,9 @@ def validate_artifact_refs(
             raise PromotionError(
                 f"evidence artifact SHA-256 mismatch for {relative}: expected {expected}, got {actual}"
             )
-        validated.append({"path": relative, "sha256": actual, "size": path.stat().st_size})
+        validated.append(
+            {"path": relative, "sha256": actual, "size": path.stat().st_size}
+        )
     return validated
 
 
@@ -417,7 +450,9 @@ def validate_evidence(
     model = entry.get("model")
     scenario = entry.get("scenario")
     label = f"{model}/{scenario}"
-    relative, path = safe_regular_file(campaign_root, entry.get("report"), "evidence report")
+    relative, path = safe_regular_file(
+        campaign_root, entry.get("report"), "evidence report"
+    )
     expected_sha = require_digest(entry.get("sha256"), relative)
     actual_sha = sha256_file(path)
     if actual_sha != expected_sha:
@@ -426,7 +461,9 @@ def validate_evidence(
         )
     evidence = load_object(path)
     if evidence.get("schema") != EVIDENCE_SCHEMA or evidence.get("pass") is not True:
-        raise PromotionError(f"evidence is not a passing {EVIDENCE_SCHEMA} report: {relative}")
+        raise PromotionError(
+            f"evidence is not a passing {EVIDENCE_SCHEMA} report: {relative}"
+        )
     if evidence.get("release_ready") is not False:
         raise PromotionError(f"scenario evidence must not self-promote: {relative}")
     if evidence.get("model") != model or evidence.get("scenario") != scenario:
@@ -462,7 +499,9 @@ def validate_evidence(
     validate_scenario_metrics(model, scenario, metrics)
     gate_count = validate_gates(evidence.get("gates"), label)
     validate_resources(evidence.get("resources"), label)
-    artifacts = validate_artifact_refs(campaign_root, relative, evidence.get("artifacts"))
+    artifacts = validate_artifact_refs(
+        campaign_root, relative, evidence.get("artifacts")
+    )
     return {
         "model": model,
         "scenario": scenario,
@@ -489,13 +528,18 @@ def validate_manifest(path: Path) -> dict[str, Any]:
         raise PromotionError("target git_head must be a full lowercase commit hash")
     target = {
         "git_head": git_head,
-        "binary_sha256": require_digest(target_raw.get("binary_sha256"), "target binary"),
+        "binary_sha256": require_digest(
+            target_raw.get("binary_sha256"), "target binary"
+        ),
         "backend": target_raw.get("backend"),
         "device_family": target_raw.get("device_family"),
     }
     if target["backend"] != "metal":
         raise PromotionError("Qwen3-VL promotion currently requires backend=metal")
-    if not isinstance(target["device_family"], str) or not target["device_family"].strip():
+    if (
+        not isinstance(target["device_family"], str)
+        or not target["device_family"].strip()
+    ):
         raise PromotionError("target device_family must be non-empty")
     binary_relative, binary_path = safe_regular_file(
         campaign_root, target_raw.get("binary"), "target runtime binary"
@@ -560,14 +604,20 @@ def validate_manifest(path: Path) -> dict[str, Any]:
             raise PromotionError("malformed promotion evidence entry")
         key = (entry.get("model"), entry.get("scenario"))
         if key in entries:
-            raise PromotionError(f"duplicate promotion evidence lane: {key[0]}/{key[1]}")
+            raise PromotionError(
+                f"duplicate promotion evidence lane: {key[0]}/{key[1]}"
+            )
         entries[key] = entry
     required = required_matrix()
     actual = set(entries)
     if actual != required:
         missing = sorted(f"{model}/{scenario}" for model, scenario in required - actual)
-        unexpected = sorted(f"{model}/{scenario}" for model, scenario in actual - required)
-        raise PromotionError(f"incomplete promotion matrix: missing={missing} unexpected={unexpected}")
+        unexpected = sorted(
+            f"{model}/{scenario}" for model, scenario in actual - required
+        )
+        raise PromotionError(
+            f"incomplete promotion matrix: missing={missing} unexpected={unexpected}"
+        )
 
     validated = [
         validate_evidence(campaign_root, entries[key], target, model_receipts)

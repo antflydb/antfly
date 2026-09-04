@@ -72,7 +72,8 @@ def high_precision_logit_pass(metrics: dict[str, Any]) -> bool:
         and metrics.get("mean_abs", math.inf) <= HIGH_PRECISION_LIMITS["max_mean_abs"]
         and metrics.get("rmse", math.inf) <= HIGH_PRECISION_LIMITS["max_rmse"]
         and metrics.get("max_abs", math.inf) <= HIGH_PRECISION_LIMITS["max_max_abs"]
-        and metrics.get("top_k_overlap", -1) >= HIGH_PRECISION_LIMITS["min_top_10_overlap"]
+        and metrics.get("top_k_overlap", -1)
+        >= HIGH_PRECISION_LIMITS["min_top_10_overlap"]
     )
 
 
@@ -83,7 +84,9 @@ def validate_high_precision_bundle(model_dir: Path) -> dict[str, Any]:
     try:
         conversion_report = json.loads(report_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise NativePrecisionError(f"invalid high-precision conversion report: {exc}") from exc
+        raise NativePrecisionError(
+            f"invalid high-precision conversion report: {exc}"
+        ) from exc
     if (
         conversion_report.get("schema") != high_precision.SCHEMA
         or conversion_report.get("pass") is not True
@@ -91,7 +94,9 @@ def validate_high_precision_bundle(model_dir: Path) -> dict[str, Any]:
         or conversion_report.get("benchmark_only") is not True
         or conversion_report.get("output_identity") != high_precision.OUTPUT_IDENTITY
     ):
-        raise NativePrecisionError("high-precision bundle lacks a passing benchmark-only conversion report")
+        raise NativePrecisionError(
+            "high-precision bundle lacks a passing benchmark-only conversion report"
+        )
     evidence["conversion_report_sha256"] = sha256_file(report_path)
     evidence["conversion"] = {
         "source": conversion_report.get("source"),
@@ -107,7 +112,9 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.output.exists():
         raise NativePrecisionError(f"refusing to overwrite output: {args.output}")
     if not args.antfly_bin.is_file() or not args.antfly_bin.stat().st_mode & 0o111:
-        raise NativePrecisionError(f"Antfly binary is not executable: {args.antfly_bin}")
+        raise NativePrecisionError(
+            f"Antfly binary is not executable: {args.antfly_bin}"
+        )
     if not args.image.is_file() or args.image.is_symlink():
         raise NativePrecisionError(f"image must be a regular file: {args.image}")
     if not 2 <= args.native_runs <= 10:
@@ -174,13 +181,17 @@ def _summarize_native(
             )
         timing_ms = timing.get("timing_ms")
         if not isinstance(timing_ms, dict):
-            raise NativePrecisionError(f"{profile} native run {run_index} omitted timing_ms")
+            raise NativePrecisionError(
+                f"{profile} native run {run_index} omitted timing_ms"
+            )
         try:
             core_seconds = float(timing_ms["generate"]) / 1000.0
             vision_seconds = float(timing_ms["multimodal_prepare_inner"]) / 1000.0
             prefill_seconds = float(timing_ms["prefill_inner"]) / 1000.0
         except (KeyError, TypeError, ValueError) as exc:
-            raise NativePrecisionError(f"{profile} native timing is incomplete") from exc
+            raise NativePrecisionError(
+                f"{profile} native timing is incomplete"
+            ) from exc
         samples.append(
             {
                 "run": run_index,
@@ -198,21 +209,33 @@ def _summarize_native(
     token_sequences = [tuple(sample["token_ids"] or []) for sample in samples]
     logit_hashes = [sample["prefill_logits_sha256"] for sample in samples]
     if len(set(token_sequences)) != 1 or len(token_sequences[0]) != args.max_tokens:
-        raise NativePrecisionError(f"{profile} native token sequences are not deterministic")
+        raise NativePrecisionError(
+            f"{profile} native token sequences are not deterministic"
+        )
     if len(set(logit_hashes)) != 1:
-        raise NativePrecisionError(f"{profile} native prefill logits are not bitwise deterministic")
+        raise NativePrecisionError(
+            f"{profile} native prefill logits are not bitwise deterministic"
+        )
     return {
         "profile": profile,
         "timing_boundary": "fresh process; native timing_ms.generate excludes model load",
         "runs": samples,
         "median": {
-            "core_seconds": statistics.median(sample["core_seconds"] for sample in samples),
-            "vision_seconds": statistics.median(sample["vision_seconds"] for sample in samples),
-            "prefill_seconds": statistics.median(sample["prefill_seconds"] for sample in samples),
+            "core_seconds": statistics.median(
+                sample["core_seconds"] for sample in samples
+            ),
+            "vision_seconds": statistics.median(
+                sample["vision_seconds"] for sample in samples
+            ),
+            "prefill_seconds": statistics.median(
+                sample["prefill_seconds"] for sample in samples
+            ),
             "process_seconds": statistics.median(
                 sample["resources"]["elapsed_seconds"] for sample in samples
             ),
-            "max_rss_mib": max(sample["resources"]["max_rss_mib"] for sample in samples),
+            "max_rss_mib": max(
+                sample["resources"]["max_rss_mib"] for sample in samples
+            ),
         },
         "determinism": {
             "token_sequence_exact": True,
@@ -267,7 +290,9 @@ def run_mps(args: argparse.Namespace, work_dir: Path) -> dict[str, Any]:
     )
     payload = json.loads(output.read_text(encoding="utf-8"))
     if result != 0 or payload.get("pass") is not True:
-        raise NativePrecisionError(f"Transformers MPS benchmark failed: {payload.get('failure')}")
+        raise NativePrecisionError(
+            f"Transformers MPS benchmark failed: {payload.get('failure')}"
+        )
     logits = work_dir / "transformers_mps.artifacts" / "mps_last_logits.f32le"
     if not logits.is_file():
         raise NativePrecisionError("Transformers MPS benchmark omitted final logits")
@@ -285,7 +310,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--antfly-bin", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path)
-    parser.add_argument("--oracle-script", type=Path, default=here / "transformers_oracle.py")
+    parser.add_argument(
+        "--oracle-script", type=Path, default=here / "transformers_oracle.py"
+    )
     parser.add_argument("--prompt", default="Describe the image briefly.")
     parser.add_argument("--max-tokens", type=int, default=1)
     parser.add_argument("--native-runs", type=int, default=5)
@@ -311,7 +338,14 @@ def main(argv: list[str] | None = None) -> int:
     # Never turn a failing retry into an overwrite of existing benchmark
     # evidence.  The output is an attestation, not a mutable status file.
     if args.output.exists():
-        print(json.dumps({"pass": False, "failure": f"refusing to overwrite output: {args.output}"}))
+        print(
+            json.dumps(
+                {
+                    "pass": False,
+                    "failure": f"refusing to overwrite output: {args.output}",
+                }
+            )
+        )
         return 2
     report: dict[str, Any] = {
         "schema": SCHEMA,
@@ -339,27 +373,46 @@ def main(argv: list[str] | None = None) -> int:
             oracle_script=args.oracle_script,
             oracle_timeout_seconds=args.mps_timeout_seconds,
         )
-        preprocessing_oracle, preprocessing_execution = run_oracle(oracle_args, work_dir)
+        preprocessing_oracle, preprocessing_execution = run_oracle(
+            oracle_args, work_dir
+        )
         mps = run_mps(args, work_dir)
         high_native = _summarize_native(
-            "bf16", args, Path(high["model_dir"]), preprocessing_oracle,
-            Path(preprocessing_execution["patches"]), work_dir,
+            "bf16",
+            args,
+            Path(high["model_dir"]),
+            preprocessing_oracle,
+            Path(preprocessing_execution["patches"]),
+            work_dir,
         )
         q4_native = _summarize_native(
-            "q4", args, Path(q4["model_dir"]), preprocessing_oracle,
-            Path(preprocessing_execution["patches"]), work_dir,
+            "q4",
+            args,
+            Path(q4["model_dir"]),
+            preprocessing_oracle,
+            Path(preprocessing_execution["patches"]),
+            work_dir,
         )
         mps_logits = Path(mps["logits"])
-        high_metrics = logit_metrics(mps_logits, Path(high_native["runs"][0]["prefill_logits"]))
-        q4_metrics = logit_metrics(mps_logits, Path(q4_native["runs"][0]["prefill_logits"]))
+        high_metrics = logit_metrics(
+            mps_logits, Path(high_native["runs"][0]["prefill_logits"])
+        )
+        q4_metrics = logit_metrics(
+            mps_logits, Path(q4_native["runs"][0]["prefill_logits"])
+        )
         mps_argmax = mps["report"]["oracle"]["last_logits"]["argmax_token_id"]
         gates = {
             "transformers_mps_pass": mps["report"].get("pass") is True,
             "high_precision_logit_quality": high_precision_logit_pass(high_metrics),
-            "high_precision_argmax_exact": high_metrics.get("actual_argmax") == mps_argmax,
-            "high_precision_token_matches_mps": high_native["determinism"]["generated_token_ids"] == [mps_argmax],
+            "high_precision_argmax_exact": high_metrics.get("actual_argmax")
+            == mps_argmax,
+            "high_precision_token_matches_mps": high_native["determinism"][
+                "generated_token_ids"
+            ]
+            == [mps_argmax],
             "q4_argmax_exact": q4_metrics.get("actual_argmax") == mps_argmax,
-            "q4_token_matches_mps": q4_native["determinism"]["generated_token_ids"] == [mps_argmax],
+            "q4_token_matches_mps": q4_native["determinism"]["generated_token_ids"]
+            == [mps_argmax],
         }
         report.update(
             {
@@ -381,7 +434,10 @@ def main(argv: list[str] | None = None) -> int:
                 "transformers_mps": mps,
                 "models": {"bf16": high, "q4": q4},
                 "native": {"bf16": high_native, "q4": q4_native},
-                "logit_metrics": {"bf16_vs_transformers_mps": high_metrics, "q4_vs_transformers_mps": q4_metrics},
+                "logit_metrics": {
+                    "bf16_vs_transformers_mps": high_metrics,
+                    "q4_vs_transformers_mps": q4_metrics,
+                },
                 "gates": gates,
             }
         )

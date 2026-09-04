@@ -15,23 +15,65 @@ import benchmark_qwen3vl_native_image_batch as benchmark
 
 class ComparisonTests(unittest.TestCase):
     def test_comparison_uses_image_throughput_not_request_throughput(self) -> None:
-        single = {"input_count": 1, "median": {"generate_seconds": 10.0, "vision_seconds": 4.0, "prefill_seconds": 6.0}}
-        batch = {"input_count": 2, "median": {"generate_seconds": 15.0, "vision_seconds": 7.0, "prefill_seconds": 8.0}}
+        single = {
+            "input_count": 1,
+            "median": {
+                "generate_seconds": 10.0,
+                "vision_seconds": 4.0,
+                "prefill_seconds": 6.0,
+            },
+        }
+        batch = {
+            "input_count": 2,
+            "median": {
+                "generate_seconds": 15.0,
+                "vision_seconds": 7.0,
+                "prefill_seconds": 8.0,
+            },
+        }
         metrics = benchmark.comparison(single, batch)
-        self.assertAlmostEqual(0.75, metrics["single_images_per_core_second"] / metrics["batch_images_per_core_second"])
+        self.assertAlmostEqual(
+            0.75,
+            metrics["single_images_per_core_second"]
+            / metrics["batch_images_per_core_second"],
+        )
         self.assertAlmostEqual(4.0 / 3.0, metrics["core_throughput_gain"])
         self.assertAlmostEqual(8.0 / 7.0, metrics["vision_throughput_gain"])
         self.assertAlmostEqual(1.5, metrics["prefill_throughput_gain"])
 
     def test_main_binds_binary_to_provenance(self) -> None:
         with (
-            mock.patch.object(benchmark, "validate_args", return_value=[Path("batch.jpg")] ),
-            mock.patch.object(benchmark, "validate_managed_bundle", return_value={"bundle": True}),
-            mock.patch.object(benchmark, "run_profile", side_effect=[
-                {"input_count": 1, "median": {"generate_seconds": 1.0, "vision_seconds": 0.4, "prefill_seconds": 0.6}},
-                {"input_count": 2, "median": {"generate_seconds": 1.5, "vision_seconds": 0.7, "prefill_seconds": 0.8}},
-            ]),
-            mock.patch.object(benchmark, "git_provenance", return_value={"ok": True}) as provenance,
+            mock.patch.object(
+                benchmark, "validate_args", return_value=[Path("batch.jpg")]
+            ),
+            mock.patch.object(
+                benchmark, "validate_managed_bundle", return_value={"bundle": True}
+            ),
+            mock.patch.object(
+                benchmark,
+                "run_profile",
+                side_effect=[
+                    {
+                        "input_count": 1,
+                        "median": {
+                            "generate_seconds": 1.0,
+                            "vision_seconds": 0.4,
+                            "prefill_seconds": 0.6,
+                        },
+                    },
+                    {
+                        "input_count": 2,
+                        "median": {
+                            "generate_seconds": 1.5,
+                            "vision_seconds": 0.7,
+                            "prefill_seconds": 0.8,
+                        },
+                    },
+                ],
+            ),
+            mock.patch.object(
+                benchmark, "git_provenance", return_value={"ok": True}
+            ) as provenance,
             mock.patch.object(benchmark, "write_json_atomic"),
             mock.patch.object(benchmark, "parse_args") as parse_args,
             mock.patch("builtins.print"),
@@ -118,7 +160,9 @@ class ComparisonTests(unittest.TestCase):
                 }
             }
         }
-        with self.assertRaisesRegex(benchmark.ImageBatchBenchmarkError, "complete stage timing"):
+        with self.assertRaisesRegex(
+            benchmark.ImageBatchBenchmarkError, "complete stage timing"
+        ):
             benchmark.stage_timing_evidence(timing, profile="single", run=1)
 
     def test_image_geometry_binds_aggregate_visual_tokens_to_image_grids(self) -> None:
@@ -152,7 +196,9 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual([1, 38, 56], images[0]["grid_thw"])
 
     def test_image_geometry_rejects_mismatched_visual_token_count(self) -> None:
-        with self.assertRaisesRegex(benchmark.ImageBatchBenchmarkError, "does not match"):
+        with self.assertRaisesRegex(
+            benchmark.ImageBatchBenchmarkError, "does not match"
+        ):
             benchmark.image_geometry_evidence(
                 {
                     "visual_token_count": 533,

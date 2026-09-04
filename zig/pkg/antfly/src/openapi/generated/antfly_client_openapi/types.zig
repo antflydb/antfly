@@ -8683,12 +8683,13 @@ pub const EmbedderConfig = struct {
     provider: EmbedderProvider,
     /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and will send binary content (images, audio, etc.) to the provider instead of extracting text. The provider's API is still responsible for accepting the content — this flag just tells Antfly not to strip it. Not needed for models already in the registry (e.g., `multimodalembedding`, `gemini-embedding-2-preview`, `clip-*`, `clipclap`). **Example:** ```json { "provider": "vertex", "model": "some-future-multimodal-model", "multimodal": true } ```
     multimodal: ?bool = null,
-    /// Advanced override for the provider-specific retrieval-query task type. Antfly normally derives this automatically from semantic-search operations (for example `search_query` for Cohere and Bedrock Cohere models).
+    /// Deprecated compatibility form of `retrieval.query_input_type`. New configurations should use the nested `retrieval` object.
     query_input_type: ?[]const u8 = null,
-    /// Advanced override for the provider-specific retrieval-document task type. Antfly normally derives this automatically for index and artifact writes (for example `search_document` for Cohere and Bedrock Cohere models).
+    /// Deprecated compatibility form of `retrieval.document_input_type`. New configurations should use the nested `retrieval` object.
     document_input_type: ?[]const u8 = null,
-    /// Optional retrieval instruction sent only for query embeddings to instruction-aware models such as Qwen3-Embedding. It is never applied while indexing documents.
+    /// Deprecated compatibility form of `retrieval.query_instruction`. New configurations should use the nested `retrieval` object.
     query_instruction: ?[]const u8 = null,
+    retrieval: ?EmbeddingRetrievalConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -8712,6 +8713,7 @@ pub const EmbedderConfig = struct {
         .{ "query_input_type", "query_input_type", true },
         .{ "document_input_type", "document_input_type", true },
         .{ "query_instruction", "query_instruction", true },
+        .{ "retrieval", "retrieval", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -8800,6 +8802,10 @@ pub const EmbedderConfig = struct {
         }
         if (self.query_instruction) |value| {
             try jw.objectField("query_instruction");
+            try jw.write(value);
+        }
+        if (self.retrieval) |value| {
+            try jw.objectField("retrieval");
             try jw.write(value);
         }
         try jw.endObject();
@@ -8940,6 +8946,48 @@ pub const EmbeddingIndexActivityPhase = enum {
             .{ "idle", .idle },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Advanced retrieval-role overrides. Antfly assigns canonical task intent automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index and artifact writes are `RETRIEVAL_DOCUMENT`. These fields only override how a provider or instruction-aware model represents that intent.
+pub const EmbeddingRetrievalConfig = struct {
+    /// Provider-specific query role, such as `search_query` for Cohere. When omitted, the provider adapter derives it from `RETRIEVAL_QUERY`.
+    query_input_type: ?[]const u8 = null,
+    /// Provider-specific document role, such as `search_document` for Cohere. When omitted, the provider adapter derives it from `RETRIEVAL_DOCUMENT`.
+    document_input_type: ?[]const u8 = null,
+    /// Optional instruction sent only with retrieval-query embeddings. Document embeddings never receive this instruction.
+    query_instruction: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "query_input_type", "query_input_type", true },
+        .{ "document_input_type", "document_input_type", true },
+        .{ "query_instruction", "query_instruction", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.query_input_type) |value| {
+            try jw.objectField("query_input_type");
+            try jw.write(value);
+        }
+        if (self.document_input_type) |value| {
+            try jw.objectField("document_input_type");
+            try jw.write(value);
+        }
+        if (self.query_instruction) |value| {
+            try jw.objectField("query_instruction");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 

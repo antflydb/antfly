@@ -66,7 +66,9 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.device == "cpu" and args.dtype != "bfloat16":
         raise QualificationError("the canonical CPU OCR lane requires bfloat16")
     if args.attn_implementation not in ATTENTION_IMPLEMENTATIONS:
-        raise QualificationError(f"unsupported attention implementation: {args.attn_implementation}")
+        raise QualificationError(
+            f"unsupported attention implementation: {args.attn_implementation}"
+        )
     if args.load_strategy not in LOAD_STRATEGIES:
         raise QualificationError(f"unsupported load strategy: {args.load_strategy}")
     if not args.prompt:
@@ -76,7 +78,9 @@ def validate_args(args: argparse.Namespace) -> None:
     if not 1 <= args.max_merged_tokens <= 576:
         raise QualificationError("max merged tokens must be in [1, 576]")
     if not 0 <= args.warmup_runs <= 10 or not 1 <= args.timed_runs <= 20:
-        raise QualificationError("warmup runs must be in [0, 10] and timed runs in [1, 20]")
+        raise QualificationError(
+            "warmup runs must be in [0, 10] and timed runs in [1, 20]"
+        )
     if args.timeout_seconds <= 0 or args.sample_interval_seconds <= 0:
         raise QualificationError("timeouts and sample intervals must be positive")
     if args.max_rss_mib <= 0 or not 0 <= args.min_free_percent <= 100:
@@ -86,7 +90,9 @@ def validate_args(args: argparse.Namespace) -> None:
     if not 0.0 < args.mps_high_watermark_ratio <= 1.0:
         raise QualificationError("MPS high watermark ratio must be in (0, 1]")
     if not 0.0 <= args.mps_low_watermark_ratio <= args.mps_high_watermark_ratio:
-        raise QualificationError("MPS low watermark ratio must be in [0, high watermark]")
+        raise QualificationError(
+            "MPS low watermark ratio must be in [0, high watermark]"
+        )
 
 
 def benchmark_environment(args: argparse.Namespace) -> dict[str, str]:
@@ -233,7 +239,9 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
             device_map={"": args.device},
         )
     else:
-        model = Qwen3VLForConditionalGeneration.from_pretrained(weights_dir, **load_options)
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            weights_dir, **load_options
+        )
         model.to(args.device)
     model.eval()
     synchronize(args.device)
@@ -250,9 +258,12 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
     # Prepare one untimed contract input for report evidence. Every warmup and
     # timed request below repeats this work inside its timing boundary.
     rendered, evidence_inputs = make_inputs(args, processor)
-    input_ids = [int(token) for token in evidence_inputs["input_ids"].reshape(-1).tolist()]
+    input_ids = [
+        int(token) for token in evidence_inputs["input_ids"].reshape(-1).tolist()
+    ]
     image_grid_thw = [
-        [int(item) for item in row] for row in evidence_inputs["image_grid_thw"].tolist()
+        [int(item) for item in row]
+        for row in evidence_inputs["image_grid_thw"].tolist()
     ]
     prompt_tokens = len(input_ids)
     visual_token_count = merged_visual_token_count(
@@ -265,7 +276,9 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         current_rendered, inputs = make_inputs(args, processor)
         if current_rendered != rendered:
             raise QualificationError("rendered prompt changed during one OCR benchmark")
-        current_input_ids = [int(token) for token in inputs["input_ids"].reshape(-1).tolist()]
+        current_input_ids = [
+            int(token) for token in inputs["input_ids"].reshape(-1).tolist()
+        ]
         current_grid = [
             [int(item) for item in row] for row in inputs["image_grid_thw"].tolist()
         ]
@@ -293,7 +306,9 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         if elapsed <= 0.0:
             raise QualificationError("non-positive OCR request timing")
         if sequences.ndim != 2 or sequences.shape[0] != 1:
-            raise QualificationError(f"unexpected generation sequence shape: {tuple(sequences.shape)}")
+            raise QualificationError(
+                f"unexpected generation sequence shape: {tuple(sequences.shape)}"
+            )
         if sequences.shape[1] <= prompt_tokens:
             raise QualificationError("Transformers generated no OCR tokens")
         token_ids = [int(token) for token in sequences[0, prompt_tokens:].tolist()]
@@ -420,24 +435,34 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def validate_worker_report(worker: dict[str, Any], args: argparse.Namespace) -> dict[str, bool]:
+def validate_worker_report(
+    worker: dict[str, Any], args: argparse.Namespace
+) -> dict[str, bool]:
     benchmark = worker.get("benchmark")
     request = worker.get("request")
     model = worker.get("model")
     runtime = worker.get("runtime")
-    token_ids = benchmark.get("generated_token_ids") if isinstance(benchmark, dict) else None
-    token_count = benchmark.get("generated_token_count") if isinstance(benchmark, dict) else None
+    token_ids = (
+        benchmark.get("generated_token_ids") if isinstance(benchmark, dict) else None
+    )
+    token_count = (
+        benchmark.get("generated_token_count") if isinstance(benchmark, dict) else None
+    )
     checks = {
         "schema": worker.get("schema") == WORKER_SCHEMA,
         "model_sha256": isinstance(model, dict) and model.get("sha256") == MODEL_SHA256,
         "device": isinstance(runtime, dict) and runtime.get("device") == args.device,
-        "request_max_tokens": isinstance(request, dict) and request.get("max_tokens") == args.max_tokens,
+        "request_max_tokens": isinstance(request, dict)
+        and request.get("max_tokens") == args.max_tokens,
         "request_max_merged_tokens": isinstance(request, dict)
         and request.get("max_merged_tokens") == args.max_merged_tokens,
         "timed_tokens_deterministic": isinstance(benchmark, dict)
         and benchmark.get("timed_token_sequences_deterministic") is True,
         "generated_token_ids": isinstance(token_ids, list)
-        and all(isinstance(token, int) and not isinstance(token, bool) for token in token_ids),
+        and all(
+            isinstance(token, int) and not isinstance(token, bool)
+            for token in token_ids
+        ),
         "generated_token_count": isinstance(token_count, int)
         and not isinstance(token_count, bool)
         and 1 <= token_count <= args.max_tokens
@@ -458,8 +483,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--prompt", default="Read all visible text.")
     parser.add_argument("--device", choices=DEVICES, required=True)
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
-    parser.add_argument("--attn-implementation", choices=ATTENTION_IMPLEMENTATIONS, default="sdpa")
-    parser.add_argument("--load-strategy", choices=LOAD_STRATEGIES, default="device_map")
+    parser.add_argument(
+        "--attn-implementation", choices=ATTENTION_IMPLEMENTATIONS, default="sdpa"
+    )
+    parser.add_argument(
+        "--load-strategy", choices=LOAD_STRATEGIES, default="device_map"
+    )
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--timed-runs", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=64)
@@ -539,7 +568,10 @@ def run_parent(args: argparse.Namespace) -> dict[str, Any]:
             "mps_prefer_metal": args.mps_prefer_metal if args.device == "mps" else None,
         },
         "harness": {
-            "script": {"path": str(Path(__file__).resolve()), "sha256": sha256_file(Path(__file__))},
+            "script": {
+                "path": str(Path(__file__).resolve()),
+                "sha256": sha256_file(Path(__file__)),
+            },
             "requirements": {
                 "path": str(args.requirements_file.resolve(strict=True)),
                 "sha256": sha256_file(args.requirements_file),
@@ -560,9 +592,13 @@ def main(argv: list[str] | None = None) -> int:
             if args.worker_output is None:
                 raise QualificationError("--worker-output is required in worker mode")
             if args.output is not None or args.work_dir is not None:
-                raise QualificationError("worker mode cannot accept --output or --work-dir")
+                raise QualificationError(
+                    "worker mode cannot accept --output or --work-dir"
+                )
             if args.worker_output.exists():
-                raise QualificationError(f"refusing to overwrite worker output: {args.worker_output}")
+                raise QualificationError(
+                    f"refusing to overwrite worker output: {args.worker_output}"
+                )
             worker = run_worker(args)
             write_json_atomic(args.worker_output.resolve(), worker)
             return 0
@@ -572,7 +608,10 @@ def main(argv: list[str] | None = None) -> int:
             "pass": False,
             "release_ready": False,
             "created_unix_seconds": int(time.time()),
-            "host": {"platform": platform.platform(), "python": platform.python_version()},
+            "host": {
+                "platform": platform.platform(),
+                "python": platform.python_version(),
+            },
         }
         try:
             report = run_parent(args)
@@ -584,7 +623,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.output is None:
             raise QualificationError("--output is required outside worker mode")
         write_json_atomic(args.output.resolve(), report)
-        print(json.dumps({"pass": report["pass"], "report": str(args.output.resolve())}))
+        print(
+            json.dumps({"pass": report["pass"], "report": str(args.output.resolve())})
+        )
         return 0 if report["pass"] else 2
     except (QualificationError, OSError, RuntimeError, ValueError) as exc:
         print(f"Qwen3-VL Transformers OCR benchmark failed: {exc}", file=sys.stderr)

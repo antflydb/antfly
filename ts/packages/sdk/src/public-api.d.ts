@@ -8953,6 +8953,31 @@ export interface components {
          */
         EmbedderProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "mock" | "antfly";
         /**
+         * @description Advanced retrieval-role overrides. Antfly assigns canonical task intent
+         *     automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
+         *     and artifact writes are `RETRIEVAL_DOCUMENT`. These fields only override
+         *     how a provider or instruction-aware model represents that intent.
+         */
+        EmbeddingRetrievalConfig: {
+            /**
+             * @description Provider-specific query role, such as `search_query` for Cohere.
+             *     When omitted, the provider adapter derives it from
+             *     `RETRIEVAL_QUERY`.
+             */
+            query_input_type?: string;
+            /**
+             * @description Provider-specific document role, such as `search_document` for
+             *     Cohere. When omitted, the provider adapter derives it from
+             *     `RETRIEVAL_DOCUMENT`.
+             */
+            document_input_type?: string;
+            /**
+             * @description Optional instruction sent only with retrieval-query embeddings.
+             *     Document embeddings never receive this instruction.
+             */
+            query_instruction?: string;
+        };
+        /**
          * @description A unified configuration for an embedding provider.
          *
          *     Embedders can be configured with templates to customize how documents are
@@ -9156,23 +9181,27 @@ export interface components {
              */
             multimodal?: boolean;
             /**
-             * @description Advanced override for the provider-specific retrieval-query task type.
-             *     Antfly normally derives this automatically from semantic-search operations
-             *     (for example `search_query` for Cohere and Bedrock Cohere models).
+             * @deprecated
+             * @description Deprecated compatibility form of
+             *     `retrieval.query_input_type`. New configurations should use the
+             *     nested `retrieval` object.
              */
             query_input_type?: string;
             /**
-             * @description Advanced override for the provider-specific retrieval-document task type.
-             *     Antfly normally derives this automatically for index and artifact writes
-             *     (for example `search_document` for Cohere and Bedrock Cohere models).
+             * @deprecated
+             * @description Deprecated compatibility form of
+             *     `retrieval.document_input_type`. New configurations should use
+             *     the nested `retrieval` object.
              */
             document_input_type?: string;
             /**
-             * @description Optional retrieval instruction sent only for query embeddings to
-             *     instruction-aware models such as Qwen3-Embedding. It is never applied
-             *     while indexing documents.
+             * @deprecated
+             * @description Deprecated compatibility form of
+             *     `retrieval.query_instruction`. New configurations should use the
+             *     nested `retrieval` object.
              */
             query_instruction?: string;
+            retrieval?: components["schemas"]["EmbeddingRetrievalConfig"];
         };
         /** @description Configuration for the Google generative AI provider (Gemini). */
         GoogleGeneratorConfig: {

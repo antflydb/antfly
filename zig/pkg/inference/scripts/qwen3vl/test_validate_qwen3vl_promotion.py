@@ -49,7 +49,9 @@ class PromotionCampaignTests(unittest.TestCase):
         elif scenario == "cache_lifecycle":
             values["cycles"] = 10
         elif scenario == "performance":
-            values.update(warmups=1, paired_trials=5, performance_regression_percent=5.0)
+            values.update(
+                warmups=1, paired_trials=5, performance_regression_percent=5.0
+            )
         elif scenario == "soak":
             values.update(duration_seconds=3_600, completed_requests=100)
         elif scenario == "text_parity":
@@ -102,7 +104,9 @@ class PromotionCampaignTests(unittest.TestCase):
                 {
                     "version": 2,
                     "source": {"owner": "Qwen", "name": model, "variant": "test"},
-                    "artifacts": [{"path": "model.gguf", "size": 1, "sha256": "c" * 64}],
+                    "artifacts": [
+                        {"path": "model.gguf", "size": 1, "sha256": "c" * 64}
+                    ],
                 },
             )
             model_targets[model] = {
@@ -173,7 +177,9 @@ class PromotionCampaignTests(unittest.TestCase):
         write_json(path, manifest)
         return path, manifest
 
-    def rewrite_entry_digest(self, root: Path, manifest: dict[str, object], index: int) -> None:
+    def rewrite_entry_digest(
+        self, root: Path, manifest: dict[str, object], index: int
+    ) -> None:
         entry = manifest["evidence"][index]
         entry["sha256"] = sha256(root / entry["report"])
         write_json(root / "promotion-manifest.json", manifest)
@@ -184,7 +190,9 @@ class PromotionCampaignTests(unittest.TestCase):
             report = promotion.validate_manifest(path)
             self.assertTrue(report["pass"])
             self.assertTrue(report["release_ready"])
-            self.assertEqual(len(promotion.required_matrix()), report["validated_lane_count"])
+            self.assertEqual(
+                len(promotion.required_matrix()), report["validated_lane_count"]
+            )
 
     def test_missing_lane_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -192,7 +200,9 @@ class PromotionCampaignTests(unittest.TestCase):
             path, manifest = self.make_campaign(root)
             manifest["evidence"].pop()
             write_json(path, manifest)
-            with self.assertRaisesRegex(promotion.PromotionError, "incomplete promotion matrix"):
+            with self.assertRaisesRegex(
+                promotion.PromotionError, "incomplete promotion matrix"
+            ):
                 promotion.validate_manifest(path)
 
     def test_dirty_runtime_fails_even_with_updated_report_hash(self) -> None:
@@ -214,8 +224,12 @@ class PromotionCampaignTests(unittest.TestCase):
             path, manifest = self.make_campaign(root)
             entry = manifest["evidence"][0]
             report = json.loads((root / entry["report"]).read_text(encoding="utf-8"))
-            (root / report["artifacts"][0]["path"]).write_text("tampered", encoding="utf-8")
-            with self.assertRaisesRegex(promotion.PromotionError, "artifact SHA-256 mismatch"):
+            (root / report["artifacts"][0]["path"]).write_text(
+                "tampered", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                promotion.PromotionError, "artifact SHA-256 mismatch"
+            ):
                 promotion.validate_manifest(path)
 
     def test_tampered_runtime_binary_fails_closed(self) -> None:
@@ -223,7 +237,9 @@ class PromotionCampaignTests(unittest.TestCase):
             root = Path(raw)
             path, manifest = self.make_campaign(root)
             (root / manifest["target"]["binary"]).write_bytes(b"tampered")
-            with self.assertRaisesRegex(promotion.PromotionError, "runtime binary SHA-256 mismatch"):
+            with self.assertRaisesRegex(
+                promotion.PromotionError, "runtime binary SHA-256 mismatch"
+            ):
                 promotion.validate_manifest(path)
 
     def test_tampered_managed_receipt_fails_closed(self) -> None:
@@ -234,7 +250,9 @@ class PromotionCampaignTests(unittest.TestCase):
             (root / manifest["models"][model]["managed_receipt"]).write_text(
                 "{}", encoding="utf-8"
             )
-            with self.assertRaisesRegex(promotion.PromotionError, "managed receipt SHA-256 mismatch"):
+            with self.assertRaisesRegex(
+                promotion.PromotionError, "managed receipt SHA-256 mismatch"
+            ):
                 promotion.validate_manifest(path)
 
     def test_performance_regression_above_five_percent_fails(self) -> None:
@@ -306,7 +324,9 @@ class PromotionCampaignTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(promotion.PromotionError, "duplicate JSON key 'schema'"):
+            with self.assertRaisesRegex(
+                promotion.PromotionError, "duplicate JSON key 'schema'"
+            ):
                 promotion.validate_manifest(path)
 
     def test_cli_failure_report_never_sets_release_ready(self) -> None:
@@ -317,7 +337,10 @@ class PromotionCampaignTests(unittest.TestCase):
             write_json(path, manifest)
             output = root / "promotion.json"
             with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(2, promotion.main(["--manifest", str(path), "--output", str(output)]))
+                self.assertEqual(
+                    2,
+                    promotion.main(["--manifest", str(path), "--output", str(output)]),
+                )
             report = json.loads(output.read_text(encoding="utf-8"))
             self.assertFalse(report["pass"])
             self.assertFalse(report["release_ready"])

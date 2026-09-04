@@ -480,9 +480,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "timed_model_forward_median": statistics.median(
                 timed_model_forward_samples
             ),
-            "timed_model_forward_p95": percentile(
-                timed_model_forward_samples, 0.95
-            ),
+            "timed_model_forward_p95": percentile(timed_model_forward_samples, 0.95),
             "warmup_logit_postprocess_samples": warmup_logit_postprocess_samples,
             "timed_logit_postprocess_samples": timed_logit_postprocess_samples,
         },

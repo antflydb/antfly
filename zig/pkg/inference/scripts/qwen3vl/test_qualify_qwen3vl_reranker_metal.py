@@ -91,17 +91,28 @@ class RerankerQualificationTests(unittest.TestCase):
             [execution(), execution()],
         )
         self.assertFalse(passed)
-        self.assertFalse(next(gate for gate in gates if gate["name"] == "metal_1_mrope_exact")["pass"])
+        self.assertFalse(
+            next(gate for gate in gates if gate["name"] == "metal_1_mrope_exact")[
+                "pass"
+            ]
+        )
 
     def test_calibrated_q4_is_rejected_by_cli(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            qualification.parse_args([
-                "--model-dir", "/tmp/model",
-                "--oracle-model-dir", "/tmp/oracle",
-                "--antfly-bin", "/tmp/antfly",
-                "--output", "/tmp/output.json",
-                "--decoder-quantization", "Q4_K_M",
-            ])
+            qualification.parse_args(
+                [
+                    "--model-dir",
+                    "/tmp/model",
+                    "--oracle-model-dir",
+                    "/tmp/oracle",
+                    "--antfly-bin",
+                    "/tmp/antfly",
+                    "--output",
+                    "/tmp/output.json",
+                    "--decoder-quantization",
+                    "Q4_K_M",
+                ]
+            )
 
 
 if __name__ == "__main__":

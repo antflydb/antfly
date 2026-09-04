@@ -53,7 +53,9 @@ def sha256_file(path: Path) -> str:
 
 def safe_relative_path(path: Path) -> str:
     relative = PurePosixPath(path.as_posix())
-    if relative.is_absolute() or any(part in ("", ".", "..") for part in relative.parts):
+    if relative.is_absolute() or any(
+        part in ("", ".", "..") for part in relative.parts
+    ):
         raise MlxVlmBenchmarkError(f"unsafe model artifact path: {path}")
     return str(relative)
 
@@ -161,7 +163,9 @@ def _token_trace(responses: list[Any], max_tokens: int) -> tuple[list[int], Any]
             f"MLX-VLM generated {len(tokens)} tokens; expected exactly {max_tokens}"
         )
     if int(getattr(final, "generation_tokens", 0)) != max_tokens:
-        raise MlxVlmBenchmarkError("MLX-VLM final generation token count is inconsistent")
+        raise MlxVlmBenchmarkError(
+            "MLX-VLM final generation token count is inconsistent"
+        )
     return tokens, final
 
 
@@ -209,7 +213,9 @@ def run_once(
     }
 
 
-def visual_token_evidence(processor: Any, image: Path, max_pixels: int) -> dict[str, int]:
+def visual_token_evidence(
+    processor: Any, image: Path, max_pixels: int
+) -> dict[str, int]:
     """Bind MLX preprocessing to the native 576-merged-token request contract."""
     try:
         from PIL import Image
@@ -262,13 +268,17 @@ def run(args: argparse.Namespace, model_evidence: dict[str, Any]) -> dict[str, A
             "mlx-vlm": importlib.metadata.version("mlx-vlm"),
         }
     except importlib.metadata.PackageNotFoundError as exc:
-        raise MlxVlmBenchmarkError("MLX-VLM distribution metadata is unavailable") from exc
+        raise MlxVlmBenchmarkError(
+            "MLX-VLM distribution metadata is unavailable"
+        ) from exc
     if not mx.metal.is_available():
         raise MlxVlmBenchmarkError("MLX Metal backend is unavailable")
 
     model_path = model_evidence["path"]
     try:
-        local_config = json.loads((Path(model_path) / "config.json").read_text(encoding="utf-8"))
+        local_config = json.loads(
+            (Path(model_path) / "config.json").read_text(encoding="utf-8")
+        )
     except (OSError, json.JSONDecodeError) as exc:
         raise MlxVlmBenchmarkError(f"invalid local MLX config: {exc}") from exc
     profile_contract = precision_contract(args.profile, local_config)
@@ -284,21 +294,35 @@ def run(args: argparse.Namespace, model_evidence: dict[str, Any]) -> dict[str, A
 
     warmups = [
         run_once(
-            stream_generate, model, processor, formatted_prompt, args.image,
-            args.max_tokens, args.max_pixels, mx,
+            stream_generate,
+            model,
+            processor,
+            formatted_prompt,
+            args.image,
+            args.max_tokens,
+            args.max_pixels,
+            mx,
         )
         for _ in range(args.warmup_runs)
     ]
     timed = [
         run_once(
-            stream_generate, model, processor, formatted_prompt, args.image,
-            args.max_tokens, args.max_pixels, mx,
+            stream_generate,
+            model,
+            processor,
+            formatted_prompt,
+            args.image,
+            args.max_tokens,
+            args.max_pixels,
+            mx,
         )
         for _ in range(args.timed_runs)
     ]
     token_sequences = [sample["generated_token_ids"] for sample in timed]
     if len({tuple(tokens) for tokens in token_sequences}) != 1:
-        raise MlxVlmBenchmarkError("MLX-VLM timed token sequences are not deterministic")
+        raise MlxVlmBenchmarkError(
+            "MLX-VLM timed token sequences are not deterministic"
+        )
     prompt_counts = {sample["prompt_tokens"] for sample in timed}
     if len(prompt_counts) != 1:
         raise MlxVlmBenchmarkError("MLX-VLM prompt token counts changed across runs")
@@ -328,7 +352,9 @@ def run(args: argparse.Namespace, model_evidence: dict[str, Any]) -> dict[str, A
         },
         "request": {
             "prompt": args.prompt,
-            "formatted_prompt_sha256": hashlib.sha256(formatted_prompt.encode()).hexdigest(),
+            "formatted_prompt_sha256": hashlib.sha256(
+                formatted_prompt.encode()
+            ).hexdigest(),
             "image": str(args.image.resolve(strict=True)),
             "image_sha256": sha256_file(args.image),
             "max_tokens": args.max_tokens,
@@ -344,14 +370,25 @@ def run(args: argparse.Namespace, model_evidence: dict[str, Any]) -> dict[str, A
             "warmups": warmups,
             "timed": timed,
             "median": {
-                "end_to_end_seconds": median([sample["end_to_end_seconds"] for sample in timed]),
-                "prefill_seconds": median([sample["prefill_seconds"] for sample in timed]),
-                "decode_seconds": median([sample["decode_seconds"] for sample in timed]),
+                "end_to_end_seconds": median(
+                    [sample["end_to_end_seconds"] for sample in timed]
+                ),
+                "prefill_seconds": median(
+                    [sample["prefill_seconds"] for sample in timed]
+                ),
+                "decode_seconds": median(
+                    [sample["decode_seconds"] for sample in timed]
+                ),
                 "peak_memory_gib": max(sample["peak_memory_gib"] for sample in timed),
             },
         },
         "parity_scope": {
-            "exact": ["image_sha256", "formatted_prompt_sha256", "token_count", "timed_token_sequence"],
+            "exact": [
+                "image_sha256",
+                "formatted_prompt_sha256",
+                "token_count",
+                "timed_token_sequence",
+            ],
             "not_claimed": ["last_logits", "intermediate_activations"],
         },
     }
@@ -390,7 +427,14 @@ def main(argv: list[str] | None = None) -> int:
     # A failed invocation must not replace an earlier attestation.  Check this
     # before constructing or serializing a failure report.
     if args.output.exists():
-        print(json.dumps({"pass": False, "failure": f"refusing to overwrite output: {args.output}"}))
+        print(
+            json.dumps(
+                {
+                    "pass": False,
+                    "failure": f"refusing to overwrite output: {args.output}",
+                }
+            )
+        )
         return 2
     report: dict[str, Any] = {
         "schema": SCHEMA,
@@ -403,10 +447,18 @@ def main(argv: list[str] | None = None) -> int:
         validate_args(args)
         model_evidence = fingerprint_model_dir(args.model_dir)
         report = {**report, **run(args, model_evidence)}
-    except (ImportError, MlxVlmBenchmarkError, OSError, RuntimeError, ValueError) as exc:
+    except (
+        ImportError,
+        MlxVlmBenchmarkError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
         report["failure"] = str(exc)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    args.output.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     print(json.dumps({"pass": report["pass"], "report": str(args.output.resolve())}))
     return 0 if report["pass"] else 2
 

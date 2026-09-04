@@ -83,7 +83,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--antfly-bin", type=Path, required=True)
-    parser.add_argument("--image", type=Path, required=True, help="single-image baseline input")
+    parser.add_argument(
+        "--image", type=Path, required=True, help="single-image baseline input"
+    )
     parser.add_argument(
         "--batch-image",
         type=Path,
@@ -123,13 +125,17 @@ def validate_args(args: argparse.Namespace) -> list[Path]:
     if args.output.exists() or args.work_dir.exists():
         raise ImageBatchBenchmarkError("refusing to overwrite output or work directory")
     if not args.antfly_bin.is_file() or not args.antfly_bin.stat().st_mode & 0o111:
-        raise ImageBatchBenchmarkError(f"Antfly binary is not executable: {args.antfly_bin}")
+        raise ImageBatchBenchmarkError(
+            f"Antfly binary is not executable: {args.antfly_bin}"
+        )
     if not 2 <= args.runs <= 10:
         raise ImageBatchBenchmarkError("runs must be in [2, 10]")
     if not 2 <= args.batch_size <= 8:
         raise ImageBatchBenchmarkError("batch-size must be in [2, 8]")
     if args.max_tokens != 1:
-        raise ImageBatchBenchmarkError("this input-ingest benchmark requires --max-tokens 1")
+        raise ImageBatchBenchmarkError(
+            "this input-ingest benchmark requires --max-tokens 1"
+        )
     if args.timeout_seconds <= 0 or args.max_rss_mib <= 0:
         raise ImageBatchBenchmarkError("invalid timeout or RSS limit")
     if not 0 <= args.min_free_percent <= 100 or args.max_swap_growth_mib < 0:
@@ -137,7 +143,9 @@ def validate_args(args: argparse.Namespace) -> list[Path]:
 
     batch_images = list(args.batch_image or [args.image] * args.batch_size)
     if len(batch_images) != args.batch_size:
-        raise ImageBatchBenchmarkError("batch-image count must exactly equal batch-size")
+        raise ImageBatchBenchmarkError(
+            "batch-image count must exactly equal batch-size"
+        )
     for image in [args.image, *batch_images]:
         if not image.is_file() or image.is_symlink():
             raise ImageBatchBenchmarkError(f"image must be a regular file: {image}")
@@ -179,7 +187,9 @@ def required_timing(timing: dict[str, Any], profile: str, run: int) -> dict[str,
             "process_seconds": float(values["total"]) / 1000.0,
         }
     except (KeyError, TypeError, ValueError) as exc:
-        raise ImageBatchBenchmarkError(f"{profile} run {run} has incomplete timing") from exc
+        raise ImageBatchBenchmarkError(
+            f"{profile} run {run} has incomplete timing"
+        ) from exc
 
 
 def _positive_int(value: Any, field: str, profile: str, run: int) -> int:
@@ -212,7 +222,9 @@ def image_geometry_evidence(
     pre_merge_tokens = 0
     for index, image in enumerate(images):
         if not isinstance(image, dict):
-            raise ImageBatchBenchmarkError(f"{profile} run {run} image {index} is not an object")
+            raise ImageBatchBenchmarkError(
+                f"{profile} run {run} image {index} is not an object"
+            )
         grid = image.get("grid_thw")
         if not isinstance(grid, list) or len(grid) != 3:
             raise ImageBatchBenchmarkError(
@@ -226,40 +238,62 @@ def image_geometry_evidence(
         normalized.append(
             {
                 "source_width": _positive_int(
-                    image.get("source_width"), f"images[{index}].source_width", profile, run
+                    image.get("source_width"),
+                    f"images[{index}].source_width",
+                    profile,
+                    run,
                 ),
                 "source_height": _positive_int(
-                    image.get("source_height"), f"images[{index}].source_height", profile, run
+                    image.get("source_height"),
+                    f"images[{index}].source_height",
+                    profile,
+                    run,
                 ),
                 "resized_width": _positive_int(
-                    image.get("resized_width"), f"images[{index}].resized_width", profile, run
+                    image.get("resized_width"),
+                    f"images[{index}].resized_width",
+                    profile,
+                    run,
                 ),
                 "resized_height": _positive_int(
-                    image.get("resized_height"), f"images[{index}].resized_height", profile, run
+                    image.get("resized_height"),
+                    f"images[{index}].resized_height",
+                    profile,
+                    run,
                 ),
                 "grid_thw": [temporal, rows, columns],
                 "patch_rows": _positive_int(
                     image.get("patch_rows"), f"images[{index}].patch_rows", profile, run
                 ),
                 "patch_columns": _positive_int(
-                    image.get("patch_columns"), f"images[{index}].patch_columns", profile, run
+                    image.get("patch_columns"),
+                    f"images[{index}].patch_columns",
+                    profile,
+                    run,
                 ),
             }
         )
     merge_area = QWEN3VL_SPATIAL_MERGE_SIZE**2
-    if pre_merge_tokens % merge_area or pre_merge_tokens // merge_area != aggregate_visual_tokens:
+    if (
+        pre_merge_tokens % merge_area
+        or pre_merge_tokens // merge_area != aggregate_visual_tokens
+    ):
         raise ImageBatchBenchmarkError(
             f"{profile} run {run} visual_token_count does not match the image grids"
         )
     return aggregate_visual_tokens, normalized
 
 
-def stage_timing_evidence(timing: dict[str, Any], *, profile: str, run: int) -> dict[str, Any]:
+def stage_timing_evidence(
+    timing: dict[str, Any], *, profile: str, run: int
+) -> dict[str, Any]:
     """Validate the bounded Metal timing snapshot emitted with a request."""
 
     metal = timing.get("metal")
     if not isinstance(metal, dict):
-        raise ImageBatchBenchmarkError(f"{profile} run {run} omitted Metal timing evidence")
+        raise ImageBatchBenchmarkError(
+            f"{profile} run {run} omitted Metal timing evidence"
+        )
     stage = metal.get("stage_timing_ns")
     if not isinstance(stage, dict):
         raise ImageBatchBenchmarkError(f"{profile} run {run} omitted stage_timing_ns")
@@ -288,9 +322,20 @@ def stage_timing_evidence(timing: dict[str, Any], *, profile: str, run: int) -> 
     for regime in ("prefill", "decode"):
         raw = stage.get(regime)
         if not isinstance(raw, dict):
-            raise ImageBatchBenchmarkError(f"{profile} run {run} omitted stage_timing_ns.{regime}")
+            raise ImageBatchBenchmarkError(
+                f"{profile} run {run} omitted stage_timing_ns.{regime}"
+            )
         values: dict[str, int] = {}
-        for bucket in ("frames", "gpu", "attention", "ffn", "ple", "tail", "embedding", "other"):
+        for bucket in (
+            "frames",
+            "gpu",
+            "attention",
+            "ffn",
+            "ple",
+            "tail",
+            "embedding",
+            "other",
+        ):
             value = raw.get(bucket)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ImageBatchBenchmarkError(
@@ -324,7 +369,9 @@ def run_profile(
         )
         token_ids = timing.get("token_ids")
         if not isinstance(token_ids, list) or len(token_ids) != args.max_tokens:
-            raise ImageBatchBenchmarkError(f"{profile} run {run} omitted exactly one generated token")
+            raise ImageBatchBenchmarkError(
+                f"{profile} run {run} omitted exactly one generated token"
+            )
         sample = {
             "run": run,
             "input_count": len(images),
@@ -337,18 +384,24 @@ def run_profile(
             "parity_artifact": str(run_dir / "antfly_parity.json"),
         }
         if args.require_stage_timing:
-            sample["stage_timing"] = stage_timing_evidence(timing, profile=profile, run=run)
+            sample["stage_timing"] = stage_timing_evidence(
+                timing, profile=profile, run=run
+            )
         samples.append(sample)
 
     token_sequences = [tuple(sample["token_ids"]) for sample in samples]
     if len(set(token_sequences)) != 1:
-        raise ImageBatchBenchmarkError(f"{profile} generated token sequence is not deterministic")
+        raise ImageBatchBenchmarkError(
+            f"{profile} generated token sequence is not deterministic"
+        )
     geometry_snapshots = {
         json.dumps(sample["image_geometry"], sort_keys=True, separators=(",", ":"))
         for sample in samples
     }
     if len(geometry_snapshots) != 1:
-        raise ImageBatchBenchmarkError(f"{profile} image geometry changed across identical runs")
+        raise ImageBatchBenchmarkError(
+            f"{profile} image geometry changed across identical runs"
+        )
     return {
         "input_count": len(images),
         "input_sha256": [sha256_file(image) for image in images],
@@ -369,7 +422,9 @@ def run_profile(
             )
         }
         | {
-            "max_rss_mib": max(sample["resources"]["max_rss_mib"] for sample in samples),
+            "max_rss_mib": max(
+                sample["resources"]["max_rss_mib"] for sample in samples
+            ),
             "max_swapout_growth_mib": max(
                 sample["resources"]["swapout_growth_mib"] for sample in samples
             ),
@@ -441,7 +496,9 @@ def main(argv: list[str] | None = None) -> int:
             "performance_environment": performance_environment(),
             "stage_timing": {
                 "required": require_stage_timing,
-                "environment": stage_timing_environment() if require_stage_timing else None,
+                "environment": stage_timing_environment()
+                if require_stage_timing
+                else None,
             },
             "model_bundle": bundle,
             "input": {
@@ -449,7 +506,8 @@ def main(argv: list[str] | None = None) -> int:
                 "max_tokens": args.max_tokens,
                 "single_image": str(args.image),
                 "batch_images": [str(image) for image in batch_images],
-                "batch_reuses_single_image": batch_images == [args.image] * args.batch_size,
+                "batch_reuses_single_image": batch_images
+                == [args.image] * args.batch_size,
             },
             "resource_limits": {
                 "max_rss_mib": args.max_rss_mib,

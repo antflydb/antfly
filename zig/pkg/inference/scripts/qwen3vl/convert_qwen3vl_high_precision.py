@@ -60,7 +60,13 @@ PROJECTOR_NAME = "mmproj-Qwen3VL-2B-Instruct-BF16.gguf"
 
 
 def safe_relative_path(raw: object) -> str:
-    if not isinstance(raw, str) or not raw or "\\" in raw or ":" in raw or "\x00" in raw:
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or "\\" in raw
+        or ":" in raw
+        or "\x00" in raw
+    ):
         raise ConversionError(f"unsafe artifact path: {raw!r}")
     path = PurePosixPath(raw)
     if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
@@ -153,7 +159,9 @@ def validate_decoder(path: Path) -> dict[str, Any]:
         raise ConversionError(f"BF16 decoder is missing required tensors: {missing}")
     types = sorted({tensor.tensor_type.name for tensor in reader.tensors})
     if any(name.startswith("Q") for name in types):
-        raise ConversionError(f"high-precision decoder unexpectedly contains quantized tensors: {types}")
+        raise ConversionError(
+            f"high-precision decoder unexpectedly contains quantized tensors: {types}"
+        )
     # The official 2B checkpoint has tied input/output embeddings, so the
     # valid llama.cpp export intentionally omits ``output.weight``.  Bind the
     # shared output matrix to token_embd instead (as the qualified Q4 receipt
@@ -197,7 +205,9 @@ def validate_projector(path: Path) -> dict[str, Any]:
         raise ConversionError(f"BF16 projector is missing required tensors: {missing}")
     types = sorted({tensor.tensor_type.name for tensor in reader.tensors})
     if any(name.startswith("Q") for name in types):
-        raise ConversionError(f"high-precision projector unexpectedly contains quantized tensors: {types}")
+        raise ConversionError(
+            f"high-precision projector unexpectedly contains quantized tensors: {types}"
+        )
     # llama.cpp deliberately forces the vision patch/merger matrices to F32
     # for a BF16 mmproj (see its tensor_force_quant policy).  That is a
     # higher-precision, architecture-required exception—not a quantized
@@ -254,7 +264,9 @@ def build_bundle(
     if destination.exists() or destination.is_symlink():
         raise ConversionError(f"destination already exists: {destination}")
 
-    staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.staging-", dir=destination.parent))
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}.staging-", dir=destination.parent)
+    )
     published = False
     try:
         # Retain the validated first artifact as the published candidate, then
@@ -265,7 +277,11 @@ def build_bundle(
         second_digests: dict[str, str] = {}
         first_decoder = staging / "decoder-a-bf16.gguf"
         convert_artifact(
-            source["root"], first_decoder, converter, Path("decoder-a.log"), projector=False
+            source["root"],
+            first_decoder,
+            converter,
+            Path("decoder-a.log"),
+            projector=False,
         )
         first_digests["decoder"] = sha256_file(first_decoder)
         decoder_contract = validate_decoder(first_decoder)
@@ -273,7 +289,11 @@ def build_bundle(
 
         first_projector = staging / "projector-a-bf16.gguf"
         convert_artifact(
-            source["root"], first_projector, converter, Path("projector-a.log"), projector=True
+            source["root"],
+            first_projector,
+            converter,
+            Path("projector-a.log"),
+            projector=True,
         )
         first_digests["projector"] = sha256_file(first_projector)
         projector_contract = validate_projector(first_projector)
@@ -281,7 +301,11 @@ def build_bundle(
 
         second_decoder = staging / "decoder-b-bf16.gguf"
         convert_artifact(
-            source["root"], second_decoder, converter, Path("decoder-b.log"), projector=False
+            source["root"],
+            second_decoder,
+            converter,
+            Path("decoder-b.log"),
+            projector=False,
         )
         second_digests["decoder"] = sha256_file(second_decoder)
         validate_decoder(second_decoder)
@@ -289,7 +313,11 @@ def build_bundle(
 
         second_projector = staging / "projector-b-bf16.gguf"
         convert_artifact(
-            source["root"], second_projector, converter, Path("projector-b.log"), projector=True
+            source["root"],
+            second_projector,
+            converter,
+            Path("projector-b.log"),
+            projector=True,
         )
         second_digests["projector"] = sha256_file(second_projector)
         validate_projector(second_projector)
@@ -316,7 +344,11 @@ def build_bundle(
                 {
                     "type": "generative",
                     "inputs": ["text", "image"],
-                    "capabilities": ["qwen3vl", "multimodal", "high_precision_reference"],
+                    "capabilities": [
+                        "qwen3vl",
+                        "multimodal",
+                        "high_precision_reference",
+                    ],
                     "benchmark_only": True,
                 }
             ),
@@ -353,7 +385,9 @@ def build_bundle(
         ]
         write_bytes(
             staging / RECEIPT_NAME,
-            json_bytes({"version": 2, "source": OUTPUT_IDENTITY, "artifacts": artifacts}),
+            json_bytes(
+                {"version": 2, "source": OUTPUT_IDENTITY, "artifacts": artifacts}
+            ),
         )
         os.rename(staging, destination)
         published = True

@@ -55,7 +55,10 @@ class PrecisionBackendComparisonTests(unittest.TestCase):
                 "max_merged_tokens": 576,
                 "visual_token_count": 532,
             },
-            "benchmark": {"median": {"end_to_end_seconds": 4.0}, "timed": [{"generated_token_ids": [1986]}]},
+            "benchmark": {
+                "median": {"end_to_end_seconds": 4.0},
+                "timed": [{"generated_token_ids": [1986]}],
+            },
         }
 
     def test_high_precision_comparison_requires_matching_profile(self) -> None:
@@ -68,7 +71,9 @@ class PrecisionBackendComparisonTests(unittest.TestCase):
     def test_comparison_rejects_different_request(self) -> None:
         mlx = self.mlx("q4")
         mlx["request"]["image_sha256"] = "b" * 64
-        with self.assertRaisesRegex(comparison.ComparisonError, "requests do not match"):
+        with self.assertRaisesRegex(
+            comparison.ComparisonError, "requests do not match"
+        ):
             comparison.profile_comparison(self.native(), mlx, "q4")
 
     def test_existing_report_is_never_overwritten(self) -> None:
@@ -77,10 +82,14 @@ class PrecisionBackendComparisonTests(unittest.TestCase):
             output.write_text('{"preserve": true}\n')
             result = comparison.main(
                 [
-                    "--native-report", str(output),
-                    "--mlx-bf16-report", str(output),
-                    "--mlx-q4-report", str(output),
-                    "--output", str(output),
+                    "--native-report",
+                    str(output),
+                    "--mlx-bf16-report",
+                    str(output),
+                    "--mlx-q4-report",
+                    str(output),
+                    "--output",
+                    str(output),
                 ]
             )
             self.assertEqual(2, result)

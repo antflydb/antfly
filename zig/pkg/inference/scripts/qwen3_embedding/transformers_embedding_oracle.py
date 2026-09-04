@@ -53,7 +53,9 @@ CUSTOM_INSTRUCTION = (
     "Given a question about world capitals, retrieve the passage that answers it"
 )
 SHARED_TEXT = "The Great Wall of China is visible from low Earth orbit."
-LONG_SENTENCE = "Antfly stores documents in shards and serves hybrid search across them. "
+LONG_SENTENCE = (
+    "Antfly stores documents in shards and serves hybrid search across them. "
+)
 LONG_REPEATS = 900
 
 EXPECTED_VERSIONS = {
@@ -86,7 +88,9 @@ def verify_environment(allow_mismatch: bool = False) -> dict[str, str]:
                 file=sys.stderr,
             )
         else:
-            raise OracleError(f"oracle dependency mismatch: {json.dumps(mismatches, sort_keys=True)}")
+            raise OracleError(
+                f"oracle dependency mismatch: {json.dumps(mismatches, sort_keys=True)}"
+            )
     return actual
 
 
@@ -105,7 +109,9 @@ def render_case_text(case: dict[str, Any]) -> str:
         return format_query(case["text"], instruction)
     if role == "document":
         if case["instruction"] is not None:
-            raise OracleError(f"document case {case['id']!r} must not carry an instruction")
+            raise OracleError(
+                f"document case {case['id']!r} must not carry an instruction"
+            )
         return case["text"]
     raise OracleError(f"unknown oracle role: {role!r}")
 
@@ -116,7 +122,9 @@ def verify_single_trailing_eos(token_ids: list[int]) -> None:
     if not token_ids:
         raise OracleError("tokenizer produced an empty sequence")
     if token_ids[-1] != EOS_TOKEN_ID:
-        raise OracleError(f"sequence does not end with EOS {EOS_TOKEN_ID}: tail={token_ids[-4:]}")
+        raise OracleError(
+            f"sequence does not end with EOS {EOS_TOKEN_ID}: tail={token_ids[-4:]}"
+        )
     if token_ids.count(EOS_TOKEN_ID) != 1:
         raise OracleError(
             f"expected exactly one EOS {EOS_TOKEN_ID}, found {token_ids.count(EOS_TOKEN_ID)}"
@@ -133,13 +141,17 @@ def truncate_and_renormalize(vector: list[float], dimensions: int) -> list[float
     prefix = [float(value) for value in vector[:dimensions]]
     norm = math.sqrt(sum(value * value for value in prefix))
     if not math.isfinite(norm) or norm <= 0.0:
-        raise OracleError(f"cannot renormalize a degenerate {dimensions}-dim prefix (norm={norm})")
+        raise OracleError(
+            f"cannot renormalize a degenerate {dimensions}-dim prefix (norm={norm})"
+        )
     return [value / norm for value in prefix]
 
 
 def cosine(left: list[float], right: list[float]) -> float:
     if len(left) != len(right) or not left:
-        raise OracleError(f"cosine requires equal non-empty vectors: {len(left)} vs {len(right)}")
+        raise OracleError(
+            f"cosine requires equal non-empty vectors: {len(left)} vs {len(right)}"
+        )
     dot = sum(a * b for a, b in zip(left, right))
     left_norm = math.sqrt(sum(a * a for a in left))
     right_norm = math.sqrt(sum(b * b for b in right))
@@ -265,12 +277,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.model_dir is not None:
         source = str(args.model_dir.resolve(strict=True))
-        load_kwargs: dict[str, Any] = {"local_files_only": True, "trust_remote_code": False}
+        load_kwargs: dict[str, Any] = {
+            "local_files_only": True,
+            "trust_remote_code": False,
+        }
     else:
         source = args.model_id
         load_kwargs = {"revision": args.revision, "trust_remote_code": False}
 
-    tokenizer = AutoTokenizer.from_pretrained(source, padding_side="left", **load_kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(
+        source, padding_side="left", **load_kwargs
+    )
     config = AutoConfig.from_pretrained(source, **load_kwargs)
     architectures = list(getattr(config, "architectures", None) or [])
     if architectures != [EXPECTED_ARCHITECTURE]:
@@ -284,7 +301,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     # (151643) — which matches config.json's eos_token_id and is the token
     # last-token pooling reads. Validate the *encoded* trailing token, not
     # the tokenizer's nominal eos_token_id.
-    verify_single_trailing_eos([int(token) for token in tokenizer("antfly")["input_ids"]])
+    verify_single_trailing_eos(
+        [int(token) for token in tokenizer("antfly")["input_ids"]]
+    )
 
     # transformers >= 5 renamed torch_dtype to dtype; support both so
     # --allow-env-mismatch runs on a 4.x environment still work.
@@ -369,7 +388,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if len(vector) != HIDDEN_SIZE:
             raise OracleError(f"unexpected embedding width: {len(vector)}")
         if not all(math.isfinite(value) for value in vector):
-            raise OracleError(f"case {case['id']!r} produced non-finite embedding values")
+            raise OracleError(
+                f"case {case['id']!r} produced non-finite embedding values"
+            )
 
         unit_vectors[case["id"]] = vector
         cases_payload.append(
@@ -434,7 +455,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "shared_text": {
                 "query_case": "query_shared_text",
                 "document_case": "doc_shared_text",
-                "cosine": float(f"{cosine(query_shared, document_shared):.{FLOAT_DECIMALS}f}"),
+                "cosine": float(
+                    f"{cosine(query_shared, document_shared):.{FLOAT_DECIMALS}f}"
+                ),
                 "identical": False,
             },
         },

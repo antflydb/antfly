@@ -17991,26 +17991,25 @@ fn applyDenseEmbeddingRequestOptions(
 
     if (query_side) {
         if (request.instruction) |instr| {
-            if (style != .qwen3_embedding) return error.InstructionNotSupportedForModel;
-            const owned = try std.fmt.allocPrint(allocator, "Instruct: {s}\nQuery:", .{instr});
+            const template = manifest.embedding_profile.instruction_template;
+            if (template.len == 0) return error.InstructionNotSupportedForModel;
+            const marker = "{instruction}";
+            const marker_at = std.mem.indexOf(u8, template, marker) orelse
+                return error.InstructionNotSupportedForModel;
+            const owned = try std.fmt.allocPrint(
+                allocator,
+                "{s}{s}{s}",
+                .{ template[0..marker_at], instr, template[marker_at + marker.len ..] },
+            );
             pipeline.config.text_prefix = owned;
             return owned;
         }
-        pipeline.config.text_prefix = switch (style) {
-            .qwen3_embedding => manifest.queryPrefix(),
-            else => if (manifest.embedding_query_prefix.len > 0)
-                manifest.embedding_query_prefix
-            else
-                "Query: ",
-        };
+        pipeline.config.text_prefix = manifest.embedding_profile.query.prefix;
         return null;
     }
     if (task_type.usesDocumentPrefix()) {
         if (request.instruction != null) return error.InstructionRequiresQueryTask;
-        pipeline.config.text_prefix = if (manifest.embedding_text_prefix.len > 0 or style == .qwen3_embedding)
-            manifest.embedding_text_prefix
-        else
-            "Document: ";
+        pipeline.config.text_prefix = manifest.embedding_profile.document.prefix;
         return null;
     }
     return error.UnsupportedEmbeddingTaskType;
@@ -19150,9 +19149,16 @@ test "qwen3 embedding request options wrap queries with instructions" {
         .allocator = allocator,
         .pooling = .last,
         .embedding_style = .qwen3_embedding,
+        .embedding_profile = .{
+            .task_contract = .profiled,
+            .query = .{ .declared = true },
+            .document = .{ .declared = true },
+        },
         .model_type = .embedder,
     };
     defer manifest.deinit();
+    manifest.embedding_profile.query.prefix = try allocator.dupe(u8, manifest_mod.qwen3_embedding_default_query_prefix);
+    manifest.embedding_profile.instruction_template = try allocator.dupe(u8, manifest_mod.qwen3_embedding_instruction_template);
 
     var pipeline = embedding_mod.EmbeddingPipeline{
         .allocator = allocator,
@@ -19262,8 +19268,11 @@ test "prefix-only encoder embedding profiles switch query and document roles" {
     const allocator = std.testing.allocator;
     var manifest = manifest_mod.ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
-    manifest.embedding_query_prefix = try allocator.dupe(u8, "search_query: ");
-    manifest.embedding_text_prefix = try allocator.dupe(u8, "search_document: ");
+    manifest.embedding_profile = .{
+        .task_contract = .profiled,
+        .query = .{ .prefix = try allocator.dupe(u8, "search_query: "), .declared = true },
+        .document = .{ .prefix = try allocator.dupe(u8, "search_document: "), .declared = true },
+    };
 
     var pipeline = embedding_mod.EmbeddingPipeline{
         .allocator = allocator,
@@ -19294,7 +19303,11 @@ test "jina embedding request options switch query and document prefixes" {
         .pooling = .last,
     };
     defer manifest.deinit();
-    manifest.embedding_text_prefix = try allocator.dupe(u8, "Document: ");
+    manifest.embedding_profile = .{
+        .task_contract = .profiled,
+        .query = .{ .prefix = try allocator.dupe(u8, "Query: "), .declared = true },
+        .document = .{ .prefix = try allocator.dupe(u8, "Document: "), .declared = true },
+    };
     manifest.tasks = try allocator.alloc([]const u8, 1);
     manifest.tasks[0] = try allocator.dupe(u8, "retrieval");
 
@@ -19352,7 +19365,11 @@ test "jina embedding request options support legacy input_type aliases" {
         .pooling = .last,
     };
     defer manifest.deinit();
-    manifest.embedding_text_prefix = try allocator.dupe(u8, "Document: ");
+    manifest.embedding_profile = .{
+        .task_contract = .profiled,
+        .query = .{ .prefix = try allocator.dupe(u8, "Query: "), .declared = true },
+        .document = .{ .prefix = try allocator.dupe(u8, "Document: "), .declared = true },
+    };
 
     var pipeline = embedding_mod.EmbeddingPipeline{
         .allocator = allocator,

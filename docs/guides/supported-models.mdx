@@ -72,6 +72,32 @@ antfly inference pull hf:antflydb/clipclap:gguf:Q4_K --tasks embed
 antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF --tasks generate
 ```
 
+Antfly treats retrieval roles as model input semantics, not model-name aliases.
+Semantic searches automatically use `RETRIEVAL_QUERY`; index and artifact writes
+use `RETRIEVAL_DOCUMENT`. Known asymmetric models load a declarative
+`embedding_profile` from their trusted bundle or Sentence Transformers metadata.
+A model that declares task-sensitive inputs but has no complete query/document
+profile is rejected before its weights are admitted.
+
+Provider-specific overrides are rarely needed. When they are, keep them under
+the embedder's `retrieval` object:
+
+```json
+{
+  "provider": "bedrock",
+  "model": "cohere.embed-v4",
+  "request_format": "cohere_v4",
+  "region": "us-east-1",
+  "retrieval": {
+    "query_input_type": "search_query",
+    "document_input_type": "search_document"
+  }
+}
+```
+
+The older flat `query_input_type`, `document_input_type`, and
+`query_instruction` fields remain read-compatible but are deprecated.
+
 ## Thoroughly tested artifacts (documentation certification)
 
 These particular artifacts were checked for a meaningful result rather than merely a

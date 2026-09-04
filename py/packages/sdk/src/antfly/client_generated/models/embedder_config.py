@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.embedder_provider import EmbedderProvider
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.embedding_retrieval_config import EmbeddingRetrievalConfig
+
 
 T = TypeVar("T", bound="EmbedderConfig")
 
@@ -212,15 +216,20 @@ class EmbedderConfig:
                   "multimodal": true
                 }
                 ```
-            query_input_type (str | Unset): Advanced override for the provider-specific retrieval-query task type.
-                Antfly normally derives this automatically from semantic-search operations
-                (for example `search_query` for Cohere and Bedrock Cohere models).
-            document_input_type (str | Unset): Advanced override for the provider-specific retrieval-document task type.
-                Antfly normally derives this automatically for index and artifact writes
-                (for example `search_document` for Cohere and Bedrock Cohere models).
-            query_instruction (str | Unset): Optional retrieval instruction sent only for query embeddings to
-                instruction-aware models such as Qwen3-Embedding. It is never applied
-                while indexing documents.
+            query_input_type (str | Unset): Deprecated compatibility form of
+                `retrieval.query_input_type`. New configurations should use the
+                nested `retrieval` object.
+            document_input_type (str | Unset): Deprecated compatibility form of
+                `retrieval.document_input_type`. New configurations should use
+                the nested `retrieval` object.
+            query_instruction (str | Unset): Deprecated compatibility form of
+                `retrieval.query_instruction`. New configurations should use the
+                nested `retrieval` object.
+            retrieval (EmbeddingRetrievalConfig | Unset): Advanced retrieval-role overrides. Antfly assigns canonical task
+                intent
+                automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
+                and artifact writes are `RETRIEVAL_DOCUMENT`. These fields only override
+                how a provider or instruction-aware model represents that intent.
     """
 
     provider: EmbedderProvider
@@ -228,6 +237,7 @@ class EmbedderConfig:
     query_input_type: str | Unset = UNSET
     document_input_type: str | Unset = UNSET
     query_instruction: str | Unset = UNSET
+    retrieval: EmbeddingRetrievalConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -240,6 +250,10 @@ class EmbedderConfig:
         document_input_type = self.document_input_type
 
         query_instruction = self.query_instruction
+
+        retrieval: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.retrieval, Unset):
+            retrieval = self.retrieval.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -256,11 +270,15 @@ class EmbedderConfig:
             field_dict["document_input_type"] = document_input_type
         if query_instruction is not UNSET:
             field_dict["query_instruction"] = query_instruction
+        if retrieval is not UNSET:
+            field_dict["retrieval"] = retrieval
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.embedding_retrieval_config import EmbeddingRetrievalConfig
+
         d = dict(src_dict)
         provider = EmbedderProvider(d.pop("provider"))
 
@@ -272,12 +290,20 @@ class EmbedderConfig:
 
         query_instruction = d.pop("query_instruction", UNSET)
 
+        _retrieval = d.pop("retrieval", UNSET)
+        retrieval: EmbeddingRetrievalConfig | Unset
+        if isinstance(_retrieval, Unset):
+            retrieval = UNSET
+        else:
+            retrieval = EmbeddingRetrievalConfig.from_dict(_retrieval)
+
         embedder_config = cls(
             provider=provider,
             multimodal=multimodal,
             query_input_type=query_input_type,
             document_input_type=document_input_type,
             query_instruction=query_instruction,
+            retrieval=retrieval,
         )
 
         embedder_config.additional_properties = d

@@ -29,11 +29,18 @@ class NativePrecisionBenchmarkContractTests(unittest.TestCase):
             "top_k_overlap": 10,
         }
         self.assertTrue(benchmark.high_precision_logit_pass(metrics))
-        self.assertFalse(benchmark.high_precision_logit_pass({**metrics, "top_k_overlap": 8}))
+        self.assertFalse(
+            benchmark.high_precision_logit_pass({**metrics, "top_k_overlap": 8})
+        )
 
     def test_high_precision_profile_is_not_a_production_receipt(self) -> None:
-        self.assertEqual("bf16-reference-bundle-v1", benchmark.high_precision.OUTPUT_IDENTITY["variant"])
-        self.assertNotEqual("q4-k-m-bundle-v1", benchmark.high_precision.OUTPUT_IDENTITY["variant"])
+        self.assertEqual(
+            "bf16-reference-bundle-v1",
+            benchmark.high_precision.OUTPUT_IDENTITY["variant"],
+        )
+        self.assertNotEqual(
+            "q4-k-m-bundle-v1", benchmark.high_precision.OUTPUT_IDENTITY["variant"]
+        )
 
     def test_precision_limits_are_stricter_than_q4_gate(self) -> None:
         self.assertGreater(
@@ -47,13 +54,20 @@ class NativePrecisionBenchmarkContractTests(unittest.TestCase):
             output.write_text('{"preserve": true}\n')
             result = benchmark.main(
                 [
-                    "--high-precision-model-dir", raw,
-                    "--q4-model-dir", raw,
-                    "--weights-dir", raw,
-                    "--processor-dir", raw,
-                    "--image", str(output),
-                    "--antfly-bin", str(output),
-                    "--output", str(output),
+                    "--high-precision-model-dir",
+                    raw,
+                    "--q4-model-dir",
+                    raw,
+                    "--weights-dir",
+                    raw,
+                    "--processor-dir",
+                    raw,
+                    "--image",
+                    str(output),
+                    "--antfly-bin",
+                    str(output),
+                    "--output",
+                    str(output),
                 ]
             )
             self.assertEqual(2, result)
@@ -85,7 +99,9 @@ class NativePrecisionBenchmarkContractTests(unittest.TestCase):
                 min_free_percent=15,
                 max_swap_growth_mib=0.0,
             )
-            with mock.patch.object(benchmark.mps_benchmark, "main", side_effect=fake_mps_main):
+            with mock.patch.object(
+                benchmark.mps_benchmark, "main", side_effect=fake_mps_main
+            ):
                 result = benchmark.run_mps(args, work_dir)
             self.assertEqual("bfloat16", captured[captured.index("--dtype") + 1])
             self.assertTrue(Path(result["logits"]).is_file())

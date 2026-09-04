@@ -66,15 +66,20 @@ def validate_request_match(
     native_runs = native_profile.get("runs")
     native_visual_tokens = None
     if isinstance(native_runs, list) and native_runs:
-        native_visual_tokens = native_runs[0].get("parity", {}).get("visual_token_count")
+        native_visual_tokens = (
+            native_runs[0].get("parity", {}).get("visual_token_count")
+        )
     checks = {
         "prompt": native_request.get("prompt") == mlx_request.get("prompt"),
-        "image_sha256": native_request.get("image_sha256") == mlx_request.get("image_sha256"),
+        "image_sha256": native_request.get("image_sha256")
+        == mlx_request.get("image_sha256"),
         "max_tokens": native_request.get("max_tokens") == mlx_request.get("max_tokens"),
         "max_merged_tokens": (
-            native_request.get("max_merged_tokens") == mlx_request.get("max_merged_tokens")
+            native_request.get("max_merged_tokens")
+            == mlx_request.get("max_merged_tokens")
         ),
-        "visual_token_count": native_visual_tokens == mlx_request.get("visual_token_count"),
+        "visual_token_count": native_visual_tokens
+        == mlx_request.get("visual_token_count"),
     }
     if not all(checks.values()):
         raise ComparisonError(f"benchmark requests do not match: {checks}")
@@ -100,12 +105,14 @@ def profile_comparison(
     precision_checks = {
         "native_profile": native_precision.get(
             "high_precision_native" if profile == "bf16" else "q4_native"
-        ) == expected_native,
+        )
+        == expected_native,
         "mlx_profile": mlx.get("precision_contract", {}).get("profile") == profile,
     }
     if expected_transformers is not None:
         precision_checks["declared_transformers_mps_profile"] = (
-            native_precision.get("high_precision_transformers_mps") == expected_transformers
+            native_precision.get("high_precision_transformers_mps")
+            == expected_transformers
         )
         precision_checks["measured_transformers_mps_profile"] = (
             native.get("transformers_mps", {})
@@ -115,7 +122,9 @@ def profile_comparison(
             == expected_transformers
         )
     if not all(precision_checks.values()):
-        raise ComparisonError(f"benchmark precision contracts do not match: {precision_checks}")
+        raise ComparisonError(
+            f"benchmark precision contracts do not match: {precision_checks}"
+        )
     native_median = native_profile.get("median", {})
     mlx_median = mlx.get("benchmark", {}).get("median", {})
     native_seconds = native_median.get("core_seconds")
@@ -123,10 +132,16 @@ def profile_comparison(
     if not isinstance(native_seconds, (int, float)) or native_seconds <= 0:
         raise ComparisonError(f"native {profile} report has no positive core timing")
     if not isinstance(mlx_seconds, (int, float)) or mlx_seconds <= 0:
-        raise ComparisonError(f"MLX {profile} report has no positive warmed request timing")
+        raise ComparisonError(
+            f"MLX {profile} report has no positive warmed request timing"
+        )
     native_tokens = native_profile.get("determinism", {}).get("generated_token_ids")
     mlx_runs = mlx.get("benchmark", {}).get("timed", [])
-    mlx_tokens = mlx_runs[0].get("generated_token_ids") if isinstance(mlx_runs, list) and mlx_runs else None
+    mlx_tokens = (
+        mlx_runs[0].get("generated_token_ids")
+        if isinstance(mlx_runs, list) and mlx_runs
+        else None
+    )
     if not isinstance(native_tokens, list) or not isinstance(mlx_tokens, list):
         raise ComparisonError(f"{profile} report lacks generated token evidence")
     return {
@@ -169,7 +184,14 @@ def main(argv: list[str] | None = None) -> int:
     # Comparison reports are immutable evidence, just like the source
     # benchmark reports they bind.  Refuse before emitting a failure report.
     if args.output.exists():
-        print(json.dumps({"pass": False, "failure": f"refusing to overwrite output: {args.output}"}))
+        print(
+            json.dumps(
+                {
+                    "pass": False,
+                    "failure": f"refusing to overwrite output: {args.output}",
+                }
+            )
+        )
         return 2
     report: dict[str, Any] = {
         "schema": SCHEMA,
@@ -199,10 +221,16 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 "comparisons": {"high_precision": high, "q4": q4},
                 "gates": {
-                    "high_precision_request_exact": all(high["request_contract"].values()),
+                    "high_precision_request_exact": all(
+                        high["request_contract"].values()
+                    ),
                     "q4_request_exact": all(q4["request_contract"].values()),
-                    "high_precision_precision_contract_exact": all(high["precision_contract"].values()),
-                    "q4_precision_contract_exact": all(q4["precision_contract"].values()),
+                    "high_precision_precision_contract_exact": all(
+                        high["precision_contract"].values()
+                    ),
+                    "q4_precision_contract_exact": all(
+                        q4["precision_contract"].values()
+                    ),
                     "high_precision_token_sequence_exact": high["token_sequence_exact"],
                     "q4_token_sequence_exact": q4["token_sequence_exact"],
                 },
@@ -214,7 +242,9 @@ def main(argv: list[str] | None = None) -> int:
     except (ComparisonError, OSError, ValueError) as exc:
         report["failure"] = str(exc)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    args.output.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     print(json.dumps({"pass": report["pass"], "report": str(args.output.resolve())}))
     return 0 if report["pass"] else 2
 

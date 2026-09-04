@@ -19,8 +19,10 @@ import benchmark_qwen3vl_mlx_vlm as benchmark
 class MlxVlmBenchmarkContractTests(unittest.TestCase):
     def test_requirements_pin_chat_template_runtime(self) -> None:
         requirements = (
-            Path(__file__).resolve().parent / "requirements-qwen3vl-mlx-vlm.txt"
-        ).read_text(encoding="utf-8").splitlines()
+            (Path(__file__).resolve().parent / "requirements-qwen3vl-mlx-vlm.txt")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
         self.assertIn("jinja2==3.1.6", requirements)
         self.assertIn("mlx-vlm==0.6.17", requirements)
 
@@ -41,7 +43,9 @@ class MlxVlmBenchmarkContractTests(unittest.TestCase):
                 benchmark.fingerprint_model_dir(root)
 
     def test_token_trace_ignores_final_summary_duplicate(self) -> None:
-        intermediate = SimpleNamespace(token=1986, finish_reason=None, generation_tokens=1)
+        intermediate = SimpleNamespace(
+            token=1986, finish_reason=None, generation_tokens=1
+        )
         final = SimpleNamespace(token=1986, finish_reason="length", generation_tokens=1)
         tokens, actual_final = benchmark._token_trace([intermediate, final], 1)
         self.assertEqual([1986], tokens)
@@ -49,7 +53,9 @@ class MlxVlmBenchmarkContractTests(unittest.TestCase):
 
     def test_token_trace_rejects_short_generation(self) -> None:
         final = SimpleNamespace(token=None, finish_reason="length", generation_tokens=0)
-        with self.assertRaisesRegex(benchmark.MlxVlmBenchmarkError, "generated 0 tokens"):
+        with self.assertRaisesRegex(
+            benchmark.MlxVlmBenchmarkError, "generated 0 tokens"
+        ):
             benchmark._token_trace([final], 1)
 
     def test_profiles_keep_high_precision_and_q4_distinct(self) -> None:
@@ -61,12 +67,20 @@ class MlxVlmBenchmarkContractTests(unittest.TestCase):
 
     def test_precision_contract_rejects_wrong_quantization(self) -> None:
         self.assertEqual(
-            0, benchmark.precision_contract("bf16", {"model_type": "qwen3_vl"})["quantization_bits"]
+            0,
+            benchmark.precision_contract("bf16", {"model_type": "qwen3_vl"})[
+                "quantization_bits"
+            ],
         )
         self.assertEqual(
-            4, benchmark.precision_contract("q4", {"quantization": {"bits": 4}})["quantization_bits"]
+            4,
+            benchmark.precision_contract("q4", {"quantization": {"bits": 4}})[
+                "quantization_bits"
+            ],
         )
-        with self.assertRaisesRegex(benchmark.MlxVlmBenchmarkError, "quantization.bits"):
+        with self.assertRaisesRegex(
+            benchmark.MlxVlmBenchmarkError, "quantization.bits"
+        ):
             benchmark.precision_contract("q4", {"quantization": {"bits": 8}})
 
     def test_existing_report_is_never_overwritten(self) -> None:
@@ -76,8 +90,14 @@ class MlxVlmBenchmarkContractTests(unittest.TestCase):
             output.write_text('{"preserve": true}\n')
             result = benchmark.main(
                 [
-                    "--model-dir", str(root), "--image", str(output),
-                    "--profile", "bf16", "--output", str(output),
+                    "--model-dir",
+                    str(root),
+                    "--image",
+                    str(output),
+                    "--profile",
+                    "bf16",
+                    "--output",
+                    str(output),
                 ]
             )
             self.assertEqual(2, result)
@@ -91,7 +111,9 @@ class MlxVlmBenchmarkContractTests(unittest.TestCase):
                 mock.patch.object(benchmark, "parse_args", return_value=args),
                 mock.patch.object(benchmark, "validate_args"),
                 mock.patch.object(benchmark, "fingerprint_model_dir", return_value={}),
-                mock.patch.object(benchmark, "run", side_effect=ImportError("missing jinja2")),
+                mock.patch.object(
+                    benchmark, "run", side_effect=ImportError("missing jinja2")
+                ),
             ):
                 self.assertEqual(2, benchmark.main([]))
             report = json.loads(output.read_text(encoding="utf-8"))

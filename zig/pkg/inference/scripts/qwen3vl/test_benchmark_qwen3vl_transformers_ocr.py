@@ -67,7 +67,9 @@ class TransformersOcrBenchmarkTests(unittest.TestCase):
     def test_worker_command_replays_greedy_request_contract(self) -> None:
         command = benchmark.worker_command(args(), Path("/work/worker.json"))
         self.assertIn("--worker", command)
-        self.assertEqual("/work/worker.json", command[command.index("--worker-output") + 1])
+        self.assertEqual(
+            "/work/worker.json", command[command.index("--worker-output") + 1]
+        )
         self.assertEqual("64", command[command.index("--max-tokens") + 1])
         self.assertEqual("576", command[command.index("--max-merged-tokens") + 1])
         self.assertEqual("mps", command[command.index("--device") + 1])

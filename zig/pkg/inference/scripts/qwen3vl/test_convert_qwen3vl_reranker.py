@@ -32,10 +32,16 @@ class ConversionTests(unittest.TestCase):
             path = source / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
-            artifacts.append({"path": relative, "size": len(data), "sha256": digest(data)})
+            artifacts.append(
+                {"path": relative, "size": len(data), "sha256": digest(data)}
+            )
         (source / conversion.RECEIPT_NAME).write_text(
             json.dumps(
-                {"version": 2, "source": conversion.SOURCE_IDENTITY, "artifacts": artifacts}
+                {
+                    "version": 2,
+                    "source": conversion.SOURCE_IDENTITY,
+                    "artifacts": artifacts,
+                }
             ),
             encoding="utf-8",
         )
@@ -46,13 +52,17 @@ class ConversionTests(unittest.TestCase):
             source = self.make_source(Path(raw))
             result = conversion.validate_source(source)
             self.assertEqual(result["root"], source.resolve())
-            self.assertEqual(result["artifacts"]["model.safetensors"]["sha256"], digest(b"weights"))
+            self.assertEqual(
+                result["artifacts"]["model.safetensors"]["sha256"], digest(b"weights")
+            )
 
     def test_validate_source_rejects_unreceipted_file(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             source = self.make_source(Path(raw))
             (source / "surprise.bin").write_bytes(b"unexpected")
-            with self.assertRaisesRegex(conversion.ConversionError, "receipt/file set mismatch"):
+            with self.assertRaisesRegex(
+                conversion.ConversionError, "receipt/file set mismatch"
+            ):
                 conversion.validate_source(source)
 
     def test_validate_source_rejects_symlink(self) -> None:
@@ -63,7 +73,9 @@ class ConversionTests(unittest.TestCase):
             target.write_bytes(b"weights")
             (source / "model.safetensors").unlink()
             (source / "model.safetensors").symlink_to(target)
-            with self.assertRaisesRegex(conversion.ConversionError, "not a regular file"):
+            with self.assertRaisesRegex(
+                conversion.ConversionError, "not a regular file"
+            ):
                 conversion.validate_source(source)
 
     def test_tool_hash_is_mandatory(self) -> None:
@@ -107,7 +119,9 @@ class ConversionTests(unittest.TestCase):
             quantizer.write_bytes(b"quantizer")
             output = root / "output"
 
-            def fake_pass(_source: Path, work: Path, label: str, *_tools: Path) -> dict[str, Path]:
+            def fake_pass(
+                _source: Path, work: Path, label: str, *_tools: Path
+            ) -> dict[str, Path]:
                 values = {
                     "bf16": work / f"decoder-{label}-bf16.gguf",
                     "decoder": work / f"decoder-{label}-q4.gguf",
@@ -119,8 +133,12 @@ class ConversionTests(unittest.TestCase):
 
             with (
                 mock.patch.object(conversion, "convert_pass", side_effect=fake_pass),
-                mock.patch.object(conversion, "validate_decoder", return_value={"ok": True}),
-                mock.patch.object(conversion, "validate_projector", return_value={"ok": True}),
+                mock.patch.object(
+                    conversion, "validate_decoder", return_value={"ok": True}
+                ),
+                mock.patch.object(
+                    conversion, "validate_projector", return_value={"ok": True}
+                ),
             ):
                 report = conversion.build_bundle(
                     source,
@@ -154,7 +172,9 @@ class ConversionTests(unittest.TestCase):
             quantizer.write_bytes(b"quantizer")
             output = root / "output"
 
-            def fake_pass(_source: Path, work: Path, label: str, *_tools: Path) -> dict[str, Path]:
+            def fake_pass(
+                _source: Path, work: Path, label: str, *_tools: Path
+            ) -> dict[str, Path]:
                 values = {
                     "bf16": work / f"decoder-{label}-bf16.gguf",
                     "decoder": work / f"decoder-{label}-q4.gguf",
@@ -190,10 +210,14 @@ class ConversionTests(unittest.TestCase):
         )
 
     def test_unsupported_quantization_fails_closed(self) -> None:
-        with self.assertRaisesRegex(conversion.ConversionError, "unsupported decoder quantization"):
+        with self.assertRaisesRegex(
+            conversion.ConversionError, "unsupported decoder quantization"
+        ):
             conversion.output_identity("IQ2_XS")
 
-    def test_published_bundle_is_revalidated_from_receipt_and_live_contracts(self) -> None:
+    def test_published_bundle_is_revalidated_from_receipt_and_live_contracts(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             source = self.make_source(root)
@@ -203,7 +227,9 @@ class ConversionTests(unittest.TestCase):
             quantizer.write_bytes(b"quantizer")
             output = root / "output"
 
-            def fake_pass(_source: Path, work: Path, label: str, *_args: object) -> dict[str, Path]:
+            def fake_pass(
+                _source: Path, work: Path, label: str, *_args: object
+            ) -> dict[str, Path]:
                 values = {
                     "bf16": work / f"decoder-{label}-bf16.gguf",
                     "decoder": work / f"decoder-{label}-q8.gguf",
@@ -214,15 +240,23 @@ class ConversionTests(unittest.TestCase):
                 return values
 
             def tool_info(path: Path, expected: str, _label: str) -> dict[str, object]:
-                return {"path": str(path.resolve()), "sha256": expected, "size": path.stat().st_size}
+                return {
+                    "path": str(path.resolve()),
+                    "sha256": expected,
+                    "size": path.stat().st_size,
+                }
 
             decoder_contract = {"decoder_quantization": "Q8_0"}
             projector_contract = {"artifact_type": "mmproj"}
             with (
                 mock.patch.object(conversion, "convert_pass", side_effect=fake_pass),
                 mock.patch.object(conversion, "validate_tool", side_effect=tool_info),
-                mock.patch.object(conversion, "validate_decoder", return_value=decoder_contract),
-                mock.patch.object(conversion, "validate_projector", return_value=projector_contract),
+                mock.patch.object(
+                    conversion, "validate_decoder", return_value=decoder_contract
+                ),
+                mock.patch.object(
+                    conversion, "validate_projector", return_value=projector_contract
+                ),
             ):
                 conversion.build_bundle(
                     source,

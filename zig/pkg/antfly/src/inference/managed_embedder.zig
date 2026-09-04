@@ -1480,9 +1480,9 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         .multimodal = embedder_cfg.multimodal,
         .input_type = embedder_cfg.input_type,
         .truncate = embedder_cfg.truncate,
-        .query_input_type = try configObjectString(embedder_value, "query_input_type"),
-        .document_input_type = try configObjectString(embedder_value, "document_input_type"),
-        .query_instruction = try configObjectString(embedder_value, "query_instruction"),
+        .query_input_type = if (embedder_cfg.query_input_type.len > 0) embedder_cfg.query_input_type else null,
+        .document_input_type = if (embedder_cfg.document_input_type.len > 0) embedder_cfg.document_input_type else null,
+        .query_instruction = if (embedder_cfg.query_instruction.len > 0) embedder_cfg.query_instruction else null,
     }, .{ .emit_null_optional_fields = false });
 }
 
@@ -2594,12 +2594,9 @@ fn validateCatalogOwnerSemanticIdentity(
     defer embedder_cfg.deinit(alloc);
     const provider = parseEmbedderProvider(embedder_cfg) catch
         return error.InvalidEmbeddingArtifactProducer;
-    const configured_query_input_type = (configObjectString(embedder_value, "query_input_type") catch
-        return error.InvalidEmbeddingArtifactProducer) orelse "";
-    const configured_document_input_type = (configObjectString(embedder_value, "document_input_type") catch
-        return error.InvalidEmbeddingArtifactProducer) orelse "";
-    const configured_query_instruction = (configObjectString(embedder_value, "query_instruction") catch
-        return error.InvalidEmbeddingArtifactProducer) orelse "";
+    const configured_query_input_type = embedder_cfg.query_input_type;
+    const configured_document_input_type = embedder_cfg.document_input_type;
+    const configured_query_instruction = embedder_cfg.query_instruction;
     if (!std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "provider"), @tagName(provider)) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "model"), embedder_cfg.model) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "request_format"), embedder_cfg.request_format) or
@@ -3336,11 +3333,11 @@ fn buildManagedEmbeddingEntry(
     errdefer alloc.free(base_url);
     const input_type = if (embedder_cfg.input_type.len > 0) try alloc.dupe(u8, embedder_cfg.input_type) else @constCast("");
     errdefer if (input_type.len > 0) alloc.free(input_type);
-    const query_input_type = if (try configObjectString(embedder, "query_input_type")) |value| try alloc.dupe(u8, value) else @constCast("");
+    const query_input_type = if (embedder_cfg.query_input_type.len > 0) try alloc.dupe(u8, embedder_cfg.query_input_type) else @constCast("");
     errdefer if (query_input_type.len > 0) alloc.free(query_input_type);
-    const document_input_type = if (try configObjectString(embedder, "document_input_type")) |value| try alloc.dupe(u8, value) else @constCast("");
+    const document_input_type = if (embedder_cfg.document_input_type.len > 0) try alloc.dupe(u8, embedder_cfg.document_input_type) else @constCast("");
     errdefer if (document_input_type.len > 0) alloc.free(document_input_type);
-    const query_instruction = if (try configObjectString(embedder, "query_instruction")) |value| try alloc.dupe(u8, value) else @constCast("");
+    const query_instruction = if (embedder_cfg.query_instruction.len > 0) try alloc.dupe(u8, embedder_cfg.query_instruction) else @constCast("");
     errdefer if (query_instruction.len > 0) alloc.free(query_instruction);
     const truncate = if (embedder_cfg.truncate.len > 0) try alloc.dupe(u8, embedder_cfg.truncate) else @constCast("");
     errdefer if (truncate.len > 0) alloc.free(truncate);
@@ -3640,16 +3637,6 @@ fn configObjectU32(value: std.json.Value, field_name: []const u8) ?u32 {
         .string => |text| std.fmt.parseUnsigned(u32, text, 10) catch null,
         else => null,
     };
-}
-
-fn configObjectString(value: std.json.Value, field_name: []const u8) !?[]const u8 {
-    const object = switch (value) {
-        .object => |object| object,
-        else => return null,
-    };
-    const field = object.get(field_name) orelse return null;
-    if (field != .string) return error.InvalidManagedEmbeddingIndex;
-    return field.string;
 }
 
 fn envOptionalU32(name: [:0]const u8) ?u32 {
@@ -4323,6 +4310,16 @@ pub fn testEmbeddingTaskRouting() !void {
     const document_context = embeddingRequestContext(&entry, .retrieval_document);
     try std.testing.expectEqual(EmbeddingTaskType.retrieval_document, document_context.task_type);
     try std.testing.expect(document_context.instruction == null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"provider":"bedrock","model":"cohere.embed-v4","region":"us-east-1","retrieval":{"query_input_type":"search_query","document_input_type":"search_document","query_instruction":"retrieve passages"}}
+    , .{});
+    defer parsed.deinit();
+    var config = try parseEmbedderConfigFromValue(std.testing.allocator, parsed.value);
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("search_query", config.query_input_type);
+    try std.testing.expectEqualStrings("search_document", config.document_input_type);
+    try std.testing.expectEqualStrings("retrieve passages", config.query_instruction);
 }
 
 test "managed embeddings derive provider task types from query and document operations" {

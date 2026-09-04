@@ -43,12 +43,15 @@ pub const safetensors_bundle_variant = "bf16-safetensors-bundle-v1";
 
 /// Generated model_manifest.json for GGUF bundles. GGUF checkpoints carry no
 /// sentence-transformers sidecars, so the embedder contract is declared
-/// explicitly. The query prefix is intentionally omitted: manifests without
-/// one fall back to the model-card default retrieval instruction, keeping the
-/// wrapper text centralized in models/manifest.zig.
+/// explicitly through the same declarative embedding profile consumed by
+/// safetensors and operator-provided manifests.
 pub const gguf_bundle_model_manifest =
     "{\"type\":\"embedder\",\"pooling\":\"last\",\"normalize\":true," ++
-    "\"embedding_style\":\"qwen3_embedding\",\"document_prefix\":\"\"}\n";
+    "\"embedding_style\":\"qwen3_embedding\",\"embedding_profile\":{" ++
+    "\"task_contract\":\"profiled\",\"query\":{" ++
+    "\"prefix\":\"Instruct: Given a web search query, retrieve relevant passages that answer the query\\nQuery:\"," ++
+    "\"instruction_template\":\"Instruct: {instruction}\\nQuery:\"}," ++
+    "\"document\":{\"prefix\":\"\"}}}\n";
 
 const tokenizer_sidecar = Artifact{
     .repo = safetensors_repo,
@@ -252,4 +255,7 @@ test "Qwen3-Embedding artifact catalog is immutable and internally consistent" {
     try std.testing.expectEqualStrings("embedder", parsed.value.object.get("type").?.string);
     try std.testing.expectEqualStrings("last", parsed.value.object.get("pooling").?.string);
     try std.testing.expectEqualStrings("qwen3_embedding", parsed.value.object.get("embedding_style").?.string);
+    const profile = parsed.value.object.get("embedding_profile").?.object;
+    try std.testing.expectEqualStrings("profiled", profile.get("task_contract").?.string);
+    try std.testing.expectEqualStrings("", profile.get("document").?.object.get("prefix").?.string);
 }

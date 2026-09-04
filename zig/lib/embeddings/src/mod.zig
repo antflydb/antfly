@@ -132,6 +132,19 @@ pub fn stringifyAlloc(alloc: Allocator, cfg: Config) ![]u8 {
 }
 
 pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !Config {
+    const retrieval = generated.retrieval;
+    const query_input_type = try resolveRetrievalField(
+        if (retrieval) |value| value.query_input_type else null,
+        generated.query_input_type,
+    );
+    const document_input_type = try resolveRetrievalField(
+        if (retrieval) |value| value.document_input_type else null,
+        generated.document_input_type,
+    );
+    const query_instruction = try resolveRetrievalField(
+        if (retrieval) |value| value.query_instruction else null,
+        generated.query_instruction,
+    );
     var cfg = Config{
         .provider = generated.provider,
         .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
@@ -156,9 +169,9 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
         else
             null,
         .input_type = if (generated.input_type) |input_type| try alloc.dupe(u8, input_type) else "",
-        .query_input_type = if (generated.query_input_type) |value| try alloc.dupe(u8, value) else "",
-        .document_input_type = if (generated.document_input_type) |value| try alloc.dupe(u8, value) else "",
-        .query_instruction = if (generated.query_instruction) |value| try alloc.dupe(u8, value) else "",
+        .query_input_type = if (query_input_type) |value| try alloc.dupe(u8, value) else "",
+        .document_input_type = if (document_input_type) |value| try alloc.dupe(u8, value) else "",
+        .query_instruction = if (query_instruction) |value| try alloc.dupe(u8, value) else "",
         .truncate = if (generated.truncate) |truncate| try alloc.dupe(u8, truncate) else "",
         .batch_size = if (generated.batch_size) |batch_size|
             std.math.cast(u32, batch_size) orelse return error.InvalidEmbedderConfig
@@ -193,13 +206,38 @@ pub fn openApiFromConfig(cfg: Config) openapi.EmbedderConfig {
         .dimension = if (cfg.dimension) |dimension| dimension else null,
         .dimensions = if (cfg.dimensions) |dimensions| dimensions else null,
         .input_type = if (cfg.input_type.len > 0) cfg.input_type else null,
-        .query_input_type = if (cfg.query_input_type.len > 0) cfg.query_input_type else null,
-        .document_input_type = if (cfg.document_input_type.len > 0) cfg.document_input_type else null,
-        .query_instruction = if (cfg.query_instruction.len > 0) cfg.query_instruction else null,
+        // Always emit the canonical nested form. The flat fields remain
+        // parser-only compatibility for configurations admitted before the
+        // retrieval object was introduced.
+        .query_input_type = null,
+        .document_input_type = null,
+        .query_instruction = null,
+        .retrieval = openApiRetrievalConfig(cfg),
         .truncate = if (cfg.truncate.len > 0) cfg.truncate else null,
         .batch_size = if (cfg.batch_size) |batch_size| batch_size else null,
         .strip_new_lines = cfg.strip_new_lines,
         .multimodal = if (cfg.multimodal) true else null,
+    };
+}
+
+fn resolveRetrievalField(nested: ?[]const u8, legacy: ?[]const u8) !?[]const u8 {
+    if (nested) |nested_value| {
+        if (legacy) |legacy_value| {
+            if (!std.mem.eql(u8, nested_value, legacy_value)) return error.InvalidEmbedderConfig;
+        }
+        return nested_value;
+    }
+    return legacy;
+}
+
+fn openApiRetrievalConfig(cfg: Config) ?openapi.EmbeddingRetrievalConfig {
+    if (cfg.query_input_type.len == 0 and
+        cfg.document_input_type.len == 0 and
+        cfg.query_instruction.len == 0) return null;
+    return .{
+        .query_input_type = if (cfg.query_input_type.len > 0) cfg.query_input_type else null,
+        .document_input_type = if (cfg.document_input_type.len > 0) cfg.document_input_type else null,
+        .query_instruction = if (cfg.query_instruction.len > 0) cfg.query_instruction else null,
     };
 }
 
@@ -214,7 +252,7 @@ fn validBedrockRequestFormat(value: []const u8) bool {
 test "embedder config round trip" {
     const alloc = std.testing.allocator;
     const raw =
-        \\{"provider":"openai","model":"text-embedding-3-small","url":"https://api.openai.com","api_key":"sk-test","dimensions":1536,"query_input_type":"search_query","document_input_type":"search_document","query_instruction":"retrieve relevant passages"}
+        \\{"provider":"openai","model":"text-embedding-3-small","url":"https://api.openai.com","api_key":"sk-test","dimensions":1536,"retrieval":{"query_input_type":"search_query","document_input_type":"search_document","query_instruction":"retrieve relevant passages"}}
     ;
     var cfg = try parseConfigFromSlice(alloc, raw);
     defer cfg.deinit(alloc);
@@ -236,6 +274,23 @@ test "embedder config round trip" {
     try std.testing.expectEqualStrings("search_query", reparsed.query_input_type);
     try std.testing.expectEqualStrings("search_document", reparsed.document_input_type);
     try std.testing.expectEqualStrings("retrieve relevant passages", reparsed.query_instruction);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"retrieval\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_input_type\":\"search_query\"") != null);
+}
+
+test "embedder config accepts matching legacy retrieval fields and rejects conflicts" {
+    const alloc = std.testing.allocator;
+    const compatible =
+        \\{"provider":"openai","model":"text-embedding-3-small","query_input_type":"search_query","retrieval":{"query_input_type":"search_query"}}
+    ;
+    var cfg = try parseConfigFromSlice(alloc, compatible);
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqualStrings("search_query", cfg.query_input_type);
+
+    const conflicting =
+        \\{"provider":"openai","model":"text-embedding-3-small","query_input_type":"classification","retrieval":{"query_input_type":"search_query"}}
+    ;
+    try std.testing.expectError(error.InvalidEmbedderConfig, parseConfigFromSlice(alloc, conflicting));
 }
 
 test "embedder config supports antfly api_url normalization" {

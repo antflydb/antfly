@@ -28,7 +28,9 @@ class QueryFormattingTests(unittest.TestCase):
 
     def test_query_case_renders_with_instruction(self) -> None:
         case = {"id": "q", "role": "query", "instruction": "Find it", "text": "hello"}
-        self.assertEqual("Instruct: Find it\nQuery:hello", oracle.render_case_text(case))
+        self.assertEqual(
+            "Instruct: Find it\nQuery:hello", oracle.render_case_text(case)
+        )
 
     def test_document_case_is_raw_text(self) -> None:
         case = {"id": "d", "role": "document", "instruction": None, "text": "hello"}
@@ -36,7 +38,9 @@ class QueryFormattingTests(unittest.TestCase):
 
     def test_document_with_instruction_fails_closed(self) -> None:
         case = {"id": "d", "role": "document", "instruction": "nope", "text": "hello"}
-        with self.assertRaisesRegex(oracle.OracleError, "must not carry an instruction"):
+        with self.assertRaisesRegex(
+            oracle.OracleError, "must not carry an instruction"
+        ):
             oracle.render_case_text(case)
 
     def test_unknown_role_fails_closed(self) -> None:
@@ -55,7 +59,9 @@ class EosVerificationTests(unittest.TestCase):
 
     def test_duplicate_eos_fails(self) -> None:
         with self.assertRaisesRegex(oracle.OracleError, "exactly one EOS"):
-            oracle.verify_single_trailing_eos([10, oracle.EOS_TOKEN_ID, oracle.EOS_TOKEN_ID])
+            oracle.verify_single_trailing_eos(
+                [10, oracle.EOS_TOKEN_ID, oracle.EOS_TOKEN_ID]
+            )
 
     def test_empty_sequence_fails(self) -> None:
         with self.assertRaisesRegex(oracle.OracleError, "empty sequence"):
@@ -67,7 +73,9 @@ class MatryoshkaTests(unittest.TestCase):
         vector = [float(index + 1) for index in range(64)]
         reduced = oracle.truncate_and_renormalize(vector, 32)
         self.assertEqual(32, len(reduced))
-        self.assertAlmostEqual(1.0, math.sqrt(sum(value * value for value in reduced)), places=12)
+        self.assertAlmostEqual(
+            1.0, math.sqrt(sum(value * value for value in reduced)), places=12
+        )
 
     def test_truncation_preserves_prefix_direction(self) -> None:
         vector = [3.0, 4.0] + [0.0] * 62
@@ -143,8 +151,12 @@ class PromptSetTests(unittest.TestCase):
             set(cases),
         )
         # Three primary queries (default/custom/short) plus the shared-text query.
-        self.assertEqual(4, sum(1 for case in cases.values() if case["role"] == "query"))
-        self.assertEqual(7, sum(1 for case in cases.values() if case["role"] == "document"))
+        self.assertEqual(
+            4, sum(1 for case in cases.values() if case["role"] == "query")
+        )
+        self.assertEqual(
+            7, sum(1 for case in cases.values() if case["role"] == "document")
+        )
 
     def test_roles_and_instructions_are_consistent(self) -> None:
         for case in oracle.prompt_cases():
@@ -156,7 +168,9 @@ class PromptSetTests(unittest.TestCase):
 
     def test_shared_text_appears_as_both_roles(self) -> None:
         cases = {case["id"]: case for case in oracle.prompt_cases()}
-        self.assertEqual(cases["doc_shared_text"]["text"], cases["query_shared_text"]["text"])
+        self.assertEqual(
+            cases["doc_shared_text"]["text"], cases["query_shared_text"]["text"]
+        )
         self.assertEqual("document", cases["doc_shared_text"]["role"])
         self.assertEqual("query", cases["query_shared_text"]["role"])
         self.assertEqual(
@@ -165,8 +179,12 @@ class PromptSetTests(unittest.TestCase):
 
     def test_custom_instruction_query_differs_from_default(self) -> None:
         cases = {case["id"]: case for case in oracle.prompt_cases()}
-        self.assertNotEqual(oracle.DEFAULT_INSTRUCTION, cases["query_custom"]["instruction"])
-        self.assertEqual(oracle.DEFAULT_INSTRUCTION, cases["query_default"]["instruction"])
+        self.assertNotEqual(
+            oracle.DEFAULT_INSTRUCTION, cases["query_custom"]["instruction"]
+        )
+        self.assertEqual(
+            oracle.DEFAULT_INSTRUCTION, cases["query_default"]["instruction"]
+        )
 
     def test_short_query_has_two_words(self) -> None:
         cases = {case["id"]: case for case in oracle.prompt_cases()}
@@ -194,7 +212,9 @@ class ContractConstantTests(unittest.TestCase):
     def test_schema_and_model_pins(self) -> None:
         self.assertEqual("antfly.qwen3_embedding.transformers_oracle.v1", oracle.SCHEMA)
         self.assertEqual("Qwen/Qwen3-Embedding-0.6B", oracle.MODEL_ID)
-        self.assertEqual("97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3", oracle.DEFAULT_REVISION)
+        self.assertEqual(
+            "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3", oracle.DEFAULT_REVISION
+        )
         self.assertEqual(151_643, oracle.EOS_TOKEN_ID)
         self.assertEqual(1_024, oracle.HIDDEN_SIZE)
         self.assertEqual(28, oracle.NUM_HIDDEN_LAYERS)

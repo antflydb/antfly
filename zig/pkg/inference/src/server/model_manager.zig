@@ -2675,7 +2675,7 @@ pub const LoadedModel = struct {
                 .max => .max,
                 .last => .last,
             },
-            .text_prefix = self.manifest.embedding_text_prefix,
+            .text_prefix = self.manifest.embedding_profile.document.prefix,
             .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or
                 generic_encoder != null or
                 session_factory.supportsResidentTextEncoder(self.session),

@@ -24,7 +24,12 @@ import time
 from typing import Any
 
 from qualify_qwen3vl_metal import validate_managed_reranker_bundle
-from transformers_oracle import OracleError, sha256_file, tensor_f32le_bytes, verify_environment
+from transformers_oracle import (
+    OracleError,
+    sha256_file,
+    tensor_f32le_bytes,
+    verify_environment,
+)
 
 
 MODEL_REPOSITORY = "Qwen/Qwen3-VL-Reranker-2B"
@@ -39,7 +44,9 @@ SYSTEM_PROMPT = (
     "Judge whether the Document meets the requirements based on the Query and the Instruct provided. "
     'Note that the answer can only be "yes" or "no".'
 )
-DEFAULT_INSTRUCTION = "Given a search query, retrieve relevant candidates that answer the query."
+DEFAULT_INSTRUCTION = (
+    "Given a search query, retrieve relevant candidates that answer the query."
+)
 
 
 def render_expected_prompt(instruction: str, query: str, document: str) -> str:
@@ -90,19 +97,25 @@ def reranker_messages(
     ]
 
 
-def truncate_upstream(ids: list[int], max_length: int, special_ids: set[int]) -> list[int]:
+def truncate_upstream(
+    ids: list[int], max_length: int, special_ids: set[int]
+) -> list[int]:
     """Reproduce the pinned helper, including its max_length + 5 behavior."""
 
     if len(ids) <= max_length:
         return ids
     if len(ids) < PROTECTED_SUFFIX_TOKENS:
-        raise OracleError("reranker token sequence is shorter than the protected suffix")
+        raise OracleError(
+            "reranker token sequence is shorter than the protected suffix"
+        )
     prefix = ids[:-PROTECTED_SUFFIX_TOKENS]
     suffix = ids[-PROTECTED_SUFFIX_TOKENS:]
     special_count = sum(token in special_ids for token in prefix)
     ordinary_budget = max_length - special_count
     if ordinary_budget < 0:
-        raise OracleError("special reranker tokens exceed the upstream truncation budget")
+        raise OracleError(
+            "special reranker tokens exceed the upstream truncation budget"
+        )
     kept: list[int] = []
     ordinary_kept = 0
     for token in prefix:
@@ -148,9 +161,13 @@ def render_and_tokenize(
         expected_document = (IMAGE_MARKER if image is not None else "") + document
         expected = render_expected_prompt(instruction, query, expected_document)
         if generic != expected:
-            raise OracleError("generic pinned chat template drifted from the official reference prompt")
+            raise OracleError(
+                "generic pinned chat template drifted from the official reference prompt"
+            )
         if dedicated != expected:
-            raise OracleError("dedicated reranker template drifted from the official reference prompt")
+            raise OracleError(
+                "dedicated reranker template drifted from the official reference prompt"
+            )
         rendered.append(expected)
 
     if image is None:
@@ -167,7 +184,9 @@ def render_and_tokenize(
         max_pixels = max_merged_tokens * factor_area
         official_min_pixels = int(processor.image_processor.size["shortest_edge"])
         if max_pixels < official_min_pixels:
-            raise OracleError("max merged tokens cannot satisfy the official image minimum")
+            raise OracleError(
+                "max merged tokens cannot satisfy the official image minimum"
+            )
         encoded = processor(
             text=rendered,
             images=[image],
@@ -217,7 +236,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     bundle = validate_managed_reranker_bundle(args.model_dir)
     model_dir = Path(bundle["model_dir"])
     model_path = Path(bundle["model_path"])
-    if model_path.stat().st_size != MODEL_SIZE or sha256_file(model_path) != MODEL_SHA256:
+    if (
+        model_path.stat().st_size != MODEL_SIZE
+        or sha256_file(model_path) != MODEL_SHA256
+    ):
         raise OracleError("pinned BF16 reranker model identity mismatch")
 
     instruction = args.instruction or DEFAULT_INSTRUCTION
@@ -277,21 +299,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             video_grid_thw=None,
             attention_mask=model_inputs["attention_mask"],
         )
-        final_hidden = lm.model(**model_inputs, use_cache=False, return_dict=True).last_hidden_state[:, -1]
+        final_hidden = lm.model(
+            **model_inputs, use_cache=False, return_dict=True
+        ).last_hidden_state[:, -1]
         yes_weight = lm.lm_head.weight[YES_TOKEN_ID]
         no_weight = lm.lm_head.weight[NO_TOKEN_ID]
         score_logits = final_hidden @ (yes_weight - no_weight)
         synchronize(args.device)
-        final_hidden_f32 = final_hidden.to(device="cpu", dtype=torch.float32).contiguous()
-        score_logits_f32 = score_logits.to(device="cpu", dtype=torch.float32).contiguous()
+        final_hidden_f32 = final_hidden.to(
+            device="cpu", dtype=torch.float32
+        ).contiguous()
+        score_logits_f32 = score_logits.to(
+            device="cpu", dtype=torch.float32
+        ).contiguous()
         # The BF16 model projection defines the reference logit. Probability
         # conversion is an API operation, not another model layer, and the
         # native reranker applies sigmoid in f32 as well.
         scores_f32 = torch.sigmoid(score_logits_f32).contiguous()
     finished_at = time.monotonic()
 
-    if final_hidden_f32.shape != (len(args.document), int(lm.config.text_config.hidden_size)):
-        raise OracleError(f"unexpected final hidden shape: {tuple(final_hidden_f32.shape)}")
+    if final_hidden_f32.shape != (
+        len(args.document),
+        int(lm.config.text_config.hidden_size),
+    ):
+        raise OracleError(
+            f"unexpected final hidden shape: {tuple(final_hidden_f32.shape)}"
+        )
     if not bool(torch.isfinite(final_hidden_f32).all().item()):
         raise OracleError("Transformers produced non-finite final hidden values")
     if not bool(torch.isfinite(scores_f32).all().item()):
@@ -307,7 +340,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     active_mrope_positions = [
         [
             int(value)
-            for value in positions_cpu[:, row_index, torch.tensor(mask_row, dtype=torch.bool)]
+            for value in positions_cpu[
+                :, row_index, torch.tensor(mask_row, dtype=torch.bool)
+            ]
             .reshape(-1)
             .tolist()
         ]
@@ -351,7 +386,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "input_ids": [[int(token) for token in row] for row in ids],
             "attention_mask": [[int(value) for value in row] for row in masks],
             "active_mrope_position_ids": active_mrope_positions,
-            "mrope_position_deltas": [int(value) for value in deltas_cpu.reshape(-1).tolist()],
+            "mrope_position_deltas": [
+                int(value) for value in deltas_cpu.reshape(-1).tolist()
+            ],
             "image": (
                 {
                     "path": str(image_path),
@@ -383,7 +420,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "final_hidden_f32le_sha256": hashlib.sha256(hidden_bytes).hexdigest(),
             "final_hidden_min": float(np.frombuffer(hidden_bytes, dtype="<f4").min()),
             "final_hidden_max": float(np.frombuffer(hidden_bytes, dtype="<f4").max()),
-            "hidden_output": str(args.hidden_output.resolve()) if args.hidden_output else None,
+            "hidden_output": str(args.hidden_output.resolve())
+            if args.hidden_output
+            else None,
         },
         "timing_seconds": {
             "load_and_move": loaded_at - load_started,
@@ -408,7 +447,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     if not 1 <= args.max_length <= MAX_LENGTH + PROTECTED_SUFFIX_TOKENS:
-        parser.error(f"--max-length must be in [1, {MAX_LENGTH + PROTECTED_SUFFIX_TOKENS}]")
+        parser.error(
+            f"--max-length must be in [1, {MAX_LENGTH + PROTECTED_SUFFIX_TOKENS}]"
+        )
     if not 1 <= args.threads <= 16:
         parser.error("--threads must be in [1, 16]")
     if not 4 <= args.max_merged_tokens <= 1024:
@@ -422,7 +463,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
         payload = run(args)
-        args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        args.output.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         return 0
     except (OracleError, OSError, RuntimeError, ValueError) as exc:
         print(f"Qwen3-VL Transformers reranker oracle failed: {exc}", file=sys.stderr)

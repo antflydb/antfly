@@ -31,12 +31,15 @@ class HighPrecisionConversionTests(unittest.TestCase):
             root = Path(raw)
             self.write_source(root)
             digest = hashlib.sha256(b"weights").hexdigest()
-            with mock.patch.object(conversion, "MODEL_SIZE", len(b"weights")), mock.patch.object(
-                conversion, "MODEL_SHA256", digest
+            with (
+                mock.patch.object(conversion, "MODEL_SIZE", len(b"weights")),
+                mock.patch.object(conversion, "MODEL_SHA256", digest),
             ):
                 evidence = conversion.validate_source(root)
             self.assertEqual(digest, evidence["model"]["sha256"])
-            self.assertEqual(set(conversion.REQUIRED_SIDECARS), set(evidence["sidecars"]))
+            self.assertEqual(
+                set(conversion.REQUIRED_SIDECARS), set(evidence["sidecars"])
+            )
 
     def test_validate_source_rejects_wrong_architecture(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -44,17 +47,18 @@ class HighPrecisionConversionTests(unittest.TestCase):
             self.write_source(root)
             (root / "config.json").write_text(json.dumps({"model_type": "qwen2_vl"}))
             digest = hashlib.sha256(b"weights").hexdigest()
-            with mock.patch.object(conversion, "MODEL_SIZE", len(b"weights")), mock.patch.object(
-                conversion, "MODEL_SHA256", digest
+            with (
+                mock.patch.object(conversion, "MODEL_SIZE", len(b"weights")),
+                mock.patch.object(conversion, "MODEL_SHA256", digest),
             ):
                 with self.assertRaisesRegex(conversion.ConversionError, "model_type"):
                     conversion.validate_source(root)
 
     def test_output_identity_is_explicitly_reference_only(self) -> None:
-        self.assertEqual("bf16-reference-bundle-v1", conversion.OUTPUT_IDENTITY["variant"])
-        self.assertNotEqual(
-            conversion.OUTPUT_IDENTITY["variant"], "q4-k-m-bundle-v1"
+        self.assertEqual(
+            "bf16-reference-bundle-v1", conversion.OUTPUT_IDENTITY["variant"]
         )
+        self.assertNotEqual(conversion.OUTPUT_IDENTITY["variant"], "q4-k-m-bundle-v1")
 
     def test_safe_relative_path_rejects_traversal(self) -> None:
         with self.assertRaises(conversion.ConversionError):
