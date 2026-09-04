@@ -17273,7 +17273,8 @@ fn applyReranker(
         try std.fmt.allocPrint(alloc, "{{{{{s}}}}}", .{cfg.field});
     defer alloc.free(doc_template);
 
-    const rerank_count = rerankerCandidateCount(result.hits.len, cfg.candidate_count);
+    const output_limit = rerankerOutputLimit(req.limit, cfg.top_n);
+    const rerank_count = rerankerCandidateCount(result.hits.len, cfg.candidate_count, req.offset, output_limit);
 
     const documents = try alloc.alloc([]const u8, rerank_count);
     defer alloc.free(documents);
@@ -17349,7 +17350,6 @@ fn applyReranker(
         }
     }.lessThan);
 
-    const output_limit = rerankerOutputLimit(req.limit, cfg.top_n);
     try pageRerankedSearchHits(alloc, result, rerank_count, req.offset, output_limit);
 
     meta.reranker = .{
@@ -17359,8 +17359,14 @@ fn applyReranker(
     };
 }
 
-fn rerankerCandidateCount(hit_count: usize, candidate_count: ?u32) usize {
-    return if (candidate_count) |count| @min(hit_count, count) else hit_count;
+fn rerankerCandidateCount(
+    hit_count: usize,
+    candidate_count: ?u32,
+    offset: u32,
+    output_limit: u32,
+) usize {
+    const window = candidate_count orelse offset +| output_limit;
+    return @min(hit_count, window);
 }
 
 fn rerankerOutputLimit(query_limit: u32, top_n: ?u32) u32 {
@@ -17368,8 +17374,8 @@ fn rerankerOutputLimit(query_limit: u32, top_n: ?u32) u32 {
 }
 
 test "reranker candidate and output windows have distinct bounds" {
-    try std.testing.expectEqual(@as(usize, 50), rerankerCandidateCount(100, 50));
-    try std.testing.expectEqual(@as(usize, 100), rerankerCandidateCount(100, null));
+    try std.testing.expectEqual(@as(usize, 50), rerankerCandidateCount(100, 50, 5, 10));
+    try std.testing.expectEqual(@as(usize, 15), rerankerCandidateCount(100, null, 5, 10));
     try std.testing.expectEqual(@as(u32, 10), rerankerOutputLimit(25, 10));
     try std.testing.expectEqual(@as(u32, 25), rerankerOutputLimit(25, null));
 }

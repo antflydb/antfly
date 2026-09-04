@@ -1697,7 +1697,10 @@ const ComponentPaging = struct {
 };
 
 fn componentPaging(req: types.SearchRequest) ComponentPaging {
-    var limit = req.limit +| req.offset;
+    var limit = if (req.reranker) |reranker|
+        reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset
+    else
+        req.limit +| req.offset;
     const needs_component_window = requestHasPostprocessPageTransforms(req);
 
     if (!needs_component_window) {
@@ -1711,13 +1714,8 @@ fn componentPaging(req: types.SearchRequest) ComponentPaging {
         if (merge_config.window_size > limit) limit = merge_config.window_size;
     }
     if (req.reranker) |reranker| {
-        if (reranker.candidate_count) |candidate_count| {
-            if (candidate_count > limit) limit = candidate_count;
-        }
-        if (reranker.top_n) |top_n| {
-            const reranker_page_end = top_n +| req.offset;
-            if (reranker_page_end > limit) limit = reranker_page_end;
-        }
+        const reranker_window = reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset;
+        if (reranker_window > limit) limit = reranker_window;
     }
 
     return .{
@@ -1738,6 +1736,16 @@ test "reranker component paging includes the post-rerank offset" {
     });
     try std.testing.expectEqual(@as(u32, 0), paging.offset);
     try std.testing.expectEqual(@as(u32, 17), paging.limit);
+
+    const legacy_top_n = componentPaging(.{
+        .limit = 5,
+        .reranker = .{
+            .provider = .antfly,
+            .field = "body",
+            .top_n = 2,
+        },
+    });
+    try std.testing.expectEqual(@as(u32, 2), legacy_top_n.limit);
 }
 
 fn requestHasPostprocessPageTransforms(req: types.SearchRequest) bool {
