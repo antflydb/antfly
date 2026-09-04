@@ -392,6 +392,9 @@ const internal_service_issuer_key = "antfly.internal_service.issuer";
 const internal_service_rollout_mode_key = "antfly.internal_service.rollout_mode";
 const data_raft_max_snapshot_transfer_bytes: usize = 1 << 30;
 const data_raft_max_regular_ready_bytes: usize = 64 * 1024 * 1024;
+// Bound each follower independently; the runtime Ready ceiling remains a
+// last-resort invariant rather than ordinary replication flow control.
+const data_raft_max_inflight_bytes_per_peer: usize = data_raft_max_regular_ready_bytes;
 const data_raft_max_single_ready_bytes: usize =
     data_raft_max_snapshot_transfer_bytes + data_raft_max_regular_ready_bytes;
 
@@ -1221,6 +1224,7 @@ const DataDescriptorFactory = struct {
                     .check_quorum = true,
                     .step_down_on_removal = true,
                     .max_size_per_msg = data_raft_max_regular_ready_bytes,
+                    .max_inflight_bytes = data_raft_max_inflight_bytes_per_peer,
                     .max_committed_size_per_ready = data_raft_max_regular_ready_bytes,
                     .random_seed = antfly.raft.stableRandomSeed(record.group_id, record.local_node_id),
                 },
@@ -1265,6 +1269,7 @@ test "data descriptor factory separates bootstrap voters from transport peers" {
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4 }, desc.group.raft_config.peers);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, desc.initial_voters.?);
     try std.testing.expectEqual(data_raft_max_regular_ready_bytes, desc.group.raft_config.max_size_per_msg);
+    try std.testing.expectEqual(data_raft_max_inflight_bytes_per_peer, desc.group.raft_config.max_inflight_bytes);
     try std.testing.expectEqual(data_raft_max_regular_ready_bytes, desc.group.raft_config.max_committed_size_per_ready);
 }
 
