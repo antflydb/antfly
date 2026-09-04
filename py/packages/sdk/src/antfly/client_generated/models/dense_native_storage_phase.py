@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class DenseNativeStoragePhase(str, Enum):
+class DenseNativeStoragePhase(StrEnum):
     LEGACY = "legacy"
     NATIVE_AUTHORITATIVE = "native_authoritative"
     NATIVE_BUILDING = "native_building"
