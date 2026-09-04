@@ -8,7 +8,19 @@ on:
         required: true
         type: string
       source_commit:
-        description: "Exact default-branch commit to build"
+        description: "Exact trusted release-line commit to build"
+        required: true
+        type: string
+      release_line:
+        description: "Tag-derived release line, or nightly"
+        required: true
+        type: string
+      source_ref:
+        description: "Controller-selected protected source branch"
+        required: true
+        type: string
+      source_ref_head:
+        description: "Immutable source branch head observed by the controller"
         required: true
         type: string
       channel:
@@ -60,15 +72,33 @@ jobs:
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - name: Require compatible immutable default-branch source
+      - name: Require compatible immutable release-line source
         env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
           SOURCE_COMMIT: ${{ inputs.source_commit }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_LINE: ${{ inputs.release_line }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_REF_HEAD: ${{ inputs.source_ref_head }}
         run: |
           set -euo pipefail
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-          git fetch --no-tags origin "$DEFAULT_BRANCH"
-          git merge-base --is-ancestor "$SOURCE_COMMIT" "origin/$DEFAULT_BRANCH"
+          [[ "$SOURCE_REF_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          if [ "$RELEASE_CHANNEL" = nightly ]; then
+            resolved="$(python scripts/release/release_lines.py nightly)"
+            test "$RELEASE_LINE" = "$(jq -r .release_line <<<"$resolved")"
+            test "$SOURCE_REF" = "$(jq -r .source_ref <<<"$resolved")"
+          else
+            python scripts/release/release_lines.py verify-provenance \
+              --tag "$RELEASE_TAG" \
+              --release-line "$RELEASE_LINE" \
+              --source-ref "$SOURCE_REF" >/dev/null
+            test "$SOURCE_COMMIT" = "$SOURCE_REF_HEAD"
+          fi
+          git fetch --no-tags origin "$SOURCE_REF"
+          current_source_head="$(git rev-parse FETCH_HEAD)"
+          git merge-base --is-ancestor "$SOURCE_REF_HEAD" "$current_source_head"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" "$SOURCE_REF_HEAD"
           python scripts/release/validate_source_contract.py --commit "$SOURCE_COMMIT"
       - name: Validate release channel
         id: channel
@@ -224,6 +254,9 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag_name }}
           SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RELEASE_LINE: ${{ inputs.release_line }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_REF_HEAD: ${{ inputs.source_ref_head }}
           BUILD_CONTROLLER_COMMIT: ${{ needs.release-plan.outputs.build_controller_commit }}
           RELEASE_CHANNEL: ${{ needs.release-plan.outputs.channel }}
         run: |
@@ -232,6 +265,9 @@ jobs:
             --tag "$RELEASE_TAG" \
             --channel "$RELEASE_CHANNEL" \
             --source-commit "$SOURCE_COMMIT" \
+            --release-line "$RELEASE_LINE" \
+            --source-ref "$SOURCE_REF" \
+            --source-ref-head "$SOURCE_REF_HEAD" \
             --build-controller-commit "$BUILD_CONTROLLER_COMMIT" \
             > dist/release-request/release-request.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

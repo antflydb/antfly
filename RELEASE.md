@@ -58,8 +58,9 @@ credentials.
    `.github/workflows/antfly-nightly.yml` emit only an untrusted JSON request.
    They never call a builder. `.github/workflows/antfly-release-build-controller.yml`
    is loaded through `workflow_run` from the default branch. It requires tag
-   requests to match the pushed tag and commit, and nightly requests to have
-   been dispatched on the default branch.
+   requests to match the pushed tag and commit and to point at the exact tip of
+   the controller-selected release branch. Nightly requests must have been
+   dispatched on the default branch.
 2. The build controller pins its exact commit and calls
    `.github/workflows/antfly-artifact-build.yml`, the sole reusable artifact
    builder, from that same commit. The requested source commit supplies only
@@ -70,8 +71,9 @@ credentials.
    calls `.github/workflows/cli-package.yml`, extracts `install.sh` and
    `openapi.yaml` directly from the selected Git commit, and uploads the native
    archives, CLI snapshot, commit-bound source snapshot, and
-   canonical `ReleaseSpec` (source commit, build-controller commit, channel,
-   build contract, and all registry versions) as an Actions artifact. The
+   canonical `ReleaseSpec` (source commit, trusted source branch and observed
+   branch head, build-controller commit, channel, build contract, and all
+   registry versions) as an Actions artifact. The
    workflow graph, nested reusable workflows, and controller-owned scripts all
    share that recorded build-controller identity.
 3. Completion of the build controller triggers
@@ -327,6 +329,38 @@ represented by every publication target (notably container tags). Historical
 spellings such as `rc2`, `pre.2`, and `preview2` can be read from existing
 journals during recovery, but cannot create a new release candidate.
 
+## Release Lines
+
+`scripts/release/release-lines.json` is the default-branch controller's map
+from a tag's `X.Y` version line to its trusted source branch. It currently maps
+`0.2` to `main`; no maintenance-branch rollout is active yet. Release tags are
+still created and pushed manually, and a new non-nightly tag is accepted only
+when its commit is the selected branch's exact tip when the controller validates
+the request. The request cannot nominate its own source branch.
+
+The selected branch and observed branch head are recorded in schema-v5 release
+provenance and carried through artifact build, promotion, ledger verification,
+and recovery. Each line also retains an explicit history of trusted source
+branches. This allows an older release built from `main` to remain verifiable
+after ownership of that line moves to its maintenance branch, without allowing
+a new tag to select a historical branch.
+
+When `main` begins 0.3 development:
+
+1. Ensure `v0.2.x` points at the intended final shared 0.2 commit.
+2. In a reviewed change on `main`, change the `0.2` `source_ref` to
+   `refs/heads/v0.2.x`, append that ref to `trusted_source_refs` without removing
+   `refs/heads/main`, and add an active `0.3` line sourced from
+   `refs/heads/main`.
+3. Backport later 0.2 fixes through PRs into `v0.2.x`, and create canonical
+   `v0.2.*` tags only from its exact tip. Do not merge 0.3-era `main` back into
+   the maintenance branch.
+
+Privileged build and promotion policy always remains on `main`; only versioned
+release source comes from the mapped maintenance branch. Repository branch/tag
+protection is an independent administrative control and is not enforced by
+this file.
+
 Run a snapshot for the current default-branch head with
 `gh workflow run antfly-nightly.yml`. To reproduce a snapshot from a specific
 default-branch commit, add `-f source_commit=<40-character-commit>`.
@@ -387,9 +421,10 @@ new plan and approval. Fresh journal and alias ETags protect the actual sweep.
 Registry cleanup removes only container digests with no retained or channel
 references. Per-ledger container identity records have an independent
 lifecycle: every expired record is removed after registry validation even when
-its image digest is shared with a retained release. Conversely, a schema-v4
-release missing its immutable container record is retained for repair rather
-than partially collected. R2 payloads and identity records are deleted only
+its image digest is shared with a retained release. Conversely, a release using
+the controller-provenance ledger schemas (v4 or v5) but missing its immutable
+container record is retained for repair rather than partially collected. R2
+payloads and identity records are deleted only
 after registry cleanup succeeds. The GC never deletes stable releases, shared
 content-addressed objects, or npm/PyPI versions. Immutable completion receipts
 remain as compact audit history after payload deletion. Existing `termite/`

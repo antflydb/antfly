@@ -23,6 +23,9 @@ jobs:
     outputs:
       tag: ${{ steps.request.outputs.tag }}
       source_commit: ${{ steps.request.outputs.source_commit }}
+      release_line: ${{ steps.request.outputs.release_line }}
+      source_ref: ${{ steps.request.outputs.source_ref }}
+      source_ref_head: ${{ steps.request.outputs.source_ref_head }}
       channel: ${{ steps.request.outputs.channel }}
       build_controller_commit: ${{ steps.request.outputs.build_controller_commit }}
     steps:
@@ -58,6 +61,12 @@ jobs:
             "Release request:push:tag")
               test "$channel" = auto
               test "$source_commit" = "$TRIGGER_HEAD_SHA"
+              resolved="$(python scripts/release/release_lines.py resolve --tag "$tag")"
+              release_line="$(jq -r .release_line <<<"$resolved")"
+              source_ref="$(jq -r .source_ref <<<"$resolved")"
+              git fetch --no-tags origin "$source_ref"
+              source_ref_head="$(git rev-parse FETCH_HEAD)"
+              test "$source_commit" = "$source_ref_head"
               git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
               test "$(git rev-parse "$tag^{commit}")" = "$source_commit"
               ;;
@@ -65,9 +74,15 @@ jobs:
               test "$TRIGGER_HEAD_BRANCH" = "$DEFAULT_BRANCH"
               test "$channel" = nightly
               test "$tag" = "v0.0.0-dev.${TRIGGER_RUN_ID}"
+              resolved="$(python scripts/release/release_lines.py nightly)"
+              release_line="$(jq -r .release_line <<<"$resolved")"
+              source_ref="$(jq -r .source_ref <<<"$resolved")"
+              git fetch --no-tags origin "$source_ref"
+              source_ref_head="$(git rev-parse FETCH_HEAD)"
               if [ -z "$source_commit" ]; then
                 source_commit="$TRIGGER_HEAD_SHA"
               fi
+              git merge-base --is-ancestor "$source_commit" "$source_ref_head"
               ;;
             *)
               echo "untrusted release build trigger" >&2
@@ -75,13 +90,16 @@ jobs:
               ;;
           esac
           [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$source_ref_head" =~ ^[0-9a-f]{40}$ ]]
           git cat-file -e "$source_commit^{commit}"
-          git merge-base --is-ancestor "$source_commit" "origin/$DEFAULT_BRANCH"
           build_controller_commit="$(git rev-parse HEAD)"
           test "$build_controller_commit" = "$GITHUB_SHA"
           {
             echo "tag=$tag"
             echo "source_commit=$source_commit"
+            echo "release_line=$release_line"
+            echo "source_ref=$source_ref"
+            echo "source_ref_head=$source_ref_head"
             echo "channel=$channel"
             echo "build_controller_commit=$build_controller_commit"
           } >> "$GITHUB_OUTPUT"
@@ -94,5 +112,8 @@ jobs:
     with:
       tag_name: ${{ needs.resolve.outputs.tag }}
       source_commit: ${{ needs.resolve.outputs.source_commit }}
+      release_line: ${{ needs.resolve.outputs.release_line }}
+      source_ref: ${{ needs.resolve.outputs.source_ref }}
+      source_ref_head: ${{ needs.resolve.outputs.source_ref_head }}
       channel: ${{ needs.resolve.outputs.channel }}
       build_controller_commit: ${{ needs.resolve.outputs.build_controller_commit }}
