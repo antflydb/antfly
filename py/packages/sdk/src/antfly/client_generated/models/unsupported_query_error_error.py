@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class UnsupportedQueryErrorError(str, Enum):
+class UnsupportedQueryErrorError(StrEnum):
     UNSUPPORTED_QUERY_REQUEST = "unsupported_query_request"
 
     def __str__(self) -> str:

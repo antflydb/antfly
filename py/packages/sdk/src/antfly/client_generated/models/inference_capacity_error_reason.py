@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceCapacityErrorReason(str, Enum):
+class InferenceCapacityErrorReason(StrEnum):
     INFERENCE_ADMISSION = "inference_admission"
     INFERENCE_CAPACITY = "inference_capacity"
 

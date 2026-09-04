@@ -2654,10 +2654,7 @@ pub const LoadedModel = struct {
         const tok = self.getTokenizer();
         const generic_encoder: ?session_factory.GenericEncoderArchConfig = session_factory.getGenericEncoderArchConfig(self.session) catch null;
         const resident_text_encoder = (self.session.backend() == .metal or self.session.backend() == .cuda) and
-            if (generic_encoder) |arch| switch (arch) {
-                .bert => true,
-                .deberta => false,
-            } else false;
+            session_factory.supportsResidentTextEncoder(self.session);
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
             .max_length = self.manifest.maxTextSequenceLength(),
             .normalize = self.manifest.normalize,
@@ -2668,7 +2665,9 @@ pub const LoadedModel = struct {
                 .last => .last,
             },
             .text_prefix = self.manifest.embedding_text_prefix,
-            .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or generic_encoder != null,
+            .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or
+                generic_encoder != null or
+                session_factory.supportsResidentTextEncoder(self.session),
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
             .resident_text_encoder = resident_text_encoder,
             // Last-token pooling reads the EOS position; guarantee exactly
@@ -5004,6 +5003,23 @@ pub const ModelManager = struct {
         );
     }
 
+    /// Architecture sessions may carry a minimum safe cache/workspace floor
+    /// that cannot be known until their config has been parsed. Apply that
+    /// floor before attaching serving admission, then reapply explicit node
+    /// overrides so an operator hard cap always remains authoritative.
+    fn admissionLimitsForSession(
+        self: *const ModelManager,
+        backend_runtime: backends.BackendRuntime,
+        session: backends.Session,
+    ) runtime.tier.memory.Limits {
+        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
+            admissionBackendClassForRuntime(backend_runtime),
+            self.process_memory_limit_bytes,
+        );
+        limits = session_factory.widenBudgetLimitsForSession(session, limits);
+        return runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
+    }
+
     /// Lazily loaded composite-model components participate in the same
     /// process-wide admission accounting as the primary session. Reserve their
     /// construction peak immediately before import, then retain only completed
@@ -5116,12 +5132,16 @@ pub const ModelManager = struct {
                     };
                 }
                 if (self.admission_enabled) {
+                    const session_admission_limits = self.admissionLimitsForSession(
+                        backend_runtime,
+                        session,
+                    );
                     attachSessionRunAdmission(
                         self.allocator,
                         &session,
                         self.admissionController(),
                         backend_runtime,
-                        admission_limits,
+                        session_admission_limits,
                         resident_amounts,
                         null,
                     ) catch |err| {
@@ -7648,12 +7668,16 @@ fn loadSessionForPreferredBackends(
                 };
             }
             if (manager.admission_enabled) {
+                const session_admission_limits = manager.admissionLimitsForSession(
+                    backend_runtime,
+                    session,
+                );
                 attachSessionRunAdmission(
                     manager.allocator,
                     &session,
                     manager.admissionController(),
                     backend_runtime,
-                    admission_limits,
+                    session_admission_limits,
                     resident_amounts,
                     &man,
                 ) catch |err| {

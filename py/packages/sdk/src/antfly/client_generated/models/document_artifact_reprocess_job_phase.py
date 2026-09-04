@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class DocumentArtifactReprocessJobPhase(str, Enum):
+class DocumentArtifactReprocessJobPhase(StrEnum):
     CANCELLED = "cancelled"
     FAILED = "failed"
     QUEUED = "queued"

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class DerivedCoveragePolicy(str, Enum):
+class DerivedCoveragePolicy(StrEnum):
     BEST_EFFORT = "best_effort"
     PARTIAL = "partial"
     STRICT = "strict"

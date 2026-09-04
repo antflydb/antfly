@@ -525,13 +525,6 @@ fn assessWithRuntimeFacts(
         .generator => unreachable,
     }
 
-    if (std.mem.eql(u8, architecture, "nomic-bert")) {
-        return makeIncompatible(
-            architecture,
-            .unsupported_backend,
-            "the published GGUF tokenizer is not supported by the current loader",
-        );
-    }
     if (std.mem.eql(u8, architecture, "bart")) {
         return makeIncompatible(
             architecture,
@@ -679,6 +672,8 @@ fn knownEncoderArchitecture(architecture: []const u8) bool {
         "deberta_v2",
         "modernbert",
         "modern_bert",
+        "nomic-bert",
+        "nomic_bert",
         "mmbert",
         "gliner",
         "gliner2",
@@ -959,7 +954,7 @@ test "release encoder contracts cover DeBERTa reranking and GLiNER2" {
     try std.testing.expectEqual(Level.compatible, assess(&gliner, "extractor").level);
 }
 
-test "known Qwen hybrid variants and incompatible Nomic GGUF stay blocked" {
+test "known Qwen hybrid variants and NomicBERT stay classified" {
     var generator = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     generator.model_type = .generator;
     try std.testing.expectEqual(Level.incompatible, assess(&generator, "qwen3_5_moe").level);
@@ -973,7 +968,8 @@ test "known Qwen hybrid variants and incompatible Nomic GGUF stay blocked" {
 
     var embedder = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     embedder.model_type = .embedder;
-    try std.testing.expectEqual(Level.incompatible, assess(&embedder, "nomic-bert").level);
+    try std.testing.expectEqual(Level.compatible, assess(&embedder, "nomic-bert").level);
+    try std.testing.expectEqual(Level.compatible, assess(&embedder, "nomic_bert").level);
 }
 
 test "Qwen3-VL bundles fail closed before runtime qualification" {

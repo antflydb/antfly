@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphArtifactNodeMappingConfigModel(str, Enum):
+class GraphArtifactNodeMappingConfigModel(StrEnum):
     DOCUMENT = "document"
     EXTERNAL = "external"
 

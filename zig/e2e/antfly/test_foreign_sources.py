@@ -21,7 +21,6 @@ from typing import Any
 
 import pytest
 import requests
-
 from helpers import query_hits_total_value, wait_until
 
 pytestmark = [
@@ -30,11 +29,17 @@ pytestmark = [
 ]
 
 DEFAULT_PG_DSN = "postgres://localhost:5432/postgres?sslmode=disable"
-PSQL_BIN = os.environ.get("ANTFLY_TEST_PSQL_BIN", "/opt/homebrew/opt/postgresql@18/bin/psql")
+PSQL_BIN = os.environ.get(
+    "ANTFLY_TEST_PSQL_BIN", "/opt/homebrew/opt/postgresql@18/bin/psql"
+)
 
 
 def _pg_dsn() -> str:
-    return os.environ.get("ANTFLY_TEST_PG_DSN") or os.environ.get("PG_DSN") or DEFAULT_PG_DSN
+    return (
+        os.environ.get("ANTFLY_TEST_PG_DSN")
+        or os.environ.get("PG_DSN")
+        or DEFAULT_PG_DSN
+    )
 
 
 def _pg_available() -> bool:
@@ -210,7 +215,9 @@ def _result_status(result: dict[str, Any]) -> int:
     return int(_first_response(result).get("status", 200))
 
 
-def _wait_for_stateful_lookup(table_api, table_name: str, key: str, *, timeout_s: float, interval_s: float) -> dict[str, Any] | None:
+def _wait_for_stateful_lookup(
+    table_api, table_name: str, key: str, *, timeout_s: float, interval_s: float
+) -> dict[str, Any] | None:
     if table_api.backend != "stateful":
         return {}
     lookup = getattr(table_api.raw, "lookup_key", None)
@@ -223,7 +230,9 @@ def _wait_for_stateful_lookup(table_api, table_name: str, key: str, *, timeout_s
     )
 
 
-def _lookup_stateful_key_if_visible(lookup, table_name: str, key: str) -> dict[str, Any] | None:
+def _lookup_stateful_key_if_visible(
+    lookup, table_name: str, key: str
+) -> dict[str, Any] | None:
     try:
         return lookup(table_name, key)
     except requests.RequestException:
@@ -415,9 +424,11 @@ def test_foreign_table_rejects_unsupported_aggregation(table_api, pg_customers_t
         )
     except requests.HTTPError as exc:
         assert exc.response is not None
-        assert exc.response.status_code == 400
+        assert exc.response.status_code == 422
+        assert exc.response.json()["error"] == "unsupported_query_request"
     else:
-        assert _result_status(result) == 400
+        assert _result_status(result) == 422
+        assert _first_response(result)["error"] == "unsupported_query_request"
 
 
 @pytest.mark.parametrize("table_api", ["stateful", "serverless"], indirect=True)
@@ -591,16 +602,18 @@ def test_foreign_table_join_with_antfly(table_api, pg_customers_table):
     if table_api.backend == "serverless":
         assert table_api.publish_table(table_name) is not None
 
+    last_join_observation: dict[str, Any] = {}
+
     def joined_result() -> dict[str, Any] | None:
         try:
             result = table_api.query_table(
                 table_name,
-                    {
-                        "limit": 10,
-                        "fields": ["customer_id", "product"],
-                        "full_text_search": {
-                            "query": "body:order",
-                        },
+                {
+                    "limit": 10,
+                    "fields": ["customer_id", "product"],
+                    "full_text_search": {
+                        "query": "body:order",
+                    },
                     "join": {
                         "right_table": "pg_customers",
                         "join_type": "left",
@@ -616,8 +629,12 @@ def test_foreign_table_join_with_antfly(table_api, pg_customers_table):
                     },
                 },
             )
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            last_join_observation.clear()
+            last_join_observation["error"] = repr(exc)
             return None
+        last_join_observation.clear()
+        last_join_observation["result"] = result
         hits = _result_hits(result)
         if len(hits) < 3:
             return None
@@ -629,7 +646,7 @@ def test_foreign_table_join_with_antfly(table_api, pg_customers_table):
         return result
 
     result = wait_until(joined_result, timeout_s=30.0, interval_s=0.25)
-    assert result is not None
+    assert result is not None, last_join_observation
 
     by_customer = {
         hit.get("_source", {}).get("customer_id"): hit.get("_source", {})
@@ -664,8 +681,18 @@ def test_direct_foreign_table_join_with_antfly(table_api, pg_customers_table):
         sync_level="full_text" if table_api.backend == "stateful" else "write",
     )
     assert batch["inserted"] == 2
-    assert _wait_for_stateful_lookup(table_api, table_name, "cust-1", timeout_s=30.0, interval_s=0.25) is not None
-    assert _wait_for_stateful_lookup(table_api, table_name, "cust-3", timeout_s=30.0, interval_s=0.25) is not None
+    assert (
+        _wait_for_stateful_lookup(
+            table_api, table_name, "cust-1", timeout_s=30.0, interval_s=0.25
+        )
+        is not None
+    )
+    assert (
+        _wait_for_stateful_lookup(
+            table_api, table_name, "cust-3", timeout_s=30.0, interval_s=0.25
+        )
+        is not None
+    )
 
     if table_api.backend == "serverless":
         assert table_api.publish_table(table_name) is not None
@@ -741,8 +768,18 @@ def test_direct_foreign_table_right_join_with_antfly(table_api, pg_customers_tab
         sync_level="full_text" if table_api.backend == "stateful" else "write",
     )
     assert batch["inserted"] == 2
-    assert _wait_for_stateful_lookup(table_api, table_name, "cust-1", timeout_s=30.0, interval_s=0.25) is not None
-    assert _wait_for_stateful_lookup(table_api, table_name, "cust-999", timeout_s=30.0, interval_s=0.25) is not None
+    assert (
+        _wait_for_stateful_lookup(
+            table_api, table_name, "cust-1", timeout_s=30.0, interval_s=0.25
+        )
+        is not None
+    )
+    assert (
+        _wait_for_stateful_lookup(
+            table_api, table_name, "cust-999", timeout_s=30.0, interval_s=0.25
+        )
+        is not None
+    )
 
     if table_api.backend == "serverless":
         assert table_api.publish_table(table_name) is not None
@@ -797,12 +834,16 @@ def test_direct_foreign_table_right_join_with_antfly(table_api, pg_customers_tab
 
 
 @pytest.mark.parametrize("table_api", ["stateful", "serverless"], indirect=True)
-def test_direct_foreign_table_join_with_foreign_rhs(table_api, pg_customers_table, pg_addresses_table):
+def test_direct_foreign_table_join_with_foreign_rhs(
+    table_api, pg_customers_table, pg_addresses_table
+):
     city_field = "pg_addresses.city"
     region_field = "pg_addresses.region"
 
     result = wait_until(
-        lambda: _direct_foreign_joined_addresses_result(table_api, pg_customers_table, pg_addresses_table),
+        lambda: _direct_foreign_joined_addresses_result(
+            table_api, pg_customers_table, pg_addresses_table
+        ),
         timeout_s=30.0,
         interval_s=0.25,
     )
@@ -830,7 +871,9 @@ def test_nested_foreign_leaf_join_with_antfly(table_api, pg_addresses_table):
     customer_region_field = f"{customers_table}.pg_addresses.region"
 
     created_customers = table_api.create_table(customers_table)
-    assert (created_customers.get("name") or created_customers.get("table_name")) == customers_table
+    assert (
+        created_customers.get("name") or created_customers.get("table_name")
+    ) == customers_table
     created_docs = table_api.create_table(docs_table)
     assert (created_docs.get("name") or created_docs.get("table_name")) == docs_table
 
@@ -885,17 +928,21 @@ def test_nested_foreign_leaf_join_with_antfly(table_api, pg_addresses_table):
                             "right_field": "_id",
                             "operator": "eq",
                         },
-                        "right_fields": ["name", "pg_addresses.city", "pg_addresses.region"],
-                            "nested_join": {
-                                "right_table": "pg_addresses",
-                                "join_type": "left",
-                                "on": {
-                                    "left_field": "address_id",
-                                    "right_field": "id",
-                                    "operator": "eq",
-                                },
-                                "right_fields": ["city", "region"],
+                        "right_fields": [
+                            "name",
+                            "pg_addresses.city",
+                            "pg_addresses.region",
+                        ],
+                        "nested_join": {
+                            "right_table": "pg_addresses",
+                            "join_type": "left",
+                            "on": {
+                                "left_field": "address_id",
+                                "right_field": "id",
+                                "operator": "eq",
                             },
+                            "right_fields": ["city", "region"],
+                        },
                     },
                     "foreign_sources": {
                         "pg_addresses": _address_foreign_source(pg_addresses_table),
@@ -910,7 +957,9 @@ def test_nested_foreign_leaf_join_with_antfly(table_api, pg_addresses_table):
         sources = [hit.get("_source", {}) for hit in hits]
         if not any(source.get(customer_city_field) == "Seattle" for source in sources):
             return None
-        if not any(source.get(customer_city_field) == "San Francisco" for source in sources):
+        if not any(
+            source.get(customer_city_field) == "San Francisco" for source in sources
+        ):
             return None
         return result
 
@@ -964,13 +1013,17 @@ def _direct_foreign_joined_addresses_result(
     sources = [hit.get("_source", {}) for hit in hits]
     if not any(source.get("pg_addresses.city") == "Seattle" for source in sources):
         return None
-    if not any(source.get("pg_addresses.city") == "San Francisco" for source in sources):
+    if not any(
+        source.get("pg_addresses.city") == "San Francisco" for source in sources
+    ):
         return None
     return result
 
 
 @pytest.mark.parametrize("table_api", ["stateful", "serverless"], indirect=True)
-def test_foreign_table_nested_foreign_leaf_join(table_api, pg_customers_table, pg_addresses_table):
+def test_foreign_table_nested_foreign_leaf_join(
+    table_api, pg_customers_table, pg_addresses_table
+):
     table_name = f"foreign_orders_nested_{table_api.backend}_{time.time_ns()}"
     customer_city_field = "pg_customers.pg_addresses.city"
     customer_region_field = "pg_customers.pg_addresses.region"
@@ -1017,7 +1070,12 @@ def test_foreign_table_nested_foreign_leaf_join(table_api, pg_customers_table, p
                             "right_field": "customer_id",
                             "operator": "eq",
                         },
-                        "right_fields": ["name", "tier", "pg_addresses.city", "pg_addresses.region"],
+                        "right_fields": [
+                            "name",
+                            "tier",
+                            "pg_addresses.city",
+                            "pg_addresses.region",
+                        ],
                         "nested_join": {
                             "right_table": "pg_addresses",
                             "join_type": "left",
@@ -1043,7 +1101,9 @@ def test_foreign_table_nested_foreign_leaf_join(table_api, pg_customers_table, p
         sources = [hit.get("_source", {}) for hit in hits]
         if not any(source.get(customer_city_field) == "Seattle" for source in sources):
             return None
-        if not any(source.get(customer_city_field) == "San Francisco" for source in sources):
+        if not any(
+            source.get(customer_city_field) == "San Francisco" for source in sources
+        ):
             return None
         return result
 
@@ -1088,7 +1148,11 @@ def test_direct_foreign_table_nested_foreign_leaf_join(
                             "right_field": "customer_id",
                             "operator": "eq",
                         },
-                        "right_fields": ["name", "pg_addresses.city", "pg_addresses.region"],
+                        "right_fields": [
+                            "name",
+                            "pg_addresses.city",
+                            "pg_addresses.region",
+                        ],
                         "nested_join": {
                             "right_table": "pg_addresses",
                             "join_type": "left",
@@ -1115,7 +1179,9 @@ def test_direct_foreign_table_nested_foreign_leaf_join(
         sources = [hit.get("_source", {}) for hit in hits]
         if not any(source.get(customer_city_field) == "Seattle" for source in sources):
             return None
-        if not any(source.get(customer_city_field) == "San Francisco" for source in sources):
+        if not any(
+            source.get(customer_city_field) == "San Francisco" for source in sources
+        ):
             return None
         return result
 
@@ -1135,7 +1201,9 @@ def test_direct_foreign_table_nested_foreign_leaf_join(
 
 
 @pytest.mark.parametrize("table_api", ["stateful", "serverless"], indirect=True)
-def test_direct_foreign_table_join_with_right_filters(table_api, pg_orders_table, pg_customers_table):
+def test_direct_foreign_table_join_with_right_filters(
+    table_api, pg_orders_table, pg_customers_table
+):
     customer_name_field = "pg_customers.name"
     customer_tier_field = "pg_customers.tier"
 
@@ -1196,7 +1264,9 @@ def test_direct_foreign_table_join_with_right_filters(table_api, pg_orders_table
 
 
 @pytest.mark.parametrize("table_api", ["stateful", "serverless"], indirect=True)
-def test_direct_foreign_table_join_with_right_filter_prefix(table_api, pg_orders_table, pg_customers_table):
+def test_direct_foreign_table_join_with_right_filter_prefix(
+    table_api, pg_orders_table, pg_customers_table
+):
     customer_name_field = "pg_customers.name"
 
     def joined_result() -> dict[str, Any] | None:

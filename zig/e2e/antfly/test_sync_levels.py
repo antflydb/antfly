@@ -60,7 +60,9 @@ def test_table_full_text_sync_level_makes_text_search_visible(table_api):
     assert hits == ["doc:a"]
 
 
-def test_serverless_enrichment_sync_level_is_accepted_for_managed_materialization(serverless_api):
+def test_serverless_enrichment_sync_level_is_accepted_for_managed_materialization(
+    serverless_api,
+):
     table_name = "docs_sync_enrichments"
 
     created = serverless_api.put(

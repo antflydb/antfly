@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class BraveSearchConfigFreshness(str, Enum):
+class BraveSearchConfigFreshness(StrEnum):
     PD = "pd"
     PM = "pm"
     PW = "pw"

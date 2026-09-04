@@ -40,7 +40,9 @@ def test_rerank_score_ordering(api):
     assert len(scores) == len(documents)
 
     # ML doc should beat cooking (strong signal)
-    assert scores[0] > scores[3], f"ML ({scores[0]:.4f}) should beat cooking ({scores[3]:.4f})"
+    assert scores[0] > scores[3], (
+        f"ML ({scores[0]:.4f}) should beat cooking ({scores[3]:.4f})"
+    )
     # At least one ML-related doc should be in the top 2
     ml_scores = [scores[0], scores[2]]
     other_scores = [scores[1], scores[3]]

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class CreateAlgebraicIndexRequestType(str, Enum):
+class CreateAlgebraicIndexRequestType(StrEnum):
     ALGEBRAIC = "algebraic"
 
     def __str__(self) -> str:

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ExtractionStructureFieldType1Type(str, Enum):
+class ExtractionStructureFieldType1Type(StrEnum):
     ARRAY = "array"
     LIST = "list"
     STR = "str"

@@ -42,7 +42,9 @@ from .models import (
 
 pytestmark = pytest.mark.model_integration
 
-_SURYA_LOCAL_EXPECTATIONS = Path(__file__).with_name("testdata") / "surya_expectations.local.json"
+_SURYA_LOCAL_EXPECTATIONS = (
+    Path(__file__).with_name("testdata") / "surya_expectations.local.json"
+)
 
 
 def _assert_read_result_shape(result: dict):
@@ -81,10 +83,9 @@ def _find_reader_model(api, needle: str) -> str | None:
 
 
 def _find_multistage_reader_model(api) -> str | None:
-    override = (
-        os.environ.get("ANTFLY_INFERENCE_MULTISTAGE_READER_MODEL")
-        or os.environ.get("ANTFLY_INFERENCE_PADDLEOCR_MODEL")
-    )
+    override = os.environ.get(
+        "ANTFLY_INFERENCE_MULTISTAGE_READER_MODEL"
+    ) or os.environ.get("ANTFLY_INFERENCE_PADDLEOCR_MODEL")
     if override:
         return override
 
@@ -96,7 +97,9 @@ def _find_multistage_reader_model(api) -> str | None:
 
 
 def _find_surya_reader_model(api) -> str | None:
-    override = os.environ.get("ANTFLY_INFERENCE_SURYA_READER_MODEL") or os.environ.get("ANTFLY_INFERENCE_SURYA_MODEL")
+    override = os.environ.get("ANTFLY_INFERENCE_SURYA_READER_MODEL") or os.environ.get(
+        "ANTFLY_INFERENCE_SURYA_MODEL"
+    )
     if override:
         return override
     return _find_reader_model(api, "surya")
@@ -134,7 +137,9 @@ def _assert_text_contains_any(observed_text: str, env_name: str) -> None:
     assert any(_normalize_text(item) in normalized for item in expected)
 
 
-def _assert_known_model_output(model: str, observed_text: str, fixture_present: bool) -> None:
+def _assert_known_model_output(
+    model: str, observed_text: str, fixture_present: bool
+) -> None:
     normalized_model = model.strip().lower()
     normalized_text = _normalize_text(observed_text)
 
@@ -161,7 +166,9 @@ def _load_surya_expectations() -> dict:
     return {}
 
 
-def _maybe_write_surya_expectations(result: dict, regions: list[dict], labels: list[str]) -> None:
+def _maybe_write_surya_expectations(
+    result: dict, regions: list[dict], labels: list[str]
+) -> None:
     path = os.environ.get("ANTFLY_INFERENCE_SURYA_WRITE_EXPECTATIONS_JSON", "").strip()
     if not path:
         return
@@ -170,10 +177,14 @@ def _maybe_write_surya_expectations(result: dict, regions: list[dict], labels: l
         "require_labels": bool(labels),
         "text_any": [result["text"]] if result.get("text") else [],
         "labels_any": sorted({label for label in labels if label}),
-        "region_texts": [region["text"] for region in regions if region["text"].strip()],
+        "region_texts": [
+            region["text"] for region in regions if region["text"].strip()
+        ],
         "region_labels": [region.get("label", "") for region in regions],
     }
-    Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    Path(path).write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def _read_or_skip_backend_unavailable(
@@ -189,24 +200,31 @@ def _read_or_skip_backend_unavailable(
     body = {"model": model, "images": image_objs, "prompt": prompt, **kwargs}
     resp = api.post("/read", json=body)
 
-    if resp.status_code == 500 and resp.headers.get("content-type", "").startswith("application/json"):
+    if resp.status_code == 500 and resp.headers.get("content-type", "").startswith(
+        "application/json"
+    ):
         payload = resp.json()
         if (
             not require_runtime_support
             and payload.get("error") == "MODEL_LOAD_FAILED"
             and payload.get("message") == "NoBackendAvailable"
         ):
-            pytest.skip("Reader model is installed, but this antfly runtime was built without a compatible backend")
+            pytest.skip(
+                "Reader model is installed, but this antfly runtime was built without a compatible backend"
+            )
         if (
             not require_runtime_support
             and payload.get("error") in {"MODEL_LOAD_FAILED", "INFERENCE_FAILED"}
-            and payload.get("message") in {
+            and payload.get("message")
+            in {
                 "MissingWeight",
                 "ShapeMismatch",
                 "UnsupportedShape",
             }
         ):
-            pytest.skip("Reader model is installed, but this antfly graph runtime does not support it yet")
+            pytest.skip(
+                "Reader model is installed, but this antfly graph runtime does not support it yet"
+            )
         if require_runtime_support:
             pytest.fail(
                 f"required reader {model!r} failed with HTTP {resp.status_code}: {payload!r}"
@@ -238,7 +256,9 @@ def test_read_with_prompt(api):
 @pytest.mark.multimodal
 def test_read_florence_model_answers_text(api):
     """Florence readers should load explicitly and return text."""
-    model = os.environ.get("ANTFLY_INFERENCE_FLORENCE_MODEL") or _find_reader_model(api, "florence")
+    model = os.environ.get("ANTFLY_INFERENCE_FLORENCE_MODEL") or _find_reader_model(
+        api, "florence"
+    )
     if not model:
         pytest.skip("No Florence reader model is available")
 
@@ -277,8 +297,7 @@ def test_read_recovers_after_forced_run_admission_denials():
         )
 
     model = (
-        os.environ.get("ANTFLY_INFERENCE_FLORENCE_MODEL")
-        or "antflydb/florence-2-base"
+        os.environ.get("ANTFLY_INFERENCE_FLORENCE_MODEL") or "antflydb/florence-2-base"
     )
     if not local_model_exists(model, "readers"):
         if not inference_download_enabled():
@@ -337,7 +356,10 @@ def test_read_recovers_after_forced_run_admission_denials():
         assert server.proc.poll() is None, server.failure_diagnostic()
 
         output = server.read_output()
-        assert output.count("test-only forced inference run admission denial") >= forced_denials
+        assert (
+            output.count("test-only forced inference run admission denial")
+            >= forced_denials
+        )
     finally:
         server.stop()
 
@@ -345,7 +367,9 @@ def test_read_recovers_after_forced_run_admission_denials():
 @pytest.mark.multimodal
 def test_read_donut_model_exposes_optional_fields(api):
     """Donut-family readers should round-trip through the richer result shape."""
-    model = os.environ.get("ANTFLY_INFERENCE_DONUT_MODEL") or _find_reader_model(api, "donut")
+    model = os.environ.get("ANTFLY_INFERENCE_DONUT_MODEL") or _find_reader_model(
+        api, "donut"
+    )
     if not model:
         pytest.skip("No Donut reader model is available")
 
@@ -354,7 +378,9 @@ def test_read_donut_model_exposes_optional_fields(api):
         image, _phrases = fixture
     else:
         image = TINY_PNG_URI
-    prompt = _donut_docvqa_prompt("What is the document type?") if fixture else "<s_cord-v2>"
+    prompt = (
+        _donut_docvqa_prompt("What is the document type?") if fixture else "<s_cord-v2>"
+    )
 
     resp = api.read(images=[image], model=model, prompt=prompt)
     results = resp["data"]
@@ -363,13 +389,17 @@ def test_read_donut_model_exposes_optional_fields(api):
     assert isinstance(results[0]["text"], str)
     assert results[0]["text"].strip()
     _assert_known_model_output(model, results[0]["text"], fixture is not None)
-    _assert_text_contains_any(results[0]["text"], "ANTFLY_INFERENCE_DONUT_EXPECT_TEXT_ANY")
+    _assert_text_contains_any(
+        results[0]["text"], "ANTFLY_INFERENCE_DONUT_EXPECT_TEXT_ANY"
+    )
 
     # Donut readers may emit structured fields on some inputs; when present they must
     # use the flattened object shape expected by the Go API.
     if "fields" in results[0]:
         assert isinstance(results[0]["fields"], dict)
-        _assert_fields_include_any(results[0]["fields"], "ANTFLY_INFERENCE_DONUT_EXPECT_FIELDS_ANY")
+        _assert_fields_include_any(
+            results[0]["fields"], "ANTFLY_INFERENCE_DONUT_EXPECT_FIELDS_ANY"
+        )
 
 
 @pytest.mark.multimodal
@@ -462,26 +492,46 @@ def test_read_surya_model_round_trips_regions(api):
         normalized_text = _normalize_text(results[0]["text"])
         assert any(phrase.lower() in normalized_text for phrase in expected_phrases[:2])
 
-    extra_expected_phrases = expectations.get("text_any") or _env_csv("ANTFLY_INFERENCE_SURYA_EXPECT_TEXT_ANY")
+    extra_expected_phrases = expectations.get("text_any") or _env_csv(
+        "ANTFLY_INFERENCE_SURYA_EXPECT_TEXT_ANY"
+    )
     if extra_expected_phrases:
         normalized_text = _normalize_text(results[0]["text"])
-        assert any(phrase.lower() in normalized_text for phrase in extra_expected_phrases)
+        assert any(
+            phrase.lower() in normalized_text for phrase in extra_expected_phrases
+        )
 
-    expected_labels = {label.lower() for label in (expectations.get("labels_any") or _env_csv("ANTFLY_INFERENCE_SURYA_EXPECT_LABELS_ANY"))}
+    expected_labels = {
+        label.lower()
+        for label in (
+            expectations.get("labels_any")
+            or _env_csv("ANTFLY_INFERENCE_SURYA_EXPECT_LABELS_ANY")
+        )
+    }
     if expected_labels:
         observed_labels = {label.lower() for label in labels}
         assert observed_labels & expected_labels
 
-    expected_region_texts = expectations.get("region_texts") or _env_csv("ANTFLY_INFERENCE_SURYA_EXPECT_REGION_TEXTS")
+    expected_region_texts = expectations.get("region_texts") or _env_csv(
+        "ANTFLY_INFERENCE_SURYA_EXPECT_REGION_TEXTS"
+    )
     if expected_region_texts:
-        observed_region_texts = [_normalize_text(region["text"]) for region in regions if region["text"].strip()]
+        observed_region_texts = [
+            _normalize_text(region["text"])
+            for region in regions
+            if region["text"].strip()
+        ]
         assert observed_region_texts[: len(expected_region_texts)] == [
             _normalize_text(text) for text in expected_region_texts
         ]
 
-    expected_region_labels = expectations.get("region_labels") or _env_csv("ANTFLY_INFERENCE_SURYA_EXPECT_REGION_LABELS")
+    expected_region_labels = expectations.get("region_labels") or _env_csv(
+        "ANTFLY_INFERENCE_SURYA_EXPECT_REGION_LABELS"
+    )
     if expected_region_labels:
-        observed_region_labels = [str(region.get("label", "")).strip().lower() for region in regions]
+        observed_region_labels = [
+            str(region.get("label", "")).strip().lower() for region in regions
+        ]
         assert observed_region_labels[: len(expected_region_labels)] == [
             label.strip().lower() for label in expected_region_labels
         ]
@@ -490,7 +540,9 @@ def test_read_surya_model_round_trips_regions(api):
 @pytest.mark.multimodal
 def test_read_moondream_model_exposes_optional_fields(api):
     """Moondream-style reader models should return text and may expose structured fields."""
-    model = os.environ.get("ANTFLY_INFERENCE_MOONDREAM_MODEL") or _find_reader_model(api, "moondream")
+    model = os.environ.get("ANTFLY_INFERENCE_MOONDREAM_MODEL") or _find_reader_model(
+        api, "moondream"
+    )
     if not model:
         pytest.skip("No Moondream reader model is available")
 
@@ -510,11 +562,15 @@ def test_read_moondream_model_exposes_optional_fields(api):
     _assert_read_result_shape(results[0])
     assert isinstance(results[0]["text"], str)
     assert results[0]["text"].strip()
-    _assert_text_contains_any(results[0]["text"], "ANTFLY_INFERENCE_MOONDREAM_EXPECT_TEXT_ANY")
+    _assert_text_contains_any(
+        results[0]["text"], "ANTFLY_INFERENCE_MOONDREAM_EXPECT_TEXT_ANY"
+    )
 
     if "fields" in results[0]:
         assert isinstance(results[0]["fields"], dict)
-        _assert_fields_include_any(results[0]["fields"], "ANTFLY_INFERENCE_MOONDREAM_EXPECT_FIELDS_ANY")
+        _assert_fields_include_any(
+            results[0]["fields"], "ANTFLY_INFERENCE_MOONDREAM_EXPECT_FIELDS_ANY"
+        )
 
 
 @pytest.mark.multimodal
@@ -560,4 +616,6 @@ def test_read_pix2struct_model_answers_prompt(api):
     assert isinstance(results[0]["text"], str)
     assert results[0]["text"].strip()
     _assert_known_model_output(model, results[0]["text"], fixture is not None)
-    _assert_text_contains_any(results[0]["text"], "ANTFLY_INFERENCE_PIX2STRUCT_EXPECT_TEXT_ANY")
+    _assert_text_contains_any(
+        results[0]["text"], "ANTFLY_INFERENCE_PIX2STRUCT_EXPECT_TEXT_ANY"
+    )

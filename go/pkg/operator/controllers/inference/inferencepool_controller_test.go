@@ -105,6 +105,7 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_WORKLOAD_TYPE"]).To(Equal("general"))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_LOADING_STRATEGY"]).To(Equal("eager"))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_PREFERRED_BACKEND"]).To(Equal("pjrt"))
+			Expect(createdConfigMap.Data).NotTo(HaveKey("ANTFLY_INFERENCE_REQUIRED_BACKEND"))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_PJRT_PLUGIN"]).To(Equal(pjrtPluginPath))
 			Expect(createdConfigMap.Data["PJRT_PLUGIN_PATH"]).To(Equal(pjrtPluginPath))
 			var runtimeConfig map[string]any

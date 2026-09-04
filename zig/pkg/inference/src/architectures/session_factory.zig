@@ -24,6 +24,7 @@ const platform = @import("antfly_platform");
 const compat = @import("../io/compat.zig");
 const Session = @import("../backends/session.zig").Session;
 const ResidentOutputs = @import("../backends/session.zig").ResidentOutputs;
+const ResidentTextEmbeddingRequest = @import("../backends/session.zig").ResidentTextEmbeddingRequest;
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const TensorInfo = @import("../backends/tensor.zig").TensorInfo;
 const BackendType = @import("../backends/backends.zig").BackendType;
@@ -38,6 +39,8 @@ const clap_mod = @import("../models/clap.zig");
 const deberta_mod = @import("../models/deberta.zig");
 const layoutlmv3_mod = @import("../models/layoutlmv3.zig");
 const bert_arch = @import("bert.zig");
+const modern_bert_arch = @import("modern_bert.zig");
+const nomic_bert_arch = @import("nomic_bert.zig");
 const layoutlmv3_arch = @import("layoutlmv3.zig");
 const t5_arch = @import("t5.zig");
 const gpt_arch = @import("gpt.zig");
@@ -334,6 +337,8 @@ fn shardedSafetensorsTotalBytes(allocator: std.mem.Allocator, index_path: []cons
 /// Supported model architecture families.
 const ArchType = enum {
     bert,
+    modern_bert,
+    nomic_bert,
     deberta,
     t5,
     gpt,
@@ -348,6 +353,8 @@ const ArchType = enum {
 /// Architecture-specific config, tagged union.
 const ArchConfig = union(ArchType) {
     bert: bert.Config,
+    modern_bert: modern_bert_arch.Config,
+    nomic_bert: nomic_bert_arch.Config,
     deberta: deberta_mod.Config,
     t5: t5_mod.Config,
     gpt: gpt_mod.Config,
@@ -593,6 +600,8 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
 
     const prefix = switch (arch_config) {
         .bert => |cfg| cfg.effectivePrefix(),
+        .modern_bert => "",
+        .nomic_bert => "",
         .deberta => "deberta",
         .t5 => "", // T5 weights use full names (encoder.block.0.*, decoder.block.0.*)
         .gpt => "", // GPT weights use full names (model.layers.0.*, h.0.*)
@@ -863,6 +872,8 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
 
     const prefix = switch (arch_config) {
         .bert => |cfg| cfg.effectivePrefix(),
+        .modern_bert => "",
+        .nomic_bert => "",
         .deberta => "deberta",
         .t5 => "",
         .gpt => "",
@@ -1736,7 +1747,7 @@ fn loadSafetensorsIntoResident(
         try transposeGpt2Conv1dResidentGpuHostedWeights(allocator, resident_weights, stream);
     }
     return switch (arch_config) {
-        .t5, .gpt, .whisper, .florence, .clip, .clap => "",
+        .t5, .gpt, .whisper, .florence, .clip, .clap, .modern_bert, .nomic_bert => "",
         .gliner => "encoder",
         .deberta => "deberta",
         .layoutlmv3 => "layoutlmv3",
@@ -1786,7 +1797,6 @@ fn createGpuHostedSessionWithTaskOverride(
     try metal_runtime.validateMetalJitLoadContext(kernel_jit_config, kernel_jit_load_context);
     try ensureGpuHostedSessionAvailable(backend_type);
     const direct_quant_enabled = directQuantEnabled();
-    const quant_mode = gpuHostedQuantExecutionMode(direct_quant_enabled);
 
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
     defer mf.deinit();
@@ -1795,6 +1805,14 @@ fn createGpuHostedSessionWithTaskOverride(
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
 
     var arch_config = try detectArchitecture(allocator, model_path, mf);
+    // BGE-M3 publishes an F32 checkpoint and its dense embedding contract is
+    // expected to preserve those weights. Treating SafeTensors F32 storage as
+    // a generic direct-quant source silently staged every projection to Q8_0,
+    // which was fast but measurably changed the normalized embedding. Keep
+    // this exception exact-geometry qualified; all other BERT checkpoints
+    // retain the existing direct-quant policy.
+    const session_direct_quant_enabled = sessionDirectQuantEnabled(direct_quant_enabled, mf, arch_config);
+    const quant_mode = gpuHostedQuantExecutionMode(session_direct_quant_enabled);
     var metal_jit_scope: MetalJitRouteScope = if (build_options.enable_metal)
         metal_runtime.MetalJitRouteScope.none()
     else {};
@@ -1873,6 +1891,8 @@ fn createGpuHostedSessionWithTaskOverride(
             }
             var detected_prefix: []const u8 = switch (arch_config) {
                 .bert => |cfg| cfg.effectivePrefix(),
+                .modern_bert => "",
+                .nomic_bert => "",
                 .deberta => "deberta",
                 else => "",
             };
@@ -1984,7 +2004,7 @@ fn createGpuHostedSessionWithTaskOverride(
                 &metal_jit_scope,
                 &lazy_weights,
                 tensor_store,
-                direct_quant_enabled,
+                session_direct_quant_enabled,
                 arch_config,
                 metalJitUsesExactProfileScope(kernel_jit_config),
             );
@@ -2020,7 +2040,7 @@ fn createGpuHostedSessionWithTaskOverride(
             .a4b_inference = a4b_inference,
             .residency = residency,
             .tier_cache = tier_cache,
-            .allow_direct_quant = direct_quant_enabled,
+            .allow_direct_quant = session_direct_quant_enabled,
             .quant_execution_mode = quant_mode,
             .prefer_f32_dense_tensors = prefer_f32_dense_tensors,
             .jina_lora_adapter = gpu_jina_lora_adapter,
@@ -2085,6 +2105,12 @@ fn detectArchitectureWithGgufFile(
 
                 return .{ .gliner = cfg };
             }
+            if (modern_bert_arch.isModernBertModel(model_type)) {
+                return .{ .modern_bert = try modern_bert_arch.parseConfig(allocator, config_bytes) };
+            }
+            if (nomic_bert_arch.isNomicBertModel(model_type)) {
+                return .{ .nomic_bert = try nomic_bert_arch.parseConfig(allocator, config_bytes) };
+            }
             if (deberta_mod.isDebertaModel(model_type)) {
                 return .{ .deberta = try deberta_mod.parseConfig(allocator, config_bytes) };
             }
@@ -2121,6 +2147,9 @@ fn detectArchitectureWithGgufFile(
             }
             if (std.mem.eql(u8, model_type, "layoutlmv3")) {
                 return .{ .layoutlmv3 = try layoutlmv3_mod.parseConfig(allocator, config_bytes) };
+            }
+            if (bert.isBertModel(model_type)) {
+                return .{ .bert = try bert.parseConfig(allocator, config_bytes) };
             }
         }
     } else |_| {}
@@ -3137,6 +3166,10 @@ pub fn ggufInspectionSupportsBackend(report: GgufInspectionReport, backend: Back
 }
 
 fn normalizeWeightKey(store_kind: tensor_store_mod.StoreKind, arch_config: ArchConfig, key: []const u8, buf: *[256]u8) ![]const u8 {
+    if (arch_config == .modern_bert) {
+        if (std.mem.startsWith(u8, key, "model.")) return key;
+        return std.fmt.bufPrint(buf, "model.{s}", .{key}) catch return error.NameTooLong;
+    }
     if (store_kind != .gguf) return key;
     return switch (arch_config) {
         .gpt => |cfg| normalizeGgufGptWeightKey(cfg, key, buf) orelse key,
@@ -4361,6 +4394,99 @@ fn recommendedGpuHostedLargeDenseSafetensorsSharedCacheBudget(
     };
 }
 
+fn isBgeM3DenseEncoder(manifest: manifest_mod.ModelManifest, arch_config: ArchConfig) bool {
+    if (!std.mem.eql(u8, manifest.config_model_arch, "xlm-roberta")) return false;
+    return switch (arch_config) {
+        .bert => |cfg| cfg.model_type == .roberta and
+            cfg.vocab_size == 250002 and
+            cfg.hidden_size == 1024 and
+            cfg.num_hidden_layers == 24 and
+            cfg.num_attention_heads == 16 and
+            cfg.intermediate_size == 4096 and
+            cfg.max_position_embeddings == 8194 and
+            cfg.type_vocab_size == 1 and
+            cfg.hidden_act == .gelu_exact and
+            cfg.layer_norm_eps == 1e-5 and
+            cfg.pad_token_id == 1 and
+            cfg.position_id_mode == .roberta_padding,
+        else => false,
+    };
+}
+
+fn sessionDirectQuantEnabled(
+    direct_quant_enabled: bool,
+    manifest: manifest_mod.ModelManifest,
+    arch_config: ArchConfig,
+) bool {
+    return direct_quant_enabled and !isBgeM3DenseEncoder(manifest, arch_config);
+}
+
+fn recommendedGpuHostedBgeM3BudgetFloor(model_weight_bytes: u64) runtime.tier.memory.Limits {
+    if (model_weight_bytes == 0) return .{};
+    const total_bytes: usize = @intCast(@min(model_weight_bytes, std.math.maxInt(usize)));
+
+    // The official dense BGE-M3 checkpoint is F32 and mmap-backed. Metal keeps
+    // those source views alive while preparing reusable F16 projection slots
+    // (or the explicit F32 rollback), so the host cache must be able to account
+    // for the complete artifact. The ordinary GPU defaults already cover the
+    // prepared projections and persistent embedding table on supported
+    // machines; these are minimums, not an override of an explicit limit.
+    const host_floor = clampBytes(total_bytes +| mib(256), gib(2), gib(4));
+    const backend_floor = clampBytes((total_bytes *| 3) / 4 +| gib(1), gib(3), gib(6));
+    const combined_floor = clampBytes(host_floor +| backend_floor +| mib(512), gib(6), gib(10));
+    return .{
+        .host_limit_bytes = host_floor,
+        .backend_limit_bytes = backend_floor,
+        .combined_limit_bytes = combined_floor,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+    };
+}
+
+fn recommendedGpuHostedBgeM3SharedCacheBudget(model_weight_bytes: u64) runtime.tier.cache.Budget {
+    const floor = recommendedGpuHostedBgeM3BudgetFloor(model_weight_bytes);
+    return .{
+        .host_limit_bytes = floor.host_limit_bytes,
+        .backend_limit_bytes = floor.backend_limit_bytes,
+    };
+}
+
+test "BGE-M3 dense encoder budget is exact-geometry qualified" {
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .config_model_arch = "xlm-roberta",
+    };
+    const config = bert_arch.Config{
+        .model_type = .roberta,
+        .vocab_size = 250002,
+        .hidden_size = 1024,
+        .num_hidden_layers = 24,
+        .num_attention_heads = 16,
+        .intermediate_size = 4096,
+        .max_position_embeddings = 8194,
+        .type_vocab_size = 1,
+        .hidden_act = .gelu_exact,
+        .layer_norm_eps = 1e-5,
+        .pad_token_id = 1,
+        .position_id_mode = .roberta_padding,
+    };
+    try std.testing.expect(isBgeM3DenseEncoder(manifest, .{ .bert = config }));
+    try std.testing.expect(!sessionDirectQuantEnabled(true, manifest, .{ .bert = config }));
+    try std.testing.expect(!sessionDirectQuantEnabled(false, manifest, .{ .bert = config }));
+
+    var wrong_geometry = config;
+    wrong_geometry.hidden_size = 768;
+    try std.testing.expect(!isBgeM3DenseEncoder(manifest, .{ .bert = wrong_geometry }));
+    try std.testing.expect(sessionDirectQuantEnabled(true, manifest, .{ .bert = wrong_geometry }));
+
+    const artifact_bytes = gib(2) + mib(160);
+    const floor = recommendedGpuHostedBgeM3BudgetFloor(artifact_bytes);
+    const cache = recommendedGpuHostedBgeM3SharedCacheBudget(artifact_bytes);
+    try std.testing.expect(floor.host_limit_bytes >= artifact_bytes);
+    try std.testing.expectEqual(floor.host_limit_bytes, cache.host_limit_bytes);
+    try std.testing.expect(floor.combined_limit_bytes >= floor.host_limit_bytes + floor.backend_limit_bytes);
+}
+
 fn ensureGpuHostedSessionAvailable(backend_type: BackendType) !void {
     return switch (backend_type) {
         .metal => ensureMetalHostedSessionAvailable(),
@@ -4585,18 +4711,35 @@ fn sharedGpuHostedBudgetPolicy(
         recommendedGpuHostedQwen3VlRerankerGgufBudgetFloor(model_weight_bytes)
     else
         runtime.tier.memory.Limits{};
+    const bge_m3_budget_floor = if (isBgeM3DenseEncoder(manifest, arch_config))
+        recommendedGpuHostedBgeM3BudgetFloor(model_weight_bytes)
+    else
+        runtime.tier.memory.Limits{};
+    const bge_m3_shared_cache_floor = if (isBgeM3DenseEncoder(manifest, arch_config))
+        recommendedGpuHostedBgeM3SharedCacheBudget(model_weight_bytes)
+    else
+        runtime.tier.cache.Budget{};
     const budget_floor = widenLimits(
         widenLimits(lazy_quant_budget_floor, gemma_budget_floor),
-        widenLimits(dense_safetensors_budget_floor, qwen3vl_reranker_gguf_budget_floor),
+        widenLimits(
+            widenLimits(dense_safetensors_budget_floor, qwen3vl_reranker_gguf_budget_floor),
+            bge_m3_budget_floor,
+        ),
     );
     const shared_cache_floor = runtime.tier.cache.Budget{
         .host_limit_bytes = @max(
-            @max(lazy_quant_shared_cache_floor.host_limit_bytes, gemma_shared_cache_floor.host_limit_bytes),
-            dense_safetensors_shared_cache_floor.host_limit_bytes,
+            @max(
+                @max(lazy_quant_shared_cache_floor.host_limit_bytes, gemma_shared_cache_floor.host_limit_bytes),
+                dense_safetensors_shared_cache_floor.host_limit_bytes,
+            ),
+            bge_m3_shared_cache_floor.host_limit_bytes,
         ),
         .backend_limit_bytes = @max(
-            @max(lazy_quant_shared_cache_floor.backend_limit_bytes, gemma_shared_cache_floor.backend_limit_bytes),
-            dense_safetensors_shared_cache_floor.backend_limit_bytes,
+            @max(
+                @max(lazy_quant_shared_cache_floor.backend_limit_bytes, gemma_shared_cache_floor.backend_limit_bytes),
+                dense_safetensors_shared_cache_floor.backend_limit_bytes,
+            ),
+            bge_m3_shared_cache_floor.backend_limit_bytes,
         ),
     };
     const plan_context: runtime.tier.planner.PlanContext = blk: {
@@ -5282,6 +5425,97 @@ test "detectArchitecture recognizes generic deberta classifier configs" {
     }
 }
 
+test "detectArchitecture preserves exact GELU for BGE-M3 XLM-R config" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data =
+        \\{"model_type":"xlm-roberta","vocab_size":250002,"hidden_size":1024,"num_hidden_layers":24,"num_attention_heads":16,"intermediate_size":4096,"max_position_embeddings":8194,"type_vocab_size":1,"pad_token_id":1,"layer_norm_eps":1e-5,"hidden_act":"gelu"}
+        ,
+    });
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+
+    var mf = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer mf.deinit();
+    const arch = try detectArchitecture(allocator, model_dir, mf);
+    switch (arch) {
+        .bert => |cfg| {
+            try std.testing.expectEqual(bert.ModelType.roberta, cfg.model_type);
+            try std.testing.expectEqual(bert.HiddenActivation.gelu_exact, cfg.hidden_act);
+            try std.testing.expectEqual(bert.PositionIdMode.roberta_padding, cfg.position_id_mode);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "detectArchitecture and weight normalization recognize HuggingFace ModernBERT embeddings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data =
+        \\{"architectures":["ModernBertModel"],"model_type":"modernbert","hidden_size":768,"num_hidden_layers":22,"num_attention_heads":12,"intermediate_size":1152,"vocab_size":50368,"max_position_embeddings":8192,"local_attention":128,"global_attn_every_n_layers":3}
+        ,
+    });
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+
+    var mf = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer mf.deinit();
+    const arch = try detectArchitecture(allocator, model_dir, mf);
+    switch (arch) {
+        .modern_bert => |cfg| {
+            try std.testing.expectEqual(modern_bert_arch.CheckpointLayout.huggingface_fused_qkv_no_bias, cfg.checkpoint_layout);
+            try std.testing.expectEqual(@as(u32, 22), cfg.num_hidden_layers);
+            try std.testing.expectEqual(@as(u32, 128), cfg.local_attention_window);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var key_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "model.layers.0.attn.Wqkv.weight",
+        try normalizeWeightKey(.safetensors, arch, "layers.0.attn.Wqkv.weight", &key_buf),
+    );
+    try std.testing.expectEqualStrings(
+        "model.embeddings.tok_embeddings.weight",
+        try normalizeWeightKey(.safetensors, arch, "embeddings.tok_embeddings.weight", &key_buf),
+    );
+}
+
+test "detectArchitecture recognizes Nomic Embed Text NomicBERT config" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data =
+        \\{"architectures":["NomicBertModel"],"model_type":"nomic_bert","n_embd":768,"n_layer":12,"n_head":12,"n_inner":3072,"n_positions":8192,"vocab_size":30528,"type_vocab_size":2,"layer_norm_eps":1e-12,"rotary_emb_base":1000}
+        ,
+    });
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+
+    var mf = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer mf.deinit();
+    const arch = try detectArchitecture(allocator, model_dir, mf);
+    switch (arch) {
+        .nomic_bert => |cfg| {
+            try std.testing.expectEqual(@as(u32, 12), cfg.num_hidden_layers);
+            try std.testing.expectEqual(@as(u32, 8192), cfg.max_position_embeddings);
+            try std.testing.expectEqual(@as(f32, 1000.0), cfg.rope_theta);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "detectArchitecture treats split gliner bundle encoder config as gliner" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5908,6 +6142,7 @@ fn gpuBackendData(self: *ArchSession) *GpuHostedData {
 const arch_vtable = Session.VTable{
     .run = &archRun,
     .runResident = &archRunResident,
+    .runResidentTextEmbedding = &archRunResidentTextEmbedding,
     .inputInfo = &archInputInfo,
     .outputInfo = &archOutputInfo,
     .backend = &archBackend,
@@ -5991,11 +6226,11 @@ test "BERT architecture regression declarations compile" {
 
 fn archRunResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) !?ResidentOutputs {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    const cfg = switch (self.arch_config) {
-        .bert => |value| value,
-        else => return null,
-    };
     if (self.task == .classifier or self.task == .recognizer) return null;
+    switch (self.arch_config) {
+        .bert, .modern_bert, .nomic_bert => {},
+        else => return null,
+    }
     const bert_inputs = try parseBertRunInputs(inputs);
 
     const cb = try allocator.create(ops.ComputeBackend);
@@ -6003,7 +6238,72 @@ fn archRunResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.A
     cb.* = try makeComputeBackend(self, allocator, null);
     errdefer cb.deinit();
 
-    const hidden = try bert_arch.forwardCt(
+    const hidden = switch (self.arch_config) {
+        .bert => |cfg| try bert_arch.forwardCt(
+            cb,
+            allocator,
+            cfg,
+            bert_inputs.input_ids,
+            bert_inputs.attention_mask,
+            bert_inputs.token_type_ids,
+            bert_inputs.batch,
+            bert_inputs.seq_len,
+        ),
+        .modern_bert => |cfg| try modern_bert_arch.forwardCT(
+            cb,
+            allocator,
+            cfg,
+            bert_inputs.input_ids,
+            bert_inputs.attention_mask,
+            bert_inputs.batch,
+            bert_inputs.seq_len,
+        ),
+        .nomic_bert => |cfg| try nomic_bert_arch.forwardCT(
+            cb,
+            allocator,
+            cfg,
+            bert_inputs.input_ids,
+            bert_inputs.attention_mask,
+            bert_inputs.token_type_ids,
+            bert_inputs.batch,
+            bert_inputs.seq_len,
+        ),
+        else => unreachable,
+    };
+    errdefer cb.free(hidden);
+    const outputs = try allocator.alloc(ops.CT, 1);
+    errdefer allocator.free(outputs);
+    outputs[0] = hidden;
+    return .{
+        .outputs = outputs,
+        .backend = cb,
+        .allocator = allocator,
+        .backend_owner = cb,
+        .deinit_backend_owner = &deinitResidentComputeBackend,
+    };
+}
+
+fn archRunResidentTextEmbedding(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    request: ResidentTextEmbeddingRequest,
+    allocator: std.mem.Allocator,
+) !?ResidentOutputs {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.task == .classifier or self.task == .recognizer or self.backend_type != .metal) return null;
+    if (request.pooling != .mean) return null;
+    const cfg = switch (self.arch_config) {
+        .nomic_bert => |cfg| cfg,
+        else => return null,
+    };
+    const bert_inputs = try parseBertRunInputs(inputs);
+
+    const cb = try allocator.create(ops.ComputeBackend);
+    errdefer allocator.destroy(cb);
+    cb.* = try makeComputeBackend(self, allocator, null);
+    errdefer cb.deinit();
+
+    const embedding = (try nomic_bert_arch.forwardEmbeddingCT(
         cb,
         allocator,
         cfg,
@@ -6012,11 +6312,16 @@ fn archRunResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.A
         bert_inputs.token_type_ids,
         bert_inputs.batch,
         bert_inputs.seq_len,
-    );
-    errdefer cb.free(hidden);
+        request.normalize,
+    )) orelse {
+        cb.deinit();
+        allocator.destroy(cb);
+        return null;
+    };
+    errdefer cb.free(embedding);
     const outputs = try allocator.alloc(ops.CT, 1);
     errdefer allocator.free(outputs);
-    outputs[0] = hidden;
+    outputs[0] = embedding;
     return .{
         .outputs = outputs,
         .backend = cb,
@@ -6432,6 +6737,19 @@ pub fn getGenericEncoderArchConfig(session: Session) !GenericEncoderArchConfig {
     };
 }
 
+/// Whether the architecture can produce a resident [batch, seq, hidden]
+/// text-encoder output for the embedding pipeline. Keep this separate from
+/// GenericEncoderArchConfig: ModernBERT supports ordinary inference, but not
+/// the BERT/DeBERTa top-layer finetuning boundary APIs.
+pub fn supportsResidentTextEncoder(session: Session) bool {
+    if (session.vtable != &arch_vtable) return false;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return switch (self.arch_config) {
+        .bert, .modern_bert, .nomic_bert => true,
+        else => false,
+    };
+}
+
 pub fn widenBudgetLimitsForSession(
     session: Session,
     limits: runtime.tier.memory.Limits,
@@ -6604,6 +6922,49 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             var output_tensor = try Tensor.initFloat32(allocator, "last_hidden_state", &shape, hidden);
             errdefer output_tensor.deinit();
 
+            const result = try allocator.alloc(Tensor, 1);
+            result[0] = output_tensor;
+            return result;
+        },
+        .modern_bert => |cfg| {
+            if (self.task != .generic) return error.UnsupportedArchitectureTask;
+            const bert_inputs = try parseBertRunInputs(inputs);
+            const hidden = try modern_bert_arch.forward(
+                &cb,
+                allocator,
+                cfg,
+                bert_inputs.input_ids,
+                bert_inputs.attention_mask,
+                bert_inputs.batch,
+                bert_inputs.seq_len,
+            );
+            defer allocator.free(hidden);
+
+            const shape = [_]i64{ @intCast(bert_inputs.batch), @intCast(bert_inputs.seq_len), @intCast(cfg.hidden_size) };
+            var output_tensor = try Tensor.initFloat32(allocator, "last_hidden_state", &shape, hidden);
+            errdefer output_tensor.deinit();
+            const result = try allocator.alloc(Tensor, 1);
+            result[0] = output_tensor;
+            return result;
+        },
+        .nomic_bert => |cfg| {
+            if (self.task != .generic) return error.UnsupportedArchitectureTask;
+            const bert_inputs = try parseBertRunInputs(inputs);
+            const hidden = try nomic_bert_arch.forward(
+                &cb,
+                allocator,
+                cfg,
+                bert_inputs.input_ids,
+                bert_inputs.attention_mask,
+                bert_inputs.token_type_ids,
+                bert_inputs.batch,
+                bert_inputs.seq_len,
+            );
+            defer allocator.free(hidden);
+
+            const shape = [_]i64{ @intCast(bert_inputs.batch), @intCast(bert_inputs.seq_len), @intCast(cfg.hidden_size) };
+            var output_tensor = try Tensor.initFloat32(allocator, "last_hidden_state", &shape, hidden);
+            errdefer output_tensor.deinit();
             const result = try allocator.alloc(Tensor, 1);
             result[0] = output_tensor;
             return result;

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TextContentPartType(str, Enum):
+class TextContentPartType(StrEnum):
     TEXT = "text"
 
     def __str__(self) -> str:

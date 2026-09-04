@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class MultiMatchBodyType(str, Enum):
+class MultiMatchBodyType(StrEnum):
     BOOL_PREFIX = "bool_prefix"
 
     def __str__(self) -> str:

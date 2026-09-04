@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class EmbedderProvider(str, Enum):
+class EmbedderProvider(StrEnum):
     ANTFLY = "antfly"
     BEDROCK = "bedrock"
     COHERE = "cohere"

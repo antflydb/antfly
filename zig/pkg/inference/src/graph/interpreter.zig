@@ -4335,6 +4335,16 @@ const TestCompute = struct {
         return self.makeBuf(out, true);
     }
 
+    fn geluExactOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const self = fromCtx(ctx);
+        const out = try self.allocator.dupe(f32, testGetData(input));
+        for (out) |*v| {
+            const x = v.*;
+            v.* = 0.5 * x * (1.0 + erfApproxF32(x * 0.7071067811865476));
+        }
+        return self.makeBuf(out, true);
+    }
+
     fn binaryBroadcastOp(
         allocator: std.mem.Allocator,
         a_data: []const f32,
@@ -4560,6 +4570,7 @@ const TestCompute = struct {
         .layerNorm = &stubLayerNorm,
         .rmsNorm = &rmsNormOp,
         .gelu = &geluOp,
+        .geluExact = &geluExactOp,
         .relu = &stubUnary,
         .silu = &stubUnary,
         .quickGelu = &stubUnary,

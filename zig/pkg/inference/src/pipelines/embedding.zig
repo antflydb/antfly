@@ -268,6 +268,10 @@ pub const EmbeddingPipeline = struct {
     /// Print phase timings for CLI/debug callers. TERMITE_EMBED_TIMING still
     /// enables the same logs for server and legacy workflows.
     print_timing: bool = false,
+    /// Snapshot captured from the backend that executed the most recent
+    /// resident encoder request. This is intentionally request-scoped because
+    /// architecture sessions create and own their resident backend per run.
+    last_resident_backend_timing: ?ops_mod.BackendDebugTimingSnapshot = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -338,6 +342,13 @@ pub const EmbeddingPipeline = struct {
         const max_len = textSequenceLengthForInputs(input_info, self.config.max_length);
         const fixed_len = hasFixedTextSequenceLength(input_info);
         const batch = execution_batch;
+        const max_preprocess_tokens = std.math.mul(usize, batch, max_len) catch
+            return error.ResourceLimitExceeded;
+        var preprocess_permit = try text_session.admitHostPreprocess(
+            std.math.mul(usize, max_preprocess_tokens, 32) catch
+                return error.ResourceLimitExceeded,
+        );
+        defer preprocess_permit.deinit();
 
         const encoded = try alloc.alloc(EncodeResult, texts.len);
         defer alloc.free(encoded);
@@ -364,20 +375,17 @@ pub const EmbeddingPipeline = struct {
             }
         }
 
-        // Admit at the post-tokenization effective length rather than the
-        // pipeline max. Long-context models (32k) would otherwise bill every
-        // request — even a two-word query — at full context and exhaust the
-        // inference budget. Tokenization itself is host-bounded by the input
-        // byte length, and the permit is still acquired before any
-        // model-shaped buffer is allocated.
+        // The tokenizer/preprocessing lease above covers the conservative
+        // maximum-context host allocation. Once the real longest row is known,
+        // admit backend workspace at the actual padded sequence length. This
+        // preserves fail-closed memory accounting without forcing short BGE-M3
+        // batches to reserve 8K-token attention/FFN scratch.
         const admitted_tokens = std.math.mul(usize, batch, effective_len) catch
             return error.ResourceLimitExceeded;
         var run_permit = try text_session.admit(.{
             .batch = batch,
             .sequence = effective_len,
             .input_bytes = std.math.mul(usize, admitted_tokens, 24) catch
-                return error.ResourceLimitExceeded,
-            .host_preprocess_bytes = std.math.mul(usize, admitted_tokens, 32) catch
                 return error.ResourceLimitExceeded,
         });
         defer run_permit.deinit();
@@ -435,6 +443,7 @@ pub const EmbeddingPipeline = struct {
         seq_len: usize,
     ) ![][]f32 {
         if (batch == 0 or seq_len == 0) return error.InvalidInputShape;
+        self.last_resident_backend_timing = null;
         const total = std.math.mul(usize, batch, seq_len) catch return error.InvalidInputShape;
         if (input_ids.len != total or attention_mask.len != total) return error.InvalidInputShape;
 
@@ -463,6 +472,12 @@ pub const EmbeddingPipeline = struct {
         });
         defer run_permit.deinit();
         return self.embedPreparedTextInputs(input_set.slice(), mask_i32, input_ids, batch, seq_len, &run_permit);
+    }
+
+    /// Returns backend telemetry for the most recent successful resident
+    /// encoder request. Consumers must read this before starting another run.
+    pub fn lastResidentBackendTiming(self: *const EmbeddingPipeline) ?ops_mod.BackendDebugTimingSnapshot {
+        return self.last_resident_backend_timing;
     }
 
     fn embedPreparedTextInputs(
@@ -1625,6 +1640,21 @@ pub const EmbeddingPipeline = struct {
         permit: *session_mod.RunPermit,
     ) !?[][]f32 {
         const encoder_start = embedTimingStart(self.print_timing);
+        if (self.config.pooling == .mean) {
+            if (try permit.runResidentTextEmbedding(inputs, .{
+                .pooling = .mean,
+                .normalize = self.config.normalize,
+            }, self.allocator)) |ready_output_value| {
+                var ready_outputs = ready_output_value;
+                defer ready_outputs.deinit();
+                if (ready_outputs.outputs.len == 0) return error.NoOutputTensors;
+                const embeddings = try self.resident2DToEmbeddingsWithNormalization(&ready_outputs, batch, false);
+                self.last_resident_backend_timing = ready_outputs.backend.debugTimingSnapshot();
+                logEmbedTiming("text.encoder.pool_normalize.resident", batch, encoder_start);
+                self.recordResidentProjection(.text, .success, "text.encoder.pool_normalize.resident", batch, null);
+                return embeddings;
+            }
+        }
         var encoder_outputs = (try permit.runResident(inputs, self.allocator)) orelse
             return self.residentProjectionFallback(.text, "text.encoder.resident", batch, "unsupported");
         logEmbedTiming("text.encoder.resident", batch, encoder_start);
@@ -1650,6 +1680,7 @@ pub const EmbeddingPipeline = struct {
             .allocator = self.allocator,
         };
         const embeddings = try self.resident2DToEmbeddings(&pooled_outputs, batch);
+        self.last_resident_backend_timing = encoder_outputs.backend.debugTimingSnapshot();
         self.recordResidentProjection(.text, .success, "text.encoder.resident", batch, null);
         return embeddings;
     }
@@ -1912,6 +1943,15 @@ pub const EmbeddingPipeline = struct {
         outputs: *session_mod.ResidentOutputs,
         batch: usize,
     ) ![][]f32 {
+        return self.resident2DToEmbeddingsWithNormalization(outputs, batch, self.config.normalize);
+    }
+
+    fn resident2DToEmbeddingsWithNormalization(
+        self: *EmbeddingPipeline,
+        outputs: *session_mod.ResidentOutputs,
+        batch: usize,
+        normalize: bool,
+    ) ![][]f32 {
         if (outputs.outputs.len == 0) return error.NoOutputTensors;
         const shape = try outputs.backend.tensorShape(outputs.outputs[0], self.allocator);
         defer self.allocator.free(shape);
@@ -1919,11 +1959,11 @@ pub const EmbeddingPipeline = struct {
 
         const proj_dim: usize = @intCast(shape[shape.len - 1]);
         if (proj_dim == 0) return error.ShapeMismatch;
-        const resident_output = if (self.config.normalize)
+        const resident_output = if (normalize)
             try resident_ops.l2NormalizeLastDim(self.allocator, outputs.backend, outputs.outputs[0], shape)
         else
             outputs.outputs[0];
-        defer if (self.config.normalize) outputs.backend.free(resident_output);
+        defer if (normalize) outputs.backend.free(resident_output);
 
         const data = try outputs.backend.toFloat32(resident_output, self.allocator);
         defer self.allocator.free(data);

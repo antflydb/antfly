@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphResolverConfigFusionCombine(str, Enum):
+class GraphResolverConfigFusionCombine(StrEnum):
     MAX = "max"
     MEAN = "mean"
     NOISY_OR = "noisy_or"

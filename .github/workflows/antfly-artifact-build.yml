@@ -1,0 +1,276 @@
+name: Immutable Antfly artifact build
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        description: "Version identity, including v prefix"
+        required: true
+        type: string
+      source_commit:
+        description: "Exact trusted release-line commit to build"
+        required: true
+        type: string
+      release_line:
+        description: "Tag-derived release line, or nightly"
+        required: true
+        type: string
+      source_ref:
+        description: "Controller-selected protected source branch"
+        required: true
+        type: string
+      source_ref_head:
+        description: "Immutable source branch head observed by the controller"
+        required: true
+        type: string
+      channel:
+        description: "auto, stable, next, or nightly"
+        required: true
+        type: string
+      build_controller_commit:
+        description: "Exact default-branch workflow and script controller commit"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  release-plan:
+    name: Resolve artifact and channel policy
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.platforms.outputs.matrix }}
+      channel: ${{ steps.channel.outputs.channel }}
+      build_controller_commit: ${{ steps.controller.outputs.commit }}
+      python_build: ${{ steps.toolchain.outputs.python_build }}
+      zig_version: ${{ steps.toolchain.outputs.zig_version }}
+      zig_nix_attribute: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+      zig_nixpkgs_revision: ${{ steps.toolchain.outputs.zig_nixpkgs_revision }}
+      zig_x86_64_linux_sha256: ${{ steps.toolchain.outputs.zig_x86_64_linux_sha256 }}
+      macos_cross_sdk_version: ${{ steps.toolchain.outputs.macos_cross_sdk_version }}
+      macos_cross_sdk_sha256: ${{ steps.toolchain.outputs.macos_cross_sdk_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.build_controller_commit }}
+          fetch-depth: 0
+      - name: Validate pinned release build controller
+        id: controller
+        env:
+          BUILD_CONTROLLER_COMMIT: ${{ inputs.build_controller_commit }}
+          WORKFLOW_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_CONTROLLER_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$BUILD_CONTROLLER_COMMIT"
+          test "$WORKFLOW_COMMIT" = "$BUILD_CONTROLLER_COMMIT"
+          echo "commit=$BUILD_CONTROLLER_COMMIT" >> "$GITHUB_OUTPUT"
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Require compatible immutable release-line source
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RELEASE_LINE: ${{ inputs.release_line }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_REF_HEAD: ${{ inputs.source_ref_head }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_REF_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          if [ "$RELEASE_CHANNEL" = nightly ]; then
+            resolved="$(python scripts/release/release_lines.py nightly)"
+            test "$RELEASE_LINE" = "$(jq -r .release_line <<<"$resolved")"
+            test "$SOURCE_REF" = "$(jq -r .source_ref <<<"$resolved")"
+          else
+            python scripts/release/release_lines.py verify-provenance \
+              --tag "$RELEASE_TAG" \
+              --release-line "$RELEASE_LINE" \
+              --source-ref "$SOURCE_REF" >/dev/null
+          fi
+          git fetch --no-tags origin "$SOURCE_REF"
+          current_source_head="$(git rev-parse FETCH_HEAD)"
+          git merge-base --is-ancestor "$SOURCE_REF_HEAD" "$current_source_head"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" "$SOURCE_REF_HEAD"
+          python scripts/release/validate_source_contract.py --commit "$SOURCE_COMMIT"
+      - name: Validate release channel
+        id: channel
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          REQUESTED_CHANNEL: ${{ inputs.channel }}
+        run: |
+          python scripts/release/release_channels.py resolve \
+            --tag "$RELEASE_TAG" \
+            --channel "$REQUESTED_CHANNEL" \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Validate and export release platforms
+        id: platforms
+        run: |
+          matrix="$(python scripts/release/release_platforms.py github-matrix)"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build-zig-runtime-archives:
+    name: Build Zig archive (${{ matrix.artifact_name }})
+    needs: release-plan
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.release-plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_commit }}
+          submodules: true
+
+      - name: Install Linux build dependencies
+        if: ${{ matrix.os == 'linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates file
+
+      - name: Install Nix
+        if: ${{ matrix.os == 'linux' }}
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ needs.release-plan.outputs.zig_nixpkgs_revision }}.tar.gz
+
+      - name: Install glibc-linked Zig
+        if: ${{ matrix.os == 'linux' }}
+        env:
+          ZIG_VERSION: ${{ needs.release-plan.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ needs.release-plan.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
+
+      - name: Install pinned macOS cross-compilation SDK
+        if: ${{ matrix.macos_sdk == 'true' }}
+        env:
+          MACOS_SDK_VERSION: ${{ needs.release-plan.outputs.macos_cross_sdk_version }}
+          MACOS_SDK_SHA256: ${{ needs.release-plan.outputs.macos_cross_sdk_sha256 }}
+        run: |
+          set -euo pipefail
+          sdk_archive="$RUNNER_TEMP/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"
+          sdk_stage="$RUNNER_TEMP/macos-sdk"
+          curl --fail --location --retry 3 \
+            "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" \
+            -o "$sdk_archive"
+          echo "$MACOS_SDK_SHA256  $sdk_archive" | sha256sum --check --strict
+          mkdir -p "$sdk_stage"
+          tar -xJf "$sdk_archive" -C "$sdk_stage"
+          sdk_path="$sdk_stage/MacOSX${MACOS_SDK_VERSION}.sdk"
+          test -d "$sdk_path/System/Library/Frameworks/Metal.framework"
+          test -d "$sdk_path/System/Library/Frameworks/MetalPerformanceShaders.framework"
+          test -d "$sdk_path/System/Library/Frameworks/Accelerate.framework"
+          echo "SDK_PATH=$sdk_path" >> "$GITHUB_ENV"
+
+      - name: Test reproducible archive packaging
+        run: python3 scripts/packaging/test_reproducible_tar.py
+
+      - name: Build archive
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          archive="antfly_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}${{ matrix.archive_suffix }}.tar.gz"
+          jobs_arg=()
+          if [ -n "${{ matrix.zig_jobs }}" ]; then
+            jobs_arg=(--jobs "${{ matrix.zig_jobs }}")
+          fi
+          scripts/packaging/build_zig_release_archive.sh \
+            --version "$version" \
+            --target "${{ matrix.zig_target }}" \
+            --optimize "${{ matrix.zig_optimize }}" \
+            "${jobs_arg[@]}" \
+            --archive-name "$archive" \
+            --out-dir dist/release-archives \
+            --metal "${{ matrix.metal }}" \
+            --system-blas "${{ matrix.system_blas }}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/release-archives/*.tar.gz
+          if-no-files-found: error
+
+  package-cli-artifacts:
+    name: Build immutable CLI package snapshot
+    needs:
+      - release-plan
+      - build-zig-runtime-archives
+    uses: ./.github/workflows/cli-package.yml
+    with:
+      version: ${{ inputs.tag_name }}
+      source_commit: ${{ inputs.source_commit }}
+      python_build: ${{ needs.release-plan.outputs.python_build }}
+      zig_version: ${{ needs.release-plan.outputs.zig_version }}
+      zig_x86_64_linux_sha256: ${{ needs.release-plan.outputs.zig_x86_64_linux_sha256 }}
+
+  package-release-source:
+    name: Stage commit-bound release support files
+    needs: release-plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-plan.outputs.build_controller_commit }}
+          fetch-depth: 0
+      - name: Stage exact source objects
+        run: |
+          git fetch --no-tags origin "${{ inputs.source_commit }}"
+          python scripts/release/stage_release_source.py \
+            --commit "${{ inputs.source_commit }}" \
+            --out-dir dist/release-source
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: antfly-release-source
+          path: dist/release-source/
+          if-no-files-found: error
+
+  release-request:
+    name: Record immutable release identity
+    needs:
+      - release-plan
+      - build-zig-runtime-archives
+      - package-cli-artifacts
+      - package-release-source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-plan.outputs.build_controller_commit }}
+      - name: Write request
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RELEASE_LINE: ${{ inputs.release_line }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_REF_HEAD: ${{ inputs.source_ref_head }}
+          BUILD_CONTROLLER_COMMIT: ${{ needs.release-plan.outputs.build_controller_commit }}
+          RELEASE_CHANNEL: ${{ needs.release-plan.outputs.channel }}
+        run: |
+          mkdir -p dist/release-request
+          python scripts/release/release_channels.py spec \
+            --tag "$RELEASE_TAG" \
+            --channel "$RELEASE_CHANNEL" \
+            --source-commit "$SOURCE_COMMIT" \
+            --release-line "$RELEASE_LINE" \
+            --source-ref "$SOURCE_REF" \
+            --source-ref-head "$SOURCE_REF_HEAD" \
+            --build-controller-commit "$BUILD_CONTROLLER_COMMIT" \
+            > dist/release-request/release-request.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: antfly-release-request
+          path: dist/release-request/release-request.json
+          if-no-files-found: error

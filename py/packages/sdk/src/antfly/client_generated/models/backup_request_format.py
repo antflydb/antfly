@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class BackupRequestFormat(str, Enum):
+class BackupRequestFormat(StrEnum):
     NATIVE = "native"
     PORTABLE = "portable"
 
