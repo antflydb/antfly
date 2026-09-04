@@ -292,7 +292,7 @@ antfly lite vacuum app.aflite     # file-level vacuum only
 
 For a production application, pair regular `.afb` backups with `check`.
 
-## When to Choose Lite
+## Decisions
 
 - **One writer, one machine.** Lite pins one shard and one replica. If two processes need to write the same data, run a normal instance.
 - **Bring your own vectors, or defer them.** With no inference runtime, Lite still indexes and queries the embeddings you supply. Configure a remote provider or ship the full build when the application itself must embed.

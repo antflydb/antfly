@@ -12,13 +12,9 @@ order: 6
 - Why are my PostgreSQL deletes not reaching Antfly?
 </Questions>
 
-By the end of this guide, every insert, update, and delete on a PostgreSQL table lands in an Antfly table without a sync job or a daemon in between. Antfly subscribes to PostgreSQL logical replication, backfills the existing rows, then follows the stream. Nothing changes in the application that writes to PostgreSQL. You need Antfly running, PostgreSQL 14 or later with `wal_level = logical`, and a database user with the `REPLICATION` attribute:
+## The Result
 
-```sql
-SHOW wal_level;  -- logical
-```
-
-Here is the call you'll be making by the end, and the proof it worked:
+Every insert, update, and delete on a PostgreSQL table lands in an Antfly table without a sync job or a daemon in between. Antfly subscribes to PostgreSQL logical replication, backfills the existing rows, then follows the stream. Nothing changes in the application that writes to PostgreSQL. The table is created with a replication source, and rows can be read back from Antfly as soon as they land:
 
 ```bash
 curl -X POST http://localhost:8080/db/v1/tables/users \
@@ -44,8 +40,17 @@ curl -s http://localhost:8080/db/v1/tables/users/documents/user-1 -u admin:admin
 { "id": "user-1", "name": "Alice", "email": "alice@example.com", "score": 100 }
 ```
 
+## Before You Start
 
-## 1. Turn On Logical Replication
+Antfly running, PostgreSQL 14 or later with `wal_level = logical`, and a database user with the `REPLICATION` attribute:
+
+```sql
+SHOW wal_level;  -- logical
+```
+
+## Build It
+
+### 1. Turn On Logical Replication
 
 On self-hosted PostgreSQL, set the WAL level and give the stream room for one slot and one sender per replication source:
 
@@ -69,7 +74,7 @@ Grant the replication attribute to the user Antfly will connect as:
 ALTER USER antfly WITH REPLICATION;
 ```
 
-## 2. Store the Connection String as a Secret
+### 2. Store the Connection String as a Secret
 
 The DSN carries a password, so it goes in the secret store and the table config references it by name:
 
@@ -82,7 +87,7 @@ curl -X PUT http://localhost:8080/db/v1/secrets/pg_dsn \
 
 Use the direct connection, never a pooler. PgBouncer and Supavisor do not speak the replication protocol, and a DSN that points at one reconnects forever without an obvious error.
 
-## 3. Create the Replicated Table
+### 3. Create the Replicated Table
 
 The source table in PostgreSQL:
 
@@ -121,7 +126,7 @@ curl -s http://localhost:8080/db/v1/tables/users -u admin:admin
 
 Three errors show up here and nowhere else. `permission denied to create replication slot` means the user lacks `REPLICATION` (or the managed-service role); pre-create the slot and pass `slot_name`. `publication does not exist` means the user cannot create publications; have the table owner create one and pass `publication_name`. `wal_level is not logical` means step 1 did not take effect, usually because the restart is still pending.
 
-## 4. Watch a Row Arrive
+### 4. Watch a Row Arrive
 
 Insert in PostgreSQL:
 
@@ -143,7 +148,7 @@ Every column became a field. Updates flow the same way. Replicated rows go throu
 
 If nothing arrives, the DSN is the first suspect: check that PostgreSQL is reachable from the Antfly metadata node, that `sslmode=require` is set for cloud providers, and that the host is the direct endpoint rather than a pooler.
 
-## 5. Shape the Document
+### 5. Shape the Document
 
 Three fields on the source control how a row becomes a document.
 
@@ -217,7 +222,7 @@ Several PostgreSQL tables can feed one Antfly table. Give each source its own `o
 ]
 ```
 
-## Managed PostgreSQL Setup
+### Managed PostgreSQL Setup
 
 Every provider needs the same two things, `wal_level = logical` and a user allowed to replicate, and each exposes them differently. Pre-create the publication as the table owner whenever the replication user does not own the table, then pass `publication_name`:
 
@@ -235,7 +240,9 @@ CREATE PUBLICATION antfly_pub_users FOR TABLE users;
 
 **Amazon RDS and Aurora PostgreSQL.** Set `rds.logical_replication = 1` in the DB or cluster parameter group (`aws rds modify-db-parameter-group --db-parameter-group-name my-param-group --parameters "ParameterName=rds.logical_replication,ParameterValue=1,ApplyMethod=pending-reboot"`) and reboot. Grant with `GRANT rds_replication TO myuser;`. On Aurora, point the DSN at the writer endpoint; readers cannot serve as replication sources.
 
-## Why PostgreSQL Stays the System of Record
+## Tradeoffs
+
+Two things are yours to decide: what happens to the replication slot when Antfly is down, and what a PostgreSQL delete means for the document.
 
 Replication runs one way. Antfly never writes back, so your application keeps its transactions, constraints, and backups exactly where they are, and Antfly holds a searchable copy that is as current as the stream.
 

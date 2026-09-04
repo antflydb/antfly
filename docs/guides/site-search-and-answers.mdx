@@ -12,15 +12,22 @@ order: 2
 - How do I show sources and collect feedback on generated answers?
 </Questions>
 
-By the end of this guide, your React app has a search page and an answer box on the same Antfly table. Type `billing` and results appear before you finish the word, with a category facet you can click to narrow. Type "how do refunds work?" into the ask box and an answer streams in, cites the documents it used, and offers a follow-up. You need Antfly running with an indexed table and Ollama with a small model pulled. The examples use a table called `docs` with an embeddings index named `body_embeddings`; the [Quickstart](/docs/guides/quickstart) shows how to create one.
+## The Result
+
+Your React app has a search page and an answer box on the same Antfly table. Type `billing` and results appear before you finish the word, with a category facet you can click to narrow. Type "how do refunds work?" into the ask box and an answer streams in, cites the documents it used, and offers a follow-up. The search page is one provider and five components; the answer box is two more.
+
+## Before You Start
+
+Antfly running with an indexed table, and Ollama with a small model pulled. The examples use a table called `docs` with an embeddings index named `body_embeddings`; the [Quickstart](/docs/guides/quickstart) shows how to create one.
 
 ```bash
 curl -s http://localhost:8080/db/v1/tables/docs | head -c 300
 ollama pull gemma3:4b
 ```
 
+## Build It
 
-## 1. Install the Packages
+### 1. Install the Packages
 
 ```bash
 npm install @antfly/components @antfly/sdk react react-dom
@@ -36,7 +43,7 @@ import '@antfly/components/styles'
 Without the stylesheet import every component renders as unstyled markup: no dropdown positioning, no facet layout. It is the most common "the library is broken" report.
 </Callout>
 
-## 2. Build the Search Page
+### 2. Build the Search Page
 
 One `<Antfly>` provider holds the API URL, the table, and the auth headers. Every widget inside it contributes part of a single batched query, so you never fetch, hold state, or wire an effect:
 
@@ -90,7 +97,7 @@ Three props do the work. `QueryBox` defaults to `mode="live"`, so this searches 
 
 Facet buckets come from the stored document values at the field path you name, so use the plain field name (`category`, not `category.keyword`). Values are never tokenized: short label-like fields facet well, long prose fields do not.
 
-## 3. Add the Answer Box
+### 3. Add the Answer Box
 
 The answer box lives inside the same provider and gets its own input, in submit mode:
 
@@ -147,7 +154,7 @@ Drop `<AnswerBox />` beside `<Results>` and the page is done. The answer streams
 
 The retrieval agent accepts `gemini`, `vertex`, `openai`, `ollama`, and `antfly` as generator providers. Other values parse and then fail the request with a 400.
 
-## 4. Run It
+### 4. Run It
 
 ```bash
 antfly standalone
@@ -156,7 +163,9 @@ npm run dev
 
 Type into the search box and watch the results and facet counts move. Then ask a full question in the ask box and press Ask. If search works and the ask box does nothing, it is a `searchBoxId` typo. If both are silent, open the network tab: an empty multiquery means no widget is contributing a query.
 
-## Why the Answer Box Gets Its Own Input
+## Tradeoffs
+
+The answer box gets its own input rather than sharing the search box.
 
 Running both off one box is tempting: type once, see results and an answer. The library does not allow it.
 

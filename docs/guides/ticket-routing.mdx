@@ -11,16 +11,9 @@ order: 4
 - How do I keep PostgreSQL as the system of record while adding retrieval?
 </Questions>
 
-By the end of this guide, every ticket written to your Postgres `tickets` table arrives in Antfly on its own, and one call returns the team that should own it, chosen from the resolved tickets that look most like it. Postgres stays the system of record throughout, with no migration and no export job. You need Antfly running, a Postgres with `wal_level = logical`, and its connection string stored as a secret:
+## The Result
 
-```bash
-curl -X PUT http://localhost:8080/db/v1/secrets/pg_dsn \
-  -u admin:admin \
-  -H "Content-Type: application/json" \
-  -d '{"value": "postgres://antfly:secret@db.internal:5432/support?sslmode=require"}'
-```
-
-Here is the call you'll be making by the end:
+Every ticket written to your Postgres `tickets` table arrives in Antfly on its own, and one call returns the team that should own it, chosen from the resolved tickets that look most like it. Postgres stays the system of record throughout, with no migration and no export job:
 
 ```bash
 curl -X POST http://localhost:8080/db/v1/agents/retrieval \
@@ -76,8 +69,20 @@ curl -X POST http://localhost:8080/db/v1/agents/retrieval \
 }
 ```
 
+## Before You Start
 
-## 1. Stream Tickets from PostgreSQL
+Antfly running, a Postgres with `wal_level = logical`, and its connection string stored as a secret:
+
+```bash
+curl -X PUT http://localhost:8080/db/v1/secrets/pg_dsn \
+  -u admin:admin \
+  -H "Content-Type: application/json" \
+  -d '{"value": "postgres://antfly:secret@db.internal:5432/support?sslmode=require"}'
+```
+
+## Build It
+
+### 1. Stream Tickets from PostgreSQL
 
 Antfly has built-in change data capture. A `replication_sources` block on the table subscribes it to Postgres logical replication, and a semantic index in the same call makes every ticket retrievable the moment it lands:
 
@@ -115,7 +120,7 @@ antfly query --table tickets --full-text-search 'status:resolved' --fields subje
 
 Cloud SQL, Supabase, Neon, RDS, and self-hosted Postgres each need a small amount of setup on the database side (publications, replication slots, `wal_level`). [Stream PostgreSQL into Antfly](/docs/guides/cdc-replication) has each one.
 
-## 2. Retrieve Similar Resolved Tickets
+### 2. Retrieve Similar Resolved Tickets
 
 When a new ticket arrives, find its nearest neighbors among tickets that already have an outcome:
 
@@ -140,17 +145,19 @@ curl -X POST http://localhost:8080/db/v1/query \
 
 The keyword side restricts the pool to resolved tickets. The semantic side finds the ones that read like this one. The reranker orders them by how well the full body matches, and the pruner drops the ones that only loosely do. Whatever survives is the evidence the routing decision rests on.
 
-## 3. Classify the Ticket
+### 3. Classify the Ticket
 
 Every surviving neighbor carries a `team`. The simplest classifier is a majority vote over that field in your pipeline code: transparent, fast, and easy to explain when someone asks why a ticket landed where it did.
 
-When the neighbors disagree, let the retrieval agent make the call in the same request. The `system_prompt` on the generation step asks for a team name instead of a prose answer, which is the call shown at the top of this page. Your pipeline reads `generation` for the decision and `hits` for the evidence, then writes the team back to Postgres like any other update.
+When the neighbors disagree, let the retrieval agent make the call in the same request. The `system_prompt` on the generation step asks for a team name instead of a prose answer, which is the call shown in The Result. Your pipeline reads `generation` for the decision and `hits` for the evidence, then writes the team back to Postgres like any other update.
 
-## 4. Close the Loop
+### 4. Close the Loop
 
 Because Postgres is the source and replication is always on, corrections feed back in without any extra step. When a person corrects a route and the row updates, the corrected ticket flows back into Antfly and becomes evidence for the next decision. Routing accuracy improves as resolved history grows, with no retraining step and no export job.
 
-## Why the Pruner Decides Who Gets a Human
+## Tradeoffs
+
+The pruner's floor sets how much evidence a routing decision needs before it goes out without a person.
 
 A misrouted ticket is almost always a retrieval failure: the wrong history reached the classifier. The pruner is where you set how much evidence a decision needs. With `min_score_ratio: 0.6`, a ticket unlike anything resolved before comes back with few or no neighbors, and that is the signal to send it to a triage queue instead of guessing.
 

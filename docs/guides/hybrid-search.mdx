@@ -12,13 +12,9 @@ description: "One query that matches exact words and meaning at once, with fusio
 - How do I prune low-quality results from search results?
 </Questions>
 
-By the end of this guide, one query finds documents that contain your words and documents that mean the same thing, fuses the two lists, reorders them with a cross-encoder, and drops the weak tail. You will also know which of those stages to turn on for your data. The examples run against the Wikipedia table from the [Quickstart](/docs/guides/quickstart), so have that loaded:
+## The Result
 
-```bash
-antfly query --table wikipedia --full-text-search 'body:Einstein' --fields title --limit 1
-```
-
-Here is the query you'll be running by the end:
+One query finds documents that contain your words and documents that mean the same thing, fuses the two lists, reorders them with a cross-encoder, and drops the weak tail. Each stage is independent, and the steps below add them one at a time:
 
 ```bash
 curl -X POST http://localhost:8080/db/v1/query \
@@ -40,9 +36,17 @@ curl -X POST http://localhost:8080/db/v1/query \
   }'
 ```
 
-Each stage is independent. Four steps add them one at a time.
+## Before You Start
 
-## 1. Run Both Searches in One Query
+The Wikipedia table from the [Quickstart](/docs/guides/quickstart), loaded and indexed:
+
+```bash
+antfly query --table wikipedia --full-text-search 'body:Einstein' --fields title --limit 1
+```
+
+## Build It
+
+### 1. Run Both Searches in One Query
 
 `full_text_search` finds documents that contain the words. `semantic_search` finds documents that mean the same thing. Put both in one request and Antfly runs them in parallel and fuses the ranked lists:
 
@@ -81,7 +85,7 @@ curl -X POST http://localhost:8080/db/v1/query \
 
 Keyword search misses synonyms and paraphrases: "automobile" never finds "cars". Semantic search misses exact strings a keyword index catches instantly: an error code, a part number, a name spelled one way. Running both covers each one's blind spot.
 
-## 2. Choose How the Lists Fuse
+### 2. Choose How the Lists Fuse
 
 `merge_config` controls the fusion. The default is Reciprocal Rank Fusion:
 
@@ -119,7 +123,7 @@ Lean the weights toward `full_text` when exact matches must win (catalog search,
 
 The CLI always fuses with RRF; use the REST API or an SDK for `merge_config`.
 
-## 3. Rerank the Candidates
+### 3. Rerank the Candidates
 
 Fusion gets the right documents into the pool. A cross-encoder reranker reads each query-document pair in full and rescores it, which orders the pool far more accurately than either retrieval score:
 
@@ -139,7 +143,7 @@ antfly query --table wikipedia \
 
 `field` names the document text the reranker scores; use `template` instead when the text spans several fields. Retrieve more than you need (50 to 100) and let the reranker sort them. It runs on Antfly Inference in the same process, and it adds latency in proportion to the candidate count, so `limit` is the knob.
 
-## 4. Prune the Tail
+### 4. Prune the Tail
 
 Pruning runs after fusion and reranking. Instead of returning a fixed count, it returns only what clears a quality bar. The strategies combine in one `pruner` object:
 
@@ -163,7 +167,9 @@ antfly query --table wikipedia \
 
 `min_score_ratio` and `max_score_gap_percent` together are the usual pair: one sets a floor relative to the best result, the other stops at the elbow where relevance falls off. Pair pruning with RSF; RRF's compressed scores give the gap detector nothing to see.
 
-## Which Stages Your Query Needs
+## Tradeoffs
+
+Which stages to turn on depends on how your users ask.
 
 | Your users | Turn on |
 |------------|---------|

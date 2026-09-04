@@ -118,7 +118,7 @@ Changing source membership, projection fields, analyzer semantics, embedding spa
 
 The released v0.2 embeddings fields remain supported for v0.2 compatibility, with no removal release scheduled. `source_artifact_name` is descriptive when paired with `embedding_name`; the matching enrichment is authoritative. Internal graph manifest and edge materialization fields are engine-owned, not alternate public APIs. No graph status aliases were released, and the unreleased Go v0.2 SDK surface creates no additional compatibility obligation.
 
-## When to Reach for One
+## Decisions
 
 - Search should land on the precise passage but return the document it came from: union document and chunk vectors, then group by hierarchy.
 - Two enrichments write different JSON shapes into one searchable text index: use source-local `field` overrides.
