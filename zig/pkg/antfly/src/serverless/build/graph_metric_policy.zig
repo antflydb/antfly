@@ -10,14 +10,15 @@
 
 const std = @import("std");
 const graph_mod = @import("../../graph/graph.zig");
+const metric_cost = @import("../../graph/metric_cost.zig");
 const bounded_decode = @import("../bounded_decode.zig");
 
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.
-// Epoch 2 adds decode-overlap admission and the reusable compiled-topology
-// projection path. Bump so manifests built under the older memory/work model
-// are not silently reused after rollout.
-pub const materializer_epoch: u32 = 2;
+// Epoch 5 introduces algorithm-specific work admission shared with the kernel.
+// Rebuild older sidecars so admission decisions and output remain tied to one
+// explicit materializer contract.
+pub const materializer_epoch: u32 = 5;
 const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {
@@ -33,7 +34,7 @@ pub const Limits = struct {
     max_metric_payload_bytes: usize = 256 * 1024 * 1024,
     max_total_metric_payload_bytes: usize = 512 * 1024 * 1024,
     // Bounds the decoded topology, compiled projection, dense kernel vectors,
-    // sortable score ownership, and encoded output that may coexist for one
+    // borrowed sortable score views, and encoded output that may coexist for one
     // materialization. Work and payload limits alone do not bound this peak.
     max_peak_memory_bytes: usize = 1024 * 1024 * 1024,
     max_nodes: usize = 1_000_000,
@@ -159,10 +160,26 @@ pub fn workItems(node_count: usize, edge_count: usize, iterations: u32, passes: 
 }
 
 pub fn metricWorkItems(kind: graph_mod.GraphMetricKind, node_count: usize, edge_count: usize, max_iterations: u32) !u64 {
-    return switch (kind) {
-        .degree => try workItems(node_count, edge_count, 1, 1),
-        .pagerank, .eigenvector, .hits_authority, .hits_hub => try workItems(node_count, edge_count, max_iterations, 2),
+    const kernel_kind: metric_cost.Kind = switch (kind) {
+        .degree => .degree,
+        .pagerank => .pagerank,
+        .eigenvector => .eigenvector,
+        .hits_authority, .hits_hub => .hits,
     };
+    return try metric_cost.kernelWorkItems(kernel_kind, node_count, edge_count, max_iterations);
+}
+
+pub fn projectionWorkItems(
+    source_node_count: usize,
+    source_edge_count: usize,
+    projected_node_count: usize,
+    projected_edge_count: usize,
+    projected_passes: u64,
+) !u64 {
+    if (projected_passes == 0 or projected_passes > 4) return error.InvalidGraphMetricBuildOptions;
+    const source_scan = try workItems(source_node_count, source_edge_count, 1, 1);
+    const indexed_projection = try workItems(projected_node_count, projected_edge_count, 1, projected_passes);
+    return std.math.add(u64, source_scan, indexed_projection) catch error.GraphMetricBuildBudgetExceeded;
 }
 
 /// Total work charged for one materialization. Projection scans every source
@@ -176,7 +193,10 @@ pub fn materializationWorkItems(
     projected_edge_count: usize,
     max_iterations: u32,
 ) !u64 {
-    const projection = try workItems(source_node_count, source_edge_count, 1, 1);
+    // Active-set discovery, exact projection fill, and degree counts require
+    // three passes. Neighbor-bearing kernels add one adjacency fill pass.
+    const projection_passes: u64 = if (kind == .degree) 3 else 4;
+    const projection = try projectionWorkItems(source_node_count, source_edge_count, projected_node_count, projected_edge_count, projection_passes);
     const kernel = try metricWorkItems(kind, projected_node_count, projected_edge_count, max_iterations);
     return std.math.add(u64, projection, kernel) catch error.GraphMetricBuildBudgetExceeded;
 }

@@ -2740,6 +2740,7 @@ test "db graph metric runtime role distinct worker owners complete separate acti
 
     var finished = false;
     var steps: usize = 0;
+    var consecutive_idle_workers: usize = 0;
     while (steps < 200) : (steps += 1) {
         const worker_tick = if (steps % 2 == 0)
             try replacement_worker_a_runtime.runOnceDetailed()
@@ -2755,7 +2756,15 @@ test "db graph metric runtime role distinct worker owners complete separate acti
             finished = true;
             break;
         }
-        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+        if (worker_tick.durableProgressed() or coordinator_tick.durableProgressed()) {
+            consecutive_idle_workers = 0;
+        } else {
+            consecutive_idle_workers += 1;
+        }
+        // A cursor-resumable page remains bound to its current worker until
+        // completion or lease expiry. Only declare a stall after every worker
+        // identity in this pool has had a chance to run.
+        if (consecutive_idle_workers >= 2) {
             return error.GraphMetricBuildNoEligiblePage;
         }
     }
@@ -8965,20 +8974,24 @@ test "db graph metric runtime planned hits production budget matches local oracl
     }
     for (0..130) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:hub-{d:0>3}", .{i});
-        errdefer alloc.free(key);
         const value = try std.fmt.allocPrint(
             alloc,
             "{{\"title\":\"hub {d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"doc:authority\",\"weight\":1.0}}]}}}}}}",
             .{i},
         );
-        errdefer alloc.free(value);
-        try writes.append(alloc, .{ .key = key, .value = value });
+        writes.append(alloc, .{ .key = key, .value = value }) catch |err| {
+            alloc.free(key);
+            alloc.free(value);
+            return err;
+        };
     }
     const authority_key = try alloc.dupe(u8, "doc:authority");
-    errdefer alloc.free(authority_key);
     const authority_value = try alloc.dupe(u8, "{\"title\":\"authority\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}");
-    errdefer alloc.free(authority_value);
-    try writes.append(alloc, .{ .key = authority_key, .value = authority_value });
+    writes.append(alloc, .{ .key = authority_key, .value = authority_value }) catch |err| {
+        alloc.free(authority_key);
+        alloc.free(authority_value);
+        return err;
+    };
 
     try local_db.batch(.{
         .writes = writes.items,

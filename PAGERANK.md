@@ -438,6 +438,66 @@ preserve the prior published generation only for invalid output or corrupt
 state, such as NaN scores, infinities, missing graph metadata, or incomplete
 iteration output.
 
+## Execution and Memory Architecture
+
+Graph metric kernels consume an immutable ordinal topology whose adjacency
+lanes are selected by capability: degree retains counts only, PageRank retains
+incoming neighbors plus outgoing counts, eigenvector retains incoming
+neighbors, and HITS retains both neighbor lanes. A compatible metric group
+builds the union once. Endpoint ordinals are validated during construction so
+reused topology is not rescanned for every metric.
+
+Serverless compilation enforces the peak-memory limit with a live allocation
+limiter after charging the decoded source graph. Admission therefore follows
+observed vertex, edge, and distinct-edge-type cardinality instead of rejecting
+low-cardinality graphs using a pessimistic per-edge string estimate. Encoders
+borrow canonical node IDs, and paired HITS outputs are encoded and published
+one at a time.
+
+Large dense and adjacency passes use the caller's shared `std.Io` runtime.
+Floating-point reductions use fixed logical partitions and merge them in a
+stable order, so changing execution parallelism does not change score bits.
+The embedded compatibility runner uses the same storage-independent kernels in
+serial mode; it is an oracle and rollback path rather than a second algorithm.
+Serverless operators can bound per-materialization CPU fanout with
+`--graph-metric-max-parallelism` or
+`ANTFLY_SERVERLESS_GRAPH_METRIC_MAX_PARALLELISM` (range 1-16, default 4).
+Admission and execution share one algorithm-specific logical cost model:
+PageRank, eigenvector, and HITS account separately for adjacency passes, dense
+reductions, normalization/scaling, and vector setup. This keeps the configured
+work ceiling meaningful for sparse graphs and prevents HITS from being admitted
+using a cheaper single-vector estimate.
+
+The durable planned runner treats attempt records and per-page contribution
+records as recovery journals, not history. Successful attempt outputs are
+consumed during bounded adoption, and the corresponding per-page contribution
+journal is deleted atomically when its page completes. A shared summary barrier
+is created whenever reduction spans multiple pages, allowing reducers to delete
+consumed contribution totals after the next rank is durable and roll old
+rank/source-factor generations as later iterations advance. The active working
+set is therefore bounded by graph cardinality and page size, not multiplied by
+the configured iteration count; final cleanup still removes the job namespace
+and abandoned attempts.
+
+Scan-page adoption also maintains one target-owned out-degree total per node.
+The retained per-page value is an idempotency ledger: a reclaimed attempt
+replaces that page's value and adjusts the total by its delta. Initialization
+therefore performs one point lookup per node instead of probing every scan
+partition, while retry safety remains independent of worker identity.
+
+Published native generations keep the complete node-keyed score vector for
+point reads, but their score-ordered secondary index retains only the best
+10,000 entries, matching the public `top_k` ceiling. Each publication page
+merges its local top prefix with that bounded durable prefix, so top-k remains
+`O(K)` to read without doubling persistent score storage. Native reranking and
+graph projections resolve candidate columns through stable read snapshots and
+reuse a key buffer across candidates. Graph filtering, ordering, and limiting
+then stay columnar: clause names are resolved once, bounded result pages use
+`O(N log K)` selection, and per-node metric objects are allocated only for
+surviving projected rows. External serverless reconciliation accepts the same
+caller-owned compute runtime as ordinary lake builds, keeping CPU fanout under
+one operator-visible limit.
+
 ## Query Integration
 
 At query time:

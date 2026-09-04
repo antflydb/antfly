@@ -68,6 +68,10 @@ pub const Segment = struct {
     iterations_completed: u32,
     delta: f64,
     scores: []Score,
+    /// Decoded segments own score identifiers. Encoders can instead borrow a
+    /// canonical projection for the segment's short, scoped lifetime without
+    /// adding ownership metadata to every score.
+    owns_score_node_ids: bool = true,
 
     pub fn deinit(self: *Segment, alloc: Allocator) void {
         alloc.free(self.graph_index_name);
@@ -75,7 +79,7 @@ pub const Segment = struct {
         alloc.free(self.source_graph_artifact_id);
         alloc.free(self.source_graph_checksum);
         self.edge_filter.deinit(alloc);
-        for (self.scores) |*item| item.deinit(alloc);
+        if (self.owns_score_node_ids) for (self.scores) |*item| item.deinit(alloc);
         alloc.free(self.scores);
         self.* = undefined;
     }

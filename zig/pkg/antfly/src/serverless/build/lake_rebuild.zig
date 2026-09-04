@@ -549,6 +549,36 @@ pub fn reconcileResolvedExternalSourceSidecarsWithCancellationAlloc(
     cancellation: CancellationToken,
     provenance: lake_graph_metric.Provenance,
 ) !ReconciledManifest {
+    return try reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(
+        alloc,
+        artifacts,
+        source_provider,
+        base_source,
+        inventory,
+        table,
+        published_declarations,
+        cancellation,
+        provenance,
+        .{},
+    );
+}
+
+/// Reconciles external sidecars while routing graph-metric kernels through the
+/// caller-owned executor. The compatibility wrappers above remain serial, but
+/// production builders can share their bounded std.Io runtime instead of
+/// creating an unaccounted execution domain.
+pub fn reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    source_provider: RowSourceProvider,
+    base_source: manifest_base_source.BaseSourceDescriptor,
+    inventory: external_source.Inventory,
+    table: TableIndexDefinition,
+    published_declarations: []const sidecar_manifest.DeclaredArtifact,
+    cancellation: CancellationToken,
+    provenance: lake_graph_metric.Provenance,
+    runtime: lake_graph_metric.ComputeRuntime,
+) !ReconciledManifest {
     try provenance.validate();
     try cancellation.check();
     var desired = try desiredArtifactsFromResolvedExternalSourceAlloc(alloc, base_source, inventory, table);
@@ -572,7 +602,7 @@ pub fn reconcileResolvedExternalSourceSidecarsWithCancellationAlloc(
 
     var reconciled = try reconcileExecutedOperationsAlloc(alloc, published, operation_plan, executed);
     defer reconciled.deinit(alloc);
-    return try appendExternalGraphMetricDeclarationsAlloc(alloc, artifacts, table.indexes_json, reconciled.artifacts, published_declarations, cancellation, provenance);
+    return try appendExternalGraphMetricDeclarationsAlloc(alloc, artifacts, table.indexes_json, reconciled.artifacts, published_declarations, cancellation, provenance, runtime);
 }
 
 fn appendExternalGraphMetricDeclarationsAlloc(
@@ -583,6 +613,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
     published_declarations: []const sidecar_manifest.DeclaredArtifact,
     cancellation: CancellationToken,
     provenance: lake_graph_metric.Provenance,
+    runtime: lake_graph_metric.ComputeRuntime,
 ) !ReconciledManifest {
     try cancellation.check();
     const specs = try graph_metric_config.parseIndexSpecsAlloc(alloc, indexes_json);
@@ -722,6 +753,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                 &graph_metric_budget,
                 &prepared_graph.?,
                 effective_provenance,
+                runtime,
             ) catch |err| switch (err) {
                 error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
                     alloc,

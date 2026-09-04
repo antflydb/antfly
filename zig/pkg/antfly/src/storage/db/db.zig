@@ -29327,15 +29327,17 @@ pub const DB = struct {
         const rerank = req.graph_metric_rerank orelse return;
         if (req.count_only) return error.UnsupportedQueryRequest;
         const entry = self.core.graphIndex(rerank.index_name) orelse return error.IndexNotFound;
-        var status = try entry.index.graphMetricStatus(rerank.metric_name);
-        defer status.deinit(entry.index.alloc);
-        if (status.published_generation == 0) return error.MetricNotReady;
-        if (rerank.freshness == .fresh and status.state != .fresh) return error.MetricStale;
+        const node_ids = try result.alloc.alloc([]const u8, result.hits.len);
+        defer result.alloc.free(node_ids);
+        for (result.hits, 0..) |hit, i| node_ids[i] = hit.id;
+        var score_snapshot = try entry.index.graphMetricScoreSnapshotAlloc(rerank.metric_name, node_ids);
+        defer score_snapshot.deinit(entry.index.alloc);
+        if (score_snapshot.status.published_generation == 0) return error.MetricNotReady;
+        if (rerank.freshness == .fresh and score_snapshot.status.state != .fresh) return error.MetricStale;
 
-        var result_status = try cloneGraphMetricStatusFromGraph(result.alloc, status);
+        var result_status = try cloneGraphMetricStatusFromGraph(result.alloc, score_snapshot.status);
         errdefer result_status.deinit(result.alloc);
-        for (result.hits) |*hit| {
-            const metric_score_optional = try entry.index.graphMetricScore(rerank.metric_name, hit.id);
+        for (result.hits, score_snapshot.scores) |*hit, metric_score_optional| {
             const metric_score = metric_score_optional orelse rerank.missing_score;
             const base_score: f64 = if (hit.score) |score| @floatCast(score) else 0.0;
             const final_score = clampF64ToF32(rerank.base_weight * base_score + rerank.weight * metric_score);
@@ -29349,7 +29351,7 @@ pub const DB = struct {
                 .metric_weight = rerank.weight,
                 .missing_score_used = metric_score_optional == null,
                 .final_score = final_score,
-                .published_generation = status.published_generation,
+                .published_generation = score_snapshot.status.published_generation,
             };
             errdefer result.alloc.free(details.index_name);
             details.metric_name = try result.alloc.dupe(u8, rerank.metric_name);

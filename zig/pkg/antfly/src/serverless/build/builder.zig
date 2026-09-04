@@ -98,6 +98,7 @@ pub const Builder = struct {
     progress: *catalog_mod.ProgressStore,
     wal: *wal_mod.WalStore,
     io: ?std.Io = null,
+    graph_metric_max_parallelism: usize = lake_graph_metric.default_compute_parallelism,
 
     const CurrentHeadManifest = struct {
         progress_version: u64 = 0,
@@ -128,6 +129,11 @@ pub const Builder = struct {
 
     pub fn setIo(self: *Builder, io: ?std.Io) void {
         self.io = io;
+    }
+
+    pub fn setGraphMetricMaxParallelism(self: *Builder, max_parallelism: usize) !void {
+        if (max_parallelism == 0 or max_parallelism > lake_graph_metric.max_compute_parallelism) return error.InvalidGraphMetricBuildOptions;
+        self.graph_metric_max_parallelism = max_parallelism;
     }
 
     fn realtimeNs(self: *const Builder) u64 {
@@ -400,7 +406,7 @@ pub const Builder = struct {
             .published_generation = next_version,
             .edge_generation = next_version,
             .computed_at_ms = @divTrunc(self.realtimeNs(), std.time.ns_per_ms),
-        });
+        }, self.io, self.graph_metric_max_parallelism);
         defer freeArtifactRefs(self.alloc, graph_metric_refs);
         const published_graph_refs = try concatArtifactRefSlicesAlloc(self.alloc, graph_refs, graph_metric_refs);
         defer self.alloc.free(published_graph_refs);
@@ -655,7 +661,7 @@ pub const Builder = struct {
             .published_generation = next_version,
             .edge_generation = next_version,
             .computed_at_ms = @divTrunc(self.realtimeNs(), std.time.ns_per_ms),
-        });
+        }, self.io, self.graph_metric_max_parallelism);
         defer freeArtifactRefs(self.alloc, graph_metric_refs);
         const published_graph_refs = try concatArtifactRefSlicesAlloc(self.alloc, graph_refs, graph_metric_refs);
         defer self.alloc.free(published_graph_refs);
@@ -3591,6 +3597,8 @@ fn buildGraphMetricArtifactRefsAlloc(
     specs: []const graph_metric_config.IndexSpec,
     cancellation: CancellationToken,
     provenance: lake_graph_metric.Provenance,
+    io: ?std.Io,
+    max_parallelism: usize,
 ) ![]manifest_mod.ArtifactRef {
     var refs = std.ArrayListUnmanaged(manifest_mod.ArtifactRef).empty;
     errdefer {
@@ -3730,6 +3738,10 @@ fn buildGraphMetricArtifactRefsAlloc(
                 &graph_metric_budget,
                 &prepared_graph.?,
                 effective_provenance,
+                .{
+                    .io = io,
+                    .max_parallelism = if (io == null) 1 else max_parallelism,
+                },
             ) catch |err| switch (err) {
                 error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
                     alloc,

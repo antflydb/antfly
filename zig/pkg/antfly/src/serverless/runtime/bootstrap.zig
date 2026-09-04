@@ -75,6 +75,10 @@ pub const BootstrapConfig = struct {
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
     graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
+    /// CPU fanout available to one graph-metric kernel. Work is scheduled on
+    /// the shared std.Io backend, so deployments can align this with their
+    /// runtime capacity instead of materializers creating private threads.
+    graph_metric_max_parallelism: u8 = @intCast(build_mod.default_graph_metric_compute_parallelism),
 };
 
 pub const RuntimeStatus = api_mod.RuntimeStatusResult;
@@ -412,6 +416,7 @@ pub const OwnedStack = struct {
 
         self.builder = build_mod.Builder.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
         self.builder.setIo(io);
+        try self.builder.setGraphMetricMaxParallelism(cfg.graph_metric_max_parallelism);
         self.catalog = catalog_mod.CatalogService.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal, &self.builder, &self.catalog_store);
         self.external_source_object_store_resolver = .{};
         self.external_source_object_store_resolver.configure(cfg.node_config, cfg.secret_store);
@@ -564,6 +569,8 @@ pub const OwnedStack = struct {
 
 pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
+    if (cfg.graph_metric_max_parallelism == 0 or cfg.graph_metric_max_parallelism > build_mod.max_graph_metric_compute_parallelism)
+        return error.InvalidGraphMetricBuildOptions;
     if (cfg.manifest_write_version != manifest_mod.codec.rolling_compatible_write_version and
         cfg.manifest_write_version != manifest_mod.codec.legacy_graph_metric_write_version and
         cfg.manifest_write_version != manifest_mod.codec.range_integrity_write_version and
@@ -1234,6 +1241,23 @@ test "runtime bootstrap requires bounded query cache budgets" {
     invalid = base;
     invalid.query_cache_payload_max_bytes = 2048;
     try std.testing.expectError(error.QueryCachePayloadExceedsBudget, validateConfig(alloc, invalid));
+}
+
+test "runtime bootstrap requires bounded graph metric parallelism" {
+    const alloc = std.testing.allocator;
+    const base = BootstrapConfig{
+        .artifacts_uri = "file:///tmp/antfly-artifacts",
+        .manifests_uri = "file:///tmp/antfly-manifests",
+        .wal_uri = "file:///tmp/antfly-wal",
+        .progress_uri = "file:///tmp/antfly-progress",
+        .catalog_uri = "file:///tmp/antfly-catalog",
+    };
+    try validateConfig(alloc, base);
+    var invalid = base;
+    invalid.graph_metric_max_parallelism = 0;
+    try std.testing.expectError(error.InvalidGraphMetricBuildOptions, validateConfig(alloc, invalid));
+    invalid.graph_metric_max_parallelism = 17;
+    try std.testing.expectError(error.InvalidGraphMetricBuildOptions, validateConfig(alloc, invalid));
 }
 
 test "runtime bootstrap bucket provisioning fails closed" {
