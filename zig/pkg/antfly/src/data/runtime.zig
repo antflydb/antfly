@@ -80,6 +80,8 @@ const setup_io_thread_stack_size = thread_config.minimum_partitioned_stack_size;
 const local_group_status_cache_ttl_ms: u64 = 60 * std.time.ms_per_s;
 const store_status_report_interval_ticks: usize = 40;
 const store_status_heartbeat_interval_ms: u64 = 30 * std.time.ms_per_s;
+const embedding_activity_report_interval_ms: u64 = 1 * std.time.ms_per_s;
+const embedding_activity_protocol_version = antfly.metadata.table_manager.embedding_activity_protocol_version;
 const StoreStatusReportKind = enum { none, heartbeat, full };
 const metadata_head_cache_ttl_ms: u64 = std.time.ms_per_s;
 const metadata_snapshot_cache_ttl_ms: u64 = std.time.ms_per_s;
@@ -644,6 +646,10 @@ const IndexRepairQueueEntry = struct {
 };
 
 const IndexRepairQueueWake = enum {
+    /// Ensure durable debt has a queue entry without changing an existing
+    /// causal wake or owner-selected deadline. A newly observed entry is
+    /// runnable so lost notifications remain recoverable.
+    observed,
     immediate,
     retained,
     parked,
@@ -651,22 +657,95 @@ const IndexRepairQueueWake = enum {
 
 fn indexRepairQueueWakeFromAggregate(wake: antfly.db.DB.IndexRepairWake) IndexRepairQueueWake {
     return switch (wake) {
-        // Pending debt paired with an empty aggregate is an inconsistent/lost
-        // wake observation. Fail toward a bounded audit instead of parking it.
-        .immediate, .empty => .immediate,
+        .immediate => .immediate,
+        // `empty` is handled by indexRepairQueueScheduleFromResult, where a
+        // realtime fallback deadline can be attached. Keep this conservative
+        // mapping for callers which are only projecting the tagged state.
+        .empty => .retained,
         .at_realtime_ms => .retained,
         .parked => .parked,
     };
 }
 
+const IndexRepairQueueSchedule = struct {
+    retry_at_realtime_ms: u64,
+    wake: IndexRepairQueueWake,
+};
+
+fn indexRepairQueueScheduleFromResult(
+    aggregate_wake: antfly.db.DB.IndexRepairWake,
+    retry_at_realtime_ms: u64,
+    busy: bool,
+    made_progress: bool,
+    realtime_now_ms: u64,
+) IndexRepairQueueSchedule {
+    // An empty aggregate means the DB's exact intent directory has no runnable
+    // wake even though a broader group-level audit still reported pending.
+    // This occurs while a resident initial build owns normal coverage or a
+    // status handoff awaits its final observation. Retrying immediately would
+    // make that coarse level-trigger spin independently of the exact owner.
+    // Attach a bounded audit deadline; any causally newer visibility edge
+    // replaces the selected queue generation and wakes it immediately.
+    //
+    // A resident writer can likewise temporarily own the lifecycle fence while
+    // its enrichment/derived workers make the exact progress repair awaits.
+    // More generally, a pending runnable result may only self-reschedule
+    // immediately after a material quantum. Ownership changes, cancellation,
+    // stale scheduler observations, and other no-op deferrals must wait for a
+    // causally newer event or this bounded audit; otherwise one group can hot
+    // poll and starve normal backfill on the shared maintenance worker.
+    if (retry_at_realtime_ms == 0 and
+        (aggregate_wake == .empty or
+            (aggregate_wake == .immediate and (busy or !made_progress))))
+    {
+        return .{
+            .retry_at_realtime_ms = realtime_now_ms +| provisioned_index_repair_interval_ms,
+            .wake = .retained,
+        };
+    }
+    return .{
+        .retry_at_realtime_ms = retry_at_realtime_ms,
+        .wake = indexRepairQueueWakeFromAggregate(aggregate_wake),
+    };
+}
+
 test "data runtime preserves tagged aggregate index repair wake semantics" {
     try std.testing.expectEqual(IndexRepairQueueWake.immediate, indexRepairQueueWakeFromAggregate(.immediate));
-    try std.testing.expectEqual(IndexRepairQueueWake.immediate, indexRepairQueueWakeFromAggregate(.empty));
+    try std.testing.expectEqual(IndexRepairQueueWake.retained, indexRepairQueueWakeFromAggregate(.empty));
     try std.testing.expectEqual(IndexRepairQueueWake.parked, indexRepairQueueWakeFromAggregate(.parked));
     try std.testing.expectEqual(
         IndexRepairQueueWake.retained,
         indexRepairQueueWakeFromAggregate(.{ .at_realtime_ms = 42 }),
     );
+}
+
+test "cooperative writer contention uses a preemptible bounded repair audit" {
+    const empty = indexRepairQueueScheduleFromResult(.empty, 0, false, false, 1_000);
+    try std.testing.expectEqual(@as(u64, 6_000), empty.retry_at_realtime_ms);
+    try std.testing.expectEqual(IndexRepairQueueWake.retained, empty.wake);
+
+    const scheduled = indexRepairQueueScheduleFromResult(.empty, 0, true, false, 1_000);
+    try std.testing.expectEqual(@as(u64, 6_000), scheduled.retry_at_realtime_ms);
+    try std.testing.expectEqual(IndexRepairQueueWake.retained, scheduled.wake);
+
+    // Runnable debt discovered behind the resident writer is still
+    // cooperative contention. The selected queue generation applies this
+    // delay only if no newer progress/visibility callback replaced it.
+    const runnable = indexRepairQueueScheduleFromResult(.immediate, 0, true, false, 1_000);
+    try std.testing.expectEqual(@as(u64, 6_000), runnable.retry_at_realtime_ms);
+    try std.testing.expectEqual(IndexRepairQueueWake.retained, runnable.wake);
+
+    const no_progress = indexRepairQueueScheduleFromResult(.immediate, 0, false, false, 1_000);
+    try std.testing.expectEqual(@as(u64, 6_000), no_progress.retry_at_realtime_ms);
+    try std.testing.expectEqual(IndexRepairQueueWake.retained, no_progress.wake);
+
+    const progressed = indexRepairQueueScheduleFromResult(.immediate, 0, false, true, 1_000);
+    try std.testing.expectEqual(@as(u64, 0), progressed.retry_at_realtime_ms);
+    try std.testing.expectEqual(IndexRepairQueueWake.immediate, progressed.wake);
+
+    const durable = indexRepairQueueScheduleFromResult(.{ .at_realtime_ms = 9_000 }, 9_000, true, false, 1_000);
+    try std.testing.expectEqual(@as(u64, 9_000), durable.retry_at_realtime_ms);
+    try std.testing.expectEqual(IndexRepairQueueWake.retained, durable.wake);
 }
 
 const IndexRepairQueueMutationGuard = union(enum) {
@@ -2126,6 +2205,8 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_runs_started_total", "counter", "Node-local index repair scans started", self.data_server.provisioned_index_repair_started.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_runs_completed_total", "counter", "Node-local index repair scans completed", self.data_server.provisioned_index_repair_completed.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_runs_failed_total", "counter", "Node-local index repair group scans that failed", self.data_server.provisioned_index_repair_failed.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_debt_events_total", "counter", "Durable repair-debt visibility edges received by the node-local scheduler", self.data_server.provisioned_index_repair_debt_events.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_runnable_wake_events_total", "counter", "Exact progress or released-control-plane edges that requested immediate repair admission", self.data_server.provisioned_index_repair_runnable_wake_events.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_attempts_total", "counter", "Durable index reconstruction attempts admitted by this node", self.data_server.provisioned_index_repair_attempted.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repairs_completed_total", "counter", "Indexes reconstructed and validated by this node", self.data_server.provisioned_index_repair_repaired.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_queue_depth", "gauge", "Known local groups with durable index repair debt", self.data_server.provisioned_index_repair_queue_depth.load(.monotonic));
@@ -3140,6 +3221,9 @@ const CachedSplitKey = union(enum) {
 };
 
 const StoreStatusHeartbeatCache = struct {
+    valid: bool = false,
+    embedding_activity_protocol_version: u16 = 0,
+    embedding_activity_sequence: u64 = 0,
     reporter_incarnation: u64 = 0,
     status_generation: u64 = 0,
     artifact_sources_protocol_version: u16 = 0,
@@ -4164,6 +4248,11 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         // control-plane backoff preserves that exclusion without terminating
         // the data process and permanently removing a destination voter.
         error.TransitionDestinationProvisioningBusy,
+        // The reconciler retains exact per-group failure classification. This
+        // aggregate is emitted only when all placement failures in the round
+        // are retryable; permanent and restart-required aggregates use
+        // distinct errors and remain fatal to this process lifecycle.
+        error.ReplicaReconcileIncomplete,
         // Placement and split-transition projections are multi-row. A data
         // node can briefly observe its destination placement before the
         // provisioning range becomes visible in the same snapshot. Fail
@@ -4221,6 +4310,9 @@ test "data runtime treats transient metadata failures as retryable bootstrap fai
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataIncarnationUnavailable));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MissingAuthoritativeBootstrapVoters));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.TransitionDestinationProvisioningBusy));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.ReplicaReconcileIncomplete));
+    try std.testing.expect(!isRetryableMetadataBootstrapError(error.ReplicaReconcilePermanentFailure));
+    try std.testing.expect(!isRetryableMetadataBootstrapError(error.ReplicaReconcileRestartRequired));
     try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidArguments));
     try std.testing.expect(!isRetryableMetadataBootstrapError(error.MetadataIncarnationMismatch));
 }
@@ -4326,6 +4418,48 @@ test "data runtime heartbeat cache cannot regress to an older full report" {
 
     try std.testing.expectEqual(@as(u64, 11), server.store_status_heartbeat_cache.status_generation);
     try std.testing.expectEqual(@as(u64, 200), server.store_status_heartbeat_cache.capacity_bytes);
+}
+
+test "data runtime activity-only snapshots reuse the durable status generation" {
+    var cached_indexes = [_]antfly.metadata.table_manager.RuntimeIndexStatusReport{.{
+        .name = "semantic",
+        .kind = "dense_vector",
+        .doc_count = 10,
+        .coverage_generation = 7,
+        .coverage_config_hash = 9,
+        .embedding_activity_observed = true,
+        .embedding_activity = .{ .epoch = 3, .sample_sequence = 4, .embeddings_computed = 10 },
+    }};
+    var cached_runtime = [_]antfly.metadata.table_manager.RuntimeGroupStatusReport{.{
+        .group_id = 2,
+        .indexes = cached_indexes[0..],
+    }};
+    var observed_indexes = cached_indexes;
+    observed_indexes[0].embedding_activity.sample_sequence = 5;
+    observed_indexes[0].embedding_activity.embeddings_computed = 20;
+    var observed_runtime = cached_runtime;
+    observed_runtime[0].indexes = observed_indexes[0..];
+
+    var server: DataServer = undefined;
+    server.store_status_cache_mutex = .unlocked;
+    server.store_status_generation = .init(20);
+    server.store_status_heartbeat_cache = .{
+        .valid = true,
+        .reporter_incarnation = 4,
+        .status_generation = 10,
+        .runtime_statuses = cached_runtime[0..],
+    };
+    const candidate: antfly.metadata.table_manager.StoreStatusReport = .{
+        .store_id = 7,
+        .reporter_incarnation = 4,
+        .runtime_statuses = observed_runtime[0..],
+    };
+
+    try std.testing.expectEqual(@as(u64, 10), server.durableGenerationForStoreStatus(candidate));
+    try std.testing.expectEqual(@as(u64, 20), server.store_status_generation.load(.monotonic));
+    observed_indexes[0].doc_count += 1;
+    try std.testing.expectEqual(@as(u64, 20), server.durableGenerationForStoreStatus(candidate));
+    try std.testing.expectEqual(@as(u64, 21), server.store_status_generation.load(.monotonic));
 }
 
 test "idle cached runtime status stays fresh only for the published root generation" {
@@ -5078,6 +5212,9 @@ pub const DataServer = struct {
     local_transition_runtime: ?antfly.raft.TransitionRuntime = null,
     store_status_ticks: std.atomic.Value(usize) = .init(0),
     store_status_dirty: std.atomic.Value(bool) = .init(true),
+    embedding_activity_status_dirty: std.atomic.Value(bool) = .init(false),
+    embedding_activity_report_sequence: std.atomic.Value(u64) = .init(1),
+    last_embedding_activity_report_at_ms: u64 = 0,
     store_capacity_probe_failures: std.atomic.Value(u64) = .init(0),
     last_store_status_report_at_ms: u64 = 0,
     last_data_raft_metadata_sync_at_ms: u64 = 0,
@@ -5158,6 +5295,7 @@ pub const DataServer = struct {
     provisioned_startup_catch_up_thread: ?std.Thread = null,
     provisioned_startup_catch_up_active: std.atomic.Value(bool) = .init(false),
     background_work_quiesced: bool = false,
+    external_provider_users_quiesced: bool = false,
     provisioned_startup_catch_up_target_mutex: std.atomic.Mutex = .unlocked,
     provisioned_startup_catch_up_target_group_id: u64 = 0,
     provisioned_startup_catch_up_target_table_name: ?[]u8 = null,
@@ -5188,6 +5326,8 @@ pub const DataServer = struct {
     provisioned_index_repair_started: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_completed: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_failed: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_debt_events: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_runnable_wake_events: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_attempted: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_repaired: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_queue_depth: std.atomic.Value(u64) = .init(0),
@@ -5208,7 +5348,10 @@ pub const DataServer = struct {
     provisioned_index_repair_scan_cursor: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_queue_mutex: std.atomic.Mutex = .unlocked,
     provisioned_index_repair_cancel_mutex: std.atomic.Mutex = .unlocked,
-    provisioned_index_repair_cancel_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Reference-counted control-plane leases. Multiple index activations may
+    /// overlap on one shard; repair remains canceled until the last exact
+    /// activation owner releases its lease.
+    provisioned_index_repair_cancel_groups: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     // Known debt is an O(1) linked hash queue. The cursor lets every pass inspect
     // a fixed window without copying or sorting the entire node's repair debt.
     provisioned_index_repair_group_ages: std.AutoHashMapUnmanaged(u64, IndexRepairQueueEntry) = .empty,
@@ -5380,6 +5523,24 @@ pub const DataServer = struct {
         // startup catch-up runnable or feed its zero-progress quarantine.
         stats.groups_with_debt += 1;
         return true;
+    }
+
+    fn busyStartupCatchUpNeedsRetry(
+        result: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult,
+        durable_metadata_debt: bool,
+        runtime_status_refresh_pending: bool,
+        cached_status_has_debt: ?bool,
+    ) bool {
+        // The catch-up owner has inspected durable state more recently than
+        // the runtime-status cache. In particular, native restore debt is not
+        // represented by replay_catch_up_required or backfill_active, so a
+        // busy return with had_debt=true must remain level-triggered even when
+        // the cached projection looks clean. The cache is only an optimization
+        // for contention where the owner did not observe durable debt.
+        return result.had_debt or
+            durable_metadata_debt or
+            runtime_status_refresh_pending or
+            (cached_status_has_debt orelse true);
     }
 
     const StartupCatchUpCompletion = struct {
@@ -7218,6 +7379,13 @@ pub const DataServer = struct {
                     break :blk true;
                 };
                 if (registration_ready) {
+                    if (self.embedding_activity_status_dirty.load(.acquire) and
+                        (self.last_embedding_activity_report_at_ms == 0 or
+                            now_ms -| self.last_embedding_activity_report_at_ms >= embedding_activity_report_interval_ms))
+                    {
+                        self.store_status_dirty.store(true, .release);
+                        self.store_status_ticks.store(store_status_report_interval_ticks, .release);
+                    }
                     _ = self.store_status_ticks.fetchAdd(1, .monotonic);
                     const due_store_status_heartbeat = self.last_store_status_report_at_ms == 0 or
                         now_ms -| self.last_store_status_report_at_ms >= store_status_heartbeat_interval_ms;
@@ -7344,6 +7512,24 @@ pub const DataServer = struct {
         self.deinitWithDeadline(antfly.common.runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
     }
 
+    /// Stop and join every activity that can retain an externally owned
+    /// provider. This is a stronger barrier than quiesceBackgroundWork: cached
+    /// DBs own autonomous enrichment workers and therefore must be closed
+    /// before the provider's model manager or callback context is destroyed.
+    /// Resource accounting remains alive until normal DataServer teardown.
+    pub fn quiesceExternalProviderUsersWithDeadline(
+        self: *DataServer,
+        deadline: antfly.common.runtime_lifecycle.ShutdownDeadline,
+    ) !void {
+        if (self.external_provider_users_quiesced) return;
+        self.quiesceBackgroundWorkWithDeadline(deadline);
+        self.write_source.quiesce();
+        if (self.data_raft_apply) |apply_sm| apply_sm.write_source.quiesce();
+        self.provisioned_storage.detachWriteSourceRuntimeHooks();
+        try self.provisioned_storage.quiesceExternalProviderUsers();
+        self.external_provider_users_quiesced = true;
+    }
+
     pub fn publicListenerFailure(self: *const DataServer) ?anyerror {
         return if (self.listener) |listener| listener.runtimeFailure() else null;
     }
@@ -7356,7 +7542,10 @@ pub const DataServer = struct {
         self: *DataServer,
         deadline: antfly.common.runtime_lifecycle.ShutdownDeadline,
     ) void {
-        self.quiesceBackgroundWorkWithDeadline(deadline);
+        self.quiesceExternalProviderUsersWithDeadline(deadline) catch |err| {
+            std.log.err("data server provider shutdown barrier failed err={s}", .{@errorName(err)});
+            @panic("data server provider shutdown barrier failed");
+        };
         if (self.ha_admin_server) |*server| server.deinit();
         if (self.ha_promoted_primary) |*primary| primary.close();
         if (self.ha_standby_replication_http_executor) |*executor| executor.deinit();
@@ -7791,6 +7980,13 @@ pub const DataServer = struct {
         defer remote_metadata.cache_mutex.unlock();
         remote_metadata.test_faults.fetch_head_error = fetch_error;
         remote_metadata.test_faults.force_snapshot_cache_miss = fetch_error != null;
+    }
+
+    pub fn remoteMetadataLifecycleLinearizableReadsForTest(self: *DataServer) u64 {
+        comptime std.debug.assert(@import("builtin").is_test);
+        const remote_metadata = self.remote_metadata orelse
+            @panic("remote metadata is unavailable");
+        return remote_metadata.test_faults.lifecycle_linearizable_snapshot_calls.load(.acquire);
     }
 
     pub fn localShardOperationAdapter(self: *DataServer) antfly.raft.ShardOperationAdapter {
@@ -9546,29 +9742,37 @@ pub const DataServer = struct {
     ) void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         switch (action) {
-            .enqueue, .enqueue_runnable => {
-                self.enqueueProvisionedIndexRepairForTable(table_name, group_id) catch |err| {
+            .observe_debt => {
+                _ = self.provisioned_index_repair_debt_events.fetchAdd(1, .monotonic);
+                self.observeProvisionedIndexRepairForTable(table_name, group_id) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
                     self.provisioned_index_repair_dirty.store(true, .release);
-                    std.log.warn("provisioned index repair debt enqueue failed group={} err={s}", .{ group_id, @errorName(err) });
+                    std.log.warn("provisioned index repair debt observation failed group={} err={s}", .{ group_id, @errorName(err) });
                     return;
                 };
-                if (action == .enqueue_runnable) {
-                    self.maybeRequestProvisionedIndexRepair() catch |err| {
-                        // The exact durable queue remains dirty, and the
-                        // control loop is a lost-wakeup fallback. Admission
-                        // pressure must not turn a successful catalog mutation
-                        // into a failed API request.
-                        std.log.warn("provisioned index repair immediate admission deferred group={} err={s}", .{
-                            group_id,
-                            @errorName(err),
-                        });
-                    };
-                }
+            },
+            .signal_runnable => {
+                _ = self.provisioned_index_repair_runnable_wake_events.fetchAdd(1, .monotonic);
+                const request_admission = self.coalesceProvisionedIndexRepairRunnableForTable(table_name, group_id) catch |err| {
+                    _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                    self.provisioned_index_repair_dirty.store(true, .release);
+                    std.log.warn("provisioned index repair runnable signal failed group={} err={s}", .{ group_id, @errorName(err) });
+                    return;
+                };
+                if (!request_admission) return;
+                self.maybeRequestProvisionedIndexRepair() catch |err| {
+                    // The exact durable queue remains dirty, and the control
+                    // loop is a lost-wakeup fallback. Admission pressure must
+                    // not turn a successful catalog mutation into a failed API
+                    // request.
+                    std.log.warn("provisioned index repair immediate admission deferred group={} err={s}", .{
+                        group_id,
+                        @errorName(err),
+                    });
+                };
             },
             .remove => {
                 self.removeProvisionedIndexRepair(group_id);
-                self.clearProvisionedIndexRepairCancellation(group_id);
             },
             .cancel => self.requestProvisionedIndexRepairCancellation(group_id) catch |err| {
                 _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
@@ -9584,6 +9788,19 @@ pub const DataServer = struct {
         kind: antfly.public_api.ProvisionedTableWriteSource.LocalChangeKind,
     ) void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (kind == .runtime_activity) {
+            self.markRuntimeStatusDirty(table_name, kind);
+            self.embedding_activity_status_dirty.store(true, .release);
+            if (self.store_registration != null) {
+                self.requestRuntimeStatusRefresh() catch |err| switch (err) {
+                    error.ThreadQuotaExceeded,
+                    error.SystemResources,
+                    => std.log.warn("runtime activity refresh deferred table={s} err={s}", .{ table_name, @errorName(err) }),
+                    else => std.log.warn("runtime activity refresh failed table={s} err={s}", .{ table_name, @errorName(err) }),
+                };
+            }
+            return;
+        }
         if (kind == .runtime_status) {
             self.markRuntimeStatusDirty(table_name, kind);
             self.markStoreStatusDirtyImmediate();
@@ -9600,7 +9817,7 @@ pub const DataServer = struct {
         self.markLocalSplitKeyCacheDirty();
         switch (kind) {
             .data, .index_repair => self.markLocalGroupDataChanged(),
-            .runtime_status => unreachable,
+            .runtime_status, .runtime_activity => unreachable,
             .runtime_reconciled => {
                 // Reconciliation updates indexes inside the current root.
                 // Invalidate the status plane and report immediately, but do
@@ -9808,7 +10025,7 @@ pub const DataServer = struct {
         self.runtime_status_dirty.store(true, .release);
         switch (kind) {
             .data => self.provisioned_startup_catch_up_dirty.store(true, .release),
-            .index_repair, .runtime_reconciled, .runtime_status => {},
+            .index_repair, .runtime_reconciled, .runtime_status, .runtime_activity => {},
             .structural => {
                 self.clearProvisionedStartupCatchUpBackoffs();
                 self.provisioned_startup_catch_up_dirty.store(true, .release);
@@ -12204,12 +12421,12 @@ pub const DataServer = struct {
         // round; clearing at the end would lose that notification.
         _ = self.store_status_dirty.swap(false, .acq_rel);
         errdefer self.store_status_dirty.store(true, .release);
-        const status_generation = self.store_status_generation.fetchAdd(1, .monotonic);
+        const claimed_activity = self.embedding_activity_status_dirty.swap(false, .acq_rel);
+        errdefer if (claimed_activity) self.embedding_activity_status_dirty.store(true, .release);
         var snapshot = try remote_metadata.fetchSnapshot();
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
         const reporter_incarnation = try self.reporterIncarnation();
-        if (snapshot.status.runtime_status_protocol_ready_version >=
-            metadata_runtime_status_protocol.current_record_version and
+        if (runtimeStatusReadyForStoreRegistration(snapshot.status.runtime_status_protocol_ready_version) and
             (!storeReporterIncarnationVisible(
                 snapshot.stores,
                 registration.store_id,
@@ -12219,10 +12436,9 @@ pub const DataServer = struct {
                 registration.store_id,
             )))
         {
-            // A process that registered while v13 was still rolling out has a
-            // legacy zero-incarnation record. Re-register once activation is
-            // durable so it gains causal authority without churning status
-            // records throughout the mixed-version window.
+            // A process that registered before the V15 safety-profile boundary
+            // has an incomplete record. Re-register once that mandatory
+            // profile is safe; optional activity heartbeats never gate it.
             self.store_registration_confirmed = false;
             try self.registerNodeIfConfigured();
         }
@@ -12294,10 +12510,11 @@ pub const DataServer = struct {
 
         const capacity = self.observeStoreCapacityForStatus();
 
-        const report: antfly.metadata.table_manager.StoreStatusReport = .{
+        const candidate_report: antfly.metadata.table_manager.StoreStatusReport = .{
             .store_id = registration.store_id,
+            .embedding_activity_protocol_version = embedding_activity_protocol_version,
+            .embedding_activity_sequence = self.embedding_activity_report_sequence.fetchAdd(1, .monotonic),
             .reporter_incarnation = reporter_incarnation,
-            .status_generation = status_generation,
             .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .live = true,
             .health_class = "healthy",
@@ -12305,6 +12522,27 @@ pub const DataServer = struct {
             .available_bytes = capacity.available_bytes,
             .group_statuses = group_statuses,
             .runtime_statuses = runtime_statuses,
+        };
+        const status_generation = self.durableGenerationForStoreStatus(candidate_report);
+
+        const report: antfly.metadata.table_manager.StoreStatusReport = .{
+            .store_id = candidate_report.store_id,
+            .embedding_activity_protocol_version = candidate_report.embedding_activity_protocol_version,
+            .embedding_activity_sequence = candidate_report.embedding_activity_sequence,
+            .reporter_incarnation = candidate_report.reporter_incarnation,
+            .status_generation = status_generation,
+            .artifact_sources_protocol_version = candidate_report.artifact_sources_protocol_version,
+            .live = candidate_report.live,
+            .health_class = candidate_report.health_class,
+            .capacity_bytes = candidate_report.capacity_bytes,
+            .available_bytes = candidate_report.available_bytes,
+            .lease_pressure = candidate_report.lease_pressure,
+            .read_load = candidate_report.read_load,
+            .write_load = candidate_report.write_load,
+            .active_backfills = candidate_report.active_backfills,
+            .backfill_progress_millis = candidate_report.backfill_progress_millis,
+            .group_statuses = candidate_report.group_statuses,
+            .runtime_statuses = candidate_report.runtime_statuses,
         };
         // Collection performs DB I/O outside the status-cache locks. If a
         // placement or Raft ownership transition raced that work, do not let
@@ -12324,6 +12562,7 @@ pub const DataServer = struct {
         );
         try self.storeStatusHeartbeatCacheReplace(report);
         self.last_store_status_report_at_ms = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        if (claimed_activity) self.last_embedding_activity_report_at_ms = self.last_store_status_report_at_ms;
         self.clearMetadataBootstrapRetry();
     }
 
@@ -12334,6 +12573,44 @@ pub const DataServer = struct {
             .capacity_bytes = self.store_status_heartbeat_cache.capacity_bytes,
             .available_bytes = self.store_status_heartbeat_cache.available_bytes,
         };
+    }
+
+    fn durableGenerationForStoreStatus(
+        self: *DataServer,
+        candidate: antfly.metadata.table_manager.StoreStatusReport,
+    ) u64 {
+        lockAtomic(&self.store_status_cache_mutex);
+        const cache = &self.store_status_heartbeat_cache;
+        if (cache.valid and
+            cache.reporter_incarnation == candidate.reporter_incarnation)
+        {
+            const previous: antfly.metadata.table_manager.StoreStatusReport = .{
+                .store_id = candidate.store_id,
+                .embedding_activity_protocol_version = cache.embedding_activity_protocol_version,
+                .embedding_activity_sequence = cache.embedding_activity_sequence,
+                .reporter_incarnation = cache.reporter_incarnation,
+                .status_generation = cache.status_generation,
+                .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
+                .live = cache.live,
+                .health_class = cache.health_class,
+                .capacity_bytes = cache.capacity_bytes,
+                .available_bytes = cache.available_bytes,
+                .lease_pressure = cache.lease_pressure,
+                .read_load = cache.read_load,
+                .write_load = cache.write_load,
+                .active_backfills = cache.active_backfills,
+                .backfill_progress_millis = cache.backfill_progress_millis,
+                .group_statuses = cache.group_statuses,
+                .runtime_statuses = cache.runtime_statuses,
+            };
+            if (antfly.metadata.store_observer.reportsDurablyEqual(previous, candidate)) {
+                const generation = cache.status_generation;
+                self.store_status_cache_mutex.unlock();
+                return generation;
+            }
+        }
+        self.store_status_cache_mutex.unlock();
+        return self.store_status_generation.fetchAdd(1, .monotonic);
     }
 
     fn observeStoreCapacityForStatus(self: *DataServer) StoreCapacitySnapshot {
@@ -12709,7 +12986,9 @@ pub const DataServer = struct {
                 break :failed null;
             };
             if (result) |value| {
-                if (value.hasPlacementFailures()) reconcile_commit_error = error.ReplicaReconcileIncomplete;
+                if (value.placementFailureError()) |err| {
+                    reconcile_commit_error = err;
+                }
             }
             if (reconcile_commit_error == null) {
                 if (apply_group_transition) |*transition| transition.commit();
@@ -12932,9 +13211,23 @@ pub const DataServer = struct {
         lockAtomic(&self.store_status_cache_mutex);
         defer self.store_status_cache_mutex.unlock();
         const cache = &self.store_status_heartbeat_cache;
-        if (cache.group_statuses.len == 0 and cache.runtime_statuses.len == 0) return null;
+        if (!cache.valid) return null;
+        const runtime_statuses = try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, cache.runtime_statuses);
+        errdefer if (runtime_statuses.len > 0)
+            antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
+        for (runtime_statuses) |*group_runtime_status| {
+            for (group_runtime_status.indexes) |*index_status| {
+                index_status.embedding_activity_observed = false;
+                index_status.embedding_activity = .{};
+            }
+        }
         return .{
             .store_id = store_id,
+            .embedding_activity_protocol_version = cache.embedding_activity_protocol_version,
+            // A cached heartbeat is a durable liveness refresh, not a new
+            // activity observation. Keep the owner sequence for diagnostics,
+            // but strip observation validity below before sending it.
+            .embedding_activity_sequence = cache.embedding_activity_sequence,
             .reporter_incarnation = cache.reporter_incarnation,
             .status_generation = cache.status_generation,
             .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
@@ -12948,7 +13241,7 @@ pub const DataServer = struct {
             .active_backfills = cache.active_backfills,
             .backfill_progress_millis = cache.backfill_progress_millis,
             .group_statuses = try antfly.metadata.table_manager.cloneGroupStatuses(self.alloc, cache.group_statuses),
-            .runtime_statuses = try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, cache.runtime_statuses),
+            .runtime_statuses = runtime_statuses,
         };
     }
 
@@ -12965,6 +13258,9 @@ pub const DataServer = struct {
         errdefer if (runtime_statuses.len > 0)
             antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
         var next: StoreStatusHeartbeatCache = .{
+            .valid = true,
+            .embedding_activity_protocol_version = report.embedding_activity_protocol_version,
+            .embedding_activity_sequence = report.embedding_activity_sequence,
             .reporter_incarnation = report.reporter_incarnation,
             .status_generation = report.status_generation,
             .artifact_sources_protocol_version = report.artifact_sources_protocol_version,
@@ -13408,7 +13704,7 @@ pub const DataServer = struct {
         return generation;
     }
 
-    fn enqueueProvisionedIndexRepairWithRetryForTable(
+    fn upsertProvisionedIndexRepairQueueEntry(
         self: *DataServer,
         table_name: ?[]const u8,
         group_id: u64,
@@ -13440,8 +13736,10 @@ pub const DataServer = struct {
                 if (wake == .immediate) {
                     entry.wake_generation = self.nextProvisionedIndexRepairWakeGenerationLocked();
                 }
-                entry.transient_failure_count = 0;
-                entry.next_retry_at_ms = next_retry_at_ms;
+                if (wake != .observed) {
+                    entry.transient_failure_count = 0;
+                    entry.next_retry_at_ms = next_retry_at_ms;
+                }
                 if (wake == .immediate and !entry.immediate_wake_pending) {
                     entry.immediate_wake_pending = true;
                     _ = self.provisioned_index_repair_immediate_wake_count.fetchAdd(1, .release);
@@ -13499,8 +13797,10 @@ pub const DataServer = struct {
         if (gop.found_existing and wake == .immediate) {
             gop.value_ptr.wake_generation = self.nextProvisionedIndexRepairWakeGenerationLocked();
         }
-        gop.value_ptr.transient_failure_count = 0;
-        gop.value_ptr.next_retry_at_ms = next_retry_at_ms;
+        if (!gop.found_existing or wake != .observed) {
+            gop.value_ptr.transient_failure_count = 0;
+            gop.value_ptr.next_retry_at_ms = next_retry_at_ms;
+        }
         if (wake == .immediate and !gop.value_ptr.immediate_wake_pending) {
             gop.value_ptr.immediate_wake_pending = true;
             _ = self.provisioned_index_repair_immediate_wake_count.fetchAdd(1, .release);
@@ -13633,16 +13933,36 @@ pub const DataServer = struct {
         self.provisioned_index_repair_fallback_not_before_ms.store(0, .release);
     }
 
-    fn enqueueProvisionedIndexRepair(self: *DataServer, group_id: u64) !void {
-        _ = try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, 0, .immediate, .unguarded);
+    fn signalProvisionedIndexRepairRunnable(self: *DataServer, group_id: u64) !void {
+        _ = try self.upsertProvisionedIndexRepairQueueEntry(null, group_id, 0, .immediate, .unguarded);
     }
 
-    fn enqueueProvisionedIndexRepairForTable(self: *DataServer, table_name: []const u8, group_id: u64) !void {
-        _ = try self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, 0, .immediate, .unguarded);
+    fn signalProvisionedIndexRepairRunnableForTable(self: *DataServer, table_name: []const u8, group_id: u64) !void {
+        _ = try self.upsertProvisionedIndexRepairQueueEntry(table_name, group_id, 0, .immediate, .unguarded);
     }
 
-    fn enqueueProvisionedIndexRepairWithRetry(self: *DataServer, group_id: u64, next_retry_at_ms: u64) !void {
-        _ = try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, next_retry_at_ms, .retained, .unguarded);
+    /// A progress callback can be emitted by the same resident writer while a
+    /// repair quantum is already inspecting that group. Replacing the selected
+    /// generation in that window prevents the quantum's cooperative deferral
+    /// from applying and turns ordinary build progress into an immediate
+    /// repair loop. The active owner already observes the durable scheduler
+    /// directory; coalesce concurrent edges as level observations and retain a
+    /// bounded audit fallback. Outside an active quantum, the edge remains a
+    /// causal wake and clears stale node-local backoff immediately.
+    fn coalesceProvisionedIndexRepairRunnableForTable(self: *DataServer, table_name: []const u8, group_id: u64) !bool {
+        if (self.provisioned_index_repair_active.load(.acquire)) {
+            try self.observeProvisionedIndexRepairForTable(table_name, group_id);
+            return false;
+        }
+        try self.signalProvisionedIndexRepairRunnableForTable(table_name, group_id);
+        return true;
+    }
+
+    /// Record a periodic level observation of durable repair debt. Unlike a
+    /// causal enqueue, observing already-known debt cannot wake the owner or
+    /// replace its exact retry/backoff decision.
+    fn observeProvisionedIndexRepairForTable(self: *DataServer, table_name: []const u8, group_id: u64) !void {
+        _ = try self.upsertProvisionedIndexRepairQueueEntry(table_name, group_id, 0, .observed, .unguarded);
     }
 
     fn removeProvisionedIndexRepairLocked(self: *DataServer, group_id: u64, now_ms: u64) void {
@@ -13713,13 +14033,22 @@ pub const DataServer = struct {
     fn requestProvisionedIndexRepairCancellation(self: *DataServer, group_id: u64) !void {
         lockAtomic(&self.provisioned_index_repair_cancel_mutex);
         defer self.provisioned_index_repair_cancel_mutex.unlock();
-        try self.provisioned_index_repair_cancel_groups.put(self.alloc, group_id, {});
+        const result = try self.provisioned_index_repair_cancel_groups.getOrPut(self.alloc, group_id);
+        if (!result.found_existing) {
+            result.value_ptr.* = 1;
+            return;
+        }
+        result.value_ptr.* = std.math.add(u32, result.value_ptr.*, 1) catch
+            return error.IndexRepairCancellationLeaseOverflow;
     }
 
     fn clearProvisionedIndexRepairCancellation(self: *DataServer, group_id: u64) void {
         lockAtomic(&self.provisioned_index_repair_cancel_mutex);
         defer self.provisioned_index_repair_cancel_mutex.unlock();
-        _ = self.provisioned_index_repair_cancel_groups.remove(group_id);
+        const count = self.provisioned_index_repair_cancel_groups.getPtr(group_id) orelse return;
+        std.debug.assert(count.* > 0);
+        count.* -= 1;
+        if (count.* == 0) _ = self.provisioned_index_repair_cancel_groups.remove(group_id);
     }
 
     fn provisionedIndexRepairCancellationRequested(self: *DataServer, group_id: u64) bool {
@@ -13797,6 +14126,20 @@ pub const DataServer = struct {
         const started_ns = platform_time.monotonicNs();
         _ = self.provisioned_warmup_started.fetchAdd(1, .monotonic);
         var stats: ProvisionedWarmupStats = .{};
+        // Warmup and recovery are one ordered startup pipeline. Every exit,
+        // including metadata-not-yet-visible and allocation/error exits, must
+        // hand the level-triggered recovery bit to the catch-up scheduler.
+        // Otherwise a harmless early warmup miss can leave the process serving
+        // only its stale persisted status until unrelated traffic wakes it.
+        defer self.requestProvisionedStartupCatchUp() catch |err| switch (err) {
+            error.ThreadQuotaExceeded,
+            error.SystemResources,
+            => std.log.warn("provisioned cache warmup startup catch-up deferred err={}", .{err}),
+            else => {
+                _ = self.provisioned_warmup_failed.fetchAdd(1, .monotonic);
+                std.log.warn("provisioned cache warmup startup catch-up failed err={}", .{err});
+            },
+        };
         defer self.provisioned_warmup_last_group_count.store(stats.warmed_group_count, .monotonic);
         defer self.provisioned_warmup_last_duration_ns.store(stats.duration_ns, .monotonic);
         defer stats.duration_ns = platform_time.monotonicNs() - started_ns;
@@ -13842,15 +14185,6 @@ pub const DataServer = struct {
             else => {
                 _ = self.provisioned_warmup_failed.fetchAdd(1, .monotonic);
                 std.log.warn("provisioned cache warmup runtime status refresh failed err={}", .{err});
-            },
-        };
-        self.requestProvisionedStartupCatchUp() catch |err| switch (err) {
-            error.ThreadQuotaExceeded,
-            error.SystemResources,
-            => std.log.warn("provisioned cache warmup startup catch-up deferred err={}", .{err}),
-            else => {
-                _ = self.provisioned_warmup_failed.fetchAdd(1, .monotonic);
-                std.log.warn("provisioned cache warmup startup catch-up failed err={}", .{err});
             },
         };
         _ = self.provisioned_warmup_completed.fetchAdd(1, .monotonic);
@@ -13959,7 +14293,8 @@ pub const DataServer = struct {
                 // therefore cannot be restricted to the current Raft leader.
                 // Keeping the exception scoped to a live restore identity
                 // preserves single-leader admission for all steady-state debt.
-                if (range.restore_backup_id.len == 0 or range.restore_location.len == 0) {
+                const restore_repair_pending = range.restore_backup_id.len != 0 and range.restore_location.len != 0;
+                if (!restore_repair_pending) {
                     switch (startupCatchUpGroupDisposition(
                         snapshot.stores,
                         snapshot.placement_intents,
@@ -14032,9 +14367,13 @@ pub const DataServer = struct {
                 };
                 stats.group_count += 1;
                 if (result.index_repair_pending) {
-                    self.enqueueProvisionedIndexRepairForTable(table.name, group_id) catch |err| {
+                    // Startup catch-up is a periodic level observation, not a
+                    // causal progress edge. It may recover a lost queue entry,
+                    // but must not erase the exact repair owner's deadline or
+                    // manufacture a new immediate wake once debt is known.
+                    self.observeProvisionedIndexRepairForTable(table.name, group_id) catch |err| {
                         _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
-                        std.log.warn("provisioned index repair enqueue failed group={} err={s}", .{ group_id, @errorName(err) });
+                        std.log.warn("provisioned index repair debt observation failed group={} err={s}", .{ group_id, @errorName(err) });
                         self.provisioned_index_repair_dirty.store(true, .release);
                     };
                     self.cacheQueuedProvisionedIndexRepairRoute(
@@ -14051,13 +14390,13 @@ pub const DataServer = struct {
                 if (accountParkedIndexRepair(&stats, result)) continue;
                 if (result.busy) {
                     stats.busy_groups += 1;
-                    if (self.runtime_status_dirty.load(.acquire) or self.runtime_status_refresh_active.load(.acquire)) {
-                        stats.debt_remaining = true;
-                        stats.unparked_debt_remaining = true;
-                        continue;
-                    }
-                    const cached_debt: ?bool = self.cachedRuntimeStatusHasStartupCatchUpDebt(table.name, group_id) catch true;
-                    if (cached_debt orelse true) {
+                    const runtime_status_refresh_pending = self.runtime_status_dirty.load(.acquire) or
+                        self.runtime_status_refresh_active.load(.acquire);
+                    const cached_debt: ?bool = if (result.had_debt or runtime_status_refresh_pending)
+                        null
+                    else
+                        self.cachedRuntimeStatusHasStartupCatchUpDebt(table.name, group_id) catch null;
+                    if (busyStartupCatchUpNeedsRetry(result, restore_repair_pending, runtime_status_refresh_pending, cached_debt)) {
                         stats.debt_remaining = true;
                         stats.unparked_debt_remaining = true;
                     }
@@ -14365,6 +14704,17 @@ pub const DataServer = struct {
             const group_id = candidate.group_id;
             const table_name = candidate.table_name;
 
+            // A structural activation owns this group's control-plane lease.
+            // Do not open the resident writer merely to discover cancellation
+            // inside DB repair: repeated no-op opens can continuously beat the
+            // structural owner to the same writer lock. Keep the durable queue
+            // entry intact and let clear_cancel re-arm it after activation.
+            if (self.provisionedIndexRepairCancellationRequested(group_id)) {
+                found_pending = true;
+                _ = self.provisioned_index_repair_cooperative_deferrals.fetchAdd(1, .monotonic);
+                continue;
+            }
+
             // Healthy resident writers own ordinary async replay and publish
             // runtime status directly. A resident writer with repair metadata
             // or durable intent debt must still be audited, while a contended
@@ -14469,11 +14819,18 @@ pub const DataServer = struct {
                 _ = self.provisioned_index_repair_disk_waits.fetchAdd(1, .monotonic);
             }
             if (result.index_repair_pending) {
-                _ = self.enqueueProvisionedIndexRepairWithRetryForTable(
+                const queue_schedule = indexRepairQueueScheduleFromResult(
+                    result.index_repair_wake,
+                    result.index_repair_retry_at_ms,
+                    result.busy,
+                    result.made_progress,
+                    platform_clock.Clock.real().nowRealtimeMs(),
+                );
+                _ = self.upsertProvisionedIndexRepairQueueEntry(
                     table_name,
                     group_id,
-                    result.index_repair_retry_at_ms,
-                    indexRepairQueueWakeFromAggregate(result.index_repair_wake),
+                    queue_schedule.retry_at_realtime_ms,
+                    queue_schedule.wake,
                     .{ .selected = candidate.queue_wake_generation },
                 ) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
@@ -14492,7 +14849,7 @@ pub const DataServer = struct {
                 };
             } else {
                 // The result owns only the wake that selected this attempt.
-                // A callback may enqueue newer repair debt while DB/status
+                // A callback may signal newer repair work while DB/status
                 // observation is finishing; never let the older completion
                 // remove that causally later edge.
                 if (!self.removeProvisionedIndexRepairIfUnchanged(group_id, candidate.queue_wake_generation)) {
@@ -15244,6 +15601,20 @@ pub const DataServer = struct {
             const range = findRangeByGroupId(ranges, group_id) orelse continue;
             if (range.table_id != table.table_id) continue;
 
+            // Startup catch-up owns a managed writer before it advertises its
+            // target. Snapshot that existing owner first: this is an O(1)
+            // lease, never a competing DB open, and it is the only authority
+            // for a publication restored after process restart. Falling back
+            // to the pre-restart cache first can pin `runtime_unavailable`
+            // for the whole duration of a provider retry even though the
+            // certified generation is already queryable.
+            if (try self.snapshotManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id)) |live_status| {
+                var status = live_status;
+                status.withMetadataDefaults(.live_writer_publish, platform_time.monotonicNs());
+                self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
+                try items.append(self.alloc, status);
+                continue;
+            }
             if (try self.snapshotCachedActiveStartupGroupStatus(table.name, group_id, active_target)) |cached| {
                 var status = cached;
                 self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
@@ -15251,13 +15622,6 @@ pub const DataServer = struct {
                 continue;
             }
             if (self.shouldSkipActiveStartupGroupStatusOpen(table.name, group_id, active_target)) {
-                continue;
-            }
-            if (try self.snapshotManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id)) |live_status| {
-                var status = live_status;
-                status.withMetadataDefaults(.live_writer_publish, platform_time.monotonicNs());
-                self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
-                try items.append(self.alloc, status);
                 continue;
             }
             if (self.hasReadBlockingActivityBestEffort(table.name, group_id)) {
@@ -16575,6 +16939,7 @@ const RemoteMetadataSource = struct {
         fetch_head_error: ?anyerror = null,
         fetch_head_mismatches_remaining: usize = 0,
         force_snapshot_cache_miss: bool = false,
+        lifecycle_linearizable_snapshot_calls: std.atomic.Value(u64) = .init(0),
     } else struct {};
 
     alloc: std.mem.Allocator,
@@ -18409,9 +18774,13 @@ const RemoteMetadataSource = struct {
         const timeout_ns = 30 * std.time.ns_per_s;
         const poll_interval_ms: u64 = 10;
         const start_ns = platform_time.monotonicNs();
+        var needs_authoritative_fence = true;
 
         while (true) {
-            var snapshot = try self.fetchSnapshot();
+            var snapshot = if (needs_authoritative_fence) blk: {
+                needs_authoritative_fence = false;
+                break :blk try self.fetchLifecycleSnapshot();
+            } else try self.fetchSnapshot();
 
             if (remoteTableLifecycleMatches(&snapshot, table_name, expected)) {
                 freeAdminSnapshotOwned(self.alloc, &snapshot);
@@ -18433,9 +18802,13 @@ const RemoteMetadataSource = struct {
         const timeout_ns = 30 * std.time.ns_per_s;
         const poll_interval_ms: u64 = 10;
         const start_ns = platform_time.monotonicNs();
+        var needs_authoritative_fence = true;
 
         while (true) {
-            var snapshot = try self.fetchSnapshot();
+            var snapshot = if (needs_authoritative_fence) blk: {
+                needs_authoritative_fence = false;
+                break :blk try self.fetchLifecycleSnapshot();
+            } else try self.fetchSnapshot();
 
             if (remoteTableProjectionMatches(&snapshot, table_name, schema_json, indexes_json)) {
                 freeAdminSnapshotOwned(self.alloc, &snapshot);
@@ -18445,6 +18818,19 @@ const RemoteMetadataSource = struct {
             if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
             platform_clock.Clock.real().sleepMs(poll_interval_ms);
         }
+    }
+
+    /// Lifecycle barriers guard name reuse and generation publication. An
+    /// ordinary cached/follower snapshot may legitimately lag and therefore
+    /// cannot prove absence or that a matching definition is the new
+    /// incarnation. Prefer the metadata service's linearizable snapshot,
+    /// which also installs the fenced result in the process cache. The
+    /// fallback is only for servers that do not expose that capability.
+    fn fetchLifecycleSnapshot(self: *RemoteMetadataSource) !antfly.metadata_api.AdminSnapshot {
+        if (@import("builtin").is_test)
+            _ = self.test_faults.lifecycle_linearizable_snapshot_calls.fetchAdd(1, .release);
+        if (try remoteLinearizableSnapshot(self, .{})) |snapshot| return snapshot;
+        return try self.fetchSnapshot();
     }
 
     fn registerNode(self: *RemoteMetadataSource, record: antfly.metadata.table_manager.StoreRecord) !void {
@@ -19033,6 +19419,8 @@ fn runtimeStatusReportFromLocalStatus(
         .topology_generation = status.metadata.topology_generation,
         .lsm_root_generation = status.metadata.lsm_root_generation,
         .status_generation = status.metadata.status_generation,
+        .target_observation_revision = status.metadata.target_observation_revision,
+        .target_observation_complete = status.metadata.target_observation_complete,
         .doc_count = controlPlaneDocumentCount(status.stats),
         .disk_bytes = status.disk_bytes,
         .disk_bytes_known = status.disk_bytes_known,
@@ -19150,6 +19538,9 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .edge_count = index.edge_count,
         .node_count = index.node_count,
         .root_node = index.root_node,
+        .publication_target_count = index.publication_target_count,
+        .publication_target_ready = index.publication_target_ready,
+        .serving_snapshot_ready = index.serving_snapshot_ready,
         .coverage_produced_count = index.coverage_produced_count,
         .coverage_skipped_count = index.coverage_skipped_count,
         .coverage_terminal_failed_count = index.coverage_terminal_failed_count,
@@ -19162,9 +19553,42 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .replay_applied_sequence = index.replay_applied_sequence,
         .replay_target_sequence = index.replay_target_sequence,
         .replay_catch_up_required = index.replay_catch_up_required,
+        // Retained activity stays visible to local standalone status, but only
+        // a direct owner sample may refresh the metadata hop's TTL.
+        .embedding_activity_observed = index.embedding_activity_sample_fresh,
+        .embedding_activity = .{
+            .epoch = index.embedding_activity.epoch,
+            .sample_sequence = index.embedding_activity.sample_sequence,
+            .phase = switch (index.embedding_activity.effectivePhase()) {
+                .idle => .idle,
+                .preparing => .preparing,
+                .embedding => .embedding,
+                .publishing => .publishing,
+                .waiting_retry => .waiting_retry,
+            },
+            .chunks_created = index.embedding_activity.chunks_created,
+            .embedding_batches_completed = index.embedding_activity.embedding_batches_completed,
+            .embeddings_computed = index.embedding_activity.embeddings_computed,
+            .active_batch_size = index.embedding_activity.active_batch_size,
+            .last_progress_at_ms = index.embedding_activity.last_progress_at_ms,
+        },
         .source_replay = source_replay,
-        .repair_status = index.index_repair_status,
-        .repair_active_generation_serviceable = index.index_repair_active_generation_serviceable,
+        .lifecycle_work_class = switch (index.index_lifecycle_work_class) {
+            .none => .none,
+            .initial_build => .initial_build,
+            .repair => if (index.index_repair_status != null) .repair else .none,
+        },
+        // Initial materialization uses the same bounded durable generation
+        // scheduler, but it is not repair debt. Carry its progress through the
+        // backfill/publication fields and reserve the compact repair channel
+        // for an actually damaged or operator-rebuilt generation.
+        .repair_status = if (index.index_lifecycle_work_class == .initial_build)
+            null
+        else
+            index.index_repair_status,
+        .repair_active_generation_serviceable = index.index_lifecycle_work_class == .repair and
+            index.index_repair_status != null and
+            index.index_repair_active_generation_serviceable,
     };
 }
 
@@ -19173,6 +19597,22 @@ test "data runtime report preserves compact managed repair admission state" {
     const report = try runtimeIndexStatusReportFromLocalIndex(alloc, .{
         .name = "thumbnail",
         .kind = .dense_vector,
+        .publication_target_count = 2500,
+        .publication_target_ready = true,
+        .serving_snapshot_ready = true,
+        .embedding_activity_observed = true,
+        .embedding_activity_sample_fresh = true,
+        .embedding_activity = .{
+            .epoch = 7,
+            .sample_sequence = 2,
+            .chunks_created = 9,
+            .embedding_batches_completed = 2,
+            .embeddings_computed = 8,
+            .active_batch_size = 4,
+            .retrying = true,
+            .last_progress_at_ms = 1_787_990_400_000,
+        },
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .waiting,
         .index_repair_active_generation_serviceable = false,
     });
@@ -19180,14 +19620,54 @@ test "data runtime report preserves compact managed repair admission state" {
 
     try std.testing.expectEqual(antfly.metadata.table_manager.IndexRepairStatus.waiting, report.repair_status.?);
     try std.testing.expect(!report.repair_active_generation_serviceable);
+    try std.testing.expect(report.publication_target_ready);
+    try std.testing.expectEqual(@as(u64, 2500), report.publication_target_count);
+    try std.testing.expect(report.serving_snapshot_ready);
 
     const encoded = try std.json.Stringify.valueAlloc(alloc, report, .{});
     defer alloc.free(encoded);
     try ant_json.testing.expectSubsetJsonText(
         alloc,
-        "{\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
+        "{\"publication_target_count\":2500,\"publication_target_ready\":true,\"serving_snapshot_ready\":true,\"embedding_activity_observed\":true,\"embedding_activity\":{\"epoch\":7,\"sample_sequence\":2,\"phase\":\"waiting_retry\",\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
         encoded,
     );
+}
+
+test "data runtime report projects initial build through lifecycle rather than repair" {
+    const alloc = std.testing.allocator;
+    const report = try runtimeIndexStatusReportFromLocalIndex(alloc, .{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .index_lifecycle_work_class = .initial_build,
+        .backfill_active = true,
+        .index_repair_status = .waiting,
+        .index_repair_active_generation_serviceable = true,
+    });
+    defer antfly.metadata.table_manager.freeRuntimeIndexStatusReport(alloc, report);
+
+    try std.testing.expect(report.backfill_active);
+    try std.testing.expect(report.repair_status == null);
+    try std.testing.expect(!report.repair_active_generation_serviceable);
+}
+
+test "data runtime report does not forward a locally retained activity sample as fresh" {
+    const alloc = std.testing.allocator;
+    const report = try runtimeIndexStatusReportFromLocalIndex(alloc, .{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .embedding_activity_observed = true,
+        .embedding_activity_sample_fresh = false,
+        .embedding_activity = .{
+            .epoch = 7,
+            .sample_sequence = 2,
+            .embeddings_computed = 8,
+        },
+    });
+    defer antfly.metadata.table_manager.freeRuntimeIndexStatusReport(alloc, report);
+
+    try std.testing.expect(!report.embedding_activity_observed);
+    try std.testing.expectEqual(@as(u64, 7), report.embedding_activity.epoch);
+    try std.testing.expectEqual(@as(u64, 2), report.embedding_activity.sample_sequence);
 }
 
 test "data runtime report preserves per-source replay watermarks" {
@@ -19388,7 +19868,7 @@ fn storeRegistrationVisible(
         if (!std.mem.eql(u8, store.api_url, record.api_url)) continue;
         if (!std.mem.eql(u8, store.raft_url, record.raft_url)) continue;
         // A zero committed incarnation is a legacy rolling-upgrade record.
-        // Once v13 is active, registration visibility requires the exact
+        // Once the v15 safety profile is active, registration visibility requires the exact
         // process incarnation and stale processes lose report authority.
         if (store.reporter_incarnation != 0 and
             store.reporter_incarnation != record.reporter_incarnation) continue;
@@ -19422,6 +19902,13 @@ fn storeNativeGenerationRestoreCapabilityVisible(
     return false;
 }
 
+fn runtimeStatusReadyForStoreRegistration(ready_version: u16) bool {
+    return metadata_runtime_status_protocol.profileSatisfies(
+        ready_version,
+        metadata_runtime_status_protocol.native_restore_identity_record_version,
+    );
+}
+
 test "data store registration waits for native generation capability acknowledgment" {
     const expected = antfly.metadata.table_manager.StoreRecord{
         .store_id = 101,
@@ -19438,6 +19925,10 @@ test "data store registration waits for native generation capability acknowledgm
     committed.native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version;
     try std.testing.expect(storeRegistrationVisible(&.{committed}, expected));
     try std.testing.expect(storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
+    try std.testing.expect(!runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.v0_2_0_record_version));
+    try std.testing.expect(runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.native_restore_identity_record_version));
+    try std.testing.expect(runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.current_record_version));
+    try std.testing.expect(!runtimeStatusReadyForStoreRegistration(16));
 }
 
 fn findRangeByGroupId(
@@ -26084,7 +26575,7 @@ test "data runtime status refresh reuses managed writer snapshot instead of reop
     try std.testing.expectEqual(@as(u64, 9), docs_cached.items[0].metadata.node_id);
 }
 
-test "data runtime status refresh falls back to live managed writer status when cache entry is missing" {
+test "data runtime status refresh observes active startup owner before cached fallback" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -26212,6 +26703,9 @@ test "data runtime status refresh falls back to live managed writer status when 
 
     try std.testing.expect((try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")) == null);
 
+    server.provisioned_startup_catch_up_active.store(true, .release);
+    try server.setProvisionedStartupCatchUpTarget(77, "docs");
+    defer server.clearProvisionedStartupCatchUpTarget();
     try server.requestRuntimeStatusRefresh();
 
     var docs_cached = (try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")).?;
@@ -26656,6 +27150,25 @@ test "data runtime startup catch-up parks scheduler when only quarantined debt r
     const delegated = DataServer.startupCatchUpCompletion(delegated_stats, true, 7, 7);
     try std.testing.expect(!delegated.dirty);
     try std.testing.expectEqual(@as(u64, 0), delegated.not_before_ms);
+
+    const durable_restore_debt = antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
+        .had_debt = true,
+        .busy = true,
+    };
+    try std.testing.expect(DataServer.busyStartupCatchUpNeedsRetry(
+        durable_restore_debt,
+        false,
+        false,
+        false,
+    ));
+
+    const unknown_busy = antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
+        .busy = true,
+    };
+    try std.testing.expect(DataServer.busyStartupCatchUpNeedsRetry(unknown_busy, true, false, false));
+    try std.testing.expect(DataServer.busyStartupCatchUpNeedsRetry(unknown_busy, false, false, null));
+    try std.testing.expect(DataServer.busyStartupCatchUpNeedsRetry(unknown_busy, false, true, false));
+    try std.testing.expect(!DataServer.busyStartupCatchUpNeedsRetry(unknown_busy, false, false, false));
 }
 
 test "data runtime provisioned startup catch-up clears replay debt for local groups" {
@@ -27739,32 +28252,53 @@ test "data runtime repair debt hook targets the affected group queue" {
     try std.testing.expect(server.runtime_status_dirty.load(.acquire));
     try std.testing.expect(!server.provisioned_startup_catch_up_dirty.load(.acquire));
 
-    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .enqueue);
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .observe_debt);
     try std.testing.expect(server.provisioned_index_repair_dirty.load(.acquire));
     try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
     try std.testing.expectEqualStrings("docs", server.provisioned_index_repair_group_ages.get(7001).?.table_name.?);
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_queue_depth.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_started.load(.monotonic));
+
+    const observed_entry = server.provisioned_index_repair_group_ages.getPtr(7001).?;
+    const observed_generation = observed_entry.wake_generation;
+    observed_entry.next_retry_at_ms = std.math.maxInt(u64);
+    observed_entry.transient_failure_count = 3;
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .observe_debt);
+    try std.testing.expectEqual(observed_generation, observed_entry.wake_generation);
+    try std.testing.expectEqual(std.math.maxInt(u64), observed_entry.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 3), observed_entry.transient_failure_count);
+    try std.testing.expect(!observed_entry.immediate_wake_pending);
 
     // Broad startup discovery must not starve exact, post-reservation debt.
     // Same-group exclusion is enforced by the write source and returns a
     // retained busy result if the discovery worker actually owns this shard.
     server.provisioned_startup_catch_up_active.store(true, .release);
-    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .enqueue_runnable);
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .signal_runnable);
+    try std.testing.expect(observed_entry.wake_generation != observed_generation);
+    try std.testing.expectEqual(@as(u64, 0), observed_entry.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 0), observed_entry.transient_failure_count);
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_started.load(.monotonic));
     try std.testing.expect(!server.provisioned_index_repair_active.load(.acquire));
     server.provisioned_startup_catch_up_active.store(false, .release);
 
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .cancel);
     try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
-    // A visibility clear is an aggregate audit enqueue, not a destructive
-    // lifecycle remove, and cannot consume another owner's cancellation.
-    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .enqueue);
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .cancel);
+    try std.testing.expectEqual(@as(u32, 2), server.provisioned_index_repair_cancel_groups.get(7001).?);
+    // Queue state and control-plane lease ownership are independent. Neither
+    // a level-triggered debt observation nor durable-debt removal can consume an
+    // activation owner's cancellation lease.
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .observe_debt);
+    try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .remove);
+    try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .clear_cancel);
     try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .clear_cancel);
     try std.testing.expect(!server.provisionedIndexRepairCancellationRequested(7001));
 
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .observe_debt);
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .remove);
     try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7001));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_queue_depth.load(.monotonic));
@@ -27804,21 +28338,72 @@ test "data runtime repair failures preserve durable backoff and increase retry d
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
 
-    try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
+    defer server.removeProvisionedIndexRepair(7001);
     const entry = server.provisioned_index_repair_group_ages.getPtr(7001).?;
     const selected_generation = entry.wake_generation;
+    try std.testing.expect(server.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(7001, selected_generation));
+    try std.testing.expect(!entry.immediate_wake_pending);
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
     entry.next_retry_at_ms = std.math.maxInt(u64);
     const deferral = try server.deferProvisionedIndexRepairAfterFailureForTable("docs", 7001, selected_generation);
     try std.testing.expect(deferral.applied);
     try std.testing.expectEqual(std.math.maxInt(u64), deferral.retry_at_ms);
     try std.testing.expectEqual(@as(u32, 1), entry.transient_failure_count);
 
+    // Periodic startup/status observation is level-triggered. It may restore a
+    // lost entry, but must not turn known debt into a new causal wake or erase
+    // the exact owner's retry policy.
+    try server.observeProvisionedIndexRepairForTable("docs", 7001);
+    try std.testing.expectEqual(selected_generation, entry.wake_generation);
+    try std.testing.expectEqual(std.math.maxInt(u64), entry.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 1), entry.transient_failure_count);
+    try std.testing.expect(!entry.immediate_wake_pending);
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
+
     // An explicit/durable wake replaces node-local failure state rather than
     // leaving a recovered group parked behind stale scheduler backoff.
-    try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
     try std.testing.expectEqual(@as(u64, 0), entry.next_retry_at_ms);
     try std.testing.expectEqual(@as(u32, 0), entry.transient_failure_count);
     server.removeProvisionedIndexRepair(7001);
+}
+
+test "data runtime coalesces repair progress emitted during an active quantum" {
+    const alloc = std.testing.allocator;
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = undefined,
+        .read_source = undefined,
+        .write_source = undefined,
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.provisioned_index_repair_group_ages.deinit(alloc);
+
+    try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
+    defer server.removeProvisionedIndexRepair(7001);
+    const entry = server.provisioned_index_repair_group_ages.getPtr(7001).?;
+    const selected_generation = entry.wake_generation;
+    try std.testing.expect(server.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(7001, selected_generation));
+    entry.next_retry_at_ms = 42;
+    entry.transient_failure_count = 3;
+
+    server.provisioned_index_repair_active.store(true, .release);
+    try std.testing.expect(!try server.coalesceProvisionedIndexRepairRunnableForTable("docs", 7001));
+    try std.testing.expectEqual(selected_generation, entry.wake_generation);
+    try std.testing.expectEqual(@as(u64, 42), entry.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 3), entry.transient_failure_count);
+    try std.testing.expect(!entry.immediate_wake_pending);
+
+    server.provisioned_index_repair_active.store(false, .release);
+    try std.testing.expect(try server.coalesceProvisionedIndexRepairRunnableForTable("docs", 7001));
+    try std.testing.expect(entry.wake_generation != selected_generation);
+    try std.testing.expectEqual(@as(u64, 0), entry.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 0), entry.transient_failure_count);
+    try std.testing.expect(entry.immediate_wake_pending);
 }
 
 test "data runtime exact repair requeue is allocation-free and failed new enqueue is atomic" {
@@ -27835,7 +28420,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
 
-    try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
     const selected_generation = server.provisioned_index_repair_group_ages.get(7001).?.wake_generation;
     var failing = std.testing.FailingAllocator.init(alloc, .{});
     failing.fail_index = failing.alloc_index;
@@ -27843,7 +28428,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
 
     // Retaining an existing exact wake must not allocate, even when its durable
     // retry deadline changes after a cooperative repair slice.
-    try std.testing.expect(try server.enqueueProvisionedIndexRepairWithRetryForTable(
+    try std.testing.expect(try server.upsertProvisionedIndexRepairQueueEntry(
         "docs",
         7001,
         1234,
@@ -27852,7 +28437,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     ));
     try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
     try std.testing.expectEqual(selected_generation, server.provisioned_index_repair_group_ages.get(7001).?.wake_generation);
-    try std.testing.expect(try server.enqueueProvisionedIndexRepairWithRetryForTable(
+    try std.testing.expect(try server.upsertProvisionedIndexRepairQueueEntry(
         "docs",
         7001,
         0,
@@ -27869,7 +28454,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     // fallback work selected without a queue entry cannot remove it either.
     // Retry and failure outcomes are fenced by the same ownership token, so
     // they cannot restore stale backoff over the immediate wake either.
-    try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
     const newer_entry = server.provisioned_index_repair_group_ages.getPtr(7001).?;
     const newer_generation = newer_entry.wake_generation;
     try std.testing.expect(newer_generation != selected_generation);
@@ -27881,7 +28466,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), newer_entry.next_retry_at_ms);
     try std.testing.expectEqual(@as(u32, 0), newer_entry.transient_failure_count);
-    try std.testing.expect(!try server.enqueueProvisionedIndexRepairWithRetryForTable(
+    try std.testing.expect(!try server.upsertProvisionedIndexRepairQueueEntry(
         "docs",
         7001,
         std.math.maxInt(u64),
@@ -27890,7 +28475,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     ));
     const stale_deferral = try server.deferProvisionedIndexRepairAfterFailureForTable("docs", 7001, selected_generation);
     try std.testing.expect(!stale_deferral.applied);
-    try std.testing.expect(!try server.enqueueProvisionedIndexRepairWithRetryForTable(
+    try std.testing.expect(!try server.upsertProvisionedIndexRepairQueueEntry(
         "docs",
         7001,
         std.math.maxInt(u64),
@@ -27910,7 +28495,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     // mistaken for retained exact debt.
     try std.testing.expectError(
         error.OutOfMemory,
-        server.enqueueProvisionedIndexRepairWithRetryForTable("docs", 7002, 0, .retained, .{ .selected = null }),
+        server.upsertProvisionedIndexRepairQueueEntry("docs", 7002, 0, .retained, .{ .selected = null }),
     );
     try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7002));
 
@@ -27921,7 +28506,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     // Destructive lifecycle removal is terminal for every scheduler outcome
     // selected before it. Neither a pending result nor its failure path may
     // recreate the removed route after the group-operation barrier is released.
-    try std.testing.expect(!try server.enqueueProvisionedIndexRepairWithRetryForTable(
+    try std.testing.expect(!try server.upsertProvisionedIndexRepairQueueEntry(
         "docs",
         7001,
         0,
@@ -27936,7 +28521,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     // Fallback discovery selected no queue owner and independently proved
     // durable debt, so it remains authorized to materialize an absent route.
     server.alloc = alloc;
-    try std.testing.expect(try server.enqueueProvisionedIndexRepairWithRetryForTable(
+    try std.testing.expect(try server.upsertProvisionedIndexRepairQueueEntry(
         "docs",
         7001,
         0,
@@ -27962,7 +28547,7 @@ test "data runtime repair queue links and removes debt in constant time" {
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
 
-    for (1..42) |group_id| try server.enqueueProvisionedIndexRepair(@intCast(group_id));
+    for (1..42) |group_id| try server.signalProvisionedIndexRepairRunnable(@intCast(group_id));
     try std.testing.expectEqual(@as(?u64, 1), server.provisioned_index_repair_queue_head);
     try std.testing.expectEqual(@as(?u64, 41), server.provisioned_index_repair_queue_tail);
     try std.testing.expectEqual(@as(u64, 41), server.provisioned_index_repair_queue_depth.load(.monotonic));

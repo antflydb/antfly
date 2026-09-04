@@ -23,8 +23,11 @@ const projection_checkpoint_mod = @import("../derived/apply_state.zig");
 const applied_seq_prefix = "\x00\x00__metadata__:enrichment_applied:";
 const runtime_status_prefix = "\x00\x00__metadata__:enrichment_status:";
 const runtime_retry_count_prefix = "\x00\x00__metadata__:enrichment_retry_count:";
+const replay_cursor_prefix = "\x00\x00__metadata__:enrichment_replay_cursor:";
 const checkpoint_magic = "AFENRCP1";
 const checkpoint_format_version: u32 = 1;
+const replay_cursor_magic = "AFENRC1";
+const replay_cursor_format_version: u32 = 1;
 
 pub const ProjectionStatus = projection_checkpoint_mod.ProjectionStatus;
 pub const ProjectionCheckpoint = projection_checkpoint_mod.ProjectionCheckpoint;
@@ -66,6 +69,22 @@ pub const RuntimeStatus = struct {
     worker_failed: bool = false,
 };
 
+/// Durable progress within one source replay interval. The ordinary applied
+/// sequence advances only after every document through that sequence settles;
+/// this cursor prevents a restart from republishing already-checkpointed
+/// preparation windows from a large batch. `base_applied_sequence` fences the
+/// cursor to the exact replay epoch that created it.
+pub const ReplayCursor = struct {
+    base_applied_sequence: u64,
+    sequence: u64,
+    doc_key: []u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.doc_key);
+        self.* = undefined;
+    }
+};
+
 // Keep the primary record byte-for-byte readable by pre-sidecar binaries so a
 // production rollback never turns enrichment telemetry into a DB-open error.
 const runtime_status_len = 62;
@@ -91,6 +110,91 @@ fn runtimeStatusKey(alloc: Allocator, scope: []const u8) ![]u8 {
 
 fn runtimeRetryCountKey(alloc: Allocator, scope: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}{s}", .{ runtime_retry_count_prefix, scope });
+}
+
+fn replayCursorKey(alloc: Allocator, scope: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ replay_cursor_prefix, scope });
+}
+
+pub fn loadReplayCursor(alloc: Allocator, store: anytype, scope: []const u8) !?ReplayCursor {
+    const key = try replayCursorKey(alloc, scope);
+    defer alloc.free(key);
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    const borrowed = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    const raw = try alloc.dupe(u8, borrowed);
+    defer alloc.free(raw);
+    return try decodeReplayCursor(alloc, raw);
+}
+
+pub fn saveReplayCursor(store: anytype, scope: []const u8, cursor: ReplayCursor) !void {
+    const key = try replayCursorKey(std.heap.page_allocator, scope);
+    defer std.heap.page_allocator.free(key);
+    const raw = try encodeReplayCursor(std.heap.page_allocator, cursor);
+    defer std.heap.page_allocator.free(raw);
+    var runtime = try initRuntimeStore(std.heap.page_allocator, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    try txn.put(key, raw);
+    try txn.commit();
+}
+
+pub fn clearReplayCursor(store: anytype, scope: []const u8) !void {
+    const key = try replayCursorKey(std.heap.page_allocator, scope);
+    defer std.heap.page_allocator.free(key);
+    var runtime = try initRuntimeStore(std.heap.page_allocator, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+    try txn.commit();
+}
+
+fn encodeReplayCursor(alloc: Allocator, cursor: ReplayCursor) ![]u8 {
+    if (cursor.doc_key.len == 0 or cursor.doc_key.len > std.math.maxInt(u32))
+        return error.InvalidEnrichmentState;
+    const body_len = replay_cursor_magic.len + 4 + 8 + 8 + 4 + cursor.doc_key.len;
+    const raw = try alloc.alloc(u8, body_len + 4);
+    @memcpy(raw[0..replay_cursor_magic.len], replay_cursor_magic);
+    var pos: usize = replay_cursor_magic.len;
+    writeCheckpointInt(raw, &pos, u32, replay_cursor_format_version);
+    writeCheckpointInt(raw, &pos, u64, cursor.base_applied_sequence);
+    writeCheckpointInt(raw, &pos, u64, cursor.sequence);
+    writeCheckpointInt(raw, &pos, u32, @intCast(cursor.doc_key.len));
+    @memcpy(raw[pos .. pos + cursor.doc_key.len], cursor.doc_key);
+    pos += cursor.doc_key.len;
+    writeCheckpointInt(raw, &pos, u32, std.hash.Crc32.hash(raw[0..body_len]));
+    return raw;
+}
+
+fn decodeReplayCursor(alloc: Allocator, raw: []const u8) !ReplayCursor {
+    const fixed_len = replay_cursor_magic.len + 4 + 8 + 8 + 4 + 4;
+    if (raw.len < fixed_len or !std.mem.eql(u8, raw[0..replay_cursor_magic.len], replay_cursor_magic))
+        return error.InvalidEnrichmentState;
+    const body_len = raw.len - 4;
+    const expected_crc = std.mem.readInt(u32, raw[body_len..][0..4], .little);
+    if (std.hash.Crc32.hash(raw[0..body_len]) != expected_crc) return error.InvalidEnrichmentState;
+    var pos: usize = replay_cursor_magic.len;
+    if (readCheckpointInt(raw, &pos, u32) != replay_cursor_format_version)
+        return error.InvalidEnrichmentState;
+    const base_applied_sequence = readCheckpointInt(raw, &pos, u64);
+    const sequence = readCheckpointInt(raw, &pos, u64);
+    const key_len: usize = readCheckpointInt(raw, &pos, u32);
+    if (key_len == 0 or key_len != body_len - pos) return error.InvalidEnrichmentState;
+    return .{
+        .base_applied_sequence = base_applied_sequence,
+        .sequence = sequence,
+        .doc_key = try alloc.dupe(u8, raw[pos..body_len]),
+    };
 }
 
 pub fn loadAppliedSequence(alloc: Allocator, store: anytype, scope: []const u8) !u64 {
@@ -350,6 +454,40 @@ test "enrichment apply state works with lsm backend store" {
     try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(std.testing.allocator, runtime, "chunks"));
     try saveAppliedSequence(runtime, "chunks", 23);
     try std.testing.expectEqual(@as(u64, 23), try loadAppliedSequence(std.testing.allocator, runtime, "chunks"));
+}
+
+test "enrichment replay cursor round trips and clears independently" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    try std.testing.expect((try loadReplayCursor(alloc, runtime, "generated")) == null);
+    try saveReplayCursor(runtime, "generated", .{
+        .base_applied_sequence = 11,
+        .sequence = 12,
+        .doc_key = @constCast("doc:064"),
+    });
+    var cursor = (try loadReplayCursor(alloc, runtime, "generated")).?;
+    defer cursor.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 11), cursor.base_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 12), cursor.sequence);
+    try std.testing.expectEqualStrings("doc:064", cursor.doc_key);
+    try clearReplayCursor(runtime, "generated");
+    try std.testing.expect((try loadReplayCursor(alloc, runtime, "generated")) == null);
+}
+
+test "enrichment replay cursor rejects corruption" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeReplayCursor(alloc, .{
+        .base_applied_sequence = 1,
+        .sequence = 2,
+        .doc_key = @constCast("doc:a"),
+    });
+    defer alloc.free(encoded);
+    encoded[encoded.len - 1] ^= 0xff;
+    try std.testing.expectError(error.InvalidEnrichmentState, decodeReplayCursor(alloc, encoded));
 }
 
 test "enrichment projection checkpoint persists status and identity fields" {

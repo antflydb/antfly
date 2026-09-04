@@ -31,6 +31,7 @@ const httpx = @import("httpx");
 const extension_domain = @import("../extensions/mod.zig");
 const google_auth = @import("antfly_google").auth;
 const backup_contract = @import("backup_contract.zig");
+const backup_repository = @import("../storage/backup_repository.zig");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 
 fn objectCancellationToken(cancellation: CancellationToken) ?object_storage.CancellationToken {
@@ -514,6 +515,1269 @@ pub const BackupLocation = union(enum) {
         self.* = undefined;
     }
 };
+
+/// Production adapter from the configured backup location to the canonical
+/// refs/manifests/blobs repository. The adapter borrows `location`; callers
+/// must keep both values alive for the complete repository operation.
+const repository_epoch_path = "control/repository.epoch";
+const repository_coordinator_path = "control/repository.coordinator";
+const repository_epoch_max_bytes: usize = 32;
+const repository_coordinator_duration_ns: u64 = 5 * std.time.ns_per_min;
+
+fn parseRepositoryEpoch(encoded: []const u8) !u64 {
+    const trimmed = std.mem.trim(u8, encoded, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidBackupRepositoryEpoch;
+    return std.fmt.parseUnsigned(u64, trimmed, 10) catch
+        return error.InvalidBackupRepositoryEpoch;
+}
+
+fn encodeRepositoryEpoch(buf: *[32]u8, epoch: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "{d}\n", .{epoch}) catch unreachable;
+}
+
+const RemoteRepositoryCoordinator = struct {
+    alloc: std.mem.Allocator,
+    store: *RemoteBackupStore,
+    owner: [32]u8,
+    etag: []u8,
+    released: bool = false,
+
+    fn deinit(self: *@This()) void {
+        self.alloc.free(self.etag);
+        self.* = undefined;
+    }
+
+    /// Refreshing with an ETag CAS is the fencing check. An owner paused past
+    /// expiry cannot resume a control-plane mutation after a successor has
+    /// replaced the coordinator object.
+    fn refresh(self: *@This()) !void {
+        const now_unix_ns: u64 = @intCast(platform_time.realtimeNs());
+        const encoded = try encodeClusterBackupReservationLease(
+            self.alloc,
+            &self.owner,
+            now_unix_ns +| repository_coordinator_duration_ns,
+        );
+        defer self.alloc.free(encoded);
+        const key = try self.store.keyAlloc(self.alloc, repository_coordinator_path);
+        defer self.alloc.free(key);
+        var result = self.store.client.putObject(self.store.bucket, key, encoded, .{
+            .content_type = "text/plain",
+            .if_match_etag = self.etag,
+        }) catch |err| switch (err) {
+            error.FileNotFound, error.PreconditionFailed => return error.BackupPublicationFenced,
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+        const next_etag = result.etag orelse return error.BackupReservationIdentityUnavailable;
+        const owned = try self.alloc.dupe(u8, next_etag);
+        self.alloc.free(self.etag);
+        self.etag = owned;
+    }
+
+    fn release(self: *@This()) !void {
+        if (self.released) return;
+        if (!try self.store.deleteSuffixIfOwned(
+            self.alloc,
+            repository_coordinator_path,
+            &self.owner,
+        )) return error.BackupPublicationFenced;
+        self.released = true;
+    }
+};
+
+fn acquireRemoteRepositoryCoordinator(
+    alloc: std.mem.Allocator,
+    store: *RemoteBackupStore,
+) !RemoteRepositoryCoordinator {
+    try store.ensureBucket();
+    var entropy: [16]u8 = undefined;
+    try store.io.randomSecure(&entropy);
+    const owner = std.fmt.bytesToHex(entropy, .lower);
+    const now_unix_ns: u64 = @intCast(platform_time.realtimeNs());
+    const encoded = try encodeClusterBackupReservationLease(
+        alloc,
+        &owner,
+        now_unix_ns +| repository_coordinator_duration_ns,
+    );
+    defer alloc.free(encoded);
+    const key = try store.keyAlloc(alloc, repository_coordinator_path);
+    defer alloc.free(key);
+    var result = store.client.putObject(store.bucket, key, encoded, .{
+        .content_type = "text/plain",
+        .if_none_match = true,
+    }) catch |err| switch (err) {
+        error.PreconditionFailed => blk: {
+            var current = try store.client.getObject(store.bucket, key, .{
+                .range = .{ .offset = 0, .length = max_backup_attempt_lease_bytes },
+                .skip_metadata_probe = true,
+                .max_response_bytes = max_backup_attempt_lease_bytes,
+            });
+            defer current.deinit(alloc);
+            const lease = parseClusterBackupReservationLease(current.body) catch
+                return error.BackupRepositoryBusy;
+            if (!clusterBackupLeaseReclaimable(lease.expires_at_unix_ns, now_unix_ns))
+                return error.BackupRepositoryBusy;
+            const etag = current.metadata.etag orelse
+                return error.BackupReservationIdentityUnavailable;
+            break :blk store.client.putObject(store.bucket, key, encoded, .{
+                .content_type = "text/plain",
+                .if_match_etag = etag,
+            }) catch |replace_err| switch (replace_err) {
+                error.FileNotFound, error.PreconditionFailed => return error.BackupRepositoryBusy,
+                else => return replace_err,
+            };
+        },
+        else => return err,
+    };
+    defer result.deinit(alloc);
+    const etag = try alloc.dupe(
+        u8,
+        result.etag orelse return error.BackupReservationIdentityUnavailable,
+    );
+    return .{ .alloc = alloc, .store = store, .owner = owner, .etag = etag };
+}
+
+pub const RepositoryLocationBackend = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+
+    pub fn backend(self: *@This()) backup_repository.Backend {
+        return .{
+            .context = self,
+            .garbage_collector = switch (self.location.*) {
+                .file => .{ .delete_unreachable = deleteIfOlderThan },
+                .remote => null,
+            },
+            .put_immutable = putImmutable,
+            .read_alloc = readAlloc,
+            .contains = contains,
+            .read_stable_epoch = readStableRepositoryEpoch,
+            .activate_lease = activateRepositoryLease,
+            .renew_lease = renewRepositoryLease,
+            .finalize_publication = finalizeRepositoryPublication,
+            .release_lease = releaseRepositoryLease,
+            .put_blob_from_file = putBlobFromFile,
+            .materialize_blob_to_file = materializeBlobToFile,
+        };
+    }
+
+    fn fromContext(context: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn putImmutable(context: *anyopaque, path: []const u8, bytes: []const u8) !void {
+        const self = fromContext(context);
+        try validateArtifactRelativePath(path);
+        switch (self.location.*) {
+            .file => |backup_root| {
+                var root = try openOrCreateBackupRootNoFollow(self.io, backup_root);
+                defer root.close(self.io);
+                try ensureBackupRelativeParentNoFollow(self.io, root, path);
+                if (try writeFileToBackupRootIfAbsentLocked(self.alloc, self.io, root, path, bytes)) return;
+                const existing = try readFileFromBackupRootAlloc(
+                    self.alloc,
+                    self.io,
+                    root,
+                    path,
+                    bytes.len +| 1,
+                );
+                defer self.alloc.free(existing);
+                if (!std.mem.eql(u8, existing, bytes)) return error.BackupPublicationConflict;
+            },
+            .remote => |*store| {
+                store.writeBytesIfAbsent(self.alloc, path, bytes, "application/json") catch |err| switch (err) {
+                    error.BackupAlreadyExists => {
+                        const existing = try store.readBytesAllocLimited(self.alloc, path, bytes.len +| 1);
+                        defer self.alloc.free(existing);
+                        if (!std.mem.eql(u8, existing, bytes)) return error.BackupPublicationConflict;
+                    },
+                    else => return err,
+                };
+            },
+        }
+    }
+
+    fn readAlloc(context: *anyopaque, alloc: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+        const self = fromContext(context);
+        return readFileFromLocationUsingIoLimited(alloc, self.io, self.location, path, limit);
+    }
+
+    fn contains(context: *anyopaque, path: []const u8) !bool {
+        const self = fromContext(context);
+        try validateArtifactRelativePath(path);
+        return switch (self.location.*) {
+            .file => |backup_root| blk: {
+                var root = openBackupRootNoFollow(self.io, backup_root) catch |err| switch (err) {
+                    error.FileNotFound => break :blk false,
+                    else => return err,
+                };
+                defer root.close(self.io);
+                break :blk try fileExistsFromBackupRoot(self.io, root, path);
+            },
+            .remote => |*store| blk: {
+                const key = try store.keyAlloc(self.alloc, path);
+                defer self.alloc.free(key);
+                var metadata = store.client.statObject(store.bucket, key) catch |err| switch (err) {
+                    error.FileNotFound => break :blk false,
+                    else => return err,
+                };
+                metadata.deinit(self.alloc);
+                break :blk true;
+            },
+        };
+    }
+
+    fn publishRef(
+        context: *anyopaque,
+        path: []const u8,
+        encoded: []const u8,
+        expected_manifest_sha256: ?[]const u8,
+        expected_generation: ?u64,
+    ) !void {
+        const self = fromContext(context);
+        try validateArtifactRelativePath(path);
+        var next = try backup_repository.parseRefCanonical(self.alloc, encoded);
+        defer next.deinit();
+        switch (self.location.*) {
+            .file => |backup_root| {
+                var root = try openOrCreateBackupRootNoFollow(self.io, backup_root);
+                defer root.close(self.io);
+                const lock_path = try std.fmt.allocPrint(self.alloc, "{s}.cas.lock", .{path});
+                defer self.alloc.free(lock_path);
+                try ensureBackupRelativeParentNoFollow(self.io, root, lock_path);
+                var lock = try openOrCreateBackupLockFile(self.io, root, lock_path);
+                defer lock.close(self.io);
+                try lock.lock(self.io, .exclusive);
+                defer lock.unlock(self.io);
+                const current_encoded = readFileFromBackupRootAlloc(
+                    self.alloc,
+                    self.io,
+                    root,
+                    path,
+                    64 * 1024,
+                ) catch |err| switch (err) {
+                    error.FileNotFound => null,
+                    else => return err,
+                };
+                defer if (current_encoded) |value| self.alloc.free(value);
+                // Exact replay is success after an ambiguous client result.
+                if (current_encoded) |value| {
+                    if (std.mem.eql(u8, value, encoded)) return;
+                }
+                var current: ?backup_repository.ParsedRef = if (current_encoded) |value|
+                    try backup_repository.parseRefCanonical(self.alloc, value)
+                else
+                    null;
+                defer if (current) |*value| value.deinit();
+                try backup_repository.validateRefPublication(.{
+                    .next = next.value,
+                    .expected_manifest_sha256 = expected_manifest_sha256,
+                    .expected_generation = expected_generation,
+                }, if (current) |value| value.value else null);
+                try ensureBackupRelativeParentNoFollow(self.io, root, path);
+                try replaceFileInBackupRootUnderHeldLock(self.alloc, self.io, root, path, encoded);
+            },
+            .remote => |*store| {
+                try store.ensureBucket();
+                const key = try store.keyAlloc(self.alloc, path);
+                defer self.alloc.free(key);
+                var current_result = store.client.getObject(store.bucket, key, .{
+                    .range = .{ .offset = 0, .length = 64 * 1024 + 1 },
+                    .max_response_bytes = 64 * 1024 + 1,
+                }) catch |err| switch (err) {
+                    error.FileNotFound => null,
+                    else => return err,
+                };
+                defer if (current_result) |*value| value.deinit(self.alloc);
+                if (current_result) |*value| {
+                    if (std.mem.eql(u8, value.body, encoded)) return;
+                }
+                var current: ?backup_repository.ParsedRef = if (current_result) |*value|
+                    try backup_repository.parseRefCanonical(self.alloc, value.body)
+                else
+                    null;
+                defer if (current) |*value| value.deinit();
+                try backup_repository.validateRefPublication(.{
+                    .next = next.value,
+                    .expected_manifest_sha256 = expected_manifest_sha256,
+                    .expected_generation = expected_generation,
+                }, if (current) |value| value.value else null);
+                var result = store.client.putObject(store.bucket, key, encoded, .{
+                    .content_type = "application/json",
+                    .if_none_match = current_result == null,
+                    .if_match_etag = if (current_result) |value|
+                        value.metadata.etag orelse return error.BackupReservationIdentityUnavailable
+                    else
+                        null,
+                }) catch |err| switch (err) {
+                    error.FileNotFound, error.PreconditionFailed => return error.BackupRefConflict,
+                    else => return err,
+                };
+                result.deinit(self.alloc);
+            },
+        }
+    }
+
+    fn localRefMatchesEncoded(
+        self: *@This(),
+        root: std.Io.Dir,
+        path: []const u8,
+        encoded: []const u8,
+    ) !bool {
+        const current = readFileFromBackupRootAlloc(
+            self.alloc,
+            self.io,
+            root,
+            path,
+            64 * 1024,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer self.alloc.free(current);
+        return std.mem.eql(u8, current, encoded);
+    }
+
+    fn remoteRefMatchesEncoded(
+        self: *@This(),
+        store: *RemoteBackupStore,
+        path: []const u8,
+        encoded: []const u8,
+    ) !bool {
+        const current = store.readBytesAllocLimited(self.alloc, path, 64 * 1024) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer self.alloc.free(current);
+        return std.mem.eql(u8, current, encoded);
+    }
+
+    fn readStableRepositoryEpoch(context: *anyopaque) !u64 {
+        const self = fromContext(context);
+        return switch (self.location.*) {
+            .file => |backup_root| blk: {
+                var root = try openOrCreateBackupRootNoFollow(self.io, backup_root);
+                defer root.close(self.io);
+                try ensureBackupRelativeParentNoFollow(self.io, root, repository_coordinator_path);
+                var lock = try openOrCreateBackupLockFile(self.io, root, repository_coordinator_path);
+                defer lock.close(self.io);
+                try lock.lock(self.io, .exclusive);
+                defer lock.unlock(self.io);
+                break :blk try self.stabilizeLocalRepositoryEpochUnderLock(root);
+            },
+            .remote => |*store| blk: {
+                var coordinator = try acquireRemoteRepositoryCoordinator(self.alloc, store);
+                defer coordinator.deinit();
+                defer coordinator.release() catch {};
+                break :blk try self.stabilizeRemoteRepositoryEpochUnderLock(store, &coordinator);
+            },
+        };
+    }
+
+    fn nextRepositoryEpoch(epoch: u64) !u64 {
+        if (epoch == std.math.maxInt(u64)) return error.BackupRepositoryEpochExhausted;
+        return epoch + 1;
+    }
+
+    fn writeLocalRepositoryEpochUnderLock(
+        self: *@This(),
+        root: std.Io.Dir,
+        epoch: u64,
+    ) !void {
+        var encoded: [32]u8 = undefined;
+        try replaceFileInBackupRootUnderHeldLock(
+            self.alloc,
+            self.io,
+            root,
+            repository_epoch_path,
+            encodeRepositoryEpoch(&encoded, epoch),
+        );
+    }
+
+    fn writeRemoteRepositoryEpochUnderLock(
+        self: *@This(),
+        store: *RemoteBackupStore,
+        coordinator: *RemoteRepositoryCoordinator,
+        epoch: u64,
+    ) !void {
+        try coordinator.refresh();
+        var encoded: [32]u8 = undefined;
+        const key = try store.keyAlloc(self.alloc, repository_epoch_path);
+        defer self.alloc.free(key);
+        var current = store.client.getObject(store.bucket, key, .{
+            .range = .{ .offset = 0, .length = repository_epoch_max_bytes },
+            .skip_metadata_probe = true,
+            .max_response_bytes = repository_epoch_max_bytes,
+        }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        defer if (current) |*value| value.deinit(self.alloc);
+        if (current) |*value| {
+            const observed = try parseRepositoryEpoch(value.body);
+            if (epoch != observed +| 1) return error.BackupRepositoryEpochChanged;
+        } else if (epoch != 1) return error.BackupRepositoryEpochChanged;
+        var result = store.client.putObject(store.bucket, key, encodeRepositoryEpoch(&encoded, epoch), .{
+            .content_type = "text/plain",
+            .if_none_match = current == null,
+            .if_match_etag = if (current) |value|
+                value.metadata.etag orelse return error.BackupReservationIdentityUnavailable
+            else
+                null,
+        }) catch |err| switch (err) {
+            error.FileNotFound, error.PreconditionFailed => return error.BackupRepositoryEpochChanged,
+            else => return err,
+        };
+        result.deinit(self.alloc);
+    }
+
+    fn readLocalRepositoryEpochAssumeRoot(self: *@This(), root: std.Io.Dir) !u64 {
+        const encoded = readFileFromBackupRootAlloc(
+            self.alloc,
+            self.io,
+            root,
+            repository_epoch_path,
+            repository_epoch_max_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => return err,
+        };
+        defer self.alloc.free(encoded);
+        return try parseRepositoryEpoch(encoded);
+    }
+
+    fn readRemoteRepositoryEpochAssumeStore(
+        self: *@This(),
+        store: *RemoteBackupStore,
+    ) !u64 {
+        const encoded = store.readBytesAllocLimited(
+            self.alloc,
+            repository_epoch_path,
+            repository_epoch_max_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => return err,
+        };
+        defer self.alloc.free(encoded);
+        return try parseRepositoryEpoch(encoded);
+    }
+
+    fn stabilizeLocalRepositoryEpochUnderLock(
+        self: *@This(),
+        root: std.Io.Dir,
+    ) !u64 {
+        const observed = try readLocalRepositoryEpochAssumeRoot(self, root);
+        if (observed % 2 == 0) return observed;
+        const stable = try nextRepositoryEpoch(observed);
+        try self.writeLocalRepositoryEpochUnderLock(root, stable);
+        return stable;
+    }
+
+    fn beginLocalRepositoryRootMutationUnderLock(
+        self: *@This(),
+        root: std.Io.Dir,
+    ) !u64 {
+        const stable = try self.stabilizeLocalRepositoryEpochUnderLock(root);
+        const in_progress = try nextRepositoryEpoch(stable);
+        const committed = try nextRepositoryEpoch(in_progress);
+        try self.writeLocalRepositoryEpochUnderLock(root, in_progress);
+        return committed;
+    }
+
+    fn stabilizeRemoteRepositoryEpochUnderLock(
+        self: *@This(),
+        store: *RemoteBackupStore,
+        coordinator: *RemoteRepositoryCoordinator,
+    ) !u64 {
+        try coordinator.refresh();
+        const observed = try readRemoteRepositoryEpochAssumeStore(self, store);
+        if (observed % 2 == 0) return observed;
+        const stable = try nextRepositoryEpoch(observed);
+        try self.writeRemoteRepositoryEpochUnderLock(store, coordinator, stable);
+        return stable;
+    }
+
+    fn beginRemoteRepositoryRootMutationUnderLock(
+        self: *@This(),
+        store: *RemoteBackupStore,
+        coordinator: *RemoteRepositoryCoordinator,
+    ) !u64 {
+        const stable = try self.stabilizeRemoteRepositoryEpochUnderLock(store, coordinator);
+        const in_progress = try nextRepositoryEpoch(stable);
+        const committed = try nextRepositoryEpoch(in_progress);
+        try self.writeRemoteRepositoryEpochUnderLock(store, coordinator, in_progress);
+        return committed;
+    }
+
+    fn deleteRemoteRepositoryLease(
+        self: *@This(),
+        store: *RemoteBackupStore,
+        lease_path: []const u8,
+        fencing_token: u64,
+    ) !void {
+        const key = try store.keyAlloc(self.alloc, lease_path);
+        defer self.alloc.free(key);
+        var current = try store.client.getObject(store.bucket, key, .{
+            .range = .{ .offset = 0, .length = 64 * 1024 },
+            .skip_metadata_probe = true,
+            .max_response_bytes = 64 * 1024,
+        });
+        defer current.deinit(self.alloc);
+        var lease = try backup_repository.parseLeaseCanonical(self.alloc, current.body, 0);
+        defer lease.deinit();
+        if (lease.value.fencing_token != fencing_token) return error.BackupPublicationFenced;
+        const etag = current.metadata.etag orelse return error.BackupReservationIdentityUnavailable;
+        store.client.deleteObject(store.bucket, key, .{ .if_match_etag = etag }) catch |err| switch (err) {
+            error.FileNotFound, error.PreconditionFailed => return error.BackupPublicationFenced,
+            else => return err,
+        };
+    }
+
+    fn activateRepositoryLease(
+        context: *anyopaque,
+        path: []const u8,
+        encoded: []const u8,
+        fencing_token: u64,
+    ) !u64 {
+        const self = fromContext(context);
+        try validateArtifactRelativePath(path);
+        return switch (self.location.*) {
+            .file => |backup_root| blk: {
+                var root = try openOrCreateBackupRootNoFollow(self.io, backup_root);
+                defer root.close(self.io);
+                try ensureBackupRelativeParentNoFollow(self.io, root, repository_coordinator_path);
+                var lock = try openOrCreateBackupLockFile(self.io, root, repository_coordinator_path);
+                defer lock.close(self.io);
+                try lock.lock(self.io, .exclusive);
+                defer lock.unlock(self.io);
+                const existing = readFileFromBackupRootAlloc(
+                    self.alloc,
+                    self.io,
+                    root,
+                    path,
+                    64 * 1024,
+                ) catch |err| switch (err) {
+                    error.FileNotFound => null,
+                    else => return err,
+                };
+                defer if (existing) |value| self.alloc.free(value);
+                if (existing) |value| {
+                    var parsed = try backup_repository.parseLeaseCanonical(self.alloc, value, 0);
+                    defer parsed.deinit();
+                    if (parsed.value.fencing_token != fencing_token or
+                        !std.mem.eql(u8, value, encoded)) return error.BackupRepositoryBusy;
+                    break :blk try self.stabilizeLocalRepositoryEpochUnderLock(root);
+                } else {
+                    const stable = try self.beginLocalRepositoryRootMutationUnderLock(root);
+                    try ensureBackupRelativeParentNoFollow(self.io, root, path);
+                    try replaceFileInBackupRootUnderHeldLock(self.alloc, self.io, root, path, encoded);
+                    try self.writeLocalRepositoryEpochUnderLock(root, stable);
+                    break :blk stable;
+                }
+            },
+            .remote => |*store| blk: {
+                var coordinator = try acquireRemoteRepositoryCoordinator(self.alloc, store);
+                defer coordinator.deinit();
+                defer coordinator.release() catch {};
+                try coordinator.refresh();
+                const existing = store.readBytesAllocLimited(self.alloc, path, 64 * 1024) catch |err| switch (err) {
+                    error.FileNotFound => null,
+                    else => return err,
+                };
+                defer if (existing) |value| self.alloc.free(value);
+                if (existing) |value| {
+                    var parsed = try backup_repository.parseLeaseCanonical(self.alloc, value, 0);
+                    defer parsed.deinit();
+                    if (parsed.value.fencing_token != fencing_token or
+                        !std.mem.eql(u8, value, encoded)) return error.BackupRepositoryBusy;
+                    break :blk try self.stabilizeRemoteRepositoryEpochUnderLock(store, &coordinator);
+                } else {
+                    const stable = try self.beginRemoteRepositoryRootMutationUnderLock(store, &coordinator);
+                    try coordinator.refresh();
+                    try store.writeBytesIfAbsent(self.alloc, path, encoded, "application/json");
+                    try self.writeRemoteRepositoryEpochUnderLock(store, &coordinator, stable);
+                    break :blk stable;
+                }
+            },
+        };
+    }
+
+    fn finalizeRepositoryPublication(
+        context: *anyopaque,
+        lease_path: []const u8,
+        fencing_token: u64,
+        manifest_sha256: []const u8,
+        now_unix_ns: i128,
+        ref_path: []const u8,
+        encoded_ref: []const u8,
+        expected_manifest_sha256: ?[]const u8,
+        expected_generation: ?u64,
+    ) !u64 {
+        const self = fromContext(context);
+        var next_ref = try backup_repository.parseRefCanonical(self.alloc, encoded_ref);
+        defer next_ref.deinit();
+        if (!std.mem.eql(u8, next_ref.value.manifest_sha256, manifest_sha256))
+            return error.BackupPublicationFenced;
+        return switch (self.location.*) {
+            .file => |backup_root| blk: {
+                var root = try openOrCreateBackupRootNoFollow(self.io, backup_root);
+                defer root.close(self.io);
+                try ensureBackupRelativeParentNoFollow(self.io, root, repository_coordinator_path);
+                var lock = try openOrCreateBackupLockFile(self.io, root, repository_coordinator_path);
+                defer lock.close(self.io);
+                try lock.lock(self.io, .exclusive);
+                defer lock.unlock(self.io);
+                if (try self.localRefMatchesEncoded(root, ref_path, encoded_ref))
+                    break :blk try self.stabilizeLocalRepositoryEpochUnderLock(root);
+                const lease_bytes = readFileFromBackupRootAlloc(
+                    self.alloc,
+                    self.io,
+                    root,
+                    lease_path,
+                    64 * 1024,
+                ) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        if (!try self.localRefMatchesEncoded(root, ref_path, encoded_ref))
+                            return error.BackupPublicationFenced;
+                        break :blk try self.stabilizeLocalRepositoryEpochUnderLock(root);
+                    },
+                    else => return err,
+                };
+                defer self.alloc.free(lease_bytes);
+                var lease = try backup_repository.parseLeaseCanonical(self.alloc, lease_bytes, now_unix_ns);
+                defer lease.deinit();
+                if (lease.value.fencing_token != fencing_token or
+                    !std.mem.eql(u8, lease.value.manifest_sha256, manifest_sha256))
+                    return error.BackupPublicationFenced;
+                const stable = try self.beginLocalRepositoryRootMutationUnderLock(root);
+                try publishRef(context, ref_path, encoded_ref, expected_manifest_sha256, expected_generation);
+                // The ref is the commit point. Failed cleanup only retains
+                // data until lease expiry and cannot make commit ambiguous.
+                deleteFileDurablyFromBackupRoot(self.io, root, lease_path) catch {};
+                try self.writeLocalRepositoryEpochUnderLock(root, stable);
+                break :blk stable;
+            },
+            .remote => |*store| blk: {
+                var coordinator = try acquireRemoteRepositoryCoordinator(self.alloc, store);
+                defer coordinator.deinit();
+                defer coordinator.release() catch {};
+                try coordinator.refresh();
+                if (try self.remoteRefMatchesEncoded(store, ref_path, encoded_ref))
+                    break :blk try self.stabilizeRemoteRepositoryEpochUnderLock(store, &coordinator);
+                const lease_bytes = store.readBytesAllocLimited(self.alloc, lease_path, 64 * 1024) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        if (!try self.remoteRefMatchesEncoded(store, ref_path, encoded_ref))
+                            return error.BackupPublicationFenced;
+                        break :blk try self.stabilizeRemoteRepositoryEpochUnderLock(store, &coordinator);
+                    },
+                    else => return err,
+                };
+                defer self.alloc.free(lease_bytes);
+                var lease = try backup_repository.parseLeaseCanonical(self.alloc, lease_bytes, now_unix_ns);
+                defer lease.deinit();
+                if (lease.value.fencing_token != fencing_token or
+                    !std.mem.eql(u8, lease.value.manifest_sha256, manifest_sha256))
+                    return error.BackupPublicationFenced;
+                const stable = try self.beginRemoteRepositoryRootMutationUnderLock(store, &coordinator);
+                try coordinator.refresh();
+                try publishRef(context, ref_path, encoded_ref, expected_manifest_sha256, expected_generation);
+                deleteRemoteRepositoryLease(self, store, lease_path, fencing_token) catch {};
+                try self.writeRemoteRepositoryEpochUnderLock(store, &coordinator, stable);
+                break :blk stable;
+            },
+        };
+    }
+
+    fn renewRepositoryLease(
+        context: *anyopaque,
+        lease_path: []const u8,
+        fencing_token: u64,
+        manifest_sha256: []const u8,
+        now_unix_ns: i128,
+        expires_at_unix_ns: i128,
+    ) !u64 {
+        const self = fromContext(context);
+        if (expires_at_unix_ns <= now_unix_ns) return error.InvalidBackupLease;
+        return switch (self.location.*) {
+            .file => |backup_root| blk: {
+                var root = try openOrCreateBackupRootNoFollow(self.io, backup_root);
+                defer root.close(self.io);
+                try ensureBackupRelativeParentNoFollow(self.io, root, repository_coordinator_path);
+                var lock = try openOrCreateBackupLockFile(self.io, root, repository_coordinator_path);
+                defer lock.close(self.io);
+                try lock.lock(self.io, .exclusive);
+                defer lock.unlock(self.io);
+                const encoded = try readFileFromBackupRootAlloc(self.alloc, self.io, root, lease_path, 64 * 1024);
+                defer self.alloc.free(encoded);
+                var parsed = try backup_repository.parseLeaseCanonical(self.alloc, encoded, now_unix_ns);
+                defer parsed.deinit();
+                if (parsed.value.fencing_token != fencing_token or
+                    !std.mem.eql(u8, parsed.value.manifest_sha256, manifest_sha256))
+                    return error.BackupPublicationFenced;
+                if (expires_at_unix_ns == parsed.value.expires_at_unix_ns)
+                    break :blk try self.stabilizeLocalRepositoryEpochUnderLock(root);
+                if (expires_at_unix_ns < parsed.value.expires_at_unix_ns)
+                    return error.InvalidBackupLease;
+                const renewed: backup_repository.Lease = .{
+                    .lease_id = parsed.value.lease_id,
+                    .manifest_sha256 = parsed.value.manifest_sha256,
+                    .base_manifest_sha256 = parsed.value.base_manifest_sha256,
+                    .fencing_token = fencing_token,
+                    .expires_at_unix_ns = expires_at_unix_ns,
+                };
+                const renewed_encoded = try backup_repository.encodeLeaseCanonicalAlloc(self.alloc, renewed, now_unix_ns);
+                defer self.alloc.free(renewed_encoded);
+                const stable = try self.beginLocalRepositoryRootMutationUnderLock(root);
+                try replaceFileInBackupRootUnderHeldLock(self.alloc, self.io, root, lease_path, renewed_encoded);
+                try self.writeLocalRepositoryEpochUnderLock(root, stable);
+                break :blk stable;
+            },
+            .remote => |*store| blk: {
+                var coordinator = try acquireRemoteRepositoryCoordinator(self.alloc, store);
+                defer coordinator.deinit();
+                defer coordinator.release() catch {};
+                try coordinator.refresh();
+                const key = try store.keyAlloc(self.alloc, lease_path);
+                defer self.alloc.free(key);
+                var current = try store.client.getObject(store.bucket, key, .{
+                    .range = .{ .offset = 0, .length = 64 * 1024 },
+                    .skip_metadata_probe = true,
+                    .max_response_bytes = 64 * 1024,
+                });
+                defer current.deinit(self.alloc);
+                var parsed = try backup_repository.parseLeaseCanonical(self.alloc, current.body, now_unix_ns);
+                defer parsed.deinit();
+                if (parsed.value.fencing_token != fencing_token or
+                    !std.mem.eql(u8, parsed.value.manifest_sha256, manifest_sha256))
+                    return error.BackupPublicationFenced;
+                if (expires_at_unix_ns == parsed.value.expires_at_unix_ns)
+                    break :blk try self.stabilizeRemoteRepositoryEpochUnderLock(store, &coordinator);
+                if (expires_at_unix_ns < parsed.value.expires_at_unix_ns)
+                    return error.InvalidBackupLease;
+                const renewed: backup_repository.Lease = .{
+                    .lease_id = parsed.value.lease_id,
+                    .manifest_sha256 = parsed.value.manifest_sha256,
+                    .base_manifest_sha256 = parsed.value.base_manifest_sha256,
+                    .fencing_token = fencing_token,
+                    .expires_at_unix_ns = expires_at_unix_ns,
+                };
+                const renewed_encoded = try backup_repository.encodeLeaseCanonicalAlloc(self.alloc, renewed, now_unix_ns);
+                defer self.alloc.free(renewed_encoded);
+                const etag = current.metadata.etag orelse return error.BackupReservationIdentityUnavailable;
+                const stable = try self.beginRemoteRepositoryRootMutationUnderLock(store, &coordinator);
+                try coordinator.refresh();
+                var result = store.client.putObject(store.bucket, key, renewed_encoded, .{
+                    .content_type = "application/json",
+                    .if_match_etag = etag,
+                }) catch |err| switch (err) {
+                    error.FileNotFound, error.PreconditionFailed => return error.BackupPublicationFenced,
+                    else => return err,
+                };
+                result.deinit(self.alloc);
+                try self.writeRemoteRepositoryEpochUnderLock(store, &coordinator, stable);
+                break :blk stable;
+            },
+        };
+    }
+
+    fn releaseRepositoryLease(
+        context: *anyopaque,
+        lease_path: []const u8,
+        fencing_token: u64,
+    ) !u64 {
+        const self = fromContext(context);
+        return switch (self.location.*) {
+            .file => |backup_root| blk: {
+                var root = try openOrCreateBackupRootNoFollow(self.io, backup_root);
+                defer root.close(self.io);
+                try ensureBackupRelativeParentNoFollow(self.io, root, repository_coordinator_path);
+                var lock = try openOrCreateBackupLockFile(self.io, root, repository_coordinator_path);
+                defer lock.close(self.io);
+                try lock.lock(self.io, .exclusive);
+                defer lock.unlock(self.io);
+                const lease_bytes = readFileFromBackupRootAlloc(
+                    self.alloc,
+                    self.io,
+                    root,
+                    lease_path,
+                    64 * 1024,
+                ) catch |err| switch (err) {
+                    error.FileNotFound => break :blk try self.stabilizeLocalRepositoryEpochUnderLock(root),
+                    else => return err,
+                };
+                defer self.alloc.free(lease_bytes);
+                var lease = try backup_repository.parseLeaseCanonical(self.alloc, lease_bytes, 0);
+                defer lease.deinit();
+                if (lease.value.fencing_token != fencing_token) return error.BackupPublicationFenced;
+                const stable = try self.beginLocalRepositoryRootMutationUnderLock(root);
+                try deleteFileDurablyFromBackupRoot(self.io, root, lease_path);
+                try self.writeLocalRepositoryEpochUnderLock(root, stable);
+                break :blk stable;
+            },
+            .remote => |*store| blk: {
+                var coordinator = try acquireRemoteRepositoryCoordinator(self.alloc, store);
+                defer coordinator.deinit();
+                defer coordinator.release() catch {};
+                try coordinator.refresh();
+                const stable = try self.beginRemoteRepositoryRootMutationUnderLock(store, &coordinator);
+                deleteRemoteRepositoryLease(self, store, lease_path, fencing_token) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                };
+                try self.writeRemoteRepositoryEpochUnderLock(store, &coordinator, stable);
+                break :blk stable;
+            },
+        };
+    }
+
+    fn deleteIfOlderThan(
+        context: *anyopaque,
+        path: []const u8,
+        cutoff_unix_ns: i128,
+        expected_epoch: u64,
+    ) !bool {
+        const self = fromContext(context);
+        try validateArtifactRelativePath(path);
+        return switch (self.location.*) {
+            .file => |backup_root| blk: {
+                var root = openBackupRootNoFollow(self.io, backup_root) catch |err| switch (err) {
+                    error.FileNotFound => break :blk false,
+                    else => return err,
+                };
+                defer root.close(self.io);
+                try ensureBackupRelativeParentNoFollow(self.io, root, repository_coordinator_path);
+                var coordinator = try openOrCreateBackupLockFile(self.io, root, repository_coordinator_path);
+                defer coordinator.close(self.io);
+                try coordinator.lock(self.io, .exclusive);
+                defer coordinator.unlock(self.io);
+                if (expected_epoch % 2 != 0 or
+                    try readLocalRepositoryEpochAssumeRoot(self, root) != expected_epoch)
+                    return error.BackupRepositoryEpochChanged;
+                const lock_path = try std.fmt.allocPrint(self.alloc, "{s}.publish.lock", .{path});
+                defer self.alloc.free(lock_path);
+                try ensureBackupRelativeParentNoFollow(self.io, root, lock_path);
+                var lock = try openOrCreateBackupLockFile(self.io, root, lock_path);
+                defer lock.close(self.io);
+                try lock.lock(self.io, .exclusive);
+                defer lock.unlock(self.io);
+                var parent = openBackupRelativeParentNoFollow(self.io, root, path) catch |err| switch (err) {
+                    error.FileNotFound => break :blk false,
+                    else => return err,
+                };
+                defer parent.deinit(self.io);
+                const stat = parent.dir.statFile(self.io, parent.basename, .{}) catch |err| switch (err) {
+                    error.FileNotFound => break :blk false,
+                    else => return err,
+                };
+                if (stat.mtime.toNanoseconds() >= cutoff_unix_ns) break :blk false;
+                try deleteFileDurablyFromBackupRoot(self.io, root, path);
+                break :blk true;
+            },
+            .remote => blk: {
+                // A renewable coordinator plus ETag cannot fence a process
+                // paused after its last refresh. Content-addressed bytes can
+                // also be republished with the same ETag. Remote repositories
+                // therefore remain append-only until a transactional catalog
+                // can tombstone and delete an exact storage generation.
+                break :blk error.BackupRepositoryGcUnsupported;
+            },
+        };
+    }
+
+    fn putBlobFromFile(
+        context: *anyopaque,
+        io: std.Io,
+        path: []const u8,
+        source_path: []const u8,
+        logical_size_bytes: u64,
+        sha256: []const u8,
+        publication_fence: u64,
+    ) !backup_repository.VerifiedBlobReceipt {
+        const self = fromContext(context);
+        try validateArtifactRelativePath(path);
+        if (publication_fence == 0) return error.InvalidBackupLease;
+        var source = if (std.fs.path.isAbsolute(source_path))
+            try std.Io.Dir.openFileAbsolute(io, source_path, .{})
+        else
+            try std.Io.Dir.cwd().openFile(io, source_path, .{});
+        defer source.close(io);
+        const initial_source_stat = try source.stat(io);
+        try validateFileIntegrity(self.alloc, io, source_path, logical_size_bytes, sha256);
+        if (!localArtifactStatsEqual(initial_source_stat, try source.stat(io)))
+            return error.SourceFileChanged;
+        var storage_identity: u64 = 0;
+        switch (self.location.*) {
+            .file => |backup_root| {
+                var root = try openOrCreateBackupRootNoFollow(io, backup_root);
+                defer root.close(io);
+                try ensureBackupRelativeParentNoFollow(io, root, path);
+                const created = try copyFileToBackupRootIfAbsentLocked(
+                    self.alloc,
+                    io,
+                    root,
+                    path,
+                    source_path,
+                );
+                _ = created;
+                // Verify both newly copied and pre-existing objects. The
+                // source pathname can be replaced after the pre-hash, and a
+                // content-addressed key must never be accepted on source-stat
+                // evidence alone.
+                try validateBackupRootFileIntegrity(
+                    io,
+                    root,
+                    path,
+                    logical_size_bytes,
+                    sha256,
+                );
+                var parent = try openBackupRelativeParentNoFollow(io, root, path);
+                defer parent.deinit(io);
+                const stored_stat = try parent.dir.statFile(io, parent.basename, .{});
+                storage_identity = localArtifactStatIdentity(stored_stat);
+            },
+            .remote => |*store| {
+                try store.ensureBucket();
+                const key = try store.keyAlloc(self.alloc, path);
+                defer self.alloc.free(key);
+                var maybe_result: ?object_storage.PutResult = store.client.putFileWithIo(io, store.bucket, key, source_path, .{
+                    .content_type = "application/octet-stream",
+                    .if_none_match = true,
+                }) catch |err| switch (err) {
+                    error.PreconditionFailed => blk: {
+                        storage_identity = try verifyRemoteBlob(
+                            self.alloc,
+                            store,
+                            key,
+                            logical_size_bytes,
+                            sha256,
+                            null,
+                        );
+                        break :blk null;
+                    },
+                    else => return err,
+                };
+                if (maybe_result) |*result| {
+                    defer result.deinit(self.alloc);
+                    const uploaded_etag = try self.alloc.dupe(
+                        u8,
+                        result.etag orelse return error.BackupReservationIdentityUnavailable,
+                    );
+                    defer self.alloc.free(uploaded_etag);
+                    storage_identity = verifyRemoteBlob(
+                        self.alloc,
+                        store,
+                        key,
+                        logical_size_bytes,
+                        sha256,
+                        uploaded_etag,
+                    ) catch |verify_err| {
+                        store.client.deleteObject(store.bucket, key, .{
+                            .if_match_etag = uploaded_etag,
+                        }) catch |delete_err| switch (delete_err) {
+                            error.FileNotFound, error.PreconditionFailed => {},
+                            else => return delete_err,
+                        };
+                        return verify_err;
+                    };
+                }
+            },
+        }
+        if (!localArtifactStatsEqual(initial_source_stat, try source.stat(io)))
+            return error.SourceFileChanged;
+        var current_source = if (std.fs.path.isAbsolute(source_path))
+            try std.Io.Dir.openFileAbsolute(io, source_path, .{})
+        else
+            try std.Io.Dir.cwd().openFile(io, source_path, .{});
+        defer current_source.close(io);
+        if (!localArtifactStatsEqual(initial_source_stat, try current_source.stat(io)))
+            return error.SourceFileChanged;
+        return .{
+            .content_sha256 = sha256,
+            .storage_sha256 = sha256,
+            .logical_size_bytes = logical_size_bytes,
+            .publication_fence = publication_fence,
+            .storage_identity = storage_identity,
+        };
+    }
+
+    fn materializeBlobToFile(
+        context: *anyopaque,
+        io: std.Io,
+        path: []const u8,
+        destination_path: []const u8,
+        logical_size_bytes: u64,
+        sha256: []const u8,
+    ) !void {
+        const self = fromContext(context);
+        try copyFileFromLocationVerifiedUsingIo(
+            self.alloc,
+            io,
+            self.location,
+            path,
+            destination_path,
+            logical_size_bytes,
+            sha256,
+            .none,
+        );
+    }
+};
+
+test "canonical repository file adapter streams blobs and compare-and-swaps refs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repository", .{tmp.sub_path});
+    defer alloc.free(root);
+    const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source.bin", .{tmp.sub_path});
+    defer alloc.free(source_path);
+    const restored_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restored.bin", .{tmp.sub_path});
+    defer alloc.free(restored_path);
+    try writeFileAbsolute(source_path, "shared immutable bytes");
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var location: BackupLocation = .{ .file = try alloc.dupe(u8, root) };
+    defer location.deinit(alloc);
+    var adapter: RepositoryLocationBackend = .{
+        .alloc = alloc,
+        .io = io_impl.io(),
+        .location = &location,
+    };
+    const backend = adapter.backend();
+
+    try backend.put_immutable(backend.context, "manifests/control", "one");
+    try backend.put_immutable(backend.context, "manifests/control", "one");
+    try std.testing.expectError(
+        error.BackupPublicationConflict,
+        backend.put_immutable(backend.context, "manifests/control", "two"),
+    );
+
+    var integrity = try portableBytesIntegrityAlloc(alloc, "shared immutable bytes");
+    defer integrity.deinit(alloc);
+    const blob_path = try backup_repository.blobPathAlloc(alloc, integrity.sha256);
+    defer alloc.free(blob_path);
+    const receipt = try backend.put_blob_from_file(
+        backend.context,
+        io_impl.io(),
+        blob_path,
+        source_path,
+        integrity.size_bytes,
+        integrity.sha256,
+        1,
+    );
+    try std.testing.expectEqual(@as(u64, 1), receipt.publication_fence);
+    try std.testing.expect(receipt.storage_identity != 0);
+    try std.testing.expect(try backend.contains(backend.context, blob_path));
+    try backend.materialize_blob_to_file(
+        backend.context,
+        io_impl.io(),
+        blob_path,
+        restored_path,
+        integrity.size_bytes,
+        integrity.sha256,
+    );
+    var restored = try artifactIntegrityAlloc(alloc, io_impl.io(), .portable, restored_path);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(integrity.size_bytes, restored.size_bytes);
+    try std.testing.expectEqualStrings(integrity.sha256, restored.sha256);
+
+    const manifest_a = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const manifest_b = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const ref_path = try backup_repository.refPathAlloc(alloc, "daily");
+    defer alloc.free(ref_path);
+    const first: backup_repository.Ref = .{
+        .backup_id = "daily",
+        .manifest_sha256 = manifest_a,
+        .generation = 1,
+        .updated_at_unix_ns = 1,
+    };
+    const first_encoded = try backup_repository.encodeRefCanonicalAlloc(alloc, first);
+    defer alloc.free(first_encoded);
+    try RepositoryLocationBackend.publishRef(&adapter, ref_path, first_encoded, null, null);
+    try RepositoryLocationBackend.publishRef(&adapter, ref_path, first_encoded, null, null);
+    const second: backup_repository.Ref = .{
+        .backup_id = "daily",
+        .manifest_sha256 = manifest_b,
+        .generation = 2,
+        .updated_at_unix_ns = 2,
+    };
+    const second_encoded = try backup_repository.encodeRefCanonicalAlloc(alloc, second);
+    defer alloc.free(second_encoded);
+    try RepositoryLocationBackend.publishRef(&adapter, ref_path, second_encoded, manifest_a, 1);
+    const resolved = try backend.read_alloc(backend.context, alloc, ref_path, 64 * 1024);
+    defer alloc.free(resolved);
+    var parsed = try backup_repository.parseRefCanonical(alloc, resolved);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 2), parsed.value.generation);
+    try std.testing.expectEqualStrings(manifest_b, parsed.value.manifest_sha256);
+
+    const source_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(source_root);
+    const manifest: backup_repository.Manifest = .{
+        .backup_id = "session",
+        .table_id = 7,
+        .table_name = "docs",
+        .catalog_sha256 = integrity.sha256,
+        .representation = .native,
+        .created_at_unix_ns = 1,
+        .shards = &.{.{
+            .group_id = 9,
+            .start_key_base64 = "",
+            .object_paths = &.{"source.bin"},
+            .capture_revision = 1,
+            .checkpoint_revision = 1,
+        }},
+        .objects = &.{.{
+            .logical_path = "source.bin",
+            .role = "catalog",
+            .content_sha256 = integrity.sha256,
+            .logical_size_bytes = integrity.size_bytes,
+        }},
+        .blobs = &.{.{
+            .content_sha256 = integrity.sha256,
+            .storage_sha256 = integrity.sha256,
+            .representative_object_path = "source.bin",
+            .logical_size_bytes = integrity.size_bytes,
+            .stored_size_bytes = integrity.size_bytes,
+        }},
+    };
+    const plan: backup_repository.SnapshotPlan = .{ .manifest = manifest };
+    var session = try backup_repository.beginPublication(
+        alloc,
+        backend,
+        plan,
+        "session-publication",
+        41,
+        1,
+        100,
+    );
+    defer session.deinit(alloc);
+    const receipts = try backup_repository.uploadSnapshotBlobsFromDirectory(
+        alloc,
+        io_impl.io(),
+        backend,
+        plan,
+        session,
+        source_root,
+    );
+    defer alloc.free(receipts);
+    const committed_epoch = try backup_repository.finishPublication(alloc, backend, plan, session, receipts, .{ .next = .{
+        .backup_id = "session",
+        .manifest_sha256 = session.manifest_sha256,
+        .generation = 1,
+        .updated_at_unix_ns = 2,
+    } }, 2);
+    try std.testing.expect(committed_epoch % 2 == 0);
+    // An ambiguous client result is exactly replayable even though successful
+    // finalization already consumed the publication lease.
+    try std.testing.expectEqual(committed_epoch, try backup_repository.finishPublication(
+        alloc,
+        backend,
+        plan,
+        session,
+        receipts,
+        .{ .next = .{
+            .backup_id = "session",
+            .manifest_sha256 = session.manifest_sha256,
+            .generation = 1,
+            .updated_at_unix_ns = 2,
+        } },
+        101,
+    ));
+    var snapshot = try backup_repository.resolveSnapshot(alloc, backend, "session");
+    defer snapshot.deinit();
+    try std.testing.expectEqualStrings(session.manifest_sha256, snapshot.ref.value.manifest_sha256);
+}
+
+test "remote repository coordinator fences a resumed stale owner" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer location.deinit(alloc);
+    const store = &location.remote;
+
+    var stale = try acquireRemoteRepositoryCoordinator(alloc, store);
+    defer stale.deinit();
+    var adapter: RepositoryLocationBackend = .{
+        .alloc = alloc,
+        .io = store.io,
+        .location = &location,
+    };
+    const repository_backend = adapter.backend();
+    try std.testing.expect(repository_backend.garbage_collector == null);
+    var empty_reachability: backup_repository.Reachability = .{ .repository_epoch = 0 };
+    defer empty_reachability.deinit(alloc);
+    try std.testing.expectError(
+        error.BackupRepositoryGcUnsupported,
+        backup_repository.sweepUnreachable(
+            alloc,
+            repository_backend,
+            &empty_reachability,
+            &.{.{
+                .kind = .blob,
+                .sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            }},
+            0,
+        ),
+    );
+    try adapter.writeRemoteRepositoryEpochUnderLock(store, &stale, 1);
+    try std.testing.expectError(
+        error.BackupRepositoryEpochChanged,
+        adapter.writeRemoteRepositoryEpochUnderLock(store, &stale, 1),
+    );
+    const successor_owner = "successor-owner";
+    const encoded = try encodeClusterBackupReservationLease(
+        alloc,
+        successor_owner,
+        @as(u64, @intCast(platform_time.realtimeNs())) +| repository_coordinator_duration_ns,
+    );
+    defer alloc.free(encoded);
+    const key = try store.keyAlloc(alloc, repository_coordinator_path);
+    defer alloc.free(key);
+    var replacement = try store.client.putObject(store.bucket, key, encoded, .{
+        .content_type = "text/plain",
+        .if_match_etag = stale.etag,
+    });
+    replacement.deinit(alloc);
+
+    try std.testing.expectError(error.BackupPublicationFenced, stale.refresh());
+    try std.testing.expectError(error.BackupPublicationFenced, stale.release());
+}
+
+test "repository remote verification accepts only full-object SHA-256 proofs" {
+    const expected = "0000000000000000000000000000000000000000000000000000000000000000";
+    var metadata: object_storage.ObjectMetadata = .{
+        .bucket = @constCast("bucket"),
+        .key = @constCast("key"),
+        .checksum = .{
+            .algorithm = .sha256_hex,
+            .value = @constCast(expected),
+            .checksum_type = .full_object,
+        },
+        .content_length = 0,
+    };
+    try std.testing.expect(remoteFullSha256ProofMatches(metadata, expected).?);
+    metadata.checksum.?.value = @constCast("1000000000000000000000000000000000000000000000000000000000000000");
+    try std.testing.expect(!remoteFullSha256ProofMatches(metadata, expected).?);
+    metadata.checksum.?.checksum_type = .composite;
+    try std.testing.expect(remoteFullSha256ProofMatches(metadata, expected) == null);
+
+    const digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @splat(0);
+    var encoded: [std.base64.standard.Encoder.calcSize(digest.len)]u8 = undefined;
+    const base64_digest = std.base64.standard.Encoder.encode(&encoded, &digest);
+    metadata.checksum = .{
+        .algorithm = .sha256_base64,
+        .value = @constCast(base64_digest),
+        .checksum_type = .full_object,
+    };
+    try std.testing.expect(remoteFullSha256ProofMatches(metadata, expected).?);
+    metadata.checksum_scope = .response_body;
+    try std.testing.expect(remoteFullSha256ProofMatches(metadata, expected) == null);
+}
 
 pub const OpenOptions = struct {
     secret_store: ?*common_secrets.FileStore = null,
@@ -2532,6 +3796,10 @@ fn resolveFilesystemLocationAlloc(alloc: std.mem.Allocator, configured_root: []c
     // that leave the configured root while still allowing backup directories to
     // be created below it.
     var ancestor: []const u8 = candidate;
+    // Preserve the sentinel in realPathFileAbsoluteAlloc's allocation shape;
+    // erasing it to []u8 would free one byte less than was allocated.
+    var canonical_ancestor: ?[:0]u8 = null;
+    defer if (canonical_ancestor) |value| alloc.free(value);
     while (true) {
         const canonical = std.Io.Dir.realPathFileAbsoluteAlloc(io, ancestor, alloc) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => {
@@ -2540,11 +3808,34 @@ fn resolveFilesystemLocationAlloc(alloc: std.mem.Allocator, configured_root: []c
             },
             else => return err,
         };
-        defer alloc.free(canonical);
-        if (!pathIsWithin(canonical_root, canonical)) return error.ConnectionPrefixDenied;
+        if (!pathIsWithin(canonical_root, canonical)) {
+            alloc.free(canonical);
+            return error.ConnectionPrefixDenied;
+        }
+        canonical_ancestor = canonical;
         break;
     }
-    return candidate;
+
+    // Authorization and later no-follow traversal must address the same
+    // filesystem identity. `realPath` above may have accepted an in-scope
+    // alias such as macOS `/var` -> `/private/var`; returning the lexical
+    // candidate would then make the secure component walker reject that alias
+    // as `NotDir`. Rebase only the not-yet-existing suffix onto the proven
+    // canonical ancestor. Every subsequently created component is still
+    // opened with no-follow semantics, so an attacker cannot redirect it.
+    const suffix_start = if (ancestor.len == candidate.len)
+        candidate.len
+    else if (ancestor.len == 1 and ancestor[0] == std.fs.path.sep)
+        1
+    else
+        ancestor.len + 1;
+    const suffix = candidate[suffix_start..];
+    const resolved = if (suffix.len == 0)
+        try alloc.dupe(u8, canonical_ancestor.?)
+    else
+        try std.fs.path.join(alloc, &.{ canonical_ancestor.?, suffix });
+    alloc.free(candidate);
+    return resolved;
 }
 
 fn pathIsWithin(root: []const u8, candidate: []const u8) bool {
@@ -2561,6 +3852,34 @@ test "restore filesystem scope containment handles filesystem roots and componen
     try std.testing.expect(pathIsWithin("/", "/private/tmp/backup"));
     try std.testing.expect(pathIsWithin("/var/backups", "/var/backups/tenant-a"));
     try std.testing.expect(!pathIsWithin("/var/backups", "/var/backups-evil"));
+}
+
+test "filesystem backup location returns the canonical authorized identity" {
+    if (std.fs.path.sep != '/') return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const physical = try std.fs.path.join(alloc, &.{ root, "physical" });
+    defer alloc.free(physical);
+    try fs_paths.createDirPathPortable(io, physical);
+    const alias = try std.fs.path.join(alloc, &.{ root, "alias" });
+    defer alloc.free(alias);
+    try std.Io.Dir.symLinkAbsolute(io, physical, alias, .{ .is_directory = true });
+
+    // A connection-scoped file URI is rooted at configured_root; its URI path
+    // is intentionally relative to that capability root.
+    const resolved = try resolveFilesystemLocationAlloc(alloc, root, "file:///alias/new/backup", io);
+    defer alloc.free(resolved);
+    const expected = try std.fs.path.join(alloc, &.{ physical, "new", "backup" });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
+
+    var opened = try openOrCreateBackupRootNoFollow(io, resolved);
+    opened.close(io);
 }
 
 pub fn createManifest(
@@ -7605,6 +8924,155 @@ fn writeFileToBackupRootIfAbsentLockedWithCancellation(
     );
 }
 
+fn copyFileToBackupRootIfAbsentLocked(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    backup_root: std.Io.Dir,
+    relative_path: []const u8,
+    source_path: []const u8,
+) !bool {
+    const lock_path = try std.fmt.allocPrint(alloc, "{s}.publish.lock", .{relative_path});
+    defer alloc.free(lock_path);
+    try ensureBackupRelativeParentNoFollow(io, backup_root, lock_path);
+    var lock_file = try openOrCreateBackupLockFile(io, backup_root, lock_path);
+    defer lock_file.close(io);
+    try lock_file.lock(io, .exclusive);
+    defer lock_file.unlock(io);
+    if (try fileExistsFromBackupRoot(io, backup_root, relative_path)) return false;
+
+    var parent = try openBackupRelativeParentNoFollow(io, backup_root, relative_path);
+    defer parent.deinit(io);
+    var source = if (std.fs.path.isAbsolute(source_path))
+        try std.Io.Dir.openFileAbsolute(io, source_path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, source_path, .{});
+    defer source.close(io);
+    const source_stat = try source.stat(io);
+    var atomic_file = try parent.dir.createFileAtomic(io, parent.basename, .{
+        .make_path = false,
+        .replace = false,
+    });
+    defer atomic_file.deinit(io);
+    var writer_buffer: [64 * 1024]u8 = undefined;
+    var writer = atomic_file.file.writer(io, &writer_buffer);
+    var source_reader: std.Io.File.Reader = .initSize(source, io, &.{}, source_stat.size);
+    _ = writer.interface.sendFileAll(&source_reader, .unlimited) catch |err| switch (err) {
+        error.ReadFailed => return source_reader.err.?,
+        error.WriteFailed => return writer.err.?,
+    };
+    try writer.end();
+    const final_source_stat = try source.stat(io);
+    if (final_source_stat.size != source_stat.size or
+        !std.meta.eql(final_source_stat.mtime, source_stat.mtime))
+        return error.SourceFileChanged;
+    try atomic_file.file.sync(io);
+    atomic_file.link(io) catch |err| switch (err) {
+        error.PathAlreadyExists => return false,
+        else => return err,
+    };
+    try fs_paths.syncDirectoryHandlePortable(io, parent.dir);
+    return true;
+}
+
+fn validateFileIntegrity(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    expected_size: u64,
+    expected_sha256: []const u8,
+) !void {
+    if (!isLowerSha256Hex(expected_sha256)) return error.BackupIntegrityMissing;
+    var integrity = try artifactIntegrityAlloc(alloc, io, .portable, path);
+    defer integrity.deinit(alloc);
+    if (integrity.size_bytes != expected_size or
+        !std.mem.eql(u8, integrity.sha256, expected_sha256))
+        return error.BackupArtifactIntegrityMismatch;
+}
+
+fn validateBackupRootFileIntegrity(
+    io: std.Io,
+    backup_root: std.Io.Dir,
+    relative_path: []const u8,
+    expected_size: u64,
+    expected_sha256: []const u8,
+) !void {
+    if (!isLowerSha256Hex(expected_sha256)) return error.BackupIntegrityMissing;
+    var parent = try openBackupRelativeParentNoFollow(io, backup_root, relative_path);
+    defer parent.deinit(io);
+    var file = try parent.dir.openFile(io, parent.basename, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    });
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size != expected_size) return error.BackupArtifactIntegrityMismatch;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    try hashFileContents(io, file, stat, &hasher);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const actual = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &actual, expected_sha256))
+        return error.BackupArtifactIntegrityMismatch;
+}
+
+fn verifyRemoteBlob(
+    alloc: std.mem.Allocator,
+    store: *RemoteBackupStore,
+    key: []const u8,
+    expected_size: u64,
+    expected_sha256: []const u8,
+    expected_etag: ?[]const u8,
+) !u64 {
+    if (!isLowerSha256Hex(expected_sha256)) return error.BackupIntegrityMissing;
+    var metadata = try store.client.statObject(store.bucket, key);
+    defer metadata.deinit(alloc);
+    if (metadata.content_length != expected_size)
+        return error.BackupArtifactIntegrityMismatch;
+    const etag = metadata.etag orelse return error.RestoreArtifactIdentityMissing;
+    if (expected_etag) |identity| {
+        if (!std.mem.eql(u8, identity, etag)) return error.SourceFileChanged;
+    }
+    if (remoteFullSha256ProofMatches(metadata, expected_sha256)) |matches| {
+        if (!matches) return error.BackupArtifactIntegrityMismatch;
+    } else {
+        // Providers without a full-object SHA-256 still receive the same
+        // guarantee by hashing one GET pinned to the exact post-upload ETag.
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        try store.hashObjectVersion(alloc, key, expected_size, etag, &hasher);
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        hasher.final(&digest);
+        const actual = std.fmt.bytesToHex(digest, .lower);
+        if (!std.mem.eql(u8, &actual, expected_sha256))
+            return error.BackupArtifactIntegrityMismatch;
+    }
+    var identity = std.hash.Wyhash.hash(expected_size, etag);
+    if (identity == 0) identity = 1;
+    return identity;
+}
+
+/// Returns null when provider metadata cannot prove a full-object SHA-256.
+/// A supported but mismatched checksum is a conclusive integrity failure.
+fn remoteFullSha256ProofMatches(
+    metadata: object_storage.ObjectMetadata,
+    expected_sha256: []const u8,
+) ?bool {
+    if (metadata.checksum_scope != .object) return null;
+    const checksum = metadata.checksum orelse return null;
+    if (checksum.checksum_type != .full_object) return null;
+    return switch (checksum.algorithm) {
+        .sha256_hex => std.ascii.eqlIgnoreCase(checksum.value, expected_sha256),
+        .sha256_base64 => blk: {
+            var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            _ = std.fmt.hexToBytes(&digest, expected_sha256) catch break :blk false;
+            var encoded: [std.base64.standard.Encoder.calcSize(digest.len)]u8 = undefined;
+            const value = std.base64.standard.Encoder.encode(&encoded, &digest);
+            break :blk std.mem.eql(u8, checksum.value, value);
+        },
+        else => null,
+    };
+}
+
 fn replaceFileInBackupRootUnderHeldLock(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -10947,6 +12415,17 @@ fn localArtifactStatsEqual(
         std.meta.eql(lhs.ctime, rhs.ctime);
 }
 
+fn localArtifactStatIdentity(stat: std.Io.File.Stat) u64 {
+    var hasher = std.hash.Wyhash.init(@intCast(stat.inode));
+    hasher.update(std.mem.asBytes(&stat.size));
+    const mtime = stat.mtime.toNanoseconds();
+    const ctime = stat.ctime.toNanoseconds();
+    hasher.update(std.mem.asBytes(&mtime));
+    hasher.update(std.mem.asBytes(&ctime));
+    const identity = hasher.final();
+    return if (identity == 0) 1 else identity;
+}
+
 const LocalNativeIdentityFile = struct {
     path: []u8,
     stat: std.Io.File.Stat,
@@ -13153,6 +14632,25 @@ fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupManif
         .replication_sources_json = try alloc.dupe(u8, manifest.replication_sources_json),
         .shards = shards,
     };
+}
+
+/// Derive the mutable restore envelope for a destination table without
+/// changing the immutable source manifest that authenticated the backup.
+/// Native bundle extraction uses this after verifying the sealed AFB2 source;
+/// the resulting table manifest is the target-scoped intent consumed by the
+/// ordinary restore API.
+pub fn deriveRestoreManifestForTargetTable(
+    alloc: std.mem.Allocator,
+    source: TableBackupManifest,
+    target_table_name: []const u8,
+) !TableBackupManifest {
+    if (target_table_name.len == 0) return error.InvalidBackupRequest;
+    var target = try cloneTableBackupManifest(alloc, source);
+    errdefer target.deinit(alloc);
+    const owned_target_name = try alloc.dupe(u8, target_table_name);
+    alloc.free(@constCast(target.table_name));
+    target.table_name = owned_target_name;
+    return target;
 }
 
 fn cloneClusterBackupManifest(alloc: std.mem.Allocator, manifest: ClusterBackupManifest) !ClusterBackupManifest {

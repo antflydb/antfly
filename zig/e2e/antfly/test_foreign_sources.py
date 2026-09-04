@@ -21,7 +21,6 @@ from typing import Any
 
 import pytest
 import requests
-
 from helpers import query_hits_total_value, wait_until
 
 pytestmark = [
@@ -415,9 +414,11 @@ def test_foreign_table_rejects_unsupported_aggregation(table_api, pg_customers_t
         )
     except requests.HTTPError as exc:
         assert exc.response is not None
-        assert exc.response.status_code == 400
+        assert exc.response.status_code == 422
+        assert exc.response.json()["error"] == "unsupported_query_request"
     else:
-        assert _result_status(result) == 400
+        assert _result_status(result) == 422
+        assert _first_response(result)["error"] == "unsupported_query_request"
 
 
 @pytest.mark.parametrize("table_api", ["stateful", "serverless"], indirect=True)
@@ -591,6 +592,8 @@ def test_foreign_table_join_with_antfly(table_api, pg_customers_table):
     if table_api.backend == "serverless":
         assert table_api.publish_table(table_name) is not None
 
+    last_join_observation: dict[str, Any] = {}
+
     def joined_result() -> dict[str, Any] | None:
         try:
             result = table_api.query_table(
@@ -616,8 +619,12 @@ def test_foreign_table_join_with_antfly(table_api, pg_customers_table):
                     },
                 },
             )
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            last_join_observation.clear()
+            last_join_observation["error"] = repr(exc)
             return None
+        last_join_observation.clear()
+        last_join_observation["result"] = result
         hits = _result_hits(result)
         if len(hits) < 3:
             return None
@@ -629,7 +636,7 @@ def test_foreign_table_join_with_antfly(table_api, pg_customers_table):
         return result
 
     result = wait_until(joined_result, timeout_s=30.0, interval_s=0.25)
-    assert result is not None
+    assert result is not None, last_join_observation
 
     by_customer = {
         hit.get("_source", {}).get("customer_id"): hit.get("_source", {})
