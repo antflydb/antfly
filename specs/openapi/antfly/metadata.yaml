@@ -1981,6 +1981,29 @@ components:
           type: integer
           format: int32
           enum: [422]
+    RerankerCandidateLimitExceededError:
+      type: object
+      additionalProperties: false
+      required: [status, error, message, provider, maximum, retryable]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [reranker_candidate_limit_exceeded]
+        message:
+          type: string
+        provider:
+          $ref: 'reranking.yaml#/components/schemas/RerankerProvider'
+        maximum:
+          type: integer
+          format: int32
+          minimum: 1
+        retryable:
+          type: boolean
+          enum: [false]
     GraphDistinctBudgetExceededError:
       type: object
       additionalProperties: false
@@ -2184,6 +2207,7 @@ components:
       oneOf:
         - $ref: '#/components/schemas/ExactSortError'
         - $ref: '#/components/schemas/QueryCandidateBudgetExceededError'
+        - $ref: '#/components/schemas/RerankerCandidateLimitExceededError'
         - $ref: '#/components/schemas/GraphQueryUnprocessableError'
         - $ref: '#/components/schemas/QueryFilterError'
         - $ref: '#/components/schemas/UnsupportedHierarchyGroupingError'

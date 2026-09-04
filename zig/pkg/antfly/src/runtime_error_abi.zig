@@ -326,6 +326,7 @@ pub const Detail = enum(c_int) {
     native_backup_projection_not_quiescent,
     native_backup_projection_repair_failed,
     native_backup_projection_repair_paused,
+    reranker_candidate_limit_exceeded,
 };
 
 pub const Status = extern struct {
@@ -504,6 +505,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.NativeBackupProjectionNotQuiescent => status(.retryable, .native_backup_projection_not_quiescent),
         error.NativeBackupProjectionRepairFailed => status(.corrupt, .native_backup_projection_repair_failed),
         error.NativeBackupProjectionRepairPaused => status(.conflict, .native_backup_projection_repair_paused),
+        error.RerankerCandidateLimitExceeded => status(.invalid_argument, .reranker_candidate_limit_exceeded),
         error.EnrichmentNotFound => status(.not_found, .enrichment_not_found),
         error.InvalidExtensionEnrichment => status(.invalid_argument, .invalid_extension_enrichment),
         error.ConflictingEnrichmentConfig => status(.invalid_argument, .conflicting_enrichment_config),
@@ -960,6 +962,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .native_backup_projection_not_quiescent => "NativeBackupProjectionNotQuiescent",
         .native_backup_projection_repair_failed => "NativeBackupProjectionRepairFailed",
         .native_backup_projection_repair_paused => "NativeBackupProjectionRepairPaused",
+        .reranker_candidate_limit_exceeded => "RerankerCandidateLimitExceeded",
     };
 }
 
@@ -985,6 +988,7 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.InvalidEmbeddingArtifactProducer, errorFromStatus(statusFromError(error.InvalidEmbeddingArtifactProducer)));
     try std.testing.expectEqual(error.NativeBackupRepairStateNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupRepairStateNotQuiescent)));
     try std.testing.expectEqual(error.NativeBackupProjectionNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupProjectionNotQuiescent)));
+    try std.testing.expectEqual(error.RerankerCandidateLimitExceeded, errorFromStatus(statusFromError(error.RerankerCandidateLimitExceeded)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));

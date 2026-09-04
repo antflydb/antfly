@@ -7932,6 +7932,7 @@ pub const QueryUnprocessableError = union(enum) {
     query_candidate_budget_exceeded_error: *QueryCandidateBudgetExceededError,
     graph_query_unsupported_error: *GraphQueryUnsupportedError,
     graph_match_operation_limit_exceeded_error: *GraphMatchOperationLimitExceededError,
+    reranker_candidate_limit_exceeded_error: *RerankerCandidateLimitExceededError,
     graph_anchor_filter_requires_index_error: *GraphAnchorFilterRequiresIndexError,
     unsupported_query_error: *UnsupportedQueryError,
     query_filter_error: *QueryFilterError,
@@ -8080,6 +8081,18 @@ pub const QueryUnprocessableError = union(enum) {
             "status",
             "error",
             "message",
+            "provider",
+            "maximum",
+            "retryable",
+        }) and
+            objectStringEquals(source.object, "error", "reranker_candidate_limit_exceeded"))
+        {
+            if (try parseStructuralVariant(RerankerCandidateLimitExceededError, allocator, source, options)) |parsed| return .{ .reranker_candidate_limit_exceeded_error = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
             "retryable",
         }) and
             objectStringEquals(source.object, "error", "graph_anchor_filter_requires_index"))
@@ -8126,6 +8139,7 @@ pub const QueryUnprocessableError = union(enum) {
             .query_candidate_budget_exceeded_error => |v| try jw.write(v.*),
             .graph_query_unsupported_error => |v| try jw.write(v.*),
             .graph_match_operation_limit_exceeded_error => |v| try jw.write(v.*),
+            .reranker_candidate_limit_exceeded_error => |v| try jw.write(v.*),
             .graph_anchor_filter_requires_index_error => |v| try jw.write(v.*),
             .unsupported_query_error => |v| try jw.write(v.*),
             .query_filter_error => |v| try jw.write(v.*),
@@ -8661,6 +8675,50 @@ pub const ReplicationTransformOp = struct {
             try jw.objectField("value");
             try jw.write(value);
         }
+        try jw.endObject();
+    }
+};
+
+pub const RerankerCandidateLimitExceededError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    provider: antfly_reranking_openapi.RerankerProvider,
+    maximum: i32,
+    retryable: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "status", "status", false },
+        .{ "error", "error", false },
+        .{ "message", "message", false },
+        .{ "provider", "provider", false },
+        .{ "maximum", "maximum", false },
+        .{ "retryable", "retryable", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("error");
+        try jw.write(self.@"error");
+        try jw.objectField("message");
+        try jw.write(self.message);
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("maximum");
+        try jw.write(self.maximum);
+        try jw.objectField("retryable");
+        try jw.write(self.retryable);
         try jw.endObject();
     }
 };

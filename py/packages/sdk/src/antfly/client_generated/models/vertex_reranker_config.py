@@ -40,12 +40,18 @@ class VertexRerankerConfig:
             credentials_path (str | Unset): Path to an ADC credential JSON file (service-account, authorized-user, or
                 external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls
                 back to the default ADC chain.
+            candidate_count (int | Unset): Maximum candidates for Vertex. Google Ranking API accepts at most 200 records in
+                one request; Antfly rejects larger windows before retrieval fan-out.
+            top_n (int | Unset): Deprecated final-page-size override. Vertex can return at most 200 records; prefer
+                QueryRequest.limit.
     """
 
     provider: VertexRerankerConfigProvider
     model: str = "semantic-ranker-default@latest"
     project_id: str | Unset = UNSET
     credentials_path: str | Unset = UNSET
+    candidate_count: int | Unset = UNSET
+    top_n: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -56,6 +62,10 @@ class VertexRerankerConfig:
         project_id = self.project_id
 
         credentials_path = self.credentials_path
+
+        candidate_count = self.candidate_count
+
+        top_n = self.top_n
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -69,6 +79,10 @@ class VertexRerankerConfig:
             field_dict["project_id"] = project_id
         if credentials_path is not UNSET:
             field_dict["credentials_path"] = credentials_path
+        if candidate_count is not UNSET:
+            field_dict["candidate_count"] = candidate_count
+        if top_n is not UNSET:
+            field_dict["top_n"] = top_n
 
         return field_dict
 
@@ -83,11 +97,17 @@ class VertexRerankerConfig:
 
         credentials_path = d.pop("credentials_path", UNSET)
 
+        candidate_count = d.pop("candidate_count", UNSET)
+
+        top_n = d.pop("top_n", UNSET)
+
         vertex_reranker_config = cls(
             provider=provider,
             model=model,
             project_id=project_id,
             credentials_path=credentials_path,
+            candidate_count=candidate_count,
+            top_n=top_n,
         )
 
         vertex_reranker_config.additional_properties = d

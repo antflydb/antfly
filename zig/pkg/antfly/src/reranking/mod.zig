@@ -114,6 +114,7 @@ pub fn normalizeOperationalError(err: anyerror) anyerror {
         error.RerankTransientFailure,
         error.RerankUpstreamFailure,
         error.Timeout,
+        => err,
         // httpx spells transport cancellation `Canceled`; collapse both
         // spellings to the process-wide semantic cancellation before this
         // error crosses into query dependency classification.
@@ -158,6 +159,10 @@ test "reranking runtime failures use stable query dependency classes" {
     try std.testing.expectEqual(error.Cancelled, normalizeOperationalError(error.Canceled));
     try std.testing.expectEqual(error.Cancelled, normalizeOperationalError(error.Cancelled));
     try std.testing.expectEqual(error.RerankRateLimited, normalizeOperationalError(error.QueueFull));
+    try std.testing.expectEqual(error.RerankRateLimited, normalizeOperationalError(error.RerankRateLimited));
+    try std.testing.expectEqual(error.RerankTransientFailure, normalizeOperationalError(error.RerankTransientFailure));
+    try std.testing.expectEqual(error.RerankUpstreamFailure, normalizeOperationalError(error.RerankUpstreamFailure));
+    try std.testing.expectEqual(error.Timeout, normalizeOperationalError(error.Timeout));
 }
 
 test "reranking runtime rejects saturation and expired work before provider dispatch" {

@@ -25718,6 +25718,7 @@ pub const QueryUnprocessableError = union(enum) {
     query_candidate_budget_exceeded_error: *QueryCandidateBudgetExceededError,
     graph_query_unsupported_error: *GraphQueryUnsupportedError,
     graph_match_operation_limit_exceeded_error: *GraphMatchOperationLimitExceededError,
+    reranker_candidate_limit_exceeded_error: *RerankerCandidateLimitExceededError,
     graph_anchor_filter_requires_index_error: *GraphAnchorFilterRequiresIndexError,
     unsupported_query_error: *UnsupportedQueryError,
     query_filter_error: *QueryFilterError,
@@ -25866,6 +25867,18 @@ pub const QueryUnprocessableError = union(enum) {
             "status",
             "error",
             "message",
+            "provider",
+            "maximum",
+            "retryable",
+        }) and
+            objectStringEquals(source.object, "error", "reranker_candidate_limit_exceeded"))
+        {
+            if (try parseStructuralVariant(RerankerCandidateLimitExceededError, allocator, source, options)) |parsed| return .{ .reranker_candidate_limit_exceeded_error = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
             "retryable",
         }) and
             objectStringEquals(source.object, "error", "graph_anchor_filter_requires_index"))
@@ -25912,6 +25925,7 @@ pub const QueryUnprocessableError = union(enum) {
             .query_candidate_budget_exceeded_error => |v| try jw.write(v.*),
             .graph_query_unsupported_error => |v| try jw.write(v.*),
             .graph_match_operation_limit_exceeded_error => |v| try jw.write(v.*),
+            .reranker_candidate_limit_exceeded_error => |v| try jw.write(v.*),
             .graph_anchor_filter_requires_index_error => |v| try jw.write(v.*),
             .unsupported_query_error => |v| try jw.write(v.*),
             .query_filter_error => |v| try jw.write(v.*),
@@ -26492,6 +26506,15 @@ pub const ReplicationTransformOp = struct {
         }
         try jw.endObject();
     }
+};
+
+pub const RerankerCandidateLimitExceededError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    provider: RerankerProvider,
+    maximum: i32,
+    retryable: bool,
 };
 
 /// A unified configuration for a reranking provider.
@@ -32098,6 +32121,10 @@ pub const VertexRerankerConfig = struct {
     project_id: ?[]const u8 = null,
     /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain.
     credentials_path: ?[]const u8 = null,
+    /// Maximum candidates for Vertex. Google Ranking API accepts at most 200 records in one request; Antfly rejects larger windows before retrieval fan-out.
+    candidate_count: ?i64 = null,
+    /// Deprecated final-page-size override. Vertex can return at most 200 records; prefer QueryRequest.limit.
+    top_n: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -32105,6 +32132,8 @@ pub const VertexRerankerConfig = struct {
         .{ "model", "model", false },
         .{ "project_id", "project_id", true },
         .{ "credentials_path", "credentials_path", true },
+        .{ "candidate_count", "candidate_count", true },
+        .{ "top_n", "top_n", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -32127,6 +32156,14 @@ pub const VertexRerankerConfig = struct {
         }
         if (self.credentials_path) |value| {
             try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.candidate_count) |value| {
+            try jw.objectField("candidate_count");
+            try jw.write(value);
+        }
+        if (self.top_n) |value| {
+            try jw.objectField("top_n");
             try jw.write(value);
         }
         try jw.endObject();

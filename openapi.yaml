@@ -8706,6 +8706,38 @@ components:
           format: int32
           enum:
             - 422
+    RerankerCandidateLimitExceededError:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - error
+        - message
+        - provider
+        - maximum
+        - retryable
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum:
+            - 422
+        error:
+          type: string
+          enum:
+            - reranker_candidate_limit_exceeded
+        message:
+          type: string
+        provider:
+          $ref: '#/components/schemas/RerankerProvider'
+        maximum:
+          type: integer
+          format: int32
+          minimum: 1
+        retryable:
+          type: boolean
+          enum:
+            - false
     GraphDistinctBudgetExceededError:
       type: object
       additionalProperties: false
@@ -8979,6 +9011,7 @@ components:
       oneOf:
         - $ref: '#/components/schemas/ExactSortError'
         - $ref: '#/components/schemas/QueryCandidateBudgetExceededError'
+        - $ref: '#/components/schemas/RerankerCandidateLimitExceededError'
         - $ref: '#/components/schemas/GraphQueryUnprocessableError'
         - $ref: '#/components/schemas/QueryFilterError'
         - $ref: '#/components/schemas/UnsupportedHierarchyGroupingError'
@@ -17854,6 +17887,13 @@ components:
             are applied as additional narrowing.
       required:
         - name
+    RerankerProvider:
+      type: string
+      enum:
+        - antfly
+        - cohere
+        - vertex
+      description: The reranking provider to use.
     GraphPathObjective:
       type: string
       enum:
@@ -23538,13 +23578,6 @@ components:
           type: number
           format: double
           description: RRF k constant (1/(k+rank)). Defaults to 60.0.
-    RerankerProvider:
-      type: string
-      enum:
-        - antfly
-        - cohere
-        - vertex
-      description: The reranking provider to use.
     AntflyRerankerConfig:
       type: object
       description: Configuration for the Antfly inference reranking provider.
@@ -23643,6 +23676,19 @@ components:
           description: Path to an ADC credential JSON file (service-account, authorized-user, or external-account).
             Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls
             back to the default ADC chain.
+        candidate_count:
+          type: integer
+          minimum: 1
+          maximum: 200
+          description: Maximum candidates for Vertex. Google Ranking API accepts at most 200 records in
+            one request; Antfly rejects larger windows before retrieval fan-out.
+        top_n:
+          type: integer
+          minimum: 1
+          maximum: 200
+          deprecated: true
+          description: Deprecated final-page-size override. Vertex can return at most 200 records; prefer
+            QueryRequest.limit.
       required:
         - provider
         - model

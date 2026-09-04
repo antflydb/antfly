@@ -21,6 +21,18 @@ const Allocator = std.mem.Allocator;
 pub const Provider = openapi.RerankerProvider;
 pub const OpenApiConfig = openapi.RerankerConfig;
 pub const max_candidate_count: u32 = 1000;
+pub const vertex_max_candidate_count: u32 = 200;
+
+/// The provider request is deliberately a single globally-ranked window. Keep
+/// its ceiling aligned with each upstream API instead of accepting work that
+/// the selected provider cannot execute or splitting scores into incomparable
+/// batches.
+pub fn maxCandidateCountForProvider(provider: Provider) u32 {
+    return switch (provider) {
+        .vertex => vertex_max_candidate_count,
+        .antfly, .cohere => max_candidate_count,
+    };
+}
 
 pub const Config = struct {
     provider: Provider,
@@ -68,11 +80,14 @@ pub const Config = struct {
                 if (self.model.len == 0) return error.InvalidRerankerConfig;
             },
         }
+        const provider_max = maxCandidateCountForProvider(self.provider);
         if (self.candidate_count) |candidate_count| {
-            if (candidate_count == 0 or candidate_count > max_candidate_count) return error.InvalidRerankerConfig;
+            if (candidate_count == 0) return error.InvalidRerankerConfig;
+            if (candidate_count > provider_max) return error.RerankerCandidateLimitExceeded;
         }
         if (self.top_n) |top_n| {
-            if (top_n == 0 or top_n > max_candidate_count) return error.InvalidRerankerConfig;
+            if (top_n == 0) return error.InvalidRerankerConfig;
+            if (top_n > provider_max) return error.RerankerCandidateLimitExceeded;
         }
         if (self.candidate_count != null and self.top_n != null and self.top_n.? > self.candidate_count.?) {
             return error.InvalidRerankerConfig;
@@ -95,7 +110,8 @@ pub fn validateQueryWindow(cfg: Config, offset: u32, limit: u32) !void {
     try cfg.validate();
     const output_limit = cfg.top_n orelse limit;
     const effective_candidates = cfg.candidate_count orelse offset +| output_limit;
-    if (effective_candidates > max_candidate_count) return error.InvalidRerankerConfig;
+    if (effective_candidates > maxCandidateCountForProvider(cfg.provider))
+        return error.RerankerCandidateLimitExceeded;
 }
 
 pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
@@ -191,9 +207,29 @@ test "reranker work is bounded with and without an explicit candidate count" {
     const base = Config{ .provider = .antfly, .field = "body" };
     var explicit = base;
     explicit.candidate_count = max_candidate_count + 1;
-    try std.testing.expectError(error.InvalidRerankerConfig, explicit.validate());
-    try std.testing.expectError(error.InvalidRerankerConfig, validateQueryWindow(base, 1, max_candidate_count));
+    try std.testing.expectError(error.RerankerCandidateLimitExceeded, explicit.validate());
+    try std.testing.expectError(error.RerankerCandidateLimitExceeded, validateQueryWindow(base, 1, max_candidate_count));
     try validateQueryWindow(base, 0, max_candidate_count);
+}
+
+test "reranker candidate limits follow provider request capabilities" {
+    const vertex = Config{
+        .provider = .vertex,
+        .field = "body",
+        .model = "semantic-ranker-default@latest",
+    };
+    try validateQueryWindow(vertex, 0, vertex_max_candidate_count);
+    try std.testing.expectError(
+        error.RerankerCandidateLimitExceeded,
+        validateQueryWindow(vertex, 0, vertex_max_candidate_count + 1),
+    );
+
+    const cohere = Config{
+        .provider = .cohere,
+        .field = "body",
+        .model = "rerank-v4.0-pro",
+    };
+    try validateQueryWindow(cohere, 0, max_candidate_count);
 }
 
 test "reranker config requires field or template" {

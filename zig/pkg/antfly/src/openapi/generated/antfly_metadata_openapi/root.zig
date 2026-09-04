@@ -170,6 +170,7 @@ pub const ReplicationSource = types.ReplicationSource;
 pub const ReplicationSourceActionHint = types.ReplicationSourceActionHint;
 pub const ReplicationSourceStatus = types.ReplicationSourceStatus;
 pub const ReplicationTransformOp = types.ReplicationTransformOp;
+pub const RerankerCandidateLimitExceededError = types.RerankerCandidateLimitExceededError;
 pub const RerankerProfile = types.RerankerProfile;
 pub const RestoreJob = types.RestoreJob;
 pub const RestoreJobList = types.RestoreJobList;

@@ -4125,6 +4125,8 @@ pub fn build(b: *std.Build) void {
         "api http client round-trips public status and internal capability routes",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",
+        "api http query budget rejection response exposes stable sort reason",
+        "api query contract enforces provider-specific reranker candidate limits",
         "api query contract targets named full text retrieval without changing primary filters",
         "metadata.query routing validates named full text retrieval and keeps schema filters separate",
         "encode query request preserves the singular named full text selector across shard forwarding",

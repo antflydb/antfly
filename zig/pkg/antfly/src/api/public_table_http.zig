@@ -31,6 +31,7 @@ const common_config = @import("../common/config.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const query_contract = @import("query_contract.zig");
 const operation = @import("operation.zig");
+const reranking_contract = @import("antfly_reranking");
 
 threadlocal var last_batch_failure_name: ?[]const u8 = null;
 threadlocal var last_ambiguous_batch_txn_id: ?[32]u8 = null;
@@ -143,6 +144,7 @@ pub const TableApi = struct {
         ModelNotFound,
         UnsupportedExactSort,
         QueryCandidateBudgetExceeded,
+        RerankerCandidateLimitExceeded,
         GraphWorkBudgetExceeded,
         GraphMinWeightDomainViolation,
         GraphMaxWeightDomainViolation,
@@ -873,6 +875,25 @@ pub fn unsupportedQueryBody(alloc: std.mem.Allocator) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, UnsupportedQueryError{}, .{});
 }
 
+/// Stable, non-retryable response for a reranker window that the selected
+/// provider cannot rank in one request. Vertex is currently the only public
+/// provider with a ceiling below Antfly's global 1,000-candidate bound.
+pub const RerankerCandidateLimitExceededError = struct {
+    status: u16 = 422,
+    @"error": []const u8 = "reranker_candidate_limit_exceeded",
+    message: []const u8 = "reranker candidate window exceeds the selected provider limit",
+    provider: []const u8,
+    maximum: u32,
+    retryable: bool = false,
+};
+
+pub fn vertexRerankerCandidateLimitExceededBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, RerankerCandidateLimitExceededError{
+        .provider = "vertex",
+        .maximum = reranking_contract.vertex_max_candidate_count,
+    }, .{});
+}
+
 pub fn isNonRetryableTableStorageReadError(err: anyerror) bool {
     return switch (err) {
         error.InvalidManifest,
@@ -1491,6 +1512,10 @@ pub fn handleTableQueryRequest(
             error.QueryCandidateBudgetExceeded => {
                 std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
                 return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc), .json = true };
+            },
+            error.RerankerCandidateLimitExceeded => {
+                std.log.warn("public table query exceeds reranker provider candidate limit table={s}", .{table_name});
+                return .{ .status = 422, .body = try vertexRerankerCandidateLimitExceededBody(alloc), .json = true };
             },
             error.GraphWorkBudgetExceeded => {
                 std.log.warn("public table graph work budget exceeded table={s}", .{table_name});

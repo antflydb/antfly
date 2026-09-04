@@ -4397,6 +4397,7 @@ pub const AntflyApiHandler = struct {
                 }
                 var semantic_resolver = runner.server.semanticStatusResolver(runner.query_embedding_security_scope.domain, runner.query_embedding_security_scope.value);
                 var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| {
+                    if (err == error.RerankerCandidateLimitExceeded) return err;
                     if (query_api.isPublicQueryValidationError(err)) {
                         return error.InvalidRetrievalAgentRequest;
                     }
@@ -4524,6 +4525,14 @@ pub const AntflyApiHandler = struct {
             error.TreeRootSetTooLarge => {
                 _ = ctx.status(422);
                 return ctx.text("tree root set exceeds the bounded retrieval limit");
+            },
+            error.RerankerCandidateLimitExceeded => {
+                var response = contextual_operations.jsonWithStatus(
+                    422,
+                    try public_table_http.vertexRerankerCandidateLimitExceededBody(alloc),
+                    false,
+                );
+                return try respondOwnedApiResponse(ctx, &response);
             },
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
                 _ = ctx.status(400);

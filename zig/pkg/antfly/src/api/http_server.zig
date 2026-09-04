@@ -6373,6 +6373,7 @@ pub const ApiHttpServer = struct {
                     runner.query_embedding_security_scope.value,
                 );
                 var query_req = query_api.parsePublicQueryRequest(inner_alloc, semantic_resolver.iface(), table_name, query_json) catch |err| {
+                    if (err == error.RerankerCandidateLimitExceeded) return err;
                     if (query_api.isPublicQueryValidationError(err)) {
                         return error.InvalidRetrievalAgentRequest;
                     }
@@ -6542,6 +6543,10 @@ pub const ApiHttpServer = struct {
         const retrieval_resp = retrieval_agent.executeWithEventSink(alloc, query_runner.iface(), generation_runner.iface(), body, sink.iface()) catch |err| switch (err) {
             error.TreeRootSetTooLarge => {
                 try queue.status(alloc, task_id, context_id, "failed", "tree root set exceeds the bounded retrieval limit");
+                return;
+            },
+            error.RerankerCandidateLimitExceeded => {
+                try queue.status(alloc, task_id, context_id, "failed", "vertex reranker supports at most 200 candidates per query");
                 return;
             },
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
@@ -14658,6 +14663,7 @@ pub const ApiHttpServer = struct {
                 false,
             ),
             error.QueryCandidateBudgetExceeded => try contextualQueryCandidateBudgetExceededResponse(self.alloc),
+            error.RerankerCandidateLimitExceeded => try contextualRerankerCandidateLimitExceededResponse(self.alloc),
             error.GraphWorkBudgetExceeded => contextual_operations.jsonWithStatus(
                 422,
                 try public_table_http.graphWorkBudgetExceededBody(self.alloc),
@@ -18018,6 +18024,14 @@ fn contextualQueryCandidateBudgetExceededResponse(alloc: std.mem.Allocator) !con
         .sort_rejection_detail = public_rejection.detail,
         .sort_rejection_field = diagnostic.field,
     });
+}
+
+fn contextualRerankerCandidateLimitExceededResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    return .{
+        .status = 422,
+        .content_type = "application/json",
+        .body = try public_table_http.vertexRerankerCandidateLimitExceededBody(alloc),
+    };
 }
 
 fn contextualHierarchyCursorStaleResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
@@ -22085,6 +22099,16 @@ test "api http query budget rejection response exposes stable sort reason" {
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_reason);
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_detail);
     try std.testing.expectEqualStrings("full_text_index_v0", parsed.value.sort_rejection_field);
+
+    var reranker_resp = try contextualRerankerCandidateLimitExceededResponse(alloc);
+    defer reranker_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), reranker_resp.status);
+    var reranker_error = try std.json.parseFromSlice(public_table_http.RerankerCandidateLimitExceededError, alloc, reranker_resp.body, .{});
+    defer reranker_error.deinit();
+    try std.testing.expectEqualStrings("reranker_candidate_limit_exceeded", reranker_error.value.@"error");
+    try std.testing.expectEqualStrings("vertex", reranker_error.value.provider);
+    try std.testing.expectEqual(@as(u32, 200), reranker_error.value.maximum);
+    try std.testing.expect(!reranker_error.value.retryable);
 }
 
 test "api http unsupported sorted query response exposes stable sort reason" {

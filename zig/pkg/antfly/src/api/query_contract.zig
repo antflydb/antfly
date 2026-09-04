@@ -2243,8 +2243,10 @@ fn applyCommonSearchRequestOptions(
             error.InvalidRerankerConfig => return error.InvalidQueryRequest,
             else => return err,
         };
-        reranking_mod.validateQueryWindow(req.reranker.?, req.offset, req.limit) catch
-            return error.InvalidQueryRequest;
+        reranking_mod.validateQueryWindow(req.reranker.?, req.offset, req.limit) catch |err| switch (err) {
+            error.InvalidRerankerConfig => return error.InvalidQueryRequest,
+            else => return err,
+        };
     }
 
     const has_semantic = request.semantic_search != null or request.embeddings != null;
@@ -2836,6 +2838,7 @@ pub fn isPublicQueryValidationError(err: anyerror) bool {
         error.InvalidExclusionQueryRequest,
         error.UnsupportedFilterQueryRequest,
         error.UnsupportedExclusionQueryRequest,
+        error.RerankerCandidateLimitExceeded,
         => true,
         else => false,
     };
@@ -15493,6 +15496,7 @@ test "api query contract classifies typed filter errors as validation errors" {
         error.InvalidExclusionQueryRequest,
         error.UnsupportedFilterQueryRequest,
         error.UnsupportedExclusionQueryRequest,
+        error.RerankerCandidateLimitExceeded,
     }) |err| {
         try std.testing.expect(isPublicQueryValidationError(err));
     }
@@ -15713,6 +15717,30 @@ test "api query contract preflight rejects count with reranker" {
     defer parsed.deinit();
 
     try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
+}
+
+test "api query contract enforces provider-specific reranker candidate limits" {
+    const vertex_body =
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "limit": 201,
+        \\  "reranker": {"provider":"vertex","model":"semantic-ranker-default@latest","field":"body"}
+        \\}
+    ;
+    try std.testing.expectError(
+        error.RerankerCandidateLimitExceeded,
+        parsePublicQueryRequest(std.testing.allocator, null, "docs", vertex_body),
+    );
+
+    const cohere_body =
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "limit": 201,
+        \\  "reranker": {"provider":"cohere","model":"rerank-v4.0-pro","field":"body"}
+        \\}
+    ;
+    var cohere = try parsePublicQueryRequest(std.testing.allocator, null, "docs", cohere_body);
+    cohere.deinit(std.testing.allocator);
 }
 
 test "api query contract rejects count with stored sort" {

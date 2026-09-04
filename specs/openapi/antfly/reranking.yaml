@@ -95,6 +95,17 @@ components:
         credentials_path:
           type: string
           description: "Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain."
+        candidate_count:
+          type: integer
+          minimum: 1
+          maximum: 200
+          description: "Maximum candidates for Vertex. Google Ranking API accepts at most 200 records in one request; Antfly rejects larger windows before retrieval fan-out."
+        top_n:
+          type: integer
+          minimum: 1
+          maximum: 200
+          deprecated: true
+          description: "Deprecated final-page-size override. Vertex can return at most 200 records; prefer QueryRequest.limit."
       required:
         - provider
         - model

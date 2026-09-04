@@ -203,6 +203,10 @@ pub const VertexRerankerConfig = struct {
     project_id: ?[]const u8 = null,
     /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain.
     credentials_path: ?[]const u8 = null,
+    /// Maximum candidates for Vertex. Google Ranking API accepts at most 200 records in one request; Antfly rejects larger windows before retrieval fan-out.
+    candidate_count: ?i64 = null,
+    /// Deprecated final-page-size override. Vertex can return at most 200 records; prefer QueryRequest.limit.
+    top_n: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -210,6 +214,8 @@ pub const VertexRerankerConfig = struct {
         .{ "model", "model", false },
         .{ "project_id", "project_id", true },
         .{ "credentials_path", "credentials_path", true },
+        .{ "candidate_count", "candidate_count", true },
+        .{ "top_n", "top_n", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -232,6 +238,14 @@ pub const VertexRerankerConfig = struct {
         }
         if (self.credentials_path) |value| {
             try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.candidate_count) |value| {
+            try jw.objectField("candidate_count");
+            try jw.write(value);
+        }
+        if (self.top_n) |value| {
+            try jw.objectField("top_n");
             try jw.write(value);
         }
         try jw.endObject();

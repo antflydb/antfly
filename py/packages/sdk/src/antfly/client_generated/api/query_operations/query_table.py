@@ -19,6 +19,7 @@ from ...models.query_candidate_budget_exceeded_error import QueryCandidateBudget
 from ...models.query_dependency_error import QueryDependencyError
 from ...models.query_filter_error import QueryFilterError
 from ...models.query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
+from ...models.reranker_candidate_limit_exceeded_error import RerankerCandidateLimitExceededError
 from ...models.stateful_query_request import StatefulQueryRequest
 from ...models.stateful_query_responses import StatefulQueryResponses
 from ...models.table_storage_unreadable_error import TableStorageUnreadableError
@@ -71,6 +72,7 @@ def _parse_response(
     | QueryCandidateBudgetExceededError
     | QueryDependencyError
     | QueryFilterError
+    | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
     | HierarchyCursorStaleError
@@ -136,6 +138,7 @@ def _parse_response(
             | QueryCandidateBudgetExceededError
             | QueryDependencyError
             | QueryFilterError
+            | RerankerCandidateLimitExceededError
             | UnsupportedHierarchyGroupingError
             | UnsupportedQueryError
         ):
@@ -153,6 +156,14 @@ def _parse_response(
                 componentsschemas_query_unprocessable_error_type_1 = QueryCandidateBudgetExceededError.from_dict(data)
 
                 return componentsschemas_query_unprocessable_error_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_unprocessable_error_type_2 = RerankerCandidateLimitExceededError.from_dict(data)
+
+                return componentsschemas_query_unprocessable_error_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
@@ -212,15 +223,7 @@ def _parse_response(
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_unprocessable_error_type_3 = QueryFilterError.from_dict(data)
-
-                return componentsschemas_query_unprocessable_error_type_3
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_unprocessable_error_type_4 = UnsupportedHierarchyGroupingError.from_dict(data)
+                componentsschemas_query_unprocessable_error_type_4 = QueryFilterError.from_dict(data)
 
                 return componentsschemas_query_unprocessable_error_type_4
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -228,16 +231,24 @@ def _parse_response(
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_unprocessable_error_type_5 = UnsupportedQueryError.from_dict(data)
+                componentsschemas_query_unprocessable_error_type_5 = UnsupportedHierarchyGroupingError.from_dict(data)
 
                 return componentsschemas_query_unprocessable_error_type_5
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_unprocessable_error_type_6 = UnsupportedQueryError.from_dict(data)
+
+                return componentsschemas_query_unprocessable_error_type_6
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_query_unprocessable_error_type_6 = QueryDependencyError.from_dict(data)
+            componentsschemas_query_unprocessable_error_type_7 = QueryDependencyError.from_dict(data)
 
-            return componentsschemas_query_unprocessable_error_type_6
+            return componentsschemas_query_unprocessable_error_type_7
 
         response_422 = _parse_response_422(response.json())
 
@@ -306,6 +317,7 @@ def _build_response(
     | QueryCandidateBudgetExceededError
     | QueryDependencyError
     | QueryFilterError
+    | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
     | HierarchyCursorStaleError
@@ -341,6 +353,7 @@ def sync_detailed(
     | QueryCandidateBudgetExceededError
     | QueryDependencyError
     | QueryFilterError
+    | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
     | HierarchyCursorStaleError
@@ -363,7 +376,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | HierarchyCursorStaleError | TopologyChangedError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses]
+        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | HierarchyCursorStaleError | TopologyChangedError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses]
     """
 
     kwargs = _get_kwargs(
@@ -397,6 +410,7 @@ def sync(
     | QueryCandidateBudgetExceededError
     | QueryDependencyError
     | QueryFilterError
+    | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
     | HierarchyCursorStaleError
@@ -420,7 +434,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | HierarchyCursorStaleError | TopologyChangedError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses
+        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | HierarchyCursorStaleError | TopologyChangedError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses
     """
 
     return sync_detailed(
@@ -449,6 +463,7 @@ async def asyncio_detailed(
     | QueryCandidateBudgetExceededError
     | QueryDependencyError
     | QueryFilterError
+    | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
     | HierarchyCursorStaleError
@@ -471,7 +486,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | HierarchyCursorStaleError | TopologyChangedError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses]
+        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | HierarchyCursorStaleError | TopologyChangedError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses]
     """
 
     kwargs = _get_kwargs(
@@ -503,6 +518,7 @@ async def asyncio(
     | QueryCandidateBudgetExceededError
     | QueryDependencyError
     | QueryFilterError
+    | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
     | HierarchyCursorStaleError
@@ -526,7 +542,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | HierarchyCursorStaleError | TopologyChangedError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses
+        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | HierarchyCursorStaleError | TopologyChangedError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses
     """
 
     return (

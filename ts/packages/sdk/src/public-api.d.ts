@@ -3096,6 +3096,21 @@ export interface components {
              */
             status: 422;
         };
+        RerankerCandidateLimitExceededError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /** @enum {string} */
+            error: "reranker_candidate_limit_exceeded";
+            message: string;
+            provider: components["schemas"]["RerankerProvider"];
+            /** Format: int32 */
+            maximum: number;
+            /** @enum {boolean} */
+            retryable: false;
+        };
         GraphDistinctBudgetExceededError: {
             /**
              * Format: int32
@@ -3247,7 +3262,7 @@ export interface components {
             actual: number;
         };
         GraphQueryUnprocessableError: components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphWorkBudgetExceededError"] | components["schemas"]["GraphPathWeightDomainError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphQueryUnsupportedError"] | components["schemas"]["GraphMatchOperationLimitExceededError"];
-        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphQueryUnprocessableError"] | components["schemas"]["QueryFilterError"] | components["schemas"]["UnsupportedHierarchyGroupingError"] | components["schemas"]["UnsupportedQueryError"] | components["schemas"]["QueryDependencyError"];
+        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["RerankerCandidateLimitExceededError"] | components["schemas"]["GraphQueryUnprocessableError"] | components["schemas"]["QueryFilterError"] | components["schemas"]["UnsupportedHierarchyGroupingError"] | components["schemas"]["UnsupportedQueryError"] | components["schemas"]["QueryDependencyError"];
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -8814,6 +8829,11 @@ export interface components {
             } | null;
         };
         /**
+         * @description The reranking provider to use.
+         * @enum {string}
+         */
+        RerankerProvider: "antfly" | "cohere" | "vertex";
+        /**
          * @description Objective used to rank graph paths:
          *     - min_hops: Minimize the number of edges.
          *     - min_weight_sum: Minimize the sum of finite non-negative edge weights.
@@ -12292,11 +12312,6 @@ export interface components {
             rank_constant?: number;
         };
         /**
-         * @description The reranking provider to use.
-         * @enum {string}
-         */
-        RerankerProvider: "antfly" | "cohere" | "vertex";
-        /**
          * @description Configuration for the Antfly inference reranking provider.
          * @example {
          *       "provider": "antfly",
@@ -12373,6 +12388,13 @@ export interface components {
             project_id?: string;
             /** @description Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain. */
             credentials_path?: string;
+            /** @description Maximum candidates for Vertex. Google Ranking API accepts at most 200 records in one request; Antfly rejects larger windows before retrieval fan-out. */
+            candidate_count?: number;
+            /**
+             * @deprecated
+             * @description Deprecated final-page-size override. Vertex can return at most 200 records; prefer QueryRequest.limit.
+             */
+            top_n?: number;
         };
         /**
          * @description A unified configuration for a reranking provider.
