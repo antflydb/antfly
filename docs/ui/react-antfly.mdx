@@ -326,7 +326,7 @@ const summarizer = {
 - `id` (string, required): Unique identifier
 - `searchBoxId` (string, required): ID of the QueryBox that provides the search value
 - `summarizer` (object, required): LLM configuration
-  - `provider`: "ollama", "openai", "anthropic", "bedrock", "google"
+- `provider`: "antfly", "ollama", "openai", "gemini", or "vertex"
   - `model`: Model name
   - `api_key`: API key (if required)
 - `systemPrompt` (string): Custom system prompt for the LLM

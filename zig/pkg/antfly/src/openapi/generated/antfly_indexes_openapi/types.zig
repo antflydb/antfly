@@ -3780,7 +3780,7 @@ pub const FullTextIndexStats = struct {
     repair: ?IndexRepairStatus = null,
     /// Whether the index is actively rebuilding, replaying, or catching up.
     backfill_active: ?bool = null,
-    /// Progress of ongoing rebuild as fraction [0.0, 1.0]
+    /// Full-text materialization completion as a fraction from 0.0 to 1.0. A ready index reports 1.0.
     backfill_progress: ?f64 = null,
     /// Number of documents indexed during current rebuild
     backfill_items_processed: ?i64 = null,

@@ -21,8 +21,8 @@ class AntflyRerankerConfig:
 
     Attributes:
         provider (AntflyRerankerConfigProvider):
-        model (str | Unset): Optional reranking model name. When omitted, the Antfly inference service selects its
-            configured default reranker.
+        model (str | Unset): Optional reranking model name. When omitted, the Antfly inference service selects a model
+            from its reranker model directory. Set this explicitly when more than one reranker is installed.
         url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment
             variable.
     """

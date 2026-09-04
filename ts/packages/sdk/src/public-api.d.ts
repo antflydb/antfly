@@ -10385,7 +10385,7 @@ export interface components {
             backfill_active?: boolean;
             /**
              * Format: double
-             * @description Progress of ongoing rebuild as fraction [0.0, 1.0]
+             * @description Full-text materialization completion as a fraction from 0.0 to 1.0. A ready index reports 1.0.
              */
             backfill_progress?: number;
             /**
@@ -12328,7 +12328,7 @@ export interface components {
         AntflyRerankerConfig: {
             /** @enum {string} */
             provider: "antfly";
-            /** @description Optional reranking model name. When omitted, the Antfly inference service selects its configured default reranker. */
+            /** @description Optional reranking model name. When omitted, the Antfly inference service selects a model from its reranker model directory. Set this explicitly when more than one reranker is installed. */
             model?: string;
             /**
              * Format: uri

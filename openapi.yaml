@@ -20328,7 +20328,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: number
           format: double
-          description: Progress of ongoing rebuild as fraction [0.0, 1.0]
+          description: Full-text materialization completion as a fraction from 0.0 to 1.0. A ready index
+            reports 1.0.
         backfill_items_processed:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -23500,7 +23501,8 @@ components:
         model:
           type: string
           description: Optional reranking model name. When omitted, the Antfly inference service selects
-            its configured default reranker.
+            a model from its reranker model directory. Set this explicitly when more than one reranker
+            is installed.
         url:
           type: string
           format: uri

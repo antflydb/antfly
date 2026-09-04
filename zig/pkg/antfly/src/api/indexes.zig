@@ -5536,6 +5536,25 @@ fn appendSingleIndexRuntimeStatus(
     const terminal_enrichment_failure = enrichment_degraded or
         (if (visible_enrichment) |stats| stats.worker_failed else false);
     const terminal_load_failure = load_error != null and raw_load_error_matches_desired_incarnation;
+    // Progress is a completion fraction, not merely a pulse from an active
+    // worker. Full-text runtime snapshots can legitimately retain their last
+    // cursor value after the worker settles; once the exact incarnation is
+    // authoritative and every lifecycle fence is clear, expose the completed
+    // state as 1.0. This keeps `ready`, indexed cardinality, and progress
+    // mutually consistent for CLI/UI consumers.
+    if (index_type == .full_text and
+        coverage_generation != 0 and
+        authority.readiness_authoritative and
+        !backfill_active and
+        !replay_catch_up_required and
+        replay_applied_sequence >= replay_target_sequence and
+        !catch_up_active and
+        catch_up_applied_sequence >= catch_up_target_sequence and
+        load_error == null and
+        !repair_blocks_readiness)
+    {
+        backfill_progress = 1.0;
+    }
     var source_coverage_complete_for_readiness = index_type != .embeddings;
     var artifact_publish_pending = false;
 
@@ -7994,6 +8013,58 @@ test "full text aggregate preserves explicit current backfill state" {
     try std.testing.expect(aggregate.replay_catch_up_required);
     try std.testing.expect(aggregate.backfill_active);
     try std.testing.expectEqual(@as(f64, 0.0), aggregate.backfill_progress);
+}
+
+test "derived coverage ready full text status reports complete progress" {
+    const alloc = std.testing.allocator;
+    const config_json = "{\"type\":\"full_text\"}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexRuntimeIdentity(alloc, "search_idx", parsed_config.value)).?;
+
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "search_idx",
+        .kind = .full_text,
+        .doc_count = 10_000,
+        .term_count = 42_000,
+        .backfill_active = false,
+        // A settled worker may retain an old/default cursor estimate. The
+        // public lifecycle must normalize this when readiness is complete.
+        .backfill_progress = 0.0,
+        .replay_applied_sequence = 10_000,
+        .replay_target_sequence = 10_000,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
+    }};
+    var local_items = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .source_doc_count = 10_000, .doc_count = 10_000, .index_count = 1, .indexes = indexes[0..] },
+    }};
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items[0..] };
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"search_idx\":" ++ config_json ++ "}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "search_idx", &local_status)).?;
+    defer alloc.free(encoded);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"status\":{\"total_indexed\":10000,\"backfill_progress\":1.0,\"readiness\":{\"state\":\"ready\",\"queryable\":true,\"complete\":true}}}",
+        encoded,
+    );
 }
 
 test "index status keeps generic catch-up lag pending when replay sequence is equal" {

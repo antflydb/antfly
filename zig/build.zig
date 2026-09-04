@@ -4267,9 +4267,10 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        // Mach-O debug codegen retained 10.3 GiB for this intentionally broad
-        // command root. Linux remains within the aggregate's 7 GiB claim.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        // Mach-O debug codegen currently peaks a little above 12 GiB for this
+        // intentionally broad command root. Linux remains within the
+        // aggregate's 7 GiB claim.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
     });
     const run_cmd_tests = addFilteredTestRunArtifact(b, cmd_tests);
     const cmd_test_step = b.step("cmd-test", "Run Antfly command and client CLI tests");
@@ -4682,6 +4683,7 @@ pub fn build(b: *std.Build) void {
         "data runtime repair failures preserve durable backoff and increase retry delay",
         "index repair fallback backoff never blocks an exact durable wake",
         "data runtime preserves tagged aggregate index repair wake semantics",
+        "index repair no-op audit stays below operator log level",
         "data runtime exact repair requeue is allocation-free and failed new enqueue is atomic",
         "data runtime repair queue links and removes debt in constant time",
         "data runtime startup catch-up parks scheduler when only quarantined debt remains",
@@ -6580,6 +6582,7 @@ pub fn build(b: *std.Build) void {
             "dense publication target requires every expected shard observation",
             "derived coverage aggregation rejects mixed config observations",
             "derived coverage embedding activity aggregation is order independent and phase authoritative",
+            "derived coverage ready full text status reports complete progress",
             "chunked dense completion follows the physical publication target",
             "runtime status best effort overlay cannot clear readiness under apply contention",
             "index status exposes compact repair state without internal diagnostics",
@@ -7253,6 +7256,7 @@ pub fn build(b: *std.Build) void {
         "derived backlog tracker fails closed when sequence accounting allocation fails",
         "derived backlog tracker bounds sequence-only admission drain window",
         "hbc shared cache namespaces entries",
+        "hbc index reports shared cache ownership",
         "hbc shared cache evicts across namespaces under one resource budget",
         "hbc shared cache CLOCK refreshes recency on borrowed vector hits",
         "hbc shared vector replacement cannot return an older external value",

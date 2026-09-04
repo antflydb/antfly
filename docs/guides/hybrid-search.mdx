@@ -130,7 +130,7 @@ antfly query --table wikipedia \
   }'
 ```
 
-The `field` parameter tells the reranker which document field to score against the query. `candidate_count` controls the expensive scoring window, while the query's `limit` controls the number returned. The `antfly` provider uses the inference service's configured default reranker when `model` is omitted; set `model` explicitly to select an installed model such as `mixedbread-ai/mxbai-rerank-base-v1`.
+The `field` parameter tells the reranker which document field to score against the query. `candidate_count` controls the expensive scoring window, while the query's `limit` controls the number returned. When `model` is omitted, the `antfly` provider selects a model from the inference service's reranker directory; set it explicitly when more than one reranker is installed, for example `mixedbread-ai/mxbai-rerank-base-v1`.
 
 The executable reranker providers are `antfly`, `cohere`, and `vertex`.
 Antfly retrieves the bounded window from each shard, retains the globally best

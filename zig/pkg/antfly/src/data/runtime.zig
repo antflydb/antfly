@@ -709,6 +709,23 @@ fn indexRepairQueueScheduleFromResult(
     };
 }
 
+fn provisionedIndexRepairPassHasOperatorActivity(
+    result: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult,
+) bool {
+    // The fallback audit deliberately revisits healthy groups so missed
+    // notifications remain recoverable. Those steady-state observations are
+    // useful when debugging the scheduler, but logging both the begin and end
+    // of every no-op pass at info level overwhelms normal quickstart logs.
+    // Keep info for attempted or completed work. Persistent pending, busy,
+    // disk-admission, and terminal-degraded state remains available in debug
+    // logs and metrics without being re-announced on every audit.
+    return result.index_repair_attempted or
+        result.index_repair_repaired or
+        result.index_repair_degraded or
+        result.made_progress or
+        result.cleared_debt;
+}
+
 test "data runtime preserves tagged aggregate index repair wake semantics" {
     try std.testing.expectEqual(IndexRepairQueueWake.immediate, indexRepairQueueWakeFromAggregate(.immediate));
     try std.testing.expectEqual(IndexRepairQueueWake.retained, indexRepairQueueWakeFromAggregate(.empty));
@@ -717,6 +734,28 @@ test "data runtime preserves tagged aggregate index repair wake semantics" {
         IndexRepairQueueWake.retained,
         indexRepairQueueWakeFromAggregate(.{ .at_realtime_ms = 42 }),
     );
+}
+
+test "index repair no-op audit stays below operator log level" {
+    try std.testing.expect(!provisionedIndexRepairPassHasOperatorActivity(.{}));
+    try std.testing.expect(!provisionedIndexRepairPassHasOperatorActivity(.{
+        .had_debt = true,
+        .index_repair_pending = true,
+        .busy = true,
+        .index_repair_disk_wait = true,
+    }));
+    try std.testing.expect(provisionedIndexRepairPassHasOperatorActivity(.{
+        .made_progress = true,
+    }));
+    try std.testing.expect(provisionedIndexRepairPassHasOperatorActivity(.{
+        .index_repair_attempted = true,
+    }));
+    try std.testing.expect(provisionedIndexRepairPassHasOperatorActivity(.{
+        .cleared_debt = true,
+    }));
+    try std.testing.expect(!provisionedIndexRepairPassHasOperatorActivity(.{
+        .terminal_degraded = true,
+    }));
 }
 
 test "cooperative writer contention uses a preemptible bounded repair audit" {
@@ -14732,7 +14771,7 @@ pub const DataServer = struct {
             ownership_fence.owner_epoch = ownership_fence.currentOwnerEpoch();
             groups_inspected +|= 1;
             const attempt_started_ns = platform_time.monotonicNs();
-            std.log.info("provisioned index repair begin group={} table={s} queued={}", .{
+            std.log.debug("provisioned index repair begin group={} table={s} queued={}", .{
                 group_id,
                 table_name,
                 candidate.queued,
@@ -14783,20 +14822,28 @@ pub const DataServer = struct {
                 );
                 continue;
             };
-            std.log.info(
-                "provisioned index repair pass group={} table={s} duration_ms={} attempted={} repaired={} degraded={} pending={} busy={} disk_wait={}",
-                .{
-                    group_id,
-                    table_name,
-                    (platform_time.monotonicNs() -| attempt_started_ns) / std.time.ns_per_ms,
-                    result.index_repair_attempted,
-                    result.index_repair_repaired,
-                    result.index_repair_degraded,
-                    result.index_repair_pending,
-                    result.busy,
-                    result.index_repair_disk_wait,
-                },
-            );
+            const repair_log_args = .{
+                group_id,
+                table_name,
+                (platform_time.monotonicNs() -| attempt_started_ns) / std.time.ns_per_ms,
+                result.index_repair_attempted,
+                result.index_repair_repaired,
+                result.index_repair_degraded,
+                result.index_repair_pending,
+                result.busy,
+                result.index_repair_disk_wait,
+            };
+            if (provisionedIndexRepairPassHasOperatorActivity(result)) {
+                std.log.info(
+                    "provisioned index repair pass group={} table={s} duration_ms={} attempted={} repaired={} degraded={} pending={} busy={} disk_wait={}",
+                    repair_log_args,
+                );
+            } else {
+                std.log.debug(
+                    "provisioned index repair pass group={} table={s} duration_ms={} attempted={} repaired={} degraded={} pending={} busy={} disk_wait={}",
+                    repair_log_args,
+                );
+            }
             found_pending = found_pending or result.index_repair_pending;
             if (result.index_repair_disk_wait) {
                 _ = self.provisioned_index_repair_disk_waits.fetchAdd(1, .monotonic);

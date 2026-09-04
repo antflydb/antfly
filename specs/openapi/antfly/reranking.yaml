@@ -22,7 +22,7 @@ components:
           enum: [antfly]
         model:
           type: string
-          description: "Optional reranking model name. When omitted, the Antfly inference service selects its configured default reranker."
+          description: "Optional reranking model name. When omitted, the Antfly inference service selects a model from its reranker model directory. Set this explicitly when more than one reranker is installed."
         url:
           type: string
           format: uri

@@ -1817,7 +1817,7 @@ pub const AntflyGeneratorConfig = struct {
 /// Configuration for the Antfly inference reranking provider.
 pub const AntflyRerankerConfig = struct {
     provider: []const u8,
-    /// Optional reranking model name. When omitted, the Antfly inference service selects its configured default reranker.
+    /// Optional reranking model name. When omitted, the Antfly inference service selects a model from its reranker model directory. Set this explicitly when more than one reranker is installed.
     model: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
@@ -11848,7 +11848,7 @@ pub const FullTextIndexStats = struct {
     repair: ?IndexRepairStatus = null,
     /// Whether the index is actively rebuilding, replaying, or catching up.
     backfill_active: ?bool = null,
-    /// Progress of ongoing rebuild as fraction [0.0, 1.0]
+    /// Full-text materialization completion as a fraction from 0.0 to 1.0. A ready index reports 1.0.
     backfill_progress: ?f64 = null,
     /// Number of documents indexed during current rebuild
     backfill_items_processed: ?i64 = null,
@@ -26532,7 +26532,7 @@ pub const RerankerConfig = struct {
     candidate_count: ?i64 = null,
     /// Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present or the selected provider's candidate ceiling; Vertex currently accepts at most 200.
     top_n: ?i64 = null,
-    /// Optional reranking model name. When omitted, the Antfly inference service selects its configured default reranker.
+    /// Optional reranking model name. When omitted, the Antfly inference service selects a model from its reranker model directory. Set this explicitly when more than one reranker is installed.
     model: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
