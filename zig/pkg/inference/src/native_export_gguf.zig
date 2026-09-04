@@ -4038,7 +4038,7 @@ fn buildBertMetadataEntries(
     try appendMetadataU32Entry(allocator, &entries, "bert.label_count", config.num_labels);
     try entries.append(allocator, .{
         .key = try allocator.dupe(u8, "bert.hidden_act"),
-        .value = .{ .string = try allocator.dupe(u8, config.hidden_act) },
+        .value = .{ .string = try allocator.dupe(u8, config.hidden_act.wireName()) },
     });
 
     if (manifest.chat_template) |value| {

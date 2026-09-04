@@ -35,7 +35,9 @@ from paired_benchmark import (
 
 
 TOKEN_IDS_RE = re.compile(r"^token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$", re.MULTILINE)
-PROMPT_TOKEN_IDS_RE = re.compile(r"^prompt_token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$", re.MULTILINE)
+PROMPT_TOKEN_IDS_RE = re.compile(
+    r"^prompt_token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$", re.MULTILINE
+)
 ENVIRONMENT_VARIABLE_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
 DEFAULT_PROMPTS = (
     "Write one sentence about ants.",
@@ -95,7 +97,9 @@ class RouteCountExpectation:
 
     def __post_init__(self) -> None:
         if not self.name or self.exact_count < 1:
-            raise ValueError("qualification route count requires a counter name and positive exact count")
+            raise ValueError(
+                "qualification route count requires a counter name and positive exact count"
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -117,15 +121,21 @@ class QualificationWorkload:
             ("benchmark prompt", self.benchmark_prompt_sha256),
         ):
             if not re.fullmatch(r"[0-9a-f]{64}", digest):
-                raise ValueError(f"qualification workload {label} SHA-256 must be lowercase hexadecimal")
+                raise ValueError(
+                    f"qualification workload {label} SHA-256 must be lowercase hexadecimal"
+                )
         if self.benchmark_prompt_tokens < 1:
-            raise ValueError("qualification workload prompt-token count must be positive")
+            raise ValueError(
+                "qualification workload prompt-token count must be positive"
+            )
         if not self.lengths or any(length < 1 for length in self.lengths):
             raise ValueError("qualification workload output lengths must be positive")
         if not self.cache_dtype:
             raise ValueError("qualification workload cache dtype must be non-empty")
         if self.prefill_chunk_size < 1 or self.capture_kv_capacity < 1:
-            raise ValueError("qualification workload chunk size and capture capacity must be positive")
+            raise ValueError(
+                "qualification workload chunk size and capture capacity must be positive"
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -146,30 +156,50 @@ class CandidateSpec:
     require_persistent_replay: bool = False
 
     def __post_init__(self) -> None:
-        if not self.kernel_id or not re.fullmatch(r"[a-z0-9][a-z0-9._/-]*", self.kernel_id):
-            raise ValueError("candidate kernel ID must be a non-empty lowercase catalog ID")
-        if not self.environment_variable or not ENVIRONMENT_VARIABLE_RE.fullmatch(self.environment_variable):
-            raise ValueError("candidate environment variable must be a valid environment name")
+        if not self.kernel_id or not re.fullmatch(
+            r"[a-z0-9][a-z0-9._/-]*", self.kernel_id
+        ):
+            raise ValueError(
+                "candidate kernel ID must be a non-empty lowercase catalog ID"
+            )
+        if not self.environment_variable or not ENVIRONMENT_VARIABLE_RE.fullmatch(
+            self.environment_variable
+        ):
+            raise ValueError(
+                "candidate environment variable must be a valid environment name"
+            )
         if not self.required_route_counters:
             raise ValueError("candidate must require at least one route counter")
         names = tuple(counter.name for counter in self.required_route_counters)
         if len(set(names)) != len(names):
             raise ValueError("candidate route counters must be unique")
-        forbidden_names = tuple(counter.name for counter in self.forbidden_route_counters)
+        forbidden_names = tuple(
+            counter.name for counter in self.forbidden_route_counters
+        )
         if len(set(forbidden_names)) != len(forbidden_names):
             raise ValueError("candidate forbidden counters must be unique")
-        baseline_names = tuple(counter.name for counter in self.required_baseline_route_counters)
+        baseline_names = tuple(
+            counter.name for counter in self.required_baseline_route_counters
+        )
         if len(set(baseline_names)) != len(baseline_names):
             raise ValueError("required baseline route counters must be unique")
         if set(names) & set(forbidden_names):
-            raise ValueError("required route counters and forbidden counters must be disjoint")
+            raise ValueError(
+                "required route counters and forbidden counters must be disjoint"
+            )
         if set(names) & set(baseline_names):
-            raise ValueError("candidate and baseline required route counters must be disjoint")
-        qualification_count_names = tuple(item.name for item in self.qualification_route_counts)
+            raise ValueError(
+                "candidate and baseline required route counters must be disjoint"
+            )
+        qualification_count_names = tuple(
+            item.name for item in self.qualification_route_counts
+        )
         if len(set(qualification_count_names)) != len(qualification_count_names):
             raise ValueError("qualification route-count counters must be unique")
         if not set(qualification_count_names).issubset(names):
-            raise ValueError("qualification route-count counters must be required candidate routes")
+            raise ValueError(
+                "qualification route-count counters must be required candidate routes"
+            )
         for counter in (
             self.required_route_counters
             + self.forbidden_route_counters
@@ -181,12 +211,18 @@ class CandidateSpec:
         if len(set(fixed_names)) != len(fixed_names):
             raise ValueError("fixed comparison environment variables must be unique")
         if self.environment_variable in fixed_names:
-            raise ValueError("fixed comparison environment must not override the selected candidate gate")
+            raise ValueError(
+                "fixed comparison environment must not override the selected candidate gate"
+            )
         for name, value in self.fixed_comparison_environment:
             if not ENVIRONMENT_VARIABLE_RE.fullmatch(name):
-                raise ValueError("fixed comparison environment variable name is invalid")
+                raise ValueError(
+                    "fixed comparison environment variable name is invalid"
+                )
             if any(ord(character) < 32 or ord(character) == 127 for character in value):
-                raise ValueError("fixed comparison environment value contains an unsupported control character")
+                raise ValueError(
+                    "fixed comparison environment value contains an unsupported control character"
+                )
         for label, value in (
             ("baseline", self.baseline_gate_value),
             ("candidate", self.candidate_gate_value),
@@ -194,10 +230,15 @@ class CandidateSpec:
             if not isinstance(value, str) or not value:
                 raise ValueError(f"{label} candidate gate value must be non-empty")
             if any(ord(character) < 32 or ord(character) == 127 for character in value):
-                raise ValueError(f"{label} candidate gate value contains an unsupported control character")
+                raise ValueError(
+                    f"{label} candidate gate value contains an unsupported control character"
+                )
         if self.baseline_gate_value == self.candidate_gate_value:
             raise ValueError("baseline and candidate gate values must differ")
-        if not isinstance(self.route_phase, str) or self.route_phase not in {"decode", "prefill"}:
+        if not isinstance(self.route_phase, str) or self.route_phase not in {
+            "decode",
+            "prefill",
+        }:
             raise ValueError("candidate route phase must be decode or prefill")
         if not isinstance(self.require_persistent_replay, bool):
             raise ValueError("candidate persistent-replay requirement must be boolean")
@@ -255,7 +296,9 @@ DEFAULT_TIMING_METADATA = TimingMetadata()
 
 GENERATED_ATTENTION_KERNEL_ID = "cuda.attention.gqa.decode.generated"
 SCORE_PREWORK_ATTENTION_KERNEL_ID = "cuda.attention.gqa.decode.score_prework"
-SCORE_PREWORK_TILED64_ATTENTION_KERNEL_ID = "cuda.attention.gqa.decode.score_prework.tiled64"
+SCORE_PREWORK_TILED64_ATTENTION_KERNEL_ID = (
+    "cuda.attention.gqa.decode.score_prework.tiled64"
+)
 GQA_PREFILL_TILED_F16_EXACT_KERNEL_ID = "cuda.attention.gqa.prefill.tiled_f16_exact"
 GQA_PREFILL_TILED_F16_WARP_KERNEL_ID = "cuda.attention.gqa.prefill.tiled_f16_warp"
 GQA_PREFILL_FLASH_F16_SM89_KERNEL_ID = "cuda.attention.gqa.prefill.flash_f16_sm89"
@@ -270,8 +313,12 @@ CUBLASLT_BF16_PREFILL_SM89_KERNEL_ID = "cuda.cublaslt.bf16.prefill.sm89"
 PLE_GATE_BF16_MIRROR_FIRST_SM89_E2B_KERNEL_ID = (
     "cuda.ple.gate.prefill.bf16_mirror_first.sm89_e2b"
 )
-GENERATED_ATTENTION_SPLIT_KV_MIN_TOKENS_ENV = "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SPLIT_KV_MIN_TOKENS"
-GENERATED_ATTENTION_SPLIT_KV_SPLITS_ENV = "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SPLIT_KV_SPLITS"
+GENERATED_ATTENTION_SPLIT_KV_MIN_TOKENS_ENV = (
+    "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SPLIT_KV_MIN_TOKENS"
+)
+GENERATED_ATTENTION_SPLIT_KV_SPLITS_ENV = (
+    "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SPLIT_KV_SPLITS"
+)
 DEFAULT_CAPTURE_KV_PROMPT_HEADROOM = 1024
 SUPPORTED_CACHE_DTYPES = ("f16", "f32", "int8", "fp8", "int4", "polar4", "turbo3")
 CAPTURE_KV_CAPACITY_ENV = "ANTFLY_CAPTURE_FORCE_KV_CAPACITY"
@@ -456,17 +503,27 @@ CANDIDATE_CATALOG = {
     GENERATED_ATTENTION_KERNEL_ID: CandidateSpec(
         kernel_id=GENERATED_ATTENTION_KERNEL_ID,
         environment_variable="ANTFLY_GENERATED_ATTENTION_DECODE",
-        required_route_counters=(RouteCounter("launch_attention_gqa_decode_generated", "generated attention"),),
+        required_route_counters=(
+            RouteCounter(
+                "launch_attention_gqa_decode_generated", "generated attention"
+            ),
+        ),
         legacy_kind=CandidateKind.GENERATED_ATTENTION,
     ),
     SCORE_PREWORK_ATTENTION_KERNEL_ID: CandidateSpec(
         kernel_id=SCORE_PREWORK_ATTENTION_KERNEL_ID,
         environment_variable="ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK",
         required_route_counters=(
-            RouteCounter("launch_attention_gqa_decode_score_prework", "generated score-prework attention"),
+            RouteCounter(
+                "launch_attention_gqa_decode_score_prework",
+                "generated score-prework attention",
+            ),
         ),
         forbidden_route_counters=(
-            RouteCounter("launch_attention_gqa_decode_fast_fallbacks", "score-prework attention fallbacks"),
+            RouteCounter(
+                "launch_attention_gqa_decode_fast_fallbacks",
+                "score-prework attention fallbacks",
+            ),
         ),
         fixed_comparison_environment=SCORE_PREWORK_ATTENTION_COMPARISON_ENVIRONMENT,
     ),
@@ -508,7 +565,9 @@ CANDIDATE_CATALOG = {
                 "launch_attention_gqa_decode_score_prework_tiled64_symbol_fallbacks",
                 "tiled64 score-prework symbol fallbacks",
             ),
-            RouteCounter("launch_attention_gqa_decode_fast", "fast decode attention route"),
+            RouteCounter(
+                "launch_attention_gqa_decode_fast", "fast decode attention route"
+            ),
             RouteCounter(
                 "launch_attention_gqa_decode_fast_fallbacks",
                 "fast decode attention fallbacks",
@@ -717,9 +776,16 @@ CANDIDATE_CATALOG = {
     Q4_0_Q8_1_LM_HEAD_ARGMAX_KERNEL_ID: CandidateSpec(
         kernel_id=Q4_0_Q8_1_LM_HEAD_ARGMAX_KERNEL_ID,
         environment_variable="ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX",
-        required_route_counters=(RouteCounter("lm_head_argmax_fused_q4_0_q8_1", "Q4_0 x Q8_1 LM-head argmax"),),
+        required_route_counters=(
+            RouteCounter(
+                "lm_head_argmax_fused_q4_0_q8_1", "Q4_0 x Q8_1 LM-head argmax"
+            ),
+        ),
         forbidden_route_counters=(
-            RouteCounter("lm_head_argmax_q4_0_q8_1_fallbacks", "Q4_0 x Q8_1 LM-head argmax fallbacks"),
+            RouteCounter(
+                "lm_head_argmax_q4_0_q8_1_fallbacks",
+                "Q4_0 x Q8_1 LM-head argmax fallbacks",
+            ),
         ),
         legacy_kind=CandidateKind.Q4_0_Q8_1_LM_HEAD_ARGMAX,
     ),
@@ -727,10 +793,16 @@ CANDIDATE_CATALOG = {
         kernel_id=Q6_K_Q8_1_LM_HEAD_ARGMAX_KERNEL_ID,
         environment_variable="ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX",
         required_route_counters=(
-            RouteCounter("lm_head_argmax_generated_q6_k_q8_1_hits", "generated Q6_K x Q8_1 LM-head argmax"),
+            RouteCounter(
+                "lm_head_argmax_generated_q6_k_q8_1_hits",
+                "generated Q6_K x Q8_1 LM-head argmax",
+            ),
         ),
         forbidden_route_counters=(
-            RouteCounter("lm_head_argmax_generated_q6_k_q8_1_fallbacks", "generated Q6_K x Q8_1 LM-head argmax fallbacks"),
+            RouteCounter(
+                "lm_head_argmax_generated_q6_k_q8_1_fallbacks",
+                "generated Q6_K x Q8_1 LM-head argmax fallbacks",
+            ),
         ),
         legacy_kind=CandidateKind.Q6_K_Q8_1_LM_HEAD_ARGMAX,
         requires_explicit_model=True,
@@ -739,12 +811,24 @@ CANDIDATE_CATALOG = {
         kernel_id=Q4_0_Q8_1_FFN_KERNEL_ID,
         environment_variable="ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN",
         required_route_counters=(
-            RouteCounter("q4_0_generated_e2b_pair_q8_hits", "Q4_0 x Q8_1 generated E2B FFN pair route"),
-            RouteCounter("q4_0_generated_e2b_down_q8_hits", "Q4_0 x Q8_1 generated E2B FFN down route"),
+            RouteCounter(
+                "q4_0_generated_e2b_pair_q8_hits",
+                "Q4_0 x Q8_1 generated E2B FFN pair route",
+            ),
+            RouteCounter(
+                "q4_0_generated_e2b_down_q8_hits",
+                "Q4_0 x Q8_1 generated E2B FFN down route",
+            ),
         ),
         forbidden_route_counters=(
-            RouteCounter("q4_0_generated_e2b_pair_q8_fallbacks", "Q4_0 x Q8_1 generated E2B FFN pair fallbacks"),
-            RouteCounter("q4_0_generated_e2b_down_q8_fallbacks", "Q4_0 x Q8_1 generated E2B FFN down fallbacks"),
+            RouteCounter(
+                "q4_0_generated_e2b_pair_q8_fallbacks",
+                "Q4_0 x Q8_1 generated E2B FFN pair fallbacks",
+            ),
+            RouteCounter(
+                "q4_0_generated_e2b_down_q8_fallbacks",
+                "Q4_0 x Q8_1 generated E2B FFN down fallbacks",
+            ),
         ),
         legacy_kind=CandidateKind.Q4_0_Q8_1_E2B_FFN,
         fixed_comparison_environment=E2B_FFN_COUPLED_COMPARISON_ENVIRONMENT,
@@ -753,14 +837,30 @@ CANDIDATE_CATALOG = {
         kernel_id=Q4_0_Q8_1_E2B_FFN_PAIR_ONLY_KERNEL_ID,
         environment_variable="ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY",
         required_route_counters=(
-            RouteCounter("q4_0_generated_e2b_pair_only_hits", "generated E2B FFN pair-only route"),
+            RouteCounter(
+                "q4_0_generated_e2b_pair_only_hits", "generated E2B FFN pair-only route"
+            ),
         ),
         forbidden_route_counters=(
-            RouteCounter("q4_0_generated_e2b_pair_only_fallbacks", "generated E2B FFN pair-only fallbacks"),
-            RouteCounter("q4_0_generated_e2b_pair_q8_hits", "coupled generated E2B FFN pair route"),
-            RouteCounter("q4_0_generated_e2b_down_q8_hits", "generated E2B FFN down route"),
-            RouteCounter("q4_0_generated_e2b_exact_pair_f32_hits", "exact F32 generated E2B FFN pair route"),
-            RouteCounter("q4_0_generated_e2b_exact_down_f32_hits", "exact F32 generated E2B FFN down route"),
+            RouteCounter(
+                "q4_0_generated_e2b_pair_only_fallbacks",
+                "generated E2B FFN pair-only fallbacks",
+            ),
+            RouteCounter(
+                "q4_0_generated_e2b_pair_q8_hits",
+                "coupled generated E2B FFN pair route",
+            ),
+            RouteCounter(
+                "q4_0_generated_e2b_down_q8_hits", "generated E2B FFN down route"
+            ),
+            RouteCounter(
+                "q4_0_generated_e2b_exact_pair_f32_hits",
+                "exact F32 generated E2B FFN pair route",
+            ),
+            RouteCounter(
+                "q4_0_generated_e2b_exact_down_f32_hits",
+                "exact F32 generated E2B FFN down route",
+            ),
         ),
         legacy_kind=CandidateKind.Q4_0_Q8_1_E2B_FFN_PAIR_ONLY,
         fixed_comparison_environment=E2B_FFN_PAIR_ONLY_COMPARISON_ENVIRONMENT,
@@ -769,8 +869,14 @@ CANDIDATE_CATALOG = {
         kernel_id=Q4_0_E2B_FFN_EXACT_KERNEL_ID,
         environment_variable="ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT",
         required_route_counters=(
-            RouteCounter("q4_0_generated_e2b_exact_pair_f32_hits", "exact F32 generated E2B FFN pair route"),
-            RouteCounter("q4_0_generated_e2b_exact_down_f32_hits", "exact F32 generated E2B FFN down route"),
+            RouteCounter(
+                "q4_0_generated_e2b_exact_pair_f32_hits",
+                "exact F32 generated E2B FFN pair route",
+            ),
+            RouteCounter(
+                "q4_0_generated_e2b_exact_down_f32_hits",
+                "exact F32 generated E2B FFN down route",
+            ),
         ),
         forbidden_route_counters=(
             RouteCounter(
@@ -805,7 +911,9 @@ CANDIDATE_CATALOG = {
         kernel_id=CUBLASLT_BF16_PREFILL_SM89_KERNEL_ID,
         environment_variable="ANTFLY_INFERENCE_CUDA_CUBLASLT_BF16_TUNING_PROFILE",
         required_route_counters=(
-            RouteCounter("bf16_cublaslt_tuning_tuned_calls", "SM89 BF16 cuBLASLt tuned plan"),
+            RouteCounter(
+                "bf16_cublaslt_tuning_tuned_calls", "SM89 BF16 cuBLASLt tuned plan"
+            ),
         ),
         forbidden_route_counters=(
             RouteCounter(
@@ -930,8 +1038,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="forbidden counter as NAME or NAME=LABEL; repeat the option or use comma-separated values",
     )
-    parser.add_argument("--binary", type=pathlib.Path, default=inference / "zig-out/bin/antfly-inference")
-    parser.add_argument("--wrapper", type=pathlib.Path, default=inference / "scripts/gemma4/with_gemma4_qat_cuda_tuning.sh")
+    parser.add_argument(
+        "--binary",
+        type=pathlib.Path,
+        default=inference / "zig-out/bin/antfly-inference",
+    )
+    parser.add_argument(
+        "--wrapper",
+        type=pathlib.Path,
+        default=inference / "scripts/gemma4/with_gemma4_qat_cuda_tuning.sh",
+    )
     parser.add_argument(
         "--artifact-check-script",
         type=pathlib.Path,
@@ -1063,7 +1179,11 @@ def parse_args() -> argparse.Namespace:
             "coverage across the stable decode steps"
         ),
     )
-    parser.add_argument("--output-dir", type=pathlib.Path, default=pathlib.Path("/tmp/antfly-gemma4-cuda-candidate"))
+    parser.add_argument(
+        "--output-dir",
+        type=pathlib.Path,
+        default=pathlib.Path("/tmp/antfly-gemma4-cuda-candidate"),
+    )
     parser.add_argument(
         "--capture-kv-capacity",
         type=int,
@@ -1117,7 +1237,10 @@ def parse_args() -> argparse.Namespace:
         or args.kernel_id == Q6_K_Q8_1_LM_HEAD_ARGMAX_KERNEL_ID
     )
     if args.model is None and not q6_selected:
-        args.model = repo / ".models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf"
+        args.model = (
+            repo
+            / ".models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf"
+        )
     # run_case executes from the repository root so that the tuning wrapper has
     # a stable working directory. Resolve caller-provided launch operands here
     # while the caller's working directory is still in effect.
@@ -1154,8 +1277,12 @@ def load_prompt_fixture(path: pathlib.Path) -> tuple[str, dict]:
     prompt = segment * repeat + suffix
     encoded = prompt.encode("utf-8")
     digest = hashlib.sha256(encoded).hexdigest()
-    if len(encoded) != raw.get("expected_user_utf8_bytes") or digest != raw.get("expected_user_sha256"):
-        raise ValueError("prompt fixture rendered user content does not match its byte/hash contract")
+    if len(encoded) != raw.get("expected_user_utf8_bytes") or digest != raw.get(
+        "expected_user_sha256"
+    ):
+        raise ValueError(
+            "prompt fixture rendered user content does not match its byte/hash contract"
+        )
     reference_prefix = raw.get("reference_chat_prefix")
     reference_suffix = raw.get("reference_chat_suffix")
     if not isinstance(reference_prefix, str) or not isinstance(reference_suffix, str):
@@ -1163,18 +1290,21 @@ def load_prompt_fixture(path: pathlib.Path) -> tuple[str, dict]:
     benchmark_prompt = reference_prefix + prompt + reference_suffix
     benchmark_encoded = benchmark_prompt.encode("utf-8")
     benchmark_digest = hashlib.sha256(benchmark_encoded).hexdigest()
-    if (
-        len(benchmark_encoded) != raw.get("expected_reference_prompt_utf8_bytes")
-        or benchmark_digest != raw.get("expected_reference_prompt_sha256")
-    ):
-        raise ValueError("prompt fixture rendered reference prompt does not match its byte/hash contract")
+    if len(benchmark_encoded) != raw.get(
+        "expected_reference_prompt_utf8_bytes"
+    ) or benchmark_digest != raw.get("expected_reference_prompt_sha256"):
+        raise ValueError(
+            "prompt fixture rendered reference prompt does not match its byte/hash contract"
+        )
     expected_prompt_tokens = raw.get("expected_reference_prompt_tokens")
     if (
         isinstance(expected_prompt_tokens, bool)
         or not isinstance(expected_prompt_tokens, int)
         or expected_prompt_tokens < 1
     ):
-        raise ValueError("prompt fixture expected reference prompt tokens must be a positive integer")
+        raise ValueError(
+            "prompt fixture expected reference prompt tokens must be a positive integer"
+        )
     return benchmark_prompt, {
         "schema": raw["schema"],
         "id": str(raw.get("id") or path.stem),
@@ -1205,7 +1335,12 @@ def input_path_provenance(path: pathlib.Path) -> dict:
         before = resolved.stat()
         digest = sha256_file(resolved)
         after = resolved.stat()
-        before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
         after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
         if before_identity != after_identity:
             raise RuntimeError(f"benchmark input changed while hashing: {resolved}")
@@ -1220,18 +1355,22 @@ def input_path_provenance(path: pathlib.Path) -> dict:
         files = []
         for item in paths:
             item_provenance = input_path_provenance(item)
-            files.append({
-                "path": item.relative_to(resolved).as_posix(),
-                "bytes": item_provenance["bytes"],
-                "sha256": item_provenance["sha256"],
-            })
+            files.append(
+                {
+                    "path": item.relative_to(resolved).as_posix(),
+                    "bytes": item_provenance["bytes"],
+                    "sha256": item_provenance["sha256"],
+                }
+            )
         final_paths = sorted(
             item.relative_to(resolved).as_posix()
             for item in resolved.rglob("*")
             if item.is_file()
         )
         if final_paths != [item["path"] for item in files]:
-            raise RuntimeError(f"benchmark input directory changed while hashing: {resolved}")
+            raise RuntimeError(
+                f"benchmark input directory changed while hashing: {resolved}"
+            )
         identity = {"files": files}
         return {
             "path": str(resolved),
@@ -1256,18 +1395,22 @@ def _required_file_provenance(path: pathlib.Path) -> dict:
 
 def candidate_cuda_artifact_provenance(repo: pathlib.Path | None = None) -> dict:
     """Hash the release-gate artifact set plus its generator sources."""
-    repo = pathlib.Path(__file__).resolve().parents[5] if repo is None else repo.resolve()
+    repo = (
+        pathlib.Path(__file__).resolve().parents[5] if repo is None else repo.resolve()
+    )
     release_files = release_provenance.artifact_provenance(repo)
     files = {name: dict(value) for name, value in release_files.items()}
     graph = repo / "zig/pkg/inference/src/graph"
-    files.update({
-        "renderer_source": _required_file_provenance(
-            graph / "quant_kernel_cuda_renderer.zig"
-        ),
-        "compiler_source": _required_file_provenance(
-            graph / "quant_kernel_compiler.zig"
-        ),
-    })
+    files.update(
+        {
+            "renderer_source": _required_file_provenance(
+                graph / "quant_kernel_cuda_renderer.zig"
+            ),
+            "compiler_source": _required_file_provenance(
+                graph / "quant_kernel_compiler.zig"
+            ),
+        }
+    )
     identity = {
         name: {
             "bytes": value.get("bytes"),
@@ -1292,7 +1435,9 @@ def qualification_runtime_environment(
             for name in STRICT_RUNTIME_ENVIRONMENT_KEYS
             if name in os.environ
         }
-        environment.setdefault("PATH", "/usr/local/cuda-13.2/bin:/usr/local/bin:/usr/bin:/bin")
+        environment.setdefault(
+            "PATH", "/usr/local/cuda-13.2/bin:/usr/local/bin:/usr/bin:/bin"
+        )
         environment.setdefault("LANG", "C.UTF-8")
         environment.setdefault("LC_ALL", "C.UTF-8")
         environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -1326,10 +1471,7 @@ def strict_environment_provenance(
         gpu_execution_state
     )
     git = {**git, "sha256": canonical_sha256(git)}
-    toolchain_identity = {
-        name: toolchains.get(name)
-        for name in ("zig", "nvcc")
-    }
+    toolchain_identity = {name: toolchains.get(name) for name in ("zig", "nvcc")}
     toolchains = {
         **toolchains,
         "sha256": canonical_sha256(toolchain_identity),
@@ -1358,7 +1500,9 @@ def strict_qualification_provenance_errors(provenance: dict) -> list[str]:
         if isinstance(item, dict)
     }
     if provenance.get("sha256") != canonical_sha256(provenance_identity):
-        errors.append("strict qualification top-level provenance hash does not match its contents")
+        errors.append(
+            "strict qualification top-level provenance hash does not match its contents"
+        )
     runtime_environment = provenance.get("runtime_environment") or {}
     runtime_values = runtime_environment.get("values")
     runtime_identity = {
@@ -1370,7 +1514,9 @@ def strict_qualification_provenance_errors(provenance: dict) -> list[str]:
         or not isinstance(runtime_values, dict)
         or runtime_environment.get("sha256") != canonical_sha256(runtime_identity)
     ):
-        errors.append("strict qualification effective runtime environment is not content-addressed")
+        errors.append(
+            "strict qualification effective runtime environment is not content-addressed"
+        )
     git = provenance.get("git") or {}
     commit = git.get("commit")
     if (
@@ -1396,7 +1542,9 @@ def strict_qualification_provenance_errors(provenance: dict) -> list[str]:
             errors.append(f"strict qualification requires Git {field}")
     git_identity = {name: value for name, value in git.items() if name != "sha256"}
     if git.get("sha256") != canonical_sha256(git_identity):
-        errors.append("strict qualification Git dirty-state hash does not match its contents")
+        errors.append(
+            "strict qualification Git dirty-state hash does not match its contents"
+        )
     if not isinstance(git.get("dirty"), bool):
         errors.append("strict qualification requires an explicit Git dirty state")
     errors.extend(release_provenance.git_content_provenance_errors(git))
@@ -1410,17 +1558,18 @@ def strict_qualification_provenance_errors(provenance: dict) -> list[str]:
             or not _valid_sha256(tool.get("sha256"))
             or not tool.get("version")
         ):
-            errors.append(f"strict qualification requires {name} path, hash, and version provenance")
+            errors.append(
+                f"strict qualification requires {name} path, hash, and version provenance"
+            )
     zig_version = (toolchains.get("zig") or {}).get("version")
     if zig_version and str(zig_version).strip() != "0.16.0":
-        errors.append(f"strict qualification requires Zig 0.16.0, observed {zig_version!r}")
+        errors.append(
+            f"strict qualification requires Zig 0.16.0, observed {zig_version!r}"
+        )
     nvcc_version = (toolchains.get("nvcc") or {}).get("version")
     if nvcc_version and "release 13.2" not in str(nvcc_version):
         errors.append("strict qualification requires the CUDA 13.2 NVCC toolchain")
-    toolchain_identity = {
-        name: toolchains.get(name)
-        for name in ("zig", "nvcc")
-    }
+    toolchain_identity = {name: toolchains.get(name) for name in ("zig", "nvcc")}
     if toolchains.get("sha256") != canonical_sha256(toolchain_identity):
         errors.append("strict qualification toolchain hash does not match its contents")
 
@@ -1465,7 +1614,9 @@ def strict_qualification_provenance_errors(provenance: dict) -> list[str]:
                 )
     compute_processes = gpu.get("selected_compute_processes") or {}
     if compute_processes.get("error"):
-        errors.append("strict qualification could not inspect selected-GPU compute processes")
+        errors.append(
+            "strict qualification could not inspect selected-GPU compute processes"
+        )
     elif compute_processes.get("selected_gpu_processes"):
         errors.append(
             "strict qualification requires an idle selected GPU; competing processes: "
@@ -1500,7 +1651,9 @@ def strict_qualification_provenance_errors(provenance: dict) -> list[str]:
         for name, value in sorted(files.items())
     }
     if artifacts.get("sha256") != canonical_sha256(artifact_identity):
-        errors.append("strict qualification CUDA artifact-set hash does not match its contents")
+        errors.append(
+            "strict qualification CUDA artifact-set hash does not match its contents"
+        )
     return errors
 
 
@@ -1531,14 +1684,16 @@ def qualification_provenance(
         harness_files["tuning_profile"] = input_path_provenance(
             script_path.with_name("gemma4_qat_cuda_tuning.sh")
         )
-        harness_files.update({
-            "release_provenance_support": input_path_provenance(
-                pathlib.Path(release_provenance.__file__).resolve()
-            ),
-            "gpu_provenance_support": input_path_provenance(
-                pathlib.Path(warm_server_provenance.__file__).resolve()
-            ),
-        })
+        harness_files.update(
+            {
+                "release_provenance_support": input_path_provenance(
+                    pathlib.Path(release_provenance.__file__).resolve()
+                ),
+                "gpu_provenance_support": input_path_provenance(
+                    pathlib.Path(warm_server_provenance.__file__).resolve()
+                ),
+            }
+        )
     harness_identity = {
         name: {"bytes": value.get("bytes"), "sha256": value.get("sha256")}
         for name, value in sorted(harness_files.items())
@@ -1561,11 +1716,13 @@ def qualification_provenance(
             **runtime_identity,
             "sha256": canonical_sha256(runtime_identity),
         }
-    value["sha256"] = canonical_sha256({
-        name: item.get("sha256")
-        for name, item in sorted(value.items())
-        if isinstance(item, dict)
-    })
+    value["sha256"] = canonical_sha256(
+        {
+            name: item.get("sha256")
+            for name, item in sorted(value.items())
+            if isinstance(item, dict)
+        }
+    )
     return value
 
 
@@ -1639,12 +1796,9 @@ def run_embedded_cuda_artifact_check(
         inference,
     )
     fields = _parse_colon_fields(output)
-    expected = (
-        ((provenance.get("cuda_artifacts") or {}).get("files") or {}).get(
-            "runtime_sm89_cubin"
-        )
-        or {}
-    )
+    expected = ((provenance.get("cuda_artifacts") or {}).get("files") or {}).get(
+        "runtime_sm89_cubin"
+    ) or {}
     errors: list[str] = []
     if returncode != 0:
         errors.append(f"artifact-identity command exited {returncode}")
@@ -1718,7 +1872,9 @@ def run_controlled_release_build(args: argparse.Namespace) -> dict:
     if returncode != 0:
         errors.append(f"controlled ReleaseFast SM89 build exited {returncode}")
     if not canonical_binary.is_file():
-        errors.append("controlled ReleaseFast SM89 build did not produce the canonical binary")
+        errors.append(
+            "controlled ReleaseFast SM89 build did not produce the canonical binary"
+        )
     return {
         "command": command,
         "cwd": str(inference),
@@ -1775,7 +1931,8 @@ def run_artifact_freshness_checks(
         inference,
     )
     return {
-        "controlled_release_build": controlled_release_build or {
+        "controlled_release_build": controlled_release_build
+        or {
             "passed": False,
             "errors": ["controlled ReleaseFast build result was not provided"],
         },
@@ -1792,14 +1949,12 @@ def artifact_freshness_attestation(
 ) -> dict:
     before_artifacts = before.get("cuda_artifacts") or {}
     after_artifacts = after.get("cuda_artifacts") or {}
-    artifacts_unchanged = (
-        _valid_sha256(before_artifacts.get("sha256"))
-        and before_artifacts.get("sha256") == after_artifacts.get("sha256")
-    )
-    binding_unchanged = (
-        _valid_sha256(before.get("sha256"))
-        and before.get("sha256") == after.get("sha256")
-    )
+    artifacts_unchanged = _valid_sha256(
+        before_artifacts.get("sha256")
+    ) and before_artifacts.get("sha256") == after_artifacts.get("sha256")
+    binding_unchanged = _valid_sha256(before.get("sha256")) and before.get(
+        "sha256"
+    ) == after.get("sha256")
     checks_passed = all(
         bool((checks.get(name) or {}).get("passed"))
         for name in (
@@ -1829,7 +1984,7 @@ def capture_qualification_runtime_guard(
     stage: str,
     runtime_environment: dict[str, str] | None = None,
 ) -> dict:
-    expected_gpu = ((provenance.get("gpu") or {}).get("execution_state") or {})
+    expected_gpu = (provenance.get("gpu") or {}).get("execution_state") or {}
     observed_gpu = warm_server_provenance.capture_gpu_execution_state(
         runtime_environment
     )
@@ -1868,7 +2023,9 @@ def nested_value(value: object, path: str) -> object | None:
     return current
 
 
-def timing_counter(timing: dict, key: str, metadata: TimingMetadata = DEFAULT_TIMING_METADATA) -> int:
+def timing_counter(
+    timing: dict, key: str, metadata: TimingMetadata = DEFAULT_TIMING_METADATA
+) -> int:
     group = nested_value(timing, metadata.counter_group)
     if not isinstance(group, dict):
         return 0
@@ -1908,8 +2065,12 @@ def parse_environment_override(value: str, option: str) -> tuple[str, str]:
         raise ValueError(f"{option} must use NAME=VALUE: {value!r}")
     if not ENVIRONMENT_VARIABLE_RE.fullmatch(name):
         raise ValueError(f"{option} variable name is invalid: {name!r}")
-    if any(ord(character) < 32 or ord(character) == 127 for character in configured_value):
-        raise ValueError(f"{option} value contains an unsupported control character: {name!r}")
+    if any(
+        ord(character) < 32 or ord(character) == 127 for character in configured_value
+    ):
+        raise ValueError(
+            f"{option} value contains an unsupported control character: {name!r}"
+        )
     return name, configured_value
 
 
@@ -1939,7 +2100,9 @@ def parse_common_environment_list(values: list[str]) -> tuple[tuple[str, str], .
     return overrides
 
 
-def parse_route_counter_list(values: list[str] | None) -> tuple[RouteCounter, ...] | None:
+def parse_route_counter_list(
+    values: list[str] | None,
+) -> tuple[RouteCounter, ...] | None:
     if values is None:
         return None
     counters = []
@@ -1949,14 +2112,22 @@ def parse_route_counter_list(values: list[str] | None) -> tuple[RouteCounter, ..
 
 
 def resolve_candidate_spec(args: argparse.Namespace) -> CandidateSpec:
-    base = CANDIDATE_CATALOG.get(args.kernel_id) if args.kernel_id is not None else candidate_spec(args.candidate)
+    base = (
+        CANDIDATE_CATALOG.get(args.kernel_id)
+        if args.kernel_id is not None
+        else candidate_spec(args.candidate)
+    )
     required = parse_route_counter_list(args.required_route_counter)
     forbidden = parse_route_counter_list(args.forbidden_route_counter)
     if base is None:
         if args.candidate_environment_variable is None:
-            raise ValueError("uncatalogued kernel ID requires --candidate-environment-variable")
+            raise ValueError(
+                "uncatalogued kernel ID requires --candidate-environment-variable"
+            )
         if not required:
-            raise ValueError("uncatalogued kernel ID requires at least one --required-route-counter")
+            raise ValueError(
+                "uncatalogued kernel ID requires at least one --required-route-counter"
+            )
         return CandidateSpec(
             kernel_id=args.kernel_id,
             environment_variable=args.candidate_environment_variable,
@@ -1965,9 +2136,14 @@ def resolve_candidate_spec(args: argparse.Namespace) -> CandidateSpec:
         )
     return CandidateSpec(
         kernel_id=base.kernel_id,
-        environment_variable=args.candidate_environment_variable or base.environment_variable,
-        required_route_counters=required if required is not None else base.required_route_counters,
-        forbidden_route_counters=forbidden if forbidden is not None else base.forbidden_route_counters,
+        environment_variable=args.candidate_environment_variable
+        or base.environment_variable,
+        required_route_counters=required
+        if required is not None
+        else base.required_route_counters,
+        forbidden_route_counters=forbidden
+        if forbidden is not None
+        else base.forbidden_route_counters,
         required_baseline_route_counters=base.required_baseline_route_counters,
         legacy_kind=base.legacy_kind,
         requires_explicit_model=base.requires_explicit_model,
@@ -2028,9 +2204,7 @@ def resolve_common_environment(
         )
     fixed = dict(spec.fixed_comparison_environment)
     conflicts = sorted(
-        name
-        for name, value in overrides
-        if name in fixed and fixed[name] != value
+        name for name, value in overrides if name in fixed and fixed[name] != value
     )
     if conflicts:
         raise ValueError(
@@ -2118,8 +2292,12 @@ def resolve_capture_kv_capacity(args: argparse.Namespace) -> tuple[int, str]:
             raise ValueError("capture-kv-capacity must be positive")
         return args.capture_kv_capacity, "explicit"
     if not args.lengths or any(length < 1 for length in args.lengths):
-        raise ValueError("output lengths must be positive before resolving capture KV capacity")
-    return max(args.lengths) + DEFAULT_CAPTURE_KV_PROMPT_HEADROOM, "max-output-plus-prompt-headroom"
+        raise ValueError(
+            "output lengths must be positive before resolving capture KV capacity"
+        )
+    return max(
+        args.lengths
+    ) + DEFAULT_CAPTURE_KV_PROMPT_HEADROOM, "max-output-plus-prompt-headroom"
 
 
 def validate_qualification_contract(
@@ -2130,7 +2308,9 @@ def validate_qualification_contract(
     """Keep cataloged fixed-sample evidence from being weakened at invocation time."""
     if spec is None:
         spec = resolve_candidate_spec(args)
-    if spec.require_persistent_replay and getattr(args, "no_require_persistent_replay", False):
+    if spec.require_persistent_replay and getattr(
+        args, "no_require_persistent_replay", False
+    ):
         raise ValueError(f"{spec.kernel_id} requires persistent replay validation")
     if args.qualification_profile == "legacy":
         return
@@ -2147,9 +2327,7 @@ def validate_qualification_contract(
             f"{args.qualification_profile} requires the immutable catalog definition for {spec.kernel_id}; "
             "gate and route-counter overrides are legacy-only"
         )
-    canonical_artifact_check = (
-        SCRIPTS_DIR / "regen-cuda-artifacts.sh"
-    ).resolve()
+    canonical_artifact_check = (SCRIPTS_DIR / "regen-cuda-artifacts.sh").resolve()
     canonical_wrapper = (
         pathlib.Path(__file__).resolve().parent / "with_gemma4_qat_cuda_tuning.sh"
     ).resolve()
@@ -2166,7 +2344,9 @@ def validate_qualification_contract(
             f"{args.qualification_profile} requires the canonical artifact check script "
             f"{canonical_artifact_check}"
         )
-    candidate_overrides = parse_candidate_environment_list(getattr(args, "candidate_env", []))
+    candidate_overrides = parse_candidate_environment_list(
+        getattr(args, "candidate_env", [])
+    )
     if candidate_overrides:
         raise ValueError(
             f"{args.qualification_profile} forbids --candidate-env; cataloged gate values and "
@@ -2174,14 +2354,18 @@ def validate_qualification_contract(
         )
     common_overrides = parse_common_environment_list(getattr(args, "common_env", []))
     allowed_common = {"CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"}
-    unsupported_common = sorted(name for name, _ in common_overrides if name not in allowed_common)
+    unsupported_common = sorted(
+        name for name, _ in common_overrides if name not in allowed_common
+    )
     if unsupported_common:
         raise ValueError(
             f"{args.qualification_profile} permits only GPU-selection variables in --common-env; "
             "unsupported: " + ", ".join(unsupported_common)
         )
     for name, value in common_overrides:
-        if name == "CUDA_VISIBLE_DEVICES" and not re.fullmatch(r"GPU-[0-9A-Fa-f-]+", value):
+        if name == "CUDA_VISIBLE_DEVICES" and not re.fullmatch(
+            r"GPU-[0-9A-Fa-f-]+", value
+        ):
             raise ValueError(
                 f"{args.qualification_profile} requires a full GPU UUID in CUDA_VISIBLE_DEVICES"
             )
@@ -2196,14 +2380,18 @@ def validate_qualification_contract(
         )
 
     profile = QUALIFICATION_PROFILES[args.qualification_profile]
-    if profile["require_locked_prompt_fixture"] and (not args.prompt_fixture or args.prompt):
+    if profile["require_locked_prompt_fixture"] and (
+        not args.prompt_fixture or args.prompt
+    ):
         raise ValueError(
             f"{args.qualification_profile} requires --prompt-fixture and forbids unlocked --prompt cases"
         )
     if not args.require_full_route_coverage:
         raise ValueError(f"{args.qualification_profile} requires full route coverage")
     if args.no_require_persistent_replay:
-        raise ValueError(f"{args.qualification_profile} requires persistent replay validation")
+        raise ValueError(
+            f"{args.qualification_profile} requires persistent replay validation"
+        )
     if args.bootstrap_samples < 10_000:
         raise ValueError(
             f"{args.qualification_profile} requires at least 10000 bootstrap samples"
@@ -2239,9 +2427,13 @@ def validate_qualification_contract(
             f"{spec.kernel_id} qualification requires exactly one locked --prompt-fixture and forbids --prompt"
         )
     if prompt_fixture_metadata is None:
-        prompt_fixture_metadata = [load_prompt_fixture(path)[1] for path in args.prompt_fixture]
+        prompt_fixture_metadata = [
+            load_prompt_fixture(path)[1] for path in args.prompt_fixture
+        ]
     if len(prompt_fixture_metadata) != 1:
-        raise ValueError(f"{spec.kernel_id} qualification requires exactly one prompt fixture")
+        raise ValueError(
+            f"{spec.kernel_id} qualification requires exactly one prompt fixture"
+        )
     fixture = prompt_fixture_metadata[0]
     expected_fixture_fields = {
         "id": workload.fixture_id,
@@ -2302,8 +2494,12 @@ def result_config_metadata(
             "bootstrap_samples": getattr(args, "bootstrap_samples", 10_000),
             "bootstrap_seed": getattr(args, "bootstrap_seed", 20260730),
             "require_phase_metrics": getattr(args, "require_phase_metrics", False),
-            "require_full_route_coverage": getattr(args, "require_full_route_coverage", False),
-            "require_locked_prompt_fixture": getattr(args, "require_locked_prompt_fixture", False),
+            "require_full_route_coverage": getattr(
+                args, "require_full_route_coverage", False
+            ),
+            "require_locked_prompt_fixture": getattr(
+                args, "require_locked_prompt_fixture", False
+            ),
             "strict_provenance_required": (
                 getattr(args, "qualification_profile", "legacy") != "legacy"
             ),
@@ -2347,12 +2543,18 @@ def candidate_metadata(spec: CandidateSpec) -> dict:
         "route_phase": spec.route_phase,
         "route_counter": spec.route_counter,
         "route_counters": [route.name for route in spec.required_route_counters],
-        "required_route_counters": [route.name for route in spec.required_route_counters],
+        "required_route_counters": [
+            route.name for route in spec.required_route_counters
+        ],
         "required_baseline_route_counters": [
             route.name for route in spec.required_baseline_route_counters
         ],
-        "candidate_forbidden_counters": [counter.name for counter in spec.forbidden_route_counters],
-        "forbidden_route_counters": [counter.name for counter in spec.forbidden_route_counters],
+        "candidate_forbidden_counters": [
+            counter.name for counter in spec.forbidden_route_counters
+        ],
+        "forbidden_route_counters": [
+            counter.name for counter in spec.forbidden_route_counters
+        ],
         "requires_explicit_model": spec.requires_explicit_model,
         "require_persistent_replay": spec.require_persistent_replay,
         "qualification_workload": (
@@ -2420,7 +2622,11 @@ def validate_pair(
         errors.append("missing generated token IDs")
     elif baseline_ids != candidate_ids:
         mismatch = next(
-            (index for index, pair in enumerate(zip(baseline_ids, candidate_ids)) if pair[0] != pair[1]),
+            (
+                index
+                for index, pair in enumerate(zip(baseline_ids, candidate_ids))
+                if pair[0] != pair[1]
+            ),
             min(len(baseline_ids), len(candidate_ids)),
         )
         errors.append(f"token IDs differ at index {mismatch}")
@@ -2431,9 +2637,13 @@ def validate_pair(
 
     baseline_prompt_ids = baseline.get("prompt_token_ids") or []
     candidate_prompt_ids = candidate.get("prompt_token_ids") or []
-    if expected_prompt_tokens is not None and (not baseline_prompt_ids or not candidate_prompt_ids):
+    if expected_prompt_tokens is not None and (
+        not baseline_prompt_ids or not candidate_prompt_ids
+    ):
         errors.append("missing prompt token IDs for the locked prompt fixture")
-    elif (baseline_prompt_ids or candidate_prompt_ids) and baseline_prompt_ids != candidate_prompt_ids:
+    elif (
+        baseline_prompt_ids or candidate_prompt_ids
+    ) and baseline_prompt_ids != candidate_prompt_ids:
         errors.append("baseline and candidate prompt token IDs differ")
     if expected_prompt_tokens is not None and (
         len(baseline_prompt_ids) != expected_prompt_tokens
@@ -2447,12 +2657,24 @@ def validate_pair(
     if timing_info.require_persistent_replay:
         for label, timing in (("baseline", baseline), ("candidate", candidate)):
             minimum_replays = max(1, requested_tokens - 8)
-            replays = timing_counter(timing, timing_info.persistent_replay_counter, timing_info)
+            replays = timing_counter(
+                timing, timing_info.persistent_replay_counter, timing_info
+            )
             if replays < minimum_replays:
-                errors.append(f"{label} persistent replays {replays} below {minimum_replays}")
-            if timing_counter(timing, timing_info.graph_discard_counter, timing_info) != 0:
+                errors.append(
+                    f"{label} persistent replays {replays} below {minimum_replays}"
+                )
+            if (
+                timing_counter(timing, timing_info.graph_discard_counter, timing_info)
+                != 0
+            ):
                 errors.append(f"{label} reported graph capture discards")
-            if timing_counter(timing, timing_info.graph_capacity_skip_counter, timing_info) != 0:
+            if (
+                timing_counter(
+                    timing, timing_info.graph_capacity_skip_counter, timing_info
+                )
+                != 0
+            ):
                 errors.append(f"{label} reported graph capacity skips")
 
     for route in spec.required_baseline_route_counters:
@@ -2502,14 +2724,26 @@ def pair_attestation(
         return {
             "required": timing_info.require_persistent_replay,
             "minimum_persistent_replays": minimum_replays,
-            "persistent_replays": timing_counter(timing, timing_info.persistent_replay_counter, timing_info),
-            "discards": timing_counter(timing, timing_info.graph_discard_counter, timing_info),
-            "capacity_skips": timing_counter(timing, timing_info.graph_capacity_skip_counter, timing_info),
+            "persistent_replays": timing_counter(
+                timing, timing_info.persistent_replay_counter, timing_info
+            ),
+            "discards": timing_counter(
+                timing, timing_info.graph_discard_counter, timing_info
+            ),
+            "capacity_skips": timing_counter(
+                timing, timing_info.graph_capacity_skip_counter, timing_info
+            ),
         }
 
-    candidate_replays = timing_counter(candidate, timing_info.persistent_replay_counter, timing_info)
-    candidate_discards = timing_counter(candidate, timing_info.graph_discard_counter, timing_info)
-    candidate_capacity_skips = timing_counter(candidate, timing_info.graph_capacity_skip_counter, timing_info)
+    candidate_replays = timing_counter(
+        candidate, timing_info.persistent_replay_counter, timing_info
+    )
+    candidate_discards = timing_counter(
+        candidate, timing_info.graph_discard_counter, timing_info
+    )
+    candidate_capacity_skips = timing_counter(
+        candidate, timing_info.graph_capacity_skip_counter, timing_info
+    )
     stable_replay_coverage = (
         timing_info.require_persistent_replay
         and candidate_replays >= minimum_replays
@@ -2590,7 +2824,8 @@ def pair_attestation(
             route["route_attested"] for route in required_routes.values()
         ),
         "all_required_baseline_routes_attested": all(
-            route["baseline_route_attested"] for route in required_baseline_routes.values()
+            route["baseline_route_attested"]
+            for route in required_baseline_routes.values()
         ),
     }
 
@@ -2615,26 +2850,38 @@ def run_case(
         "generate",
         str(args.model),
         prompt,
-        "--backend", "cuda",
-        "--combined-budget-mb", "22000",
-        "--backend-budget-mb", "19000",
-        "--kv-budget-mb", "1024",
-        "--scratch-budget-mb", "2048",
-        "--prefill-chunk-size", str(getattr(args, "prefill_chunk_size", 32)),
-        "--max-tokens", str(tokens),
-        "--temperature", "0",
+        "--backend",
+        "cuda",
+        "--combined-budget-mb",
+        "22000",
+        "--backend-budget-mb",
+        "19000",
+        "--kv-budget-mb",
+        "1024",
+        "--scratch-budget-mb",
+        "2048",
+        "--prefill-chunk-size",
+        str(getattr(args, "prefill_chunk_size", 32)),
+        "--max-tokens",
+        str(tokens),
+        "--temperature",
+        "0",
         "--raw-prompt",
         "--no-chat-template",
         "--ignore-eos",
-        "--cache-dtype", getattr(args, "cache_dtype", "f32"),
+        "--cache-dtype",
+        getattr(args, "cache_dtype", "f32"),
         "--print-token-count",
         "--print-prompt-token-ids",
         "--print-token-ids",
         "--print-timing",
-        "--json-timing", str(timing_path),
+        "--json-timing",
+        str(timing_path),
     ]
     env = dict(getattr(args, "qualification_runtime_environment", os.environ))
-    configure_candidate_environment(env, spec, enabled, candidate_environment, common_environment)
+    configure_candidate_environment(
+        env, spec, enabled, candidate_environment, common_environment
+    )
     env[CAPTURE_KV_CAPACITY_ENV] = str(capture_kv_capacity)
     completed = subprocess.run(
         command,
@@ -2648,16 +2895,23 @@ def run_case(
     )
     log_path.write_text(completed.stdout, encoding="utf-8")
     if completed.returncode != 0:
-        raise RuntimeError(f"{mode} command failed with exit {completed.returncode}; see {log_path}")
+        raise RuntimeError(
+            f"{mode} command failed with exit {completed.returncode}; see {log_path}"
+        )
     if not timing_path.is_file():
         raise RuntimeError(f"{mode} command did not write {timing_path}")
     timing = json.loads(timing_path.read_text(encoding="utf-8"))
     token_match = TOKEN_IDS_RE.search(completed.stdout)
-    timing["token_ids"] = [int(value) for value in token_match.group("ids").split()] if token_match else []
+    timing["token_ids"] = (
+        [int(value) for value in token_match.group("ids").split()]
+        if token_match
+        else []
+    )
     prompt_token_match = PROMPT_TOKEN_IDS_RE.search(completed.stdout)
     timing["prompt_token_ids"] = (
         [int(value) for value in prompt_token_match.group("ids").split()]
-        if prompt_token_match else []
+        if prompt_token_match
+        else []
     )
     return timing
 
@@ -2701,7 +2955,9 @@ def _positive_finite_metric(value: object) -> float | None:
 
 
 def timing_latency_metrics(timing: dict) -> dict:
-    timing_ms = timing.get("timing_ms") if isinstance(timing.get("timing_ms"), dict) else {}
+    timing_ms = (
+        timing.get("timing_ms") if isinstance(timing.get("timing_ms"), dict) else {}
+    )
     prefill = _positive_finite_metric(timing_ms.get("prefill_inner"))
     decode = _positive_finite_metric(timing_ms.get("decode_inner"))
     total = _positive_finite_metric(timing_ms.get("generate"))
@@ -2752,7 +3008,9 @@ def paired_latency(baseline: dict, candidate: dict) -> dict:
         candidate_value = arms["candidate"].get(metric)
         ratios[metric] = (
             candidate_value / baseline_value
-            if baseline_value is not None and candidate_value is not None and baseline_value > 0.0
+            if baseline_value is not None
+            and candidate_value is not None
+            and baseline_value > 0.0
             else None
         )
     return {
@@ -2785,7 +3043,9 @@ def summarize_latency_pairs(
     metrics = {}
     for metric_index, metric in enumerate(LATENCY_METRICS):
         baseline_values = [float(pair["latency"]["baseline"][metric]) for pair in pairs]
-        candidate_values = [float(pair["latency"]["candidate"][metric]) for pair in pairs]
+        candidate_values = [
+            float(pair["latency"]["candidate"][metric]) for pair in pairs
+        ]
         metrics[metric] = {
             "baseline": distribution(baseline_values),
             "candidate": distribution(candidate_values),
@@ -2817,7 +3077,11 @@ def latency_promotion_errors(summary: dict, args: argparse.Namespace) -> list[st
         threshold is not None for pair in limits.values() for threshold in pair
     )
     if not summary.get("available"):
-        return ["required TTFT/decode/total timing metrics are unavailable"] if requires_metrics else []
+        return (
+            ["required TTFT/decode/total timing metrics are unavailable"]
+            if requires_metrics
+            else []
+        )
 
     errors: list[str] = []
     for metric, (median_limit, ci_limit) in limits.items():
@@ -2850,7 +3114,9 @@ def flatten_pair_throughputs(items: list[dict]) -> list[dict]:
     flattened = []
     for item in items:
         if item.get("pairs") is not None:
-            flattened.extend(pair.get("paired_throughput", pair) for pair in item["pairs"])
+            flattened.extend(
+                pair.get("paired_throughput", pair) for pair in item["pairs"]
+            )
         else:
             flattened.append(item.get("paired_throughput", item))
     return flattened
@@ -2913,16 +3179,22 @@ def summarize_case(prompt: str, tokens: int, pairs: list[dict]) -> dict:
     }
 
 
-def case_promotion_errors(case: dict, min_candidate_ratio: float, max_cv: float) -> list[str]:
+def case_promotion_errors(
+    case: dict, min_candidate_ratio: float, max_cv: float
+) -> list[str]:
     errors = []
     if case["min_candidate_ratio"] < min_candidate_ratio:
         errors.append(
             f"minimum candidate ratio {case['min_candidate_ratio']:.6f} below {min_candidate_ratio:.6f}"
         )
     if case["baseline_tok_s_cv"] > max_cv:
-        errors.append(f"baseline throughput CV {case['baseline_tok_s_cv']:.6f} above {max_cv:.6f}")
+        errors.append(
+            f"baseline throughput CV {case['baseline_tok_s_cv']:.6f} above {max_cv:.6f}"
+        )
     if case["candidate_tok_s_cv"] > max_cv:
-        errors.append(f"candidate throughput CV {case['candidate_tok_s_cv']:.6f} above {max_cv:.6f}")
+        errors.append(
+            f"candidate throughput CV {case['candidate_tok_s_cv']:.6f} above {max_cv:.6f}"
+        )
     return errors
 
 
@@ -2941,7 +3213,9 @@ def main() -> None:
             args.model_label = args.model.stem
         timing_info = timing_metadata_from_args(args)
         candidate_environment = resolve_candidate_environment(args, spec)
-        common_environment = resolve_common_environment(args, spec, candidate_environment)
+        common_environment = resolve_common_environment(
+            args, spec, candidate_environment
+        )
         capture_kv_capacity = resolve_capture_kv_capacity(args)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
@@ -2961,19 +3235,31 @@ def main() -> None:
         or args.prefill_chunk_size <= 0
         or any(length < 1 for length in args.lengths)
     ):
-        raise SystemExit("timeout, repeats, prefill chunk size, and output lengths must be positive")
+        raise SystemExit(
+            "timeout, repeats, prefill chunk size, and output lengths must be positive"
+        )
     if strict_qualification and args.build_timeout_sec < 1800:
-        raise SystemExit("strict qualification requires --build-timeout-sec of at least 1800 seconds")
+        raise SystemExit(
+            "strict qualification requires --build-timeout-sec of at least 1800 seconds"
+        )
     if strict_qualification and args.artifact_timeout_sec < 1800:
-        raise SystemExit("strict qualification requires --artifact-timeout-sec of at least 1800 seconds")
-    if args.qualification_fixed_samples is not None and args.repeats != args.qualification_fixed_samples:
+        raise SystemExit(
+            "strict qualification requires --artifact-timeout-sec of at least 1800 seconds"
+        )
+    if (
+        args.qualification_fixed_samples is not None
+        and args.repeats != args.qualification_fixed_samples
+    ):
         raise SystemExit(
             f"{args.qualification_profile} qualification requires exactly "
             f"{args.qualification_fixed_samples} paired samples per case"
         )
     if args.bootstrap_samples < 1:
         raise SystemExit("bootstrap-samples must be positive")
-    if args.qualification_profile in {"promotion", "prefill-promotion"} and args.bootstrap_samples < 10_000:
+    if (
+        args.qualification_profile in {"promotion", "prefill-promotion"}
+        and args.bootstrap_samples < 10_000
+    ):
         raise SystemExit(
             f"{args.qualification_profile} qualification requires at least 10000 bootstrap samples"
         )
@@ -2991,7 +3277,9 @@ def main() -> None:
     ):
         value = getattr(args, name)
         if value is not None and (not math.isfinite(value) or value <= 0.0):
-            raise SystemExit(name.replace("_", "-") + " must be a finite positive number")
+            raise SystemExit(
+                name.replace("_", "-") + " must be a finite positive number"
+            )
     if not args.model_label.strip() or not args.config_label.strip():
         raise SystemExit("model-label and config-label must be non-empty")
     try:
@@ -3014,17 +3302,28 @@ def main() -> None:
     args.prompt_contracts = [
         prompt_identity(
             prompt,
-            source=("fixture" if hashlib.sha256(prompt.encode("utf-8")).hexdigest() in fixture_metadata_by_digest else
-                    "explicit" if args.prompt else "default"),
+            source=(
+                "fixture"
+                if hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+                in fixture_metadata_by_digest
+                else "explicit"
+                if args.prompt
+                else "default"
+            ),
             fixture_id=(
-                fixture_metadata_by_digest.get(hashlib.sha256(prompt.encode("utf-8")).hexdigest()) or {}
+                fixture_metadata_by_digest.get(
+                    hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+                )
+                or {}
             ).get("id"),
         )
         for prompt in prompts
     ]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.qualification_profile != "legacy" and any(args.output_dir.iterdir()):
-        raise SystemExit("fixed-sample qualification requires a new empty output directory")
+        raise SystemExit(
+            "fixed-sample qualification requires a new empty output directory"
+        )
     raw_samples_path = args.output_dir / "candidate_samples.jsonl"
     manifest_path = args.output_dir / "evidence_manifest.json"
     raw_samples_path.unlink(missing_ok=True)
@@ -3045,7 +3344,8 @@ def main() -> None:
                     allow_nan=False,
                     indent=2,
                     sort_keys=True,
-                ) + "\n",
+                )
+                + "\n",
                 encoding="utf-8",
             )
             raise SystemExit("\n".join(controlled_release_build["errors"]))
@@ -3057,7 +3357,9 @@ def main() -> None:
     try:
         provenance = qualification_provenance(args, runtime_environment)
     except (OSError, RuntimeError) as exc:
-        raise SystemExit(f"could not collect stable candidate-qualification provenance: {exc}") from exc
+        raise SystemExit(
+            f"could not collect stable candidate-qualification provenance: {exc}"
+        ) from exc
     if strict_qualification:
         preflight_errors = strict_qualification_provenance_errors(provenance)
         if preflight_errors:
@@ -3099,7 +3401,8 @@ def main() -> None:
                     allow_nan=False,
                     indent=2,
                     sort_keys=True,
-                ) + "\n",
+                )
+                + "\n",
                 encoding="utf-8",
             )
             raise SystemExit("\n".join(preflight_errors))
@@ -3119,7 +3422,9 @@ def main() -> None:
         )
         provenance["runtime_guards"].append(guard)
         runtime_guards_path.write_text(
-            json.dumps(provenance["runtime_guards"], allow_nan=False, indent=2, sort_keys=True)
+            json.dumps(
+                provenance["runtime_guards"], allow_nan=False, indent=2, sort_keys=True
+            )
             + "\n",
             encoding="utf-8",
         )
@@ -3179,7 +3484,9 @@ def main() -> None:
                 )
                 pair = {
                     "repetition": repetition + 1,
-                    "execution_order": ["candidate" if enabled else "baseline" for enabled in order],
+                    "execution_order": [
+                        "candidate" if enabled else "baseline" for enabled in order
+                    ],
                     **throughput,
                     "paired_throughput": throughput,
                     "latency": latency,
@@ -3189,7 +3496,8 @@ def main() -> None:
                         if strict_qualification
                         else None
                     ),
-                    "token_ids_equal": (baseline.get("token_ids") or []) == (candidate.get("token_ids") or []),
+                    "token_ids_equal": (baseline.get("token_ids") or [])
+                    == (candidate.get("token_ids") or []),
                     "errors": errors,
                 }
                 pairs.append(pair)
@@ -3204,9 +3512,15 @@ def main() -> None:
                     "candidate": candidate,
                 }
                 with raw_samples_path.open("a", encoding="utf-8") as output:
-                    output.write(json.dumps(raw_sample, sort_keys=True, allow_nan=False) + "\n")
+                    output.write(
+                        json.dumps(raw_sample, sort_keys=True, allow_nan=False) + "\n"
+                    )
                 validation_failures.extend(f"{pair_stem}: {error}" for error in errors)
-                candidate_name = spec.legacy_kind.value if spec.legacy_kind is not None else spec.kernel_id
+                candidate_name = (
+                    spec.legacy_kind.value
+                    if spec.legacy_kind is not None
+                    else spec.kernel_id
+                )
                 print(
                     f"candidate_parity kind={candidate_name} kernel_id={spec.kernel_id} tokens={tokens} "
                     f"repeat={repetition + 1}/{args.repeats} order={','.join(pair['execution_order'])} "
@@ -3229,13 +3543,17 @@ def main() -> None:
             ]
             case["checks"] = {
                 "validation": not case["errors"],
-                "candidate_ratio": case["min_candidate_ratio"] >= args.min_candidate_ratio,
-                "stability": case["baseline_tok_s_cv"] <= args.max_cv and case["candidate_tok_s_cv"] <= args.max_cv,
+                "candidate_ratio": case["min_candidate_ratio"]
+                >= args.min_candidate_ratio,
+                "stability": case["baseline_tok_s_cv"] <= args.max_cv
+                and case["candidate_tok_s_cv"] <= args.max_cv,
                 "phase_latency": not latency_errors,
             }
             case["passed"] = all(case["checks"].values())
             cases.append(case)
-            promotion_failures.extend(f"{stem}: {error}" for error in case["promotion_errors"])
+            promotion_failures.extend(
+                f"{stem}: {error}" for error in case["promotion_errors"]
+            )
 
     try:
         post_run_provenance = qualification_provenance(args, runtime_environment)
@@ -3253,8 +3571,13 @@ def main() -> None:
         post_run_provenance is not None
         and post_run_provenance.get("sha256") == provenance.get("sha256")
     )
-    if post_run_provenance is not None and not provenance["unchanged_during_qualification"]:
-        validation_failures.append("candidate qualification inputs changed during the benchmark")
+    if (
+        post_run_provenance is not None
+        and not provenance["unchanged_during_qualification"]
+    ):
+        validation_failures.append(
+            "candidate qualification inputs changed during the benchmark"
+        )
     if strict_qualification:
         post_artifact_sha256 = (
             (post_run_provenance.get("cuda_artifacts") or {}).get("sha256")
@@ -3272,14 +3595,16 @@ def main() -> None:
             and freshness["artifacts_unchanged_during_qualification"]
         )
         if not freshness["artifacts_unchanged_during_qualification"]:
-            validation_failures.append("CUDA qualification artifacts changed during the benchmark")
+            validation_failures.append(
+                "CUDA qualification artifacts changed during the benchmark"
+            )
         provenance["post_run_binding"] = (
             {
                 "sha256": post_run_provenance.get("sha256"),
                 "git_sha256": (post_run_provenance.get("git") or {}).get("sha256"),
-                "toolchains_sha256": (
-                    post_run_provenance.get("toolchains") or {}
-                ).get("sha256"),
+                "toolchains_sha256": (post_run_provenance.get("toolchains") or {}).get(
+                    "sha256"
+                ),
                 "gpu_sha256": (post_run_provenance.get("gpu") or {}).get("sha256"),
                 "cuda_artifacts_sha256": post_artifact_sha256,
             }
@@ -3322,7 +3647,10 @@ def main() -> None:
             "phase_latency": all(case["checks"]["phase_latency"] for case in cases),
             "fixed_sample_count": (
                 args.qualification_fixed_samples is None
-                or all(case["repeats"] == args.qualification_fixed_samples for case in cases)
+                or all(
+                    case["repeats"] == args.qualification_fixed_samples
+                    for case in cases
+                )
             ),
             "strict_provenance": (
                 not strict_qualification
@@ -3350,9 +3678,14 @@ def main() -> None:
         "failures": failures,
     }
     summary_path = args.output_dir / "candidate_summary.json"
-    summary_path.write_text(json.dumps(summary, allow_nan=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    summary_path.write_text(
+        json.dumps(summary, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     manifest = write_evidence_manifest(args.output_dir, manifest_path)
-    candidate_name = spec.legacy_kind.value if spec.legacy_kind is not None else spec.kernel_id
+    candidate_name = (
+        spec.legacy_kind.value if spec.legacy_kind is not None else spec.kernel_id
+    )
     print(
         f"candidate_parity kind={candidate_name} kernel_id={spec.kernel_id} "
         f"model={args.model_label} config={args.config_label} passed={str(not failures).lower()} "

@@ -137,7 +137,9 @@ class ResourceMonitorTests(unittest.TestCase):
         monitor.stop()
         with self.assertRaisesRegex(acceptance.AcceptanceError, "fell below"):
             monitor.check()
-        killpg.assert_called_once_with(self.RunningProcess.pid, acceptance.signal.SIGTERM)
+        killpg.assert_called_once_with(
+            self.RunningProcess.pid, acceptance.signal.SIGTERM
+        )
 
     @mock.patch.object(acceptance.os, "killpg")
     @mock.patch.object(
@@ -163,14 +165,14 @@ class ResourceMonitorTests(unittest.TestCase):
         monitor.stop()
         with self.assertRaisesRegex(acceptance.AcceptanceError, "failed closed"):
             monitor.check()
-        killpg.assert_called_once_with(self.RunningProcess.pid, acceptance.signal.SIGTERM)
+        killpg.assert_called_once_with(
+            self.RunningProcess.pid, acceptance.signal.SIGTERM
+        )
 
 
 class ContractTests(unittest.TestCase):
     def test_short_serial_oracle_never_self_promotes_to_release_ready(self) -> None:
-        qualification = acceptance.release_qualification(
-            semantic_oracle_attested=True
-        )
+        qualification = acceptance.release_qualification(semantic_oracle_attested=True)
         self.assertFalse(qualification["release_ready"])
         self.assertTrue(qualification["semantic_oracle_attested"])
         self.assertEqual("short_serial_acceptance", qualification["scope"])
@@ -184,7 +186,9 @@ class ContractTests(unittest.TestCase):
             binary.touch()
             model_dir = tmp / "model"
             model_dir.mkdir()
-            with mock.patch.object(acceptance.platform, "system", return_value="Darwin"):
+            with mock.patch.object(
+                acceptance.platform, "system", return_value="Darwin"
+            ):
                 args = acceptance.parse_args(
                     [
                         "--antfly-bin",
@@ -204,7 +208,9 @@ class ContractTests(unittest.TestCase):
             binary.touch()
             model_dir = tmp / "model"
             model_dir.mkdir()
-            with mock.patch.object(acceptance.platform, "system", return_value="Darwin"):
+            with mock.patch.object(
+                acceptance.platform, "system", return_value="Darwin"
+            ):
                 args = acceptance.parse_args(
                     [
                         "--antfly-bin",
@@ -271,9 +277,7 @@ class ContractTests(unittest.TestCase):
             residency_mode="streamed",
             memory_budget_mb=2048,
         )
-        self.assertEqual(
-            1, config["admission"]["inference"]["max_concurrent_requests"]
-        )
+        self.assertEqual(1, config["admission"]["inference"]["max_concurrent_requests"])
         self.assertEqual("off", config["generation_batching"]["mode"])
         self.assertFalse(config["prompt_cache"]["enabled"])
         self.assertEqual(
@@ -340,9 +344,7 @@ class ContractTests(unittest.TestCase):
 
     def test_natural_eos_response_accepts_short_stop_and_rejects_length(self) -> None:
         response = {
-            "choices": [
-                {"message": {"content": "Paris"}, "finish_reason": "stop"}
-            ],
+            "choices": [{"message": {"content": "Paris"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 12, "completion_tokens": 2},
         }
         summary = acceptance.summarize_response(
@@ -380,9 +382,7 @@ class ContractTests(unittest.TestCase):
         )
         self.assertEqual(2, len(result["measured_events"]))
         self.assertEqual(457, result["measured_events"][0]["frame_submits"])
-        self.assertEqual(
-            7.0, result["generation_timings_ms"][0]["decode_tok_s"]
-        )
+        self.assertEqual(7.0, result["generation_timings_ms"][0]["decode_tok_s"])
 
     def test_selected_page_moe_requires_bounded_no_copy_marker(self) -> None:
         result = acceptance.validate_server_log(
@@ -402,9 +402,7 @@ class ContractTests(unittest.TestCase):
         )
         self.assertEqual(16, result["selected_page_moe"]["allocations"])
         self.assertEqual(0, result["selected_page_moe"]["weight_copies"])
-        self.assertEqual(
-            120, result["measured_events"][0]["selected_page_successes"]
-        )
+        self.assertEqual(120, result["measured_events"][0]["selected_page_successes"])
 
     def test_selected_page_moe_requires_request_scoped_success(self) -> None:
         with self.assertRaisesRegex(
@@ -449,9 +447,7 @@ class ContractTests(unittest.TestCase):
             )
 
     def test_selected_page_moe_rejects_request_accounting_mismatch(self) -> None:
-        bad = SELECTED_PAGE_TELEMETRY.replace(
-            "allocations=1920", "allocations=1919"
-        )
+        bad = SELECTED_PAGE_TELEMETRY.replace("allocations=1920", "allocations=1919")
         with self.assertRaisesRegex(
             acceptance.AcceptanceError, "selected-expert page MoE telemetry"
         ):
@@ -466,7 +462,9 @@ class ContractTests(unittest.TestCase):
             )
 
     def test_unrequested_selected_page_request_telemetry_is_rejected(self) -> None:
-        with self.assertRaisesRegex(acceptance.AcceptanceError, "explicit harness request"):
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "explicit harness request"
+        ):
             acceptance.validate_server_log(
                 RUNTIME + "\n" + GOOD_TIMING + "\n" + SELECTED_PAGE_TELEMETRY,
                 residency_mode="streamed",
@@ -489,9 +487,17 @@ class ContractTests(unittest.TestCase):
             )
 
     def test_selected_page_moe_unrequested_marker_is_rejected(self) -> None:
-        with self.assertRaisesRegex(acceptance.AcceptanceError, "explicit harness request"):
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "explicit harness request"
+        ):
             acceptance.validate_server_log(
-                RUNTIME + "\n" + SELECTED_PAGE_MOE + "\n" + GOOD_TIMING + "\n" + GOOD_TELEMETRY,
+                RUNTIME
+                + "\n"
+                + SELECTED_PAGE_MOE
+                + "\n"
+                + GOOD_TIMING
+                + "\n"
+                + GOOD_TELEMETRY,
                 residency_mode="streamed",
                 memory_budget_mb=2048,
                 output_tokens=8,
@@ -535,10 +541,9 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(30, result["measured_events"][0]["slot_upload_batches"])
 
     def test_host_route_selection_rollback_is_attested(self) -> None:
-        host_routes = (
-            GOOD_TELEMETRY.replace("route_select_successes=120", "route_select_successes=0")
-            .replace("route_select_fallbacks=0", "route_select_fallbacks=120")
-        )
+        host_routes = GOOD_TELEMETRY.replace(
+            "route_select_successes=120", "route_select_successes=0"
+        ).replace("route_select_fallbacks=0", "route_select_fallbacks=120")
         result = acceptance.validate_server_log(
             RUNTIME + "\n" + GOOD_TIMING + "\n" + host_routes,
             residency_mode="streamed",
@@ -548,9 +553,7 @@ class ContractTests(unittest.TestCase):
             max_frame_submits=520,
             require_device_route_select=False,
         )
-        self.assertEqual(
-            120, result["measured_events"][0]["route_select_fallbacks"]
-        )
+        self.assertEqual(120, result["measured_events"][0]["route_select_fallbacks"])
 
     def test_eager_route_counters_are_rejected(self) -> None:
         bad = GOOD_TELEMETRY.replace("linear_attempts=0", "linear_attempts=1")
@@ -642,9 +645,7 @@ class ContractTests(unittest.TestCase):
             max_frame_submits=520,
             completion_token_counts=[3],
         )
-        self.assertEqual(
-            2.0, result["generation_timings_ms"][0]["decode_tok_s"]
-        )
+        self.assertEqual(2.0, result["generation_timings_ms"][0]["decode_tok_s"])
 
 
 if __name__ == "__main__":

@@ -212,16 +212,34 @@ class EmbedderConfig:
                   "multimodal": true
                 }
                 ```
+            query_input_type (str | Unset): Advanced override for the provider-specific retrieval-query task type.
+                Antfly normally derives this automatically from semantic-search operations
+                (for example `search_query` for Cohere and Bedrock Cohere models).
+            document_input_type (str | Unset): Advanced override for the provider-specific retrieval-document task type.
+                Antfly normally derives this automatically for index and artifact writes
+                (for example `search_document` for Cohere and Bedrock Cohere models).
+            query_instruction (str | Unset): Optional retrieval instruction sent only for query embeddings to
+                instruction-aware models such as Qwen3-Embedding. It is never applied
+                while indexing documents.
     """
 
     provider: EmbedderProvider
     multimodal: bool | Unset = UNSET
+    query_input_type: str | Unset = UNSET
+    document_input_type: str | Unset = UNSET
+    query_instruction: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         provider = self.provider.value
 
         multimodal = self.multimodal
+
+        query_input_type = self.query_input_type
+
+        document_input_type = self.document_input_type
+
+        query_instruction = self.query_instruction
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -232,6 +250,12 @@ class EmbedderConfig:
         )
         if multimodal is not UNSET:
             field_dict["multimodal"] = multimodal
+        if query_input_type is not UNSET:
+            field_dict["query_input_type"] = query_input_type
+        if document_input_type is not UNSET:
+            field_dict["document_input_type"] = document_input_type
+        if query_instruction is not UNSET:
+            field_dict["query_instruction"] = query_instruction
 
         return field_dict
 
@@ -242,9 +266,18 @@ class EmbedderConfig:
 
         multimodal = d.pop("multimodal", UNSET)
 
+        query_input_type = d.pop("query_input_type", UNSET)
+
+        document_input_type = d.pop("document_input_type", UNSET)
+
+        query_instruction = d.pop("query_instruction", UNSET)
+
         embedder_config = cls(
             provider=provider,
             multimodal=multimodal,
+            query_input_type=query_input_type,
+            document_input_type=document_input_type,
+            query_instruction=query_instruction,
         )
 
         embedder_config.additional_properties = d

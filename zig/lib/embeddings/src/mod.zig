@@ -34,6 +34,9 @@ pub const Config = struct {
     dimension: ?u32 = null,
     dimensions: ?u32 = null,
     input_type: []const u8 = "",
+    query_input_type: []const u8 = "",
+    document_input_type: []const u8 = "",
+    query_instruction: []const u8 = "",
     truncate: []const u8 = "",
     batch_size: ?u32 = null,
     strip_new_lines: ?bool = null,
@@ -53,6 +56,9 @@ pub const Config = struct {
             .dimension = self.dimension,
             .dimensions = self.dimensions,
             .input_type = if (self.input_type.len > 0) try alloc.dupe(u8, self.input_type) else "",
+            .query_input_type = if (self.query_input_type.len > 0) try alloc.dupe(u8, self.query_input_type) else "",
+            .document_input_type = if (self.document_input_type.len > 0) try alloc.dupe(u8, self.document_input_type) else "",
+            .query_instruction = if (self.query_instruction.len > 0) try alloc.dupe(u8, self.query_instruction) else "",
             .truncate = if (self.truncate.len > 0) try alloc.dupe(u8, self.truncate) else "",
             .batch_size = self.batch_size,
             .strip_new_lines = self.strip_new_lines,
@@ -70,6 +76,9 @@ pub const Config = struct {
         if (self.credentials_path.len > 0) alloc.free(self.credentials_path);
         if (self.region.len > 0) alloc.free(self.region);
         if (self.input_type.len > 0) alloc.free(self.input_type);
+        if (self.query_input_type.len > 0) alloc.free(self.query_input_type);
+        if (self.document_input_type.len > 0) alloc.free(self.document_input_type);
+        if (self.query_instruction.len > 0) alloc.free(self.query_instruction);
         if (self.truncate.len > 0) alloc.free(self.truncate);
         self.* = undefined;
     }
@@ -147,6 +156,9 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
         else
             null,
         .input_type = if (generated.input_type) |input_type| try alloc.dupe(u8, input_type) else "",
+        .query_input_type = if (generated.query_input_type) |value| try alloc.dupe(u8, value) else "",
+        .document_input_type = if (generated.document_input_type) |value| try alloc.dupe(u8, value) else "",
+        .query_instruction = if (generated.query_instruction) |value| try alloc.dupe(u8, value) else "",
         .truncate = if (generated.truncate) |truncate| try alloc.dupe(u8, truncate) else "",
         .batch_size = if (generated.batch_size) |batch_size|
             std.math.cast(u32, batch_size) orelse return error.InvalidEmbedderConfig
@@ -181,6 +193,9 @@ pub fn openApiFromConfig(cfg: Config) openapi.EmbedderConfig {
         .dimension = if (cfg.dimension) |dimension| dimension else null,
         .dimensions = if (cfg.dimensions) |dimensions| dimensions else null,
         .input_type = if (cfg.input_type.len > 0) cfg.input_type else null,
+        .query_input_type = if (cfg.query_input_type.len > 0) cfg.query_input_type else null,
+        .document_input_type = if (cfg.document_input_type.len > 0) cfg.document_input_type else null,
+        .query_instruction = if (cfg.query_instruction.len > 0) cfg.query_instruction else null,
         .truncate = if (cfg.truncate.len > 0) cfg.truncate else null,
         .batch_size = if (cfg.batch_size) |batch_size| batch_size else null,
         .strip_new_lines = cfg.strip_new_lines,
@@ -199,7 +214,7 @@ fn validBedrockRequestFormat(value: []const u8) bool {
 test "embedder config round trip" {
     const alloc = std.testing.allocator;
     const raw =
-        \\{"provider":"openai","model":"text-embedding-3-small","url":"https://api.openai.com","api_key":"sk-test","dimensions":1536}
+        \\{"provider":"openai","model":"text-embedding-3-small","url":"https://api.openai.com","api_key":"sk-test","dimensions":1536,"query_input_type":"search_query","document_input_type":"search_document","query_instruction":"retrieve relevant passages"}
     ;
     var cfg = try parseConfigFromSlice(alloc, raw);
     defer cfg.deinit(alloc);
@@ -208,6 +223,9 @@ test "embedder config round trip" {
     try std.testing.expectEqualStrings("text-embedding-3-small", cfg.model);
     try std.testing.expectEqualStrings("https://api.openai.com", cfg.url);
     try std.testing.expectEqual(@as(?u32, 1536), cfg.dimensions);
+    try std.testing.expectEqualStrings("search_query", cfg.query_input_type);
+    try std.testing.expectEqualStrings("search_document", cfg.document_input_type);
+    try std.testing.expectEqualStrings("retrieve relevant passages", cfg.query_instruction);
 
     const encoded = try stringifyAlloc(alloc, cfg);
     defer alloc.free(encoded);
@@ -215,6 +233,9 @@ test "embedder config round trip" {
     defer reparsed.deinit(alloc);
     try std.testing.expectEqual(.openai, reparsed.provider);
     try std.testing.expectEqualStrings("text-embedding-3-small", reparsed.model);
+    try std.testing.expectEqualStrings("search_query", reparsed.query_input_type);
+    try std.testing.expectEqualStrings("search_document", reparsed.document_input_type);
+    try std.testing.expectEqualStrings("retrieve relevant passages", reparsed.query_instruction);
 }
 
 test "embedder config supports antfly api_url normalization" {

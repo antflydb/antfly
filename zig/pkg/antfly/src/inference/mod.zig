@@ -114,6 +114,10 @@ test "managed embedder normalizes local admission overload across embedding mode
     try managed_embedder.testLocalAdmissionOverloadNormalization();
 }
 
+test "managed embedder routes query and document embedding tasks" {
+    try managed_embedder.testEmbeddingTaskRouting();
+}
+
 test "query embedding cache owns results and coalesces misses" {
     try query_embedding_cache.testOwnedValuesAndHits();
     try query_embedding_cache.testConcurrentCoalescing();

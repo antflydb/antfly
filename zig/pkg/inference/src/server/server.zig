@@ -3633,7 +3633,32 @@ pub const Node = struct {
         model_name: []const u8,
         texts: []const []const u8,
     ) ![][]f32 {
+        return self.embedDenseTextsDirectWithContextAndTask(
+            allocator,
+            io,
+            deadline_ns,
+            model_name,
+            texts,
+            null,
+            null,
+        );
+    }
+
+    pub fn embedDenseTextsDirectWithContextAndTask(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        deadline_ns: ?u64,
+        model_name: []const u8,
+        texts: []const []const u8,
+        task_type_name: ?[]const u8,
+        instruction: ?[]const u8,
+    ) ![][]f32 {
         if (texts.len == 0) return try allocator.alloc([]f32, 0);
+        const task_type = if (task_type_name) |name|
+            parseEmbeddingTaskType(name) orelse return error.UnsupportedEmbeddingTaskType
+        else
+            EmbeddingTaskType.RETRIEVAL_DOCUMENT;
         try ensureDirectEmbeddingDeadline(deadline_ns);
         try self.acquireAdmissionUnits(1);
         defer self.releaseAdmission();
@@ -3651,6 +3676,8 @@ pub const Node = struct {
             allocator: std.mem.Allocator,
             deadline_ns: ?u64,
             texts: []const []const u8,
+            task_type: EmbeddingTaskType,
+            instruction: ?[]const u8,
             vectors: ?[][]f32 = null,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
@@ -3663,6 +3690,8 @@ pub const Node = struct {
                     attempt.deadline_ns,
                     model,
                     attempt.texts,
+                    attempt.task_type,
+                    attempt.instruction,
                 );
                 asset_lease.release();
                 errdefer freeDirectDenseVectors(attempt.allocator, vectors);
@@ -3674,6 +3703,8 @@ pub const Node = struct {
             .allocator = allocator,
             .deadline_ns = deadline_ns,
             .texts = texts,
+            .task_type = task_type,
+            .instruction = instruction,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
         return attempt.vectors.?;
@@ -3684,10 +3715,21 @@ pub const Node = struct {
         deadline_ns: ?u64,
         model: *model_manager_mod.LoadedModel,
         texts: []const []const u8,
+        task_type: EmbeddingTaskType,
+        instruction: ?[]const u8,
     ) ![][]f32 {
         try model.ensureEmbeddingAssets(true, false, false);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         var pipeline = model.embeddingPipeline(allocator);
+        const owned_prefix = try applyDenseEmbeddingRequestOptions(allocator, &pipeline, &model.manifest, .{
+            .model = "",
+            .input = .null,
+            .encoding_format = null,
+            .dimensions = null,
+            .task_type = task_type,
+            .instruction = instruction,
+        });
+        defer if (owned_prefix) |prefix| allocator.free(prefix);
         return pipeline.embed(texts);
     }
 
@@ -4552,6 +4594,8 @@ pub const Node = struct {
             &parsed,
             &reserved_units,
             deadline_ns,
+            .RETRIEVAL_DOCUMENT,
+            null,
         );
     }
 
@@ -4574,8 +4618,34 @@ pub const Node = struct {
         model_name: []const u8,
         parts: []const DirectDenseEmbedPart,
     ) ![][]f32 {
+        return self.embedDensePartsDirectWithContextAndTask(
+            allocator,
+            io,
+            deadline_ns,
+            model_name,
+            parts,
+            null,
+            null,
+        );
+    }
+
+    pub fn embedDensePartsDirectWithContextAndTask(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        deadline_ns: ?u64,
+        model_name: []const u8,
+        parts: []const DirectDenseEmbedPart,
+        task_type_raw: ?[]const u8,
+        instruction: ?[]const u8,
+    ) ![][]f32 {
         if (parts.len == 0) return try allocator.alloc([]f32, 0);
         try ensureDirectEmbeddingDeadline(deadline_ns);
+
+        const task_type = if (task_type_raw) |raw|
+            parseEmbeddingTaskType(raw) orelse return error.UnsupportedEmbeddingTaskType
+        else
+            EmbeddingTaskType.RETRIEVAL_DOCUMENT;
 
         const preflight = try directDenseEmbedPreflight(parts);
         const media_admission = requestMediaAdmission(self, preflight.shape);
@@ -4626,6 +4696,8 @@ pub const Node = struct {
             &parsed,
             &reserved_units,
             deadline_ns,
+            task_type,
+            instruction,
         );
     }
 
@@ -4637,6 +4709,8 @@ pub const Node = struct {
         parsed: *ParsedDenseEmbedInputs,
         reserved_units: *usize,
         deadline_ns: ?u64,
+        task_type: EmbeddingTaskType,
+        instruction: ?[]const u8,
     ) ![][]f32 {
         if (parsed.total_count == 0) return try allocator.alloc([]f32, 0);
         try ensureDirectEmbeddingDeadline(deadline_ns);
@@ -4664,6 +4738,8 @@ pub const Node = struct {
             parsed: *ParsedDenseEmbedInputs,
             audio_decode_working_bytes: usize,
             deadline_ns: ?u64,
+            task_type: EmbeddingTaskType,
+            instruction: ?[]const u8,
             vectors: ?[][]f32 = null,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
@@ -4674,6 +4750,15 @@ pub const Node = struct {
                 try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
                 var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.parsed);
                 pipeline.config.max_audio_decode_working_bytes = attempt.audio_decode_working_bytes;
+                const owned_prefix = try applyDenseEmbeddingRequestOptions(attempt.allocator, &pipeline, &model.manifest, .{
+                    .model = "",
+                    .input = .null,
+                    .encoding_format = null,
+                    .dimensions = null,
+                    .task_type = attempt.task_type,
+                    .instruction = attempt.instruction,
+                });
+                defer if (owned_prefix) |prefix| attempt.allocator.free(prefix);
                 var audio_asset_guard = AudioEmbeddingAssetGuard.init(
                     model,
                     attempt.parsed.audio.items.len > 0,
@@ -4698,6 +4783,8 @@ pub const Node = struct {
             .parsed = parsed,
             .audio_decode_working_bytes = audio_decode_working_bytes,
             .deadline_ns = deadline_ns,
+            .task_type = task_type,
+            .instruction = instruction,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
         return attempt.vectors.?;
@@ -5282,8 +5369,10 @@ pub const Node = struct {
     /// Always returns memory owned by `self.allocator`; the caller must free it.
     pub fn resolveModelPath(self: *Node, io: std.Io, name: ?[]const u8, task_type: ?[]const u8) ![]const u8 {
         if (name) |raw| {
-            // Strip "hf:" prefix if present
-            const n = if (std.mem.startsWith(u8, raw, "hf:")) raw[3..] else raw;
+            // Resolve qualified production aliases before deriving the stable
+            // variant install path, then strip the optional Hub prefix.
+            const resolved_ref = registry_mod.resolveFriendlyRef(raw) orelse raw;
+            const n = if (std.mem.startsWith(u8, resolved_ref, "hf:")) resolved_ref[3..] else resolved_ref;
 
             // Explicit Hub variants installed by the registry live in stable,
             // variant-specific leaf directories. Resolve that identity before
@@ -16988,6 +17077,13 @@ test "HTTP model resolution is canonical and contained while trusted resolution 
     const explicit_variant_config = try std.fs.path.join(alloc, &.{ explicit_variant_root, "config.json" });
     defer alloc.free(explicit_variant_config);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = explicit_variant_config, .data = "{}" });
+    const bge_ref = try registry_mod.ModelRef.parse(registry_mod.bge_m3_pinned_ref);
+    const bge_variant_root = try registry_mod.modelInstallDirAlloc(alloc, models_root, bge_ref);
+    defer alloc.free(bge_variant_root);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, bge_variant_root);
+    const bge_variant_config = try std.fs.path.join(alloc, &.{ bge_variant_root, "config.json" });
+    defer alloc.free(bge_variant_config);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = bge_variant_config, .data = "{}" });
 
     var node: Node = undefined;
     node.config = .{ .models_dir = models_root };
@@ -17002,6 +17098,9 @@ test "HTTP model resolution is canonical and contained while trusted resolution 
     const explicit_resolved = try node.resolveRequestModelPath(request_allocator, std.testing.io, "owner/model:gguf:Q4_K_M", "generators");
     defer request_allocator.free(explicit_resolved);
     try std.testing.expectEqualStrings(explicit_variant_root, explicit_resolved);
+    const bge_resolved = try node.resolveRequestModelPath(request_allocator, std.testing.io, "BAAI/bge-m3", "embedders");
+    defer request_allocator.free(bge_resolved);
+    try std.testing.expectEqualStrings(bge_variant_root, bge_resolved);
     const trusted_resolved = try node.resolveModelPath(std.testing.io, model_root, "generators");
     defer alloc.free(trusted_resolved);
     try std.testing.expectEqualStrings(model_root, trusted_resolved);
@@ -17859,8 +17958,8 @@ fn embedRequestParseErrorMessage(err: anyerror) []const u8 {
     };
 }
 
-/// Configure query/document prefixes for last-token decoder embedders
-/// (Jina v5, Qwen3-Embedding) from the manifest and request. Returns an
+/// Configure query/document prefixes from the model-owned embedding task
+/// profile (including Jina, Qwen3-Embedding, and Nomic). Returns an
 /// owned prefix buffer when a per-request instruction was rendered; the
 /// caller must keep it alive for the pipeline run and free it afterwards.
 fn applyDenseEmbeddingRequestOptions(
@@ -17869,15 +17968,15 @@ fn applyDenseEmbeddingRequestOptions(
     manifest: *const manifest_mod.ModelManifest,
     request: ParsedEmbedRequest,
 ) !?[]u8 {
-    if (!manifest.isLastTokenDecoderEmbedder()) {
+    if (!manifest.hasEmbeddingTaskProfile()) {
         if (request.instruction != null) return error.InstructionNotSupportedForModel;
         return null;
     }
 
-    // Manifests written before embedding_style existed match the legacy
-    // Jina heuristic; treat them as Jina v5.
+    // Manifests written before embedding_style existed can still match the
+    // legacy Jina heuristic. Prefix-only encoder profiles keep style .none.
     const style: manifest_mod.EmbeddingStyle = if (manifest.embedding_style == .none)
-        .jina_v5
+        if (manifest.isLastTokenDecoderEmbedder()) .jina_v5 else .none
     else
         manifest.embedding_style;
 
@@ -19157,6 +19256,35 @@ test "instruction is rejected for non-instruction models" {
         error.InstructionNotSupportedForModel,
         applyDenseEmbeddingRequestOptions(allocator, &pipeline, &manifest, request),
     );
+}
+
+test "prefix-only encoder embedding profiles switch query and document roles" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+    manifest.embedding_query_prefix = try allocator.dupe(u8, "search_query: ");
+    manifest.embedding_text_prefix = try allocator.dupe(u8, "search_document: ");
+
+    var pipeline = embedding_mod.EmbeddingPipeline{
+        .allocator = allocator,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{},
+    };
+    const base_request = ParsedEmbedRequest{
+        .model = "nomic-embed-text-v1.5",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task_type = .RETRIEVAL_QUERY,
+    };
+    try applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, base_request);
+    try std.testing.expectEqualStrings("search_query: ", pipeline.config.text_prefix);
+
+    var document_request = base_request;
+    document_request.task_type = .RETRIEVAL_DOCUMENT;
+    try applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, document_request);
+    try std.testing.expectEqualStrings("search_document: ", pipeline.config.text_prefix);
 }
 
 test "jina embedding request options switch query and document prefixes" {

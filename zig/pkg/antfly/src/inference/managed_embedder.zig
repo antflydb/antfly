@@ -61,10 +61,34 @@ pub const ProviderKind = enum {
     antfly,
 };
 
+/// Antfly assigns retrieval roles from the operation: artifact/index writes
+/// are documents and semantic-search inputs are queries. Provider adapters
+/// translate these canonical roles to their wire-specific spelling.
+pub const EmbeddingTaskType = enum {
+    retrieval_query,
+    retrieval_document,
+
+    pub fn canonical(self: EmbeddingTaskType) []const u8 {
+        return switch (self) {
+            .retrieval_query => "RETRIEVAL_QUERY",
+            .retrieval_document => "RETRIEVAL_DOCUMENT",
+        };
+    }
+
+    pub fn cohereInputType(self: EmbeddingTaskType) []const u8 {
+        return switch (self) {
+            .retrieval_query => "search_query",
+            .retrieval_document => "search_document",
+        };
+    }
+};
+
 pub const EmbeddingRequestContext = struct {
     io: std.Io,
     deadline_ns: ?u64,
     cancellation: ?CancellationToken = null,
+    task_type: EmbeddingTaskType = .retrieval_document,
+    instruction: ?[]const u8 = null,
 
     pub fn check(self: EmbeddingRequestContext) !void {
         if (self.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
@@ -412,6 +436,11 @@ pub const ManagedEmbeddingEntry = struct {
     region: []u8 = "",
     bedrock_request_format: bedrock_provider.RequestFormat = .auto,
     input_type: []u8 = "",
+    /// Advanced provider overrides. When omitted, Antfly derives these from
+    /// whether it is embedding an indexed document or a search query.
+    query_input_type: []u8 = "",
+    document_input_type: []u8 = "",
+    query_instruction: []u8 = "",
     truncate: []u8 = "",
     bedrock_credentials: bedrock_provider.CredentialCache = .{},
     api_key: ?common_secrets.SecretValue = null,
@@ -438,6 +467,9 @@ pub const ManagedEmbeddingEntry = struct {
         alloc.free(self.base_url);
         if (self.region.len > 0) alloc.free(self.region);
         if (self.input_type.len > 0) alloc.free(self.input_type);
+        if (self.query_input_type.len > 0) alloc.free(self.query_input_type);
+        if (self.document_input_type.len > 0) alloc.free(self.document_input_type);
+        if (self.query_instruction.len > 0) alloc.free(self.query_instruction);
         if (self.truncate.len > 0) alloc.free(self.truncate);
         self.bedrock_credentials.deinit(alloc);
         if (self.api_key) |*api_key| api_key.deinit(alloc);
@@ -527,6 +559,9 @@ fn managedEmbeddingEntriesEquivalentForLookup(
         std.mem.eql(u8, lhs.region, rhs.region) and
         lhs.bedrock_request_format == rhs.bedrock_request_format and
         std.mem.eql(u8, lhs.input_type, rhs.input_type) and
+        std.mem.eql(u8, lhs.query_input_type, rhs.query_input_type) and
+        std.mem.eql(u8, lhs.document_input_type, rhs.document_input_type) and
+        std.mem.eql(u8, lhs.query_instruction, rhs.query_instruction) and
         std.mem.eql(u8, lhs.truncate, rhs.truncate);
 }
 
@@ -546,6 +581,9 @@ fn managedEmbeddingEntriesSemanticallyEquivalent(
         std.mem.eql(u8, lhs.region, rhs.region) and
         lhs.bedrock_request_format == rhs.bedrock_request_format and
         std.mem.eql(u8, lhs.input_type, rhs.input_type) and
+        std.mem.eql(u8, lhs.query_input_type, rhs.query_input_type) and
+        std.mem.eql(u8, lhs.document_input_type, rhs.document_input_type) and
+        std.mem.eql(u8, lhs.query_instruction, rhs.query_instruction) and
         std.mem.eql(u8, lhs.truncate, rhs.truncate);
 }
 
@@ -796,6 +834,7 @@ pub const ManagedEmbedder = struct {
             .dense_embed_parts_fn = embedDenseParts,
             .media_part_limit_fn = denseMediaPartLimit,
             .deinit_fn = deinitDenseEmbedder,
+            .set_cancellation_fn = setEmbedderCancellation,
             .foreground_bounded = self.denseForegroundBounded(),
         };
     }
@@ -806,6 +845,7 @@ pub const ManagedEmbedder = struct {
             .sparse_embed_fn = embedSparse,
             .sparse_embed_batch_fn = embedSparseBatch,
             .deinit_fn = deinitSparseEmbedder,
+            .set_cancellation_fn = setEmbedderCancellation,
             .foreground_bounded = self.sparseForegroundBounded(),
         };
     }
@@ -884,7 +924,7 @@ pub const ManagedEmbedder = struct {
 
     pub fn embedQuery(self: *const ManagedEmbedder, alloc: std.mem.Allocator, index_name: []const u8, text: []const u8) ![]f32 {
         const entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
-        return try embedWithEntry(alloc, entry, text, entry.dimensions);
+        return try embedWithEntryForTask(alloc, entry, text, entry.dimensions, .retrieval_query);
     }
 
     pub fn embedQueryWithCancellation(
@@ -901,7 +941,7 @@ pub const ManagedEmbedder = struct {
         request_entry.auth_header_cache = .{};
         defer request_entry.auth_header_cache.deinit(alloc);
         request_entry.cancellation = cancellation;
-        return try embedWithEntry(alloc, &request_entry, text, request_entry.dimensions);
+        return try embedWithEntryForTask(alloc, &request_entry, text, request_entry.dimensions, .retrieval_query);
     }
 
     /// Digest the effective dense-text embedding operation. Table and index
@@ -929,6 +969,10 @@ pub const ManagedEmbedder = struct {
         hashQueryCacheField(&hasher, entry.model);
         hashQueryCacheField(&hasher, entry.region);
         hashQueryCacheField(&hasher, entry.input_type);
+        hashQueryCacheField(&hasher, entry.query_input_type);
+        hashQueryCacheField(&hasher, entry.document_input_type);
+        hashQueryCacheField(&hasher, entry.query_instruction);
+        hashQueryCacheField(&hasher, EmbeddingTaskType.retrieval_query.canonical());
         hashQueryCacheField(&hasher, entry.truncate);
         hashQueryCacheU64(&hasher, entry.dimensions);
         hashQueryCacheSecretIdentity(&hasher, entry.api_key);
@@ -953,7 +997,7 @@ pub const ManagedEmbedder = struct {
         try validateRenderedTemplate(alloc, rendered);
         const parts = try template_mod.textToParts(alloc, rendered);
         defer template_mod.freeContentParts(alloc, parts);
-        return embedWithEntryParts(alloc, entry, parts, entry.dimensions) catch |err| return err;
+        return embedWithEntryPartsForTask(alloc, entry, parts, entry.dimensions, .retrieval_query) catch |err| return err;
     }
 
     pub fn embedQueryWithTemplateAndCancellation(
@@ -977,7 +1021,7 @@ pub const ManagedEmbedder = struct {
         try validateRenderedTemplate(alloc, rendered);
         const parts = try template_mod.textToParts(alloc, rendered);
         defer template_mod.freeContentParts(alloc, parts);
-        return embedWithEntryParts(alloc, &request_entry, parts, request_entry.dimensions) catch |err| return err;
+        return embedWithEntryPartsForTask(alloc, &request_entry, parts, request_entry.dimensions, .retrieval_query) catch |err| return err;
     }
 
     fn findQueryEntry(self: *const ManagedEmbedder, index_name: []const u8) ?*const ManagedEmbeddingEntry {
@@ -1061,6 +1105,11 @@ pub const ManagedEmbedder = struct {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const entry = self.findArtifactEntry(embedding_name) orelse return null;
         return if (isAntflyProvider(entry.provider)) 1 else null;
+    }
+
+    fn setEmbedderCancellation(ptr: *anyopaque, cancellation: CancellationToken) void {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        for (self.entries) |*entry| entry.cancellation = cancellation;
     }
 
     fn deinitDenseEmbedder(ptr: *anyopaque, alloc: std.mem.Allocator) void {
@@ -1147,8 +1196,14 @@ fn embeddingIo(entry: *const ManagedEmbeddingEntry) std.Io {
     return entry.io orelse std.Io.Threaded.global_single_threaded.io();
 }
 
-fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry) EmbeddingRequestContext {
-    return .{ .io = embeddingIo(entry), .deadline_ns = embeddingOperationDeadline(entry), .cancellation = entry.cancellation };
+fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) EmbeddingRequestContext {
+    return .{
+        .io = embeddingIo(entry),
+        .deadline_ns = embeddingOperationDeadline(entry),
+        .cancellation = entry.cancellation,
+        .task_type = task_type,
+        .instruction = if (task_type == .retrieval_query and entry.query_instruction.len > 0) entry.query_instruction else null,
+    };
 }
 
 fn embeddingOperationDeadline(entry: *const ManagedEmbeddingEntry) u64 {
@@ -1411,6 +1466,9 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         multimodal: bool,
         input_type: []const u8,
         truncate: []const u8,
+        query_input_type: ?[]const u8 = null,
+        document_input_type: ?[]const u8 = null,
+        query_instruction: ?[]const u8 = null,
     };
     return try std.json.Stringify.valueAlloc(alloc, SemanticProducer{
         .provider = @tagName(provider),
@@ -1422,7 +1480,10 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         .multimodal = embedder_cfg.multimodal,
         .input_type = embedder_cfg.input_type,
         .truncate = embedder_cfg.truncate,
-    }, .{});
+        .query_input_type = try configObjectString(embedder_value, "query_input_type"),
+        .document_input_type = try configObjectString(embedder_value, "document_input_type"),
+        .query_instruction = try configObjectString(embedder_value, "query_instruction"),
+    }, .{ .emit_null_optional_fields = false });
 }
 
 /// Returns the durable, credential-free identity of the producer configured
@@ -2172,7 +2233,10 @@ fn semanticProducerComparisonConfigJsonAlloc(
             std.mem.eql(u8, field.key_ptr.*, "sparse") or
             std.mem.eql(u8, field.key_ptr.*, "multimodal") or
             std.mem.eql(u8, field.key_ptr.*, "input_type") or
-            std.mem.eql(u8, field.key_ptr.*, "truncate");
+            std.mem.eql(u8, field.key_ptr.*, "truncate") or
+            std.mem.eql(u8, field.key_ptr.*, "query_input_type") or
+            std.mem.eql(u8, field.key_ptr.*, "document_input_type") or
+            std.mem.eql(u8, field.key_ptr.*, "query_instruction");
         if (!allowed) return error.InvalidEmbeddingArtifactProducer;
     }
     if (object.get("url") != null or object.get("api_url") != null or object.get("base_url") != null)
@@ -2201,6 +2265,9 @@ fn semanticProducerComparisonConfigJsonAlloc(
         request_format: ?[]const u8 = null,
         input_type: ?[]const u8 = null,
         truncate: ?[]const u8 = null,
+        query_input_type: ?[]const u8 = null,
+        document_input_type: ?[]const u8 = null,
+        query_instruction: ?[]const u8 = null,
         multimodal: ?bool = null,
     };
     const optionalString = struct {
@@ -2222,6 +2289,9 @@ fn semanticProducerComparisonConfigJsonAlloc(
         .request_format = try optionalString(object, "request_format"),
         .input_type = try optionalString(object, "input_type"),
         .truncate = try optionalString(object, "truncate"),
+        .query_input_type = try optionalString(object, "query_input_type"),
+        .document_input_type = try optionalString(object, "document_input_type"),
+        .query_instruction = try optionalString(object, "query_instruction"),
         .multimodal = multimodal,
     }, .{ .emit_null_optional_fields = false });
 }
@@ -2491,6 +2561,13 @@ fn semanticIdentityStringField(identity: std.json.Value, name: []const u8) ![]co
     return field.string;
 }
 
+fn semanticIdentityOptionalStringField(identity: std.json.Value, name: []const u8) ![]const u8 {
+    if (identity != .object) return error.InvalidEmbeddingArtifactProducer;
+    const field = identity.object.get(name) orelse return "";
+    if (field != .string) return error.InvalidEmbeddingArtifactProducer;
+    return field.string;
+}
+
 fn validateCatalogOwnerSemanticIdentity(
     alloc: std.mem.Allocator,
     owner: CatalogProducerOwner,
@@ -2517,11 +2594,20 @@ fn validateCatalogOwnerSemanticIdentity(
     defer embedder_cfg.deinit(alloc);
     const provider = parseEmbedderProvider(embedder_cfg) catch
         return error.InvalidEmbeddingArtifactProducer;
+    const configured_query_input_type = (configObjectString(embedder_value, "query_input_type") catch
+        return error.InvalidEmbeddingArtifactProducer) orelse "";
+    const configured_document_input_type = (configObjectString(embedder_value, "document_input_type") catch
+        return error.InvalidEmbeddingArtifactProducer) orelse "";
+    const configured_query_instruction = (configObjectString(embedder_value, "query_instruction") catch
+        return error.InvalidEmbeddingArtifactProducer) orelse "";
     if (!std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "provider"), @tagName(provider)) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "model"), embedder_cfg.model) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "request_format"), embedder_cfg.request_format) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "input_type"), embedder_cfg.input_type) or
-        !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "truncate"), embedder_cfg.truncate))
+        !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "truncate"), embedder_cfg.truncate) or
+        !std.mem.eql(u8, try semanticIdentityOptionalStringField(parsed_identity.value, "query_input_type"), configured_query_input_type) or
+        !std.mem.eql(u8, try semanticIdentityOptionalStringField(parsed_identity.value, "document_input_type"), configured_document_input_type) or
+        !std.mem.eql(u8, try semanticIdentityOptionalStringField(parsed_identity.value, "query_instruction"), configured_query_instruction))
     {
         return error.InvalidEmbeddingArtifactProducer;
     }
@@ -3250,6 +3336,12 @@ fn buildManagedEmbeddingEntry(
     errdefer alloc.free(base_url);
     const input_type = if (embedder_cfg.input_type.len > 0) try alloc.dupe(u8, embedder_cfg.input_type) else @constCast("");
     errdefer if (input_type.len > 0) alloc.free(input_type);
+    const query_input_type = if (try configObjectString(embedder, "query_input_type")) |value| try alloc.dupe(u8, value) else @constCast("");
+    errdefer if (query_input_type.len > 0) alloc.free(query_input_type);
+    const document_input_type = if (try configObjectString(embedder, "document_input_type")) |value| try alloc.dupe(u8, value) else @constCast("");
+    errdefer if (document_input_type.len > 0) alloc.free(document_input_type);
+    const query_instruction = if (try configObjectString(embedder, "query_instruction")) |value| try alloc.dupe(u8, value) else @constCast("");
+    errdefer if (query_instruction.len > 0) alloc.free(query_instruction);
     const truncate = if (embedder_cfg.truncate.len > 0) try alloc.dupe(u8, embedder_cfg.truncate) else @constCast("");
     errdefer if (truncate.len > 0) alloc.free(truncate);
     const api_key = switch (provider) {
@@ -3278,6 +3370,9 @@ fn buildManagedEmbeddingEntry(
         .region = bedrock_region,
         .bedrock_request_format = bedrock_request_format,
         .input_type = input_type,
+        .query_input_type = query_input_type,
+        .document_input_type = document_input_type,
+        .query_instruction = query_instruction,
         .truncate = truncate,
         .api_key = api_key,
         .secret_store = options.secret_store,
@@ -3547,6 +3642,16 @@ fn configObjectU32(value: std.json.Value, field_name: []const u8) ?u32 {
     };
 }
 
+fn configObjectString(value: std.json.Value, field_name: []const u8) !?[]const u8 {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const field = object.get(field_name) orelse return null;
+    if (field != .string) return error.InvalidManagedEmbeddingIndex;
+    return field.string;
+}
+
 fn envOptionalU32(name: [:0]const u8) ?u32 {
     const raw_z = getenv(name) orelse return null;
     const raw = std.mem.span(raw_z);
@@ -3634,6 +3739,14 @@ fn queryTemplateRenderConfig(entry: *const ManagedEmbeddingEntry) template_remot
     }
     if (comptime @hasField(template_remote.RenderConfig, "deadline_ns")) {
         config.deadline_ns = entry.deadline_ns;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
+        if (entry.cancellation) |token| {
+            config.cancellation = scraping.CancellationToken.fromCallback(
+                token.ptr,
+                token.is_cancelled_fn,
+            );
+        }
     }
     if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
         if (isAntflyProvider(entry.provider)) config.max_media_parts = 1;
@@ -3848,6 +3961,16 @@ fn embedWithEntryParts(
     parts: []const template_mod.ContentPart,
     dims: u32,
 ) ![]f32 {
+    return embedWithEntryPartsForTask(alloc, entry, parts, dims, .retrieval_document);
+}
+
+fn embedWithEntryPartsForTask(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    parts: []const template_mod.ContentPart,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]f32 {
     if (entry.provider == .bedrock and (entry.multimodal or partsContainMedia(parts))) {
         try waitForEntryPacer(entry);
         var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
@@ -3857,7 +3980,7 @@ fn embedWithEntryParts(
             .region = entry.region,
             .endpoint = entry.base_url,
             .request_format = entry.bedrock_request_format,
-            .input_type = entry.input_type,
+            .input_type = effectiveInputType(entry, task_type),
             .truncate = entry.truncate,
             .dimension = dims,
             .cancellation = entry.cancellation,
@@ -3877,7 +4000,7 @@ fn embedWithEntryParts(
         if (entry.antfly_provider) |local| {
             if (local.embed_dense_parts) |embed_parts| {
                 try waitForEntryPacer(entry);
-                const context = embeddingRequestContext(entry);
+                const context = embeddingRequestContext(entry, task_type);
                 try context.check();
                 const vectors = (if (local.embed_dense_parts_with_context) |embed_parts_with_context|
                     AntflyProviderBoundary.call("embed_dense_parts_with_context", local.boundary_dispatch, embed_parts_with_context, .{ local.ptr, alloc, entry.model, parts, context })
@@ -3899,6 +4022,7 @@ fn embedWithEntryParts(
 
         var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
         defer provider.deinit();
+        provider.setRequestCancellation(entry.cancellation);
         if (entry.api_key) |*api_key_ref| {
             if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
                 defer alloc.free(auth_header);
@@ -3906,7 +4030,13 @@ fn embedWithEntryParts(
             }
         }
 
-        var result = provider.embedParts(alloc, entry.model, parts) catch |err| switch (err) {
+        var result = provider.embedPartsWithTask(
+            alloc,
+            entry.model,
+            parts,
+            task_type.canonical(),
+            effectiveInstruction(entry, task_type),
+        ) catch |err| switch (err) {
             error.EmptyResponse => return error.EmptyEmbeddingResponse,
             else => return err,
         };
@@ -3919,7 +4049,7 @@ fn embedWithEntryParts(
 
     const flattened = try flattenContentPartsToText(alloc, parts);
     defer alloc.free(flattened);
-    return try embedWithEntry(alloc, entry, flattened, dims);
+    return try embedWithEntryForTask(alloc, entry, flattened, dims, task_type);
 }
 
 fn embedSparseWithEntry(
@@ -4126,7 +4256,17 @@ fn embedWithEntry(
     text: []const u8,
     dims: u32,
 ) ![]f32 {
-    const vectors = try embedBatchWithEntry(alloc, entry, &.{text}, dims);
+    return embedWithEntryForTask(alloc, entry, text, dims, .retrieval_document);
+}
+
+fn embedWithEntryForTask(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    text: []const u8,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]f32 {
+    const vectors = try embedBatchWithEntryForTask(alloc, entry, &.{text}, dims, task_type);
     errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
     if (vectors.len == 0) return error.EmptyEmbeddingResponse;
 
@@ -4141,20 +4281,75 @@ fn embedBatchWithEntry(
     texts: []const []const u8,
     dims: u32,
 ) ![]const []const f32 {
+    return embedBatchWithEntryForTask(alloc, entry, texts, dims, .retrieval_document);
+}
+
+fn effectiveInputType(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) []const u8 {
+    const role_override = switch (task_type) {
+        .retrieval_query => entry.query_input_type,
+        .retrieval_document => entry.document_input_type,
+    };
+    if (role_override.len > 0) return role_override;
+    // Backward-compatible expert override: the legacy field applies to both
+    // roles. New configurations should prefer the role-specific fields.
+    if (entry.input_type.len > 0) return entry.input_type;
+    return task_type.cohereInputType();
+}
+
+fn effectiveInstruction(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) ?[]const u8 {
+    if (task_type != .retrieval_query or entry.query_instruction.len == 0) return null;
+    return entry.query_instruction;
+}
+
+pub fn testEmbeddingTaskRouting() !void {
+    const entry = ManagedEmbeddingEntry{
+        .alloc = std.testing.allocator,
+        .index_name = @constCast("semantic"),
+        .provider = .bedrock,
+        .model = @constCast("cohere.embed-v4"),
+        .base_url = @constCast("https://bedrock.example"),
+        .dimensions = 1024,
+        .query_input_type = @constCast("custom_query"),
+        .query_instruction = @constCast("retrieve relevant passages"),
+    };
+    try std.testing.expectEqualStrings("custom_query", effectiveInputType(&entry, .retrieval_query));
+    try std.testing.expectEqualStrings("search_document", effectiveInputType(&entry, .retrieval_document));
+    try std.testing.expectEqualStrings("retrieve relevant passages", effectiveInstruction(&entry, .retrieval_query).?);
+    try std.testing.expect(effectiveInstruction(&entry, .retrieval_document) == null);
+
+    const query_context = embeddingRequestContext(&entry, .retrieval_query);
+    try std.testing.expectEqual(EmbeddingTaskType.retrieval_query, query_context.task_type);
+    try std.testing.expectEqualStrings("retrieve relevant passages", query_context.instruction.?);
+    const document_context = embeddingRequestContext(&entry, .retrieval_document);
+    try std.testing.expectEqual(EmbeddingTaskType.retrieval_document, document_context.task_type);
+    try std.testing.expect(document_context.instruction == null);
+}
+
+test "managed embeddings derive provider task types from query and document operations" {
+    try testEmbeddingTaskRouting();
+}
+
+fn embedBatchWithEntryForTask(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    texts: []const []const u8,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]const []const f32 {
     switch (entry.provider) {
         .openai, .ollama => {
             if (entry.requests_per_minute > 0 and texts.len > entry.burst) {
-                return try embedBatchWithOpenAiCompatiblePacedChunks(alloc, entry, texts, dims);
+                return try embedBatchWithOpenAiCompatiblePacedChunks(alloc, entry, texts, dims, task_type);
             }
-            return try embedBatchWithOpenAiCompatible(alloc, entry, texts, dims);
+            return try embedBatchWithOpenAiCompatible(alloc, entry, texts, dims, task_type);
         },
         .bedrock => {
-            return try embedBatchWithBedrock(alloc, entry, texts, dims);
+            return try embedBatchWithBedrock(alloc, entry, texts, dims, task_type);
         },
         .antfly => {
             if (entry.antfly_provider) |local| {
                 try waitForEntryPacer(entry);
-                const context = embeddingRequestContext(entry);
+                const context = embeddingRequestContext(entry, task_type);
                 try context.check();
                 const vectors = (if (local.embed_dense_texts_with_context) |embed_with_context|
                     AntflyProviderBoundary.call("embed_dense_texts_with_context", local.boundary_dispatch, embed_with_context, .{ local.ptr, alloc, entry.model, texts, context })
@@ -4162,10 +4357,11 @@ fn embedBatchWithEntry(
                     AntflyProviderBoundary.call("embed_dense_texts", local.boundary_dispatch, local.embed_dense_texts, .{ local.ptr, alloc, entry.model, texts })) catch |err|
                     return normalizeLocalEmbeddingError(err);
                 errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
-                context.check() catch |err| {
-                    db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
-                    return err;
-                };
+                // The errdefer is the sole owner of failure cleanup. Native
+                // kernels may return successfully after lifecycle cancellation;
+                // manually freeing here as well would double-release their
+                // allocator-owned result while unwinding the cancellation.
+                try context.check();
                 try validateDenseBatch(vectors, texts.len, dims);
                 return vectors;
             }
@@ -4183,7 +4379,13 @@ fn embedBatchWithEntry(
                 }
             }
 
-            var result = try provider.embedder().embed(alloc, entry.model, texts);
+            var result = try provider.embedWithTask(
+                alloc,
+                entry.model,
+                texts,
+                task_type.canonical(),
+                effectiveInstruction(entry, task_type),
+            );
             errdefer result.deinit();
             try validateDenseBatch(result.vectors, texts.len, dims);
             return try adoptDenseBatchResult(alloc, &result);
@@ -4196,6 +4398,7 @@ fn embedBatchWithBedrock(
     entry: *const ManagedEmbeddingEntry,
     texts: []const []const u8,
     dims: u32,
+    task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
     const max_batch = bedrock_provider.maxBatchSizeForFormat(entry.bedrock_request_format);
     var out = std.ArrayListUnmanaged([]const f32).empty;
@@ -4207,7 +4410,7 @@ fn embedBatchWithBedrock(
     var offset: usize = 0;
     while (offset < texts.len) {
         const end = @min(texts.len, offset + max_batch);
-        const vectors = try embedBatchWithBedrockRequest(alloc, entry, texts[offset..end], dims);
+        const vectors = try embedBatchWithBedrockRequest(alloc, entry, texts[offset..end], dims, task_type);
         errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
         try out.ensureUnusedCapacity(alloc, vectors.len);
         for (vectors) |vector| out.appendAssumeCapacity(vector);
@@ -4222,6 +4425,7 @@ fn embedBatchWithBedrockRequest(
     entry: *const ManagedEmbeddingEntry,
     texts: []const []const u8,
     dims: u32,
+    task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
     try waitForEntryPacer(entry);
     var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
@@ -4230,7 +4434,7 @@ fn embedBatchWithBedrockRequest(
         .region = entry.region,
         .endpoint = entry.base_url,
         .request_format = entry.bedrock_request_format,
-        .input_type = entry.input_type,
+        .input_type = effectiveInputType(entry, task_type),
         .truncate = entry.truncate,
         .dimension = dims,
         .cancellation = entry.cancellation,
@@ -4247,6 +4451,7 @@ fn embedBatchWithOpenAiCompatiblePacedChunks(
     entry: *const ManagedEmbeddingEntry,
     texts: []const []const u8,
     dims: u32,
+    task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
     const chunk_size = @max(@as(usize, 1), @as(usize, @intCast(entry.burst)));
     var out = std.ArrayListUnmanaged([]const f32).empty;
@@ -4258,7 +4463,7 @@ fn embedBatchWithOpenAiCompatiblePacedChunks(
     var offset: usize = 0;
     while (offset < texts.len) {
         const end = @min(texts.len, offset + chunk_size);
-        const vectors = try embedBatchWithOpenAiCompatible(alloc, entry, texts[offset..end], dims);
+        const vectors = try embedBatchWithOpenAiCompatible(alloc, entry, texts[offset..end], dims, task_type);
         errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
         try out.ensureUnusedCapacity(alloc, vectors.len);
         for (vectors) |vector| out.appendAssumeCapacity(vector);
@@ -4273,7 +4478,9 @@ fn embedBatchWithOpenAiCompatible(
     entry: *const ManagedEmbeddingEntry,
     texts: []const []const u8,
     dims: u32,
+    task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
+    _ = task_type;
     const Request = openai_api.types.CreateEmbeddingRequest;
     const Response = struct {
         data: []const struct {
@@ -5405,6 +5612,7 @@ pub fn testRemoteEmbeddingCancellation() !void {
     const DelayedApp = struct {
         entered: std.atomic.Value(bool) = .init(false),
         release: std.atomic.Value(bool) = .init(false),
+        completed: std.atomic.Value(bool) = .init(false),
 
         fn executor(self: *@This()) http_common.RequestExecutor {
             return .{ .ptr = self, .vtable = &.{ .execute = execute } };
@@ -5413,9 +5621,13 @@ pub fn testRemoteEmbeddingCancellation() !void {
         fn execute(ptr: *anyopaque, response_alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/v1/embeddings"));
+            try std.testing.expect(
+                std.mem.endsWith(u8, req.uri, "/v1/embeddings") or
+                    std.mem.endsWith(u8, req.uri, "/embed"),
+            );
             self.entered.store(true, .release);
             while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+            self.completed.store(true, .release);
             return .{
                 .status = 200,
                 .content_type = try response_alloc.dupe(u8, "application/json"),
@@ -5469,9 +5681,60 @@ pub fn testRemoteEmbeddingCancellation() !void {
     worker.join();
     const elapsed_ns = monotonicNowNs() - started_ns;
     app.release.store(true, .release);
+    while (!app.completed.load(.acquire)) std.atomic.spinLoopHint();
 
     try std.testing.expectEqual(error.Cancelled, err_out.?);
     try std.testing.expect(elapsed_ns < 250 * std.time.ns_per_ms);
+
+    // Multimodal Antfly requests use a distinct provider path from dense text
+    // batches. It must carry the same runtime lifecycle cancellation or a
+    // ClipClap invocation can pin synchronous index activation until its full
+    // transport deadline.
+    app.entered.store(false, .release);
+    app.release.store(false, .release);
+    app.completed.store(false, .release);
+    const antfly_indexes_json = try std.fmt.allocPrint(alloc,
+        \\{{"visual_idx":{{"type":"embeddings","field":"image","dimension":3,"embedder":{{"provider":"antfly","model":"antflydb/clipclap","api_url":"{s}"}}}}}}
+    , .{base_uri});
+    defer alloc.free(antfly_indexes_json);
+    var parts_cancellation = std.atomic.Value(bool).init(false);
+    var multimodal = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, antfly_indexes_json, .{
+        .io = io_impl.io(),
+        .cancellation = CancellationToken.fromAtomic(&parts_cancellation),
+    });
+    defer multimodal.deinit();
+
+    const PartsWorker = struct {
+        fn run(target: *ManagedEmbedder, err_out_ptr: *?anyerror) void {
+            const parts = [_]template_mod.ContentPart{.{
+                .media_url = "data:image/png;base64,iVBORw0KGgo=",
+            }};
+            const vector = target.denseInterface().embedDenseParts(
+                alloc,
+                "visual_idx",
+                &parts,
+                3,
+            ) catch |err| {
+                err_out_ptr.* = err;
+                return;
+            };
+            alloc.free(vector);
+            err_out_ptr.* = error.TestUnexpectedResult;
+        }
+    };
+    err_out = null;
+    const parts_worker = try std.Thread.spawn(.{}, PartsWorker.run, .{ &multimodal, &err_out });
+    while (!app.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    const parts_started_ns = monotonicNowNs();
+    parts_cancellation.store(true, .release);
+    parts_worker.join();
+    const parts_elapsed_ns = monotonicNowNs() - parts_started_ns;
+    app.release.store(true, .release);
+    while (!app.completed.load(.acquire)) std.atomic.spinLoopHint();
+
+    try std.testing.expectEqual(error.Cancelled, err_out.?);
+    try std.testing.expect(parts_elapsed_ns < 250 * std.time.ns_per_ms);
 }
 
 pub fn testFileBackedApiKeyRotation() !void {

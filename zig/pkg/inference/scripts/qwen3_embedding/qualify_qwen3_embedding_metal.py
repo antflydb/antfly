@@ -434,7 +434,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--oracle", type=Path, required=True)
     parser.add_argument("--base-url", required=True)
-    parser.add_argument("--model", default="qwen3-embedding-0.6b")
+    parser.add_argument("--model", default="Qwen/Qwen3-Embedding-0.6B-GGUF")
     parser.add_argument("--tier", choices=sorted(TIER_MIN_COSINE), required=True)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--report", type=Path)

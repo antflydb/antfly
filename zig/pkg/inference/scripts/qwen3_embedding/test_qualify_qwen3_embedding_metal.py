@@ -106,9 +106,9 @@ class OracleValidationTests(unittest.TestCase):
 class RequestBodyTests(unittest.TestCase):
     def test_document_sends_raw_text_without_task_type(self) -> None:
         body = qualify.embedding_request_body(
-            "qwen3-embedding-0.6b", "hello", "document", None, oracle.DEFAULT_INSTRUCTION
+            "Qwen/Qwen3-Embedding-0.6B-GGUF", "hello", "document", None, oracle.DEFAULT_INSTRUCTION
         )
-        self.assertEqual({"model": "qwen3-embedding-0.6b", "input": "hello"}, body)
+        self.assertEqual({"model": "Qwen/Qwen3-Embedding-0.6B-GGUF", "input": "hello"}, body)
 
     def test_default_query_sends_task_type_only(self) -> None:
         body = qualify.embedding_request_body(

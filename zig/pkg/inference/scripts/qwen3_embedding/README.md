@@ -50,9 +50,9 @@ requirements file.
 Pull one of the served variants first:
 
 ```bash
-antfly inference pull qwen3-embedding-0.6b              # GGUF Q8_0
-antfly inference pull qwen3-embedding-0.6b-f16          # GGUF F16
-antfly inference pull qwen3-embedding-0.6b-safetensors  # safetensors
+antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1  # GGUF Q8_0
+antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1   # GGUF F16
+antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1  # safetensors
 ```
 
 Then run the gate against the running server:
@@ -61,7 +61,7 @@ Then run the gate against the running server:
 python3 qualify_qwen3_embedding_metal.py \
     --oracle /tmp/qwen3_embedding_oracle.json \
     --base-url http://127.0.0.1:8080 \
-    --model qwen3-embedding-0.6b \
+    --model Qwen/Qwen3-Embedding-0.6B-GGUF \
     --tier q8_0 \
     --report /tmp/qwen3_embedding_qualification.json
 ```

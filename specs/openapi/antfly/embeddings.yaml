@@ -547,6 +547,24 @@ components:
                   "multimodal": true
                 }
                 ```
+            query_input_type:
+              type: string
+              description: |-
+                Advanced override for the provider-specific retrieval-query task type.
+                Antfly normally derives this automatically from semantic-search operations
+                (for example `search_query` for Cohere and Bedrock Cohere models).
+            document_input_type:
+              type: string
+              description: |-
+                Advanced override for the provider-specific retrieval-document task type.
+                Antfly normally derives this automatically for index and artifact writes
+                (for example `search_document` for Cohere and Bedrock Cohere models).
+            query_instruction:
+              type: string
+              description: |-
+                Optional retrieval instruction sent only for query embeddings to
+                instruction-aware models such as Qwen3-Embedding. It is never applied
+                while indexing documents.
           required:
             - provider
       example:

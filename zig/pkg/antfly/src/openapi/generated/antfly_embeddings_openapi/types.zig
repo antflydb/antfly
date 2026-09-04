@@ -200,6 +200,12 @@ pub const EmbedderConfig = struct {
     provider: EmbedderProvider,
     /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and will send binary content (images, audio, etc.) to the provider instead of extracting text. The provider's API is still responsible for accepting the content — this flag just tells Antfly not to strip it. Not needed for models already in the registry (e.g., `multimodalembedding`, `gemini-embedding-2-preview`, `clip-*`, `clipclap`). **Example:** ```json { "provider": "vertex", "model": "some-future-multimodal-model", "multimodal": true } ```
     multimodal: ?bool = null,
+    /// Advanced override for the provider-specific retrieval-query task type. Antfly normally derives this automatically from semantic-search operations (for example `search_query` for Cohere and Bedrock Cohere models).
+    query_input_type: ?[]const u8 = null,
+    /// Advanced override for the provider-specific retrieval-document task type. Antfly normally derives this automatically for index and artifact writes (for example `search_document` for Cohere and Bedrock Cohere models).
+    document_input_type: ?[]const u8 = null,
+    /// Optional retrieval instruction sent only for query embeddings to instruction-aware models such as Qwen3-Embedding. It is never applied while indexing documents.
+    query_instruction: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -220,6 +226,9 @@ pub const EmbedderConfig = struct {
         .{ "api_url", "api_url", true },
         .{ "provider", "provider", false },
         .{ "multimodal", "multimodal", true },
+        .{ "query_input_type", "query_input_type", true },
+        .{ "document_input_type", "document_input_type", true },
+        .{ "query_instruction", "query_instruction", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -296,6 +305,18 @@ pub const EmbedderConfig = struct {
         try jw.write(self.provider);
         if (self.multimodal) |value| {
             try jw.objectField("multimodal");
+            try jw.write(value);
+        }
+        if (self.query_input_type) |value| {
+            try jw.objectField("query_input_type");
+            try jw.write(value);
+        }
+        if (self.document_input_type) |value| {
+            try jw.objectField("document_input_type");
+            try jw.write(value);
+        }
+        if (self.query_instruction) |value| {
+            try jw.objectField("query_instruction");
             try jw.write(value);
         }
         try jw.endObject();

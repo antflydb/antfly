@@ -1,4 +1,4 @@
-from enum import Enum
+from enum import StrEnum
 
 {% set transform_op_names = {
     "$set": "SET",
@@ -11,7 +11,7 @@ from enum import Enum
     "$min": "MIN",
     "$max": "MAX",
 } %}
-class {{ enum.class_info.name }}(str, Enum):
+class {{ enum.class_info.name }}(StrEnum):
     {% for key, value in enum.values|dictsort(true) %}
     {{ transform_op_names[value] if enum.class_info.name == "TransformOpType" else key }} = "{{ value }}"
     {% endfor %}

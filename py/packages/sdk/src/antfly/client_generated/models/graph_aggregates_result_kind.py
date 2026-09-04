@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphAggregatesResultKind(str, Enum):
+class GraphAggregatesResultKind(StrEnum):
     AGGREGATES = "aggregates"
 
     def __str__(self) -> str:

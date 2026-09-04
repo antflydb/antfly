@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class DocumentArtifactTableReprocessResponseReprocessStatus(str, Enum):
+class DocumentArtifactTableReprocessResponseReprocessStatus(StrEnum):
     COMPLETE = "complete"
     IN_PROGRESS = "in_progress"
 

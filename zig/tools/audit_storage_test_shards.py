@@ -65,9 +65,15 @@ def audit_manifest(root: Path, manifest: Path, filters: Sequence[str]) -> list[s
         if count == 0:
             failures.append(f"test source missing from manifest: {relative}")
             continue
-        owners = [test_filter for test_filter in filters if any(test_filter in name for name in names)]
+        owners = [
+            test_filter
+            for test_filter in filters
+            if any(test_filter in name for name in names)
+        ]
         if len(owners) == 0:
-            failures.append(f"test source has no shard owner: {relative} ({', '.join(names)})")
+            failures.append(
+                f"test source has no shard owner: {relative} ({', '.join(names)})"
+            )
         elif len(owners) > 1:
             failures.append(
                 f"test source has multiple shard owners: {relative} ({', '.join(owners)})"
@@ -94,7 +100,9 @@ def audit_runtime_partition(source: Path, filters: Sequence[str]) -> list[str]:
         elif not any(test_filter in name for name in names):
             failures.append(f"runtime partition filter matches no tests: {test_filter}")
 
-    selected = [name for name in names if any(test_filter in name for test_filter in filters)]
+    selected = [
+        name for name in names if any(test_filter in name for test_filter in filters)
+    ]
     if not selected:
         failures.append("runtime partition selects no tests")
     elif len(selected) == len(names):
@@ -130,7 +138,9 @@ def main() -> int:
     print("storage test shard audit failed:")
     for failure in failures:
         print(f"  {failure}")
-    print("update storage/test_manifest.zig and the disjoint shard filters in zig/build.zig")
+    print(
+        "update storage/test_manifest.zig and the disjoint shard filters in zig/build.zig"
+    )
     return 1
 
 

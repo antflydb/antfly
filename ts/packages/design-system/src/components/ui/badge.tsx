@@ -22,8 +22,7 @@ const badgeVariants = cva(
         // solid amber fill — deliberate brand moments only
         brand: "bg-primary text-primary-foreground border-transparent [a&]:hover:bg-amber-300",
         // semantic destructive — red ink, quiet chassis
-        destructive:
-          "bg-transparent border-border text-destructive [a&]:hover:bg-destructive/10",
+        destructive: "bg-transparent border-border text-destructive [a&]:hover:bg-destructive/10",
       },
     },
     defaultVariants: {

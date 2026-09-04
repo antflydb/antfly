@@ -58,7 +58,7 @@ brew services start antfly
 ```
 
 <Callout type="info">
-Standalone mode starts metadata, data nodes, and Antfly inference in a single process — ideal for local development. You can also access the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080` to manage tables, run queries, and monitor your cluster.
+Standalone mode starts metadata, data nodes, and Antfly inference in a single process — ideal for local development. You can also access the [web dashboard](/docs/guides/dashboard) at `http://127.0.0.1:8080` to manage tables, run queries, and monitor your cluster. The numeric loopback address matches standalone's secure default bind on systems where `localhost` resolves to IPv6 first.
 </Callout>
 
 The 8 GiB inference host budget lets the later all-local RAG example use the
@@ -71,11 +71,11 @@ Before starting the longer semantic workflow, verify that storage and full-text
 search work with one document:
 
 ```bash
-curl -fsS -X POST http://localhost:8080/db/v1/tables/hello \
+curl -fsS -X POST http://127.0.0.1:8080/db/v1/tables/hello \
   -H "Content-Type: application/json" \
   -d '{}'
 
-curl -fsS -X POST http://localhost:8080/db/v1/tables/hello/batch \
+curl -fsS -X POST http://127.0.0.1:8080/db/v1/tables/hello/batch \
   -H "Content-Type: application/json" \
   -d '{"inserts":{"first":{"title":"Hello","body":"Antfly is ready."}},"sync_level":"full_text"}'
 
@@ -89,17 +89,26 @@ stop here and use [Troubleshooting](#troubleshooting).
 
 ### Install the embedding model
 
-Now pull the multimodal model used for text and image search. [Antfly
-inference](/docs/guides/inference) runs quantized models locally without an
-external API:
+Now pull the text embedding model used for semantic search. [Antfly
+inference](/docs/guides/inference) runs models locally without an external API:
 
 ```bash
-antfly inference pull antflydb/clipclap:gguf:Q4_K
+antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1
 antfly inference list
 ```
 
+Qwen3-Embedding uses an instruction for search queries but embeds indexed
+documents without it. Antfly applies that distinction automatically: index and
+artifact writes use the document role, while semantic searches use the query
+role.
+
 If the running standalone process does not detect the newly installed model,
 restart it once before creating the embeddings index.
+
+Once the embeddings index reaches `queryable`, Antfly durably preserves that
+published snapshot across later restarts while the remaining embeddings resume
+in the background. `complete` still means all source outcomes and the final
+vector publication have settled.
 
 ## Download Sample Data
 
@@ -137,7 +146,7 @@ antfly table create --table wikipedia \
     "template": "{{title}} {{body}}",
     "embedder": {
       "provider": "antfly",
-      "model": "antflydb/clipclap"
+      "model": "Qwen/Qwen3-Embedding-0.6B-GGUF"
     },
     "chunker": {
       "provider": "antfly",
@@ -152,7 +161,7 @@ antfly table create --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/tables/wikipedia \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/wikipedia \
   -H "Content-Type: application/json" \
   -d '{
     "indexes": {
@@ -161,7 +170,7 @@ curl -X POST http://localhost:8080/db/v1/tables/wikipedia \
         "template": "{{title}} {{body}}",
         "embedder": {
           "provider": "antfly",
-          "model": "antflydb/clipclap"
+          "model": "Qwen/Qwen3-Embedding-0.6B-GGUF"
         },
         "chunker": {
           "provider": "antfly",
@@ -181,7 +190,7 @@ curl -X POST http://localhost:8080/db/v1/tables/wikipedia \
 import { AntflyClient } from '@antfly/sdk';
 
 const client = new AntflyClient({
-  baseUrl: 'http://localhost:8080',
+  baseUrl: 'http://127.0.0.1:8080',
 });
 
 await client.tables.create('wikipedia', {
@@ -191,7 +200,7 @@ await client.tables.create('wikipedia', {
       template: '{{title}} {{body}}',
       embedder: {
         provider: 'antfly',
-        model: 'antflydb/clipclap',
+        model: 'Qwen/Qwen3-Embedding-0.6B-GGUF',
       },
       chunker: {
         provider: 'antfly',
@@ -207,7 +216,7 @@ await client.tables.create('wikipedia', {
 ```python
 from antfly import AntflyClient
 
-client = AntflyClient(base_url='http://localhost:8080')
+client = AntflyClient(base_url='http://127.0.0.1:8080')
 
 client.create_table(
     name='wikipedia',
@@ -217,7 +226,7 @@ client.create_table(
             'template': '{{title}} {{body}}',
             'embedder': {
                 'provider': 'antfly',
-                'model': 'antflydb/clipclap',
+                'model': 'Qwen/Qwen3-Embedding-0.6B-GGUF',
             },
             'chunker': {
                 'provider': 'antfly',
@@ -242,13 +251,13 @@ import (
 )
 
 ctx := context.Background()
-client, err := antfly.NewAntflyClient("http://localhost:8080", http.DefaultClient)
+client, err := antfly.NewAntflyClient("http://127.0.0.1:8080", http.DefaultClient)
 if err != nil {
 	log.Fatal(err)
 }
 
 embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
-	Model: "antflydb/clipclap",
+	Model: "Qwen/Qwen3-Embedding-0.6B-GGUF",
 })
 if err != nil { log.Fatal(err) }
 
@@ -277,7 +286,7 @@ if err != nil { log.Fatal(err) }
 use antfly_sdk::Client;
 use serde_json::json;
 
-let client = Client::new("http://localhost:8080");
+let client = Client::new("http://127.0.0.1:8080");
 
 client.create_table("wikipedia", &json!({
     "indexes": {
@@ -286,7 +295,7 @@ client.create_table("wikipedia", &json!({
             "template": "{{title}} {{body}}",
             "embedder": {
                 "provider": "antfly",
-                "model": "antflydb/clipclap"
+                "model": "Qwen/Qwen3-Embedding-0.6B-GGUF"
             },
             "chunker": {
                 "provider": "antfly",
@@ -335,12 +344,13 @@ workflow with bounded batches and retries.
 Embedding generation runs in the background. Managed embeddings indexes use
 progressive publication by default, so a safely checkpointed partial generation
 can serve semantic queries while source coverage continues in the background.
-To wait only for that first queryable generation, run:
+To continue as soon as at least one result-bearing artifact has been safely
+published, run:
 
 ```bash
 antfly index wait --table wikipedia \
   --index title_body \
-  --until queryable \
+  --until searchable-artifacts=1 \
   --timeout 20m
 ```
 
@@ -354,21 +364,35 @@ Use `antfly index list --table wikipedia` for a compact progress summary, or
 add `--output json` for the complete diagnostic payload.
 Model startup and time-to-first-result depend on hardware. The wait command
 reports bounded periodic progress and enforces the timeout; do not continue if
-it times out before the index becomes queryable. Use `publication_policy:
+it times out before the index publishes a searchable artifact. Use `publication_policy:
 atomic` when a replacement generation must remain unavailable until fully built
 and validated. See [Troubleshooting](#troubleshooting) below.
 
 <Callout type="info">
-For chunked indexes, `INDEXED` and `VISIBLE` describe physical chunks or vector
-records, not source documents, so they can exceed 10,000. The JSON status also
-contains generation-scoped source coverage. `queryable_partial` means the active
-generation is safe to query but incomplete; `ready` means coverage is complete.
+For chunked indexes, `INDEXED` and `SEARCHABLE` describe
+physical chunks or vector records, not source documents, so they can exceed
+10,000. Embeddings status keeps these dimensions separate: `source_coverage`
+reports durable source outcomes, `searchable_vectors` reports query-visible
+physical entries, and `activity` reports incarnation-scoped chunk and embedding
+work. Activity explains current speed but never changes readiness.
+Its phase is reported by the worker that owns preparation, embedding,
+publication, or retry work; incomplete coverage alone never implies
+`embedding`. If the metadata leader has not received a fresh owner heartbeat,
+`activity` is `null` and the CLI reports activity as unavailable. A transient
+status-sampling miss retains the last matching owner sample for up to 90 seconds,
+so normal lifecycle contention does not make progress flicker.
+Status reads never inspect or wait for the resident writer. If a newly accepted
+target has not yet been observed by its owner, the last published incarnation
+and searchable counts remain available and `queryable_partial`; only
+`complete` gains a `target_observation` blocker until the next publication.
+`queryable_partial` means the active generation is safe to query but incomplete;
+`ready` means coverage is complete.
 </Callout>
 
 ## Search
 
 <Callout type="info">
-You can run these queries using the CLI (shown below) or the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080`.
+You can run these queries using the CLI (shown below) or the [web dashboard](/docs/guides/dashboard) at `http://127.0.0.1:8080`.
 </Callout>
 
 ### Full-Text Search
@@ -396,7 +420,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/query \
+curl -X POST http://127.0.0.1:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -506,7 +530,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/query \
+curl -X POST http://127.0.0.1:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -636,7 +660,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/query \
+curl -X POST http://127.0.0.1:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -784,14 +808,13 @@ antfly index create --table wikipedia \
   --type embeddings \
   --coverage-policy partial \
   --template "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}" \
-  --embedder '{"provider": "antfly", "model": "antflydb/clipclap"}' \
-  --dimension 512
+  --embedder '{"provider": "antfly", "model": "antflydb/clipclap"}'
 ```
   </TabsContent>
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/tables/wikipedia/indexes/thumbnail \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/wikipedia/indexes/thumbnail \
   -H "Content-Type: application/json" \
   -d '{
     "type": "embeddings",
@@ -801,7 +824,6 @@ curl -X POST http://localhost:8080/db/v1/tables/wikipedia/indexes/thumbnail \
       "provider": "antfly",
       "model": "antflydb/clipclap"
     },
-    "dimension": 512,
     "distance_metric": "cosine"
   }'
 ```
@@ -817,7 +839,6 @@ const createdIndex = await client.indexes.create('wikipedia', 'thumbnail', {
     provider: 'antfly',
     model: 'antflydb/clipclap',
   },
-  dimension: 512,
   distance_metric: 'cosine',
 });
 ```
@@ -841,7 +862,6 @@ created_index = client.indexes.create(
         coverage_policy=DerivedCoveragePolicy.PARTIAL,
         template='{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}',
         embedder=antfly_embedder('antflydb/clipclap'),
-        dimension=512,
         distance_metric=DistanceMetric.COSINE,
     ),
 )
@@ -858,7 +878,6 @@ request, err := antfly.NewCreateIndexRequest(antfly.EmbeddingsIndexConfig{
 	CoveragePolicy: antfly.DerivedCoveragePolicyPartial,
 	Template:       "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
 	Embedder:       *embedder,
-	Dimension:      512,
 	DistanceMetric: antfly.DistanceMetricCosine,
 })
 if err != nil { log.Fatal(err) }
@@ -871,13 +890,11 @@ fmt.Printf("%+v\n", createdIndex)
   <TabsContent value="rust">
 ```rust
 use antfly_sdk::types;
-use std::num::NonZeroU64;
 
 let request = types::CreateEmbeddingsIndexRequest {
     coverage_policy: Some(types::DerivedCoveragePolicy::Partial),
     template: Some("{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}".into()),
     embedder: Some(antfly_sdk::antfly_embedder("antflydb/clipclap")),
-    dimension: NonZeroU64::new(512),
     distance_metric: Some(types::DistanceMetric::Cosine),
     ..Default::default()
 };
@@ -890,12 +907,16 @@ let created_index = client
   </TabsContent>
 </Tabs>
 
-Adding an index to a table with existing data triggers background embedding generation. The `partial` coverage policy treats articles without a `thumbnail_url` as intentional skips while still requiring every article to reach a durable outcome. Wait until the image index is queryable before continuing:
+Antfly probes the selected embedding model during creation and stores its
+dimension in the normalized index definition. Specify `dimension` only when
+you also want creation to verify an explicit expected size.
+
+Adding an index to a table with existing data triggers background embedding generation. The `partial` coverage policy treats articles without a `thumbnail_url` as intentional skips while still requiring every article to reach a durable outcome. Wait until the image index has published at least one searchable artifact before continuing:
 
 ```bash
 antfly index wait --table wikipedia \
   --index thumbnail \
-  --until queryable \
+  --until searchable-artifacts=1 \
   --timeout 20m
 ```
 
@@ -927,7 +948,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/query \
+curl -X POST http://127.0.0.1:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -1056,7 +1077,7 @@ antfly agents retrieval --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/agents/retrieval \
+curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
   -H "Content-Type: application/json" \
   -d '{
     "queries": [{
@@ -1368,9 +1389,10 @@ Pull the missing model again, or pass the intended directory explicitly with
 
 ### An index remains pending or `index wait` times out
 
-Do not continue to semantic, image, or RAG steps until the relevant index is
-queryable. `queryable_partial` is safe to use while coverage grows; `pending` is
-not. If `index wait --until queryable` times out, capture the full status and recent
+Do not continue to semantic, image, or RAG steps until the relevant index has
+published enough searchable artifacts for the example. `queryable_partial` is
+safe to use while coverage grows, but an empty published generation cannot
+produce results. If `index wait --until searchable-artifacts=1` times out, capture the full status and recent
 watchdog messages:
 
 ```bash
@@ -1401,7 +1423,7 @@ brew services stop antfly
 
 ## Next Steps
 
-1. **[Explore the Dashboard](/docs/guides/dashboard)** — Manage tables, run queries, and monitor your cluster at `http://localhost:8080`
+1. **[Explore the Dashboard](/docs/guides/dashboard)** — Manage tables, run queries, and monitor your cluster at `http://127.0.0.1:8080`
 2. **[Image Search with CLIP](/docs/examples/image-search)** — Build a full image search application
 3. **[Browse Models](/inference)** — Discover available embedding, reranking, and generation models with `antfly inference list --remote`
 4. **[SDKs](/docs/sdks)** — Build applications with Go, TypeScript, Python, or Rust

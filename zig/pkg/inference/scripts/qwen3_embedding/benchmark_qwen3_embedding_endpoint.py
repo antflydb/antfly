@@ -55,7 +55,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:18099/v1/embeddings")
     parser.add_argument("--reference-url", help="llama.cpp /v1/embeddings endpoint")
-    parser.add_argument("--model", default="qwen3-embedding")
+    parser.add_argument("--model", default="Qwen/Qwen3-Embedding-0.6B-GGUF")
     parser.add_argument("--reference-model")
     parser.add_argument("--corpus", choices=sorted(CORPUS_PROFILES), default="mixed")
     parser.add_argument("--fixture", type=Path, help=f"exact-token {FIXTURE_SCHEMA} JSON")

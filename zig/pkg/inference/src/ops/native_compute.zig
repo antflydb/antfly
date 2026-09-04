@@ -4416,6 +4416,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .rmsNorm = &rmsNormOp,
     .rmsNormConsumeInput = &rmsNormConsumeInputOp,
     .gelu = &geluOp,
+    .geluExact = &geluExactOp,
     .geluNew = &geluNewOp,
     .relu = &reluOp,
     .silu = &siluOp,
@@ -6148,6 +6149,15 @@ fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const output = try self.allocator.dupe(f32, getData(input));
     activations_mod.gelu(output);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return propagateLogicalShapeLike(self, result, input);
+}
+
+fn geluExactOp(ctx: *anyopaque, input: CT) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const output = try self.allocator.dupe(f32, getData(input));
+    activations_mod.geluExact(output);
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
     return propagateLogicalShapeLike(self, result, input);
@@ -36081,24 +36091,46 @@ fn visionRopeOp(
     return propagateLogicalShapeLike(self, result, input);
 }
 
+/// Return the number of RoPE head chunks belonging to one token. Encoder
+/// Q/K linears preserve the token-major `[batch * sequence, hidden]` shape,
+/// so each token owns `hidden / head_dim` consecutive chunks. Falling back to
+/// the historical layout inference keeps callers without that shape metadata
+/// working, while preventing a batch-sized position stride for encoders.
+pub fn ropeChunksPerToken(logical_shape: ?[]const i64, total_chunks: usize, seq_len: usize, head_dim: usize) usize {
+    if (logical_shape) |shape| {
+        if (shape.len == 2 and shape[0] > 0 and shape[1] > 0 and
+            @as(usize, @intCast(shape[0])) % seq_len == 0 and
+            @as(usize, @intCast(shape[1])) % head_dim == 0)
+        {
+            const chunks_per_token = @as(usize, @intCast(shape[1])) / head_dim;
+            if (chunks_per_token > 0 and chunks_per_token * @as(usize, @intCast(shape[0])) == total_chunks) {
+                return chunks_per_token;
+            }
+        }
+    }
+    return total_chunks / seq_len;
+}
+
 fn ropeOp(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const data = getData(input);
     const total_chunks = data.len / head_dim;
     if (seq_len == 0) return error.InvalidRoPEInput;
     if (total_chunks % seq_len != 0) return error.InvalidRoPEInput;
-    const chunks_per_position = total_chunks / seq_len;
-    if (chunks_per_position == 0) return error.InvalidRoPEInput;
+    const chunks_per_token = ropeChunksPerToken(toBuf(input).logical_shape, total_chunks, seq_len, head_dim);
+    if (chunks_per_token == 0) return error.InvalidRoPEInput;
     const output = try self.allocator.dupe(f32, data);
     errdefer self.allocator.free(output);
 
     // Build flat position array: one position per head-sized chunk.
     // Layout is [batch * seq_len, num_heads], flattened by rows, so each token
-    // position must repeat for all heads in that row.
+    // position must repeat for all heads in that row. Do not include the batch
+    // in this stride: doing so rotates every group of `batch * heads` chunks
+    // as one token and makes single-item and batched encoder results diverge.
     const positions = try self.allocator.alloc(usize, total_chunks);
     defer self.allocator.free(positions);
     for (0..total_chunks) |tok| {
-        positions[tok] = position_offset + ((tok / chunks_per_position) % seq_len);
+        positions[tok] = position_offset + ((tok / chunks_per_token) % seq_len);
     }
 
     ropeCore(output, positions, head_dim, rope_dim, theta, freq_scale, consecutive_pairs);
@@ -45343,6 +45375,20 @@ test "ropeCore repeats positions across heads within a row" {
     try std.testing.expectApproxEqAbs(output[9], output[13], 1e-6);
     try std.testing.expectApproxEqAbs(output[10], output[14], 1e-6);
     try std.testing.expectApproxEqAbs(output[11], output[15], 1e-6);
+}
+
+test "RoPE token-major positions repeat per item across a batch" {
+    // [batch * sequence, hidden] with two heads per token. The first and
+    // third rows are both position zero; the second and fourth are position
+    // one. This is the layout produced by encoder QKV linears.
+    const logical_shape = [_]i64{ 4, 8 };
+    const chunks_per_token = ropeChunksPerToken(&logical_shape, 8, 2, 4);
+    try std.testing.expectEqual(@as(usize, 2), chunks_per_token);
+
+    const expected = [_]usize{ 0, 0, 1, 1, 0, 0, 1, 1 };
+    for (expected, 0..) |position, chunk| {
+        try std.testing.expectEqual(position, (chunk / chunks_per_token) % 2);
+    }
 }
 
 test "ropePerItem leaves padded positions unchanged" {

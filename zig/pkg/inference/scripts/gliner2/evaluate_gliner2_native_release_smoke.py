@@ -11,7 +11,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from gliner2_release_contract import CANONICAL_NORMALIZATION, path_fingerprint
-from validate_gliner2_release_data import adapter_bundle_fingerprint, base_model_fingerprint
+from validate_gliner2_release_data import (
+    adapter_bundle_fingerprint,
+    base_model_fingerprint,
+)
 
 
 NATIVE_EVALUATION_CONTRACT = "gliner2_native_full_task_evaluation/v1"
@@ -49,26 +52,36 @@ def eval_entity_labels(eval_data: Path) -> list[str]:
                 try:
                     record = json.loads(raw)
                 except json.JSONDecodeError as exc:
-                    raise ValueError(f"{source}:{line_no}: invalid JSON: {exc}") from exc
+                    raise ValueError(
+                        f"{source}:{line_no}: invalid JSON: {exc}"
+                    ) from exc
                 if not isinstance(record, dict):
                     raise ValueError(f"{source}:{line_no}: record must be an object")
                 output = record.get("output")
                 entities = output.get("entities") if isinstance(output, dict) else None
                 if entities is not None:
                     if not isinstance(entities, dict):
-                        raise ValueError(f"{source}:{line_no}: output.entities must be an object")
+                        raise ValueError(
+                            f"{source}:{line_no}: output.entities must be an object"
+                        )
                     candidates = entities
                 else:
                     legacy = record.get("entities", [])
                     if not isinstance(legacy, list):
-                        raise ValueError(f"{source}:{line_no}: entities must be an array")
+                        raise ValueError(
+                            f"{source}:{line_no}: entities must be an array"
+                        )
                     candidates = {
                         item.get("label"): None
                         for item in legacy
                         if isinstance(item, dict)
                     }
                 for raw_label in candidates:
-                    if not isinstance(raw_label, str) or not raw_label or raw_label != raw_label.strip():
+                    if (
+                        not isinstance(raw_label, str)
+                        or not raw_label
+                        or raw_label != raw_label.strip()
+                    ):
                         raise ValueError(f"{source}:{line_no}: invalid entity label")
                     if raw_label not in labels:
                         labels.append(raw_label)
@@ -77,21 +90,29 @@ def eval_entity_labels(eval_data: Path) -> list[str]:
     return labels
 
 
-def release_entity_schema(adapter_dir: Path, eval_data: Path) -> tuple[list[str], dict[str, Any]]:
+def release_entity_schema(
+    adapter_dir: Path, eval_data: Path
+) -> tuple[list[str], dict[str, Any]]:
     manifest_path = adapter_dir / "training_manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"invalid Zig training manifest: {manifest_path}: {exc}") from exc
+        raise ValueError(
+            f"invalid Zig training manifest: {manifest_path}: {exc}"
+        ) from exc
     if not isinstance(manifest, dict):
         raise ValueError("Zig training manifest must be a JSON object")
     manifest_labels = manifest.get("entity_labels")
-    if not isinstance(manifest_labels, list) or any(not isinstance(label, str) for label in manifest_labels):
+    if not isinstance(manifest_labels, list) or any(
+        not isinstance(label, str) for label in manifest_labels
+    ):
         raise ValueError("Zig training manifest requires entity_labels")
     labels = eval_entity_labels(eval_data)
     missing = [label for label in labels if label not in manifest_labels]
     if missing:
-        raise ValueError(f"eval entity labels are absent from the trained schema: {', '.join(missing)}")
+        raise ValueError(
+            f"eval entity labels are absent from the trained schema: {', '.join(missing)}"
+        )
     return labels, manifest
 
 
@@ -194,7 +215,9 @@ def main() -> int:
     parser.add_argument("--min-f1", type=release_threshold, required=True)
     parser.add_argument("--min-exact-match", type=release_threshold, required=True)
     parser.add_argument("--min-task-metric", action="append", default=[])
-    parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[5])
+    parser.add_argument(
+        "--repo-root", type=Path, default=Path(__file__).resolve().parents[5]
+    )
     args = parser.parse_args()
     model_dir = args.model_dir.expanduser().resolve()
     adapter_dir = args.adapter_dir.expanduser().resolve()
@@ -251,13 +274,17 @@ def main() -> int:
         },
         "entity_types": labels,
         "evaluated_record_count": native_summary.get("example_count", 0),
-        "evaluated_entity_record_count": native_summary.get("evaluated_entity_record_count", 0),
+        "evaluated_entity_record_count": native_summary.get(
+            "evaluated_entity_record_count", 0
+        ),
         "native_summary": native_summary,
         "normalization": native_summary.get("full_task", {}).get("normalization"),
         "expected_normalization": CANONICAL_NORMALIZATION,
         "artifacts": {
             "base_model_fingerprint_sha256": base_model_fingerprint(model_dir),
-            "adapter_bundle_fingerprint_sha256": adapter_bundle_fingerprint(adapter_dir),
+            "adapter_bundle_fingerprint_sha256": adapter_bundle_fingerprint(
+                adapter_dir
+            ),
             "eval_data_fingerprint_sha256": path_fingerprint(eval_data),
         },
     }

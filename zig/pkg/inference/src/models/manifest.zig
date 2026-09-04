@@ -376,6 +376,15 @@ pub const ModelManifest = struct {
         return "";
     }
 
+    /// True when retrieval task roles alter the text presented to the model.
+    /// Decoder execution style and task prefixing are deliberately separate:
+    /// encoder models such as Nomic can require query/document prefixes too.
+    pub fn hasEmbeddingTaskProfile(self: *const ModelManifest) bool {
+        return self.embedding_style != .none or
+            self.embedding_query_prefix.len > 0 or
+            self.embedding_text_prefix.len > 0;
+    }
+
     pub fn hasCapability(self: *const ModelManifest, cap: []const u8) bool {
         for (self.capabilities) |c| {
             if (std.mem.eql(u8, c, cap)) return true;
@@ -843,6 +852,14 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
             defer allocator.free(config_bytes);
             try ignoreNonResourceMetadataError(parseConfigJson(&manifest, allocator, config_bytes));
         }
+    }
+
+    // SentenceTransformers checkpoints carry their embedding reduction in a
+    // numbered pooling module. Honor a single declared reduction before an
+    // Antfly-specific model_manifest.json, which remains the explicit override.
+    if (try catalog.readOptional("1_Pooling/config.json")) |pooling_bytes| {
+        defer allocator.free(pooling_bytes);
+        try ignoreNonResourceMetadataError(parseSentenceTransformersPoolingConfig(&manifest, allocator, pooling_bytes));
     }
 
     // Try to parse model_manifest.json
@@ -1935,6 +1952,14 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
                 if (manifest.model_type == .embedder) manifest.model_type = .classifier;
             } else if (std.mem.eql(u8, s, "jina_embeddings_v5")) {
                 manifest.model_type = .embedder;
+            } else if (std.mem.eql(u8, s, "nomic_bert")) {
+                // Nomic Embed v1/v1.5 checkpoints require asymmetric literal
+                // task prefixes. Keep these in the manifest so HTTP and
+                // embedded inference use one model-owned profile.
+                if (manifest.embedding_query_prefix.len > 0) allocator.free(manifest.embedding_query_prefix);
+                manifest.embedding_query_prefix = try allocator.dupe(u8, "search_query: ");
+                if (manifest.embedding_text_prefix.len > 0) allocator.free(manifest.embedding_text_prefix);
+                manifest.embedding_text_prefix = try allocator.dupe(u8, "search_document: ");
             }
         }
     }
@@ -1961,6 +1986,34 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
             }
         }
     }
+}
+
+fn parseSentenceTransformersPoolingConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return;
+    const obj = parsed.value.object;
+    var selected: ?PoolingStrategy = null;
+
+    if (jsonBool(obj.get("pooling_mode_cls_token"))) selected = .cls;
+    if (jsonBool(obj.get("pooling_mode_mean_tokens"))) {
+        if (selected != null) return;
+        selected = .mean;
+    }
+    if (jsonBool(obj.get("pooling_mode_max_tokens"))) {
+        if (selected != null) return;
+        selected = .max;
+    }
+    if (jsonBool(obj.get("pooling_mode_lasttoken"))) {
+        if (selected != null) return;
+        selected = .last;
+    }
+
+    // Multiple enabled modes concatenate vectors in SentenceTransformers. Our
+    // manifest represents one reduction, so leave its configured/default mode
+    // intact rather than silently selecting an incompatible partial output.
+    if (selected) |pooling| manifest.pooling = pooling;
 }
 
 fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
@@ -3081,6 +3134,13 @@ fn jsonU32(val: std.json.Value) ?u32 {
     };
 }
 
+fn jsonBool(val: ?std.json.Value) bool {
+    return if (val) |value| switch (value) {
+        .bool => |enabled| enabled,
+        else => false,
+    } else false;
+}
+
 // -- Tests --
 
 test "manifest from config.json" {
@@ -3163,6 +3223,18 @@ test "manifest treats merged jina qwen3 task repo as embedder" {
     try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
     try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
     try std.testing.expectEqualStrings("Document: ", manifest.embedding_text_prefix);
+}
+
+test "NomicBERT config installs its asymmetric retrieval task profile" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseConfigJson(&manifest, allocator, "{\"model_type\":\"nomic_bert\"}");
+    try std.testing.expect(manifest.hasEmbeddingTaskProfile());
+    try std.testing.expectEqualStrings("search_query: ", manifest.embedding_query_prefix);
+    try std.testing.expectEqualStrings("search_document: ", manifest.embedding_text_prefix);
+    try std.testing.expect(!manifest.isLastTokenDecoderEmbedder());
 }
 
 test "loadFromDir detects qwen3-embedding sentence-transformers sidecars" {
@@ -3324,6 +3396,25 @@ test "loadFromDir infers SPLADE sparse output layout from pooling sidecar" {
     defer manifest.deinit();
 
     try std.testing.expectEqual(Sparse3DOutputLayout.batch_seq, manifest.sparse_3d_output_layout.?);
+}
+
+test "loadFromDir honors SentenceTransformers pooling metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "model/1_Pooling");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/config.json", .data = "{\"model_type\":\"modernbert\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/1_Pooling/config.json", .data = "{\"pooling_mode_cls_token\":true,\"pooling_mode_mean_tokens\":false}" });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(dir_path);
+
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(PoolingStrategy.cls, manifest.pooling);
 }
 
 test "manifest from model_manifest.json" {

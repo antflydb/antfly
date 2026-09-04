@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceModelFormat(str, Enum):
+class InferenceModelFormat(StrEnum):
     GGUF = "gguf"
     HYBRID = "hybrid"
     ONNX = "onnx"

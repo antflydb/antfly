@@ -18,9 +18,16 @@ from qualify_gliner2_cuda_hardware import source_fingerprint
 
 CONTRACT = "gliner2_cuda_hardware_qualification_matrix/v1"
 REQUIRED = {"sm80": "A100", "sm89": "L4", "sm90": "H100"}
-REQUIRED_CHECKS = {"embedded_artifacts", "full_parity", "memcheck", "initcheck", "racecheck"}
+REQUIRED_CHECKS = {
+    "embedded_artifacts",
+    "full_parity",
+    "memcheck",
+    "initcheck",
+    "racecheck",
+}
 EXPECTED_CAPABILITIES = {
-    architecture: capability for capability, (architecture, _family) in ARCHITECTURES.items()
+    architecture: capability
+    for capability, (architecture, _family) in ARCHITECTURES.items()
 }
 
 
@@ -35,7 +42,11 @@ def load(path: Path) -> dict[str, Any]:
 
 
 def is_sha256(value: Any) -> bool:
-    if not isinstance(value, str) or not value.startswith("sha256:") or len(value) != 71:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("sha256:")
+        or len(value) != 71
+    ):
         return False
     try:
         int(value.removeprefix("sha256:"), 16)
@@ -114,7 +125,9 @@ def lane_report_errors(
         or report.get("source_fingerprint_sha256") != current_fingerprint
         or report.get("source_files") != list(qualification_source_files(package_dir))
     ):
-        errors.append("lane contract, precision, artifacts, or source binding is invalid")
+        errors.append(
+            "lane contract, precision, artifacts, or source binding is invalid"
+        )
     if (
         gpu.get("architecture") != architecture
         or gpu.get("family") != family
@@ -128,19 +141,23 @@ def lane_report_errors(
         errors.append("lane does not contain the exact required check set")
         return errors
 
-    errors.extend(command_evidence_errors(
-        "embedded_artifacts",
-        checks.get("embedded_artifacts"),
-        "embedded-artifacts.log",
-        report_path,
-    ))
-    for tool in ("memcheck", "initcheck", "racecheck"):
-        errors.extend(command_evidence_errors(
-            tool,
-            checks.get(tool),
-            f"{tool}.log",
+    errors.extend(
+        command_evidence_errors(
+            "embedded_artifacts",
+            checks.get("embedded_artifacts"),
+            "embedded-artifacts.log",
             report_path,
-        ))
+        )
+    )
+    for tool in ("memcheck", "initcheck", "racecheck"):
+        errors.extend(
+            command_evidence_errors(
+                tool,
+                checks.get(tool),
+                f"{tool}.log",
+                report_path,
+            )
+        )
 
     full_parity = checks.get("full_parity")
     if not isinstance(full_parity, dict):
@@ -159,12 +176,14 @@ def lane_report_errors(
         errors.append("full_parity suite contract is invalid")
         return errors
     for test_filter in FULL_PARITY_FILTERS:
-        errors.extend(command_evidence_errors(
-            f"full_parity/{test_filter}",
-            subchecks.get(test_filter),
-            f"full-parity-{test_filter}.log",
-            report_path,
-        ))
+        errors.extend(
+            command_evidence_errors(
+                f"full_parity/{test_filter}",
+                subchecks.get(test_filter),
+                f"full-parity-{test_filter}.log",
+                report_path,
+            )
+        )
     return errors
 
 
@@ -199,7 +218,9 @@ def summarize(paths: list[Path], package_dir: Path) -> dict[str, Any]:
         )
         if lane_errors:
             evidence_logs_verified = False
-            failures.extend(f"invalid qualification lane {path}: {error}" for error in lane_errors)
+            failures.extend(
+                f"invalid qualification lane {path}: {error}" for error in lane_errors
+            )
     missing = sorted(set(REQUIRED) - set(lanes))
     if missing:
         failures.append("missing required CUDA architectures: " + ", ".join(missing))
@@ -238,7 +259,9 @@ def verify_summary(summary: dict[str, Any], package_dir: Path) -> list[str]:
         or summary.get("source_fingerprint_sha256") != current_fingerprint
         or set(lanes) != set(REQUIRED)
     ):
-        errors.append("CUDA hardware qualification matrix is stale or has an invalid contract")
+        errors.append(
+            "CUDA hardware qualification matrix is stale or has an invalid contract"
+        )
     for architecture, family in REQUIRED.items():
         lane = lanes.get(architecture)
         report = lane.get("report") if isinstance(lane, dict) else None
@@ -269,7 +292,9 @@ def main() -> int:
     except OSError as exc:
         parser.error(f"cannot invalidate previous CUDA matrix output: {exc}")
     try:
-        result = summarize([path.expanduser().resolve() for path in args.report], script_dir.parents[1])
+        result = summarize(
+            [path.expanduser().resolve() for path in args.report], script_dir.parents[1]
+        )
     except ValueError as exc:
         parser.error(str(exc))
     temporary = output.with_suffix(output.suffix + ".tmp")
