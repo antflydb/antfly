@@ -8167,9 +8167,12 @@ components:
       type: object
       description: Reranking execution statistics.
       properties:
+        provider:
+          $ref: "reranking.yaml#/components/schemas/RerankerProvider"
+          description: Reranking provider that executed the request.
         model:
           type: string
-          description: Reranker model that was used.
+          description: Resolved reranker model when the provider exposes a stable model name. Omitted for automatic local selection.
         documents_reranked:
           type: integer
           description: Number of documents that were reranked.
@@ -8177,6 +8180,8 @@ components:
           type: integer
           format: int64
           description: Time spent reranking in milliseconds.
+      required:
+        - provider
     MergeProfile:
       type: object
       description: Result merge statistics for hybrid search.

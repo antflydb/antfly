@@ -23,6 +23,45 @@ pub const OpenApiConfig = openapi.RerankerConfig;
 pub const max_candidate_count: u32 = 1000;
 pub const vertex_max_candidate_count: u32 = 200;
 
+pub const CredentialKind = enum { none, api_key, google_adc };
+
+/// Executable provider behavior resolved before retrieval begins. Keeping
+/// defaults and cost ceilings together gives validation, SDK-facing defaults,
+/// and dispatch one stable provider capability boundary.
+pub const ProviderCapabilities = struct {
+    default_model: []const u8,
+    default_url: []const u8,
+    max_candidate_count: u32,
+    model_required: bool,
+    credential_kind: CredentialKind,
+};
+
+pub fn providerCapabilities(provider: Provider) ProviderCapabilities {
+    return switch (provider) {
+        .antfly => .{
+            .default_model = "",
+            .default_url = "http://127.0.0.1:8082",
+            .max_candidate_count = max_candidate_count,
+            .model_required = false,
+            .credential_kind = .none,
+        },
+        .cohere => .{
+            .default_model = "rerank-english-v3.0",
+            .default_url = "https://api.cohere.com",
+            .max_candidate_count = max_candidate_count,
+            .model_required = true,
+            .credential_kind = .api_key,
+        },
+        .vertex => .{
+            .default_model = "semantic-ranker-default@latest",
+            .default_url = "https://discoveryengine.googleapis.com/v1",
+            .max_candidate_count = vertex_max_candidate_count,
+            .model_required = true,
+            .credential_kind = .google_adc,
+        },
+    };
+}
+
 pub const CandidateLimitDiagnostic = struct {
     provider: Provider,
     maximum: u32,
@@ -81,20 +120,13 @@ fn candidateLimitExceeded(provider: Provider) error{RerankerCandidateLimitExceed
 /// the selected provider cannot execute or splitting scores into incomparable
 /// batches.
 pub fn maxCandidateCountForProvider(provider: Provider) u32 {
-    return switch (provider) {
-        .vertex => vertex_max_candidate_count,
-        .antfly, .cohere => max_candidate_count,
-    };
+    return providerCapabilities(provider).max_candidate_count;
 }
 
 /// Stable provider defaults live at the executable boundary so every client
 /// (generated or hand-written) gets the same behavior when `model` is omitted.
 pub fn defaultModelForProvider(provider: Provider) []const u8 {
-    return switch (provider) {
-        .antfly => "",
-        .cohere => "rerank-english-v3.0",
-        .vertex => "semantic-ranker-default@latest",
-    };
+    return providerCapabilities(provider).default_model;
 }
 
 pub const Config = struct {
@@ -137,13 +169,9 @@ pub const Config = struct {
 
     pub fn validate(self: Config) !void {
         if (self.field.len == 0 and self.template.len == 0) return error.InvalidRerankerConfig;
-        switch (self.provider) {
-            .antfly => {},
-            .cohere, .vertex => {
-                if (self.model.len == 0) return error.InvalidRerankerConfig;
-            },
-        }
-        const provider_max = maxCandidateCountForProvider(self.provider);
+        const capabilities = providerCapabilities(self.provider);
+        if (capabilities.model_required and self.model.len == 0) return error.InvalidRerankerConfig;
+        const provider_max = capabilities.max_candidate_count;
         if (self.candidate_count) |candidate_count| {
             if (candidate_count == 0) return error.InvalidRerankerConfig;
             if (candidate_count > provider_max) return candidateLimitExceeded(self.provider);
@@ -159,10 +187,7 @@ pub const Config = struct {
 
     pub fn defaultedUrl(self: Config) []const u8 {
         if (self.url.len > 0) return self.url;
-        return switch (self.provider) {
-            .antfly => "http://127.0.0.1:8082",
-            else => "",
-        };
+        return providerCapabilities(self.provider).default_url;
     }
 };
 
@@ -226,12 +251,20 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.RerankerConfig) !C
 }
 
 test "external reranker models have executable defaults" {
+    const antfly = providerCapabilities(.antfly);
+    try std.testing.expectEqualStrings("", antfly.default_model);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8082", antfly.default_url);
+    try std.testing.expectEqual(CredentialKind.none, antfly.credential_kind);
+    try std.testing.expect(!antfly.model_required);
+
     var cohere = try configFromOpenApi(std.testing.allocator, .{
         .provider = .cohere,
         .field = "body",
     });
     defer cohere.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("rerank-english-v3.0", cohere.model);
+    try std.testing.expectEqualStrings("https://api.cohere.com", cohere.defaultedUrl());
+    try std.testing.expectEqual(CredentialKind.api_key, providerCapabilities(.cohere).credential_kind);
 
     var vertex = try configFromOpenApi(std.testing.allocator, .{
         .provider = .vertex,
@@ -239,6 +272,9 @@ test "external reranker models have executable defaults" {
     });
     defer vertex.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("semantic-ranker-default@latest", vertex.model);
+    try std.testing.expectEqualStrings("https://discoveryengine.googleapis.com/v1", vertex.defaultedUrl());
+    try std.testing.expectEqual(vertex_max_candidate_count, providerCapabilities(.vertex).max_candidate_count);
+    try std.testing.expectEqual(CredentialKind.google_adc, providerCapabilities(.vertex).credential_kind);
 }
 
 pub fn openApiFromConfig(cfg: Config) openapi.RerankerConfig {

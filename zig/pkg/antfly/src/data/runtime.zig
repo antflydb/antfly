@@ -612,6 +612,7 @@ const IndexRepairScheduleCandidate = struct {
     estimated_bytes: u64,
     queued: bool,
     queue_wake_generation: ?u64 = null,
+    metadata_epoch: u64 = 0,
     cursor_distance: usize,
 };
 
@@ -712,21 +713,23 @@ fn indexRepairQueueScheduleFromResult(
     };
 }
 
-fn provisionedIndexRepairPassHasOperatorActivity(
-    result: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult,
-) bool {
-    // The fallback audit deliberately revisits healthy groups so missed
-    // notifications remain recoverable. Those steady-state observations are
-    // useful when debugging the scheduler, but logging both the begin and end
-    // of every no-op pass at info level overwhelms normal quickstart logs.
-    // Keep info for attempted or completed work. Persistent pending, busy,
-    // disk-admission, and terminal-degraded state remains available in debug
-    // logs and metrics without being re-announced on every audit.
-    return result.index_repair_attempted or
-        result.index_repair_repaired or
-        result.index_repair_degraded or
-        result.made_progress or
-        result.cleared_debt;
+const IndexRepairOperatorTransition = enum { none, entered_terminal, recovered };
+
+fn indexRepairOperatorTransition(
+    previous_terminal_epoch: ?u64,
+    metadata_epoch: u64,
+    outcome: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome,
+) IndexRepairOperatorTransition {
+    if (outcome == .terminal_degraded) {
+        return if (previous_terminal_epoch == null or previous_terminal_epoch.? != metadata_epoch)
+            .entered_terminal
+        else
+            .none;
+    }
+    // A deferred pass did not reach the authoritative final audit, so it
+    // cannot prove that a previously observed terminal state recovered.
+    if (outcome == .deferred) return .none;
+    return if (previous_terminal_epoch != null) .recovered else .none;
 }
 
 test "data runtime preserves tagged aggregate index repair wake semantics" {
@@ -740,25 +743,52 @@ test "data runtime preserves tagged aggregate index repair wake semantics" {
 }
 
 test "index repair no-op audit stays below operator log level" {
-    try std.testing.expect(!provisionedIndexRepairPassHasOperatorActivity(.{}));
-    try std.testing.expect(!provisionedIndexRepairPassHasOperatorActivity(.{
-        .had_debt = true,
-        .index_repair_pending = true,
-        .busy = true,
-        .index_repair_disk_wait = true,
-    }));
-    try std.testing.expect(provisionedIndexRepairPassHasOperatorActivity(.{
-        .made_progress = true,
-    }));
-    try std.testing.expect(provisionedIndexRepairPassHasOperatorActivity(.{
-        .index_repair_attempted = true,
-    }));
-    try std.testing.expect(provisionedIndexRepairPassHasOperatorActivity(.{
-        .cleared_debt = true,
-    }));
-    try std.testing.expect(!provisionedIndexRepairPassHasOperatorActivity(.{
-        .terminal_degraded = true,
-    }));
+    try std.testing.expectEqual(
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome.noop,
+        (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{}).outcome(),
+    );
+    try std.testing.expectEqual(
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome.deferred,
+        (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
+            .had_debt = true,
+            .index_repair_pending = true,
+            .busy = true,
+            .index_repair_disk_wait = true,
+        }).outcome(),
+    );
+    try std.testing.expectEqual(
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome.progressed,
+        (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
+            .made_progress = true,
+        }).outcome(),
+    );
+    try std.testing.expectEqual(
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome.attempted,
+        (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
+            .index_repair_attempted = true,
+        }).outcome(),
+    );
+    try std.testing.expectEqual(
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome.progressed,
+        (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
+            .cleared_debt = true,
+        }).outcome(),
+    );
+    try std.testing.expectEqual(
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome.terminal_degraded,
+        (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
+            .terminal_degraded = true,
+        }).outcome(),
+    );
+}
+
+test "index repair terminal operator events are transition based" {
+    const Outcome = antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome;
+    try std.testing.expectEqual(IndexRepairOperatorTransition.entered_terminal, indexRepairOperatorTransition(null, 7, Outcome.terminal_degraded));
+    try std.testing.expectEqual(IndexRepairOperatorTransition.none, indexRepairOperatorTransition(7, 7, Outcome.terminal_degraded));
+    try std.testing.expectEqual(IndexRepairOperatorTransition.entered_terminal, indexRepairOperatorTransition(7, 8, Outcome.terminal_degraded));
+    try std.testing.expectEqual(IndexRepairOperatorTransition.none, indexRepairOperatorTransition(7, 7, Outcome.deferred));
+    try std.testing.expectEqual(IndexRepairOperatorTransition.recovered, indexRepairOperatorTransition(7, 7, Outcome.noop));
 }
 
 test "cooperative writer contention uses a preemptible bounded repair audit" {
@@ -5399,6 +5429,11 @@ pub const DataServer = struct {
     // Known debt is an O(1) linked hash queue. The cursor lets every pass inspect
     // a fixed window without copying or sorting the entire node's repair debt.
     provisioned_index_repair_group_ages: std.AutoHashMapUnmanaged(u64, IndexRepairQueueEntry) = .empty,
+    // Terminal repair logs are edge-triggered. The durable status/metrics
+    // remain level-triggered, while this compact group -> metadata epoch latch
+    // prevents fallback audits from repeating the same operator warning.
+    // Protected by provisioned_index_repair_mutex, which serializes passes.
+    provisioned_index_repair_terminal_log_epochs: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     provisioned_index_repair_queue_head: ?u64 = null,
     provisioned_index_repair_queue_tail: ?u64 = null,
     provisioned_index_repair_queue_cursor: ?u64 = null,
@@ -7620,6 +7655,7 @@ pub const DataServer = struct {
             if (entry.table_name) |table_name| self.alloc.free(table_name);
         }
         self.provisioned_index_repair_group_ages.deinit(self.alloc);
+        self.provisioned_index_repair_terminal_log_epochs.deinit(self.alloc);
         self.provisioned_index_repair_cancel_groups.deinit(self.alloc);
         self.provisioned_index_repair_routes.deinit(self.alloc);
         self.store_status_heartbeat_cache.clear(self.alloc);
@@ -14479,6 +14515,29 @@ pub const DataServer = struct {
     /// rescans durable intents instead of trusting notifications, reopens the
     /// selected DB through the managed owner, and rechecks placement and
     /// leadership immediately before claiming group work.
+    fn observeProvisionedIndexRepairOperatorTransition(
+        self: *DataServer,
+        group_id: u64,
+        metadata_epoch: u64,
+        outcome: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome,
+    ) IndexRepairOperatorTransition {
+        const previous = self.provisioned_index_repair_terminal_log_epochs.get(group_id);
+        const transition = indexRepairOperatorTransition(previous, metadata_epoch, outcome);
+        if (outcome == .terminal_degraded) {
+            if (transition == .entered_terminal) {
+                self.provisioned_index_repair_terminal_log_epochs.put(self.alloc, group_id, metadata_epoch) catch {
+                    // Logging must never make repair scheduling fallible. If
+                    // the tiny latch cannot grow, retain the important warning
+                    // even though a later audit may repeat it.
+                    return .entered_terminal;
+                };
+            }
+        } else if (transition == .recovered) {
+            _ = self.provisioned_index_repair_terminal_log_epochs.remove(group_id);
+        }
+        return transition;
+    }
+
     fn runProvisionedIndexRepair(self: *DataServer) void {
         if (self.provisioned_index_repair_shutdown.load(.acquire)) return;
         const started_ns = platform_time.monotonicNs();
@@ -14519,6 +14578,7 @@ pub const DataServer = struct {
         const QueuedRepair = struct {
             group_id: u64,
             wake_generation: u64,
+            metadata_epoch: u64,
             next_retry_at_ms: u64,
             table_name: ?[]u8,
             immediate_wake_pending: bool,
@@ -14555,6 +14615,7 @@ pub const DataServer = struct {
             queued_repairs.append(self.alloc, .{
                 .group_id = group_id,
                 .wake_generation = entry.wake_generation,
+                .metadata_epoch = entry.metadata_epoch,
                 .next_retry_at_ms = entry.next_retry_at_ms,
                 .table_name = queued_table_name,
                 .immediate_wake_pending = entry.immediate_wake_pending,
@@ -14619,6 +14680,7 @@ pub const DataServer = struct {
                 .estimated_bytes = 1,
                 .queued = true,
                 .queue_wake_generation = queued.wake_generation,
+                .metadata_epoch = queued.metadata_epoch,
                 .cursor_distance = 0,
             }) catch |err| {
                 _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
@@ -14713,6 +14775,7 @@ pub const DataServer = struct {
                     .identity_range_id = route.identity_range_id,
                     .estimated_bytes = 1,
                     .queued = false,
+                    .metadata_epoch = self.provisioned_index_repair_routes.metadata_epoch,
                     .cursor_distance = distance,
                 }) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
@@ -14827,27 +14890,45 @@ pub const DataServer = struct {
                 );
                 continue;
             };
+            const outcome = result.outcome();
+            const operator_transition = self.observeProvisionedIndexRepairOperatorTransition(
+                group_id,
+                candidate.metadata_epoch,
+                outcome,
+            );
             const repair_log_args = .{
                 group_id,
                 table_name,
                 (platform_time.monotonicNs() -| attempt_started_ns) / std.time.ns_per_ms,
+                @tagName(outcome),
                 result.index_repair_attempted,
                 result.index_repair_repaired,
                 result.index_repair_degraded,
+                result.terminal_degraded,
                 result.index_repair_pending,
                 result.busy,
                 result.index_repair_disk_wait,
             };
-            if (provisionedIndexRepairPassHasOperatorActivity(result)) {
-                std.log.info(
-                    "provisioned index repair pass group={} table={s} duration_ms={} attempted={} repaired={} degraded={} pending={} busy={} disk_wait={}",
-                    repair_log_args,
-                );
-            } else {
-                std.log.debug(
-                    "provisioned index repair pass group={} table={s} duration_ms={} attempted={} repaired={} degraded={} pending={} busy={} disk_wait={}",
-                    repair_log_args,
-                );
+            std.log.debug(
+                "provisioned index repair pass group={} table={s} duration_ms={} outcome={s} attempted={} repaired={} degraded={} terminal_degraded={} pending={} busy={} disk_wait={}",
+                repair_log_args,
+            );
+            switch (operator_transition) {
+                .entered_terminal => std.log.warn(
+                    "provisioned index repair entered terminal degradation group={} table={s} metadata_epoch={} outcome={s}",
+                    .{ group_id, table_name, candidate.metadata_epoch, @tagName(outcome) },
+                ),
+                .recovered => std.log.info(
+                    "provisioned index repair recovered from terminal degradation group={} table={s} metadata_epoch={} outcome={s}",
+                    .{ group_id, table_name, candidate.metadata_epoch, @tagName(outcome) },
+                ),
+                .none => switch (outcome) {
+                    .progressed, .repaired => std.log.info(
+                        "provisioned index repair operator activity group={} table={s} duration_ms={} outcome={s} attempted={} repaired={} degraded={} terminal_degraded={} pending={} busy={} disk_wait={}",
+                        repair_log_args,
+                    ),
+                    .noop, .deferred, .attempted, .terminal_degraded => {},
+                },
             }
             found_pending = found_pending or result.index_repair_pending;
             if (result.index_repair_disk_wait) {
@@ -15014,6 +15095,10 @@ pub const DataServer = struct {
         var previous = self.provisioned_index_repair_routes;
         self.provisioned_index_repair_routes = next;
         previous.deinit(self.alloc);
+        // Metadata epochs fence table/index incarnations. Forget transition
+        // latches at the same boundary so dropped groups cannot accumulate and
+        // a replacement incarnation can emit its own terminal edge.
+        self.provisioned_index_repair_terminal_log_epochs.clearRetainingCapacity();
         if (self.provisioned_index_repair_scan_cursor.load(.monotonic) >= self.provisioned_index_repair_routes.routes.items.len) {
             self.provisioned_index_repair_scan_cursor.store(0, .monotonic);
         }
@@ -28320,6 +28405,7 @@ test "data runtime repair debt hook targets the affected group queue" {
         .listener_cfg = undefined,
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
+    defer server.provisioned_index_repair_terminal_log_epochs.deinit(alloc);
     defer server.provisioned_index_repair_cancel_groups.deinit(alloc);
 
     server.runtime_status_dirty.store(false, .release);
@@ -28413,6 +28499,7 @@ test "data runtime repair failures preserve durable backoff and increase retry d
         .listener_cfg = undefined,
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
+    defer server.provisioned_index_repair_terminal_log_epochs.deinit(alloc);
 
     try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
     defer server.removeProvisionedIndexRepair(7001);
@@ -28458,6 +28545,7 @@ test "data runtime coalesces repair progress emitted during an active quantum" {
         .listener_cfg = undefined,
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
+    defer server.provisioned_index_repair_terminal_log_epochs.deinit(alloc);
 
     try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
     defer server.removeProvisionedIndexRepair(7001);
@@ -28495,6 +28583,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
         .listener_cfg = undefined,
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
+    defer server.provisioned_index_repair_terminal_log_epochs.deinit(alloc);
 
     try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
     const selected_generation = server.provisioned_index_repair_group_ages.get(7001).?.wake_generation;
@@ -28622,6 +28711,7 @@ test "data runtime repair queue links and removes debt in constant time" {
         .listener_cfg = undefined,
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
+    defer server.provisioned_index_repair_terminal_log_epochs.deinit(alloc);
 
     for (1..42) |group_id| try server.signalProvisionedIndexRepairRunnable(@intCast(group_id));
     try std.testing.expectEqual(@as(?u64, 1), server.provisioned_index_repair_queue_head);

@@ -8727,7 +8727,9 @@ pub const RerankerCandidateLimitExceededError = struct {
 
 /// Reranking execution statistics.
 pub const RerankerProfile = struct {
-    /// Reranker model that was used.
+    /// Reranking provider that executed the request.
+    provider: antfly_reranking_openapi.RerankerProvider,
+    /// Resolved reranker model when the provider exposes a stable model name. Omitted for automatic local selection.
     model: ?[]const u8 = null,
     /// Number of documents that were reranked.
     documents_reranked: ?i64 = null,
@@ -8736,6 +8738,7 @@ pub const RerankerProfile = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", true },
         .{ "documents_reranked", "documents_reranked", true },
         .{ "duration_ms", "duration_ms", true },
@@ -8751,6 +8754,8 @@ pub const RerankerProfile = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         if (self.model) |value| {
             try jw.objectField("model");
             try jw.write(value);

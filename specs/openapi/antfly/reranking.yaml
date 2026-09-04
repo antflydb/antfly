@@ -103,6 +103,12 @@ components:
     RerankerConfig:
       x-go-type-skip-optional-pointer: false
       description: "A unified configuration for a reranking provider."
+      discriminator:
+        propertyName: provider
+        mapping:
+          antfly: "#/components/schemas/AntflyRerankerConfig"
+          cohere: "#/components/schemas/CohereRerankerConfig"
+          vertex: "#/components/schemas/VertexRerankerConfig"
       allOf:
         - type: object
           properties:
@@ -114,6 +120,9 @@ components:
             template:
               type: string
               description: "Handlebars template to render document text for reranking."
+            model:
+              type: string
+              description: "Optional provider model name. When omitted, the selected provider's documented default is used."
             candidate_count:
               x-go-type-skip-optional-pointer: false
               type: integer

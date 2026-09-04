@@ -23,6 +23,8 @@ class RerankerConfig:
         provider (RerankerProvider): The reranking provider to use.
         field (str | Unset): Field name to extract from documents for reranking.
         template (str | Unset): Handlebars template to render document text for reranking.
+        model (str | Unset): Optional provider model name. When omitted, the selected provider's documented default is
+            used.
         candidate_count (int | Unset): Maximum number of globally highest-ranked retrieval candidates to send to the
             reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains
             the global window, and the provider is called once. Defaults to offset plus the effective final result limit
@@ -40,6 +42,7 @@ class RerankerConfig:
     provider: RerankerProvider
     field: str | Unset = UNSET
     template: str | Unset = UNSET
+    model: str | Unset = UNSET
     candidate_count: int | Unset = UNSET
     top_n: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -50,6 +53,8 @@ class RerankerConfig:
         field = self.field
 
         template = self.template
+
+        model = self.model
 
         candidate_count = self.candidate_count
 
@@ -66,6 +71,8 @@ class RerankerConfig:
             field_dict["field"] = field
         if template is not UNSET:
             field_dict["template"] = template
+        if model is not UNSET:
+            field_dict["model"] = model
         if candidate_count is not UNSET:
             field_dict["candidate_count"] = candidate_count
         if top_n is not UNSET:
@@ -82,6 +89,8 @@ class RerankerConfig:
 
         template = d.pop("template", UNSET)
 
+        model = d.pop("model", UNSET)
+
         candidate_count = d.pop("candidate_count", UNSET)
 
         top_n = d.pop("top_n", UNSET)
@@ -90,6 +99,7 @@ class RerankerConfig:
             provider=provider,
             field=field,
             template=template,
+            model=model,
             candidate_count=candidate_count,
             top_n=top_n,
         )

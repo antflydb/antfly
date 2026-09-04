@@ -17385,6 +17385,7 @@ fn applyReranker(
     }.lessThan);
 
     meta.reranker = .{
+        .provider = cfg.provider,
         .model = cfg.model,
         .documents_reranked = @intCast(owned_scores.len),
         .duration_ms = @intCast(@divTrunc(platform_time.monotonicNs() - rerank_start_ns, std.time.ns_per_ms)),

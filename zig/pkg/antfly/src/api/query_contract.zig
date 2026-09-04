@@ -279,6 +279,7 @@ pub fn queryHitsTotalValueToU32(total: metadata_openapi.QueryHitsTotal) !u32 {
 
 pub const QueryResponseMeta = struct {
     pub const RerankerProfile = struct {
+        provider: reranking_mod.Provider,
         model: []const u8 = "",
         documents_reranked: u32 = 0,
         duration_ms: i64 = 0,
@@ -7264,6 +7265,7 @@ fn buildProfileValue(
             .failed = 0,
         },
         .reranker = if (meta.reranker) |reranker| .{
+            .provider = reranker.provider,
             .model = if (reranker.model.len > 0) reranker.model else null,
             .documents_reranked = reranker.documents_reranked,
             .duration_ms = reranker.duration_ms,

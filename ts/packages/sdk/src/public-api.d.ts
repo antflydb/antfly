@@ -7833,7 +7833,9 @@ export interface components {
         };
         /** @description Reranking execution statistics. */
         RerankerProfile: {
-            /** @description Reranker model that was used. */
+            /** @description Reranking provider that executed the request. */
+            provider: components["schemas"]["RerankerProvider"];
+            /** @description Resolved reranker model when the provider exposes a stable model name. Omitted for automatic local selection. */
             model?: string;
             /** @description Number of documents that were reranked. */
             documents_reranked?: number;
@@ -12414,6 +12416,8 @@ export interface components {
             field?: string;
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
+            /** @description Optional provider model name. When omitted, the selected provider's documented default is used. */
+            model?: string;
             /** @description Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit and, when supplied explicitly, must be at least that page boundary. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency, and external API cost. The effective window must be at most 1000, and providers may impose a lower ceiling; Vertex currently accepts at most 200. Antfly rejects invalid or provider-specific windows before retrieval fan-out. */
             candidate_count?: number;
             /**

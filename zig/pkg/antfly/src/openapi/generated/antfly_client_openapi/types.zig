@@ -26530,12 +26530,12 @@ pub const RerankerConfig = struct {
     field: ?[]const u8 = null,
     /// Handlebars template to render document text for reranking.
     template: ?[]const u8 = null,
+    /// Optional provider model name. When omitted, the selected provider's documented default is used.
+    model: ?[]const u8 = null,
     /// Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit and, when supplied explicitly, must be at least that page boundary. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency, and external API cost. The effective window must be at most 1000, and providers may impose a lower ceiling; Vertex currently accepts at most 200. Antfly rejects invalid or provider-specific windows before retrieval fan-out.
     candidate_count: ?i64 = null,
     /// Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present or the selected provider's candidate ceiling; Vertex currently accepts at most 200.
     top_n: ?i64 = null,
-    /// Optional reranking model name. When omitted, Antfly inference selects a model from its reranker model directory. Set this explicitly when more than one local reranker is installed.
-    model: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
@@ -26550,9 +26550,9 @@ pub const RerankerConfig = struct {
         .{ "provider", "provider", true },
         .{ "field", "field", true },
         .{ "template", "template", true },
+        .{ "model", "model", true },
         .{ "candidate_count", "candidate_count", true },
         .{ "top_n", "top_n", true },
-        .{ "model", "model", true },
         .{ "url", "url", true },
         .{ "api_key", "api_key", true },
         .{ "project_id", "project_id", true },
@@ -26579,16 +26579,16 @@ pub const RerankerConfig = struct {
             try jw.objectField("template");
             try jw.write(value);
         }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
         if (self.candidate_count) |value| {
             try jw.objectField("candidate_count");
             try jw.write(value);
         }
         if (self.top_n) |value| {
             try jw.objectField("top_n");
-            try jw.write(value);
-        }
-        if (self.model) |value| {
-            try jw.objectField("model");
             try jw.write(value);
         }
         if (self.url) |value| {
@@ -26613,7 +26613,9 @@ pub const RerankerConfig = struct {
 
 /// Reranking execution statistics.
 pub const RerankerProfile = struct {
-    /// Reranker model that was used.
+    /// Reranking provider that executed the request.
+    provider: RerankerProvider,
+    /// Resolved reranker model when the provider exposes a stable model name. Omitted for automatic local selection.
     model: ?[]const u8 = null,
     /// Number of documents that were reranked.
     documents_reranked: ?i64 = null,
@@ -26622,6 +26624,7 @@ pub const RerankerProfile = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", true },
         .{ "documents_reranked", "documents_reranked", true },
         .{ "duration_ms", "duration_ms", true },
@@ -26637,6 +26640,8 @@ pub const RerankerProfile = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         if (self.model) |value| {
             try jw.objectField("model");
             try jw.write(value);

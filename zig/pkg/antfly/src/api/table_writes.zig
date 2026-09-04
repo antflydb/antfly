@@ -7277,6 +7277,15 @@ pub const ProvisionedTableWriteSource = struct {
     };
 
     pub const StartupCatchUpResult = struct {
+        pub const Outcome = enum {
+            noop,
+            deferred,
+            attempted,
+            progressed,
+            repaired,
+            terminal_degraded,
+        };
+
         had_debt: bool = false,
         cleared_debt: bool = false,
         terminal_degraded: bool = false,
@@ -7300,6 +7309,20 @@ pub const ProvisionedTableWriteSource = struct {
         index_repair_disk_wait: bool = false,
         index_repair_retry_at_ms: u64 = 0,
         index_repair_wake: db_mod.DB.IndexRepairWake = .empty,
+
+        /// Reduce the detailed scheduler facts to one stable operational
+        /// outcome. Callers use this for telemetry and logging policy instead
+        /// of independently interpreting an expanding set of booleans.
+        pub fn outcome(self: @This()) Outcome {
+            if (self.terminal_degraded) return .terminal_degraded;
+            if (self.index_repair_repaired) return .repaired;
+            if (self.made_progress or self.cleared_debt) return .progressed;
+            if (self.index_repair_attempted or self.index_repair_degraded) return .attempted;
+            if (self.had_debt or self.index_repair_pending or self.index_repair_paused or
+                self.busy or self.index_repair_disk_wait)
+                return .deferred;
+            return .noop;
+        }
     };
 
     pub const LocalChangeKind = enum {

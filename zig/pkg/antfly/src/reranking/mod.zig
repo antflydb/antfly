@@ -27,6 +27,8 @@ const google_auth = @import("antfly_google").auth;
 
 pub const Config = lib.Config;
 pub const Provider = lib.Provider;
+pub const ProviderCapabilities = lib.ProviderCapabilities;
+pub const providerCapabilities = lib.providerCapabilities;
 pub const max_candidate_count = lib.max_candidate_count;
 
 /// Long-lived resources shared by reranking requests. This keeps HTTP
@@ -228,9 +230,10 @@ pub fn rerankDocumentsWithOptions(
 ) ![]f32 {
     try cfg.validate();
     if (options.execution_context) |context| try context.check();
-    const configured_secret = switch (cfg.provider) {
-        .cohere => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, "COHERE_API_KEY"),
-        else => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
+    const capabilities = providerCapabilities(cfg.provider);
+    const configured_secret = switch (capabilities.credential_kind) {
+        .api_key => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, "COHERE_API_KEY"),
+        .none, .google_adc => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
     };
     const api_key = if (configured_secret) |secret_value| blk: {
         var owned_secret = secret_value;
@@ -284,7 +287,7 @@ pub fn rerankDocumentsWithOptions(
             else
                 null;
             var provider = try vertex_provider.Provider.init(alloc, http, .{
-                .base_url = if (cfg.url.len > 0) cfg.url else "https://discoveryengine.googleapis.com/v1",
+                .base_url = cfg.defaultedUrl(),
                 .project_id = if (cfg.project_id.len > 0) cfg.project_id else null,
                 .credentials_path = if (cfg.credentials_path.len > 0) cfg.credentials_path else null,
                 .bearer_token = api_key,
@@ -320,7 +323,7 @@ fn rerankCohere(
     const url = try std.fmt.allocPrint(
         alloc,
         "{s}/v2/rerank",
-        .{if (cfg.url.len > 0) cfg.url else "https://api.cohere.com"},
+        .{cfg.defaultedUrl()},
     );
     defer alloc.free(url);
     const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{api_key});
