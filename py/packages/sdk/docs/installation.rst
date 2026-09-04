@@ -4,8 +4,11 @@ Installation
 Requirements
 ------------
 
-* Python 3.10 or higher
+* Python 3.11 through 3.14
 * pip package manager
+
+Antfly drops a Python minor at the start of the calendar year in which that
+version reaches upstream end of life.
 
 Install from PyPI
 -----------------

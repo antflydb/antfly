@@ -180,7 +180,9 @@ def resolve_ref_path(ref_path: str, source_path: Path | None) -> Path:
     candidates.append((ROOT / ref_path).resolve())
     for old_prefix, new_prefix in PATH_REWRITES.items():
         if ref_path.startswith(old_prefix):
-            candidates.append((ROOT / ref_path.replace(old_prefix, new_prefix, 1)).resolve())
+            candidates.append(
+                (ROOT / ref_path.replace(old_prefix, new_prefix, 1)).resolve()
+            )
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -282,7 +284,14 @@ def ensure_root_schema(
     in_progress.add(key)
     try:
         schema_value = copy.deepcopy(source_schemas[schema_name])
-        bundled = bundle_refs(schema_value, root_spec, resolved_source_path, cache, in_progress, fallback_schemas)
+        bundled = bundle_refs(
+            schema_value,
+            root_spec,
+            resolved_source_path,
+            cache,
+            in_progress,
+            fallback_schemas,
+        )
         root_schemas[root_schema_name] = bundled
     finally:
         in_progress.remove(key)
@@ -298,10 +307,23 @@ def bundle_ref(
 ) -> str:
     if ref.startswith("#"):
         _, pointer = split_ref(f"{source_path or ROOT_SPEC}{ref}")
-        if pointer.startswith("#/components/schemas/") and source_path is not None and source_path != ROOT_SPEC:
+        if (
+            pointer.startswith("#/components/schemas/")
+            and source_path is not None
+            and source_path != ROOT_SPEC
+        ):
             schema_name = pointer.rsplit("/", 1)[-1]
-            ensure_root_schema(root_spec, schema_name, source_path, cache, in_progress, fallback_schemas)
-            return f"#/components/schemas/{target_schema_name(source_path, schema_name)}"
+            ensure_root_schema(
+                root_spec,
+                schema_name,
+                source_path,
+                cache,
+                in_progress,
+                fallback_schemas,
+            )
+            return (
+                f"#/components/schemas/{target_schema_name(source_path, schema_name)}"
+            )
         return ref
 
     ref_path, pointer = split_ref(ref)
@@ -312,10 +334,14 @@ def bundle_ref(
         resolved_path = resolve_ref_path(ref_path, source_path)
     except RuntimeError:
         root_schema_name = target_schema_name_for_ref(ref_path, schema_name)
-        if ensure_root_schema_from_fallback(root_spec, root_schema_name, cache, in_progress, fallback_schemas):
+        if ensure_root_schema_from_fallback(
+            root_spec, root_schema_name, cache, in_progress, fallback_schemas
+        ):
             return f"#/components/schemas/{root_schema_name}"
         raise
-    ensure_root_schema(root_spec, schema_name, resolved_path, cache, in_progress, fallback_schemas)
+    ensure_root_schema(
+        root_spec, schema_name, resolved_path, cache, in_progress, fallback_schemas
+    )
     return f"#/components/schemas/{target_schema_name(resolved_path, schema_name)}"
 
 
@@ -329,14 +355,30 @@ def bundle_refs(
 ) -> object:
     if isinstance(value, dict):
         if "$ref" in value and isinstance(value["$ref"], str):
-            value["$ref"] = bundle_ref(value["$ref"], root_spec, source_path, cache, in_progress, fallback_schemas)
+            value["$ref"] = bundle_ref(
+                value["$ref"],
+                root_spec,
+                source_path,
+                cache,
+                in_progress,
+                fallback_schemas,
+            )
             return value
         for key, child in list(value.items()):
             if key == "mapping" and isinstance(child, dict):
                 for mapping_key, mapping_value in list(child.items()):
                     if isinstance(mapping_value, str) and "#" in mapping_value:
-                        child[mapping_key] = bundle_ref(mapping_value, root_spec, source_path, cache, in_progress, fallback_schemas)
-            bundled_child = bundle_refs(child, root_spec, source_path, cache, in_progress, fallback_schemas)
+                        child[mapping_key] = bundle_ref(
+                            mapping_value,
+                            root_spec,
+                            source_path,
+                            cache,
+                            in_progress,
+                            fallback_schemas,
+                        )
+            bundled_child = bundle_refs(
+                child, root_spec, source_path, cache, in_progress, fallback_schemas
+            )
             if (
                 source_path == ROOT_SPEC.resolve()
                 and key in (root_spec.get("components", {}).get("schemas", {}) or {})
@@ -348,7 +390,9 @@ def bundle_refs(
         return value
     if isinstance(value, list):
         for i, child in enumerate(value):
-            value[i] = bundle_refs(child, root_spec, source_path, cache, in_progress, fallback_schemas)
+            value[i] = bundle_refs(
+                child, root_spec, source_path, cache, in_progress, fallback_schemas
+            )
         return value
     return value
 
@@ -376,7 +420,11 @@ def rewrite_external_refs(value: object) -> object:
         for key, child in list(value.items()):
             if key == "mapping" and isinstance(child, dict):
                 for mapping_key, mapping_value in list(child.items()):
-                    if isinstance(mapping_value, str) and "#" in mapping_value and not mapping_value.startswith("#"):
+                    if (
+                        isinstance(mapping_value, str)
+                        and "#" in mapping_value
+                        and not mapping_value.startswith("#")
+                    ):
                         ref_path, pointer = split_ref(mapping_value)
                         child[mapping_key] = f"{rewrite_ref_path(ref_path)}{pointer}"
             rewrite_external_refs(child)
@@ -426,7 +474,9 @@ def compare_specs(joined: dict, current: dict) -> bool:
     if actionable_drift:
         print("compare result: actionable drift detected")
     else:
-        print("compare result: no actionable drift; remaining differences are bundling-only")
+        print(
+            "compare result: no actionable drift; remaining differences are bundling-only"
+        )
     return actionable_drift
 
 

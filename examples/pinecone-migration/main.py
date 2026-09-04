@@ -29,10 +29,10 @@ from antfly.exceptions import AntflyException
 # ANCHOR: config
 # --- Configuration ---
 # Customize these values for your migration
-PINECONE_INDEX_NAME = "my-pinecone-index" # Your Pinecone index name
-TABLE_NAME = PINECONE_INDEX_NAME          # Antfly table name (using same name)
-INDEX_NAME = "nomic_index"                # Name for the vector index in Antfly
-DISTANCE_METRIC = "cosine"                # Match the metric used by your source index
+PINECONE_INDEX_NAME = "my-pinecone-index"  # Your Pinecone index name
+TABLE_NAME = PINECONE_INDEX_NAME  # Antfly table name (using same name)
+INDEX_NAME = "nomic_index"  # Name for the vector index in Antfly
+DISTANCE_METRIC = "cosine"  # Match the metric used by your source index
 
 ANTFLY_BASE_URL = os.getenv("ANTFLY_BASE_URL", "http://localhost:8080/db/v1")
 # ANCHOR_END: config
@@ -62,7 +62,7 @@ def main():
         print(f"Could not connect to Antfly: {e}")
         print("Ensure the Antfly server is running.")
         sys.exit(1)
-# ANCHOR_END: init_clients
+    # ANCHOR_END: init_clients
 
     # ANCHOR: create_table
     # --- Create Antfly table ---
@@ -89,10 +89,12 @@ def main():
     print("Fetching index statistics...")
     try:
         stats = pinecone_index.describe_index_stats()
-        namespaces = list(stats.get('namespaces', {}).keys())
-        total_vectors = stats.get('total_vector_count', 'N/A')
-        dimension = stats['dimension']
-        print(f"  -> Found {len(namespaces)} namespaces, {total_vectors} vectors, dimension {dimension}")
+        namespaces = list(stats.get("namespaces", {}).keys())
+        total_vectors = stats.get("total_vector_count", "N/A")
+        dimension = stats["dimension"]
+        print(
+            f"  -> Found {len(namespaces)} namespaces, {total_vectors} vectors, dimension {dimension}"
+        )
 
         if not namespaces:
             print("No namespaces found. Nothing to migrate.", file=sys.stderr)
@@ -114,12 +116,14 @@ def main():
             "dimension": dimension,
             "distance_metric": DISTANCE_METRIC,
         }
-        print(f"  -> Creating external index for imported vectors (metric: {DISTANCE_METRIC})")
+        print(
+            f"  -> Creating external index for imported vectors (metric: {DISTANCE_METRIC})"
+        )
 
         resp = httpx.post(
             f"{ANTFLY_BASE_URL}/tables/{TABLE_NAME}/indexes/{INDEX_NAME}",
             json=index_config,
-            timeout=30.0
+            timeout=30.0,
         )
         if resp.status_code in (200, 201):
             print("Index created successfully.")
@@ -148,10 +152,10 @@ def main():
             vector=[0.0] * dim,
             top_k=1000,
             include_values=True,
-            include_metadata=True
+            include_metadata=True,
         )
 
-        vectors = query_response.get('matches', [])
+        vectors = query_response.get("matches", [])
         if len(vectors) == 1000:
             print("  WARNING: Hit 1000 limit - may have more vectors.", file=sys.stderr)
 
@@ -170,10 +174,10 @@ def main():
         for v in vectors:
             # Flatten: metadata becomes top-level fields
             entry = {
-                'id': v['id'],
-                'values': v['values'],
-                **v.get('metadata', {}),
-                'namespace': namespace
+                "id": v["id"],
+                "values": v["values"],
+                **v.get("metadata", {}),
+                "namespace": namespace,
             }
             all_vectors[namespace].append(entry)
     # ANCHOR_END: fetch_vectors
@@ -186,21 +190,21 @@ def main():
 
             inserts = {}
             for item in items:
-                key = item['id']
-                properties = {k: v for k, v in item.items() if k != 'id'}
+                key = item["id"]
+                properties = {k: v for k, v in item.items() if k != "id"}
 
                 # Use _embeddings format for pre-computed embeddings
                 # Format: {"_embeddings": {"<index_name>": [vector values]}}
-                if 'values' in properties:
-                    embedding_vector = properties.pop('values')
-                    properties['_embeddings'] = {INDEX_NAME: embedding_vector}
+                if "values" in properties:
+                    embedding_vector = properties.pop("values")
+                    properties["_embeddings"] = {INDEX_NAME: embedding_vector}
 
                 inserts[key] = properties
 
             resp = httpx.post(
                 f"{ANTFLY_BASE_URL}/tables/{TABLE_NAME}/batch",
                 json={"inserts": inserts},
-                timeout=60.0
+                timeout=60.0,
             )
             if resp.status_code in (200, 201):
                 print(f"  -> Successfully upserted {len(items)} vectors.")
@@ -223,19 +227,19 @@ def main():
         resp = httpx.post(
             f"{ANTFLY_BASE_URL}/tables/{TABLE_NAME}/query",
             json={"limit": 200},
-            timeout=30.0
+            timeout=30.0,
         )
         if resp.status_code == 200:
             data = resp.json()
-            hits = data.get('responses', [{}])[0].get('hits', {}).get('hits', [])
+            hits = data.get("responses", [{}])[0].get("hits", {}).get("hits", [])
             print(f"Total records in Antfly: {len(hits)}")
 
             if hits:
                 print("\nSample records:")
                 for hit in hits[:3]:
-                    key = hit.get('_id', 'unknown')
-                    source = hit.get('_source', {})
-                    text = source.get('text', '')[:80] if source else ''
+                    key = hit.get("_id", "unknown")
+                    source = hit.get("_source", {})
+                    text = source.get("text", "")[:80] if source else ""
                     print(f"  - {key}: {text}...")
     except Exception as e:
         print(f"Verification failed: {e}")
@@ -245,26 +249,28 @@ def main():
     sample_vector = None
     for items in all_vectors.values():
         if items:
-            sample_key = items[0]['id']
-            sample_vector = items[0]['values']
+            sample_key = items[0]["id"]
+            sample_vector = items[0]["values"]
             break
 
     if sample_vector is not None:
-        print(f"\nTesting vector search using imported vector from key '{sample_key}'...")
+        print(
+            f"\nTesting vector search using imported vector from key '{sample_key}'..."
+        )
         try:
             resp = httpx.post(
                 f"{ANTFLY_BASE_URL}/tables/{TABLE_NAME}/query",
                 json={"embeddings": {INDEX_NAME: sample_vector}, "limit": 3},
-                timeout=30.0
+                timeout=30.0,
             )
             if resp.status_code == 200:
                 data = resp.json()
-                hits = data.get('responses', [{}])[0].get('hits', {}).get('hits', [])
+                hits = data.get("responses", [{}])[0].get("hits", {}).get("hits", [])
                 if hits:
                     print("Results:")
                     for hit in hits:
-                        score = hit.get('_score', 0)
-                        key = hit.get('_id', 'unknown')
+                        score = hit.get("_score", 0)
+                        key = hit.get("_id", "unknown")
                         print(f"  [{score:.4f}] {key}")
                 else:
                     print("  (no results)")

@@ -135,7 +135,7 @@ pub const ColumnarWriter = struct {
             const expected_docs = self.doc_count + 1;
             const actual_docs = blk: {
                 var total: u32 = 0;
-                for (fd.chunks.items[0 .. fd.chunks.items.len -| 1]) |_| {
+                for (fd.chunks.items[0..fd.chunks.items.len -| 1]) |_| {
                     total += self.chunk_size;
                 }
                 if (fd.chunks.items.len > 0) total += fd.docs_in_current;

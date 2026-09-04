@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ConnectedModelType(str, Enum):
+class ConnectedModelType(StrEnum):
     CHUNKER = "chunker"
     CLASSIFIER = "classifier"
     EMBEDDER = "embedder"

@@ -11,7 +11,13 @@ from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from benchmark_gemma4_cuda_matrix import collect_entries, evaluate, main, parse_args, run_pair_case
+from benchmark_gemma4_cuda_matrix import (
+    collect_entries,
+    evaluate,
+    main,
+    parse_args,
+    run_pair_case,
+)
 
 
 class MatrixGateTest(unittest.TestCase):
@@ -80,7 +86,10 @@ class MatrixGateTest(unittest.TestCase):
         with mock.patch.object(
             sys,
             "argv",
-            ["benchmark_gemma4_cuda_matrix.py", "--require-generated-q6-lm-head-argmax"],
+            [
+                "benchmark_gemma4_cuda_matrix.py",
+                "--require-generated-q6-lm-head-argmax",
+            ],
         ):
             self.assertTrue(parse_args().require_generated_q6_lm_head_argmax)
 
@@ -126,7 +135,9 @@ class MatrixGateTest(unittest.TestCase):
                 (run_dir / "paired_summary.json").write_text(json.dumps(summary))
                 return subprocess.CompletedProcess(command, 1)
 
-            with mock.patch("benchmark_gemma4_cuda_matrix.subprocess.run", side_effect=failed_pair) as run:
+            with mock.patch(
+                "benchmark_gemma4_cuda_matrix.subprocess.run", side_effect=failed_pair
+            ) as run:
                 entries = collect_entries(args)
 
             self.assertEqual(2, run.call_count)
@@ -173,7 +184,10 @@ class MatrixGateTest(unittest.TestCase):
                 (run_dir / "paired_summary.json").write_text(json.dumps(summary))
                 return subprocess.CompletedProcess(command, 0)
 
-            with mock.patch("benchmark_gemma4_cuda_matrix.subprocess.run", side_effect=successful_pair):
+            with mock.patch(
+                "benchmark_gemma4_cuda_matrix.subprocess.run",
+                side_effect=successful_pair,
+            ):
                 entries = collect_entries(args)
             self.assertTrue(entries[0]["pair_ok"])
 
@@ -183,8 +197,12 @@ class MatrixGateTest(unittest.TestCase):
             stale_summary = run_dir / "paired_summary.json"
             stale_summary.write_text('{"ok": true}')
             completed = subprocess.CompletedProcess(["pair-script"], 1)
-            with mock.patch("benchmark_gemma4_cuda_matrix.subprocess.run", return_value=completed):
-                with self.assertRaisesRegex(RuntimeError, "exited 1 without a readable summary"):
+            with mock.patch(
+                "benchmark_gemma4_cuda_matrix.subprocess.run", return_value=completed
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "exited 1 without a readable summary"
+                ):
                     run_pair_case(pathlib.Path("pair-script"), run_dir, {})
             self.assertFalse(stale_summary.exists())
 
@@ -196,20 +214,34 @@ class MatrixGateTest(unittest.TestCase):
             args.lengths = [256]
             args.collect_only = True
             entry = self.entry(256)
-            entry.update({"pair_exit_code": 1, "pair_summary_ok": False, "pair_ok": False})
+            entry.update(
+                {"pair_exit_code": 1, "pair_summary_ok": False, "pair_ok": False}
+            )
 
-            with mock.patch("benchmark_gemma4_cuda_matrix.parse_args", return_value=args), \
-                    mock.patch("benchmark_gemma4_cuda_matrix.collect_entries", return_value=[entry]), \
-                    mock.patch("builtins.print"):
+            with (
+                mock.patch(
+                    "benchmark_gemma4_cuda_matrix.parse_args", return_value=args
+                ),
+                mock.patch(
+                    "benchmark_gemma4_cuda_matrix.collect_entries", return_value=[entry]
+                ),
+                mock.patch("builtins.print"),
+            ):
                 main()
             result = json.loads((args.output_dir / "matrix_summary.json").read_text())
             self.assertFalse(result["passed"])
 
             args.collect_only = False
-            with mock.patch("benchmark_gemma4_cuda_matrix.parse_args", return_value=args), \
-                    mock.patch("benchmark_gemma4_cuda_matrix.collect_entries", return_value=[entry]), \
-                    mock.patch("builtins.print"), \
-                    self.assertRaisesRegex(SystemExit, "1"):
+            with (
+                mock.patch(
+                    "benchmark_gemma4_cuda_matrix.parse_args", return_value=args
+                ),
+                mock.patch(
+                    "benchmark_gemma4_cuda_matrix.collect_entries", return_value=[entry]
+                ),
+                mock.patch("builtins.print"),
+                self.assertRaisesRegex(SystemExit, "1"),
+            ):
                 main()
 
 

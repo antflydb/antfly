@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ForeignSourceType(str, Enum):
+class ForeignSourceType(StrEnum):
     POSTGRES = "postgres"
 
     def __str__(self) -> str:

@@ -17,7 +17,6 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  NPM_VERSION: 11.19.1
   GCP_REGION: us-central1
   GCP_PROJECT: antfly-image-artifacts
   GCP_REPOSITORY: containers
@@ -65,9 +64,13 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version: ${{ steps.toolchain.outputs.python_build }}
 
       - name: Download runtime archives from the completed build
         if: ${{ github.event_name == 'workflow_run' }}
@@ -525,6 +528,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: antfly-cli-snapshot
@@ -534,6 +540,8 @@ jobs:
           node-version-file: ts/package.json
           registry-url: https://registry.npmjs.org/
       - name: Install exact npm trusted-publishing client
+        env:
+          NPM_VERSION: ${{ steps.toolchain.outputs.npm_version }}
         run: |
           npm install -g "npm@$NPM_VERSION"
           test "$(npm --version)" = "$NPM_VERSION"
@@ -610,9 +618,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version: ${{ steps.toolchain.outputs.python_build }}
       - name: Verify the protected release environment contract
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -695,9 +706,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version: ${{ steps.toolchain.outputs.python_build }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: antfly-cli-snapshot
@@ -779,9 +793,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version: ${{ steps.toolchain.outputs.python_build }}
       - name: Install hash-locked object storage client
         run: |
           python -m pip install --require-hashes -r scripts/release/requirements.lock
@@ -862,9 +879,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version: ${{ steps.toolchain.outputs.python_build }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: antfly-release-payload
@@ -1036,9 +1056,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version: ${{ steps.toolchain.outputs.python_build }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ needs.prepare-release-promotion.outputs.publish_pypi == 'true' }}
         with:

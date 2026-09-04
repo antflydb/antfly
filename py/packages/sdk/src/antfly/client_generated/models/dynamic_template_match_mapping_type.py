@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class DynamicTemplateMatchMappingType(str, Enum):
+class DynamicTemplateMatchMappingType(StrEnum):
     BOOLEAN = "boolean"
     DATE = "date"
     NUMBER = "number"

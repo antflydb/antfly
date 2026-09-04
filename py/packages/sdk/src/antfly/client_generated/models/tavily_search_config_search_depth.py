@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TavilySearchConfigSearchDepth(str, Enum):
+class TavilySearchConfigSearchDepth(StrEnum):
     ADVANCED = "advanced"
     BASIC = "basic"
 

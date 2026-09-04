@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceGenerateRequestCompiledTarget(str, Enum):
+class InferenceGenerateRequestCompiledTarget(StrEnum):
     PARTITIONED = "partitioned"
     WHOLE_MODEL = "whole-model"
 

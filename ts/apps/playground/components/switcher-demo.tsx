@@ -96,7 +96,10 @@ export function SwitcherDemo() {
         <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
           SidebarSwitcher (dropdown)
         </p>
-        <SidebarProvider defaultOpen className="w-64 rounded-lg border border-sidebar-border bg-sidebar p-2 [&>*]:!min-h-0">
+        <SidebarProvider
+          defaultOpen
+          className="w-64 rounded-lg border border-sidebar-border bg-sidebar p-2 [&>*]:!min-h-0"
+        >
           <SidebarSwitcher>
             <SidebarSwitcherTrigger
               icon={<Database className="size-4" />}

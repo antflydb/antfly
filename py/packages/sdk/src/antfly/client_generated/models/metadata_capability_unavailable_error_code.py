@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class MetadataCapabilityUnavailableErrorCode(str, Enum):
+class MetadataCapabilityUnavailableErrorCode(StrEnum):
     METADATA_CAPABILITY_UNAVAILABLE = "metadata_capability_unavailable"
 
     def __str__(self) -> str:

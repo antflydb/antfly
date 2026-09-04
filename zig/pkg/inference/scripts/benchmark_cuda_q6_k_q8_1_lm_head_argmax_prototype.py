@@ -135,9 +135,7 @@ class Cuda:
                 f"prototype qualification requires SM89, found {self.compute_capability}"
             )
         context = ctypes.c_void_p()
-        self.check(
-            self.cuCtxCreate(ctypes.byref(context), 0, device), "cuCtxCreate_v2"
-        )
+        self.check(self.cuCtxCreate(ctypes.byref(context), 0, device), "cuCtxCreate_v2")
         self.context = context
         self.allocations: list[int] = []
         self.modules: list[ctypes.c_void_p] = []
@@ -208,9 +206,7 @@ class Cuda:
         self.cuEventCreate = bind(
             "cuEventCreate", [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
         )
-        self.cuEventRecord = bind(
-            "cuEventRecord", [ctypes.c_void_p, ctypes.c_void_p]
-        )
+        self.cuEventRecord = bind("cuEventRecord", [ctypes.c_void_p, ctypes.c_void_p])
         self.cuEventSynchronize = bind("cuEventSynchronize", [ctypes.c_void_p])
         self.cuEventElapsedTime = bind(
             "cuEventElapsedTime",
@@ -526,13 +522,23 @@ def launch_reduce(
         function,
         (1, 1, 1),
         (REDUCE_THREADS, 1, 1),
-        (ptr(token.pointer), ptr(values.pointer), ptr(indices.pointer), u32(1), u32(count)),
+        (
+            ptr(token.pointer),
+            ptr(values.pointer),
+            ptr(indices.pointer),
+            u32(1),
+            u32(count),
+        ),
     )
 
 
-def decode_pairs(cuda: Cuda, values: Guarded, indices: Guarded, count: int) -> list[tuple[int, int]]:
+def decode_pairs(
+    cuda: Cuda, values: Guarded, indices: Guarded, count: int
+) -> list[tuple[int, int]]:
     value_bits = struct.unpack(f"<{count}I", cuda.download(values.pointer, count * 4))
-    index_values = struct.unpack(f"<{count}I", cuda.download(indices.pointer, count * 4))
+    index_values = struct.unpack(
+        f"<{count}I", cuda.download(indices.pointer, count * 4)
+    )
     return list(zip(value_bits, index_values))
 
 
@@ -599,7 +605,9 @@ def run_correctness_case(
     cuda.upload(buffers.q8.pointer, q8_image)
     q8_hash_before = device_sha256(cuda, buffers.q8.pointer, len(q8_image))
     baseline_count = math.ceil(case.vocab / PRODUCTION_TILE)
-    poison_stage(cuda, buffers.baseline_values, buffers.baseline_indices, baseline_count)
+    poison_stage(
+        cuda, buffers.baseline_values, buffers.baseline_indices, baseline_count
+    )
     poison_token(cuda, buffers.baseline_token)
     fixed = case.vocab == MAX_VOCAB
     baseline_function = baseline_fixed if fixed else baseline_generic
@@ -646,7 +654,9 @@ def run_correctness_case(
         group_count = math.ceil(case.vocab / columns)
         for requested_grid in grids:
             grid = min(requested_grid, group_count)
-            poison_stage(cuda, buffers.candidate_values, buffers.candidate_indices, grid)
+            poison_stage(
+                cuda, buffers.candidate_values, buffers.candidate_indices, grid
+            )
             poison_token(cuda, buffers.candidate_token)
             launch_stage(
                 cuda,
@@ -699,7 +709,9 @@ def run_correctness_case(
 
             # A second launch must reproduce every candidate score bit/index,
             # not merely the final token.
-            poison_stage(cuda, buffers.candidate_values, buffers.candidate_indices, grid)
+            poison_stage(
+                cuda, buffers.candidate_values, buffers.candidate_indices, grid
+            )
             poison_token(cuda, buffers.candidate_token)
             launch_stage(
                 cuda,
@@ -892,12 +904,15 @@ def run_timing(
             full_speedup = statistics.median(
                 candidate_full_stats["paired_baseline_over_candidate"]
             )
-            stable = max(
-                float(baseline_stage_stats["cv"]),
-                float(candidate_stage_stats["cv"]),
-                float(baseline_full_stats["cv"]),
-                float(candidate_full_stats["cv"]),
-            ) <= 0.03
+            stable = (
+                max(
+                    float(baseline_stage_stats["cv"]),
+                    float(candidate_stage_stats["cv"]),
+                    float(baseline_full_stats["cv"]),
+                    float(candidate_full_stats["cv"]),
+                )
+                <= 0.03
+            )
             # A 20% latency reduction is candidate/baseline <= 0.80, which
             # is baseline/candidate >= 1.25 (not merely a 1.20x speedup).
             meets_target = stage_speedup >= 1.25 and stable
@@ -986,7 +1001,9 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     args.variants = parse_csv(args.variants, set(CANDIDATES))
     try:
-        args.grid_blocks = [positive_int(value) for value in parse_csv(args.grid_blocks)]
+        args.grid_blocks = [
+            positive_int(value) for value in parse_csv(args.grid_blocks)
+        ]
     except (ValueError, argparse.ArgumentTypeError) as error:
         parser.error(str(error))
     for path in (args.candidate_cubin, args.baseline_cubin):
@@ -1000,12 +1017,10 @@ def main() -> int:
     harness_path = Path(__file__).resolve()
     inference_dir = harness_path.parent.parent
     source_path = (
-        inference_dir
-        / "src/ops/cuda/prototypes/q6_k_q8_1_lm_head_argmax_sm89.cu"
+        inference_dir / "src/ops/cuda/prototypes/q6_k_q8_1_lm_head_argmax_sm89.cu"
     )
     build_script_path = (
-        inference_dir
-        / "scripts/build_cuda_q6_k_q8_1_lm_head_argmax_prototype.sh"
+        inference_dir / "scripts/build_cuda_q6_k_q8_1_lm_head_argmax_prototype.sh"
     )
     cuda: Cuda | None = None
     try:
@@ -1030,7 +1045,9 @@ def main() -> int:
 
         correctness_results: list[dict[str, object]] = []
         if args.suite in {"smoke", "correctness", "all"}:
-            cases = CORRECTNESS_CASES[:1] if args.suite == "smoke" else CORRECTNESS_CASES
+            cases = (
+                CORRECTNESS_CASES[:1] if args.suite == "smoke" else CORRECTNESS_CASES
+            )
             for case in cases:
                 result = run_correctness_case(
                     cuda,
@@ -1150,7 +1167,9 @@ def main() -> int:
         }
         if args.json_out:
             args.json_out.parent.mkdir(parents=True, exist_ok=True)
-            args.json_out.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
+            args.json_out.write_text(
+                json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+            )
         print(
             f"PASS cases={len(correctness_results)} timing_variants={len(timing_results)} "
             f"guards=true read_only=true exact=true",

@@ -41,12 +41,20 @@ class Platform:
     npm_libc: str | None = None
 
     def __post_init__(self) -> None:
-        if self.wheel_platform and self.wheel_platform.startswith("manylinux_") and self.release_variant != "gnu":
-            raise ValueError(f"manylinux platform {self.key} must use a GNU release archive")
+        if (
+            self.wheel_platform
+            and self.wheel_platform.startswith("manylinux_")
+            and self.release_variant != "gnu"
+        ):
+            raise ValueError(
+                f"manylinux platform {self.key} must use a GNU release archive"
+            )
         if self.npm_package_dir and self.release_os == "Linux":
             expected_libc = "glibc" if self.release_variant == "gnu" else "musl"
             if self.npm_libc != expected_libc:
-                raise ValueError(f"Linux platform {self.key} must declare npm libc {expected_libc}")
+                raise ValueError(
+                    f"Linux platform {self.key} must declare npm libc {expected_libc}"
+                )
         if not self.npm_package_dir and self.npm_libc:
             raise ValueError(f"non-npm platform {self.key} must not declare npm libc")
 
@@ -71,7 +79,9 @@ def release_platforms() -> tuple[Platform, ...]:
 
 PLATFORMS = release_platforms()
 
-PACKAGE_PLATFORMS = tuple(platform for platform in PLATFORMS if platform.npm_package_dir)
+PACKAGE_PLATFORMS = tuple(
+    platform for platform in PLATFORMS if platform.npm_package_dir
+)
 
 
 def archive_name(version: str, platform: Platform) -> str:
@@ -118,7 +128,9 @@ def safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     tar.extractall(dest)
 
 
-def extract_archive(archive_dir: Path, version: str, platform: Platform, dest: Path) -> None:
+def extract_archive(
+    archive_dir: Path, version: str, platform: Platform, dest: Path
+) -> None:
     archive = archive_dir / archive_name(version, platform)
     if not archive.exists():
         raise SystemExit(f"missing release archive: {archive}")
@@ -166,14 +178,22 @@ def update_json_version(path: Path, version: str, optional_deps: bool = False) -
 
 def update_pyproject_version(path: Path, version: str) -> None:
     text = path.read_text()
-    text = re.sub(r'^version = "[^"]+"$', f'version = "{version}"', text, count=1, flags=re.MULTILINE)
+    text = re.sub(
+        r'^version = "[^"]+"$',
+        f'version = "{version}"',
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
     path.write_text(text)
 
 
 def validate_npm_package(repo_root: Path, platform: Platform) -> None:
     if not platform.npm_package_dir:
         raise ValueError(f"platform {platform.key} does not produce an npm package")
-    package_json = repo_root / "ts" / "packages" / platform.npm_package_dir / "package.json"
+    package_json = (
+        repo_root / "ts" / "packages" / platform.npm_package_dir / "package.json"
+    )
     data = json.loads(package_json.read_text())
     expected_name = f"@antfly/{platform.npm_package_dir}"
     if data.get("name") != expected_name:
@@ -193,9 +213,15 @@ def populate_npm_package(repo_root: Path, platform: Platform, extracted: Path) -
     clean_path(package_dir / "share")
     (package_dir / "bin").mkdir(parents=True)
     shutil.copy2(extracted / "antfly", package_dir / "bin" / "antfly")
-    shutil.copytree(extracted / "include", package_dir / "include", ignore=ignore_packaging_noise)
-    shutil.copytree(extracted / "lib", package_dir / "lib", ignore=ignore_packaging_noise)
-    shutil.copytree(extracted / "share", package_dir / "share", ignore=ignore_packaging_noise)
+    shutil.copytree(
+        extracted / "include", package_dir / "include", ignore=ignore_packaging_noise
+    )
+    shutil.copytree(
+        extracted / "lib", package_dir / "lib", ignore=ignore_packaging_noise
+    )
+    shutil.copytree(
+        extracted / "share", package_dir / "share", ignore=ignore_packaging_noise
+    )
 
 
 def package_python_wheel(
@@ -217,15 +243,23 @@ def package_python_wheel(
 
     records: list[tuple[str, str, str]] = []
 
-    def write_bytes(zf: zipfile.ZipFile, arcname: str, data: bytes, mode: int | None = None) -> None:
+    def write_bytes(
+        zf: zipfile.ZipFile, arcname: str, data: bytes, mode: int | None = None
+    ) -> None:
         info = zipfile.ZipInfo(arcname)
         info.compress_type = zipfile.ZIP_DEFLATED
         info.external_attr = ((mode or 0o644) & 0xFFFF) << 16
         zf.writestr(info, data)
-        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+        digest = (
+            base64.urlsafe_b64encode(hashlib.sha256(data).digest())
+            .rstrip(b"=")
+            .decode()
+        )
         records.append((arcname, f"sha256={digest}", str(len(data))))
 
-    def write_file(zf: zipfile.ZipFile, arcname: str, path: Path, mode: int | None = None) -> None:
+    def write_file(
+        zf: zipfile.ZipFile, arcname: str, path: Path, mode: int | None = None
+    ) -> None:
         write_bytes(zf, arcname, path.read_bytes(), mode)
 
     metadata = Message()
@@ -257,7 +291,9 @@ def package_python_wheel(
         write_file(zf, f"{package_name}/bin/antfly", extracted / "antfly", 0o755)
         for dirname in ("include", "lib", "share"):
             for path in sorted((extracted / dirname).rglob("*")):
-                if path.is_file() and not is_packaging_noise(path.relative_to(extracted)):
+                if path.is_file() and not is_packaging_noise(
+                    path.relative_to(extracted)
+                ):
                     rel = path.relative_to(extracted)
                     write_file(zf, f"{package_name}/{rel.as_posix()}", path)
         write_bytes(zf, f"{dist_info}/METADATA", metadata.as_bytes())
@@ -280,9 +316,21 @@ def package_python_wheel(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", required=True, help="Antfly version, with or without v prefix")
-    parser.add_argument("--archive-dir", type=Path, default=Path("dist"), help="Directory containing release archives")
-    parser.add_argument("--out-dir", type=Path, default=Path("dist/cli-packages"), help="Output directory")
+    parser.add_argument(
+        "--version", required=True, help="Antfly version, with or without v prefix"
+    )
+    parser.add_argument(
+        "--archive-dir",
+        type=Path,
+        default=Path("dist"),
+        help="Directory containing release archives",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("dist/cli-packages"),
+        help="Output directory",
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -292,12 +340,21 @@ def main() -> int:
     out_dir = args.out_dir.resolve()
     py_out = out_dir / "python"
 
-    update_pyproject_version(repo_root / "py" / "packages" / "cli" / "pyproject.toml", python_version)
-    update_json_version(repo_root / "ts" / "packages" / "cli" / "package.json", version, optional_deps=True)
+    update_pyproject_version(
+        repo_root / "py" / "packages" / "cli" / "pyproject.toml", python_version
+    )
+    update_json_version(
+        repo_root / "ts" / "packages" / "cli" / "package.json",
+        version,
+        optional_deps=True,
+    )
     for platform in PACKAGE_PLATFORMS:
         validate_npm_package(repo_root, platform)
         assert platform.npm_package_dir is not None
-        update_json_version(repo_root / "ts" / "packages" / platform.npm_package_dir / "package.json", version)
+        update_json_version(
+            repo_root / "ts" / "packages" / platform.npm_package_dir / "package.json",
+            version,
+        )
 
     clean_path(py_out)
     for platform in PACKAGE_PLATFORMS:
@@ -307,7 +364,9 @@ def main() -> int:
             copy_antfarm(repo_root, extracted)
             populate_npm_package(repo_root, platform, extracted)
             if platform.wheel_platform:
-                wheel = package_python_wheel(repo_root, py_out, python_version, platform, extracted)
+                wheel = package_python_wheel(
+                    repo_root, py_out, python_version, platform, extracted
+                )
                 print(f"wrote {wheel}")
 
     print("npm package directories populated under ts/packages/cli-*")
