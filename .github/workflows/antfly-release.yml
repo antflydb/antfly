@@ -44,9 +44,6 @@ jobs:
       python_version: ${{ steps.registry-identity.outputs.python_version }}
       container_tag: ${{ steps.registry-identity.outputs.container_tag }}
       commit: ${{ steps.identity.outputs.commit }}
-      release_line: ${{ steps.identity.outputs.release_line }}
-      source_ref: ${{ steps.identity.outputs.source_ref }}
-      source_ref_head: ${{ steps.identity.outputs.source_ref_head }}
       build_controller_commit: ${{ steps.identity.outputs.build_controller_commit }}
       promotion_controller_commit: ${{ steps.identity.outputs.promotion_controller_commit }}
       allow_legacy: ${{ steps.identity.outputs.allow_legacy }}
@@ -128,21 +125,11 @@ jobs:
           promotion_controller_commit="$(git rev-parse HEAD)"
           if [ "$EVENT_NAME" = workflow_run ]; then
             request=dist/release-request/release-request.json
-            provenance_schema="$(jq -r .schema_version "$request")"
-            test "$provenance_schema" = 4 || test "$provenance_schema" = 5
+            test "$(jq -r .schema_version "$request")" = 4
             raw="$(jq -r .tag "$request")"
             commit="$(jq -r .source_commit "$request")"
             build_controller_commit="$(jq -r .build_controller_commit "$request")"
             requested_channel="$(jq -r .channel "$request")"
-            if [ "$provenance_schema" = 5 ]; then
-              release_line="$(jq -r .release_line "$request")"
-              source_ref="$(jq -r .source_ref "$request")"
-              source_ref_head="$(jq -r .source_ref_head "$request")"
-            else
-              release_line=""
-              source_ref=""
-              source_ref_head=""
-            fi
             allow_legacy=false
             test "$BUILD_EVENT" = workflow_run
           else
@@ -151,10 +138,6 @@ jobs:
             expected_ledger="${RECOVERY_LEDGER_SHA256,,}"
             test -n "$expected_ledger"
             build_controller_commit=""
-            provenance_schema=""
-            release_line=""
-            source_ref=""
-            source_ref_head=""
             allow_legacy=true
           fi
           if ! [[ "$raw" =~ ^v?[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.-]+)?$ ]]; then
@@ -183,26 +166,17 @@ jobs:
             echo "version=$version"
             echo "tag=$tag"
             echo "commit=$commit"
-            echo "provenance_schema=$provenance_schema"
-            echo "release_line=$release_line"
-            echo "source_ref=$source_ref"
-            echo "source_ref_head=$source_ref_head"
             echo "build_controller_commit=$build_controller_commit"
             echo "promotion_controller_commit=$promotion_controller_commit"
             echo "allow_legacy=$allow_legacy"
             echo "expected_ledger=$expected_ledger"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Require immutable controller and release-source history
+      - name: Require the tag and commit to be immutable default-branch history
         env:
-          EVENT_NAME: ${{ github.event_name }}
           RELEASE_TAG: ${{ steps.identity.outputs.tag }}
           RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
           RELEASE_CHANNEL: ${{ steps.identity.outputs.channel }}
-          PROVENANCE_SCHEMA: ${{ steps.identity.outputs.provenance_schema }}
-          RELEASE_LINE: ${{ steps.identity.outputs.release_line }}
-          SOURCE_REF: ${{ steps.identity.outputs.source_ref }}
-          SOURCE_REF_HEAD: ${{ steps.identity.outputs.source_ref_head }}
           BUILD_CONTROLLER_COMMIT: ${{ steps.identity.outputs.build_controller_commit }}
           PROMOTION_CONTROLLER_COMMIT: ${{ steps.identity.outputs.promotion_controller_commit }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -214,34 +188,13 @@ jobs:
           else
             git cat-file -e "$RELEASE_COMMIT^{commit}"
           fi
+          git merge-base --is-ancestor "$RELEASE_COMMIT" "origin/$DEFAULT_BRANCH"
           test "$(git rev-parse HEAD)" = "$PROMOTION_CONTROLLER_COMMIT"
           git merge-base --is-ancestor "$PROMOTION_CONTROLLER_COMMIT" "origin/$DEFAULT_BRANCH"
           if [ -n "$BUILD_CONTROLLER_COMMIT" ]; then
             [[ "$BUILD_CONTROLLER_COMMIT" =~ ^[0-9a-f]{40}$ ]]
             git cat-file -e "$BUILD_CONTROLLER_COMMIT^{commit}"
             git merge-base --is-ancestor "$BUILD_CONTROLLER_COMMIT" "origin/$DEFAULT_BRANCH"
-          fi
-          if [ "$EVENT_NAME" = workflow_run ]; then
-            if [ "$PROVENANCE_SCHEMA" = 5 ]; then
-              if [ "$RELEASE_CHANNEL" = nightly ]; then
-                resolved="$(python scripts/release/release_lines.py nightly)"
-                test "$RELEASE_LINE" = "$(jq -r .release_line <<<"$resolved")"
-                test "$SOURCE_REF" = "$(jq -r .source_ref <<<"$resolved")"
-              else
-                python scripts/release/release_lines.py verify-provenance \
-                  --tag "$RELEASE_TAG" \
-                  --release-line "$RELEASE_LINE" \
-                  --source-ref "$SOURCE_REF" \
-                  --allow-closed >/dev/null
-                test "$RELEASE_COMMIT" = "$SOURCE_REF_HEAD"
-              fi
-              git fetch --no-tags origin "$SOURCE_REF"
-              current_source_head="$(git rev-parse FETCH_HEAD)"
-              git merge-base --is-ancestor "$SOURCE_REF_HEAD" "$current_source_head"
-              git merge-base --is-ancestor "$RELEASE_COMMIT" "$SOURCE_REF_HEAD"
-            else
-              git merge-base --is-ancestor "$RELEASE_COMMIT" "origin/$DEFAULT_BRANCH"
-            fi
           fi
 
       - name: Install hash-locked object storage client
@@ -382,21 +335,6 @@ jobs:
             --commit "$RELEASE_COMMIT" \
             --ledger-sha256 "$actual"
           echo "sha256=$actual" >> "$GITHUB_OUTPUT"
-
-      - name: Verify recovered legacy source ancestry
-        if: ${{ github.event_name == 'repository_dispatch' }}
-        env:
-          RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -euo pipefail
-          schema="$(jq -r .schema_version dist/release-payload/artifacts.json)"
-          if [ "$schema" -le 4 ]; then
-            git cat-file -e "$RELEASE_COMMIT^{commit}"
-            git merge-base --is-ancestor "$RELEASE_COMMIT" "origin/$DEFAULT_BRANCH"
-          else
-            test "$schema" = 5
-          fi
 
       - name: Repair the GitHub release mirror from verified bytes
         if: ${{ github.event_name == 'repository_dispatch' && steps.identity.outputs.github_release != 'none' && steps.recovery.outputs.source == 'object-storage' }}
@@ -689,12 +627,10 @@ jobs:
       - name: Verify the protected release environment contract
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python scripts/release/github_environment.py check \
-            --repository "$GITHUB_REPOSITORY" \
-            --environment release-promotion
-          python scripts/release/github_rulesets.py check \
-            --repository "$GITHUB_REPOSITORY"
+        run: >-
+          python scripts/release/github_environment.py check
+          --repository "$GITHUB_REPOSITORY"
+          --environment release-promotion
       - name: Install hash-locked object storage client
         run: |
           python -m pip install --require-hashes -r scripts/release/requirements.lock
