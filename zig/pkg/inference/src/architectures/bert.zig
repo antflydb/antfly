@@ -82,8 +82,27 @@ fn bertEmbeddingLayerNormSlot(layer_count: usize) usize {
     return layer_count * bert_layer_norm_specs.len;
 }
 
-fn metalBertWeightMirrorMaxBytes() usize {
-    const mb = platform.env.getenvUsize("TERMITE_METAL_BERT_WEIGHT_MIRROR_MAX_MB") orelse 768;
+fn isBgeM3DenseConfig(config: Config) bool {
+    return config.model_type == .roberta and
+        config.vocab_size == 250002 and
+        config.hidden_size == 1024 and
+        config.num_hidden_layers == 24 and
+        config.num_attention_heads == 16 and
+        config.intermediate_size == 4096 and
+        config.max_position_embeddings == 8194 and
+        config.type_vocab_size == 1 and
+        config.hidden_act == .gelu_exact and
+        config.layer_norm_eps == 1e-5 and
+        config.pad_token_id == 1 and
+        config.position_id_mode == .roberta_padding;
+}
+
+fn metalBertWeightMirrorMaxBytes(config: Config) usize {
+    // Exact BGE-M3 F32 projections occupy 1,152 MiB. Its session admission
+    // policy accounts for that model-scoped residency, while generic BERT
+    // models retain the lower historical ceiling.
+    const default_mb: usize = if (isBgeM3DenseConfig(config)) 1280 else 768;
+    const mb = platform.env.getenvUsize("TERMITE_METAL_BERT_WEIGHT_MIRROR_MAX_MB") orelse default_mb;
     return std.math.mul(usize, mb, 1024 * 1024) catch std.math.maxInt(usize);
 }
 
@@ -140,24 +159,30 @@ fn preplanMetalEncoder(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
     // this encoder.
     if (metalEncoderSlotsPrepared(cb, config)) return true;
 
+    const exact_bge_m3 = isBgeM3DenseConfig(config);
     const weight_mirrors_requested = !platform.env.getenvBool("TERMITE_METAL_DISABLE_BERT_WEIGHT_MIRRORS") and
         !platform.env.getenvBool("TERMITE_METAL_DISABLE_BERT_Q8_STAGING");
-    const prefer_q8_mirrors = weight_mirrors_requested and platform.env.getenvBool("TERMITE_METAL_BERT_USE_Q8_MIRRORS");
+    const prefer_q8_mirrors = weight_mirrors_requested and !exact_bge_m3 and
+        platform.env.getenvBool("TERMITE_METAL_BERT_USE_Q8_MIRRORS");
     const prefer_bf16_requested = weight_mirrors_requested and !prefer_q8_mirrors and
+        !exact_bge_m3 and
         platform.env.getenvBool("TERMITE_METAL_BERT_USE_BF16_MIRRORS");
+    const force_bge_m3_f32 = exact_bge_m3 and
+        platform.env.getenvBool("TERMITE_METAL_BGE_M3_USE_F32_WEIGHTS");
     const prefer_f32_requested = weight_mirrors_requested and !prefer_q8_mirrors and !prefer_bf16_requested and
-        platform.env.getenvBool("TERMITE_METAL_BERT_USE_F32_MIRRORS");
+        ((exact_bge_m3 and force_bge_m3_f32) or platform.env.getenvBool("TERMITE_METAL_BERT_USE_F32_MIRRORS"));
     const mirror_bytes = bertDenseMirrorBytes(config, if (prefer_f32_requested) @sizeOf(f32) else @sizeOf(u16)) orelse
         std.math.maxInt(usize);
     // ponytail: keep one explicit aggregate ceiling until the runtime exposes
     // the Metal device's working-set budget to architecture preplanning.
-    const weight_mirrors_enabled = weight_mirrors_requested and mirror_bytes <= metalBertWeightMirrorMaxBytes();
+    const weight_mirrors_enabled = weight_mirrors_requested and mirror_bytes <= metalBertWeightMirrorMaxBytes(config);
     const prefer_bf16_mirrors = weight_mirrors_enabled and !prefer_q8_mirrors and
         prefer_bf16_requested;
     const prefer_f32_mps_mirrors = weight_mirrors_enabled and !prefer_q8_mirrors and !prefer_bf16_mirrors and
         prefer_f32_requested;
     const prefer_f16_mps_mirrors = weight_mirrors_enabled and !prefer_q8_mirrors and !prefer_bf16_mirrors and
         !prefer_f32_mps_mirrors;
+    const retain_dense_fallback = weight_mirrors_enabled and (!exact_bge_m3 or !force_bge_m3_f32);
 
     for (0..layer_count) |layer| {
         for (bert_linear_specs) |spec| {
@@ -173,14 +198,17 @@ fn preplanMetalEncoder(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
                 .bias = bias,
                 .in_dim = if (spec.input_intermediate) intermediate else hidden,
                 .out_dim = if (spec.output_intermediate) intermediate else hidden,
-                .retain_dense_fallback = weight_mirrors_enabled,
+                // BGE-M3 arrives as exact F32 and is loaded densely by its
+                // session policy. Its default F16 MPS mirror is selected
+                // explicitly here and never enters the generic Q8 branch.
+                .retain_dense_fallback = retain_dense_fallback,
                 // Prefill-shaped encoder GEMMs reuse an F16 mirror so Metal can
                 // use its mixed F32/F16 matrix path, matching CUDA's hybrid-
                 // residency strategy. The packed quantized weight remains the
                 // source of truth; direct, Q8, BF16, and F32 mirrors stay
                 // available for A/B runs.
-                .dense_fallback_max_bytes = if (weight_mirrors_enabled) 32 * 1024 * 1024 else null,
-                .allow_direct_quant_fallback = weight_mirrors_enabled,
+                .dense_fallback_max_bytes = if (retain_dense_fallback) 32 * 1024 * 1024 else null,
+                .allow_direct_quant_fallback = retain_dense_fallback,
                 .prefer_bf16_fallback = prefer_bf16_mirrors,
                 .prefer_f16_mps_fallback = prefer_f16_mps_mirrors,
                 .prefer_f32_mps_fallback = prefer_f32_mps_mirrors,
@@ -535,6 +563,7 @@ fn encoderLayer(
     const head_dim = hidden_dim / num_heads;
     const intermediate_dim: usize = @intCast(config.intermediate_size);
     const total = batch * seq_len;
+    const ffn_activation = runtimeActivationKind(config.hidden_act);
 
     var name_buf: [256]u8 = undefined;
 
@@ -629,7 +658,7 @@ fn encoderLayer(
             .hidden_size = hidden_dim,
             .intermediate_size = intermediate_dim,
             .eps = config.layer_norm_eps,
-            .activation = .gelu,
+            .activation = ffn_activation,
         })) |layer_out| {
             return layer_out;
         }
@@ -644,7 +673,7 @@ fn encoderLayer(
                 .residual = attn_normed,
                 .hidden_size = hidden_dim,
                 .intermediate_size = intermediate_dim,
-                .activation = .gelu,
+                .activation = ffn_activation,
             })) |output| break :blk output;
         }
 
@@ -662,13 +691,13 @@ fn encoderLayer(
             &name_buf,
         );
         defer cb.free(ffn_inter);
-        const ffn_gelu = try cb.gelu(ffn_inter);
-        defer cb.free(ffn_gelu);
+        const ffn_activated = try applyHiddenActivation(cb, ffn_inter, config.hidden_act);
+        defer cb.free(ffn_activated);
         const ffn_out = try layerLinearWithSlot(
             cb,
             allocator,
             layer,
-            ffn_gelu,
+            ffn_activated,
             "output.dense.weight",
             "output.dense.bias",
             total,
@@ -695,6 +724,24 @@ fn encoderLayer(
         &name_buf,
     );
     return layer_out;
+}
+
+fn runtimeActivationKind(activation: bert_config.HiddenActivation) ops.DecoderRuntimeActivationKind {
+    return switch (activation) {
+        .gelu_exact => .gelu_exact,
+        .gelu_tanh => .gelu_new,
+        .relu => .relu,
+        .silu => .silu,
+    };
+}
+
+fn applyHiddenActivation(cb: *const ComputeBackend, input: CT, activation: bert_config.HiddenActivation) !CT {
+    return switch (activation) {
+        .gelu_exact => (try cb.geluExact(input)) orelse return error.UnsupportedBertActivation,
+        .gelu_tanh => cb.geluNew(input),
+        .relu => cb.relu(input),
+        .silu => cb.silu(input),
+    };
 }
 
 /// Build a layer weight name like "encoder.layer.N.suffix" and look it up.
@@ -954,11 +1001,26 @@ test "BERT forward input validation rejects unsafe public inputs" {
     try std.testing.expectError(error.InvalidShape, validateBertForwardInputs(roberta_config, &ids, &mask, null, 1, 4));
 }
 
-test "BGE-M3 F16 mirror estimate stays within the production default" {
+test "BGE-M3 exact geometry admits the F32 rollback ceiling" {
     const config = Config{
+        .model_type = .roberta,
+        .vocab_size = 250002,
         .hidden_size = 1024,
         .intermediate_size = 4096,
         .num_hidden_layers = 24,
+        .num_attention_heads = 16,
+        .max_position_embeddings = 8194,
+        .type_vocab_size = 1,
+        .hidden_act = .gelu_exact,
+        .layer_norm_eps = 1e-5,
+        .pad_token_id = 1,
+        .position_id_mode = .roberta_padding,
     };
-    try std.testing.expectEqual(@as(usize, 576 * 1024 * 1024), bertDenseMirrorBytes(config, @sizeOf(u16)).?);
+    try std.testing.expect(isBgeM3DenseConfig(config));
+    try std.testing.expectEqual(@as(usize, 1152 * 1024 * 1024), bertDenseMirrorBytes(config, @sizeOf(f32)).?);
+    try std.testing.expect(bertDenseMirrorBytes(config, @sizeOf(f32)).? <= metalBertWeightMirrorMaxBytes(config));
+
+    var wrong_geometry = config;
+    wrong_geometry.hidden_size = 768;
+    try std.testing.expect(!isBgeM3DenseConfig(wrong_geometry));
 }

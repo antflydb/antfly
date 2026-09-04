@@ -16,6 +16,7 @@
 // serialization are outside the timed region.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const inference = @import("inference_internal");
 const backends = inference.backends;
@@ -27,11 +28,28 @@ const metal_runtime = inference.metal_runtime;
 const metal_generated_quant_stats = inference.metal_generated_quant_stats;
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn sysctlbyname(
+    name: [*:0]const u8,
+    oldp: ?*anyopaque,
+    oldlenp: *usize,
+    newp: ?*const anyopaque,
+    newlen: usize,
+) c_int;
+
+const DarwinSwapUsage = extern struct {
+    total: u64,
+    avail: u64,
+    used: u64,
+    pagesize: u32,
+    encrypted: u32,
+};
 
 const BackendChoice = enum { native, metal, cuda };
 
 const Options = struct {
     model_dir: []const u8 = "",
+    model_sha: []const u8 = "",
+    fixture_path: []const u8 = "src/bench/testdata/bge_m3_tokens.json",
     backend: BackendChoice = .metal,
     batch: usize = 1,
     seq_len: usize = 256,
@@ -43,6 +61,18 @@ const Options = struct {
     show_help: bool = false,
     kernel_jit: kernel_jit.Config = .{},
     kernel_jit_mode_explicit: bool = false,
+};
+
+const Fixture = struct {
+    model: []const u8,
+    seed: u64,
+    vocab_size: usize,
+    pad_token_id: i64,
+    source_text: []const u8,
+    input_ids_16: []const i64,
+    attention_mask_16: []const i64,
+    input_ids_128: []const i64,
+    attention_mask_128: []const i64,
 };
 
 const Timing = struct {
@@ -75,6 +105,13 @@ pub fn main(init: std.process.Init) !void {
     {
         return error.GeneratedKernelTuningRequiresActiveMetalJit;
     }
+
+    const fixture_bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.fixture_path, allocator, .limited(64 * 1024));
+    defer allocator.free(fixture_bytes);
+    var fixture_doc = try std.json.parseFromSlice(Fixture, allocator, fixture_bytes, .{ .ignore_unknown_fields = false });
+    defer fixture_doc.deinit();
+    const fixture = fixture_doc.value;
+    try validateFixture(fixture);
 
     var session_manager = backends.SessionManager.initWithIo(allocator, init.io);
     session_manager.preferred_backends = switch (opts.backend) {
@@ -110,8 +147,26 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(input_ids);
     const attention_mask = try allocator.alloc(i64, token_count);
     defer allocator.free(attention_mask);
-    for (input_ids, 0..) |*token, index| token.* = @intCast(4 + (index % 1024));
-    @memset(attention_mask, 1);
+    const fixture_row: ?[]const i64 = switch (opts.seq_len) {
+        16 => fixture.input_ids_16,
+        128 => fixture.input_ids_128,
+        else => null,
+    };
+    const fixture_mask: ?[]const i64 = switch (opts.seq_len) {
+        16 => fixture.attention_mask_16,
+        128 => fixture.attention_mask_128,
+        else => null,
+    };
+    if (fixture_row) |row_ids| {
+        const row_mask = fixture_mask.?;
+        for (0..opts.batch) |row| {
+            @memcpy(input_ids[row * opts.seq_len ..][0..opts.seq_len], row_ids);
+            @memcpy(attention_mask[row * opts.seq_len ..][0..opts.seq_len], row_mask);
+        }
+    } else {
+        for (input_ids, 0..) |*token, index| token.* = @intCast(4 + (index % 1024));
+        @memset(attention_mask, 1);
+    }
 
     for (0..opts.warmup_iters) |_| {
         const embeddings = try pipeline.embedTokenized(input_ids, attention_mask, opts.batch, opts.seq_len);
@@ -143,24 +198,29 @@ pub fn main(init: std.process.Init) !void {
         break :blk compareEmbeddings(generic, specialized);
     } else null;
 
+    var debug_backend = try session_factory.getComputeBackend(model.session, allocator);
+    defer debug_backend.deinit();
+    debug_backend.resetDebugTimingStats();
     const before_generated = metal_generated_quant_stats.snapshotForSession(allocator, model.session);
     const before_resident = model.resident_projection_stats.snapshot();
     const samples = try allocator.alloc(u64, opts.measure_iters);
     defer allocator.free(samples);
     var checksum: f64 = 0;
+    const rss_before = currentResidentBytes();
+    const swap_before = currentSwapBytes();
     for (samples) |*sample| {
         const start = nowNs();
         const embeddings = try pipeline.embedTokenized(input_ids, attention_mask, opts.batch, opts.seq_len);
         sample.* = nowNs() - start;
-        checksum += embeddingChecksum(embeddings);
+        checksum = embeddingChecksum(embeddings);
         freeEmbeddings(allocator, embeddings);
     }
+    const rss_after = currentResidentBytes();
+    const swap_after = currentSwapBytes();
     const generated = metal_generated_quant_stats.Stats.diff(
         before_generated,
         metal_generated_quant_stats.snapshotForSession(allocator, model.session),
     );
-    var debug_backend = try session_factory.getComputeBackend(model.session, allocator);
-    defer debug_backend.deinit();
     const provider_stats = debug_backend.debugTimingSnapshot().provider;
     const resident = model.resident_projection_stats.snapshot();
     const timing = try summarize(allocator, samples);
@@ -170,44 +230,74 @@ pub fn main(init: std.process.Init) !void {
         (@as(f64, @floatFromInt(total_ns)) / 1.0e9);
 
     std.debug.print(
-        "bge_m3_e2e backend={s} batch={} seq_len={} iters={} avg_ms={d:.3} p50_ms={d:.3} p95_ms={d:.3} min_ms={d:.3} max_ms={d:.3} embeddings_s={d:.2} resident_text={}/{} generated_total={} generated_q4_k={} generated_q6_k={} q4_k_fallback_rows_65_plus={} q6_k_fallback_rows_65_plus={} jit_exact_q4_k={} jit_tuned={} dense_f16_mb={} dense_f16_slots={} qkv_pack_mb={} runtime_mb={} mps_linears={} ",
+        "{{\"kind\":\"bge_m3_direct\",\"model\":\"{s}\",\"model_sha\":\"{s}\",\"backend\":\"{s}\",\"device\":\"{s}\",\"fixture_seed\":{d},\"batch\":{d},\"sequence_length\":{d},\"warmups\":{d},\"repeats\":{d},\"mean_ms\":{d:.6},\"p50_ms\":{d:.6},\"p95_ms\":{d:.6},\"min_ms\":{d:.6},\"max_ms\":{d:.6},\"direct_gpu_frame_ms\":{d:.6},\"embeddings_per_second\":{d:.6},",
         .{
+            fixture.model,
+            opts.model_sha,
             @tagName(opts.backend),
+            switch (opts.backend) {
+                .native => "cpu",
+                .metal => "mps",
+                .cuda => "cuda",
+            },
+            if (fixture_row != null) fixture.seed else 0,
             opts.batch,
             opts.seq_len,
+            opts.warmup_iters,
             opts.measure_iters,
             nsToMs(timing.avg_ns),
             nsToMs(timing.p50_ns),
             nsToMs(timing.p95_ns),
             nsToMs(timing.min_ns),
             nsToMs(timing.max_ns),
+            if (opts.measure_iters == 0)
+                @as(f64, 0)
+            else
+                @as(f64, @floatFromInt(provider_stats.decoder_runtime_frame_gpu_nanos)) /
+                    @as(f64, @floatFromInt(opts.measure_iters)) /
+                    @as(f64, std.time.ns_per_ms),
             embeddings_per_second,
-            resident.text_success - before_resident.text_success,
-            resident.text_fallback - before_resident.text_fallback,
-            generated.generatedTotal(),
-            generated.q4_k + generated.q4_k_bias + generated.q4_k_bias_gelu,
-            generated.q6_k + generated.q6_k_bias + generated.q6_k_bias_gelu,
-            generated.q4_k_rows_65_plus,
-            generated.q6_k_rows_65_plus,
-            generated.jit_exact_q4_k,
-            jit_tuned,
-            provider_stats.metal_runtime_dense_linear_f16_weight_bytes / (1024 * 1024),
-            provider_stats.metal_runtime_dense_linear_f16_slots,
-            provider_stats.metal_runtime_dense_qkv_packed_bytes / (1024 * 1024),
-            provider_stats.metal_runtime_total_bytes / (1024 * 1024),
-            provider_stats.metal_runtime_last_frame_mps_dense_linear_count,
         },
     );
     std.debug.print(
-        "quant_qkv={} qkv_packed={}/{} ffn_fused={}/{}/{} checksum={d:.6} attention_max_abs={d:.7} attention_cosine={d:.8}\n",
+        "\"command_counts\":{{\"compute_encoders\":{d},\"blit_encoders\":{d},\"planned_ops\":{d},\"mps_dense_linear\":{d},\"quant_qkv\":{d}}},\"optimized\":{{\"resident_text_successes\":{d},\"resident_text_fallbacks\":{d},\"qkv_packed_calls\":{d},\"qkv_packed_fallbacks\":{d},\"ffn_fused_calls\":{d},\"ffn_fused_mps_matmuls\":{d},\"ffn_fused_fallbacks\":{d},\"generated_total\":{d},\"generated_q4_k\":{d},\"generated_q6_k\":{d},\"jit_exact_q4_k\":{d},\"jit_tuned\":{d}}},",
         .{
+            provider_stats.metal_runtime_last_frame_compute_encoder_count,
+            provider_stats.metal_runtime_last_frame_blit_encoder_count,
+            provider_stats.metal_runtime_last_frame_planned_command_op_count,
+            provider_stats.metal_runtime_last_frame_mps_dense_linear_count,
             provider_stats.metal_runtime_last_frame_compute_quant_qkv_count,
+            resident.text_success - before_resident.text_success,
+            resident.text_fallback - before_resident.text_fallback,
             provider_stats.metal_runtime_dense_qkv_packed_calls,
             provider_stats.metal_runtime_dense_qkv_packed_fallbacks,
             provider_stats.metal_runtime_deberta_ffn_fused_calls,
             provider_stats.metal_runtime_deberta_ffn_fused_mps_matmuls,
             provider_stats.metal_runtime_deberta_ffn_fused_fallbacks,
+            generated.generatedTotal(),
+            generated.q4_k + generated.q4_k_bias + generated.q4_k_bias_gelu,
+            generated.q6_k + generated.q6_k_bias + generated.q6_k_bias_gelu,
+            generated.jit_exact_q4_k,
+            jit_tuned,
+        },
+    );
+    std.debug.print(
+        "\"memory\":{{\"runtime_bytes\":{d},\"dense_f32_weight_bytes\":{d},\"dense_f32_slots\":{d},\"dense_bf16_weight_bytes\":{d},\"dense_bf16_slots\":{d},\"dense_f16_weight_bytes\":{d},\"dense_f16_slots\":{d},\"qkv_pack_bytes\":{d}}},\"output_checksum\":{d:.9},\"rss_bytes\":{{\"before\":{d},\"after\":{d}}},\"swap_bytes\":{{\"before\":{d},\"after\":{d},\"available\":{}}},\"attention_validation\":{{\"max_abs\":{d:.9},\"cosine\":{d:.9}}}}}\n",
+        .{
+            provider_stats.metal_runtime_total_bytes,
+            provider_stats.metal_runtime_dense_linear_f32_weight_bytes,
+            provider_stats.metal_runtime_dense_linear_f32_slots,
+            provider_stats.metal_runtime_dense_linear_bf16_weight_bytes,
+            provider_stats.metal_runtime_dense_linear_bf16_slots,
+            provider_stats.metal_runtime_dense_linear_f16_weight_bytes,
+            provider_stats.metal_runtime_dense_linear_f16_slots,
+            provider_stats.metal_runtime_dense_qkv_packed_bytes,
             checksum,
+            rss_before,
+            rss_after,
+            swap_before orelse 0,
+            swap_after orelse 0,
+            swap_before != null and swap_after != null,
             if (attention_validation) |validation| validation.max_abs else @as(f32, -1),
             if (attention_validation) |validation| validation.cosine else @as(f64, -1),
         },
@@ -215,12 +305,20 @@ pub fn main(init: std.process.Init) !void {
     if (opts.print_embedding) {
         const embeddings = try pipeline.embedTokenized(input_ids, attention_mask, opts.batch, opts.seq_len);
         defer freeEmbeddings(allocator, embeddings);
-        std.debug.print("embedding_json=[", .{});
-        for (embeddings[0], 0..) |value, index| {
-            if (index != 0) std.debug.print(",", .{});
-            std.debug.print("{d:.9}", .{value});
+        std.debug.print(
+            "{{\"kind\":\"bge_m3_direct_embeddings\",\"model_sha\":\"{s}\",\"batch\":{d},\"sequence_length\":{d},\"embeddings\":[",
+            .{ opts.model_sha, opts.batch, opts.seq_len },
+        );
+        for (embeddings, 0..) |embedding, embedding_index| {
+            if (embedding_index != 0) std.debug.print(",", .{});
+            std.debug.print("[", .{});
+            for (embedding, 0..) |value, value_index| {
+                if (value_index != 0) std.debug.print(",", .{});
+                std.debug.print("{d:.9}", .{value});
+            }
+            std.debug.print("]", .{});
         }
-        std.debug.print("]\n", .{});
+        std.debug.print("]}}\n", .{});
     }
 }
 
@@ -261,6 +359,27 @@ fn compareEmbeddings(reference: []const []const f32, candidate: []const []const 
     };
 }
 
+fn validateFixture(fixture: Fixture) !void {
+    if (!std.mem.eql(u8, fixture.model, "BAAI/bge-m3") or
+        fixture.vocab_size != 250002 or
+        fixture.pad_token_id != 1 or
+        fixture.source_text.len == 0 or
+        fixture.input_ids_16.len != 16 or
+        fixture.attention_mask_16.len != 16 or
+        fixture.input_ids_128.len != 128 or
+        fixture.attention_mask_128.len != 128)
+    {
+        return error.InvalidBgeM3BenchmarkFixture;
+    }
+    const vocab_size: i64 = @intCast(fixture.vocab_size);
+    for (fixture.input_ids_16, fixture.attention_mask_16) |id, mask| {
+        if (id < 0 or id >= vocab_size or (mask != 0 and mask != 1)) return error.InvalidFixtureToken;
+    }
+    for (fixture.input_ids_128, fixture.attention_mask_128) |id, mask| {
+        if (id < 0 or id >= vocab_size or (mask != 0 and mask != 1)) return error.InvalidFixtureToken;
+    }
+}
+
 fn parseArgs(init: std.process.Init) !Options {
     var opts = Options{};
     var args = std.process.Args.Iterator.init(init.minimal.args);
@@ -268,6 +387,10 @@ fn parseArgs(init: std.process.Init) !Options {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--model-dir")) {
             opts.model_dir = args.next() orelse return error.MissingModelDir;
+        } else if (std.mem.eql(u8, arg, "--model-sha")) {
+            opts.model_sha = args.next() orelse return error.MissingModelSha;
+        } else if (std.mem.eql(u8, arg, "--fixture")) {
+            opts.fixture_path = args.next() orelse return error.MissingFixturePath;
         } else if (std.mem.eql(u8, arg, "--backend")) {
             opts.backend = std.meta.stringToEnum(BackendChoice, args.next() orelse return error.MissingBackend) orelse return error.InvalidBackend;
         } else if (std.mem.eql(u8, arg, "--batch")) {
@@ -282,7 +405,7 @@ fn parseArgs(init: std.process.Init) !Options {
             opts.validate_specialized_attention = true;
         } else if (std.mem.eql(u8, arg, "--tune-generated-kernels")) {
             opts.tune_generated_kernels = true;
-        } else if (std.mem.eql(u8, arg, "--print-embedding")) {
+        } else if (std.mem.eql(u8, arg, "--print-embedding") or std.mem.eql(u8, arg, "--print-embeddings")) {
             opts.print_embedding = true;
         } else if (std.mem.eql(u8, arg, "--kernel-jit-mode")) {
             opts.kernel_jit.mode = std.meta.stringToEnum(kernel_jit.Mode, args.next() orelse return error.MissingKernelJitMode) orelse return error.InvalidKernelJitMode;
@@ -342,6 +465,27 @@ fn embeddingChecksum(embeddings: []const []const f32) f64 {
     return sum;
 }
 
+fn currentResidentBytes() usize {
+    const usage = std.posix.getrusage(std.posix.rusage.SELF);
+    if (usage.maxrss <= 0) return 0;
+    const maxrss: usize = @intCast(usage.maxrss);
+    return switch (builtin.os.tag) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => maxrss,
+        .linux => std.math.mul(usize, maxrss, 1024) catch std.math.maxInt(usize),
+        else => maxrss,
+    };
+}
+
+fn currentSwapBytes() ?u64 {
+    if (builtin.os.tag != .macos) return null;
+    var usage: DarwinSwapUsage = undefined;
+    var usage_len: usize = @sizeOf(DarwinSwapUsage);
+    if (sysctlbyname("vm.swapusage", @ptrCast(&usage), &usage_len, null, 0) != 0 or usage_len != @sizeOf(DarwinSwapUsage)) {
+        return null;
+    }
+    return usage.used;
+}
+
 fn nowNs() u64 {
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
@@ -356,7 +500,7 @@ fn nsToMs(ns: u64) f64 {
 
 fn printUsage() void {
     std.debug.print(
-        "usage: zig build bench-bge-m3-e2e -Doptimize=ReleaseFast -- --model-dir <bge-m3.gguf|dir> [--backend metal|cuda|native] [--batch N] [--seq-len 256] [--warmup-iters N] [--measure-iters N] [--validate-specialized-attention] [--tune-generated-kernels] [--print-embedding] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir PATH]\n",
+        "usage: zig build bench-bge-m3-e2e -Doptimize=ReleaseFast -- --model-dir <bge-m3.gguf|dir> [--model-sha SHA256] [--fixture src/bench/testdata/bge_m3_tokens.json] [--backend metal|cuda|native] [--batch N] [--seq-len 16|128|256] [--warmup-iters N] [--measure-iters N] [--validate-specialized-attention] [--tune-generated-kernels] [--print-embeddings] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir PATH]\n",
         .{},
     );
 }

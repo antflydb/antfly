@@ -837,6 +837,25 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_deberta_encoder_layer_attempts: u64 = 0,
     metal_runtime_deberta_encoder_layer_successes: u64 = 0,
     metal_runtime_deberta_encoder_layer_fallbacks: u64 = 0,
+    metal_runtime_nomic_bert_encoder_layer_attempts: u64 = 0,
+    metal_runtime_nomic_bert_encoder_layer_successes: u64 = 0,
+    metal_runtime_nomic_bert_encoder_layer_fallbacks: u64 = 0,
+    metal_runtime_nomic_bert_encoder_layer_nanos: u128 = 0,
+    metal_runtime_nomic_bert_borrowed_f32_weight_hits: u64 = 0,
+    metal_runtime_nomic_bert_pool_normalize_attempts: u64 = 0,
+    metal_runtime_nomic_bert_pool_normalize_successes: u64 = 0,
+    metal_runtime_nomic_bert_pool_normalize_failures: u64 = 0,
+    metal_runtime_nomic_bert_qkv_rope_calls: u64 = 0,
+    metal_runtime_nomic_bert_rope_pair_calls: u64 = 0,
+    metal_runtime_nomic_bert_rope_pair_fallbacks: u64 = 0,
+    metal_runtime_nomic_bert_sdpa_q8_calls: u64 = 0,
+    metal_runtime_nomic_bert_attention_calls: u64 = 0,
+    metal_runtime_nomic_bert_attention_post_calls: u64 = 0,
+    metal_runtime_nomic_bert_ffn_pair_calls: u64 = 0,
+    metal_runtime_nomic_bert_ffn_activation_calls: u64 = 0,
+    metal_runtime_nomic_bert_ffn_output_norm_calls: u64 = 0,
+    metal_runtime_nomic_bert_ffn_fused_calls: u64 = 0,
+    metal_runtime_nomic_bert_ffn_fused_failures: u64 = 0,
     metal_runtime_deberta_relative_qk_pair_calls: u64 = 0,
     metal_runtime_deberta_relative_qk_pair_fallbacks: u64 = 0,
     metal_runtime_dense_qkv_packed_calls: u64 = 0,
@@ -1275,6 +1294,9 @@ pub const DebertaEncoderLayerSpec = backend_contracts.DebertaEncoderLayerSpec;
 pub const DebertaRelativeEmbeddingRequest = backend_contracts.DebertaRelativeEmbeddingRequest;
 pub const DebertaEncoderFramePlanRequest = backend_contracts.DebertaEncoderFramePlanRequest;
 pub const DebertaEncoderLayerRequest = backend_contracts.DebertaEncoderLayerRequest;
+pub const NomicBertEncoderLayerSpec = backend_contracts.NomicBertEncoderLayerSpec;
+pub const NomicBertEncoderLayerRequest = backend_contracts.NomicBertEncoderLayerRequest;
+pub const NomicBertPoolNormalizeRequest = backend_contracts.NomicBertPoolNormalizeRequest;
 
 pub const GraphPlanSlot = struct {
     slot: usize,
@@ -2260,6 +2282,12 @@ pub const ComputeBackend = struct {
         /// prepared backend-owned slot layout. Backends return null when the
         /// shape/path should use the ordinary eager ops.
         debertaEncoderLayer: ?*const fn (ctx: *anyopaque, request: *const DebertaEncoderLayerRequest) anyerror!?CT = null,
+
+        /// Execute one NomicBERT encoder layer from a previously prepared
+        /// backend-owned slot layout. Backends return null when the shape/path
+        /// should use the ordinary eager attention + SwiGLU sequence.
+        nomicBertEncoderLayer: ?*const fn (ctx: *anyopaque, request: *const NomicBertEncoderLayerRequest) anyerror!?CT = null,
+        nomicBertPoolNormalize: ?*const fn (ctx: *anyopaque, request: *const NomicBertPoolNormalizeRequest) anyerror!?CT = null,
 
         /// Begin a backend-owned decoder frame. Backends that support this
         /// encode subsequent runtime operations into one command submission
@@ -4096,6 +4124,20 @@ pub const ComputeBackend = struct {
 
     pub fn debertaEncoderLayer(self: *const ComputeBackend, request: *const DebertaEncoderLayerRequest) !?CT {
         if (self.vtable.debertaEncoderLayer) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn nomicBertEncoderLayer(self: *const ComputeBackend, request: *const NomicBertEncoderLayerRequest) !?CT {
+        if (self.vtable.nomicBertEncoderLayer) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn nomicBertPoolNormalize(self: *const ComputeBackend, request: *const NomicBertPoolNormalizeRequest) !?CT {
+        if (self.vtable.nomicBertPoolNormalize) |op| {
             return op(self.ptr, request);
         }
         return null;
