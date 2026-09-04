@@ -11,14 +11,9 @@ order: 1
 - How do I tune pruning for RAG quality?
 </Questions>
 
-By the end of this guide, one call answers a customer's question from your help articles. It retrieves the closest articles, reranks them, drops the weak ones, and writes the answer with a local model. You need Antfly running in standalone mode (the [Quickstart](/docs/guides/quickstart) leaves you there) and Ollama with a small model pulled:
+## The Result
 
-```bash
-curl -s http://localhost:8080/db/v1/status | head -c 200
-ollama pull gemma3:4b
-```
-
-Here is the call you'll be making, and what comes back:
+One call answers a customer's question from your help articles. It retrieves the closest articles, reranks them, drops the weak ones, and writes the answer with a local model:
 
 ```bash
 antfly agents retrieval --table help \
@@ -56,8 +51,18 @@ antfly agents retrieval --table help \
 }
 ```
 
+## Before You Start
 
-## 1. Create the Help Table
+Antfly running in standalone mode (the [Quickstart](/docs/guides/quickstart) leaves you there) and Ollama with a small model pulled:
+
+```bash
+curl -s http://localhost:8080/db/v1/status | head -c 200
+ollama pull gemma3:4b
+```
+
+## Build It
+
+### 1. Create the Help Table
 
 One embeddings index over title and content. The embedder and chunker run on Antfly Inference, inside the same process:
 
@@ -87,7 +92,7 @@ curl -X POST http://localhost:8080/db/v1/tables/help \
 
 Every table gets a full-text index by default, so this one embeddings index is all it takes for hybrid retrieval.
 
-## 2. Load Your Help Articles
+### 2. Load Your Help Articles
 
 ```bash
 curl -X POST http://localhost:8080/db/v1/tables/help/batch \
@@ -112,7 +117,7 @@ curl -X POST http://localhost:8080/db/v1/tables/help/batch \
 
 Each article is chunked and embedded as it lands. Re-insert an article under the same key to update it.
 
-## 3. Retrieve, Rerank, Prune, Answer
+### 3. Retrieve, Rerank, Prune, Answer
 
 One request to the retrieval agent runs the whole pipeline:
 
@@ -180,7 +185,9 @@ The response carries `generation`, the answer in markdown with the article ids i
 
 The generator here is Ollama on the same machine. Gemini, Vertex, OpenAI, and Antfly Inference work the same way; the [Quickstart](/docs/guides/quickstart#rag-with-alternative-providers) shows each config.
 
-## Why Pruning Is a Correctness Feature
+## Tradeoffs
+
+How strict the pruner is decides whether the agent answers at all when its evidence is weak.
 
 Retrieval always returns the closest matches it has. When a customer asks about something your help center does not cover, the closest match is still far away, and an answer generated from far-away context is confidently wrong. In a search results page a weak fourth result is harmless because a person skims past it. In an answer agent it becomes part of the answer.
 

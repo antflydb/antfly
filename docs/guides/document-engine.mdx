@@ -347,7 +347,7 @@ Exact query behavior fails closed. A sorted request returns 422 when the engine 
 
 Set `profile: true` while diagnosing. The public sort profile reports the selected plan, source, candidate source, selection reason, exactness, candidate counts, source-load behavior, and rejection reasons. Lower-level executor counters live in logs, traces, and benchmarks, not in SDK responses.
 
-## Which Path to Ask For
+## Decisions
 
 - Relevance-ordered results, text or hybrid: `full_text_search` or `semantic_search` with `limit`, no `order_by`. Add `reranker` and `pruner` when the top of the page has to be right.
 - Exact ordered browsing over a filter: map the sort field with `sortable: true`, use `order_by`, and page with `search_after`. Reserve `offset` for shallow pages.

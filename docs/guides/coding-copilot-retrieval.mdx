@@ -11,13 +11,9 @@ order: 5
 - Why does my coding assistant miss relevant files?
 </Questions>
 
-By the end of this guide, your copilot asks Antfly for context and gets back the files that matter, whether it asked by symbol name (`parseConfig`) or by intent ("where are configuration defaults applied?"), already trimmed to fit its context window. You need Antfly running in standalone mode, which the [Quickstart](/docs/guides/quickstart) leaves you with:
+## The Result
 
-```bash
-curl -s http://localhost:8080/db/v1/status | head -c 200
-```
-
-Here is the call your copilot will make by the end:
+Your copilot asks Antfly for context and gets back the files that matter, whether it asked by symbol name (`parseConfig`) or by intent ("where are configuration defaults applied?"), already trimmed to fit its context window:
 
 ```bash
 curl -X POST http://localhost:8080/db/v1/agents/retrieval \
@@ -63,8 +59,17 @@ curl -X POST http://localhost:8080/db/v1/agents/retrieval \
 }
 ```
 
+## Before You Start
 
-## 1. Index the Repo
+Antfly running in standalone mode, which the [Quickstart](/docs/guides/quickstart) leaves you with:
+
+```bash
+curl -s http://localhost:8080/db/v1/status | head -c 200
+```
+
+## Build It
+
+### 1. Index the Repo
 
 One embeddings index over file contents. Code wants smaller chunks than prose, so a function does not get split from its signature:
 
@@ -113,7 +118,7 @@ curl -X POST http://localhost:8080/db/v1/tables/repo/batch \
 
 In a real pipeline, walk the tree and batch a few hundred files per request. Re-insert a file when it changes and the index updates in place.
 
-## 2. Query Both Ways at Once
+### 2. Query Both Ways at Once
 
 Exact symbols come from the keyword side. Intent comes from the semantic side. One query runs both and fuses the ranked lists:
 
@@ -128,7 +133,7 @@ antfly query --table repo \
 
 Build the keyword side from the literal tokens in the copilot's request (identifiers, error strings, file names) and the semantic side from its description of the task, since each side finds what the other misses.
 
-## 3. Rerank Against the Task
+### 3. Rerank Against the Task
 
 Fusion gets the right candidates into the pool. A cross-encoder reranker orders them by how well each one serves what the copilot is trying to do, so rerank against the task description rather than the symbol:
 
@@ -147,11 +152,13 @@ antfly query --table repo \
   --pruner '{"min_score_ratio": 0.5}'
 ```
 
-## 4. Fit the Context Budget
+### 4. Fit the Context Budget
 
-The retrieval agent does the budgeting. Give it the same query plus `max_context_tokens`, and it assembles the reranked, pruned results up to that limit, most relevant first. That is the call at the top of this page. With no `steps.generation` block it returns context and sources, not an answer, which is what your copilot's model wants to be handed.
+The retrieval agent does the budgeting. Give it the same query plus `max_context_tokens`, and it assembles the reranked, pruned results up to that limit, most relevant first. That is the call shown in The Result. With no `steps.generation` block it returns context and sources, not an answer, which is what your copilot's model wants to be handed.
 
-## Why More Context Is Not the Goal
+## Tradeoffs
+
+The context budget is the setting to get right, and the common mistake is making it bigger than the copilot needs.
 
 A copilot can't know what it failed to retrieve. If the function that already solves the problem never reaches its context, it reinvents that function, and the failure looks like a bad model rather than a bad lookup. A bigger window does not fix this, because a window filled with near-misses buries the one file that mattered and spends tokens doing it.
 

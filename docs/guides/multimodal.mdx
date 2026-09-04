@@ -12,13 +12,9 @@ description: "An index over your images that answers a plain-language descriptio
 - What does coverage_policy partial do?
 </Questions>
 
-By the end of this guide, "map of a country" returns the articles whose thumbnails are maps, and an image URL returns the pictures that look like it. One embedding model places text and images in the same space, so there is no captioning step and no vision model in the middle, and it runs on Antfly Inference inside your instance. The examples run against the Wikipedia table from the [Quickstart](/docs/guides/quickstart), whose articles carry a `thumbnail_url` field:
+## The Result
 
-```bash
-antfly query --table wikipedia --full-text-search 'title:Iceland' --fields title,thumbnail_url --limit 1
-```
-
-Here is the query you'll be running by the end:
+"map of a country" returns the articles whose thumbnails are maps, and an image URL returns the pictures that look like it. One embedding model places text and images in the same space, so there is no captioning step and no vision model in the middle, and it runs on Antfly Inference inside your instance:
 
 ```bash
 antfly query --table wikipedia \
@@ -49,8 +45,17 @@ antfly query --table wikipedia \
 }
 ```
 
+## Before You Start
 
-## 1. Pull the Model
+The Wikipedia table from the [Quickstart](/docs/guides/quickstart), whose articles carry a `thumbnail_url` field:
+
+```bash
+antfly query --table wikipedia --full-text-search 'title:Iceland' --fields title,thumbnail_url --limit 1
+```
+
+## Build It
+
+### 1. Pull the Model
 
 ClipClap is a multimodal embedding model that understands text, images, and audio. Pull it onto Antfly Inference:
 
@@ -60,7 +65,7 @@ antfly inference pull antflydb/clipclap:gguf:Q4_K
 
 If the running instance does not pick it up, restart `antfly standalone`.
 
-## 2. Add an Image Index
+### 2. Add an Image Index
 
 The index template fetches each article's thumbnail and hands the bytes to the embedder. Articles without a thumbnail render an empty template and are skipped:
 
@@ -103,7 +108,7 @@ curl -X POST http://localhost:8080/db/v1/tables/wikipedia/indexes/thumbnail \
 
 `{{remoteMedia url=...}}` downloads the image and prepares it as model input. It accepts `http://`, `https://`, `s3://`, and `file://` URLs, refuses private IP ranges, and caps downloads at 100 MB. For images you already hold as data URIs, use `{{media url=...}}` instead.
 
-## 3. Wait for the Backfill
+### 3. Wait for the Backfill
 
 The index embeds every existing article in the background. Wait for it before querying:
 
@@ -111,7 +116,7 @@ The index embeds every existing article in the background. Wait for it before qu
 antfly index wait --table wikipedia --index thumbnail --until complete --timeout 20m
 ```
 
-## 4. Search by Description, or by Image
+### 4. Search by Description, or by Image
 
 Describe what you want to see:
 
@@ -140,7 +145,9 @@ curl -X POST http://localhost:8080/db/v1/query \
 
 A base64 data URI works the same way with `{{media url=this}}`. Mix text and image in one query by writing both into the template: `"Find pages like this: {{remoteMedia url=this}}"`.
 
-## Why One Model Sees Both
+## Tradeoffs
+
+Two choices shape the index: embedding images directly instead of captioning them, and how documents with no image count toward completion.
 
 The older way to search images was to caption them first: run a vision model over every picture, store the caption, embed the caption. Search then matched your words against the captioner's words, so any detail the captioner left out was unsearchable.
 

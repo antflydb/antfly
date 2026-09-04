@@ -50,32 +50,36 @@ goes in the opener as prose with a verification command.
 
 ## Guide anatomy
 
-Target 120 to 200 lines. In this order:
+Target 120 to 200 lines. Every guide uses the same six h2 headings, in this order, so
+the outline on the right of the page reads the same on every guide. Only the h3 steps
+under Build It vary.
 
 1. **`<Questions>`** right after frontmatter: three to five questions a person would
    actually type into a search box.
 
-2. **The opener**, no heading, two to four sentences. What the reader will have when
-   they finish, in their own world. What must already be running, with a command that
-   proves it. Nothing else: no framing, no category, no what-this-guide-covers sentence.
-   The title already said what the guide covers.
+2. **`## The Result`.** One or two sentences on what the reader has when they finish,
+   in their own world, then the finished artifact: the final request and a trimmed real
+   response, or the finished component. This is what lets the reader decide in ten
+   seconds whether the page is for them. No framing, no category, no what-this-guide-
+   covers sentence; the title already said that.
 
-3. **The result first.** Show the finished artifact before step one: the final request
-   and a trimmed real response, or the finished component, under a sentence like "Here
-   is the call you'll be making by the end." This is what lets the reader decide in ten
-   seconds whether the page is for them. Step one follows directly; no bridge line.
+3. **`## Before You Start`.** What must already be running, as a sentence fragment
+   listing the state ("Antfly running in standalone mode and Ollama with a small model
+   pulled:") followed by a command that proves it. A real state requirement lives here,
+   never in frontmatter.
 
-4. **Numbered steps.** Each ends in something runnable with visible output. Real
-   commands against `http://localhost:8080`, real JSON, no `{{PLACEHOLDER}}` blocks. Use
-   `<Tabs>` for CLI and cURL where both exist. Step headings are imperative ("Load Your
-   Help Articles").
+4. **`## Build It`**, with numbered h3 steps (`### 1. Create the Help Table`). Each
+   step ends in something runnable with visible output. Real commands against
+   `http://localhost:8080`, real JSON, no `{{PLACEHOLDER}}` blocks. Use `<Tabs>` for CLI
+   and cURL where both exist. Step headings are imperative. Reference material a step
+   needs (per-provider setup, for instance) goes in an unnumbered h3 after the steps.
 
-5. **One judgment section**, headed by its content, never by a generic label. This is
-   the tradeoff, tuning decision, or failure mode the reader has to own because the skill
-   cannot own it for them ("Why Pruning Is a Correctness Feature", "Why the Answer Box
-   Gets Its Own Input"). One per guide. If there are two, the second is a concept page.
+5. **`## Tradeoffs`.** The tuning decision, tradeoff, or failure mode the reader has to
+   own because the skill cannot own it for them. Open with one plain sentence that
+   names the specific decision (the heading is fixed, so the first sentence carries the
+   content), then the mechanism. One section, even when it holds two decisions.
 
-6. **Let Your Agent Drive**, verbatim shape:
+6. **`## Let Your Agent Drive`**, verbatim shape:
 
    ```md
    ## Let Your Agent Drive
@@ -91,16 +95,18 @@ Target 120 to 200 lines. In this order:
    guide>", and use this page to judge the result.
    ```
 
-7. **Next Steps**: two or three links, each with a clause saying why you would go there.
+7. **`## Next Steps`**: two or three links, each with a clause saying why you would go
+   there.
 
 Not in a guide: an "Overview" section, a "What this doesn't do" section, a
 "Troubleshooting" section (fold the two errors people actually hit into the step where
-they happen), an "Additional Resources" list, a feature table.
+they happen), an "Additional Resources" list, a feature table, any other h2.
 
 ## Concept anatomy
 
 Target 150 to 300 lines. Concept pages answer "how does this work and what should I
-decide?" They are read when a guide's judgment section was not enough.
+decide?" They are read when a guide's Tradeoffs section was not enough. The mechanism
+sections vary by subject; the bookends do not.
 
 1. **`<Questions>`** as above.
 2. **The opener**, no heading: what the thing is in one or two sentences, and the one
@@ -109,11 +115,12 @@ decide?" They are read when a guide's judgment section was not enough.
 3. **Sections by mechanism**, each answering one question the reader has. Headings are
    nouns or short claims, not "How It Works" or "Overview". Tables for state machines
    and option matrices; prose for reasoning.
-4. **The decisions**, near the end: when to choose which option, stated as rules with
-   the reason attached.
-5. **Let Your Agent Drive** and **Next Steps** as in guides, where a concrete prompt
-   makes sense. A concept page whose subject an agent would never be prompted to "do"
-   (model compatibility, for instance) skips the agent section.
+4. **`## Decisions`**: when to choose which option, stated as rules with the reason
+   attached. Usually last before the agent section; a page whose main job is a
+   choose-this table (model compatibility) puts it first.
+5. **`## Let Your Agent Drive`** and **`## Next Steps`** as in guides, where a concrete
+   prompt makes sense. A concept page whose subject an agent would never be prompted to
+   "do" (model compatibility, for instance) skips the agent section.
 
 ## Facts
 

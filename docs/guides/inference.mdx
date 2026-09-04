@@ -123,7 +123,7 @@ curl -X POST http://localhost:8080/db/v1/tables/TABLE/repair/issues \
 
 It lists durable repair issues, not every document in the pending tail. Pending work with no listed issue means the cause is a worker lifecycle problem or inference that is still retrying; the runtime counters and server logs tell those apart.
 
-## Choosing Between Local and External
+## Decisions
 
 Run models on Antfly Inference when the data must stay on the machine, when the index is large enough that a per-document network hop would dominate enrichment time, or when you want one process to operate. Reach for an external provider when you need a model the local runtime does not support (see the incompatible list on [Local Model Compatibility](/docs/guides/supported-models)) or a hosted model's quality for generation. Embedding and generation are configured separately, so a table can embed locally and generate through Ollama or a hosted API.
 

@@ -11,11 +11,19 @@ order: 3
 - Why does my n8n agent's Antfly query fail with `invalid query request`?
 </Questions>
 
-By the end of this guide, an n8n AI Agent answers chat messages from your Antfly table. n8n keeps owning the parts around the answer (the trigger, the ticket it opens, the CRM row it updates) and Antfly supplies what the agent knows, as one more tool on the canvas. You need an Antfly Cloud instance with an indexed table (the examples use `docs` with an embeddings index `docs_vectors` and a text field `text`) and an n8n workspace.
+## The Result
+
+An n8n AI Agent answers chat messages from your Antfly table. n8n keeps owning the parts around the answer (the trigger, the ticket it opens, the CRM row it updates) and Antfly supplies what the agent knows, as one more tool on the canvas.
 
 There is no application code in this setup. Nothing normalizes a malformed tool call or retries a bad query shape, so the discipline the retrieval needs lives in the agent's system message, written out in full; step 3 gives you that message.
 
-## 1. Create a Read-Only Instance Key
+## Before You Start
+
+An Antfly Cloud instance with an indexed table (the examples use `docs` with an embeddings index `docs_vectors` and a text field `text`) and an n8n workspace. Step 1 confirms the instance answers over MCP before n8n is involved.
+
+## Build It
+
+### 1. Create a Read-Only Instance Key
 
 In the Antfly Cloud console, create an API key on the instance n8n should read, with key type **read only**. Copy it when it is shown; it is displayed once. Cloud keys carry an `antflydb_` prefix.
 
@@ -42,7 +50,7 @@ curl -X POST https://platform.antfly.io/cloud/v1/inst_abc123/mcp/v1 \
 
 A good response carries an `Mcp-Session-Id` header and the server's capabilities. A `401` means the key is missing or malformed. A `403` means the key belongs to a different instance than the one in the URL, or the request carried an `Origin` header: hosted MCP is for backends like n8n, never for browser code.
 
-## 2. Add the MCP Client Tool Node
+### 2. Add the MCP Client Tool Node
 
 The workflow is three nodes and a trigger:
 
@@ -60,7 +68,7 @@ Add **When chat message received** and connect it to an **AI Agent**. Connect an
 
 Run the MCP node on its own before touching the agent. It should list the two tools. A connection problem is far easier to read here, where one node fails alone, than out of an agent execution trace later.
 
-## 3. Give the Agent the Query Vocabulary
+### 3. Give the Agent the Query Vocabulary
 
 Paste this into the AI Agent's **System Message**. It pins the exact tool-call shape so the model has nothing to improvise:
 
@@ -122,7 +130,7 @@ Replace `docs`, `docs_vectors`, and `text` with your own table, embeddings index
 
 Set the chat model temperature to `0` or `0.1` and the agent's maximum iterations between 4 and 6. That is tight enough to suppress speculative tool calls while allowing the one focused fallback.
 
-## 4. Send a Message and Read the Trace
+### 4. Send a Message and Read the Trace
 
 Open the chat panel and ask something your table can answer. Then open the execution and read the agent's tool calls, not just the prose.
 
@@ -130,7 +138,9 @@ A healthy execution makes one `query` call, gets chunks with real text in them, 
 
 When a call comes back `invalid query request`, open the failed tool call and look at its actual input. The error will not say which property was wrong; the input will. It is nearly always `queryRequest` arriving as a quoted string, or shorthand arguments mixed in beside it.
 
-## Why the Workflow Stops Instead of Retrying
+## Tradeoffs
+
+When a tool call fails, the agent stops rather than retrying, and the system message is what enforces that.
 
 In a coded integration a transport failure is something you catch. Here there is no catch block, and an agent's instinct on a failed tool call is to try again, differently: a second query, then a third, fanning out against an instance that is already unhealthy or a credential that was already rejected.
 
