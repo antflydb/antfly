@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -23,12 +23,16 @@ class BatchResponse:
         inserted (int | Unset): Number of documents successfully inserted
         deleted (int | Unset): Number of documents successfully deleted
         transformed (int | Unset): Number of documents successfully transformed
+        transaction_id (None | str | Unset): Stable transaction receipt ID returned for keyed batches.
+        reconcile (None | str | Unset): Transaction-session status path for this keyed batch.
     """
 
     status: BatchResponseStatus | Unset = UNSET
     inserted: int | Unset = UNSET
     deleted: int | Unset = UNSET
     transformed: int | Unset = UNSET
+    transaction_id: None | str | Unset = UNSET
+    reconcile: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -42,6 +46,18 @@ class BatchResponse:
 
         transformed = self.transformed
 
+        transaction_id: None | str | Unset
+        if isinstance(self.transaction_id, Unset):
+            transaction_id = UNSET
+        else:
+            transaction_id = self.transaction_id
+
+        reconcile: None | str | Unset
+        if isinstance(self.reconcile, Unset):
+            reconcile = UNSET
+        else:
+            reconcile = self.reconcile
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -53,6 +69,10 @@ class BatchResponse:
             field_dict["deleted"] = deleted
         if transformed is not UNSET:
             field_dict["transformed"] = transformed
+        if transaction_id is not UNSET:
+            field_dict["transaction_id"] = transaction_id
+        if reconcile is not UNSET:
+            field_dict["reconcile"] = reconcile
 
         return field_dict
 
@@ -72,11 +92,31 @@ class BatchResponse:
 
         transformed = d.pop("transformed", UNSET)
 
+        def _parse_transaction_id(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        transaction_id = _parse_transaction_id(d.pop("transaction_id", UNSET))
+
+        def _parse_reconcile(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        reconcile = _parse_reconcile(d.pop("reconcile", UNSET))
+
         batch_response = cls(
             status=status,
             inserted=inserted,
             deleted=deleted,
             transformed=transformed,
+            transaction_id=transaction_id,
+            reconcile=reconcile,
         )
 
         batch_response.additional_properties = d

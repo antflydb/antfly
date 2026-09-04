@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.transaction_session_status_outcome import TransactionSessionStatusOutcome
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -36,6 +37,8 @@ class TransactionSessionDetailsResponse:
         durable (bool):
         savepoint_limit (int | None | Unset):
         remaining_savepoints (int | None | Unset):
+        outcome (TransactionSessionStatusOutcome | Unset):
+        repair_required (bool | Unset):
         tables (list[TransactionSessionTableDetail] | Unset):
         read_snapshots (list[TransactionSessionReadSnapshot] | Unset):
         savepoint_ids (list[int] | Unset):
@@ -57,6 +60,8 @@ class TransactionSessionDetailsResponse:
     durable: bool
     savepoint_limit: int | None | Unset = UNSET
     remaining_savepoints: int | None | Unset = UNSET
+    outcome: TransactionSessionStatusOutcome | Unset = UNSET
+    repair_required: bool | Unset = UNSET
     tables: list[TransactionSessionTableDetail] | Unset = UNSET
     read_snapshots: list[TransactionSessionReadSnapshot] | Unset = UNSET
     savepoint_ids: list[int] | Unset = UNSET
@@ -103,6 +108,12 @@ class TransactionSessionDetailsResponse:
         else:
             remaining_savepoints = self.remaining_savepoints
 
+        outcome: str | Unset = UNSET
+        if not isinstance(self.outcome, Unset):
+            outcome = self.outcome.value
+
+        repair_required = self.repair_required
+
         tables: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.tables, Unset):
             tables = []
@@ -145,6 +156,10 @@ class TransactionSessionDetailsResponse:
             field_dict["savepoint_limit"] = savepoint_limit
         if remaining_savepoints is not UNSET:
             field_dict["remaining_savepoints"] = remaining_savepoints
+        if outcome is not UNSET:
+            field_dict["outcome"] = outcome
+        if repair_required is not UNSET:
+            field_dict["repair_required"] = repair_required
         if tables is not UNSET:
             field_dict["tables"] = tables
         if read_snapshots is not UNSET:
@@ -206,6 +221,15 @@ class TransactionSessionDetailsResponse:
 
         remaining_savepoints = _parse_remaining_savepoints(d.pop("remaining_savepoints", UNSET))
 
+        _outcome = d.pop("outcome", UNSET)
+        outcome: TransactionSessionStatusOutcome | Unset
+        if isinstance(_outcome, Unset):
+            outcome = UNSET
+        else:
+            outcome = TransactionSessionStatusOutcome(_outcome)
+
+        repair_required = d.pop("repair_required", UNSET)
+
         _tables = d.pop("tables", UNSET)
         tables: list[TransactionSessionTableDetail] | Unset = UNSET
         if _tables is not UNSET:
@@ -243,6 +267,8 @@ class TransactionSessionDetailsResponse:
             durable=durable,
             savepoint_limit=savepoint_limit,
             remaining_savepoints=remaining_savepoints,
+            outcome=outcome,
+            repair_required=repair_required,
             tables=tables,
             read_snapshots=read_snapshots,
             savepoint_ids=savepoint_ids,

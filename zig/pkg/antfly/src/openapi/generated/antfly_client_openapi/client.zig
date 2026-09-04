@@ -100,6 +100,13 @@ pub const CleanupTransactionSessionsParams = struct {
     cutoff_ns: ?[]const u8 = null,
 };
 
+pub const ListTransactionSessionInventoryParams = struct {
+    /// Maximum number of authorized sessions returned by this page. Source scanning is independently bounded; rolling-upgrade compatibility pages may be empty while still returning a cursor until the durable legacy principal projection is complete.
+    limit: ?[]const u8 = null,
+    /// Opaque cursor returned by the previous page. Continue while present even when the previous sessions array was empty. Cursor versions preserve in-progress canonical compatibility traversals while newly started traversals use the durable principal-scoped legacy projection after migration. A principal-scoped legacy cursor is bound to its writer-fence generation and returns 400 when that generation is no longer current or its completion proof is invalid; restart the traversal without a cursor.
+    cursor: ?[]const u8 = null,
+};
+
 /// Raw HTTP response for streaming/binary endpoints.
 pub const RawResponse = struct {
     status_code: u16,
@@ -1255,6 +1262,23 @@ pub const Client = struct {
         return ApiResponse(types.DocumentArtifactReprocessResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Perform a durably idempotent batch operation on a table
+    /// POST /db/v1/tables/{tableName}/idempotent-batch
+    pub fn idempotentBatchWrite(self: *@This(), table_name: []const u8, body: types.BatchRequest, idempotency_key: []const u8) !ApiResponse(types.IdempotentBatchResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/idempotent-batch", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.IdempotentBatchResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// List all indexes for a table
     /// GET /db/v1/tables/{tableName}/indexes
     pub fn listIndexes(self: *@This(), table_name: []const u8) !ApiResponse([]const types.IndexStatus) {
@@ -1507,6 +1531,39 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.TransactionCommitResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// List the bounded transaction-session inventory
+    /// GET /db/v1/transactions/inventory
+    pub fn listTransactionSessionInventory(self: *@This(), params: ListTransactionSessionInventoryParams) !ApiResponse(types.TransactionSessionListResponse) {
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/inventory", .{self.base_url});
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TransactionSessionListResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Get transaction session details

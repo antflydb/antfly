@@ -218,8 +218,29 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List transaction sessions */
+        /**
+         * List transaction sessions
+         * @deprecated
+         * @description Compatibility view of all authorized live interactive transaction sessions. Retained idempotency receipts are available through the bounded transaction-session inventory endpoint.
+         */
         get: operations["listTransactionSessions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/transactions/inventory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the bounded transaction-session inventory */
+        get: operations["listTransactionSessionInventory"];
         put?: never;
         post?: never;
         delete?: never;
@@ -924,6 +945,29 @@ export interface paths {
         put?: never;
         /** Perform batch inserts and deletes on a table */
         post: operations["batchWrite"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/idempotent-batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table for the idempotent batch operation */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Perform a durably idempotent batch operation on a table
+         * @description Executes a batch under a durable, payload-sealed idempotency receipt. The separate endpoint is rolling-upgrade safe because older servers reject it instead of silently ignoring the idempotency contract. Keys are scoped to the authenticated principal and table and may be replayed after timeouts, lost responses, topology changes, or process restarts. Receipts use the configured idempotency receipt retention period (`transaction_sessions.receipt_ttl_seconds`); callers must not reuse a key after that period. Terminal rejections persist and replay their original status, code, message, and retryability. Every durable receipt store uses atomic owner fencing so an expired process incarnation can be recovered after restart; distributed deployments also fail closed unless that fenced store is cluster-shared.
+         */
+        post: operations["idempotentBatchWrite"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5203,13 +5247,44 @@ export interface components {
              *     operator repair and will not be retried indefinitely.
              * @enum {string}
              */
-            status?: "committed" | "committed_pending" | "committed_repair_required";
+            status?: "committed" | "committed_pending" | "committed_visibility_pending" | "committed_recovery_pending" | "committed_repair_required";
             /** @description Number of documents successfully inserted */
             inserted?: number;
             /** @description Number of documents successfully deleted */
             deleted?: number;
             /** @description Number of documents successfully transformed */
             transformed?: number;
+            /** @description Stable transaction receipt ID returned for keyed batches. */
+            transaction_id?: string | null;
+            /** @description Transaction-session status path for this keyed batch. */
+            reconcile?: string | null;
+        };
+        IdempotentBatchResponse: {
+            /**
+             * @description Durable commit and recovery state for this operation.
+             * @enum {string}
+             */
+            status: "committed" | "committed_pending" | "committed_visibility_pending" | "committed_recovery_pending" | "committed_repair_required";
+            /** @description Number of documents inserted by the sealed operation. */
+            inserted: number;
+            /** @description Number of documents deleted by the sealed operation. */
+            deleted: number;
+            /** @description Number of documents transformed by the sealed operation. */
+            transformed: number;
+            /** @description Stable transaction receipt ID for replay and reconciliation. */
+            transaction_id: string;
+            /** @description Transaction-session status path for this operation. */
+            reconcile: string;
+        };
+        IdempotentBatchError: {
+            /** @enum {string} */
+            status: "not_applied" | "aborted" | "unknown";
+            code: string;
+            message: string;
+            retryable: boolean;
+            transaction_id: string;
+            /** @description Transaction-session status path for this keyed batch. */
+            reconcile: string;
         };
         /** @description A dense-index rebuild is retaining replay history and the node has reached its hard safety budget. */
         DenseRepairBackpressureError: {
@@ -5453,6 +5528,9 @@ export interface components {
             savepoint_limit?: number | null;
             remaining_savepoints?: number | null;
             durable: boolean;
+            /** @enum {string|null} */
+            outcome?: "not_applied" | "aborted" | "unknown" | "committed" | "committed_visibility_pending" | "committed_recovery_pending" | "committed_repair_required" | null;
+            repair_required?: boolean;
         };
         TransactionSessionTableDetail: {
             table?: string;
@@ -5474,10 +5552,13 @@ export interface components {
             savepoint_ids?: number[];
         };
         TransactionSessionListResponse: {
+            /** @description Number of authorized sessions returned in this response. */
             session_count?: number;
             lease_held_count?: number;
             lease_expired_count?: number;
             sessions?: components["schemas"]["TransactionSessionStatus"][];
+            /** @description Opaque cursor for the next bounded inventory page. Clients must continue while it is non-null, including after an empty compatibility page while the rolling-upgrade legacy projection is still being built. */
+            next_cursor?: string | null;
         };
         TransactionSessionCleanupResponse: {
             removed?: number;
@@ -15661,7 +15742,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Active transaction sessions */
+            /** @description Active interactive transaction sessions */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -15670,6 +15751,33 @@ export interface operations {
                     "application/json": components["schemas"]["TransactionSessionListResponse"];
                 };
             };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listTransactionSessionInventory: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of authorized sessions returned by this page. Source scanning is independently bounded; rolling-upgrade compatibility pages may be empty while still returning a cursor until the durable legacy principal projection is complete. */
+                limit?: number;
+                /** @description Opaque cursor returned by the previous page. Continue while present even when the previous sessions array was empty. Cursor versions preserve in-progress canonical compatibility traversals while newly started traversals use the durable principal-scoped legacy projection after migration. A principal-scoped legacy cursor is bound to its writer-fence generation and returns 400 when that generation is no longer current or its completion proof is invalid; restart the traversal without a cursor. */
+                cursor?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Active sessions and retained idempotency receipts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TransactionSessionListResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -16590,6 +16698,88 @@ export interface operations {
                 };
                 content: {
                     "text/plain": string;
+                };
+            };
+        };
+    };
+    idempotentBatchWrite: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Stable operation key scoped to the authenticated principal and table. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description Name of the table for the idempotent batch operation */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BatchRequest"];
+            };
+        };
+        responses: {
+            /** @description A committed operation was replayed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdempotentBatchResponse"];
+                };
+            };
+            /** @description Operation committed */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdempotentBatchResponse"];
+                };
+            };
+            /** @description Commit is durable; visibility, recovery, or receipt handoff remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdempotentBatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Durable non-application or an outcome that must be reconciled by stable key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdempotentBatchError"];
+                };
+            };
+            413: components["responses"]["PayloadTooLarge"];
+            /**
+             * @description Write admission or durable receipt capacity is exhausted. Because an
+             *     identical concurrent request may already own execution capacity, the
+             *     keyed response can conservatively report `unknown`; retry the same key.
+             */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdempotentBatchError"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Cluster-safe durable idempotency is unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdempotentBatchError"];
                 };
             };
         };

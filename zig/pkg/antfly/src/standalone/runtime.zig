@@ -55,7 +55,7 @@ const LocalSchemaProgressProvider = struct {
 };
 const default_public_port: u16 = 8080;
 const cors_default_methods = [_][]const u8{ "GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH" };
-const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin" };
+const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "Idempotency-Key", "X-Requested-With", "Accept", "Origin" };
 const cors_default_exposed_headers = [_][]const u8{
     "X-Request-ID",
     "Retry-After",
@@ -67,8 +67,14 @@ const cors_default_exposed_headers = [_][]const u8{
 const cors_default_max_age: u32 = 3600;
 const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
 const standalone_session_ttl_ns: u64 = std.time.ns_per_hour;
+const standalone_session_receipt_ttl_ns: u64 = std.time.ns_per_hour;
 const standalone_session_cleanup_interval_ns: u64 = std.time.ns_per_min;
+const standalone_session_cleanup_max_records: usize = 4096;
+const standalone_session_admission_cleanup_max_records: usize = 32;
+const standalone_session_admission_cleanup_budget_ns: u64 = 25 * std.time.ns_per_ms;
 const standalone_session_max_count: usize = 1024;
+const standalone_session_max_receipt_count: usize = 65536;
+const standalone_session_max_receipt_bytes: usize = 512 * 1024 * 1024;
 const standalone_session_max_record_bytes: usize = 16 * 1024 * 1024;
 const standalone_session_savepoint_limit: usize = 64;
 const antfarm_installed_asset_root = "../share/antfly/antfarm";
@@ -2369,8 +2375,15 @@ pub fn runFromIterator(
             .restore_job_store = restore_job_store,
             .incoming_graph_route_store = incoming_graph_route_store,
             .session_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.ttl_seconds * std.time.ns_per_s else standalone_session_ttl_ns,
+            .session_receipt_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.receipt_ttl_seconds * std.time.ns_per_s else standalone_session_receipt_ttl_ns,
             .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,
+            .session_cleanup_max_records = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_max_records else standalone_session_cleanup_max_records,
+            .session_admission_cleanup_max_records = if (loaded_config) |*cfg| cfg.transaction_sessions.admission_cleanup_max_records else standalone_session_admission_cleanup_max_records,
+            .session_admission_cleanup_budget_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.admission_cleanup_budget_ms * std.time.ns_per_ms else standalone_session_admission_cleanup_budget_ns,
             .session_max_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_count else standalone_session_max_count,
+            .session_max_receipt_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_receipt_count else standalone_session_max_receipt_count,
+            .session_max_receipt_bytes = if (loaded_config) |*cfg| cfg.transaction_sessions.max_receipt_bytes else standalone_session_max_receipt_bytes,
+            .session_inventory_writer_fence_generation = if (loaded_config) |*cfg| cfg.transaction_sessions.inventory_writer_fence_generation else null,
             .session_max_record_bytes = if (loaded_config) |*cfg| cfg.transaction_sessions.max_record_bytes else standalone_session_max_record_bytes,
             .session_savepoint_limit = if (loaded_config) |*cfg| cfg.transaction_sessions.max_savepoints else standalone_session_savepoint_limit,
         },
@@ -6239,12 +6252,12 @@ test "standalone CORS middleware enforces dynamic configuration" {
             .OPTIONS,
             "https://any.example",
             "POST",
-            "content-type, AUTHORIZATION",
+            "content-type, AUTHORIZATION, idempotency-key",
         );
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 204), response.status.code);
         try std.testing.expectEqualStrings("GET, POST, PUT, DELETE, OPTIONS, PATCH", response.headers.get("Access-Control-Allow-Methods").?);
-        try std.testing.expectEqualStrings("Content-Type, Authorization, X-Requested-With, Accept, Origin", response.headers.get("Access-Control-Allow-Headers").?);
+        try std.testing.expectEqualStrings("Content-Type, Authorization, Idempotency-Key, X-Requested-With, Accept, Origin", response.headers.get("Access-Control-Allow-Headers").?);
         try std.testing.expectEqualStrings("3600", response.headers.get("Access-Control-Max-Age").?);
     }
     {

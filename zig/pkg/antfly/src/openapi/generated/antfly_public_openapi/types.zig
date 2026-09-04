@@ -1644,6 +1644,10 @@ pub const BatchResponse = struct {
     deleted: ?i64 = null,
     /// Number of documents successfully transformed
     transformed: ?i64 = null,
+    /// Stable transaction receipt ID returned for keyed batches.
+    transaction_id: OpenApiOptionalNullable([]const u8) = .absent,
+    /// Transaction-session status path for this keyed batch.
+    reconcile: OpenApiOptionalNullable([]const u8) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -1651,6 +1655,8 @@ pub const BatchResponse = struct {
         .{ "inserted", "inserted", true },
         .{ "deleted", "deleted", true },
         .{ "transformed", "transformed", true },
+        .{ "transaction_id", "transaction_id", false },
+        .{ "reconcile", "reconcile", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1678,6 +1684,28 @@ pub const BatchResponse = struct {
         if (self.transformed) |value| {
             try jw.objectField("transformed");
             try jw.write(value);
+        }
+        switch (self.transaction_id) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("transaction_id");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("transaction_id");
+                try jw.write(value);
+            },
+        }
+        switch (self.reconcile) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("reconcile");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("reconcile");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -4961,6 +4989,31 @@ pub const HierarchyMatches = struct {
 pub const HierarchyProjection = struct {
     /// Fields to include from the hydrated hierarchy document. This projection is required whenever the ancestor is requested so hierarchy hydration cannot accidentally return an unbounded document. Use an empty array to return hierarchy identity without stored document fields.
     fields: []const []const u8,
+};
+
+pub const IdempotentBatchError = struct {
+    status: []const u8,
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+    transaction_id: []const u8,
+    /// Transaction-session status path for this keyed batch.
+    reconcile: []const u8,
+};
+
+pub const IdempotentBatchResponse = struct {
+    /// Durable commit and recovery state for this operation.
+    status: []const u8,
+    /// Number of documents inserted by the sealed operation.
+    inserted: i64,
+    /// Number of documents deleted by the sealed operation.
+    deleted: i64,
+    /// Number of documents transformed by the sealed operation.
+    transformed: i64,
+    /// Stable transaction receipt ID for replay and reconciliation.
+    transaction_id: []const u8,
+    /// Transaction-session status path for this operation.
+    reconcile: []const u8,
 };
 
 /// Explains why the agent stopped before completion. Present when status is "incomplete".
@@ -11900,6 +11953,8 @@ pub const TransactionSessionDetailsResponse = struct {
     savepoint_limit: OpenApiOptionalNullable(i64) = .absent,
     remaining_savepoints: OpenApiOptionalNullable(i64) = .absent,
     durable: bool,
+    outcome: OpenApiOptionalNullable([]const u8) = .absent,
+    repair_required: ?bool = null,
     tables: ?[]const TransactionSessionTableDetail = null,
     read_snapshots: ?[]const TransactionSessionReadSnapshot = null,
     savepoint_ids: ?[]const i64 = null,
@@ -11922,6 +11977,8 @@ pub const TransactionSessionDetailsResponse = struct {
         .{ "savepoint_limit", "savepoint_limit", false },
         .{ "remaining_savepoints", "remaining_savepoints", false },
         .{ "durable", "durable", false },
+        .{ "outcome", "outcome", false },
+        .{ "repair_required", "repair_required", true },
         .{ "tables", "tables", true },
         .{ "read_snapshots", "read_snapshots", true },
         .{ "savepoint_ids", "savepoint_ids", true },
@@ -11987,6 +12044,21 @@ pub const TransactionSessionDetailsResponse = struct {
         }
         try jw.objectField("durable");
         try jw.write(self.durable);
+        switch (self.outcome) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("outcome");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("outcome");
+                try jw.write(value);
+            },
+        }
+        if (self.repair_required) |value| {
+            try jw.objectField("repair_required");
+            try jw.write(value);
+        }
         if (self.tables) |value| {
             try jw.objectField("tables");
             try jw.write(value);
@@ -12004,10 +12076,13 @@ pub const TransactionSessionDetailsResponse = struct {
 };
 
 pub const TransactionSessionListResponse = struct {
+    /// Number of authorized sessions returned in this response.
     session_count: ?i64 = null,
     lease_held_count: ?i64 = null,
     lease_expired_count: ?i64 = null,
     sessions: ?[]const TransactionSessionStatus = null,
+    /// Opaque cursor for the next bounded inventory page. Clients must continue while it is non-null, including after an empty compatibility page while the rolling-upgrade legacy projection is still being built.
+    next_cursor: OpenApiOptionalNullable([]const u8) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -12015,6 +12090,7 @@ pub const TransactionSessionListResponse = struct {
         .{ "lease_held_count", "lease_held_count", true },
         .{ "lease_expired_count", "lease_expired_count", true },
         .{ "sessions", "sessions", true },
+        .{ "next_cursor", "next_cursor", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -12042,6 +12118,17 @@ pub const TransactionSessionListResponse = struct {
         if (self.sessions) |value| {
             try jw.objectField("sessions");
             try jw.write(value);
+        }
+        switch (self.next_cursor) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("next_cursor");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("next_cursor");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -12115,6 +12202,38 @@ pub const TransactionSessionStatus = struct {
     savepoint_limit: OpenApiOptionalNullable(i64) = .absent,
     remaining_savepoints: OpenApiOptionalNullable(i64) = .absent,
     durable: bool,
+    outcome: OpenApiOptionalNullable([]const u8) = .absent,
+    repair_required: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "transaction_id", "transaction_id", false },
+        .{ "owner_node_id", "owner_node_id", false },
+        .{ "begin_timestamp", "begin_timestamp", false },
+        .{ "last_touched_timestamp", "last_touched_timestamp", false },
+        .{ "lease_expires_at", "lease_expires_at", false },
+        .{ "lease_state", "lease_state", false },
+        .{ "sync_level", "sync_level", false },
+        .{ "staged_table_count", "staged_table_count", false },
+        .{ "staged_read_count", "staged_read_count", false },
+        .{ "staged_write_count", "staged_write_count", false },
+        .{ "staged_delete_count", "staged_delete_count", false },
+        .{ "read_snapshot_count", "read_snapshot_count", false },
+        .{ "savepoint_count", "savepoint_count", false },
+        .{ "savepoint_limit", "savepoint_limit", false },
+        .{ "remaining_savepoints", "remaining_savepoints", false },
+        .{ "durable", "durable", false },
+        .{ "outcome", "outcome", false },
+        .{ "repair_required", "repair_required", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -12168,6 +12287,21 @@ pub const TransactionSessionStatus = struct {
         }
         try jw.objectField("durable");
         try jw.write(self.durable);
+        switch (self.outcome) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("outcome");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("outcome");
+                try jw.write(value);
+            },
+        }
+        if (self.repair_required) |value| {
+            try jw.objectField("repair_required");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

@@ -33,6 +33,7 @@ import type {
   DocumentArtifactTableReprocessRequest,
   DocumentArtifactTableReprocessResponse,
   EnrichmentConfig,
+  IdempotentBatchResult,
   IndexStatus,
   LinearMergeRequest,
   LinearMergeResult,
@@ -159,6 +160,24 @@ export class StorageResourceExhaustedError extends Error {
   }
 }
 
+export type IdempotentBatchOutcome = "not_applied" | "aborted" | "unknown";
+
+/** A durable non-success receipt returned by an idempotent batch request. */
+export class IdempotentBatchError extends Error {
+  constructor(
+    message: string,
+    readonly httpStatus: number,
+    readonly outcome: IdempotentBatchOutcome,
+    readonly code: string,
+    readonly retryable: boolean,
+    readonly transactionId: string,
+    readonly reconcile: string
+  ) {
+    super(message);
+    this.name = "IdempotentBatchError";
+  }
+}
+
 /** @deprecated Catch QueryTemporarilyUnavailableError to handle every retryable query 503. */
 export class StorageReadTemporarilyUnavailableError extends QueryTemporarilyUnavailableError {
   declare readonly code: "storage_read_temporarily_unavailable";
@@ -254,6 +273,31 @@ function apiErrorMessage(error: unknown, fallback = "unknown error"): string {
     }
   }
   return String(error);
+}
+
+function idempotentBatchError(response: Response, error: unknown, fallbackMessage: string): Error {
+  const detail =
+    error && typeof error === "object" ? (error as Record<string, unknown>) : undefined;
+  const outcome = detail?.status;
+  if (
+    (outcome === "not_applied" || outcome === "aborted" || outcome === "unknown") &&
+    typeof detail?.code === "string" &&
+    typeof detail?.message === "string" &&
+    typeof detail?.retryable === "boolean" &&
+    typeof detail?.transaction_id === "string" &&
+    typeof detail?.reconcile === "string"
+  ) {
+    return new IdempotentBatchError(
+      fallbackMessage,
+      response.status,
+      outcome,
+      detail.code,
+      detail.retryable,
+      detail.transaction_id,
+      detail.reconcile
+    );
+  }
+  return new Error(fallbackMessage);
 }
 
 function errorMessage(error: unknown): string {
@@ -477,7 +521,9 @@ export class AntflyClient {
     body: unknown,
     options: WriteOptions | undefined,
     errorPrefix: string,
-    marshalErrorPrefix: string
+    marshalErrorPrefix: string,
+    extraHeaders?: Record<string, string>,
+    errorFactory?: (response: Response, error: unknown, fallbackMessage: string) => Error
   ): Promise<{ data?: T; text: string }> {
     const opts = normalizedWriteOptions(options);
     let encodedBody: string;
@@ -489,23 +535,26 @@ export class AntflyClient {
 
     const response = await fetch(this.url(path), {
       method: "POST",
-      headers: this.requestHeaders(),
+      headers: { ...this.requestHeaders(), ...extraHeaders },
       body: encodedBody,
       signal: opts.signal,
     });
 
     if (!response.ok) {
       const { text, truncated } = await readLimitedResponseText(response, MAX_ERROR_RESPONSE_BYTES);
+      let parsedError: unknown = text;
       let message = apiErrorMessage(text);
       try {
-        message = apiErrorMessage(parseJSON<unknown>(text), message);
+        parsedError = parseJSON<unknown>(text);
+        message = apiErrorMessage(parsedError, message);
       } catch {
         // Non-JSON error bodies are reported as-is below.
       }
       if (truncated) {
         message = `${message} (response body exceeded ${MAX_ERROR_RESPONSE_BYTES} bytes)`;
       }
-      throw new Error(`${errorPrefix}: ${response.status} ${message}`);
+      const fallbackMessage = `${errorPrefix}: ${response.status} ${message}`;
+      throw errorFactory?.(response, parsedError, fallbackMessage) ?? new Error(fallbackMessage);
     }
 
     const { text, truncated } = await readLimitedResponseText(response, opts.maxResponseBytes);
@@ -1116,6 +1165,29 @@ export class AntflyClient {
      */
     batch: async (tableName: string, request: BatchRequest): Promise<BatchResult> => {
       return this.tables.batchWithOptions(tableName, request);
+    },
+
+    /**
+     * Perform a durably idempotent batch operation. This uses a distinct route
+     * so an older server fails closed during rolling upgrades.
+     */
+    idempotentBatch: async (
+      tableName: string,
+      idempotencyKey: string,
+      request: BatchRequest,
+      options?: WriteOptions
+    ): Promise<IdempotentBatchResult> => {
+      const { data } = await this.postBoundedJSON<IdempotentBatchResult>(
+        `/db/v1/tables/${encodeURIComponent(tableName)}/idempotent-batch`,
+        request,
+        options,
+        "Idempotent batch operation failed",
+        "marshalling idempotent batch request",
+        { "Idempotency-Key": idempotencyKey },
+        idempotentBatchError
+      );
+      if (!data) throw new Error("Idempotent batch operation failed: unexpected empty response");
+      return data;
     },
 
     /**

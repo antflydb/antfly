@@ -46,6 +46,7 @@ components:
           default:
             - "Content-Type"
             - "Authorization"
+            - "Idempotency-Key"
             - "X-Requested-With"
             - "Accept"
             - "Origin"

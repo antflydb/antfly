@@ -316,6 +316,17 @@ pub const ReprocessDocumentArtifactPathParams = struct {
     artifact_name: []const u8,
 };
 
+/// Perform a durably idempotent batch operation on a table
+pub const IdempotentBatchWritePathParams = struct {
+    /// Name of the table for the idempotent batch operation
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for idempotentBatchWrite.
+pub fn parseIdempotentBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BatchRequest) {
+    return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// List all indexes for a table
 pub const ListIndexesPathParams = struct {
     /// Name of the table
@@ -466,6 +477,13 @@ pub fn parseCommitTransactionBody(allocator: std.mem.Allocator, body: []const u8
     return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+pub const ListTransactionSessionInventoryParams = struct {
+    /// Maximum number of authorized sessions returned by this page. Source scanning is independently bounded; rolling-upgrade compatibility pages may be empty while still returning a cursor until the durable legacy principal projection is complete.
+    limit: ?[]const u8 = null,
+    /// Opaque cursor returned by the previous page. Continue while present even when the previous sessions array was empty. Cursor versions preserve in-progress canonical compatibility traversals while newly started traversals use the durable principal-scoped legacy projection after migration. A principal-scoped legacy cursor is bound to its writer-fence generation and returns 400 when that generation is no longer current or its completion proof is invalid; restart the traversal without a cursor.
+    cursor: ?[]const u8 = null,
+};
+
 /// Get transaction session details
 pub const GetTransactionSessionPathParams = struct {
     transaction_id: []const u8,
@@ -587,6 +605,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/idempotent-batch", .operation_id = "idempotentBatchWrite", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
@@ -605,6 +624,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/transactions/begin", .operation_id = "beginTransaction", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/commit", .operation_id = "commitTransaction", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/transactions/inventory", .operation_id = "listTransactionSessionInventory", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/transactions/{transaction_id}", .operation_id = "getTransactionSession", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/{transaction_id}/abort", .operation_id = "abortTransactionSession", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/{transaction_id}/commit", .operation_id = "commitTransactionSession", .request_body = .buffered, .streaming_response = false },
@@ -665,6 +685,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "listDocumentArtifactManifests")) @compileError("ServerRouter: Impl missing required method 'listDocumentArtifactManifests'");
         if (!@hasDecl(Impl, "getDocumentArtifactManifest")) @compileError("ServerRouter: Impl missing required method 'getDocumentArtifactManifest'");
         if (!@hasDecl(Impl, "reprocessDocumentArtifact")) @compileError("ServerRouter: Impl missing required method 'reprocessDocumentArtifact'");
+        if (!@hasDecl(Impl, "idempotentBatchWrite")) @compileError("ServerRouter: Impl missing required method 'idempotentBatchWrite'");
         if (!@hasDecl(Impl, "listIndexes")) @compileError("ServerRouter: Impl missing required method 'listIndexes'");
         if (!@hasDecl(Impl, "getIndex")) @compileError("ServerRouter: Impl missing required method 'getIndex'");
         if (!@hasDecl(Impl, "createIndex")) @compileError("ServerRouter: Impl missing required method 'createIndex'");
@@ -683,6 +704,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "beginTransaction")) @compileError("ServerRouter: Impl missing required method 'beginTransaction'");
         if (!@hasDecl(Impl, "cleanupTransactionSessions")) @compileError("ServerRouter: Impl missing required method 'cleanupTransactionSessions'");
         if (!@hasDecl(Impl, "commitTransaction")) @compileError("ServerRouter: Impl missing required method 'commitTransaction'");
+        if (!@hasDecl(Impl, "listTransactionSessionInventory")) @compileError("ServerRouter: Impl missing required method 'listTransactionSessionInventory'");
         if (!@hasDecl(Impl, "getTransactionSession")) @compileError("ServerRouter: Impl missing required method 'getTransactionSession'");
         if (!@hasDecl(Impl, "abortTransactionSession")) @compileError("ServerRouter: Impl missing required method 'abortTransactionSession'");
         if (!@hasDecl(Impl, "commitTransactionSession")) @compileError("ServerRouter: Impl missing required method 'commitTransactionSession'");
@@ -741,6 +763,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/tables/:tableName/documents/:key/artifacts", httpx.Handler.bind(self.impl, listDocumentArtifactManifests));
             try server.get("/tables/:tableName/documents/:key/artifacts/:artifactName", httpx.Handler.bind(self.impl, getDocumentArtifactManifest));
             try server.post("/tables/:tableName/documents/:key/artifacts/:artifactName/reprocess", httpx.Handler.bind(self.impl, reprocessDocumentArtifact));
+            try server.post("/tables/:tableName/idempotent-batch", httpx.Handler.bind(self.impl, idempotentBatchWrite));
             try server.get("/tables/:tableName/indexes", httpx.Handler.bind(self.impl, listIndexes));
             try server.get("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, getIndex));
             try server.post("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createIndex));
@@ -759,6 +782,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/transactions/begin", httpx.Handler.bind(self.impl, beginTransaction));
             try server.post("/transactions/cleanup", httpx.Handler.bind(self.impl, cleanupTransactionSessions));
             try server.post("/transactions/commit", httpx.Handler.bind(self.impl, commitTransaction));
+            try server.get("/transactions/inventory", httpx.Handler.bind(self.impl, listTransactionSessionInventory));
             try server.get("/transactions/:transaction_id", httpx.Handler.bind(self.impl, getTransactionSession));
             try server.post("/transactions/:transaction_id/abort", httpx.Handler.bind(self.impl, abortTransactionSession));
             try server.post("/transactions/:transaction_id/commit", httpx.Handler.bind(self.impl, commitTransactionSession));
@@ -1070,6 +1094,13 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.reprocessDocumentArtifact(ctx, table_name, key, artifact_name);
         }
 
+        /// Perform a durably idempotent batch operation on a table
+        /// POST /tables/{tableName}/idempotent-batch
+        fn idempotentBatchWrite(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.idempotentBatchWrite(ctx, table_name);
+        }
+
         /// List all indexes for a table
         /// GET /tables/{tableName}/indexes
         fn listIndexes(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -1201,6 +1232,16 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.commitTransaction(ctx);
         }
 
+        /// List the bounded transaction-session inventory
+        /// GET /transactions/inventory
+        fn listTransactionSessionInventory(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const query_params = ListTransactionSessionInventoryParams{
+                .limit = try ctx.queryDecoded("limit"),
+                .cursor = try ctx.queryDecoded("cursor"),
+            };
+            return impl.listTransactionSessionInventory(ctx, query_params);
+        }
+
         /// Get transaction session details
         /// GET /transactions/{transaction_id}
         fn getTransactionSession(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -1307,6 +1348,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
 //   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn idempotentBatchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
@@ -1325,6 +1367,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn beginTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response
 //   fn commitTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listTransactionSessionInventory(self: *Impl, ctx: *httpx.Context, params: ListTransactionSessionInventoryParams) !httpx.Response
 //   fn getTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
 //   fn abortTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
 //   fn commitTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response

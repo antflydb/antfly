@@ -16,10 +16,11 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import pytest
 import requests
@@ -322,6 +323,150 @@ def test_multi_shard_batch_timeout_converges_to_one_terminal_state(stateful_api)
             )
     else:
         assert all_updated
+
+
+def test_idempotent_batch_survives_lost_response_and_restart(stateful_api):
+    """A keyed non-idempotent transform is applied exactly once across replay."""
+    if not stateful_api.supports_restart:
+        pytest.skip("durable receipt replay requires a real server restart")
+
+    table_name = _create_table(stateful_api, "idempotent_batch_replay")
+    stateful_api.batch_write(
+        table_name,
+        inserts={"counter": {"value": 0}},
+        sync_level="write",
+    )
+    payload = {
+        "inserts": {
+            "order:b": {"nested": {"z": 2, "a": 1}},
+            "order:a": {"value": 1},
+        },
+        "transforms": [_transform("counter", _op("$inc", "value", 1))],
+        "sync_level": "write",
+    }
+    reordered_payload = {
+        "sync_level": "write",
+        "transforms": [
+            {
+                "operations": [{"value": 1, "path": "value", "op": "$inc"}],
+                "key": "counter",
+            }
+        ],
+        "inserts": {
+            "order:a": {"value": 1},
+            "order:b": {"nested": {"a": 1, "z": 2}},
+        },
+    }
+    key = "counter-increment-1"
+    path = f"/tables/{quote(table_name, safe='')}/idempotent-batch"
+
+    # Send the complete request and deliberately discard the response. This is
+    # the production ambiguity that previously made a 409 unsafe to replay.
+    target = urlsplit(stateful_api.url)
+    connection = http.client.HTTPConnection(target.hostname, target.port, timeout=5)
+    connection.request(
+        "POST",
+        f"{target.path.rstrip('/')}{path}",
+        body=json.dumps(payload),
+        headers={
+            "Content-Type": "application/json",
+            "Idempotency-Key": key,
+            "Connection": "close",
+        },
+    )
+    # Waiting for headers proves that the server reached a durable outcome;
+    # deliberately discard the receipt body to model a client that loses the
+    # response after commit but before it can retain the reconciliation ID.
+    discarded = connection.getresponse()
+    assert discarded.status in (201, 202)
+    connection.close()
+
+    response = stateful_api.s.post(
+        f"{stateful_api.url}{path}",
+        json=payload,
+        headers={"Idempotency-Key": key},
+        timeout=30,
+    )
+    # 201 would mean this request executed the operation for the first time,
+    # so it must not be accepted as evidence of replay safety.
+    assert response.status_code in (200, 202), response.text
+    receipt = response.json()
+    assert receipt["status"].startswith("committed")
+    transaction_id = receipt["transaction_id"]
+    assert receipt["reconcile"] == f"/db/v1/transactions/{transaction_id}"
+
+    visible = wait_until(
+        lambda: stateful_api.lookup_key(table_name, "counter"),
+        timeout_s=10.0,
+        interval_s=0.1,
+    )
+    assert visible["value"] == 1
+
+    stateful_api.restart_server()
+
+    replay = stateful_api.s.post(
+        f"{stateful_api.url}{path}",
+        json=reordered_payload,
+        headers={"Idempotency-Key": key},
+        timeout=30,
+    )
+    # A recreated receipt would return 201 and could still leave the counter at
+    # one because the storage transaction ID is independently deduplicated.
+    # Require proof that the original durable receipt survived the restart.
+    assert replay.status_code in (200, 202), replay.text
+    assert replay.json()["transaction_id"] == transaction_id
+    assert stateful_api.lookup_key(table_name, "counter")["value"] == 1
+    assert stateful_api.lookup_key(table_name, "order:b")["nested"] == {"a": 1, "z": 2}
+
+    status = stateful_api.s.get(
+        f"{stateful_api.url}/transactions/{transaction_id}", timeout=30
+    )
+    assert status.status_code == 200, status.text
+    assert status.json()["outcome"].startswith("committed")
+
+    changed = stateful_api.s.post(
+        f"{stateful_api.url}{path}",
+        json={
+            "transforms": [_transform("counter", _op("$inc", "value", 2))],
+            "sync_level": "write",
+        },
+        headers={"Idempotency-Key": key},
+        timeout=30,
+    )
+    assert changed.status_code == 409, changed.text
+    assert changed.json()["code"] == "idempotency_conflict"
+    assert stateful_api.lookup_key(table_name, "counter")["value"] == 1
+
+
+def test_idempotent_batch_replays_exact_terminal_error_after_restart(stateful_api):
+    """A durable rejection retains its precise public error envelope."""
+    if not stateful_api.supports_restart:
+        pytest.skip("durable receipt replay requires a real server restart")
+
+    table_name = f"missing_idempotent_{int(time.time_ns())}"
+    path = f"/tables/{quote(table_name, safe='')}/idempotent-batch"
+    payload = {"deletes": ["doc:missing"], "sync_level": "write"}
+    headers = {"Idempotency-Key": "missing-table-terminal-envelope"}
+
+    first = stateful_api.s.post(
+        f"{stateful_api.url}{path}", json=payload, headers=headers, timeout=30
+    )
+    assert first.status_code == 409, first.text
+    first_receipt = first.json()
+    assert first_receipt["status"] == "not_applied"
+    assert first_receipt["code"] == "table_not_found"
+    assert first_receipt["message"] == "table not found"
+    assert first_receipt["retryable"] is False
+
+    stateful_api.restart_server()
+
+    replay = stateful_api.s.post(
+        f"{stateful_api.url}{path}", json=payload, headers=headers, timeout=30
+    )
+    assert replay.status_code == first.status_code, replay.text
+    replay_receipt = replay.json()
+    for field in ("status", "code", "message", "retryable", "transaction_id"):
+        assert replay_receipt[field] == first_receipt[field]
 
 
 def test_multi_batch_mixed_ops(stateful_api):

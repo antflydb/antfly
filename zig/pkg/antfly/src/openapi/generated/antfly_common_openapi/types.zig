@@ -1708,16 +1708,37 @@ pub const TLSInfo = struct {
 /// Resource and retention limits for multi-request transaction sessions.
 pub const TransactionSessionConfig = struct {
     ttl_seconds: ?i64 = null,
+    /// Retention window for compact terminal idempotency receipts.
+    receipt_ttl_seconds: ?i64 = null,
     cleanup_interval_seconds: ?i64 = null,
+    /// Maximum expired transaction sessions reclaimed by one scheduled cleanup pass.
+    cleanup_max_records: ?i64 = null,
+    /// Maximum expired idempotency receipts considered by one capacity-admission cleanup pass.
+    admission_cleanup_max_records: ?i64 = null,
+    /// Maximum monotonic time each capacity-rejected request waits for the server-owned cleanup generation before retrying admission.
+    admission_cleanup_budget_ms: ?i64 = null,
     max_count: ?i64 = null,
+    /// Independent count budget for pending and retained idempotency receipts.
+    max_receipt_count: ?i64 = null,
+    /// Aggregate durable byte budget for pending and retained idempotency receipts.
+    max_receipt_bytes: ?i64 = null,
+    /// Deployment-controlled generation proving every process that can write the interactive transaction-session namespace maintains principal inventory v1. Leave unset during rolling upgrades. Increase it before reactivation after a rollback so completion requires a fresh canonical audit. Deployment coordination must prevent pre-feature processes, which do not understand this field, from writing.
+    inventory_writer_fence_generation: ?i64 = null,
     max_record_bytes: ?i64 = null,
     max_savepoints: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "ttl_seconds", "ttl_seconds", true },
+        .{ "receipt_ttl_seconds", "receipt_ttl_seconds", true },
         .{ "cleanup_interval_seconds", "cleanup_interval_seconds", true },
+        .{ "cleanup_max_records", "cleanup_max_records", true },
+        .{ "admission_cleanup_max_records", "admission_cleanup_max_records", true },
+        .{ "admission_cleanup_budget_ms", "admission_cleanup_budget_ms", true },
         .{ "max_count", "max_count", true },
+        .{ "max_receipt_count", "max_receipt_count", true },
+        .{ "max_receipt_bytes", "max_receipt_bytes", true },
+        .{ "inventory_writer_fence_generation", "inventory_writer_fence_generation", true },
         .{ "max_record_bytes", "max_record_bytes", true },
         .{ "max_savepoints", "max_savepoints", true },
     };
@@ -1736,12 +1757,40 @@ pub const TransactionSessionConfig = struct {
             try jw.objectField("ttl_seconds");
             try jw.write(value);
         }
+        if (self.receipt_ttl_seconds) |value| {
+            try jw.objectField("receipt_ttl_seconds");
+            try jw.write(value);
+        }
         if (self.cleanup_interval_seconds) |value| {
             try jw.objectField("cleanup_interval_seconds");
             try jw.write(value);
         }
+        if (self.cleanup_max_records) |value| {
+            try jw.objectField("cleanup_max_records");
+            try jw.write(value);
+        }
+        if (self.admission_cleanup_max_records) |value| {
+            try jw.objectField("admission_cleanup_max_records");
+            try jw.write(value);
+        }
+        if (self.admission_cleanup_budget_ms) |value| {
+            try jw.objectField("admission_cleanup_budget_ms");
+            try jw.write(value);
+        }
         if (self.max_count) |value| {
             try jw.objectField("max_count");
+            try jw.write(value);
+        }
+        if (self.max_receipt_count) |value| {
+            try jw.objectField("max_receipt_count");
+            try jw.write(value);
+        }
+        if (self.max_receipt_bytes) |value| {
+            try jw.objectField("max_receipt_bytes");
+            try jw.write(value);
+        }
+        if (self.inventory_writer_fence_generation) |value| {
+            try jw.objectField("inventory_writer_fence_generation");
             try jw.write(value);
         }
         if (self.max_record_bytes) |value| {

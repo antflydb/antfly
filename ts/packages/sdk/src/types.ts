@@ -127,6 +127,7 @@ export interface BatchRequest {
   sync_level?: components["schemas"]["SyncLevel"];
 }
 export type BatchResult = components["schemas"]["BatchResponse"];
+export type IdempotentBatchResult = components["schemas"]["IdempotentBatchResponse"];
 export interface MultiBatchRequest {
   tables: Record<string, BatchRequest>;
   sync_level?: components["schemas"]["SyncLevel"];

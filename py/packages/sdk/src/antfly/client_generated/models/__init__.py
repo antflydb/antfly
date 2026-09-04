@@ -475,6 +475,10 @@ from .hierarchy_match_hit import HierarchyMatchHit
 from .hierarchy_match_hit_source import HierarchyMatchHitSource
 from .hierarchy_matches import HierarchyMatches
 from .hierarchy_projection import HierarchyProjection
+from .idempotent_batch_error import IdempotentBatchError
+from .idempotent_batch_error_status import IdempotentBatchErrorStatus
+from .idempotent_batch_response import IdempotentBatchResponse
+from .idempotent_batch_response_status import IdempotentBatchResponseStatus
 from .image_url import ImageURL
 from .image_url_content_part import ImageURLContentPart
 from .image_url_content_part_type import ImageURLContentPartType
@@ -937,6 +941,7 @@ from .transaction_session_details_response import TransactionSessionDetailsRespo
 from .transaction_session_list_response import TransactionSessionListResponse
 from .transaction_session_read_snapshot import TransactionSessionReadSnapshot
 from .transaction_session_status import TransactionSessionStatus
+from .transaction_session_status_outcome import TransactionSessionStatusOutcome
 from .transaction_session_table_detail import TransactionSessionTableDetail
 from .transaction_stage_delete_request import TransactionStageDeleteRequest
 from .transaction_stage_read_request import TransactionStageReadRequest
@@ -1456,6 +1461,10 @@ __all__ = (
     "HierarchyMatchHit",
     "HierarchyMatchHitSource",
     "HierarchyProjection",
+    "IdempotentBatchError",
+    "IdempotentBatchErrorStatus",
+    "IdempotentBatchResponse",
+    "IdempotentBatchResponseStatus",
     "ImageURL",
     "ImageURLContentPart",
     "ImageURLContentPartType",
@@ -1914,6 +1923,7 @@ __all__ = (
     "TransactionSessionListResponse",
     "TransactionSessionReadSnapshot",
     "TransactionSessionStatus",
+    "TransactionSessionStatusOutcome",
     "TransactionSessionTableDetail",
     "TransactionStageDeleteRequest",
     "TransactionStageReadRequest",

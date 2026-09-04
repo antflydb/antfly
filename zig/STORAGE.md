@@ -436,16 +436,28 @@ remain owned by the Lite constructor so conflicting duplicates fail closed.
 There is no storage-specific HTTP namespace. Clients use the same `/db/v1`
 contract regardless of whether standalone storage is `local` or `lite`.
 
-Durable multi-request transaction sessions have bounded, configurable
-retention. Defaults are one hour, cleanup every minute, 1,024 sessions, a
-16 MiB encoded record per session, and 64 savepoints:
+Durable multi-request transaction sessions and compact idempotency receipts
+have independent, bounded retention and capacity. Defaults are one hour for
+both retention windows, cleanup every minute with at most 4,096 records per
+pass, 1,024 interactive sessions, 65,536 receipts / 512 MiB of aggregate
+receipt storage, a 16 MiB encoded record, and 64 savepoints. Capacity admission
+also coalesces concurrent callers behind one server-owned cleanup job limited
+to 32 records. Each request waits at most 25 ms for that generation before
+retrying the atomic admission check once; slow storage work can continue in the
+background and is drained before the server releases session storage:
 
 ```json
 {
   "transaction_sessions": {
     "ttl_seconds": 3600,
+    "receipt_ttl_seconds": 3600,
     "cleanup_interval_seconds": 60,
+    "cleanup_max_records": 4096,
+    "admission_cleanup_max_records": 32,
+    "admission_cleanup_budget_ms": 25,
     "max_count": 1024,
+    "max_receipt_count": 65536,
+    "max_receipt_bytes": 536870912,
     "max_record_bytes": 16777216,
     "max_savepoints": 64
   }
@@ -457,6 +469,38 @@ allocation, write, or fsync leaves both the durable record and the in-memory
 session unchanged. Mutations are serialized by a bounded set of per-session
 locks; unrelated sessions do not hold the registry lock while cloning,
 renewing leases, encoding, or waiting for durable I/O.
+
+Session inventory has two immutable principal-scoped generations: records
+created by index-aware writers and a separately backfilled legacy projection.
+Reaching the end of a scan is not a migration fence. Interactive-session
+completion remains disabled unless `inventory_writer_fence_generation` is set
+after deployment coordination has drained every pre-index writer. Keep the
+same generation while the fence remains continuously active; increase it after
+any rollback or interval in which legacy writers may have returned. Because
+pre-feature processes do not understand this proof, deployment coordination
+must keep them fenced while it is active. Version-isolated receipt writers are
+intrinsically fenced.
+
+Maintenance publishes a generation-qualified durable completion marker only
+after a complete audit has observed no malformed or unprojectable canonical
+records. Discovering either persists migration debt and atomically invalidates
+any earlier completion marker; a later wholly clean audit clears that debt as
+it republishes completion. A durable per-namespace audit epoch advances with
+every debt observation and completion invalidation. Each full pass captures the
+epoch before scanning and compares it in the transaction that republishes
+completion, so a stale audit in another process cannot erase newer debt. Audit
+progress uses the exact backend key, so a
+malformed reserved key consumes bounded work and records debt without wedging
+unrelated durable transaction recovery. A new runtime operating with the fence
+unset also removes any old completion proof before continuing its audit.
+
+New inventory traversals can then read both
+principal projections. Principal-scoped legacy cursors carry the exact writer
+fence generation and are rejected after the proof is disabled, changed, or
+invalidated, requiring the client to restart the traversal;
+cursors issued before completion retain their bounded canonical compatibility
+phase. Without a valid marker, canonical compatibility remains active and
+continues to surface corrupt records rather than silently hiding them.
 
 ## Validation and safety invariants
 

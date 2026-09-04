@@ -84,6 +84,7 @@ pub const Routes = struct {
     pub const internal_tables_prefix = "/internal/v1/tables/";
     pub const internal_capabilities = "/internal/v1/capabilities";
     pub const batch_suffix = "/batch";
+    pub const idempotent_batch_suffix = "/idempotent-batch";
     pub const routed_batch_suffix = "/batch-routed-v1";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
@@ -494,6 +495,14 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, batch_suffix)) return null;
         const table_name = path[tables_prefix.len .. path.len - batch_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .table_name = table_name };
+    }
+
+    pub fn matchTableIdempotentBatch(path: []const u8) ?TableBatch {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, idempotent_batch_suffix)) return null;
+        const table_name = path[tables_prefix.len .. path.len - idempotent_batch_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
     }
@@ -1424,6 +1433,8 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", query.table_name);
     const batch = Routes.matchTableBatch("/tables/docs/batch").?;
     try std.testing.expectEqualStrings("docs", batch.table_name);
+    const idempotent_batch = Routes.matchTableIdempotentBatch("/tables/docs/idempotent-batch").?;
+    try std.testing.expectEqualStrings("docs", idempotent_batch.table_name);
     const schema = Routes.matchTableSchema("/tables/docs/schema").?;
     try std.testing.expectEqualStrings("docs", schema.table_name);
     const backup = Routes.matchTableBackup("/tables/docs/backup").?;

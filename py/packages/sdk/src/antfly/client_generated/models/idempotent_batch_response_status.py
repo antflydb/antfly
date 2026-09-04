@@ -1,7 +1,7 @@
 from enum import StrEnum
 
 
-class BatchResponseStatus(StrEnum):
+class IdempotentBatchResponseStatus(StrEnum):
     COMMITTED = "committed"
     COMMITTED_PENDING = "committed_pending"
     COMMITTED_RECOVERY_PENDING = "committed_recovery_pending"

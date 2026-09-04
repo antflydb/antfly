@@ -1101,16 +1101,52 @@ pub const ApiHttpServerConfig = struct {
     /// configured local storage root (or Lite file directory) is used.
     backup_staging_root: ?[]const u8 = null,
     session_ttl_ns: ?u64 = null,
+    session_receipt_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
+    session_cleanup_max_records: usize = 4096,
+    session_admission_cleanup_max_records: usize = 32,
+    session_admission_cleanup_budget_ns: u64 = 25 * std.time.ns_per_ms,
     session_owner_lease_ttl_ns: ?u64 = null,
     session_owner_lease_renew_interval_ns: ?u64 = null,
     session_savepoint_limit: ?usize = null,
     session_max_count: ?usize = null,
     session_max_record_bytes: ?usize = null,
+    session_max_receipt_count: ?usize = null,
+    session_max_receipt_bytes: ?usize = null,
+    /// Deployment-activated generation proving that every process capable of
+    /// writing the shared interactive-session namespace maintains principal
+    /// inventory v1. Leave null throughout a rolling upgrade. A later
+    /// reactivation after rollback must use a new generation.
+    session_inventory_writer_fence_generation: ?u64 = null,
     /// Optional node-wide resource owner. The owner must outlive ApiHttpServer.
     /// Cache budgets and concurrency are intentionally not HTTP/API config.
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
+
+const default_session_owner_lease_ttl_ns: u64 = 30 * std.time.ns_per_s;
+const session_lease_renewal_scan_batch = 256;
+
+fn safeSessionLeaseRenewInterval(ttl_ns: u64, configured_ns: ?u64) u64 {
+    const safety_interval_ns = @max(@as(u64, 1), ttl_ns / 3);
+    return @max(@as(u64, 1), @min(configured_ns orelse safety_interval_ns, safety_interval_ns));
+}
+
+/// A durable receipt without a fenced owner lease cannot be recovered safely
+/// after a process restart: the persisted process incarnation changes, while
+/// an unfenced writer could still overwrite a successor. Make fencing an
+/// invariant of every durable session configuration, not an HA-only option.
+fn withDurableSessionLeaseDefaults(input: ApiHttpServerConfig) ApiHttpServerConfig {
+    var cfg = input;
+    if (cfg.session_store != null or cfg.session_store_path != null) {
+        if (cfg.session_owner_lease_ttl_ns == null)
+            cfg.session_owner_lease_ttl_ns = default_session_owner_lease_ttl_ns;
+        cfg.session_owner_lease_renew_interval_ns = safeSessionLeaseRenewInterval(
+            cfg.session_owner_lease_ttl_ns.?,
+            cfg.session_owner_lease_renew_interval_ns,
+        );
+    }
+    return cfg;
+}
 
 pub const RaftQuarantineAdminSource = struct {
     ptr: *anyopaque,
@@ -2635,6 +2671,16 @@ pub const ApiHttpServer = struct {
     owned_foreign_registry: ?*foreign_mod.Registry = null,
     txn_sessions: transactions_api.SessionRegistry = .{},
     last_session_cleanup_ns: std.atomic.Value(u64) = .init(0),
+    receipt_admission_cleanup_owner_id: u64 = 0,
+    /// Zero means idle. A non-zero value is the exact generation currently
+    /// owned by the durable worker lane. Keeping identity and admission in one
+    /// atomic prevents completion of generation N from acknowledging N+1.
+    receipt_admission_cleanup_active_generation: std.atomic.Value(u32) = .init(0),
+    receipt_admission_cleanup_next_generation: std.atomic.Value(u32) = .init(0),
+    receipt_admission_cleanup_closing: std.atomic.Value(bool) = .init(false),
+    receipt_admission_cleanup_pause_for_test: std.atomic.Value(bool) = .init(false),
+    receipt_admission_cleanup_entered_for_test: std.Io.Event = .unset,
+    receipt_admission_cleanup_release_for_test: std.Io.Event = .unset,
     last_session_lease_renew_ns: std.atomic.Value(u64) = .init(0),
     last_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
     created_at_ns: u64 = 0,
@@ -2663,6 +2709,11 @@ pub const ApiHttpServer = struct {
     restore_leadership_term: std.atomic.Value(u64) = .init(0),
     session_maintenance_owner_id: u64 = 0,
     session_maintenance_in_flight: std.atomic.Value(bool) = .init(false),
+    session_lease_renewal_owner_id: u64 = 0,
+    session_lease_renewal_in_flight: std.atomic.Value(bool) = .init(false),
+    session_maintenance_pause_for_test: std.atomic.Value(bool) = .init(false),
+    session_maintenance_entered_for_test: std.Io.Event = .unset,
+    session_maintenance_release_for_test: std.Io.Event = .unset,
     backup_maintenance_owner_id: u64 = 0,
     index_installation_owner_id: u64 = 0,
     index_installation_closing: std.atomic.Value(bool) = .init(false),
@@ -2701,6 +2752,8 @@ pub const ApiHttpServer = struct {
         repair: u64 = 0,
         restore: u64 = 0,
         session_maintenance: u64 = 0,
+        session_lease_renewal: u64 = 0,
+        receipt_admission_cleanup: u64 = 0,
         backup_maintenance: u64 = 0,
         index_installation: u64 = 0,
         incoming_graph_routes: u64 = 0,
@@ -2713,12 +2766,16 @@ pub const ApiHttpServer = struct {
             if (ids.repair != 0) active.durable_jobs.closeOwner(ids.repair);
             if (ids.restore != 0) active.durable_jobs.closeOwner(ids.restore);
             if (ids.session_maintenance != 0) active.durable_jobs.closeOwner(ids.session_maintenance);
+            if (ids.session_lease_renewal != 0) active.durable_jobs.closeOwner(ids.session_lease_renewal);
+            if (ids.receipt_admission_cleanup != 0) active.durable_jobs.closeOwner(ids.receipt_admission_cleanup);
             if (ids.backup_maintenance != 0) active.durable_jobs.closeOwner(ids.backup_maintenance);
             if (ids.index_installation != 0) active.durable_jobs.closeOwner(ids.index_installation);
         }
         ids.repair = try active.allocOwnerId();
         ids.restore = try active.allocOwnerId();
         ids.session_maintenance = try active.allocOwnerId();
+        ids.session_lease_renewal = try active.allocOwnerId();
+        ids.receipt_admission_cleanup = try active.allocOwnerId();
         ids.backup_maintenance = try active.allocOwnerId();
         ids.index_installation = try active.allocOwnerId();
         ids.incoming_graph_routes = try active.allocOwnerId();
@@ -2790,13 +2847,14 @@ pub const ApiHttpServer = struct {
         table_read_source: ?table_reads.TableReadSource,
         table_write_source: ?table_writes.TableWriteSource,
     ) ApiHttpServer {
-        const owner_ids = allocRuntimeOwnerIds(cfg.backend_runtime) catch {
+        const effective_cfg = withDurableSessionLeaseDefaults(cfg);
+        const owner_ids = allocRuntimeOwnerIds(effective_cfg.backend_runtime) catch {
             @panic("API background owner registration failed");
         };
         return initWithRequestAllocatorAndOwners(
             owner_alloc,
             request_alloc,
-            cfg,
+            effective_cfg,
             source,
             table_read_source,
             table_write_source,
@@ -2849,8 +2907,11 @@ pub const ApiHttpServer = struct {
                     cfg.session_savepoint_limit,
                     cfg.session_max_count,
                     cfg.session_max_record_bytes,
+                    cfg.session_max_receipt_count,
+                    cfg.session_max_receipt_bytes,
                 );
                 registry.durable_scope = cfg.session_store_scope;
+                registry.inventory_writer_fence_generation = cfg.session_inventory_writer_fence_generation;
                 break :blk registry;
             },
             .join_job_store = distributed_join.JoinJobStore.init(owner_alloc, .{
@@ -2873,6 +2934,8 @@ pub const ApiHttpServer = struct {
             .repair_job_owner_id = owner_ids.repair,
             .restore_job_owner_id = .init(owner_ids.restore),
             .session_maintenance_owner_id = owner_ids.session_maintenance,
+            .session_lease_renewal_owner_id = owner_ids.session_lease_renewal,
+            .receipt_admission_cleanup_owner_id = owner_ids.receipt_admission_cleanup,
             .backup_maintenance_owner_id = owner_ids.backup_maintenance,
             .index_installation_owner_id = owner_ids.index_installation,
             .connections_cache = connections_api.Cache.init(owner_alloc),
@@ -3122,7 +3185,7 @@ pub const ApiHttpServer = struct {
         table_read_source: ?table_reads.TableReadSource,
         table_write_source: ?table_writes.TableWriteSource,
     ) !ApiHttpServer {
-        var effective_cfg = cfg;
+        var effective_cfg = withDurableSessionLeaseDefaults(cfg);
         const request_alloc = if (builtin.is_test)
             alloc
         else
@@ -3134,6 +3197,8 @@ pub const ApiHttpServer = struct {
                 if (owner_ids.repair != 0) runtime.durable_jobs.closeOwner(owner_ids.repair);
                 if (owner_ids.restore != 0) runtime.durable_jobs.closeOwner(owner_ids.restore);
                 if (owner_ids.session_maintenance != 0) runtime.durable_jobs.closeOwner(owner_ids.session_maintenance);
+                if (owner_ids.session_lease_renewal != 0) runtime.durable_jobs.closeOwner(owner_ids.session_lease_renewal);
+                if (owner_ids.receipt_admission_cleanup != 0) runtime.durable_jobs.closeOwner(owner_ids.receipt_admission_cleanup);
                 if (owner_ids.backup_maintenance != 0) runtime.durable_jobs.closeOwner(owner_ids.backup_maintenance);
                 if (owner_ids.index_installation != 0) runtime.durable_jobs.closeOwner(owner_ids.index_installation);
             }
@@ -3149,8 +3214,8 @@ pub const ApiHttpServer = struct {
         );
         owner_ids_transferred = true;
         errdefer server.deinit();
-        if (cfg.session_store_path) |path| {
-            if (cfg.session_store != null) return error.InvalidApiServerConfig;
+        if (effective_cfg.session_store_path) |path| {
+            if (effective_cfg.session_store != null) return error.InvalidApiServerConfig;
             const opened = try alloc.create(transactions_api.OpenedSessionStore);
             errdefer alloc.destroy(opened);
             opened.* = try transactions_api.OpenedSessionStore.open(alloc, path);
@@ -3164,8 +3229,11 @@ pub const ApiHttpServer = struct {
                 effective_cfg.session_savepoint_limit,
                 effective_cfg.session_max_count,
                 effective_cfg.session_max_record_bytes,
+                effective_cfg.session_max_receipt_count,
+                effective_cfg.session_max_receipt_bytes,
             );
             server.txn_sessions.durable_scope = effective_cfg.session_store_scope;
+            server.txn_sessions.inventory_writer_fence_generation = effective_cfg.session_inventory_writer_fence_generation;
         }
         if (cfg.join_job_store_path orelse cfg.session_store_path) |base_path| {
             const join_job_path = if (cfg.join_job_store_path != null)
@@ -3243,11 +3311,14 @@ pub const ApiHttpServer = struct {
         self.signalRestoreBackoffWaiters();
         self.backup_maintenance_closing.store(true, .release);
         self.index_installation_closing.store(true, .release);
+        self.receipt_admission_cleanup_closing.store(true, .release);
         if (self.cfg.backend_runtime) |runtime| {
             if (self.repair_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.repair_job_owner_id);
             const restore_owner_id = self.restore_job_owner_id.load(.acquire);
             if (restore_owner_id != 0) runtime.durable_jobs.closeOwner(restore_owner_id);
             if (self.session_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_maintenance_owner_id);
+            if (self.session_lease_renewal_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_lease_renewal_owner_id);
+            if (self.receipt_admission_cleanup_owner_id != 0) runtime.durable_jobs.closeOwner(self.receipt_admission_cleanup_owner_id);
             if (self.backup_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.backup_maintenance_owner_id);
             if (self.index_installation_owner_id != 0) runtime.durable_jobs.closeOwner(self.index_installation_owner_id);
         }
@@ -3596,6 +3667,15 @@ pub const ApiHttpServer = struct {
         // primary-local. Their mutating routes are rejected in continuous HA,
         // and their cleanup/resume loop must remain frozen for the same reason.
         if (!self.mutationBackgroundExecutionPermitted()) return;
+        // Renew before any potentially blocking recovery and keep the normal
+        // scheduler's renewal job independent from this maintenance worker.
+        // The inline call is a fallback for manual runtimes and direct users.
+        try self.maybeRenewOwnedSessionLeases();
+        if (comptime builtin.is_test) if (self.session_maintenance_pause_for_test.load(.acquire)) {
+            const io = self.sharedApiIo() orelse std.testing.io;
+            self.session_maintenance_entered_for_test.set(io);
+            self.session_maintenance_release_for_test.waitUncancelable(io);
+        };
         // Queue insertion is durable in server memory even when the bounded
         // executor temporarily rejects the worker submission. The periodic
         // supervisor is the independent wake source that makes such an
@@ -3608,7 +3688,6 @@ pub const ApiHttpServer = struct {
             std.log.warn("failed to advance stable transaction recovery err={s}", .{@errorName(err)});
         };
         try self.maybeCleanupExpiredSessions();
-        try self.maybeRenewOwnedSessionLeases();
         // Durable named-index cancellation is correctness work, not a client
         // polling obligation. Advance at most one queued pass per supervisor
         // tick; the repair-job FIFO and BackendRuntime maintenance queue keep
@@ -3630,141 +3709,243 @@ pub const ApiHttpServer = struct {
         return !self.haMutationPolicy().failover_safe_mutations_only;
     }
 
+    fn finishRejectedSessionRecovery(
+        self: *ApiHttpServer,
+        txn_id: db_mod.types.TxnId,
+        idempotent_receipt: bool,
+    ) void {
+        if (!idempotent_receipt) {
+            _ = self.txn_sessions.removeInteractiveAfterDecision(self.alloc, txn_id);
+            return;
+        }
+        _ = (self.txn_sessions.recordIdempotentDurableAbort(
+            self.alloc,
+            txn_id,
+            "transaction_conflict",
+            "batch transaction conflicted and was durably aborted",
+        ) catch |err| {
+            std.log.warn("stable idempotent batch rejection persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+            return;
+        }) orelse return;
+    }
+
+    fn sessionRecoveryLeaseRenewInterval(self: *const ApiHttpServer) ?u64 {
+        const ttl_ns = self.sessionRecoveryLeaseDurationNs() orelse return null;
+        return safeSessionLeaseRenewInterval(ttl_ns, self.cfg.session_owner_lease_renew_interval_ns);
+    }
+
+    fn sessionRecoveryLeaseDurationNs(self: *const ApiHttpServer) ?u64 {
+        const configured_ns = self.cfg.session_owner_lease_ttl_ns orelse return null;
+        const ttl_ms = @max(
+            @as(u64, 1),
+            (configured_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms,
+        );
+        return ttl_ms *| std.time.ns_per_ms;
+    }
+
+    fn sessionRecoveryLeaseExpirationNs(self: *const ApiHttpServer, now_ns: u64) ?u64 {
+        const configured_ns = self.cfg.session_owner_lease_ttl_ns orelse return null;
+        return transactions_api.sessionLeaseExpirationNs(configured_ns, now_ns);
+    }
+
     fn retryPendingTransactionRecovery(self: *ApiHttpServer, limit: usize) !void {
         const source = self.table_writes orelse return;
         const pending = try self.txn_sessions.listPendingRecoveryIds(self.alloc, limit);
         defer self.alloc.free(pending);
+        if (pending.len == 0) return;
         const local_node_id = self.localSessionNodeId();
-        const now_ns = platform_time.realtimeNs();
+        var fallback_io: ?std.Io.Threaded = if (self.sessionRecoveryLeaseRenewInterval() != null and self.sharedApiIo() == null)
+            std.Io.Threaded.init(std.heap.page_allocator, .{})
+        else
+            null;
+        defer if (fallback_io) |*owned| owned.deinit();
+        const recovery_io = self.sharedApiIo() orelse if (fallback_io) |*owned| owned.io() else null;
         for (pending) |txn_id| {
-            var recovery = (self.txn_sessions.claimPendingRecovery(self.alloc, txn_id, local_node_id, now_ns) catch |err| {
+            // Each claim receives a lease based on the instant it begins. A
+            // slow preceding recovery must not consume a later item's lease.
+            const claim_now_ns = platform_time.realtimeNs();
+            var recovery = (self.txn_sessions.claimPendingRecovery(self.alloc, txn_id, local_node_id, claim_now_ns) catch |err| {
                 std.log.warn("stable transaction recovery claim deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                 continue;
             }) orelse continue;
             defer recovery.deinit(self.alloc);
-            switch (recovery) {
-                .acknowledge => |acknowledgement| {
-                    const acknowledged = source.acknowledgeTransactionCommit(
-                        self.alloc,
-                        acknowledgement.txn_id,
-                        acknowledgement.coordinator_group_id,
-                        acknowledgement.coordinator_table_name,
-                    ) catch |err| {
-                        std.log.warn("stable transaction coordinator acknowledgement maintenance deferred txn_id={x} err={s}", .{ acknowledgement.txn_id, @errorName(err) });
-                        continue;
-                    };
-                    if (acknowledged == null) continue;
-                    _ = (self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, acknowledgement.txn_id) catch |err| {
-                        std.log.warn("stable transaction acknowledgement receipt persistence deferred txn_id={x} err={s}", .{ acknowledgement.txn_id, @errorName(err) });
-                        continue;
-                    }) orelse continue;
-                },
-                .commit => |*commit| {
-                    const distributed_tables = commit.request.distributedTables(self.alloc) catch |err| {
-                        std.log.err("invalid sealed stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        continue;
-                    };
-                    defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
-                    const outcome = (source.commitTransactionWithId(
+            if (self.sessionRecoveryLeaseRenewInterval()) |interval_ns| if (recovery_io) |io| {
+                // Claim persistence may itself block. Establish and verify a
+                // fresh post-I/O window before starting any recovered 2PC work.
+                const confirmed_expiry_ns = self.txn_sessions.confirmOwnedLeaseRunway(
+                    txn_id,
+                    local_node_id,
+                    interval_ns,
+                ) catch |err| {
+                    std.log.warn("stable transaction recovery lease confirmation deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                    continue;
+                };
+                var heartbeat = transactions_api.OwnedSessionLeaseHeartbeat.init(
+                    &self.txn_sessions,
+                    io,
+                    txn_id,
+                    local_node_id,
+                    interval_ns,
+                    confirmed_expiry_ns,
+                );
+                var heartbeat_future = io.concurrent(
+                    transactions_api.OwnedSessionLeaseHeartbeat.run,
+                    .{&heartbeat},
+                ) catch |err| {
+                    // Recovery has not entered storage work yet. Leave the
+                    // durable handoff pending for the next bounded pass.
+                    std.log.warn("stable transaction recovery heartbeat dispatch deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                    continue;
+                };
+                const lease_cancellation = transactions_api.OwnedSessionLeaseCancellation{
+                    .heartbeat = &heartbeat,
+                };
+                self.advanceClaimedTransactionRecovery(source, txn_id, &recovery, lease_cancellation.token());
+                heartbeat.stop();
+                heartbeat_future.await(io);
+                if (heartbeat.isLost())
+                    std.log.warn("stable transaction recovery lost its owner lease txn_id={x}", .{txn_id});
+                continue;
+            };
+            self.advanceClaimedTransactionRecovery(source, txn_id, &recovery, .none);
+        }
+    }
+
+    fn advanceClaimedTransactionRecovery(
+        self: *ApiHttpServer,
+        source: table_writes.TableWriteSource,
+        txn_id: db_mod.types.TxnId,
+        recovery: *transactions_api.PendingSessionRecovery,
+        cancellation: CancellationToken,
+    ) void {
+        switch (recovery.*) {
+            .acknowledge => |acknowledgement| {
+                const acknowledged = source.acknowledgeTransactionCommit(
+                    self.alloc,
+                    acknowledgement.txn_id,
+                    acknowledgement.coordinator_group_id,
+                    acknowledgement.coordinator_table_name,
+                ) catch |err| {
+                    std.log.warn("stable transaction coordinator acknowledgement maintenance deferred txn_id={x} err={s}", .{ acknowledgement.txn_id, @errorName(err) });
+                    return;
+                };
+                if (acknowledged == null) return;
+                _ = (self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, acknowledgement.txn_id) catch |err| {
+                    std.log.warn("stable transaction acknowledgement receipt persistence deferred txn_id={x} err={s}", .{ acknowledgement.txn_id, @errorName(err) });
+                    return;
+                }) orelse return;
+            },
+            .commit => |*commit| {
+                const distributed_tables = commit.request.distributedTables(self.alloc) catch |err| {
+                    std.log.err("invalid sealed stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                    return;
+                };
+                defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
+                // A lease-backed recovery always carries a real cancellation
+                // token. Keep the legacy unfenced/in-memory recovery path on
+                // the non-cancellation callback: sources may intentionally
+                // distinguish that compatibility surface, and `.none` is not
+                // a useful cancellation capability.
+                const recovery_sync_level: db_mod.types.SyncLevel =
+                    // Proposal-only delivery is insufficient for recovery:
+                    // a new leader may discard it before apply. Upgrade
+                    // only the weakest level, preserving stronger caller
+                    // visibility contracts without extra hot-path work.
+                    if (commit.repair_handoff_needs_coordinator or commit.sync_level == .propose)
+                        .write
+                    else
+                        commit.sync_level;
+                const recovery_result = if (cancellation.ptr == null)
+                    source.commitTransactionWithId(
                         self.alloc,
                         txn_id,
                         commit.begin_timestamp,
                         distributed_tables,
-                        // Proposal-only delivery is insufficient for recovery:
-                        // a new leader may discard it before apply. Upgrade
-                        // only the weakest level, preserving stronger caller
-                        // visibility contracts without extra hot-path work.
-                        if (commit.repair_handoff_needs_coordinator or commit.sync_level == .propose)
-                            .write
-                        else
-                            commit.sync_level,
-                    ) catch |err| switch (err) {
-                        error.EnrichmentWorkerFailed => {
-                            // Older records and third-party sources may expose a
-                            // committed terminal repair only as an error. Persist
-                            // that fact now; the next claim uses write durability
-                            // to recover coordinator metadata without calling the
-                            // failed provider again.
-                            _ = (self.txn_sessions.recordTerminalCommitWithRepair(
-                                self.alloc,
-                                txn_id,
-                                .committed,
-                                true,
-                                null,
-                                null,
-                            ) catch |persist_err| {
-                                std.log.warn("stable transaction repair handoff persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
-                                continue;
-                            }) orelse continue;
-                            continue;
-                        },
-                        error.InvalidBatchRequest,
-                        error.InvalidArgument,
-                        error.InvalidGraphEdges,
-                        error.UnsupportedTransformOperation,
-                        error.TopologyChanged,
-                        error.DecisionConflict,
-                        error.DocIdentityNamespaceMismatch,
-                        error.UnsupportedOperation,
-                        error.TableNotFound,
-                        error.UnknownGroup,
-                        => {
-                            _ = self.txn_sessions.remove(self.alloc, txn_id);
-                            continue;
-                        },
-                        else => {
-                            std.log.warn("stable transaction commit recovery deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                            continue;
-                        },
-                    }) orelse continue;
-                    switch (outcome) {
-                        .conflict => {
-                            // A replayed transaction ID can only conflict when
-                            // the coordinator durably chose abort.
-                            _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        },
-                        .committed => |committed| {
-                            const repair_required = commit.repair_required or committed.visibility_repair_required;
-                            const status = transactions_api.terminalCommitStatusForOutcome(
-                                committed.propagation_pending,
-                                committed.visibility_pending,
-                                committed.visibility_retry_pending,
-                                committed.visibility_repair_required,
-                            );
-                            _ = (self.txn_sessions.recordTerminalCommitWithRepair(
-                                self.alloc,
-                                txn_id,
-                                status,
-                                repair_required,
-                                committed.coordinator_group_id,
-                                committed.coordinator_table_name,
-                            ) catch |err| {
-                                std.log.warn("stable transaction terminal handoff persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                continue;
-                            }) orelse continue;
-                            // Pending is a durable decision, not a completed
-                            // API/storage handoff. Retain the coordinator's
-                            // self-participant so topology stays fenced while
-                            // maintenance replays phase two under this ID.
-                            if (status == .committed) {
-                                if (committed.coordinator_group_id) |group_id| {
-                                    const table_name = committed.coordinator_table_name orelse continue;
-                                    const acknowledged = source.acknowledgeTransactionCommit(self.alloc, txn_id, group_id, table_name) catch |err| {
-                                        std.log.warn("stable transaction recovered coordinator acknowledgement deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                        continue;
-                                    };
-                                    if (acknowledged == null) continue;
-                                    _ = (self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, txn_id) catch |err| {
-                                        std.log.warn("stable transaction recovered acknowledgement receipt persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                        continue;
-                                    }) orelse continue;
-                                }
+                        recovery_sync_level,
+                    )
+                else
+                    source.commitTransactionWithIdAndCancellation(
+                        self.alloc,
+                        txn_id,
+                        commit.begin_timestamp,
+                        distributed_tables,
+                        recovery_sync_level,
+                        cancellation,
+                    );
+                const outcome = (recovery_result catch |err| switch (err) {
+                    error.EnrichmentWorkerFailed => {
+                        // Older records and third-party sources may expose a
+                        // committed terminal repair only as an error. Persist
+                        // that fact now; the next claim uses write durability
+                        // to recover coordinator metadata without calling the
+                        // failed provider again.
+                        _ = (self.txn_sessions.recordTerminalCommitWithRepair(
+                            self.alloc,
+                            txn_id,
+                            .committed,
+                            true,
+                            null,
+                            null,
+                        ) catch |persist_err| {
+                            std.log.warn("stable transaction repair handoff persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
+                            return;
+                        }) orelse return;
+                        return;
+                    },
+                    else => {
+                        // A bare execution error does not identify the
+                        // coordinator's durable decision. Leave the receipt
+                        // pending until a typed outcome is observed.
+                        std.log.warn("stable transaction commit recovery deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                        return;
+                    },
+                }) orelse return;
+                switch (outcome) {
+                    .conflict => {
+                        // A replayed transaction ID can only conflict when
+                        // the coordinator durably chose abort.
+                        self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt);
+                    },
+                    .committed => |committed| {
+                        const repair_required = commit.repair_required or committed.visibility_repair_required;
+                        const status = transactions_api.terminalCommitStatusForOutcome(
+                            committed.propagation_pending,
+                            committed.visibility_pending,
+                            committed.visibility_retry_pending,
+                            committed.visibility_repair_required,
+                        );
+                        _ = (self.txn_sessions.recordTerminalCommitWithRepair(
+                            self.alloc,
+                            txn_id,
+                            status,
+                            repair_required,
+                            committed.coordinator_group_id,
+                            committed.coordinator_table_name,
+                        ) catch |err| {
+                            std.log.warn("stable transaction terminal handoff persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                            return;
+                        }) orelse return;
+                        // Pending is a durable decision, not a completed
+                        // API/storage handoff. Retain the coordinator's
+                        // self-participant so topology stays fenced while
+                        // maintenance replays phase two under this ID.
+                        if (status == .committed) {
+                            if (committed.coordinator_group_id) |group_id| {
+                                const table_name = committed.coordinator_table_name orelse return;
+                                const acknowledged = source.acknowledgeTransactionCommit(self.alloc, txn_id, group_id, table_name) catch |err| {
+                                    std.log.warn("stable transaction recovered coordinator acknowledgement deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                                    return;
+                                };
+                                if (acknowledged == null) return;
+                                _ = (self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, txn_id) catch |err| {
+                                    std.log.warn("stable transaction recovered acknowledgement receipt persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                                    return;
+                                }) orelse return;
                             }
-                        },
-                    }
-                },
-            }
+                        }
+                    },
+                }
+            },
         }
     }
 
@@ -3792,7 +3973,70 @@ pub const ApiHttpServer = struct {
         }
     };
 
+    const SessionLeaseRenewalWork = struct {
+        server: *ApiHttpServer,
+
+        fn run(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.server.renewOwnedSessionLeasesNow() catch |err| {
+                // Permit the runtime loop to retry immediately instead of
+                // suppressing renewal for a full interval after a failed pass.
+                self.server.last_session_lease_renew_ns.store(0, .release);
+                return err;
+            };
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.server.session_lease_renewal_in_flight.store(false, .release);
+            self.server.alloc.destroy(self);
+        }
+    };
+
+    fn scheduleSessionLeaseRenewal(self: *ApiHttpServer) !void {
+        if (self.cfg.session_owner_lease_ttl_ns == null or
+            self.cfg.session_owner_lease_renew_interval_ns == null) return;
+        if (self.session_lease_renewal_in_flight.load(.acquire)) return;
+        if (!self.claimSessionLeaseRenewalDue()) return;
+        const runtime = self.cfg.backend_runtime orelse {
+            self.renewOwnedSessionLeasesNow() catch |err| {
+                self.last_session_lease_renew_ns.store(0, .release);
+                return err;
+            };
+            return;
+        };
+        if (runtime.threaded_jobs == null or self.session_lease_renewal_owner_id == 0) {
+            self.renewOwnedSessionLeasesNow() catch |err| {
+                self.last_session_lease_renew_ns.store(0, .release);
+                return err;
+            };
+            return;
+        }
+        if (self.session_lease_renewal_in_flight.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        const work = self.alloc.create(SessionLeaseRenewalWork) catch |err| {
+            self.session_lease_renewal_in_flight.store(false, .release);
+            self.last_session_lease_renew_ns.store(0, .release);
+            return err;
+        };
+        work.* = .{ .server = self };
+        runtime.durable_jobs.submit(.{
+            .owner_id = self.session_lease_renewal_owner_id,
+            .class = .commit_durable,
+            .ptr = work,
+            .run = SessionLeaseRenewalWork.run,
+            .deinit = SessionLeaseRenewalWork.deinit,
+        }) catch |err| {
+            self.alloc.destroy(work);
+            self.session_lease_renewal_in_flight.store(false, .release);
+            self.last_session_lease_renew_ns.store(0, .release);
+            return err;
+        };
+    }
+
     pub fn scheduleSessionMaintenance(self: *ApiHttpServer) !void {
+        // Ownership fencing has its own in-flight job and owner. A slow 2PC
+        // recovery pass must never delay the next lease-renewal deadline.
+        try self.scheduleSessionLeaseRenewal();
         // The data runtime can complete many rounds per second. Rate-limit
         // submission before allocating work so an idle server does not churn
         // cleanup jobs. The worker's per-task clocks retain the configured
@@ -6626,14 +6870,138 @@ pub const ApiHttpServer = struct {
         return router.localNodeId();
     }
 
+    /// Distributed receipt ownership requires both a unique routable node and
+    /// a transport for forwarding requests to the current owner.
+    pub fn hasRoutableSessionOwner(self: *ApiHttpServer) bool {
+        return self.cfg.session_router != null and
+            self.cfg.session_executor != null and
+            self.localSessionNodeId() != 0;
+    }
+
     fn maybeCleanupExpiredSessions(self: *ApiHttpServer) !void {
         const ttl_ns = self.cfg.session_ttl_ns orelse return;
+        const receipt_ttl_ns = self.cfg.session_receipt_ttl_ns orelse ttl_ns;
         const now_ns = platform_time.realtimeNs();
         const interval_ns = self.cfg.session_cleanup_interval_ns orelse ttl_ns;
         const previous_ns = self.last_session_cleanup_ns.load(.acquire);
         if (previous_ns != 0 and now_ns -| previous_ns < interval_ns) return;
         self.last_session_cleanup_ns.store(now_ns, .release);
-        _ = try self.txn_sessions.cleanupExpired(self.alloc, now_ns -| ttl_ns);
+        _ = try self.txn_sessions.cleanupExpiredWithCutoffsLimit(
+            self.alloc,
+            now_ns -| ttl_ns,
+            now_ns -| receipt_ttl_ns,
+            self.cfg.session_cleanup_max_records,
+        );
+    }
+
+    const ReceiptAdmissionCleanupWork = struct {
+        server: *ApiHttpServer,
+        generation: u32,
+
+        fn run(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const server = self.server;
+            if (comptime builtin.is_test) if (server.receipt_admission_cleanup_pause_for_test.load(.acquire)) {
+                const io = server.sharedApiIo() orelse std.testing.io;
+                server.receipt_admission_cleanup_entered_for_test.set(io);
+                server.receipt_admission_cleanup_release_for_test.waitUncancelable(io);
+            };
+            if (server.receipt_admission_cleanup_closing.load(.acquire)) return;
+            const ttl_ns = server.cfg.session_ttl_ns orelse return;
+            const receipt_ttl_ns = server.cfg.session_receipt_ttl_ns orelse ttl_ns;
+            const now_ns = platform_time.realtimeNs();
+            _ = try server.txn_sessions.cleanupExpiredWithCutoffsLimit(
+                server.alloc,
+                0,
+                now_ns -| receipt_ttl_ns,
+                server.cfg.session_admission_cleanup_max_records,
+            );
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const server = self.server;
+            _ = server.receipt_admission_cleanup_active_generation.cmpxchgStrong(
+                self.generation,
+                0,
+                .acq_rel,
+                .acquire,
+            );
+            const io = server.sharedApiIo() orelse std.Io.Threaded.global_single_threaded.io();
+            io.futexWake(
+                u32,
+                &server.receipt_admission_cleanup_active_generation.raw,
+                std.math.maxInt(u32),
+            );
+            server.alloc.destroy(self);
+        }
+    };
+
+    /// Starts or joins the server-owned cleanup generation. The durable job
+    /// owner is drained before session storage during server teardown, so no
+    /// detached work can retain the server or its store.
+    fn scheduleReceiptAdmissionCleanup(self: *ApiHttpServer) !u32 {
+        if (self.receipt_admission_cleanup_closing.load(.acquire)) return 0;
+        const runtime = self.cfg.backend_runtime orelse return 0;
+        if (runtime.threaded_jobs == null or self.receipt_admission_cleanup_owner_id == 0) return 0;
+        const active = self.receipt_admission_cleanup_active_generation.load(.acquire);
+        if (active != 0) return active;
+
+        var generation = self.receipt_admission_cleanup_next_generation.fetchAdd(1, .acq_rel) +% 1;
+        if (generation == 0)
+            generation = self.receipt_admission_cleanup_next_generation.fetchAdd(1, .acq_rel) +% 1;
+        if (self.receipt_admission_cleanup_active_generation.cmpxchgStrong(
+            0,
+            generation,
+            .acq_rel,
+            .acquire,
+        )) |winner| return winner;
+        errdefer {
+            _ = self.receipt_admission_cleanup_active_generation.cmpxchgStrong(
+                generation,
+                0,
+                .acq_rel,
+                .acquire,
+            );
+            const io = self.sharedApiIo() orelse std.Io.Threaded.global_single_threaded.io();
+            io.futexWake(u32, &self.receipt_admission_cleanup_active_generation.raw, std.math.maxInt(u32));
+        }
+        const work = try self.alloc.create(ReceiptAdmissionCleanupWork);
+        errdefer self.alloc.destroy(work);
+        work.* = .{ .server = self, .generation = generation };
+        try runtime.durable_jobs.submit(.{
+            .owner_id = self.receipt_admission_cleanup_owner_id,
+            .class = .cleanup,
+            .ptr = work,
+            .run = ReceiptAdmissionCleanupWork.run,
+            .deinit = ReceiptAdmissionCleanupWork.deinit,
+        });
+        return generation;
+    }
+
+    /// Capacity rejection is often caused by receipts that have already
+    /// crossed their retention boundary but have not reached the periodic
+    /// reaper yet. The request only schedules server-owned work and waits for
+    /// its generation through std.Io; neither the trigger nor its followers
+    /// execute storage operations inside the admission budget.
+    pub fn reclaimExpiredReceiptCapacity(self: *ApiHttpServer, io: std.Io) !void {
+        const generation = try self.scheduleReceiptAdmissionCleanup();
+        if (generation == 0) return;
+        if (self.receipt_admission_cleanup_active_generation.load(.acquire) == generation) {
+            try io.futexWaitTimeout(
+                u32,
+                &self.receipt_admission_cleanup_active_generation.raw,
+                generation,
+                .{ .duration = .{
+                    .clock = .awake,
+                    .raw = std.Io.Duration.fromNanoseconds(self.cfg.session_admission_cleanup_budget_ns),
+                } },
+            );
+        }
+        // The retry only needs the exact generation's lifetime fence. Capacity
+        // remains authoritative in the durable create transaction; returning
+        // a shared removal count would race a successor generation.
+        return;
     }
 
     fn routeInternalGroupQueryToReadSchema(ptr: *anyopaque, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
@@ -6727,17 +7095,17 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn validateTableWritesAgainstSchema(self: *ApiHttpServer, table_name: []const u8, writes: anytype) !void {
-        if (writes.len == 0) return;
         var snapshot = (try self.source.adminSnapshot()) orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
 
-        if (table.schema_json.len != 0) {
+        if (writes.len > 0 and table.schema_json.len != 0) {
             var parsed_schema = try tables_api.parseValidatedTableSchema(self.alloc, table.schema_json);
             defer parsed_schema.deinit(self.alloc);
             try tables_api.validateWritesAgainstTableSchema(self.alloc, parsed_schema, writes);
         }
-        try validateWritesAgainstExtensionDataShapes(self.alloc, &snapshot, table_name, writes);
+        if (writes.len > 0)
+            try validateWritesAgainstExtensionDataShapes(self.alloc, &snapshot, table_name, writes);
     }
 
     pub fn validateCommitTablesAgainstSchema(self: *ApiHttpServer, tables: []const distributed_txn.TableCommitRequest) !void {
@@ -9925,22 +10293,43 @@ pub const ApiHttpServer = struct {
     }
 
     fn maybeRenewOwnedSessionLeases(self: *ApiHttpServer) !void {
-        const ttl_ns = self.cfg.session_owner_lease_ttl_ns orelse return;
-        _ = ttl_ns;
-        const interval_ns = self.cfg.session_owner_lease_renew_interval_ns orelse return;
-        const owner_node_id = self.localSessionNodeId();
-        if (owner_node_id == 0) return;
+        if (!self.claimSessionLeaseRenewalDue()) return;
+        self.renewOwnedSessionLeasesNow() catch |err| {
+            self.last_session_lease_renew_ns.store(0, .release);
+            return err;
+        };
+    }
+
+    fn claimSessionLeaseRenewalDue(self: *ApiHttpServer) bool {
+        const interval_ns = self.cfg.session_owner_lease_renew_interval_ns orelse return false;
         const schedule_now_ns = platform_time.monotonicNs();
         const previous_ns = self.last_session_lease_renew_ns.load(.acquire);
-        if (previous_ns != 0 and schedule_now_ns -| previous_ns < interval_ns) return;
-        self.last_session_lease_renew_ns.store(schedule_now_ns, .release);
+        if (previous_ns != 0 and schedule_now_ns -| previous_ns < interval_ns) return false;
+        return self.last_session_lease_renew_ns.cmpxchgStrong(
+            previous_ns,
+            schedule_now_ns,
+            .acq_rel,
+            .acquire,
+        ) == null;
+    }
+
+    fn renewOwnedSessionLeasesNow(self: *ApiHttpServer) !void {
+        if (self.cfg.session_owner_lease_ttl_ns == null) return;
+        const owner_node_id = self.localSessionNodeId();
         // Lease expirations are durable and compared across processes, so they
         // must use the Unix realtime epoch. Monotonic time is only valid for
         // deciding when this process should run another renewal pass.
-        _ = self.txn_sessions.renewOwnedLeases(owner_node_id, platform_time.realtimeNs()) catch |err| switch (err) {
+        const batch = self.txn_sessions.renewOwnedLeaseBatch(
+            owner_node_id,
+            platform_time.realtimeNs(),
+            session_lease_renewal_scan_batch,
+        ) catch |err| switch (err) {
             error.SessionLeaseLost => return,
             else => return err,
         };
+        // Continue a large active set on the next runtime tick instead of
+        // monopolizing one worker or allocating an unbounded snapshot.
+        if (batch.has_more) self.last_session_lease_renew_ns.store(0, .release);
     }
 
     pub const SessionForwardRequest = struct {
@@ -9948,17 +10337,26 @@ pub const ApiHttpServer = struct {
         target: []const u8,
         authorization: ?[]const u8,
         trusted_principal: ?[]const u8 = null,
+        idempotency_key: ?[]const u8 = null,
         content_type: ?[]const u8,
         body: []const u8,
     };
 
-    fn sessionTrustedPrincipalHeaders(
-        token: ?[]const u8,
-        storage: *[1]http_common.RequestHeader,
+    fn sessionForwardHeaders(
+        trusted_principal: ?[]const u8,
+        idempotency_key: ?[]const u8,
+        storage: *[2]http_common.RequestHeader,
     ) []const http_common.RequestHeader {
-        const value = token orelse return storage[0..0];
-        storage[0] = .{ .name = trusted_principal_header, .value = value };
-        return storage[0..1];
+        var count: usize = 0;
+        if (trusted_principal) |value| {
+            storage[count] = .{ .name = trusted_principal_header, .value = value };
+            count += 1;
+        }
+        if (idempotency_key) |value| {
+            storage[count] = .{ .name = "idempotency-key", .value = value };
+            count += 1;
+        }
+        return storage[0..count];
     }
 
     pub fn forwardSessionOperation(
@@ -9966,10 +10364,11 @@ pub const ApiHttpServer = struct {
         txn_id: db_mod.types.TxnId,
         request: SessionForwardRequest,
     ) !?contextual_operations.OwnedResponse {
-        var trusted_header_storage: [1]http_common.RequestHeader = undefined;
-        const trusted_headers = sessionTrustedPrincipalHeaders(
+        var header_storage: [2]http_common.RequestHeader = undefined;
+        const forwarded_headers = sessionForwardHeaders(
             request.trusted_principal,
-            &trusted_header_storage,
+            request.idempotency_key,
+            &header_storage,
         );
         var response = (try self.forwardSessionRequest(txn_id, .{
             .method = switch (request.method) {
@@ -9979,7 +10378,7 @@ pub const ApiHttpServer = struct {
                 .delete => .DELETE,
             },
             .uri = request.target,
-            .headers = trusted_headers,
+            .headers = forwarded_headers,
             .authorization = request.authorization,
             .content_type = request.content_type,
             .body = request.body,
@@ -10092,11 +10491,19 @@ pub const ApiHttpServer = struct {
         return try self.transactionSessionDetailsAuthorized(authenticated_identity, details);
     }
 
+    pub const AuthorizedTransactionSessionPage = struct {
+        sessions: []transactions_api.SessionStatus,
+        next_cursor: ?transactions_api.SessionListCursor,
+    };
+
+    /// Preserves the original `/transactions` contract: all authorized live
+    /// interactive sessions, without retained idempotency receipts. New code
+    /// should use the explicitly bounded inventory endpoint below.
     pub fn listAuthorizedTransactionSessions(
         self: *ApiHttpServer,
         authenticated_identity: ?AuthenticatedIdentity,
     ) ![]transactions_api.SessionStatus {
-        const candidates = try self.txn_sessions.listStatusesForPrincipal(
+        const candidates = try self.txn_sessions.listInteractiveStatusesForPrincipal(
             self.alloc,
             transactionPrincipal(authenticated_identity),
         );
@@ -10108,6 +10515,31 @@ pub const ApiHttpServer = struct {
                 try authorized.append(self.alloc, status);
         }
         return try authorized.toOwnedSlice(self.alloc);
+    }
+
+    pub fn listAuthorizedTransactionSessionsPage(
+        self: *ApiHttpServer,
+        authenticated_identity: ?AuthenticatedIdentity,
+        after: ?transactions_api.SessionListCursor,
+        limit: usize,
+    ) !AuthorizedTransactionSessionPage {
+        var candidates = try self.txn_sessions.listDetailsPageForPrincipal(
+            self.alloc,
+            transactionPrincipal(authenticated_identity),
+            after,
+            limit,
+        );
+        defer candidates.deinit(self.alloc);
+        var authorized = std.ArrayListUnmanaged(transactions_api.SessionStatus).empty;
+        errdefer authorized.deinit(self.alloc);
+        for (candidates.sessions) |details| {
+            if (try self.transactionSessionDetailsAuthorized(authenticated_identity, details))
+                try authorized.append(self.alloc, details.status);
+        }
+        return .{
+            .sessions = try authorized.toOwnedSlice(self.alloc),
+            .next_cursor = candidates.next_cursor,
+        };
     }
 
     fn transactionSessionDetailsAuthorized(
@@ -18846,6 +19278,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
             .POST, .PUT, .DELETE => .admin,
         });
     }
+    if (routes.Routes.matchTableIdempotentBatch(path)) |batch| return try tablePermission(alloc, batch.table_name, .write);
     if (routes.Routes.matchTableBatch(path)) |batch| return try tablePermission(alloc, batch.table_name, .write);
     if (routes.Routes.matchTableMerge(path)) |merge| return try tablePermission(alloc, merge.table_name, .write);
     if (routes.Routes.matchTableSchema(path)) |schema| return try tablePermission(alloc, schema.table_name, .admin);
@@ -19011,6 +19444,18 @@ test "inference connection invocation requires inference write permission" {
         .POST,
         "/connections/local-inference/inference/generate/extra",
     )) == null);
+}
+
+test "idempotent table batch requires table write permission" {
+    const required = (try requiredPermissionForRequest(
+        std.testing.allocator,
+        .POST,
+        "/tables/docs%20archive/idempotent-batch",
+    )).?;
+    defer required.deinit(std.testing.allocator);
+    try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+    try std.testing.expectEqualStrings("docs archive", required.resource);
+    try std.testing.expectEqual(usermgr.PermissionType.write, required.permission_type);
 }
 
 test "internal service credentials cannot authorize public inference routes" {
@@ -26450,6 +26895,210 @@ test "continuous HA freezes pre-existing restore workers and resumption" {
     try std.testing.expect(!server.restore_jobs_resumed.load(.acquire));
 }
 
+test "stable transaction recovery heartbeat interval stays inside the lease" {
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    var source = FakeSource{};
+    const durable_defaults = withDurableSessionLeaseDefaults(.{ .session_store_path = "/tmp/unused-session-store" });
+    try std.testing.expectEqual(@as(?u64, default_session_owner_lease_ttl_ns), durable_defaults.session_owner_lease_ttl_ns);
+    try std.testing.expectEqual(@as(?u64, default_session_owner_lease_ttl_ns / 3), durable_defaults.session_owner_lease_renew_interval_ns);
+    const clamped = withDurableSessionLeaseDefaults(.{
+        .session_store_path = "/tmp/unused-session-store",
+        .session_owner_lease_ttl_ns = 10 * std.time.ns_per_ms,
+        .session_owner_lease_renew_interval_ns = std.time.ns_per_s,
+    });
+    try std.testing.expectEqual(@as(?u64, (10 * std.time.ns_per_ms) / 3), clamped.session_owner_lease_renew_interval_ns);
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .session_owner_lease_ttl_ns = 10 * std.time.ns_per_ms,
+        .session_owner_lease_renew_interval_ns = std.time.ns_per_s,
+    }, source.iface(), null, null);
+    defer server.deinit();
+    try std.testing.expectEqual(@as(?u64, (10 * std.time.ns_per_ms) / 3), server.sessionRecoveryLeaseRenewInterval());
+    const edge_now = std.time.ns_per_ms - 1;
+    try std.testing.expect(
+        server.sessionRecoveryLeaseExpirationNs(edge_now).? - edge_now >= 10 * std.time.ns_per_ms,
+    );
+}
+
+test "standalone durable receipt is recovered after owner process restart without client replay" {
+    const alloc = std.testing.allocator;
+    const session_path = "/tmp/antfly-api-standalone-receipt-restart-recovery";
+    var cleanup_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer cleanup_io.deinit();
+    std.Io.Dir.cwd().deleteTree(cleanup_io.io(), session_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(cleanup_io.io(), session_path) catch {};
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const FakeWrites = struct {
+        commit_calls: usize = 0,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .commit_transaction_with_id = commitTransactionWithId,
+            } };
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TestUnexpectedResult;
+        }
+        fn commitTransactionWithId(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.commit_calls += 1;
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+    };
+
+    var source = FakeSource{};
+    var writes = FakeWrites{};
+    const txn_id = transactions_api.idempotentTransactionId(null, "docs", "crash-window");
+    {
+        var owner = try ApiHttpServer.initWithConfig(alloc, .{
+            .deployment_mode = .standalone,
+            .session_store_path = session_path,
+            .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
+            .session_owner_lease_renew_interval_ns = 10 * std.time.ns_per_ms,
+        }, source.iface(), null, writes.source());
+        defer owner.deinit();
+        try std.testing.expect(owner.txn_sessions.hasAtomicDurableStore());
+        try std.testing.expectEqual(transactions_api.SessionStoreScope.node_local, owner.txn_sessions.durable_scope);
+        try std.testing.expectEqual(@as(u64, 0), owner.localSessionNodeId());
+
+        var request = try transactions_api.parseCommitRequest(alloc,
+            \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}},"sync_level":"write"}
+        );
+        defer request.deinit(alloc);
+        _ = try owner.txn_sessions.beginIdempotentForPrincipal(
+            alloc,
+            txn_id,
+            .{ .sync_level = .write },
+            0,
+            null,
+            &request,
+        );
+        _ = (try owner.txn_sessions.markCommitExecutionStarted(alloc, txn_id)) orelse return error.TestExpectedEqual;
+        // Deinit models a process disappearing in the exact window after the
+        // execution marker and before any terminal receipt is written.
+    }
+
+    try cleanup_io.io().sleep(.fromMilliseconds(70), .awake);
+    var successor = try ApiHttpServer.initWithConfig(alloc, .{
+        .deployment_mode = .standalone,
+        .session_store_path = session_path,
+        .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
+        .session_owner_lease_renew_interval_ns = 10 * std.time.ns_per_ms,
+    }, source.iface(), null, writes.source());
+    defer successor.deinit();
+    try successor.runSessionMaintenanceOnce();
+
+    try std.testing.expectEqual(@as(usize, 1), writes.commit_calls);
+    var terminal = (try successor.txn_sessions.getTerminalCommit(alloc, txn_id)) orelse return error.TestExpectedEqual;
+    defer terminal.deinit(alloc);
+    try std.testing.expectEqual(transactions_api.TerminalCommitStatus.committed, terminal.status);
+    const pending = try successor.txn_sessions.listPendingRecoveryIds(alloc, 8);
+    defer alloc.free(pending);
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
+}
+
+test "stable transaction recovery retains bare decision conflict ambiguity and heartbeats its lease" {
+    const alloc = std.testing.allocator;
+    const session_path = "/tmp/antfly-api-recovery-ambiguity-heartbeat";
+    var cleanup_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer cleanup_io.deinit();
+    std.Io.Dir.cwd().deleteTree(cleanup_io.io(), session_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(cleanup_io.io(), session_path) catch {};
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const FakeWrites = struct {
+        io: std.Io,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .commit_transaction_with_id = commitTransactionWithId,
+            } };
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TestUnexpectedResult;
+        }
+        fn commitTransactionWithId(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.io.sleep(.fromMilliseconds(80), .awake);
+            // DecisionConflict reports contradictory/torn decision evidence;
+            // it does not prove that abort rather than commit won.
+            return error.DecisionConflict;
+        }
+    };
+
+    var source = FakeSource{};
+    var writes = FakeWrites{ .io = cleanup_io.io() };
+    var server = try ApiHttpServer.initWithConfig(alloc, .{
+        .session_store_path = session_path,
+        .session_owner_lease_ttl_ns = 20 * std.time.ns_per_ms,
+        .session_owner_lease_renew_interval_ns = 2 * std.time.ns_per_ms,
+    }, source.iface(), null, writes.source());
+    defer server.deinit();
+
+    var request = try transactions_api.parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}},"sync_level":"write"}
+    );
+    defer request.deinit(alloc);
+    const txn_id = transactions_api.idempotentTransactionId("alice", "docs", "ambiguous-recovery");
+    _ = try server.txn_sessions.beginIdempotentForPrincipal(
+        alloc,
+        txn_id,
+        .{ .sync_level = .write },
+        server.localSessionNodeId(),
+        "alice",
+        &request,
+    );
+    var sealed = (try server.txn_sessions.cloneIdempotentCommitRequest(alloc, txn_id, &request)) orelse return error.TestExpectedEqual;
+    sealed.deinit(alloc);
+    _ = (try server.txn_sessions.markCommitExecutionStarted(alloc, txn_id)) orelse return error.TestExpectedEqual;
+
+    try server.runSessionMaintenanceOnce();
+    try std.testing.expect((try server.txn_sessions.getIdempotentOutcome(alloc, txn_id)) == null);
+    const status = (try server.txn_sessions.getStatus(alloc, txn_id)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(status.lease_expires_at > platform_time.realtimeNs());
+    const pending = try server.txn_sessions.listPendingRecoveryIds(alloc, 8);
+    defer alloc.free(pending);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqualSlices(u8, &txn_id, &pending[0]);
+}
+
 test "continuous HA allows a configured RemoteApply batch write" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -32264,6 +32913,128 @@ test "api http server serves transaction session cleanup route" {
     try std.testing.expectEqual(@as(usize, 0), parsed_list.value.session_count);
 }
 
+test "api http server paginates transaction session inventory" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    for (0..3) |_| {
+        var begin = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = routes.Routes.transactions_begin,
+            .content_type = "application/json",
+            .body = "{}",
+        });
+        begin.deinit(alloc);
+    }
+
+    var first = try executeHttpxTestRequest(&server, .{
+        .method = .GET,
+        .uri = "/transactions/inventory?limit=2",
+    });
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), first.status);
+    var first_page = try std.json.parseFromSlice(transactions_api.SessionListResponse, alloc, first.body, .{});
+    defer first_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), first_page.value.session_count);
+    try std.testing.expect(first_page.value.next_cursor != null);
+
+    const next_uri = try std.fmt.allocPrint(alloc, "/transactions/inventory?limit=2&cursor={s}", .{first_page.value.next_cursor.?});
+    defer alloc.free(next_uri);
+    var second = try executeHttpxTestRequest(&server, .{
+        .method = .GET,
+        .uri = next_uri,
+    });
+    defer second.deinit(alloc);
+    var second_page = try std.json.parseFromSlice(transactions_api.SessionListResponse, alloc, second.body, .{});
+    defer second_page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), second_page.value.session_count);
+    try std.testing.expect(second_page.value.next_cursor == null);
+
+    inline for ([_][]const u8{
+        "/transactions/inventory?limit=0",
+        "/transactions/inventory?limit=not-a-number",
+        "/transactions/inventory?cursor=not-a-cursor",
+    }) |uri| {
+        var invalid = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = uri });
+        defer invalid.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), invalid.status);
+        try std.testing.expectEqualStrings("application/json", invalid.content_type.?);
+        var parsed_error = try std.json.parseFromSlice(std.json.Value, alloc, invalid.body, .{});
+        defer parsed_error.deinit();
+        try std.testing.expect(parsed_error.value.object.get("error") != null);
+    }
+}
+
+test "receipt admission cleanup trigger honors the cleanup budget" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .backend_runtime = &runtime,
+        .session_ttl_ns = std.time.ns_per_s,
+        .session_admission_cleanup_budget_ns = 2 * std.time.ns_per_ms,
+    }, source.iface(), null, null);
+    defer server.deinit();
+    server.receipt_admission_cleanup_pause_for_test.store(true, .release);
+    defer server.receipt_admission_cleanup_release_for_test.set(runtime.apiIoImpl().?.io());
+
+    const started_ns = platform_time.monotonicNs();
+    try server.reclaimExpiredReceiptCapacity(std.testing.io);
+    const elapsed_ns = platform_time.monotonicNs() -| started_ns;
+    // Even the caller that creates the cleanup generation only waits for its
+    // own budget. The storage worker remains server-owned until released.
+    try std.testing.expect(elapsed_ns < 250 * std.time.ns_per_ms);
+    const first_generation = server.receipt_admission_cleanup_active_generation.load(.acquire);
+    try std.testing.expect(first_generation != 0);
+
+    // Followers join the exact active generation. Timing out must not clear
+    // its ownership slot or reserve a successor that the first completion can
+    // accidentally acknowledge.
+    try server.reclaimExpiredReceiptCapacity(std.testing.io);
+    try std.testing.expectEqual(first_generation, server.receipt_admission_cleanup_active_generation.load(.acquire));
+
+    server.receipt_admission_cleanup_pause_for_test.store(false, .release);
+    server.receipt_admission_cleanup_release_for_test.set(runtime.apiIoImpl().?.io());
+    if (server.receipt_admission_cleanup_active_generation.load(.acquire) == first_generation) {
+        try std.testing.io.futexWaitTimeout(
+            u32,
+            &server.receipt_admission_cleanup_active_generation.raw,
+            first_generation,
+            .{ .duration = .{
+                .clock = .awake,
+                .raw = std.Io.Duration.fromNanoseconds(250 * std.time.ns_per_ms),
+            } },
+        );
+    }
+    try std.testing.expect(server.receipt_admission_cleanup_active_generation.load(.acquire) != first_generation);
+    const second_generation = try server.scheduleReceiptAdmissionCleanup();
+    try std.testing.expect(second_generation != 0);
+    try std.testing.expect(second_generation != first_generation);
+    runtime.durable_jobs.drainOwner(server.receipt_admission_cleanup_owner_id);
+}
+
 test "api http server reloads durable transaction sessions after restart" {
     const alloc = std.testing.allocator;
     const StoredTitle = struct {
@@ -32710,6 +33481,66 @@ test "api http server enforces configured savepoint limits and exposes remaining
     try std.testing.expect(std.mem.indexOf(u8, savepoint_again.body, "savepoint limit exceeded") != null);
 }
 
+test "distributed session ownership requires a nonzero route and executor" {
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const FakeRouter = struct {
+        local_node_id: u64,
+
+        fn iface(self: *@This()) table_router.HostedGroupRouter {
+            return .{ .ptr = self, .vtable = &.{
+                .local_node_id = localNodeId,
+                .local_status = localStatus,
+                .node_base_uri = nodeBaseUri,
+            } };
+        }
+
+        fn localNodeId(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.local_node_id;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+    const FakeExecutor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{ .ptr = undefined, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.ConnectionResetByPeer;
+        }
+    };
+
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, FakeSource.iface(), null, null);
+    defer server.deinit();
+    var zero_router = FakeRouter{ .local_node_id = 0 };
+    var routed = FakeRouter{ .local_node_id = 7 };
+
+    try std.testing.expect(!server.hasRoutableSessionOwner());
+    server.cfg.session_router = zero_router.iface();
+    server.cfg.session_executor = FakeExecutor.iface();
+    try std.testing.expect(!server.hasRoutableSessionOwner());
+    server.cfg.session_router = routed.iface();
+    server.cfg.session_executor = null;
+    try std.testing.expect(!server.hasRoutableSessionOwner());
+    server.cfg.session_executor = FakeExecutor.iface();
+    try std.testing.expect(server.hasRoutableSessionOwner());
+}
+
 test "api http server enforces session adoption timeout when configured" {
     const alloc = std.testing.allocator;
     const session_path = "/tmp/antfly-api-http-session-adopt-timeout";
@@ -33011,6 +33842,72 @@ test "api http server can renew owned session leases via explicit maintenance ho
     try std.testing.expect(!(try adopter.tryAdoptSession(txn_id)));
 }
 
+test "session lease renewal remains independent while recovery is blocked" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const alloc = std.testing.allocator;
+    const session_path = "/tmp/antfly-api-independent-session-lease-renewal";
+    var cleanup_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer cleanup_io.deinit();
+    std.Io.Dir.cwd().deleteTree(cleanup_io.io(), session_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(cleanup_io.io(), session_path) catch {};
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var source = FakeSource{};
+    var server = try ApiHttpServer.initWithConfig(alloc, .{
+        .deployment_mode = .standalone,
+        .backend_runtime = runtime.ptr(),
+        .session_store_path = session_path,
+        .session_owner_lease_ttl_ns = 100 * std.time.ns_per_ms,
+        .session_owner_lease_renew_interval_ns = 5 * std.time.ns_per_ms,
+    }, source.iface(), null, null);
+    defer {
+        server.session_maintenance_release_for_test.set(server.sharedApiIo().?);
+        server.deinit();
+    }
+
+    const idle = try server.txn_sessions.begin(alloc, .{}, 0);
+    const initial_expiry = (try server.txn_sessions.getStatus(alloc, idle.txn_id)).?.lease_expires_at;
+    server.session_maintenance_pause_for_test.store(true, .release);
+    server.last_session_lease_renew_ns.store(0, .release);
+    try server.scheduleSessionMaintenance();
+    const io = server.sharedApiIo().?;
+    try server.session_maintenance_entered_for_test.waitTimeout(io, .{
+        .duration = .{ .raw = .fromSeconds(2), .clock = .awake },
+    });
+
+    var first_expiry = initial_expiry;
+    const wait_deadline = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+    while (first_expiry <= initial_expiry and platform_time.monotonicNs() < wait_deadline) {
+        try io.sleep(.fromMilliseconds(1), .awake);
+        first_expiry = (try server.txn_sessions.getStatus(alloc, idle.txn_id)).?.lease_expires_at;
+    }
+    try std.testing.expect(first_expiry > initial_expiry);
+
+    try io.sleep(.fromMilliseconds(8), .awake);
+    try server.scheduleSessionMaintenance();
+    var second_expiry = first_expiry;
+    while (second_expiry <= first_expiry and platform_time.monotonicNs() < wait_deadline) {
+        try io.sleep(.fromMilliseconds(1), .awake);
+        second_expiry = (try server.txn_sessions.getStatus(alloc, idle.txn_id)).?.lease_expires_at;
+    }
+    try std.testing.expect(second_expiry > first_expiry);
+    try std.testing.expect(server.session_maintenance_in_flight.load(.acquire));
+    server.session_maintenance_release_for_test.set(io);
+    while (server.session_maintenance_in_flight.load(.acquire) and platform_time.monotonicNs() < wait_deadline)
+        try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expect(!server.session_maintenance_in_flight.load(.acquire));
+}
+
 test "api http server keeps session maintenance off internal request paths" {
     const alloc = std.testing.allocator;
     const session_path = "/tmp/antfly-api-http-session-renew-internal-route";
@@ -33095,7 +33992,10 @@ test "api http server keeps session maintenance off internal request paths" {
         .body = "",
     });
     defer internal_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 404), internal_resp.status);
+    // Internal service routes fail closed before dispatch when no service
+    // credential is configured; either way, request dispatch must not drive
+    // session maintenance.
+    try std.testing.expectEqual(@as(u16, 503), internal_resp.status);
     try std.testing.expectEqual(@as(u64, 0), owner.last_session_lease_renew_ns.load(.acquire));
 }
 

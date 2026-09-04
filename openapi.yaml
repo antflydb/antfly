@@ -2601,13 +2601,60 @@ paths:
       tags:
         - data_operations
       operationId: listTransactionSessions
+      deprecated: true
+      description: Compatibility view of all authorized live interactive transaction sessions. Retained
+        idempotency receipts are available through the bounded transaction-session inventory endpoint.
       responses:
         '200':
-          description: Active transaction sessions
+          description: Active interactive transaction sessions
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransactionSessionListResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/transactions/inventory:
+    get:
+      summary: List the bounded transaction-session inventory
+      tags:
+        - data_operations
+      operationId: listTransactionSessionInventory
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of authorized sessions returned by this page. Source scanning is
+            independently bounded; rolling-upgrade compatibility pages may be empty while still returning
+            a cursor until the durable legacy principal projection is complete.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque cursor returned by the previous page. Continue while present even when the
+            previous sessions array was empty. Cursor versions preserve in-progress canonical compatibility
+            traversals while newly started traversals use the durable principal-scoped legacy projection
+            after migration. A principal-scoped legacy cursor is bound to its writer-fence generation
+            and returns 400 when that generation is no longer current or its completion proof is invalid;
+            restart the traversal without a cursor.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Active sessions and retained idempotency receipts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSessionListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -4025,6 +4072,96 @@ paths:
                 type: string
         '500':
           $ref: '#/components/responses/StatelessTransactionFailure'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/idempotent-batch:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table for the idempotent batch operation
+        schema:
+          type: string
+    post:
+      summary: Perform a durably idempotent batch operation on a table
+      tags:
+        - data_operations
+      operationId: idempotentBatchWrite
+      description: >
+        Executes a batch under a durable, payload-sealed idempotency receipt. The separate endpoint is
+        rolling-upgrade safe because older servers reject it instead of silently ignoring the idempotency
+        contract. Keys are scoped to the authenticated principal and table and may be replayed after timeouts,
+        lost responses, topology changes, or process restarts. Receipts use the configured idempotency
+        receipt retention period (`transaction_sessions.receipt_ttl_seconds`); callers must not reuse
+        a key after that period. Terminal rejections persist and replay their original status, code, message,
+        and retryability. Every durable receipt store uses atomic owner fencing so an expired process
+        incarnation can be recovered after restart; distributed deployments also fail closed unless that
+        fenced store is cluster-shared.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+          description: Stable operation key scoped to the authenticated principal and table.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchRequest'
+      responses:
+        '200':
+          description: A committed operation was replayed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdempotentBatchResponse'
+        '201':
+          description: Operation committed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdempotentBatchResponse'
+        '202':
+          description: Commit is durable; visibility, recovery, or receipt handoff remains pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdempotentBatchResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '409':
+          description: Durable non-application or an outcome that must be reconciled by stable key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdempotentBatchError'
+        '429':
+          description: >
+            Write admission or durable receipt capacity is exhausted. Because an
+
+            identical concurrent request may already own execution capacity, the
+
+            keyed response can conservatively report `unknown`; retry the same key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdempotentBatchError'
+        '503':
+          description: Cluster-safe durable idempotency is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdempotentBatchError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -11986,6 +12123,8 @@ components:
           enum:
             - committed
             - committed_pending
+            - committed_visibility_pending
+            - committed_recovery_pending
             - committed_repair_required
           description: >
             Durable commit outcome. `committed_pending` means requested visibility or
@@ -12004,6 +12143,77 @@ components:
         transformed:
           type: integer
           description: Number of documents successfully transformed
+        transaction_id:
+          type: string
+          nullable: true
+          description: Stable transaction receipt ID returned for keyed batches.
+        reconcile:
+          type: string
+          nullable: true
+          description: Transaction-session status path for this keyed batch.
+    IdempotentBatchResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - inserted
+        - deleted
+        - transformed
+        - transaction_id
+        - reconcile
+      properties:
+        status:
+          type: string
+          enum:
+            - committed
+            - committed_pending
+            - committed_visibility_pending
+            - committed_recovery_pending
+            - committed_repair_required
+          description: Durable commit and recovery state for this operation.
+        inserted:
+          type: integer
+          description: Number of documents inserted by the sealed operation.
+        deleted:
+          type: integer
+          description: Number of documents deleted by the sealed operation.
+        transformed:
+          type: integer
+          description: Number of documents transformed by the sealed operation.
+        transaction_id:
+          type: string
+          description: Stable transaction receipt ID for replay and reconciliation.
+        reconcile:
+          type: string
+          description: Transaction-session status path for this operation.
+    IdempotentBatchError:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - code
+        - message
+        - retryable
+        - transaction_id
+        - reconcile
+      properties:
+        status:
+          type: string
+          enum:
+            - not_applied
+            - aborted
+            - unknown
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+        transaction_id:
+          type: string
+        reconcile:
+          type: string
+          description: Transaction-session status path for this keyed batch.
     DenseRepairBackpressureError:
       type: object
       description: A dense-index rebuild is retaining replay history and the node has reached its hard
@@ -12433,6 +12643,19 @@ components:
           nullable: true
         durable:
           type: boolean
+        outcome:
+          type: string
+          nullable: true
+          enum:
+            - not_applied
+            - aborted
+            - unknown
+            - committed
+            - committed_visibility_pending
+            - committed_recovery_pending
+            - committed_repair_required
+        repair_required:
+          type: boolean
     TransactionSessionTableDetail:
       type: object
       properties:
@@ -12481,6 +12704,7 @@ components:
       properties:
         session_count:
           type: integer
+          description: Number of authorized sessions returned in this response.
         lease_held_count:
           type: integer
         lease_expired_count:
@@ -12489,6 +12713,12 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/TransactionSessionStatus'
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next bounded inventory page. Clients must continue while
+            it is non-null, including after an empty compatibility page while the rolling-upgrade legacy
+            projection is still being built.
     TransactionSessionCleanupResponse:
       type: object
       properties:

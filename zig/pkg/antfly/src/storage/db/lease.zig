@@ -95,7 +95,35 @@ pub const Lease = struct {
     }
 
     pub fn renew(self: *Lease, owner_id: []const u8, now_ms: u64, ttl_ms: u64) !bool {
-        return try self.tryAcquire(owner_id, now_ms, ttl_ms);
+        var txn = try self.store.store.beginWrite();
+        var committed = false;
+        defer if (!committed) txn.abort();
+
+        const current_raw = txn.get(self.key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        const parsed = try std.json.parseFromSlice(LeaseRecord, self.allocator, current_raw, .{
+            .allocate = .alloc_always,
+        });
+        defer parsed.deinit();
+
+        // Renewal is not acquisition: once the confirmed window expires, the
+        // old owner must return to its higher-level adoption/CAS protocol. This
+        // prevents a paused worker from silently reclaiming authority after a
+        // lease gap merely because no replacement is currently holding it.
+        if (parsed.value.expires_at_ms <= now_ms or
+            !std.mem.eql(u8, parsed.value.owner_id, owner_id)) return false;
+
+        const payload = try std.json.Stringify.valueAlloc(self.allocator, LeaseRecord{
+            .owner_id = owner_id,
+            .expires_at_ms = now_ms + ttl_ms,
+        }, .{});
+        defer self.allocator.free(payload);
+        try txn.put(self.key, payload);
+        try txn.commit();
+        committed = true;
+        return true;
     }
 
     pub fn release(self: *Lease, owner_id: []const u8) !bool {
@@ -202,6 +230,7 @@ test "lease acquires renews and releases by owner" {
     try std.testing.expect(try lease.tryAcquire("worker-a", 1000, 250));
     try std.testing.expect(!(try lease.tryAcquire("worker-b", 1100, 250)));
     try std.testing.expect(try lease.renew("worker-a", 1200, 250));
+    try std.testing.expect(!(try lease.renew("worker-a", 1450, 250)));
     try std.testing.expect(!(try lease.release("worker-b")));
     try std.testing.expect(try lease.release("worker-a"));
     try std.testing.expect(try lease.tryAcquire("worker-b", 1300, 250));

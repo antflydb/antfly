@@ -34,15 +34,18 @@ from antfly.client_generated.models import (
     GraphQueries,
     GraphShortestPathQuery,
     GraphTraverseQuery,
+    IdempotentBatchResponse,
     InferenceGenerateChunk,
     InferenceGenerateRequest,
     InferenceGenerateResponse,
     QueryResponses,
+    SyncLevel,
 )
 from antfly.client_generated.types import UNSET
 
 from .exceptions import (
     AntflyException,
+    IdempotentBatchError,
     IndexMutationTemporarilyUnavailableError,
     InferenceAPIError,
     InferenceCapacityError,
@@ -651,6 +654,24 @@ class AntflyClient:
                         msg = text
                     if not msg:
                         msg = response.reason_phrase or f"HTTP {response.status_code}"
+                    if (
+                        error_body is not None
+                        and isinstance(error_body.get("status"), str)
+                        and isinstance(error_body.get("code"), str)
+                        and isinstance(error_body.get("message"), str)
+                        and isinstance(error_body.get("retryable"), bool)
+                        and isinstance(error_body.get("transaction_id"), str)
+                        and isinstance(error_body.get("reconcile"), str)
+                    ):
+                        raise IdempotentBatchError(
+                            response.status_code,
+                            error_body["status"],
+                            error_body["code"],
+                            error_body["message"],
+                            error_body["retryable"],
+                            error_body["transaction_id"],
+                            error_body["reconcile"],
+                        )
                     if (
                         response.status_code == 429
                         and error_body is not None
@@ -1294,3 +1315,40 @@ class AntflyClient:
             content=encoded,
             headers={"Content-Type": "application/json"},
         )
+
+    def idempotent_batch(
+        self,
+        table: str,
+        idempotency_key: str,
+        inserts: dict[str, dict[str, Any]] | None = None,
+        deletes: list[str] | None = None,
+        transforms: list[dict[str, Any]] | None = None,
+        sync_level: SyncLevel | str | None = None,
+    ) -> IdempotentBatchResponse:
+        """Perform a durably idempotent batch and return its reconciliation receipt."""
+        batch_sync_level = SyncLevel(sync_level) if isinstance(sync_level, str) else sync_level
+        request_data: dict[str, Any] = {"deletes": deletes or []}
+        if inserts is not None:
+            request_data["inserts"] = inserts
+        if transforms is not None:
+            request_data["transforms"] = transforms
+        if batch_sync_level is not None:
+            request_data["sync_level"] = batch_sync_level.value
+        request = BatchRequest.from_dict(request_data)
+        encoded = self._encode_write_request("Idempotent batch", request.to_dict())
+
+        result = self._request(
+            "POST",
+            f"/db/v1/tables/{quote(table, safe='')}/idempotent-batch",
+            content=encoded,
+            headers={
+                "Content-Type": "application/json",
+                "Idempotency-Key": idempotency_key,
+            },
+        )
+        if not isinstance(result, Mapping):
+            raise AntflyException("idempotent batch returned an invalid response")
+        try:
+            return IdempotentBatchResponse.from_dict(result)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AntflyException(f"idempotent batch returned an invalid response: {exc}") from exc

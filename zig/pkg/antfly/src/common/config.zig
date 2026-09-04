@@ -208,8 +208,15 @@ pub const Config = struct {
 
     pub const TransactionSessionConfig = struct {
         ttl_seconds: u64 = 3600,
+        receipt_ttl_seconds: u64 = 3600,
         cleanup_interval_seconds: u64 = 60,
+        cleanup_max_records: usize = 4096,
+        admission_cleanup_max_records: usize = 32,
+        admission_cleanup_budget_ms: u64 = 25,
         max_count: usize = 1024,
+        max_receipt_count: usize = 65536,
+        max_receipt_bytes: usize = 512 * 1024 * 1024,
+        inventory_writer_fence_generation: ?u64 = null,
         max_record_bytes: usize = 16 * 1024 * 1024,
         max_savepoints: usize = 64,
     };
@@ -887,8 +894,18 @@ pub const Config = struct {
         const cfg = value orelse return .{};
         return .{
             .ttl_seconds = try boundedPositiveInt(u64, cfg.ttl_seconds, 60, 604800, 3600),
+            .receipt_ttl_seconds = try boundedPositiveInt(u64, cfg.receipt_ttl_seconds, 60, 2592000, 3600),
             .cleanup_interval_seconds = try boundedPositiveInt(u64, cfg.cleanup_interval_seconds, 1, 3600, 60),
+            .cleanup_max_records = try boundedPositiveInt(usize, cfg.cleanup_max_records, 1, 1048576, 4096),
+            .admission_cleanup_max_records = try boundedPositiveInt(usize, cfg.admission_cleanup_max_records, 1, 1024, 32),
+            .admission_cleanup_budget_ms = try boundedPositiveInt(u64, cfg.admission_cleanup_budget_ms, 1, 1000, 25),
             .max_count = try boundedPositiveInt(usize, cfg.max_count, 1, 65536, 1024),
+            .max_receipt_count = try boundedPositiveInt(usize, cfg.max_receipt_count, 1, 10485760, 65536),
+            .max_receipt_bytes = try boundedPositiveInt(usize, cfg.max_receipt_bytes, 1048576, 68719476736, 512 * 1024 * 1024),
+            .inventory_writer_fence_generation = if (cfg.inventory_writer_fence_generation) |generation|
+                try boundedPositiveInt(u64, generation, 1, std.math.maxInt(i64), 1)
+            else
+                null,
             .max_record_bytes = try boundedPositiveInt(usize, cfg.max_record_bytes, 65536, 67108864, 16 * 1024 * 1024),
             .max_savepoints = try boundedPositiveInt(usize, cfg.max_savepoints, 1, 1024, 64),
         };
@@ -3366,8 +3383,15 @@ test "common config parses bounded transaction session policy" {
         \\{
         \\  "transaction_sessions": {
         \\    "ttl_seconds": 7200,
+        \\    "receipt_ttl_seconds": 86400,
         \\    "cleanup_interval_seconds": 30,
+        \\    "cleanup_max_records": 2048,
+        \\    "admission_cleanup_max_records": 16,
+        \\    "admission_cleanup_budget_ms": 10,
         \\    "max_count": 256,
+        \\    "max_receipt_count": 4096,
+        \\    "max_receipt_bytes": 268435456,
+        \\    "inventory_writer_fence_generation": 7,
         \\    "max_record_bytes": 1048576,
         \\    "max_savepoints": 16
         \\  }
@@ -3375,13 +3399,26 @@ test "common config parses bounded transaction session policy" {
     );
     defer cfg.deinit();
     try std.testing.expectEqual(@as(u64, 7200), cfg.transaction_sessions.ttl_seconds);
+    try std.testing.expectEqual(@as(u64, 86400), cfg.transaction_sessions.receipt_ttl_seconds);
     try std.testing.expectEqual(@as(u64, 30), cfg.transaction_sessions.cleanup_interval_seconds);
+    try std.testing.expectEqual(@as(usize, 2048), cfg.transaction_sessions.cleanup_max_records);
+    try std.testing.expectEqual(@as(usize, 16), cfg.transaction_sessions.admission_cleanup_max_records);
+    try std.testing.expectEqual(@as(u64, 10), cfg.transaction_sessions.admission_cleanup_budget_ms);
     try std.testing.expectEqual(@as(usize, 256), cfg.transaction_sessions.max_count);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.transaction_sessions.max_receipt_count);
+    try std.testing.expectEqual(@as(usize, 268435456), cfg.transaction_sessions.max_receipt_bytes);
+    try std.testing.expectEqual(@as(?u64, 7), cfg.transaction_sessions.inventory_writer_fence_generation);
     try std.testing.expectEqual(@as(usize, 1048576), cfg.transaction_sessions.max_record_bytes);
     try std.testing.expectEqual(@as(usize, 16), cfg.transaction_sessions.max_savepoints);
 
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
         \\{"transaction_sessions":{"ttl_seconds":1}}
+    ));
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{"transaction_sessions":{"max_receipt_bytes":1024}}
+    ));
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{"transaction_sessions":{"inventory_writer_fence_generation":0}}
     ));
 }
 

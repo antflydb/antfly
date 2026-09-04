@@ -2878,6 +2878,17 @@ test "public api multi-node e2e reloads durable cross-table transaction sessions
     const begin_base = api_base_uris[begin_index];
     const followup_base = api_base_uris[followup_index];
 
+    const unsafe_local_receipt_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
+        \\{"inserts":{"user:unsafe":{"name":"must-not-apply"}},"sync_level":"write"}
+    );
+    defer std.heap.page_allocator.free(unsafe_local_receipt_body);
+    var unsafe_local_receipt = try client.fetchIdempotentBatch(begin_base, "users", "node-local-rejected", unsafe_local_receipt_body);
+    defer unsafe_local_receipt.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 503), unsafe_local_receipt.status);
+    var parsed_unsafe_local_receipt = try parsePageJson(std.json.Value, unsafe_local_receipt.body);
+    defer parsed_unsafe_local_receipt.deinit();
+    try std.testing.expectEqualStrings("idempotency_unavailable", parsed_unsafe_local_receipt.value.object.get("code").?.string);
+
     const seed_users_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
         \\{"inserts":{"user:1":{"name":"Alice","email":"alice@example.com"}}}
     );
@@ -3126,6 +3137,43 @@ test "public api multi-node e2e adopts durable cross-table transaction sessions 
     const followup_index: usize = 1;
     const begin_base = api_base_uris[begin_index];
     const followup_base = api_base_uris[followup_index];
+
+    // The receipt lives in the shared durable namespace, so a replay on a
+    // different API node observes both the original body seal and outcome.
+    const idempotent_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
+        \\{"inserts":{"user:idempotent":{"name":"first"}},"sync_level":"write"}
+    );
+    defer std.heap.page_allocator.free(idempotent_body);
+    var idempotent_first = try client.fetchIdempotentBatch(begin_base, "users", "cross-node-operation", idempotent_body);
+    defer idempotent_first.deinit(std.heap.page_allocator);
+    try std.testing.expect(idempotent_first.status == 201 or idempotent_first.status == 202);
+    var parsed_idempotent_first = try parsePageJson(std.json.Value, idempotent_first.body);
+    defer parsed_idempotent_first.deinit();
+    const first_transaction_id = parsed_idempotent_first.value.object.get("transaction_id").?.string;
+
+    var idempotent_replay = try client.fetchIdempotentBatch(followup_base, "users", "cross-node-operation", idempotent_body);
+    defer idempotent_replay.deinit(std.heap.page_allocator);
+    try std.testing.expect(idempotent_replay.status == 200 or idempotent_replay.status == 202);
+    var parsed_idempotent_replay = try parsePageJson(std.json.Value, idempotent_replay.body);
+    defer parsed_idempotent_replay.deinit();
+    try std.testing.expectEqualStrings(first_transaction_id, parsed_idempotent_replay.value.object.get("transaction_id").?.string);
+
+    const changed_idempotent_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
+        \\{"inserts":{"user:idempotent":{"name":"second"}},"sync_level":"write"}
+    );
+    defer std.heap.page_allocator.free(changed_idempotent_body);
+    var idempotent_conflict = try client.fetchIdempotentBatch(followup_base, "users", "cross-node-operation", changed_idempotent_body);
+    defer idempotent_conflict.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 409), idempotent_conflict.status);
+    var parsed_idempotent_conflict = try parsePageJson(std.json.Value, idempotent_conflict.body);
+    defer parsed_idempotent_conflict.deinit();
+    try std.testing.expectEqualStrings("idempotency_conflict", parsed_idempotent_conflict.value.object.get("code").?.string);
+
+    var idempotent_lookup = try client.fetchLookup(followup_base, "users", "user:idempotent", null);
+    defer idempotent_lookup.deinit(std.heap.page_allocator);
+    var parsed_idempotent_lookup = try parseJsonBodyIgnoreUnknown(UserName, idempotent_lookup.body);
+    defer parsed_idempotent_lookup.deinit();
+    try std.testing.expectEqualStrings("first", parsed_idempotent_lookup.value.name);
 
     const seed_users_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
         \\{"inserts":{"user:1":{"name":"Alice","email":"alice@example.com"}}}
