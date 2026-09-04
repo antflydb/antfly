@@ -12392,13 +12392,6 @@ export interface components {
             project_id?: string;
             /** @description Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain. */
             credentials_path?: string;
-            /** @description Maximum candidates for Vertex. Google Ranking API accepts at most 200 records in one request; Antfly rejects larger windows before retrieval fan-out. */
-            candidate_count?: number;
-            /**
-             * @deprecated
-             * @description Deprecated final-page-size override. Vertex can return at most 200 records; prefer QueryRequest.limit.
-             */
-            top_n?: number;
         };
         /**
          * @description A unified configuration for a reranking provider.
@@ -12414,11 +12407,11 @@ export interface components {
             field?: string;
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
-            /** @description Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit, which must also be at most 1000. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency, and external API cost. */
+            /** @description Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit, which must also be at most 1000. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency, and external API cost. Providers may impose a lower ceiling; Vertex currently accepts at most 200. Antfly rejects a provider-specific overflow before retrieval fan-out and returns reranker_candidate_limit_exceeded with the selected provider and its exact maximum. */
             candidate_count?: number;
             /**
              * @deprecated
-             * @description Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present.
+             * @description Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present or the selected provider's candidate ceiling; Vertex currently accepts at most 200.
              */
             top_n?: number;
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);

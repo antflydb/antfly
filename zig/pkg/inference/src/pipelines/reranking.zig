@@ -920,9 +920,7 @@ test "reranking score extraction handles single-logit classifier output" {
 
 test "reranking returns an empty score list for empty documents" {
     const allocator = std.testing.allocator;
-    var pipeline: RerankingPipeline = undefined;
-    pipeline.allocator = allocator;
-    pipeline.config = .{};
+    var pipeline = RerankingPipeline.init(allocator, undefined, undefined, .{});
 
     const scores = try pipeline.rerank("what is cuda", &.{});
     defer allocator.free(scores);

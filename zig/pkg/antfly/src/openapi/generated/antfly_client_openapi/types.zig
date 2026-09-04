@@ -26526,9 +26526,9 @@ pub const RerankerConfig = struct {
     field: ?[]const u8 = null,
     /// Handlebars template to render document text for reranking.
     template: ?[]const u8 = null,
-    /// Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit, which must also be at most 1000. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency, and external API cost.
+    /// Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit, which must also be at most 1000. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency, and external API cost. Providers may impose a lower ceiling; Vertex currently accepts at most 200. Antfly rejects a provider-specific overflow before retrieval fan-out and returns reranker_candidate_limit_exceeded with the selected provider and its exact maximum.
     candidate_count: ?i64 = null,
-    /// Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present.
+    /// Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present or the selected provider's candidate ceiling; Vertex currently accepts at most 200.
     top_n: ?i64 = null,
     /// The name of the reranking model (e.g., cross-encoder model name).
     model: ?[]const u8 = null,
@@ -32123,10 +32123,6 @@ pub const VertexRerankerConfig = struct {
     project_id: ?[]const u8 = null,
     /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain.
     credentials_path: ?[]const u8 = null,
-    /// Maximum candidates for Vertex. Google Ranking API accepts at most 200 records in one request; Antfly rejects larger windows before retrieval fan-out.
-    candidate_count: ?i64 = null,
-    /// Deprecated final-page-size override. Vertex can return at most 200 records; prefer QueryRequest.limit.
-    top_n: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -32134,8 +32130,6 @@ pub const VertexRerankerConfig = struct {
         .{ "model", "model", false },
         .{ "project_id", "project_id", true },
         .{ "credentials_path", "credentials_path", true },
-        .{ "candidate_count", "candidate_count", true },
-        .{ "top_n", "top_n", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -32158,14 +32152,6 @@ pub const VertexRerankerConfig = struct {
         }
         if (self.credentials_path) |value| {
             try jw.objectField("credentials_path");
-            try jw.write(value);
-        }
-        if (self.candidate_count) |value| {
-            try jw.objectField("candidate_count");
-            try jw.write(value);
-        }
-        if (self.top_n) |value| {
-            try jw.objectField("top_n");
             try jw.write(value);
         }
         try jw.endObject();
