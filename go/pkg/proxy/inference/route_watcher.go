@@ -170,9 +170,9 @@ func (w *RouteWatcher) onRouteUpdate(oldObj, newObj any) {
 }
 
 func (w *RouteWatcher) onRouteDelete(obj any) {
-	u, ok := obj.(*unstructured.Unstructured)
+	u, ok := unstructuredFromDelete(obj)
 	if !ok {
-		w.logger.Error("failed to cast object to Unstructured")
+		w.logger.Error("failed to recover deleted InferenceProxy identity")
 		return
 	}
 

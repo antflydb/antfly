@@ -6821,25 +6821,94 @@ fn malformedGeneratedTextBatchAllowsSequentialIsolation(err: anyerror) bool {
     return switch (err) {
         error.InvalidExecutionReport,
         error.InvalidProducedBatchCardinality,
+        error.InvalidProducedBatchExecutionCardinality,
+        error.InvalidAssetProducerResponseIdentity,
         => true,
         else => false,
     };
 }
 
-fn runtimeGeneratedTextBatchIdentitiesMatch(
+fn runtimeGeneratedTextBatchFailureToYield(
+    runtime: *EnrichmentRuntime,
     items: []const asset_producer_mod.ProducedItem,
-    requests: []const asset_producer_mod.Request,
-) bool {
-    if (items.len != requests.len) return false;
-    for (items, requests) |item, request| {
-        const expected_identity = inference_work.WorkIdentity{
-            .item_id = request.item_id,
-            .source_fingerprint = request.source_fingerprint,
-            .page_number = request.page_number,
-        };
-        if (!item.identity.eql(expected_identity)) return false;
+) ?inference_work.ItemFailure {
+    for (items) |item| switch (item.result) {
+        .item_error => |failure| {
+            if (failure.retryable and shouldYieldRequestError(runtime, failure.cause))
+                return failure;
+        },
+        .value => {},
+    };
+    return null;
+}
+
+fn stageRuntimeGeneratedUnitFailure(
+    alloc: Allocator,
+    unit: document_extraction_mod.Unit,
+    method: []const u8,
+    kind: RuntimeGeneratedUnitTextKind,
+    err: anyerror,
+) !document_extraction_mod.Unit {
+    var staged = try cloneDocumentExtractionUnit(alloc, unit);
+    errdefer staged.deinit(alloc);
+    try setRuntimeGeneratedUnitFailureStage(alloc, &staged, kind, runtimeGeneratedTextFailureStage(err));
+    try markRuntimeGeneratedUnitTextFailure(alloc, &staged, method, kind, err);
+    return staged;
+}
+
+fn markRuntimeGeneratedUnitFailureTransactional(
+    alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    method: []const u8,
+    kind: RuntimeGeneratedUnitTextKind,
+    err: anyerror,
+) !void {
+    var staged = try stageRuntimeGeneratedUnitFailure(alloc, unit.*, method, kind, err);
+    errdefer staged.deinit(alloc);
+    unit.deinit(alloc);
+    unit.* = staged;
+}
+
+fn deinitRuntimeGeneratedUnitStages(
+    alloc: Allocator,
+    stages: []?document_extraction_mod.Unit,
+) void {
+    for (stages) |*stage| {
+        if (stage.*) |*unit| unit.deinit(alloc);
+        stage.* = null;
     }
-    return true;
+}
+
+fn commitRuntimeGeneratedUnitStages(
+    alloc: Allocator,
+    units: []document_extraction_mod.Unit,
+    unit_indices: []const usize,
+    stages: []?document_extraction_mod.Unit,
+) void {
+    std.debug.assert(unit_indices.len == stages.len);
+    for (unit_indices, stages) |unit_idx, *stage| {
+        units[unit_idx].deinit(alloc);
+        units[unit_idx] = stage.*.?;
+        stage.* = null;
+    }
+}
+
+fn markRuntimeGeneratedUnitFailuresTransactional(
+    alloc: Allocator,
+    working_alloc: Allocator,
+    units: []document_extraction_mod.Unit,
+    unit_indices: []const usize,
+    method: []const u8,
+    kind: RuntimeGeneratedUnitTextKind,
+    err: anyerror,
+) !void {
+    const stages = try working_alloc.alloc(?document_extraction_mod.Unit, unit_indices.len);
+    defer working_alloc.free(stages);
+    @memset(stages, null);
+    defer deinitRuntimeGeneratedUnitStages(alloc, stages);
+    for (unit_indices, 0..) |unit_idx, i|
+        stages[i] = try stageRuntimeGeneratedUnitFailure(alloc, units[unit_idx], method, kind, err);
+    commitRuntimeGeneratedUnitStages(alloc, units, unit_indices, stages);
 }
 
 fn flushRuntimeGeneratedTextBatch(
@@ -6870,33 +6939,15 @@ fn flushRuntimeGeneratedTextBatch(
     var produced_batch = assetProducerProduceBatchReportedGuarded(runtime, producer, working_alloc, requests) catch |err| {
         logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", @errorName(err), started_ns);
         if (isUnavailableOcrModelError(kind, err)) {
-            for (unit_indices) |unit_idx| {
-                try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
-                try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
-            }
+            try markRuntimeGeneratedUnitFailuresTransactional(alloc, working_alloc, units, unit_indices, method, kind, err);
             clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
             return;
         }
         if (!malformedGeneratedTextBatchAllowsSequentialIsolation(err) and
             shouldYieldRequestError(runtime, err)) return err;
-        for (unit_indices) |unit_idx| try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
         return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, @errorName(err));
     };
-    var produced_batch_owned = true;
-    defer if (produced_batch_owned) produced_batch.deinit(working_alloc);
-    if (!runtimeGeneratedTextBatchIdentitiesMatch(produced_batch.items, requests)) {
-        const fallback_reason = if (produced_batch.items.len != requests.len)
-            "response_count_mismatch"
-        else
-            "response_identity_mismatch";
-        logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", fallback_reason, started_ns);
-        // Do not retain rejected provider outputs while admitting the
-        // singleton fallback, and do not apply any item before the complete
-        // response envelope has been validated.
-        produced_batch.deinit(working_alloc);
-        produced_batch_owned = false;
-        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, fallback_reason);
-    }
+    defer produced_batch.deinit(working_alloc);
     const execution = if (produced_batch.execution.fallback_items > 0)
         "serial_fallback"
     else if (produced_batch.execution.native_items > 0)
@@ -6909,26 +6960,38 @@ fn flushRuntimeGeneratedTextBatch(
         null;
     logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, execution, fallback_reason, started_ns);
 
-    for (produced_batch.items, unit_indices) |*item, unit_idx| {
+    // Retryable envelope failures must be observed before applying any valid
+    // sibling. Otherwise an early success mutates the unit cache before a
+    // later failure yields the whole request for retry, violating apply-once
+    // semantics even though durable publication has not started yet.
+    if (runtimeGeneratedTextBatchFailureToYield(runtime, produced_batch.items)) |failure| {
+        setRetryAfterHint(runtime, failure.retry_after_ms);
+        return failure.cause;
+    }
+
+    const staged_updates = try working_alloc.alloc(?document_extraction_mod.Unit, unit_indices.len);
+    defer working_alloc.free(staged_updates);
+    @memset(staged_updates, null);
+    defer deinitRuntimeGeneratedUnitStages(alloc, staged_updates);
+
+    for (produced_batch.items, unit_indices, 0..) |*item, unit_idx, i| {
         switch (item.result) {
             .item_error => |failure| {
-                if (failure.retryable and shouldYieldRequestError(runtime, failure.cause)) {
-                    setRetryAfterHint(runtime, failure.retry_after_ms);
-                    return failure.cause;
-                }
-                try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(failure.cause));
-                try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, failure.cause);
+                staged_updates[i] = try stageRuntimeGeneratedUnitFailure(alloc, units[unit_idx], method, kind, failure.cause);
             },
             .value => |output| {
+                staged_updates[i] = try cloneDocumentExtractionUnit(alloc, units[unit_idx]);
                 item.result = .{ .value = &.{} };
-                applyRuntimeGeneratedUnitText(alloc, working_alloc, &units[unit_idx], output, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
+                applyRuntimeGeneratedUnitTextInPlace(alloc, working_alloc, &staged_updates[i].?, output, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
+                    staged_updates[i].?.deinit(alloc);
+                    staged_updates[i] = null;
                     if (shouldYieldRequestError(runtime, err)) return err;
-                    try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
-                    try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
+                    staged_updates[i] = try stageRuntimeGeneratedUnitFailure(alloc, units[unit_idx], method, kind, err);
                 };
             },
         }
     }
+    commitRuntimeGeneratedUnitStages(alloc, units, unit_indices, staged_updates);
     clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
 }
 
@@ -6954,20 +7017,17 @@ fn flushRuntimeGeneratedTextBatchSequential(
         const produced = assetProducerProduceGuarded(runtime, producer, working_alloc, request) catch |err| {
             logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", @errorName(err), started_ns);
             if (isUnavailableOcrModelError(kind, err)) {
-                try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
-                try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
+                try markRuntimeGeneratedUnitFailureTransactional(alloc, &units[unit_idx], method, kind, err);
                 continue;
             }
             if (shouldYieldRequestError(runtime, err)) return err;
-            try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
-            try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
+            try markRuntimeGeneratedUnitFailureTransactional(alloc, &units[unit_idx], method, kind, err);
             continue;
         };
         logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", fallback_reason, started_ns);
         applyRuntimeGeneratedUnitText(alloc, working_alloc, &units[unit_idx], produced, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
             if (shouldYieldRequestError(runtime, err)) return err;
-            try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
-            try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
+            try markRuntimeGeneratedUnitFailureTransactional(alloc, &units[unit_idx], method, kind, err);
         };
     }
     clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
@@ -7068,6 +7128,37 @@ fn isUnavailableOcrModelError(kind: RuntimeGeneratedUnitTextKind, err: anyerror)
 }
 
 fn applyRuntimeGeneratedUnitText(
+    alloc: Allocator,
+    produced_alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    produced: []u8,
+    method: []const u8,
+    status: []const u8,
+    kind: RuntimeGeneratedUnitTextKind,
+    quality_config: document_extraction_mod.OcrQualityConfig,
+    ocr_prompt: []const u8,
+) !void {
+    var staged = cloneDocumentExtractionUnit(alloc, unit.*) catch |err| {
+        produced_alloc.free(produced);
+        return err;
+    };
+    errdefer staged.deinit(alloc);
+    try applyRuntimeGeneratedUnitTextInPlace(
+        alloc,
+        produced_alloc,
+        &staged,
+        produced,
+        method,
+        status,
+        kind,
+        quality_config,
+        ocr_prompt,
+    );
+    unit.deinit(alloc);
+    unit.* = staged;
+}
+
+fn applyRuntimeGeneratedUnitTextInPlace(
     alloc: Allocator,
     produced_alloc: Allocator,
     unit: *document_extraction_mod.Unit,
@@ -15691,42 +15782,87 @@ fn testInvocationMemoryForRequests(
     };
 }
 
-test "generated text batch validation rejects malformed envelopes before apply" {
-    const requests = [_]asset_producer_mod.Request{
-        .{
-            .producer_type = .reader,
-            .config_json = "{}",
-            .source_text = "source-1",
-            .source_fingerprint = "document",
-            .item_id = "item-1",
-            .page_number = 1,
-        },
-        .{
-            .producer_type = .reader,
-            .config_json = "{}",
-            .source_text = "source-2",
-            .source_fingerprint = "document",
-            .item_id = "item-2",
-            .page_number = 2,
-        },
-    };
-    var items = [_]asset_producer_mod.ProducedItem{
-        .{
-            .identity = .{ .item_id = "item-1", .source_fingerprint = "document", .page_number = 1 },
-            .result = .{ .value = &.{} },
-        },
-        .{
-            .identity = .{ .item_id = "item-2", .source_fingerprint = "document", .page_number = 2 },
-            .result = .{ .value = &.{} },
-        },
-    };
-
-    try std.testing.expect(runtimeGeneratedTextBatchIdentitiesMatch(&items, &requests));
-    items[1].identity.item_id = "wrong-item";
-    try std.testing.expect(!runtimeGeneratedTextBatchIdentitiesMatch(&items, &requests));
+test "document extraction generated OCR rejects malformed envelopes before apply" {
     try std.testing.expect(malformedGeneratedTextBatchAllowsSequentialIsolation(error.InvalidExecutionReport));
     try std.testing.expect(malformedGeneratedTextBatchAllowsSequentialIsolation(error.InvalidProducedBatchCardinality));
+    try std.testing.expect(malformedGeneratedTextBatchAllowsSequentialIsolation(error.InvalidProducedBatchExecutionCardinality));
+    try std.testing.expect(malformedGeneratedTextBatchAllowsSequentialIsolation(error.InvalidAssetProducerResponseIdentity));
     try std.testing.expect(!malformedGeneratedTextBatchAllowsSequentialIsolation(error.InferenceProviderFailure));
+
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 3 },
+        .ownership = undefined,
+    };
+    const items = [_]asset_producer_mod.ProducedItem{
+        .{ .identity = .{ .item_id = "first" }, .result = .{ .value = &.{} } },
+        .{
+            .identity = .{ .item_id = "second" },
+            .result = .{ .item_error = .{
+                .cause = error.GenerateBatchItemRetryable,
+                .code = .service_unavailable,
+                .retryable = true,
+                .retry_after_ms = 250,
+            } },
+        },
+    };
+    const failure = runtimeGeneratedTextBatchFailureToYield(&runtime, &items) orelse
+        return error.TestExpectedRetryableBatchFailure;
+    try std.testing.expectEqual(error.GenerateBatchItemRetryable, failure.cause);
+    try std.testing.expectEqual(@as(?u64, 250), failure.retry_after_ms);
+}
+
+test "document extraction generated OCR applies unit updates transactionally" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const unit_fixture = document_extraction_mod.Unit{
+                .unit_id = @constCast("page-1"),
+                .unit_type = @constCast("image"),
+                .text = @constCast("prior text"),
+                .method = @constCast("pending"),
+                .extraction_status = @constCast("pending_ocr"),
+                .ocr_failure_stage = @constCast("render"),
+                .page_number = 1,
+            };
+            var unit = try cloneDocumentExtractionUnit(alloc, unit_fixture);
+            defer unit.deinit(alloc);
+            const produced = try alloc.dupe(u8, "replacement text with meaningful words");
+            applyRuntimeGeneratedUnitText(
+                alloc,
+                alloc,
+                &unit,
+                produced,
+                "reader",
+                "completed",
+                .ocr,
+                .{},
+                "<OCR>",
+            ) catch |err| {
+                // Every allocation failure must leave the original owned unit
+                // valid and byte-for-byte unchanged.
+                try std.testing.expectEqualStrings("prior text", unit.text);
+                try std.testing.expectEqualStrings("pending", unit.method);
+                try std.testing.expectEqualStrings("pending_ocr", unit.extraction_status.?);
+                try std.testing.expectEqualStrings("render", unit.ocr_failure_stage.?);
+                return err;
+            };
+            try std.testing.expectEqualStrings("replacement text with meaningful words", unit.text);
+            try std.testing.expectEqualStrings("reader", unit.method);
+            try std.testing.expectEqualStrings("completed", unit.extraction_status.?);
+            try std.testing.expect(unit.ocr_failure_stage == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "synchronous document extraction OCR batches honor request execution item cap" {
@@ -16200,6 +16336,7 @@ test "asset batch fallback keeps the logical request retry budget" {
                 .vtable = &.{
                     .produce = produce,
                     .produce_batch = produceBatch,
+                    .invocation_memory_for_requests = testInvocationMemoryForRequests,
                 },
             };
         }

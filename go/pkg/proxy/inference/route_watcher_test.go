@@ -13,6 +13,7 @@ import (
 
 	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/tools/cache"
 )
 
 func TestRouteWatcherIgnoresInformerResyncUpdate(t *testing.T) {
@@ -89,5 +90,32 @@ func TestRouteManagerKeepsSameNamedRoutesDisjointByNamespace(t *testing.T) {
 	routes.RemoveRoute("tenant-a", "reader")
 	if len(routes.routes) != 1 || routes.routes[0].Namespace != "tenant-b" || routes.routes[0].Name != "reader" {
 		t.Fatalf("routes after tenant-a delete = %#v", routes.routes)
+	}
+}
+
+func TestRouteWatcherDeletesFromInformerTombstone(t *testing.T) {
+	t.Parallel()
+
+	routes := NewRouteManager()
+	changed, err := routes.UpsertRoute(&Route{Namespace: "tenant-a", Name: "reader"})
+	if err != nil || !changed {
+		t.Fatalf("install tenant-a/reader: changed=%v err=%v", changed, err)
+	}
+	generation := routes.Generation()
+	watcher := &RouteWatcher{routeManager: routes, logger: zap.NewNop()}
+	deleted := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"namespace": "tenant-a", "name": "reader"},
+	}}
+
+	watcher.onRouteDelete(cache.DeletedFinalStateUnknown{
+		Key: "tenant-a/reader",
+		Obj: deleted,
+	})
+
+	if len(routes.routes) != 0 {
+		t.Fatalf("installed routes = %d after tombstone delete, want 0", len(routes.routes))
+	}
+	if got := routes.Generation(); got != generation+1 {
+		t.Fatalf("generation = %d after tombstone delete, want %d", got, generation+1)
 	}
 }

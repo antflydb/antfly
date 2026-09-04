@@ -1912,6 +1912,30 @@ The hardening above follows these long-term rules:
     process environment value. Distributed storage kernels therefore retain
     their inference-free dependency boundary while advertising exactly the cap
     enforced by a linked local inference runtime.
+57. **Implemented after result-envelope review:** `ProducedBatch` is a strict
+    request-scoped boundary. It centrally validates report arithmetic, one
+    execution item and result per submitted request, and the complete item,
+    source, and page identity before any consumer can observe a result. Invalid
+    envelopes are destroyed while still owned by the producer boundary. Reader
+    requests containing several images remain supported through compatibility
+    execution, but cross-request native batching accepts one image/page per
+    work item so nested image cardinality cannot be mislabeled as outer request
+    telemetry. Task executors may retain finer-grained model telemetry in their
+    typed protocol responses instead of overloading the shared envelope.
+58. **Implemented after retry-atomicity review:** generated reader and generator
+    batches preflight every per-item retryable failure before applying any
+    successful sibling to the document-unit cache. Output parsing, OCR-quality
+    selection, and deterministic failure materialization occur on owned unit
+    clones; the complete batch is swapped into place only after every stage
+    succeeds. Singleton compatibility execution uses the same transactional
+    unit replacement. A request-wide yield can therefore retry intact state
+    without transient partial mutation; deterministic item failures still
+    remain isolated and valid siblings are consumed exactly once.
+59. **Implemented after informer-lifecycle review:** distributed route deletion
+    resolves both ordinary informer objects and
+    `DeletedFinalStateUnknown` tombstones. A missed Kubernetes delete can no
+    longer leave a stale route policy, generation, or capability-routing path
+    installed indefinitely.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

@@ -693,8 +693,8 @@ pub const Runtime = struct {
             );
             defer source.deinit(alloc);
             if (uses_encoded_media) {
-                if (request.media.len == 0) return false;
-            } else if (source.images.len == 0) return false;
+                if (request.media.len != 1) return false;
+            } else if (source.images.len != 1) return false;
             const effective_prompt = source.prompt orelse cfg.value.prompt;
             if (i == 0) {
                 if (source.prompt) |prompt| {
@@ -1429,7 +1429,13 @@ pub const Runtime = struct {
                 try flat_images.appendSlice(alloc, sources[i].images);
                 for (sources[i].images) |_| try flat_source_fingerprints.append(alloc, request.source_fingerprint);
             }
-            if (image_counts[i] == 0) return error.BatchIncompatible;
+            // ProducedBatch is one typed result and one execution item per
+            // outer request. A multi-image prompt is a single request whose
+            // nested reader result has different cardinality, so it must stay
+            // on the compatibility path instead of being flattened into an
+            // ambiguous cross-request execution report. PDF preparation emits
+            // one page image per request and retains native batching here.
+            if (image_counts[i] != 1) return error.BatchIncompatible;
         }
         const total_images = if (uses_encoded_media) flat_encoded.items.len else flat_images.items.len;
         if (total_images == 0) return error.BatchIncompatible;
@@ -1537,6 +1543,7 @@ pub const Runtime = struct {
             offset += count;
         }
         try reader_execution.validate();
+        std.debug.assert(reader_execution.requested_items == requests.len);
         return try asset_producer.producedBatchFromOutputs(alloc, requests, out, reader_execution);
     }
 
@@ -4817,6 +4824,15 @@ test "asset producer runtime batches compatible antfly reader requests" {
     try std.testing.expectEqualStrings("first", results[0]);
     try std.testing.expectEqualStrings("second", results[1]);
     try std.testing.expectEqual(@as(usize, 1), local.read_calls);
+
+    const multi_image_prompt = [_]asset_producer.Request{.{
+        .producer_type = .reader,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
+        .source_text = "[\"data:image/png;base64,aaa\",\"data:image/png;base64,bbb\"]",
+        .content_type = "text/plain",
+        .inline_media_trusted = true,
+    }};
+    try std.testing.expect(!(try producer.canProduceBatch(alloc, &multi_image_prompt)));
 }
 
 test "asset producer runtime batches local encoded media without base64 adaptation" {

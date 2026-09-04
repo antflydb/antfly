@@ -101,6 +101,27 @@ pub const ProducedBatch = struct {
     items: []ProducedItem,
     execution: inference_work.ExecutionReport,
 
+    /// Validate the complete producer envelope against the logical requests
+    /// that own its results. Execution telemetry is request-scoped at this
+    /// boundary; task executors may keep finer-grained model telemetry inside
+    /// their typed response, but it must not be confused with these items.
+    pub fn validateForRequests(self: @This(), requests: []const Request) !void {
+        try self.execution.validate();
+        if (self.items.len != requests.len)
+            return error.InvalidProducedBatchCardinality;
+        if (self.execution.requested_items != requests.len)
+            return error.InvalidProducedBatchExecutionCardinality;
+        for (self.items, requests) |item, request| {
+            const expected = inference_work.WorkIdentity{
+                .item_id = request.item_id,
+                .source_fingerprint = request.source_fingerprint,
+                .page_number = request.page_number,
+            };
+            if (!item.identity.eql(expected))
+                return error.InvalidAssetProducerResponseIdentity;
+        }
+    }
+
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.items) |item| switch (item.result) {
             .value => |value| if (value.len > 0) alloc.free(value),
@@ -141,6 +162,9 @@ pub fn producedBatchFromOutputs(
         alloc.free(outputs);
     };
     if (outputs.len != requests.len) return error.InvalidProducedBatchCardinality;
+    try execution.validate();
+    if (execution.requested_items != requests.len)
+        return error.InvalidProducedBatchExecutionCardinality;
     const items = try alloc.alloc(ProducedItem, outputs.len);
     errdefer alloc.free(items);
     for (outputs, requests, 0..) |output, request, i| items[i] = .{
@@ -293,10 +317,7 @@ pub const Producer = struct {
         if (self.vtable.produce_batch_reported) |reported| {
             var batch = try reported(self.ptr, alloc, requests);
             errdefer batch.deinit(alloc);
-            try batch.execution.validate();
-            if (batch.items.len != requests.len) {
-                return error.InvalidProducedBatchCardinality;
-            }
+            try batch.validateForRequests(requests);
             return batch;
         }
         const items = try self.produceBatchUnchecked(alloc, requests);
@@ -834,6 +855,108 @@ test "asset producer destroys returned values when reported cardinality is inval
     };
     try std.testing.expectError(
         error.InvalidProducedBatchCardinality,
+        producer.produceBatchReported(std.testing.allocator, &requests),
+    );
+}
+
+test "asset producer destroys returned values when execution telemetry describes different logical items" {
+    const Fake = struct {
+        fn produce(_: *anyopaque, alloc: Allocator, _: Request) anyerror![]u8 {
+            return try alloc.dupe(u8, "unused");
+        }
+
+        fn produceBatchReported(_: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!ProducedBatch {
+            const items = try alloc.alloc(ProducedItem, requests.len);
+            errdefer alloc.free(items);
+            items[0] = .{
+                .identity = .{ .item_id = requests[0].item_id },
+                .result = .{ .value = try alloc.dupe(u8, "owned-result") },
+            };
+            // This is internally coherent executor telemetry, but it describes
+            // two nested inputs rather than the one ProducedItem/request.
+            return .{ .items = items, .execution = inference_work.ExecutionReport.serial(2) };
+        }
+
+        fn memory(_: *anyopaque, _: Allocator, requests: []const Request) !inference_work.InvocationMemoryPlan {
+            const limit = 1024 * requests.len;
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = limit,
+                .allocator_limit_bytes = limit,
+                .max_result_bytes_per_item = 256,
+                .max_result_bytes = limit,
+            };
+        }
+    };
+
+    var context: u8 = 0;
+    const producer: Producer = .{
+        .ptr = &context,
+        .vtable = &.{
+            .produce = Fake.produce,
+            .produce_batch_reported = Fake.produceBatchReported,
+            .invocation_memory_for_requests = Fake.memory,
+        },
+    };
+    const requests = [_]Request{.{
+        .producer_type = .reader,
+        .config_json = "{}",
+        .source_text = "source",
+        .item_id = "item-0",
+    }};
+    try std.testing.expectError(
+        error.InvalidProducedBatchExecutionCardinality,
+        producer.produceBatchReported(std.testing.allocator, &requests),
+    );
+}
+
+test "asset producer destroys returned values when result identity mismatches its request" {
+    const Fake = struct {
+        fn produce(_: *anyopaque, alloc: Allocator, _: Request) anyerror![]u8 {
+            return try alloc.dupe(u8, "unused");
+        }
+
+        fn produceBatchReported(_: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!ProducedBatch {
+            const items = try alloc.alloc(ProducedItem, requests.len);
+            errdefer alloc.free(items);
+            items[0] = .{
+                .identity = .{ .item_id = "different-item" },
+                .result = .{ .value = try alloc.dupe(u8, "owned-result") },
+            };
+            return .{ .items = items, .execution = inference_work.ExecutionReport.serial(requests.len) };
+        }
+
+        fn memory(_: *anyopaque, _: Allocator, requests: []const Request) !inference_work.InvocationMemoryPlan {
+            const limit = 1024 * requests.len;
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = limit,
+                .allocator_limit_bytes = limit,
+                .max_result_bytes_per_item = 256,
+                .max_result_bytes = limit,
+            };
+        }
+    };
+
+    var context: u8 = 0;
+    const producer: Producer = .{
+        .ptr = &context,
+        .vtable = &.{
+            .produce = Fake.produce,
+            .produce_batch_reported = Fake.produceBatchReported,
+            .invocation_memory_for_requests = Fake.memory,
+        },
+    };
+    const requests = [_]Request{.{
+        .producer_type = .generator,
+        .config_json = "{}",
+        .source_text = "source",
+        .source_fingerprint = "document",
+        .item_id = "item-0",
+        .page_number = 1,
+    }};
+    try std.testing.expectError(
+        error.InvalidAssetProducerResponseIdentity,
         producer.produceBatchReported(std.testing.allocator, &requests),
     );
 }
