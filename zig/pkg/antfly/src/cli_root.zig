@@ -30,6 +30,9 @@ pub const ha = @import("storage/ha/mod.zig");
 pub const db = @import("storage/db/mod.zig");
 pub const lite = @import("storage/lite/mod.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
+pub const backup_bundle = @import("storage/backup_bundle.zig");
+pub const backup_bundle_io = @import("storage/backup_bundle_io.zig");
+pub const backup_repository = @import("storage/backup_repository.zig");
 pub const portable_backup = @import("storage/portable_backup.zig");
 pub const platform_time = @import("antfly_platform").time;
 

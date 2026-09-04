@@ -5647,7 +5647,7 @@ pub const IndexManager = struct {
                 total_steps += @intCast(link_repair.repaired());
             }
             const backlog = try entry.index.postingBacklogStats();
-            if (!backlog.needsRepair()) continue;
+            if (!backlog.hasMaintenanceDebt()) continue;
 
             const result = try entry.index.repairDirtyPostingsWithOptions(.{
                 .max_postings = options.max_postings_per_index,
@@ -6212,7 +6212,7 @@ pub const IndexManager = struct {
 
         for (self.enrichments.items) |*entry| {
             if (!std.mem.eql(u8, entry.name, internal.name)) continue;
-            if (internalEnrichmentConfigsEqual(entry.*, internal)) return .unchanged;
+            if (try internalEnrichmentConfigsEqual(self.alloc, entry.*, internal)) return .unchanged;
 
             var replacement = try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal);
             var previous = entry.*;
@@ -8046,6 +8046,7 @@ pub const IndexManager = struct {
 
             if (try parseDenseGeneratorConfig(alloc, entry.config.config_json)) |generator| {
                 defer generator.deinit(alloc);
+                const input_kind = embeddingInputKind(self, generator);
                 const chunk_cfg = resolveChunkGenerator(self, generator);
                 const embedding_name = entry.embedding_name orelse entry.config.name;
                 const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
@@ -8070,6 +8071,7 @@ pub const IndexManager = struct {
                         .index_name = try alloc.dupe(u8, entry.config.name),
                         .artifact_name = try alloc.dupe(u8, chunk_cfg.artifact_name),
                         .embedding_name = try alloc.dupe(u8, embedding_name),
+                        .input_kind = input_kind,
                         .doc_key = try alloc.dupe(u8, doc_key),
                         .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
                         .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
@@ -8116,6 +8118,7 @@ pub const IndexManager = struct {
                                 .index_name = try alloc.dupe(u8, entry.config.name),
                                 .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
                                 .embedding_name = try alloc.dupe(u8, embedding_name),
+                                .input_kind = embeddingInputKindForChunkEnrichment(chunk_cfg),
                                 .doc_key = try alloc.dupe(u8, doc_key),
                                 .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                                 .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
@@ -8159,6 +8162,7 @@ pub const IndexManager = struct {
             if (try parseSparseGeneratorConfig(alloc, entry.config.config_json)) |generator| {
                 defer generator.deinit(alloc);
                 const chunk_cfg = resolveChunkGenerator(self, generator);
+                const input_kind = embeddingInputKind(self, generator);
                 const embedding_name = if (chunk_cfg.embedding_name) |name| name else entry.config.name;
                 const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
                 if (generatorHasChunking(chunk_cfg) and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name)) {
@@ -8181,6 +8185,7 @@ pub const IndexManager = struct {
                     .index_name = try alloc.dupe(u8, entry.config.name),
                     .artifact_name = try alloc.dupe(u8, chunk_cfg.artifact_name),
                     .embedding_name = try alloc.dupe(u8, embedding_name),
+                    .input_kind = input_kind,
                     .doc_key = try alloc.dupe(u8, doc_key),
                     .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
                     .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
@@ -8225,6 +8230,7 @@ pub const IndexManager = struct {
                                 .index_name = try alloc.dupe(u8, entry.config.name),
                                 .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
                                 .embedding_name = try alloc.dupe(u8, embedding_name),
+                                .input_kind = embeddingInputKindForChunkEnrichment(chunk_cfg),
                                 .doc_key = try alloc.dupe(u8, doc_key),
                                 .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                                 .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
@@ -10800,6 +10806,25 @@ pub const IndexManager = struct {
         return .projection_changed;
     }
 
+    /// Return whether `key` belongs to the source projection captured by
+    /// `context`. The caller must hold the catalog shared lock, normally
+    /// through a ManagedIndexApplyGuard. Replay delete lanes are shared by
+    /// all derived index kinds, so an artifact-backed text index must filter
+    /// them by the same source predicate used for indexing writes.
+    pub fn textPublicationContextConsumesKeyAssumeCatalogLocked(
+        self: *IndexManager,
+        index_name: []const u8,
+        context: TextPublicationContext,
+        key: []const u8,
+    ) !bool {
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        if (entry.instance_id != context.instance_id) return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
+        return try textIndexShouldConsumeDoc(self, entry, key);
+    }
+
     /// Plan the natural segment fan-out before producer admission. Projection
     /// is repeated during publication, but tokenization and segment construction
     /// still happen only once. Using the same source and segment splitters as
@@ -12944,7 +12969,7 @@ pub const IndexManager = struct {
                             multi_source_has_implicit_vector_space = true;
                             if (embedding_cfg.producer_json.len == 0) return error.InvalidIndexConfig;
                             if (multi_source_implicit_producer) |expected| {
-                                if (!std.mem.eql(u8, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
+                                if (!try enrichment_config_validation.producerJsonValuesEqual(self.alloc, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
                             } else {
                                 multi_source_implicit_producer = embedding_cfg.producer_json;
                             }
@@ -13120,7 +13145,7 @@ pub const IndexManager = struct {
                             multi_source_has_implicit_vector_space = true;
                             if (embedding_cfg.producer_json.len == 0) return error.InvalidIndexConfig;
                             if (multi_source_implicit_producer) |expected| {
-                                if (!std.mem.eql(u8, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
+                                if (!try enrichment_config_validation.producerJsonValuesEqual(self.alloc, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
                             } else {
                                 multi_source_implicit_producer = embedding_cfg.producer_json;
                             }
@@ -13686,7 +13711,7 @@ pub const IndexManager = struct {
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.expected_dims != cfg.expected_dims or
                 !std.mem.eql(u8, existing.vector_space, cfg.vector_space) or
-                !std.mem.eql(u8, existing.producer_json, cfg.producer_json) or
+                !try enrichment_config_validation.producerJsonValuesEqual(self.alloc, existing.producer_json, cfg.producer_json) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
@@ -13703,7 +13728,7 @@ pub const IndexManager = struct {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
                 !std.mem.eql(u8, existing.source_template, cfg.source_template) or
                 !std.mem.eql(u8, existing.content_type, cfg.content_type) or
-                !std.mem.eql(u8, existing.producer_json, cfg.producer_json) or
+                !try enrichment_config_validation.producerJsonValuesEqual(self.alloc, existing.producer_json, cfg.producer_json) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
@@ -20820,7 +20845,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
     };
 }
 
-fn internalEnrichmentConfigsEqual(a: enrichment_catalog.EnrichmentConfig, b: enrichment_catalog.EnrichmentConfig) bool {
+fn internalEnrichmentConfigsEqual(alloc: Allocator, a: enrichment_catalog.EnrichmentConfig, b: enrichment_catalog.EnrichmentConfig) !bool {
     return a.kind == b.kind and
         std.mem.eql(u8, a.name, b.name) and
         std.mem.eql(u8, a.source_field, b.source_field) and
@@ -20833,7 +20858,7 @@ fn internalEnrichmentConfigsEqual(a: enrichment_catalog.EnrichmentConfig, b: enr
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and
         a.full_text_index == b.full_text_index and
         std.mem.eql(u8, a.content_type, b.content_type) and
-        std.mem.eql(u8, a.producer_json, b.producer_json) and
+        try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
         std.mem.eql(u8, a.execution_json, b.execution_json);
 }
 
@@ -21866,6 +21891,48 @@ fn resolveChunkGenerator(self: *const IndexManager, generator: GeneratorConfig) 
         };
     }
     return generator;
+}
+
+/// Resolve embedding input semantics while the planner still has the catalog
+/// identity that distinguishes a named document output from a chunk producer.
+/// Runtime and replay code must consume this explicit shape rather than infer
+/// it from the overloaded artifact name.
+fn embeddingInputKind(self: *const IndexManager, generator: GeneratorConfig) enrichment_types.EmbeddingInputKind {
+    if (generator.artifact_name.len > 0) {
+        if (self.getEnrichment(.chunk, generator.artifact_name)) |cfg|
+            return embeddingInputKindForChunkEnrichment(cfg);
+    }
+    if (generatorHasChunking(generator)) return .inline_chunks;
+    return .document;
+}
+
+fn embeddingInputKindForChunkEnrichment(cfg: *const enrichment_catalog.EnrichmentConfig) enrichment_types.EmbeddingInputKind {
+    return if (cfg.source_artifact_name.len > 0) .materialized_chunks else .inline_chunks;
+}
+
+test "embedding input kind is explicit at the catalog boundary" {
+    var manager = try IndexManager.init(std.testing.allocator, ".");
+    defer manager.deinit();
+
+    try std.testing.expectEqual(
+        enrichment_types.EmbeddingInputKind.document,
+        embeddingInputKind(&manager, .{ .source_field = @constCast("body"), .artifact_name = @constCast("named_embedding_output") }),
+    );
+    try std.testing.expectEqual(
+        enrichment_types.EmbeddingInputKind.inline_chunks,
+        embeddingInputKind(&manager, .{ .source_field = @constCast("body"), .artifact_name = @constCast("inline_chunks"), .chunk_size = 256 }),
+    );
+    try std.testing.expect(try manager.ensureChunkEnrichment(.{
+        .name = "materialized_chunks",
+        .kind = .chunk,
+        .source_field = "body",
+        .source_artifact_name = "document_units",
+        .chunk_size = 256,
+    }));
+    try std.testing.expectEqual(
+        enrichment_types.EmbeddingInputKind.materialized_chunks,
+        embeddingInputKind(&manager, .{ .source_field = @constCast("body"), .artifact_name = @constCast("materialized_chunks") }),
+    );
 }
 
 fn generatorHasChunking(generator: GeneratorConfig) bool {
@@ -24723,12 +24790,13 @@ test "dense index unions multiple embedding artifact sources without overwriting
     manager.updateRange(.{ .start = "", .end = "" });
 
     const producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"test\",\"dimensions\":3}";
+    const producer_json_reordered = "{ \"dimensions\": 3, \"model\": \"test\", \"provider\": \"antfly\", \"version\": 1 }";
     try manager.addEnrichment(&store, .{
         .name = "title_dense_v1",
         .kind = .embedding,
         .field = "title",
         .expected_dims = 3,
-        .producer_json = producer_json,
+        .producer_json = producer_json_reordered,
     });
     try manager.addEnrichment(&store, .{
         .name = "document_chunks_v1",
@@ -24763,7 +24831,14 @@ test "dense index unions multiple embedding artifact sources without overwriting
     for (generated) |request| {
         if (request.kind != .dense_embedding) continue;
         embedding_request_count += 1;
-        try std.testing.expectEqualStrings(producer_json, request.producer_json);
+        try std.testing.expect(try enrichment_config_validation.producerJsonValuesEqual(alloc, producer_json, request.producer_json));
+        try std.testing.expectEqual(
+            if (std.mem.eql(u8, request.embedding_name, "body_dense_v1"))
+                enrichment_types.EmbeddingInputKind.inline_chunks
+            else
+                enrichment_types.EmbeddingInputKind.document,
+            request.input_kind,
+        );
     }
     try std.testing.expectEqual(@as(usize, 2), embedding_request_count);
 
@@ -24833,11 +24908,12 @@ test "sparse multi-source requests carry semantic producer identity" {
     manager.updateRange(.{ .start = "", .end = "" });
 
     const producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"sparse-test\"}";
+    const producer_json_reordered = "{ \"model\": \"sparse-test\", \"provider\": \"antfly\", \"version\": 1 }";
     try manager.addEnrichment(&store, .{
         .name = "title_sparse_v1",
         .kind = .embedding,
         .field = "title",
-        .producer_json = producer_json,
+        .producer_json = producer_json_reordered,
     });
     try manager.addEnrichment(&store, .{
         .name = "body_sparse_v1",
@@ -24859,7 +24935,8 @@ test "sparse multi-source requests carry semantic producer identity" {
     try std.testing.expectEqual(@as(usize, 2), generated.len);
     for (generated) |request| {
         try std.testing.expect(request.kind == .sparse_embedding);
-        try std.testing.expectEqualStrings(producer_json, request.producer_json);
+        try std.testing.expect(try enrichment_config_validation.producerJsonValuesEqual(alloc, producer_json, request.producer_json));
+        try std.testing.expectEqual(enrichment_types.EmbeddingInputKind.document, request.input_kind);
     }
 
     const foreign_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:multi", "foreign_sparse_v1");

@@ -97,6 +97,23 @@ def _document_units_index_config() -> dict:
     }
 
 
+def _semantic_embedding_producer(*, model: str, endpoint: str) -> dict:
+    """Return the durable, credential-free embedding producer identity."""
+
+    return {
+        "version": 2,
+        "provider": "openai",
+        "model": model,
+        "endpoint": endpoint,
+        "region": "",
+        "request_format": "",
+        "sparse": False,
+        "multimodal": False,
+        "input_type": "",
+        "truncate": "",
+    }
+
+
 def _manifest_ready(api, table_name: str, doc_key: str) -> dict | None:
     try:
         manifest = api.get(
@@ -1108,29 +1125,38 @@ def test_artifact_backed_embedding_table_provisions_atomically(
         )
         is not None
     )
+
+    def ready_embedding_status():
+        current = stateful_api.get_index(table_name, "document_vectors")
+        status = current.get("status", {})
+        index_coverage = status.get("coverage", {})
+        enrichment_runtime = status.get("enrichment_runtime", {})
+        if (
+            index_coverage.get("source_total") == 2
+            and index_coverage.get("produced") == 2
+            and index_coverage.get("covered") == 2
+            and index_coverage.get("observation_complete") is True
+            and index_coverage.get("complete") is True
+            and index_coverage.get("healthy") is True
+            and enrichment_runtime.get("enabled") is True
+            and enrichment_runtime.get("worker_started") is True
+            and enrichment_runtime.get("embed_batches_completed", 0) > 0
+        ):
+            return current
+        return None
+
     coverage = wait_until(
-        lambda: (
-            status
-            if (
-                (status := stateful_api.get_index(table_name, "document_vectors"))
-                .get("status", {})
-                .get("coverage", {})
-                .get("source_total")
-                == 2
-                and status["status"]["coverage"].get("produced") == 2
-                and status["status"]["coverage"].get("covered") == 2
-                and status["status"]["coverage"].get("observation_complete") is True
-                and status["status"]["coverage"].get("complete") is True
-                and status["status"]["coverage"].get("healthy") is True
-            )
-            else None
-        ),
+        ready_embedding_status,
         timeout_s=60.0,
         interval_s=0.5,
     )
     assert coverage is not None, json.dumps(
         stateful_api.get_index(table_name, "document_vectors"), sort_keys=True
     )
+    enrichment_runtime = coverage["status"]["enrichment_runtime"]
+    assert enrichment_runtime["enabled"] is True
+    assert enrichment_runtime["worker_started"] is True
+    assert enrichment_runtime.get("embed_batches_completed", 0) > 0
 
     # Match paged public /merge clients: close the final key range with an
     # empty full-index merge before the process restart. This used to leave a
@@ -1192,6 +1218,538 @@ def test_artifact_backed_embedding_table_provisions_atomically(
     )
     assert coverage_after_restart is not None, json.dumps(
         stateful_api.get_index(table_name, "document_vectors"), sort_keys=True
+    )
+
+
+def test_adding_artifact_embedding_index_preserves_populated_full_text_across_restarts(
+    stateful_api, openai_embedder
+):
+    """A vector backfill must not publish chunk deletes to a sibling text index."""
+
+    table_name = f"artifact_embedding_add_preserves_text_{time.time_ns()}"
+    doc_key = "existing-artifact-document"
+    canary = "artifactcollapsecanary"
+
+    stateful_api.create_table(table_name, num_shards=1)
+    stateful_api.create_index(
+        table_name,
+        "document_text",
+        {
+            "name": "document_text",
+            "type": "full_text",
+            "field": "text",
+            "artifact_name": "document_chunks_v1",
+            "enrichments": [
+                {
+                    "name": DOCUMENT_UNITS_ARTIFACT,
+                    "kind": "asset",
+                    "field": "url",
+                    "content_type": "application/json",
+                    "producer_json": json.dumps(
+                        {
+                            "type": "document_extraction",
+                            "config": {"ocr": {"enabled": False}},
+                        },
+                        separators=(",", ":"),
+                    ),
+                },
+                {
+                    "name": "document_chunks_v1",
+                    "kind": "chunk",
+                    "source_artifact_name": DOCUMENT_UNITS_ARTIFACT,
+                    "field": "text",
+                    "chunk_size": 512,
+                    "chunk_overlap": 0,
+                    "full_text_index": True,
+                },
+            ],
+        },
+    )
+
+    source = f"A stable document containing {canary}.".encode()
+    merged = stateful_api.batch_write(
+        table_name,
+        inserts={
+            doc_key: {
+                "filename": "canary.txt",
+                "mime_type": "text/plain",
+                "version": "1",
+                "url": "data:text/plain;base64,"
+                + base64.b64encode(source).decode(),
+            }
+        },
+        sync_level="full_index",
+    )
+    assert merged["inserted"] == 1
+
+    def text_projection_intact() -> dict | None:
+        detail = stateful_api.get_index(table_name, "document_text")
+        result = stateful_api.query_table(
+            table_name,
+            {
+                "full_text_index": "document_text",
+                "full_text_search": {"field": "text", "match": canary},
+                "limit": 5,
+            },
+        )
+        if detail.get("status", {}).get("doc_count") != 1:
+            return None
+        if doc_key not in _query_hit_ids(result):
+            return None
+        return {"detail": detail, "result": result}
+
+    before_restart = wait_until(
+        text_projection_intact,
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert before_restart is not None
+    text_incarnation = before_restart["detail"]["status"]["readiness"]["incarnation"]
+
+    stateful_api.restart_server()
+    baseline_restart = wait_until(
+        text_projection_intact,
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert baseline_restart is not None
+    assert (
+        baseline_restart["detail"]["status"]["readiness"]["incarnation"]
+        == text_incarnation
+    )
+
+    stateful_api.create_index(
+        table_name,
+        "document_vectors",
+        {
+            "name": "document_vectors",
+            "type": "embeddings",
+            "field": "embedding",
+            "dimension": 3,
+            "distance_metric": "cosine",
+            "embedding_name": "document_chunk_dense_v1",
+            "source_artifact_name": "document_chunks_v1",
+            "embedder": {
+                "provider": "openai",
+                "model": "text-embedding-3-small",
+                "url": openai_embedder,
+            },
+            "enrichments": [
+                {
+                    "name": "document_chunk_dense_v1",
+                    "kind": "embedding",
+                    "field": "text",
+                    "source_artifact_name": "document_chunks_v1",
+                    "expected_dims": 3,
+                }
+            ],
+        },
+    )
+    vector_ready = wait_until(
+        lambda: (
+            detail
+            if (detail := stateful_api.get_index(table_name, "document_vectors"))
+            .get("status", {})
+            .get("readiness", {})
+            .get("queryable")
+            is True
+            and detail["status"].get("doc_count") == 1
+            else None
+        ),
+        timeout_s=120.0,
+        interval_s=0.5,
+    )
+    assert vector_ready is not None, json.dumps(
+        stateful_api.get_index(table_name, "document_vectors"),
+        indent=2,
+        sort_keys=True,
+    )
+    assert (
+        wait_until(
+            lambda: (
+                result
+                if doc_key
+                in _query_hit_ids(
+                    result := stateful_api.query_table(
+                        table_name,
+                        {
+                            "semantic_search": canary,
+                            "indexes": ["document_vectors"],
+                            "limit": 5,
+                        },
+                    )
+                )
+                else None
+            ),
+            timeout_s=60.0,
+            interval_s=0.5,
+        )
+        is not None
+    )
+
+    after_embedding_add = text_projection_intact()
+    assert after_embedding_add is not None
+    assert (
+        after_embedding_add["detail"]["status"]["readiness"]["incarnation"]
+        == text_incarnation
+    )
+
+    stateful_api.restart_server()
+    after_final_restart = wait_until(
+        text_projection_intact,
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert after_final_restart is not None
+    assert (
+        after_final_restart["detail"]["status"]["readiness"]["incarnation"]
+        == text_incarnation
+    )
+
+
+def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
+    stateful_api, openai_embedder
+):
+    """Semantic provenance must resolve to exactly one executable owner."""
+
+    orphan_table = f"embedding_orphan_producer_{time.time_ns()}"
+    stateful_api.create_table(orphan_table, num_shards=1)
+    with pytest.raises(requests.HTTPError) as orphan_error:
+        stateful_api.put(
+            f"{_table_artifact_path(orphan_table, 'orphan_dense_v1')}/enrichment",
+            {
+                "kind": "embedding",
+                "field": "body",
+                "expected_dims": 3,
+                "producer_json": _semantic_embedding_producer(
+                    model="text-embedding-3-small",
+                    endpoint=f"{openai_embedder}/v1",
+                ),
+            },
+        )
+    assert orphan_error.value.response.status_code == 400
+    assert "embedding enrichment producer is not runnable" in orphan_error.value.response.text
+
+    owner_table = f"embedding_owned_producer_{time.time_ns()}"
+    stateful_api.post(
+        f"/tables/{owner_table}",
+        {
+            "num_shards": 1,
+            "indexes": {
+                "document_vectors": {
+                    "type": "embeddings",
+                    "field": "body",
+                    "dimension": 3,
+                    "embedding_name": "document_dense_v1",
+                    "embedder": {
+                        "provider": "openai",
+                        "model": "text-embedding-3-small",
+                        "url": openai_embedder,
+                        "dimensions": 3,
+                    },
+                    "enrichments": [
+                        {
+                            "name": "document_dense_v1",
+                            "kind": "embedding",
+                            "field": "body",
+                            "expected_dims": 3,
+                        }
+                    ],
+                }
+            },
+        },
+    )
+
+    # A second artifact-backed index may reuse the executable owner without
+    # duplicating credentials or producer metadata into the enrichment. The
+    # merged catalog must also retain that owner while this consumer exists.
+    assert_created_index(
+        stateful_api.create_index(
+            owner_table,
+            "document_artifact_vectors",
+            {
+                "type": "embeddings",
+                "dimension": 3,
+                "sources": [{"artifact": "document_dense_v1"}],
+            },
+        ),
+        "document_artifact_vectors",
+        "embeddings",
+    )
+    with pytest.raises(requests.HTTPError) as producerless_owner_delete_error:
+        stateful_api.delete_index(owner_table, "document_vectors")
+    assert producerless_owner_delete_error.value.response.status_code == 409
+    assert (
+        stateful_api.get_index(owner_table, "document_vectors")["config"]["type"]
+        == "embeddings"
+    )
+
+    with pytest.raises(requests.HTTPError) as mismatch_error:
+        stateful_api.put(
+            f"{_table_artifact_path(owner_table, 'document_dense_v1')}/enrichment",
+            {
+                "kind": "embedding",
+                "field": "body",
+                "expected_dims": 3,
+                "producer_json": _semantic_embedding_producer(
+                    model="different-model",
+                    endpoint=f"{openai_embedder}/v1",
+                ),
+            },
+        )
+    assert mismatch_error.value.response.status_code == 400
+    assert "embedding enrichment producer is not runnable" in mismatch_error.value.response.text
+
+    # A matching durable identity may be registered at table scope, but doing
+    # so makes the executable index an authoritative owner that cannot be
+    # deleted while the identity remains in the catalog.
+    stateful_api.put(
+        f"{_table_artifact_path(owner_table, 'document_dense_v1')}/enrichment",
+        {
+            "kind": "embedding",
+            "field": "body",
+            "expected_dims": 3,
+            "producer_json": _semantic_embedding_producer(
+                model="text-embedding-3-small",
+                endpoint=f"{openai_embedder}/v1",
+            ),
+        },
+    )
+    with pytest.raises(requests.HTTPError) as owner_delete_error:
+        stateful_api.delete_index(owner_table, "document_vectors")
+    assert owner_delete_error.value.response.status_code == 409
+    assert stateful_api.get_index(owner_table, "document_vectors")["config"]["type"] == "embeddings"
+
+    # Failed replacement is atomic: the original owner and its artifact remain.
+    detail = stateful_api.get_index(owner_table, "document_vectors")
+    assert detail["config"]["type"] == "embeddings"
+    doc_key = "original-producer-still-runnable"
+    written = stateful_api.batch_write(
+        owner_table,
+        inserts={doc_key: {"body": "durable artifact producer remains runnable"}},
+        sync_level="full_index",
+    )
+    assert written["inserted"] == 1
+    runtime = wait_until(
+        lambda: (
+            current
+            if (
+                (current := stateful_api.get_index(owner_table, "document_vectors"))
+                .get("status", {})
+                .get("total_indexed")
+                == 1
+                and current.get("status", {}).get("query_visible_doc_count") == 1
+                and current.get("status", {})
+                .get("enrichment_runtime", {})
+                .get("embed_batches_completed", 0)
+                > 0
+            )
+            else None
+        ),
+        timeout_s=60.0,
+        interval_s=0.5,
+    )
+    assert runtime is not None, json.dumps(
+        stateful_api.get_index(owner_table, "document_vectors"), sort_keys=True
+    )
+    consumer_runtime = wait_until(
+        lambda: (
+            current
+            if (
+                (current := stateful_api.get_index(owner_table, "document_artifact_vectors"))
+                .get("status", {})
+                .get("total_indexed")
+                == 1
+                and current.get("status", {}).get("query_visible_doc_count") == 1
+            )
+            else None
+        ),
+        timeout_s=60.0,
+        interval_s=0.5,
+    )
+    assert consumer_runtime is not None, json.dumps(
+        stateful_api.get_index(owner_table, "document_artifact_vectors"), sort_keys=True
+    )
+    semantic = wait_until(
+        lambda: (
+            response
+            if doc_key
+            in _query_hit_ids(
+                response := stateful_api.query_table(
+                    owner_table,
+                    {
+                        "semantic_search": "durable artifact producer",
+                        "indexes": ["document_vectors"],
+                        "limit": 5,
+                    },
+                )
+            )
+            else None
+        ),
+        timeout_s=60.0,
+        interval_s=0.5,
+    )
+    assert semantic is not None
+    artifact_semantic = stateful_api.query_table(
+        owner_table,
+        {
+            "semantic_search": "durable artifact producer",
+            "indexes": ["document_artifact_vectors"],
+            "limit": 5,
+        },
+    )
+    assert doc_key in _query_hit_ids(artifact_semantic)
+
+
+def test_executable_embedding_artifact_producer_survives_restart(
+    stateful_api, openai_embedder
+):
+    """Exercise a public chunk/embedding chain without an embedding-index owner."""
+
+    table_name = f"embedding_artifact_registry_{time.time_ns()}"
+    chunk_name = "document_chunks_v1"
+    embedding_name = "document_chunk_dense_v1"
+    index_name = "document_artifact_vectors"
+    doc_key = "artifact-registry-doc"
+    restarted_doc_key = "artifact-registry-doc-after-restart"
+
+    stateful_api.create_table(table_name, num_shards=1)
+    stateful_api.put(
+        f"{_table_artifact_path(table_name, chunk_name)}/enrichment",
+        {
+            "kind": "chunk",
+            "field": "body",
+            "chunk_size": 128,
+            "chunk_overlap": 16,
+        },
+    )
+    stateful_api.put(
+        f"{_table_artifact_path(table_name, embedding_name)}/enrichment",
+        {
+            "kind": "embedding",
+            # `text` is the canonical chunk-artifact payload selector even
+            # though the producer retains its original `body` source field.
+            "field": "text",
+            "source_artifact_name": chunk_name,
+            "expected_dims": 3,
+            # This legacy producer document is intentionally executable. Unlike
+            # a v2 semantic identity, it does not require an embedding-index
+            # owner to supply credentials and runtime configuration.
+            "producer_json": {
+                "provider": "openai",
+                "model": "text-embedding-3-small",
+                "url": openai_embedder,
+            },
+        },
+    )
+    created = stateful_api.create_index(
+        table_name,
+        index_name,
+        {
+            "type": "embeddings",
+            # Omit dimension to exercise catalog-derived artifact shape.
+            "sources": [{"artifact": embedding_name}],
+        },
+    )
+    assert_created_index(created, index_name, "embeddings")
+    assert created["dimension"] == 3
+
+    written = stateful_api.batch_write(
+        table_name,
+        inserts={
+            doc_key: {
+                "body": "standalone executable artifact producer restart coverage"
+            }
+        },
+        sync_level="full_index",
+    )
+    assert written["inserted"] == 1
+
+    def ready_status(expected_docs: int, require_new_work: bool):
+        current = stateful_api.get_index(table_name, index_name)
+        status = current.get("status", {})
+        enrichment_runtime = status.get("enrichment_runtime", {})
+        if (
+            status.get("total_indexed") == expected_docs
+            and status.get("query_visible_doc_count") == expected_docs
+            and enrichment_runtime.get("enabled") is True
+            and (
+                not require_new_work
+                or (
+                    enrichment_runtime.get("worker_started") is True
+                    and enrichment_runtime.get("embed_batches_completed", 0) > 0
+                )
+            )
+        ):
+            return current
+        return None
+
+    ready = wait_until(lambda: ready_status(1, True), timeout_s=60.0, interval_s=0.5)
+    assert ready is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name), sort_keys=True
+    )
+
+    def semantic_result(query: str, expected_key: str):
+        response = stateful_api.query_table(
+            table_name,
+            {
+                "semantic_search": query,
+                "indexes": [index_name],
+                "limit": 5,
+            },
+        )
+        return response if expected_key in _query_hit_ids(response) else None
+
+    assert (
+        wait_until(
+            lambda: semantic_result("executable artifact producer", doc_key),
+            timeout_s=60.0,
+            interval_s=0.5,
+        )
+        is not None
+    )
+
+    stateful_api.restart_server()
+    # Runtime counters are process-local. Existing durable vectors can be ready
+    # before an idle enrichment worker has any reason to start.
+    ready_after_restart = wait_until(
+        lambda: ready_status(1, False), timeout_s=90.0, interval_s=1.0
+    )
+    assert ready_after_restart is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name), sort_keys=True
+    )
+    assert (
+        wait_until(
+            lambda: semantic_result("executable artifact producer", doc_key),
+            timeout_s=60.0,
+            interval_s=1.0,
+        )
+        is not None
+    )
+
+    written_after_restart = stateful_api.batch_write(
+        table_name,
+        inserts={
+            restarted_doc_key: {
+                "body": "fresh chained artifact production after process restart"
+            }
+        },
+        sync_level="full_index",
+    )
+    assert written_after_restart["inserted"] == 1
+    produced_after_restart = wait_until(
+        lambda: ready_status(2, True), timeout_s=60.0, interval_s=0.5
+    )
+    assert produced_after_restart is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name), sort_keys=True
+    )
+    assert (
+        wait_until(
+            lambda: semantic_result("fresh chained production", restarted_doc_key),
+            timeout_s=60.0,
+            interval_s=0.5,
+        )
+        is not None
     )
 
 

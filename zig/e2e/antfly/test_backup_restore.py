@@ -28,7 +28,6 @@ from pathlib import Path
 
 import pytest
 import requests
-
 from conftest import (
     ANTFLY_PUBLIC_API_ROOT,
     DEFAULT_ANTFLY_BIN,
@@ -1139,7 +1138,11 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
     )
 
     backup_api.wait_index_ready(
-        table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5
+        table_name,
+        "semantic_chunked_idx",
+        timeout_s=30.0,
+        interval_s=0.5,
+        until="complete",
     )
 
     batch = backup_api.batch_write(
@@ -1182,6 +1185,7 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
         "semantic_chunked_idx",
         timeout_s=60.0,
         interval_s=0.5,
+        until="complete",
         require_query_fresh=True,
     )
     before_readiness_incarnation = before_status["readiness"]["incarnation"]
@@ -1243,6 +1247,7 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
             "semantic_chunked_idx",
             timeout_s=180.0,
             interval_s=1.0,
+            until="complete",
             require_query_fresh=True,
         )
         if backup_format == "native":

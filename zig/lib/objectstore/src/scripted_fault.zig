@@ -141,14 +141,14 @@ pub const Client = struct {
 
     fn erasedDeinit(_: Allocator, _: *anyopaque) void {}
 
-    fn bucketExists(ptr: *anyopaque, bucket: []const u8) !bool {
+    fn bucketExists(ptr: *anyopaque, bucket: []const u8, options: types.BucketOptions) !bool {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        return self.backing.vtable.bucket_exists(self.backing.ptr, bucket);
+        return self.backing.vtable.bucket_exists(self.backing.ptr, bucket, options);
     }
 
-    fn makeBucket(ptr: *anyopaque, bucket: []const u8) !void {
+    fn makeBucket(ptr: *anyopaque, bucket: []const u8, options: types.BucketOptions) !void {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        try self.backing.vtable.make_bucket(self.backing.ptr, bucket);
+        try self.backing.vtable.make_bucket(self.backing.ptr, bucket, options);
     }
 
     fn putObject(

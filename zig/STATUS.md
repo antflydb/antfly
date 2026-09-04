@@ -182,6 +182,29 @@ admin endpoints read cheap snapshots from that plane. Background workers perform
 repair and catch-up. Request handlers never repair state just to make status
 look current.
 
+### Durable safety and ephemeral activity are separate planes
+
+Admission-critical facts remain in the metadata Raft projection: reporter
+incarnation/fence, repair state, native-restore identity, and the durable
+coverage/checkpoint identities used by readiness. That codec negotiates only
+the exact v12 profile released by v0.2.0 or current v15. Every other numeric
+version is an unreleased development artifact and is rejected.
+
+Embedding work telemetry is a versioned, readiness-neutral heartbeat. The data
+owner publishes exact phase transitions and coalesced counter progress; the
+metadata leader retains matching store, group, index, generation, and config
+identities in a bounded, sharded TTL cache. Report order and per-index sample
+order are fenced separately from durable status generation, so activity-only
+updates do not create Raft writes. Cached liveness heartbeats deliberately omit
+the observation bit and cannot extend activity freshness. Local best-effort
+snapshot contention retains the last incarnation-matched sample under the same
+TTL instead of treating one missed lock as owner disappearance. Retained local
+samples remain visible to standalone clients but are not forwarded as fresh
+heartbeats, so repeated polling cannot extend another hop's TTL. An observed
+owner/incarnation replacement clears immediately; otherwise activity expires to
+unavailable after the TTL or a leader change. Status must never infer work from
+coverage debt, and activity must never authorize a query or lifecycle transition.
+
 ### Data Model
 
 Introduce a richer status record around the existing DB stats:
@@ -319,6 +342,85 @@ For an index across N expected groups:
 This preserves backward-compatible simple fields where possible while making the
 distributed reality visible.
 
+Embeddings status additionally separates lifecycle truth from work telemetry:
+
+- `incarnation`, `target_revision`, and `published_revision` identify the
+  generation and its captured/published replay boundary.
+- `milestones.queryable` and `milestones.complete` each contain `reached` plus
+  blockers specific to that milestone. Clients should wait on the requested
+  milestone instead of interpreting a generic state string.
+- `source_coverage` reports generation-scoped source outcomes. Exact coverage
+  requires a complete, fresh observation of every expected group; otherwise
+  `pending` is `null` and `observation_incomplete_reasons` says why.
+- `searchable_vectors` reports physical query-visible entries. It is not a
+  source-document counter and may be larger for chunked indexes.
+- Dense embeddings expose `publication.target_vectors`,
+  `publication.searchable_vectors`, and `publication.complete`. The object is
+  emitted only when an exact durable target exists for the current
+  incarnation; completion requires equality, not a lower-bound comparison
+  with source outcomes. Other index types should define publication facts in
+  their own physical units rather than reuse vector semantics.
+- `activity` reports volatile, incarnation-scoped work. Its counters are
+  maintained by the owning enrichment runtime and aggregated only from current
+  shard observations. A client may calculate throughput only across samples
+  whose opaque activity `epoch` is unchanged. Owners report an authoritative
+  phase independently of counters; aggregation reduces those phases with
+  `waiting_retry > embedding > publishing > preparing > idle`. A counter from
+  a lower-priority owner cannot mask a higher-priority phase.
+- Serving authority, convergence authority, and activity freshness are
+  independent. A cached published incarnation may remain queryable when the
+  owner heartbeat is absent. `complete` additionally requires the group owner
+  to have observed the latest accepted target; until then status reports
+  `target_observation` without discarding the last coverage or publication
+  counters.
+
+These dimensions have a strict dependency direction:
+
+```text
+durable source outcomes + publication/repair/topology facts -> milestones
+runtime work                                                -> activity only
+```
+
+Status encoders and waiters must never derive readiness from activity counters,
+timestamps, or a worker appearing idle. Conversely, a process restart may reset
+activity and its epoch without changing durable coverage or the queryable
+publication. This keeps status useful for UX while preserving fail-closed
+admission and bounded request-path performance.
+
+For progressive dense indexes, restart queryability is certified by the exact
+published physical count at the checkpoint's sequence and incarnation. A newer
+artifact target describes work after that safe publication and does not revoke
+it. Lazy posting centroid or quantized-payload debt is diagnostic maintenance,
+not repair state: queries use the exact fallback while bounded background work
+refreshes those caches. Structural generation faults remain repair blockers.
+
+Wait clients select an explicit useful outcome such as `complete`,
+`source-covered=N%`, or `searchable-artifacts=N`. Threshold waits also require
+query admission for the same incarnation. The v0.2.0 response has no milestone
+map, so clients use its historical fully-settled readiness rules only as a
+separate compatibility path.
+
+There is no request-time live overlay. A table commit marks the cached target
+observation pending in a small monotonic status watermark, and the runtime owner
+publishes replay target, coverage, physical artifact counters, and serving
+state together. Each publication carries the target revision captured before
+sampling, so an older in-flight publisher cannot clear a newer commit fence.
+HTTP reads only clone that immutable snapshot. Writer/apply
+lock contention can therefore delay convergence or activity observation, but
+cannot revoke a published serving generation or reset its counters. Explicit
+root replacement, exact-index mutation, and corruption fences remain the only
+paths that can revoke the corresponding serving authority.
+
+Distributed publication has two released profiles: v12 for v0.2.0 peers and
+v15 for current admission/restore safety facts. V13 and v14 were development
+artifacts and are rejected rather than negotiated. During rolling upgrades,
+writers emit v12 until every metadata voter advertises v15; repair state,
+reporter fences, native-restore identity, and exact publication targets then
+activate together and remain mandatory/fail-closed. Embedding activity is not projected through this codec:
+its separately versioned TTL heartbeat remains optional. Capability proofs are
+scoped to the metadata incarnation, membership fingerprint, and required
+profile.
+
 ### Metrics
 
 Expose status-plane health separately from table/index health:
@@ -452,8 +554,9 @@ Current Phase 4 implementation shape:
   `runtime_status_cache`. Heartbeats do not open DBs or trigger repair work;
   they serialize already-published owner status.
 - Runtime summaries contain table/group identity, freshness/source metadata,
-  topology/status generations, compact table/enrichment state, and per-index
-  counters needed by index status responses.
+  topology/status generations, target-observation authority, compact
+  table/enrichment state, and per-index counters needed by index status
+  responses.
 - API nodes merge local read-cache status with propagated remote store records.
   Local status wins for a group; remote records fill groups the API node cannot
   observe locally. There is still no request-time fanout to data owners.

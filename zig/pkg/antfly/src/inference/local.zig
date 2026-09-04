@@ -213,50 +213,41 @@ pub const Provider = struct {
     }
 
     pub fn embedParts(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart) !inference.EmbedResult {
-        var values = std.json.Array.init(alloc);
-        defer values.deinit();
-        var encoded_buffers = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (encoded_buffers.items) |buf| alloc.free(buf);
-            encoded_buffers.deinit(alloc);
-        }
+        // The multimodal request tree is only borrowed while embedJsonInput
+        // serializes it. Keep every nested map and encoded buffer under one
+        // request-scoped owner so success, cancellation, and construction
+        // failures all have the same cleanup path.
+        var input_arena = std.heap.ArenaAllocator.init(alloc);
+        defer input_arena.deinit();
+        const input_alloc = input_arena.allocator();
+        var values = std.json.Array.init(input_alloc);
 
         for (parts) |part| {
             switch (part) {
                 .text => |text| {
                     var obj = std.json.ObjectMap.empty;
-                    errdefer obj.deinit(alloc);
-                    try obj.put(alloc, "type", .{ .string = "text" });
-                    try obj.put(alloc, "text", .{ .string = text });
+                    try obj.put(input_alloc, "type", .{ .string = "text" });
+                    try obj.put(input_alloc, "text", .{ .string = text });
                     try values.append(.{ .object = obj });
                 },
                 .media_url => |url| {
                     var image_url = std.json.ObjectMap.empty;
-                    errdefer image_url.deinit(alloc);
-                    try image_url.put(alloc, "url", .{ .string = url });
+                    try image_url.put(input_alloc, "url", .{ .string = url });
 
                     var obj = std.json.ObjectMap.empty;
-                    errdefer obj.deinit(alloc);
-                    try obj.put(alloc, "type", .{ .string = "image_url" });
-                    try obj.put(alloc, "image_url", .{ .object = image_url });
+                    try obj.put(input_alloc, "type", .{ .string = "image_url" });
+                    try obj.put(input_alloc, "image_url", .{ .object = image_url });
                     try values.append(.{ .object = obj });
                 },
                 .binary => |binary_part| {
                     const encoded_len = std.base64.standard.Encoder.calcSize(binary_part.data.len);
-                    const encoded = try alloc.alloc(u8, encoded_len);
-                    errdefer alloc.free(encoded);
+                    const encoded = try input_alloc.alloc(u8, encoded_len);
                     _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
-                    try encoded_buffers.append(alloc, encoded);
 
                     var obj = std.json.ObjectMap.empty;
-                    errdefer {
-                        obj.deinit(alloc);
-                        _ = encoded_buffers.pop();
-                        alloc.free(encoded);
-                    }
-                    try obj.put(alloc, "type", .{ .string = "media" });
-                    try obj.put(alloc, "data", .{ .string = encoded });
-                    try obj.put(alloc, "mime_type", .{ .string = binary_part.mime_type });
+                    try obj.put(input_alloc, "type", .{ .string = "media" });
+                    try obj.put(input_alloc, "data", .{ .string = encoded });
+                    try obj.put(input_alloc, "mime_type", .{ .string = binary_part.mime_type });
                     try values.append(.{ .object = obj });
                 },
             }

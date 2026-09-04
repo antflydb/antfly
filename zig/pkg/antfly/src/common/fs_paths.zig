@@ -33,10 +33,39 @@ fn logPathDebug(comptime event: []const u8, path: []const u8) void {
 
 pub fn createDirPathPortable(io: anytype, path: []const u8) !void {
     if (path.len == 0) return;
-    // `Dir.createDirPath` accepts relative and absolute paths. Keeping this on
-    // the borrowed interface is essential: a VoprIo directory handle is not a
-    // kernel descriptor and must never escape into a raw POSIX mkdir path.
-    try std.Io.Dir.cwd().createDirPath(io, path);
+    if (!std.fs.path.isAbsolute(path)) {
+        try std.Io.Dir.cwd().createDirPath(io, path);
+        return;
+    }
+
+    // Threaded's createDirPath verifies every existing component with lstat.
+    // That rejects otherwise valid absolute paths containing a directory
+    // symlink (notably /tmp on macOS). Resolve an existing target first, then
+    // create only missing ancestors. Every operation still uses the borrowed
+    // interface, which is essential for VoprIo directory-handle identity and
+    // fault injection.
+    try createAbsoluteDirPath(io, path);
+}
+
+fn createAbsoluteDirPath(io: std.Io, path: []const u8) anyerror!void {
+    if (std.Io.Dir.openDirAbsolute(io, path, .{})) |dir_value| {
+        var dir = dir_value;
+        dir.close(io);
+        return;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    const parent = std.fs.path.dirname(path) orelse return error.BadPathName;
+    if (!std.mem.eql(u8, parent, path)) try createAbsoluteDirPath(io, parent);
+    std.Io.Dir.createDirAbsolute(io, path, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            var dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
+            dir.close(io);
+        },
+        else => return err,
+    };
 }
 
 pub fn createFilePortable(io: anytype, path: []const u8, flags: std.Io.Dir.CreateFileOptions) !std.Io.File {

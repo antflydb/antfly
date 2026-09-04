@@ -2888,7 +2888,10 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     try backups_api.validateRestorableManifestLayout(&backup_manifest);
     try std.testing.expectEqualStrings("docs", backup_manifest.table_name);
 
+    const lifecycle_reads_before_drop = data_server.remoteMetadataLifecycleLinearizableReadsForTest();
     _ = try client.dropTable(base_uri, "docs");
+    const lifecycle_reads_after_drop = data_server.remoteMetadataLifecycleLinearizableReadsForTest();
+    try std.testing.expect(lifecycle_reads_after_drop > lifecycle_reads_before_drop);
 
     const restore_body =
         \\{"backup_id":"standalone-like-roundtrip-snap","location":"file:///","connection":"test-backups"}
@@ -2965,6 +2968,21 @@ test "public api standalone-like e2e backs up drops and restores a table" {
             "standalone-like restore timeout ranges={d} progress={d}\n",
             .{ snapshot.ranges.len, snapshot.restore_progresses.len },
         );
+        std.debug.print(
+            "restore catch-up dirty={} active={} started={d} completed={d} failed={d} groups={d} debt={d} cleared={d} busy={d} quarantined={d}\n",
+            .{
+                data_server.provisioned_startup_catch_up_dirty.load(.acquire),
+                data_server.provisioned_startup_catch_up_active.load(.acquire),
+                data_server.provisioned_startup_catch_up_started.load(.monotonic),
+                data_server.provisioned_startup_catch_up_completed.load(.monotonic),
+                data_server.provisioned_startup_catch_up_failed.load(.monotonic),
+                data_server.provisioned_startup_catch_up_last_group_count.load(.monotonic),
+                data_server.provisioned_startup_catch_up_last_groups_with_debt.load(.monotonic),
+                data_server.provisioned_startup_catch_up_last_groups_cleared.load(.monotonic),
+                data_server.provisioned_startup_catch_up_last_busy_groups.load(.monotonic),
+                data_server.provisioned_startup_catch_up_last_quarantined_groups.load(.monotonic),
+            },
+        );
         for (snapshot.ranges) |range| {
             std.debug.print(
                 "restore range table={d} group={d} backup={s} artifact={s} location={s} completed={s}\n",
@@ -3008,6 +3026,7 @@ test "public api standalone-like e2e backs up drops and restores a table" {
         }
         return error.RestoreJobTimeout;
     }
+    if (!restore_succeeded) return error.RestoreJobTimeout;
 
     var lookup = try client.fetchLookup(base_uri, "docs", "doc:a", null);
     defer lookup.deinit(std.testing.allocator);

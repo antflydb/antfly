@@ -1,0 +1,113 @@
+name: Package CLI artifacts
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Antfly version to publish, with or without v prefix"
+        required: true
+        type: string
+      source_commit:
+        description: "Immutable source commit that produced the native archives"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ZIG_VERSION: 0.16.0
+  ZIG_X86_64_LINUX_SHA256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+
+jobs:
+  package:
+    name: Build CLI package artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_commit }}
+
+      - name: Resolve version
+        id: version
+        env:
+          RAW_VERSION: ${{ inputs.version }}
+        run: |
+          raw="$RAW_VERSION"
+          version="${raw#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Download native Zig runtime archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: antfly-zig-*
+          merge-multiple: true
+          path: dist/release-archives
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: ts/package.json
+          registry-url: https://registry.npmjs.org/
+
+      - name: Set up Zig
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils
+          curl --fail --location --retry 3 \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "$ZIG_X86_64_LINUX_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Test Antfly C ABI packaging
+        run: python scripts/packaging/test_cabi_packaging.py
+
+      - name: Build wheels and populate npm packages
+        run: |
+          python scripts/packaging/package_cli_release.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --archive-dir dist/release-archives \
+            --out-dir dist/cli-packages
+
+      - name: Smoke check package wrappers
+        run: |
+          python -m compileall -q py/packages/cli/src/antfly_cli
+          node --test ts/packages/cli/test/*.test.js
+          node --check ts/packages/cli/bin/antfly.js
+
+      - name: Pack npm packages
+        run: |
+          set -euo pipefail
+          mkdir -p dist/cli-packages/npm
+          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-darwin-arm64
+          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-arm64
+          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-x64
+          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli
+
+      - name: Build and verify immutable CLI snapshot
+        run: |
+          python scripts/release/build_cli_snapshot.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --commit "${{ inputs.source_commit }}" \
+            --npm-dir dist/cli-packages/npm \
+            --python-dir dist/cli-packages/python \
+            --out-dir dist/cli-snapshot
+          python scripts/release/verify_cli_snapshot.py \
+            --snapshot-dir dist/cli-snapshot \
+            --version "${{ steps.version.outputs.version }}" \
+            --commit "${{ inputs.source_commit }}"
+
+      - name: Upload immutable CLI snapshot
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: antfly-cli-snapshot
+          path: dist/cli-snapshot/
+          if-no-files-found: error

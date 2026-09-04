@@ -57,6 +57,7 @@ const public_table_http = @import("public_table_http.zig");
 const stored_destination_authorization = @import("stored_destination_authorization.zig");
 const tables_api = @import("tables.zig");
 const table_contract = @import("table_contract.zig");
+const table_index_config = @import("table_index_config.zig");
 const table_reads = if (builtin.is_test) @import("table_reads.zig") else @import("table_read_source.zig");
 const table_writes = @import("table_writes.zig");
 const linear_merge_api = @import("linear_merge.zig");
@@ -74,6 +75,7 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_authority = @import("../metadata/authority.zig");
 const metadata_http_routes = @import("../metadata/http_routes.zig");
+const metadata_table_topology_mutations = @import("../metadata/table_topology_mutations.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const platform_time = @import("antfly_platform").time;
@@ -512,6 +514,37 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader(http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
         _ = ctx.response.body("{\"code\":\"metadata_leader_unavailable\",\"error\":\"metadata leader unavailable\",\"message\":\"metadata leader unavailable\",\"retryable\":true,\"retry_after_ms\":1000}");
         return ctx.response.build();
+    }
+
+    fn markMetadataMutationNotAdmitted(ctx: *httpx.Context) !void {
+        // This is stronger than the metadata routing hint: callers may replay
+        // a mutation only when the authority layer proved that no proposal was
+        // admitted. Keep this marker off ambiguous and read-only failures.
+        try ctx.setHeader(
+            http_common.metadata_mutation_not_admitted_header,
+            http_common.metadata_mutation_not_admitted_value,
+        );
+    }
+
+    fn metadataMutationNotAdmittedResponse(ctx: *httpx.Context) !httpx.Response {
+        try markMetadataMutationNotAdmitted(ctx);
+        return metadataNotLeaderResponse(ctx);
+    }
+
+    fn metadataMutationNotAdmittedTextResponse(ctx: *httpx.Context, message: []const u8) !httpx.Response {
+        try markMetadataMutationNotAdmitted(ctx);
+        try ctx.setHeader("Retry-After", "1");
+        _ = ctx.status(503);
+        return ctx.text(message);
+    }
+
+    fn metadataMutationOutcomeUnknownResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader(
+            metadata_http_routes.Routes.raft_mutation_outcome_header,
+            metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+        );
+        _ = ctx.status(409);
+        return ctx.text("table mutation outcome is unknown; observe table state before retrying");
     }
 
     fn mapIngressError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
@@ -4441,6 +4474,18 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text("unsupported table index configuration");
             },
+            error.MissingEmbeddingArtifactEnrichment => {
+                _ = ctx.status(400);
+                return ctx.text("embedding index source has no matching embedding enrichment");
+            },
+            error.EmbeddingArtifactDimensionRequired => {
+                _ = ctx.status(400);
+                return ctx.text("embedding enrichment must declare positive expected_dims");
+            },
+            error.ConflictingEmbeddingArtifactDimensions => {
+                _ = ctx.status(400);
+                return ctx.text("embedding index sources declare different dimensions");
+            },
             error.ModelNotFound => return respondJsonErrorBody(ctx, 404, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"),
             error.EmbeddingProbeUnavailable => {
                 _ = ctx.status(503);
@@ -4453,6 +4498,49 @@ pub const AntflyApiHandler = struct {
         tables_api.validatePublicAlgebraicIndexesJson(alloc, create_req.indexes_json orelse tables_api.default_indexes_json) catch {
             _ = ctx.status(400);
             return ctx.text("unsupported table index configuration");
+        };
+        table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
+            alloc,
+            create_req.indexes_json orelse tables_api.default_indexes_json,
+            .{
+                .antfly_provider = self.api_server.antfly_provider,
+                .io = self.api_server.inferenceIo(),
+                .secret_store = self.api_server.cfg.secret_store,
+                .remote_content = self.api_server.cfg.remote_content,
+                .inference_api_url = self.api_server.configuredInferenceAPIURL(),
+                .inference_api_key = self.api_server.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.ModelNotFound => return respondJsonErrorBody(ctx, 404, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"),
+            error.EmbeddingProbeUnavailable => {
+                _ = ctx.status(503);
+                return ctx.text("table index validation probe unavailable");
+            },
+            error.InvalidCreateTableRequest => {
+                _ = ctx.status(400);
+                return ctx.text("unsupported table index configuration");
+            },
+            error.MissingEmbeddingArtifactEnrichment => {
+                _ = ctx.status(400);
+                return ctx.text("embedding index source has no matching embedding enrichment");
+            },
+            error.MissingEmbeddingArtifactProducer => {
+                _ = ctx.status(400);
+                return ctx.text("embedding enrichment has no producer configuration");
+            },
+            error.InvalidEmbeddingArtifactProducer => {
+                _ = ctx.status(400);
+                return ctx.text("embedding enrichment producer is not runnable");
+            },
+            error.EmbeddingArtifactDimensionRequired => {
+                _ = ctx.status(400);
+                return ctx.text("embedding enrichment must declare positive expected_dims");
+            },
+            error.ConflictingEmbeddingArtifactDimensions => {
+                _ = ctx.status(400);
+                return ctx.text("embedding index sources declare different dimensions");
+            },
+            else => return err,
         };
         const destinations_allowed = (replicationDestinationsAllowed(
             alloc,
@@ -4525,45 +4613,34 @@ pub const AntflyApiHandler = struct {
                     return ctx.text("table topology changed; retry with the current table state");
                 },
                 error.TableTopologyProtocolUpgradeRequired => {
-                    try ctx.setHeader("Retry-After", "1");
-                    _ = ctx.status(503);
-                    return ctx.text("metadata cluster upgrade in progress; retry later");
+                    return metadataMutationNotAdmittedTextResponse(ctx, "metadata cluster upgrade in progress; retry later");
                 },
                 error.RaftMutationDeadlineExceeded => {
-                    try ctx.setHeader("Retry-After", "1");
-                    _ = ctx.status(503);
-                    return ctx.text("metadata mutation deadline exceeded before admission; retry later");
+                    return metadataMutationNotAdmittedTextResponse(ctx, "metadata mutation deadline exceeded before admission; retry later");
                 },
                 error.MetadataMutationOutcomeUnknown => {
-                    try ctx.setHeader(
-                        metadata_http_routes.Routes.raft_mutation_outcome_header,
-                        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
-                    );
-                    _ = ctx.status(409);
-                    return ctx.text("table mutation outcome is unknown; observe table state before retrying");
+                    return metadataMutationOutcomeUnknownResponse(ctx);
                 },
                 error.UnsupportedOperation => {
                     _ = ctx.status(405);
                     return ctx.text("method not allowed");
                 },
                 error.UnexpectedHttpStatus => {
-                    const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
-                    if (!self.api_server.shouldRetryConfiguredMetadataMutation(err, elapsed_ns, metadata_create_attempts)) {
-                        std.log.err("public create table metadata create failed table={s} err={}", .{ decoded_table_name, err });
-                        return err;
-                    }
-                    sleepNs(self.api_server.metadataMutationRetryPollNs());
-                    continue;
+                    // An opaque response proves neither rejection nor
+                    // admission. Replaying it can duplicate a committed DDL.
+                    return metadataMutationOutcomeUnknownResponse(ctx);
                 },
                 else => {
-                    if (metadata_authority.isRetryableError(err)) {
+                    if (metadata_authority.isMutationNotAdmittedError(err)) {
                         const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
                         if (self.api_server.shouldRetryConfiguredMetadataMutation(err, elapsed_ns, metadata_create_attempts)) {
                             sleepNs(self.api_server.metadataMutationRetryPollNs());
                             continue;
                         }
-                        return metadataNotLeaderResponse(ctx);
+                        return metadataMutationNotAdmittedResponse(ctx);
                     }
+                    if (metadata_authority.isRetryableError(err))
+                        return metadataMutationOutcomeUnknownResponse(ctx);
                     std.log.err("public create table metadata create failed table={s} err={}", .{ decoded_table_name, err });
                     return err;
                 },
@@ -4636,55 +4713,58 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_table_name);
-        var drop_result = self.api_server.source.dropTableExact(alloc, decoded_table_name) catch |err| switch (err) {
-            error.TableNotFound => {
-                _ = ctx.status(404);
-                return ctx.text("not found");
-            },
-            error.UnsupportedOperation => {
-                _ = ctx.status(405);
-                return ctx.text("method not allowed");
-            },
-            error.InvalidTableName => {
-                _ = ctx.status(400);
-                return ctx.text("invalid table name");
-            },
-            error.MetadataTopologyCommandTooLarge => {
-                _ = ctx.status(413);
-                return ctx.text("table topology exceeds the 3 MiB metadata command limit; reduce the initial shard count or table definition size");
-            },
-            error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => {
-                _ = ctx.status(409);
-                return ctx.text("table topology changed or is extension-owned");
-            },
-            error.TableTopologyProtocolUpgradeRequired => {
-                try ctx.setHeader("Retry-After", "1");
-                _ = ctx.status(503);
-                return ctx.text("metadata cluster upgrade in progress; retry later");
-            },
-            error.RaftMutationDeadlineExceeded => {
-                try ctx.setHeader("Retry-After", "1");
-                _ = ctx.status(503);
-                return ctx.text("metadata mutation deadline exceeded before admission; retry later");
-            },
-            error.NotLeader => {
-                return metadataNotLeaderResponse(ctx);
-            },
-            error.MetadataMutationOutcomeUnknown => {
-                try ctx.setHeader(
-                    metadata_http_routes.Routes.raft_mutation_outcome_header,
-                    metadata_http_routes.Routes.raft_mutation_outcome_unknown,
-                );
-                _ = ctx.status(409);
-                return ctx.text("table mutation outcome is unknown; observe table state before retrying");
-            },
-            else => {
-                if (metadata_authority.isRetryableError(err))
-                    return metadataNotLeaderResponse(ctx);
-                std.log.err("public drop table metadata remove failed table={s} err={s}", .{ decoded_table_name, @errorName(err) });
-                return err;
-            },
-        };
+        const metadata_drop_start_ns = platform_time.monotonicNs();
+        var metadata_drop_attempts: usize = 0;
+        var drop_result: metadata_table_topology_mutations.DropResult = undefined;
+        while (true) {
+            metadata_drop_attempts += 1;
+            drop_result = self.api_server.source.dropTableExact(alloc, decoded_table_name) catch |err| switch (err) {
+                error.TableNotFound => {
+                    _ = ctx.status(404);
+                    return ctx.text("not found");
+                },
+                error.UnsupportedOperation => {
+                    _ = ctx.status(405);
+                    return ctx.text("method not allowed");
+                },
+                error.InvalidTableName => {
+                    _ = ctx.status(400);
+                    return ctx.text("invalid table name");
+                },
+                error.MetadataTopologyCommandTooLarge => {
+                    _ = ctx.status(413);
+                    return ctx.text("table topology exceeds the 3 MiB metadata command limit; reduce the initial shard count or table definition size");
+                },
+                error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => {
+                    _ = ctx.status(409);
+                    return ctx.text("table topology changed or is extension-owned");
+                },
+                error.TableTopologyProtocolUpgradeRequired => {
+                    return metadataMutationNotAdmittedTextResponse(ctx, "metadata cluster upgrade in progress; retry later");
+                },
+                error.RaftMutationDeadlineExceeded => {
+                    return metadataMutationNotAdmittedTextResponse(ctx, "metadata mutation deadline exceeded before admission; retry later");
+                },
+                error.MetadataMutationOutcomeUnknown => {
+                    return metadataMutationOutcomeUnknownResponse(ctx);
+                },
+                else => {
+                    if (metadata_authority.isMutationNotAdmittedError(err)) {
+                        const elapsed_ns = platform_time.monotonicNs() -| metadata_drop_start_ns;
+                        if (self.api_server.shouldRetryConfiguredMetadataMutation(err, elapsed_ns, metadata_drop_attempts)) {
+                            sleepNs(self.api_server.metadataMutationRetryPollNs());
+                            continue;
+                        }
+                        return metadataMutationNotAdmittedResponse(ctx);
+                    }
+                    if (err == error.UnexpectedHttpStatus or metadata_authority.isRetryableError(err))
+                        return metadataMutationOutcomeUnknownResponse(ctx);
+                    std.log.err("public drop table metadata remove failed table={s} err={s}", .{ decoded_table_name, @errorName(err) });
+                    return err;
+                },
+            };
+            break;
+        }
         defer drop_result.deinit(alloc);
         var repair_required = false;
         // A forwarded metadata commit can return before this API node applies
