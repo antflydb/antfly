@@ -2646,6 +2646,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransactionSessionListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:

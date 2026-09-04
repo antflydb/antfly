@@ -3355,19 +3355,16 @@ pub const AntflyApiHandler = struct {
         const alloc = self.api_server.alloc;
         const limit = if (params.limit) |value|
             std.fmt.parseUnsigned(usize, value, 10) catch {
-                _ = ctx.status(400);
-                return ctx.text("invalid transaction session page limit");
+                return jsonErrorResponse(ctx, 400, "invalid transaction session page limit");
             }
         else
             100;
         if (limit == 0 or limit > 1000) {
-            _ = ctx.status(400);
-            return ctx.text("transaction session page limit must be between 1 and 1000");
+            return jsonErrorResponse(ctx, 400, "transaction session page limit must be between 1 and 1000");
         }
         const after = if (params.cursor) |value|
             transactions_api.decodeSessionListCursor(value) catch {
-                _ = ctx.status(400);
-                return ctx.text("invalid transaction session cursor");
+                return jsonErrorResponse(ctx, 400, "invalid transaction session cursor");
             }
         else
             null;

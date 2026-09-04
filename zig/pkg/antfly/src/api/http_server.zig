@@ -2667,6 +2667,7 @@ pub const ApiHttpServer = struct {
     txn_sessions: transactions_api.SessionRegistry = .{},
     last_session_cleanup_ns: std.atomic.Value(u64) = .init(0),
     receipt_admission_cleanup_mutex: std.atomic.Mutex = .unlocked,
+    receipt_admission_cleanup_generation: std.atomic.Value(u32) = .init(0),
     last_session_lease_renew_ns: std.atomic.Value(u64) = .init(0),
     last_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
     created_at_ns: u64 = 0,
@@ -6877,17 +6878,40 @@ pub const ApiHttpServer = struct {
     /// followers wait for that pass and retry admission without repeating the
     /// same storage scan.
     pub fn reclaimExpiredReceiptCapacity(self: *ApiHttpServer, io: std.Io) !usize {
+        const budget_ns = self.cfg.session_admission_cleanup_budget_ns;
+        const deadline_ns = platform_time.monotonicNs() +| budget_ns;
+        const observed_generation = self.receipt_admission_cleanup_generation.load(.acquire);
         if (!self.receipt_admission_cleanup_mutex.tryLock()) {
-            platform_sync.lockYieldingIo(&self.receipt_admission_cleanup_mutex, io);
-            self.receipt_admission_cleanup_mutex.unlock();
+            // Wait only for the pass that was in flight when this caller
+            // arrived. The generation closes the lost-wakeup race, while the
+            // Io futex preserves cancellation and the same admission budget
+            // bounds every follower independently.
+            if (self.receipt_admission_cleanup_generation.load(.acquire) == observed_generation) {
+                try io.futexWaitTimeout(
+                    u32,
+                    &self.receipt_admission_cleanup_generation.raw,
+                    observed_generation,
+                    .{ .duration = .{
+                        .clock = .awake,
+                        .raw = std.Io.Duration.fromNanoseconds(budget_ns),
+                    } },
+                );
+            }
             return 0;
         }
-        defer self.receipt_admission_cleanup_mutex.unlock();
+        defer {
+            self.receipt_admission_cleanup_mutex.unlock();
+            _ = self.receipt_admission_cleanup_generation.fetchAdd(1, .release);
+            io.futexWake(
+                u32,
+                &self.receipt_admission_cleanup_generation.raw,
+                std.math.maxInt(u32),
+            );
+        }
 
         const ttl_ns = self.cfg.session_ttl_ns orelse return 0;
         const receipt_ttl_ns = self.cfg.session_receipt_ttl_ns orelse ttl_ns;
         const now_ns = platform_time.realtimeNs();
-        const deadline_ns = platform_time.monotonicNs() +| self.cfg.session_admission_cleanup_budget_ns;
         return try self.txn_sessions.cleanupExpiredWithCutoffsBudget(
             self.alloc,
             0,
@@ -32853,6 +32877,47 @@ test "api http server paginates transaction session inventory" {
     defer second_page.deinit();
     try std.testing.expectEqual(@as(usize, 1), second_page.value.session_count);
     try std.testing.expect(second_page.value.next_cursor == null);
+
+    inline for ([_][]const u8{
+        "/transactions/inventory?limit=0",
+        "/transactions/inventory?limit=not-a-number",
+        "/transactions/inventory?cursor=not-a-cursor",
+    }) |uri| {
+        var invalid = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = uri });
+        defer invalid.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), invalid.status);
+        try std.testing.expectEqualStrings("application/json", invalid.content_type.?);
+        var parsed_error = try std.json.parseFromSlice(std.json.Value, alloc, invalid.body, .{});
+        defer parsed_error.deinit();
+        try std.testing.expect(parsed_error.value.object.get("error") != null);
+    }
+}
+
+test "receipt admission cleanup followers honor the cleanup budget" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .session_admission_cleanup_budget_ns = 2 * std.time.ns_per_ms,
+    }, source.iface(), null, null);
+    defer server.deinit();
+
+    try std.testing.expect(server.receipt_admission_cleanup_mutex.tryLock());
+    defer server.receipt_admission_cleanup_mutex.unlock();
+    const started_ns = platform_time.monotonicNs();
+    try std.testing.expectEqual(@as(usize, 0), try server.reclaimExpiredReceiptCapacity(std.testing.io));
+    const elapsed_ns = platform_time.monotonicNs() -| started_ns;
+    // A stalled leader must not turn the opportunistic admission pass into an
+    // unbounded request queue. Leave ample sanitizer/CI scheduling headroom.
+    try std.testing.expect(elapsed_ns < 250 * std.time.ns_per_ms);
 }
 
 test "api http server reloads durable transaction sessions after restart" {

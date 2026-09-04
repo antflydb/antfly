@@ -15777,6 +15777,7 @@ export interface operations {
                     "application/json": components["schemas"]["TransactionSessionListResponse"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             500: components["responses"]["InternalServerError"];
         };
     };
