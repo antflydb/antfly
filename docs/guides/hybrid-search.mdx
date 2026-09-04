@@ -140,11 +140,12 @@ field remains as a deprecated limit override and is validated against
 `candidate_count`. Reranking changes the returned order and page, while
 `hits.total` continues to report the underlying retrieval match count. The
 effective candidate window is capped at 1,000, including when it is derived
-from `offset + limit`; oversized requests are rejected before shard fan-out or
-provider work begins.
+from `offset + limit`. Vertex has a provider-specific ceiling of 200. Oversized
+requests return `422 reranker_candidate_limit_exceeded` with the selected
+provider and its exact maximum before shard fan-out or provider work begins.
 
 <Callout type="tip">
-Set `candidate_count` higher than `offset + limit` (often 50-100, up to 1,000) to improve recall while keeping remote scoring cost bounded. Use the normal query `limit` for the final response size. A larger candidate set can improve recall but increases latency and external-provider cost.
+Set `candidate_count` higher than `offset + limit` (often 50-100, up to 1,000; Vertex supports up to 200) to improve recall while keeping remote scoring cost bounded. Use the normal query `limit` for the final response size. A larger candidate set can improve recall but increases latency and external-provider cost.
 </Callout>
 
 ## Pruning
