@@ -3263,6 +3263,21 @@ const NativeColdSequentialReader = struct {
         for (ranges) |range| stats.logical_bytes +|= range.destination.len;
         if (ranges.len == 0) return stats;
 
+        // Buffered platforms can fill a singleton destination directly. Most
+        // projection-build leaf batches touch a shard once, so forcing those
+        // reads through the coalescing bounce buffer adds a copy without
+        // creating a larger physical extent. O_DIRECT still needs the aligned
+        // scratch path below.
+        if (ranges.len == 1 and !self.direct_io.load(.acquire)) {
+            const range = ranges[0];
+            if (range.destination.len != 0) {
+                try readAllAtOffset(self.fd, range.destination, range.offset);
+                stats.physical_bytes = range.destination.len;
+                stats.physical_reads = 1;
+            }
+            return stats;
+        }
+
         // O_DIRECT requires aligned offsets, lengths, and destination buffers.
         // One reusable extent per descriptor coalesces the already sorted
         // projection stream. This avoids issuing and serializing one aligned
@@ -4116,6 +4131,15 @@ test "cold sequential reader is isolated from foreground descriptor cache" {
     random_reader.releaseScratch();
     try random_reader.readRangeInto(0, &first);
     try std.testing.expectEqualStrings("ab", &first);
+    var singleton: [2]u8 = undefined;
+    const singleton_stats = try random_reader.readRangesInto(&.{.{
+        .offset = 2,
+        .destination = &singleton,
+    }});
+    try std.testing.expectEqualStrings("cd", &singleton);
+    try std.testing.expectEqual(@as(u64, 2), singleton_stats.logical_bytes);
+    try std.testing.expectEqual(@as(u64, 1), singleton_stats.physical_reads);
+    try std.testing.expect(singleton_stats.physical_bytes >= singleton_stats.logical_bytes);
     random_reader.deinit();
     try std.testing.expectEqual(before, native.snapshotStats().fd_admitted_descriptors);
 }

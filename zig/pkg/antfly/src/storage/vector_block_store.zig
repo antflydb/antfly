@@ -1433,11 +1433,41 @@ pub const Opened = struct {
             }
         };
 
+        const ProjectionReadGroup = struct {
+            session: *ColdProjectionSession,
+            requests: []ProjectionReadRequest,
+            ordered: []const OrderedProjection,
+            ranges: []const lsm_backend.storage_io.ColdReadRange,
+            stats: lsm_backend.storage_io.ColdReadStats = .{},
+
+            fn run(self: *ProjectionReadGroup) std.Io.Cancelable!void {
+                std.debug.assert(self.ordered.len > 0 and self.ordered.len == self.ranges.len);
+                const reader_index = self.ordered[0].reader_index;
+                self.stats = self.session.readers[reader_index].readRangesInto(self.ranges) catch |err| {
+                    for (self.ordered) |ordered| self.requests[ordered.request_index].err = err;
+                    self.session.readers[reader_index].releaseScratch();
+                    return;
+                };
+                self.session.readers[reader_index].releaseScratch();
+                for (self.ordered) |ordered| {
+                    const request = &self.requests[ordered.request_index];
+                    const block = request.located.block;
+                    request.value = block.location.projectionValueFromPayload(
+                        request.scratch[0..block.location.vector_len],
+                    ) catch |err| {
+                        request.err = err;
+                        continue;
+                    };
+                }
+            }
+        };
+
         opened: *const Opened,
         readers: []lsm_backend.storage_io.ColdSequentialReader,
         opened_readers: usize = 0,
         ordered: std.ArrayListUnmanaged(OrderedProjection) = .empty,
         ranges: std.ArrayListUnmanaged(lsm_backend.storage_io.ColdReadRange) = .empty,
+        groups: std.ArrayListUnmanaged(ProjectionReadGroup) = .empty,
 
         fn init(opened: *const Opened) !ColdProjectionSession {
             if (opened.blocks.len > opened.store.storage.coldSequentialReaderCapacity())
@@ -1458,41 +1488,19 @@ pub const Opened = struct {
             for (self.readers[0..self.opened_readers]) |*reader| reader.deinit();
             self.ordered.deinit(self.opened.store.alloc);
             self.ranges.deinit(self.opened.store.alloc);
+            self.groups.deinit(self.opened.store.alloc);
             self.opened.store.alloc.free(self.readers);
             self.* = undefined;
         }
 
-        fn readProjectionInto(
-            self: *const ColdProjectionSession,
-            located: LocatedValue,
-            scratch: []u8,
-        ) !vector_block.Value {
-            return switch (located) {
-                .wal => |value| value,
-                .block => |block| blk: {
-                    _ = try self.opened.readerForLocated(block.reader_index, block.reader_generation, block.reader_shard_id);
-                    if (scratch.len < block.location.vector_len) return error.BufferTooSmall;
-                    const vector_bytes = scratch[0..block.location.vector_len];
-                    try self.readers[block.reader_index].readRangeInto(@intCast(block.location.vector_offset), vector_bytes);
-                    break :blk try block.location.projectionValueFromPayload(vector_bytes);
-                },
-            };
-        }
-
-        fn runProjectionRead(self: *const ColdProjectionSession, request: *ProjectionReadRequest) std.Io.Cancelable!void {
-            request.value = self.readProjectionInto(request.located, request.scratch) catch |err| {
-                request.err = err;
-                return;
-            };
-        }
-
         pub fn readProjectionsIntoBatch(
             self: *ColdProjectionSession,
-            _: ?std.Io,
+            maybe_io: ?std.Io,
             requests: []ProjectionReadRequest,
         ) !ReadBatchStats {
             self.ordered.clearRetainingCapacity();
             self.ranges.clearRetainingCapacity();
+            self.groups.clearRetainingCapacity();
             try self.ordered.ensureTotalCapacity(self.opened.store.alloc, requests.len);
             try self.ranges.ensureTotalCapacity(self.opened.store.alloc, requests.len);
             for (requests, 0..) |*request, request_index| {
@@ -1516,44 +1524,56 @@ pub const Opened = struct {
             }
             std.mem.sort(OrderedProjection, self.ordered.items, {}, OrderedProjection.lessThan);
 
-            var stats: ReadBatchStats = .{};
+            for (self.ordered.items) |ordered| {
+                const request = &requests[ordered.request_index];
+                const block = request.located.block;
+                self.ranges.appendAssumeCapacity(.{
+                    .offset = ordered.offset,
+                    .destination = request.scratch[0..block.location.vector_len],
+                });
+            }
+            try self.groups.ensureTotalCapacity(self.opened.store.alloc, self.readers.len);
             var start: usize = 0;
             while (start < self.ordered.items.len) {
                 const reader_index = self.ordered.items[start].reader_index;
                 var end = start + 1;
                 while (end < self.ordered.items.len and self.ordered.items[end].reader_index == reader_index) : (end += 1) {}
-                self.ranges.clearRetainingCapacity();
-                for (self.ordered.items[start..end]) |ordered| {
-                    const request = &requests[ordered.request_index];
-                    const block = request.located.block;
-                    self.ranges.appendAssumeCapacity(.{
-                        .offset = ordered.offset,
-                        .destination = request.scratch[0..block.location.vector_len],
-                    });
-                }
-                const read_result = self.readers[reader_index].readRangesInto(self.ranges.items);
-                // Groups are processed serially in physical order. Keeping the
-                // descriptor but dropping its bounce extent bounds publication
-                // scratch to one group instead of one maximum extent per shard.
-                self.readers[reader_index].releaseScratch();
-                const read_stats = read_result catch |err| {
-                    for (self.ordered.items[start..end]) |ordered| requests[ordered.request_index].err = err;
+                self.groups.appendAssumeCapacity(.{
+                    .session = self,
+                    .requests = requests,
+                    .ordered = self.ordered.items[start..end],
+                    .ranges = self.ranges.items[start..end],
+                });
+                start = end;
+            }
+
+            const io = maybe_io;
+            start = 0;
+            var concurrency_available = io != null;
+            while (start < self.groups.items.len) {
+                const end = @min(self.groups.items.len, start + Opened.positional_read_wave);
+                if (!concurrency_available) {
+                    for (self.groups.items[start..end]) |*group| try group.run();
                     start = end;
                     continue;
-                };
-                stats.physical_reads +|= read_stats.physical_reads;
-                stats.physical_bytes +|= read_stats.physical_bytes;
-                for (self.ordered.items[start..end]) |ordered| {
-                    const request = &requests[ordered.request_index];
-                    const block = request.located.block;
-                    request.value = block.location.projectionValueFromPayload(
-                        request.scratch[0..block.location.vector_len],
-                    ) catch |err| {
-                        request.err = err;
-                        continue;
+                }
+                var io_group = std.Io.Group.init;
+                var scheduled_end = start;
+                while (scheduled_end < end) : (scheduled_end += 1) {
+                    io_group.concurrent(io.?, ProjectionReadGroup.run, .{&self.groups.items[scheduled_end]}) catch {
+                        concurrency_available = false;
+                        break;
                     };
                 }
+                try io_group.await(io.?);
+                for (self.groups.items[scheduled_end..end]) |*group| try group.run();
                 start = end;
+            }
+
+            var stats: ReadBatchStats = .{};
+            for (self.groups.items) |group| {
+                stats.physical_reads +|= group.stats.physical_reads;
+                stats.physical_bytes +|= group.stats.physical_bytes;
             }
             return stats;
         }

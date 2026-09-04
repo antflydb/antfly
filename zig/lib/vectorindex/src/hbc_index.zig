@@ -2554,7 +2554,9 @@ fn searchProfiledRequestAttempt(
     try search_types.checkCancelled(req);
     const setup_start = total_start;
     const txn_start = now_fn_u64();
-    var txn = if (comptime @hasDecl(Index, "beginRuntimeSearchTxnForCoverage"))
+    var txn = if (comptime @hasDecl(Index, "beginRuntimeSearchTxnForCoverageWithAdmission"))
+        try self.beginRuntimeSearchTxnForCoverageWithAdmission(&search_admission, exhaustive_coverage)
+    else if (comptime @hasDecl(Index, "beginRuntimeSearchTxnForCoverage"))
         try self.beginRuntimeSearchTxnForCoverage(exhaustive_coverage)
     else
         try self.beginRuntimeSearchTxn();

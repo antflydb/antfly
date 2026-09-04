@@ -4486,6 +4486,61 @@ projection chunks instead of rereading and rewriting the complete 1.83-GB
 generation. Until then, private cold descriptors bound cache overlap at a
 modest two-percent total-load cost without affecting foreground query layout.
 
+A first follow-up tried to make both admission and those cold reads more
+precise. It authenticated conservative per-generation leaf occupancy and scan
+bytes in the quantized-directory header, sorted projection requests by physical
+offset, and coalesced neighboring reads. That 50K run inserted in 17.94 seconds
+and reached ready in 34.34 seconds, but it was rejected during the query curve:
+the temporary root-only generation had raised a process-lifetime admission
+floor which could never fall after compact publication. Every query was still
+charged 214.70 MB, only one query fit in the 402.65-MB node budget, the queue
+reached 19 requests, and cumulative wait time exceeded 572 seconds. Concurrency
+10 consequently collapsed to 288.5 QPS. This was an admission-accounting bug,
+not a routing, recall, or rerank change.
+
+Admission is now generation-coupled instead of process-monotonic. A request
+samples the current authenticated cost without retaining the generation while
+it waits. After receiving bandwidth it retains the then-current immutable
+generation, re-estimates its cost, and retries only if the bound generation is
+more expensive than the permit request. The retained generation transfers
+directly into the search transaction. Thus a query can never scan a more
+expensive generation than it was charged for, while a compact replacement can
+immediately lower the charge. A deterministic test publishes an expensive
+generation, admits a request, installs a compact generation, and proves that
+the first request remains on the old generation while the next permit falls
+from 25.6 KB to 128 bytes. The wait path still owns no MVCC transaction,
+request scratch, or large generation lease.
+
+The coalesced projection reader also now preserves bounded parallelism: ranges
+within one physical reader are coalesced, up to eight independent reader groups
+run concurrently, and each at-most-1-MiB bounce extent is released as soon as
+its group completes. Buffered singleton groups read directly into the caller's
+destination, avoiding a bounce allocation and copy when coalescing cannot save
+an I/O. Linux O_DIRECT continues to use aligned scratch. This bounds the extra
+maintenance scratch at approximately 8 MiB rather than one extent per shard.
+
+The final fresh public-API 50K qualification used the same batch-100,
+four-worker, native-HBC, float16-vector-block, boundary-rerank configuration.
+It reached ready in 31.2811 seconds (14.1282 insert + 17.1529 catch-up), retained
+0.9855 recall, and produced the following live curve:
+
+| concurrency | 1 | 10 | 20 | 30 |
+| --- | ---: | ---: | ---: | ---: |
+| QPS | 225.4 | 929.9 | 1,017.2 | 1,029.4 |
+| p95 latency | 5.91 ms | 21.33 ms | 53.67 ms | 76.00 ms |
+
+The machine remained contended by unrelated repository tests, so those
+absolute QPS values are not an uncontended replacement for the earlier
+274/1,109/1,198/1,229 curve. They do establish that the admission regression is
+gone: the governor held all 30 concurrent queries, peaked at 201.28 MB admitted
+against 402.65 MB capacity, and recorded zero queued requests, waits,
+cancellations, or wait time. The detailed public profile scored 23,707.5
+approximate and 137.3 exact vectors/query with 3.492-ms mean and 3.924-ms p95
+server time. Live/restart peak RSS was 1.103 GB / 339 MB. The strict AFQD schema
+is now version 1; numeric revisions 1--5 from earlier commits on this unreleased
+branch are intentionally unsupported, while released legacy-index migration
+remains governed by the separate public index lifecycle.
+
 ## Next checks
 
 1. Narrow broad persisted L0 source ranges with adaptive, workload-independent

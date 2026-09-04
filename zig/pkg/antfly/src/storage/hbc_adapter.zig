@@ -3985,9 +3985,6 @@ pub const HBCIndex = struct {
     dense_search_scan_vectors_per_leaf_high_water: AtomicU64 = .init(0),
     dense_search_scan_bytes_per_leaf_ewma: AtomicU64 = .init(0),
     dense_search_scan_bytes_per_leaf_high_water: AtomicU64 = .init(0),
-    dense_search_scan_vectors_per_leaf_floor: AtomicU64 = .init(0),
-    dense_search_unfiltered_bytes_per_leaf_floor: AtomicU64 = .init(0),
-    dense_search_filtered_bytes_per_leaf_floor: AtomicU64 = .init(0),
     write_profile: WriteProfile = .{},
     external_vector_ctx: ?*anyopaque = null,
     external_vector_loader: ?ExternalVectorLoader = null,
@@ -6885,35 +6882,11 @@ pub const HBCIndex = struct {
         if (old) |generation| generation.release();
     }
 
-    fn raiseAtomicFloor(slot: *AtomicU64, value: u64) void {
-        var current = slot.load(.acquire);
-        while (value > current) {
-            if (slot.cmpxchgWeak(current, value, .release, .acquire)) |observed|
-                current = observed
-            else
-                return;
-        }
-    }
-
-    fn publishDenseScanAdmissionFloor(
-        self: *HBCIndex,
-        admission: vectorindex_quantized_directory.AdmissionStats,
-    ) void {
-        // Serving admission precedes generation acquisition. Floors therefore
-        // remain monotonic for this process so a query admitted against an old
-        // leased generation cannot race a lower replacement. Restart restores
-        // the exact current-generation floor from its authenticated header.
-        raiseAtomicFloor(&self.dense_search_scan_vectors_per_leaf_floor, admission.max_leaf_vectors);
-        raiseAtomicFloor(&self.dense_search_unfiltered_bytes_per_leaf_floor, admission.max_unfiltered_scan_bytes);
-        raiseAtomicFloor(&self.dense_search_filtered_bytes_per_leaf_floor, admission.max_filtered_scan_bytes);
-    }
-
     fn installExperimentalPostingReadGeneration(
         self: *HBCIndex,
         generation: *ExperimentalPostingReadGeneration,
     ) void {
         lockAtomic(&self.experimental_posting_read_generation_mu);
-        self.publishDenseScanAdmissionFloor(generation.scan_admission);
         const old = self.experimental_posting_read_generation;
         self.experimental_posting_read_generation = generation;
         self.experimental_posting_reads_enabled.store(true, .release);
@@ -7364,7 +7337,6 @@ pub const HBCIndex = struct {
                             );
                         }
                     }
-                    self.publishDenseScanAdmissionFloor(current.scan_admission);
                     current.advanceDurableBoundary(
                         covered_source_sequence,
                         durable_wal_generation,
@@ -10709,6 +10681,31 @@ pub const HBCIndex = struct {
             try self.beginRuntimeCompleteSearchTxn()
         else
             try self.beginRuntimeSearchTxn();
+    }
+
+    /// Start the search transaction on the immutable generation whose scan
+    /// cost was validated after bandwidth admission. The generation is not
+    /// retained while the request waits in the admission queue; once admitted,
+    /// binding it here prevents a concurrent publication from changing the
+    /// physical scan shape underneath the granted permit.
+    pub fn beginRuntimeSearchTxnForCoverageWithAdmission(
+        self: *HBCIndex,
+        admission: *SearchAdmissionLease,
+        complete_snapshot: bool,
+    ) !vectorindex_store.NamespaceReadTxn {
+        if (admission.takeGeneration()) |generation| {
+            if (self.nativeHbcAuthoritative()) {
+                var txn = self.nativeReadTxn();
+                txn.read_lease = .{
+                    .ptr = generation,
+                    .release = ExperimentalPostingReadGeneration.releaseOpaque,
+                };
+                txn.cache_fill_epoch = self.beginSearchCacheFill();
+                return txn;
+            }
+            generation.release();
+        }
+        return try self.beginRuntimeSearchTxnForCoverage(complete_snapshot);
     }
 
     pub fn beginCompleteSnapshotRead(
@@ -14902,13 +14899,30 @@ pub const HBCIndex = struct {
         return try vectorindex_hbc_index.search(self, query, k, nowNs, elapsedSince);
     }
 
-    pub fn acquireSearchAdmission(
+    pub const SearchAdmissionLease = struct {
+        bandwidth: resource_manager_mod.DenseSearchAdmissionLease = .{},
+        generation: ?*ExperimentalPostingReadGeneration = null,
+
+        fn takeGeneration(self: *@This()) ?*ExperimentalPostingReadGeneration {
+            const generation = self.generation;
+            self.generation = null;
+            return generation;
+        }
+
+        fn release(self: *@This()) void {
+            if (self.generation) |generation| generation.release();
+            self.bandwidth.release();
+            self.* = .{};
+        }
+    };
+
+    fn estimateSearchAdmissionBytes(
         self: *HBCIndex,
         active_count: u64,
         node_count: u64,
         req: SearchRequest,
-    ) !resource_manager_mod.DenseSearchAdmissionLease {
-        const manager = self.resource_manager orelse return .{};
+        persisted_admission: ?vectorindex_quantized_directory.AdmissionStats,
+    ) u64 {
         const search_width: u64 = @intCast(req.search_width orelse self.config.search_width);
         const branching_factor: u64 = @intCast(@max(self.config.branching_factor, 2));
         // A bulk-built high-fanout tree has approximately one internal node
@@ -14922,7 +14936,7 @@ pub const HBCIndex = struct {
             std.math.divCeil(u64, node_count - 1, branching_factor) catch unreachable;
         const estimated_leaf_count = @max(node_count -| estimated_internal_nodes, 1);
         const mean_leaf_occupancy = std.math.divCeil(u64, active_count, estimated_leaf_count) catch unreachable;
-        const persisted_occupancy = self.dense_search_scan_vectors_per_leaf_floor.load(.acquire);
+        const persisted_occupancy = if (persisted_admission) |admission| admission.max_leaf_vectors else 0;
         const learned_occupancy = if (persisted_occupancy == 0)
             @max(
                 self.dense_search_scan_vectors_per_leaf_high_water.load(.acquire),
@@ -14951,9 +14965,8 @@ pub const HBCIndex = struct {
             req.filter_ids.len != 0 or req.exclude_ids.len != 0 or
             req.distance_over != null or req.distance_under != null;
         const persisted_leaf_bytes = if (needs_projection_scan)
-            self.dense_search_filtered_bytes_per_leaf_floor.load(.acquire)
-        else
-            self.dense_search_unfiltered_bytes_per_leaf_floor.load(.acquire);
+            if (persisted_admission) |admission| admission.max_filtered_scan_bytes else 0
+        else if (persisted_admission) |admission| admission.max_unfiltered_scan_bytes else 0;
         const learned_leaf_bytes = if (persisted_leaf_bytes == 0)
             @max(
                 self.dense_search_scan_bytes_per_leaf_high_water.load(.acquire),
@@ -14963,20 +14976,61 @@ pub const HBCIndex = struct {
             0;
         const layout_scan_bytes = search_width *| @max(persisted_leaf_bytes, learned_leaf_bytes);
         const max_possible_scan_bytes = active_count *| dimensions *| @sizeOf(f32);
-        const estimated_scan_bytes = @max(
+        return @max(
             @min(@max(baseline_scan_bytes, layout_scan_bytes), max_possible_scan_bytes),
             1,
         );
+    }
+
+    pub fn acquireSearchAdmission(
+        self: *HBCIndex,
+        active_count: u64,
+        node_count: u64,
+        req: SearchRequest,
+    ) !SearchAdmissionLease {
+        const manager = self.resource_manager orelse return .{};
         const cancellation: ?resource_manager_mod.DenseSearchCancellation = if (req.cancellation) |token|
             .{ .ptr = token.ptr, .is_cancelled = token.is_cancelled_fn }
         else
             null;
-        return try manager.acquireDenseSearchBandwidth(estimated_scan_bytes, cancellation, self.runtimeIo());
+        var minimum_bytes: u64 = 0;
+        while (true) {
+            const sampled_generation = self.acquireExperimentalPostingReadGeneration();
+            const sampled_admission = if (sampled_generation) |generation| generation.scan_admission else null;
+            if (sampled_generation) |generation| generation.release();
+            const requested_bytes = @max(
+                minimum_bytes,
+                self.estimateSearchAdmissionBytes(active_count, node_count, req, sampled_admission),
+            );
+            var bandwidth = try manager.acquireDenseSearchBandwidth(requested_bytes, cancellation, self.runtimeIo());
+            if (bandwidth.manager == null) return .{};
+
+            const generation = self.acquireExperimentalPostingReadGeneration();
+            if (generation) |bound| {
+                if (self.nativeHbcAuthoritative()) {
+                    const bound_bytes = self.estimateSearchAdmissionBytes(
+                        active_count,
+                        node_count,
+                        req,
+                        bound.scan_admission,
+                    );
+                    if (bound_bytes <= requested_bytes) {
+                        return .{ .bandwidth = bandwidth, .generation = bound };
+                    }
+                    bound.release();
+                    bandwidth.release();
+                    minimum_bytes = bound_bytes;
+                    continue;
+                }
+                bound.release();
+            }
+            return .{ .bandwidth = bandwidth };
+        }
     }
 
     pub fn releaseSearchAdmission(
         self: *HBCIndex,
-        lease: *resource_manager_mod.DenseSearchAdmissionLease,
+        lease: *SearchAdmissionLease,
     ) void {
         _ = self;
         lease.release();
@@ -19429,8 +19483,80 @@ test "hbc search charges estimated quantized scan bytes to node admission" {
         .k = 1,
         .search_width = 2,
     });
-    try std.testing.expectEqual(@as(u64, 112), skew_lease.bytes);
+    try std.testing.expectEqual(@as(u64, 112), skew_lease.bandwidth.bytes);
     idx.releaseSearchAdmission(&skew_lease);
+}
+
+test "hbc admission follows and pins the current immutable generation" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+        .dense_search_bandwidth_capacity_bytes = 1024 * 1024,
+    });
+    defer resource_manager.deinit(alloc);
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 64,
+        .leaf_size = 2,
+        .branching_factor = 2,
+        .search_width = 2,
+    });
+    defer idx.close();
+    idx.attachResourceManager(&resource_manager);
+    const Loader = struct {
+        fn load(_: *anyopaque, _: Allocator, _: u64, _: []const u8) ![]f32 {
+            return error.NotFound;
+        }
+    };
+    var loader_context: u8 = 0;
+    idx.setExternalVectorLoader(&loader_context, Loader.load);
+    idx.experimental_posting_wal_authoritative.store(true, .release);
+
+    const segment = try buildTestExperimentalPostingSegment(alloc, 1, .posting_state, 1, &.{1});
+    defer alloc.free(segment);
+    const expensive_state = try createTestExperimentalPostingReadState(alloc, &.{segment});
+    expensive_state.scan_admission = .{
+        .max_leaf_vectors = 100,
+        .max_unfiltered_scan_bytes = 64 * 100 * @sizeOf(f32),
+        .max_filtered_scan_bytes = 64 * 100 * @sizeOf(f32),
+    };
+    const expensive_generation = try ExperimentalPostingReadGeneration.createRoot(alloc, expensive_state);
+    idx.installExperimentalPostingReadGeneration(expensive_generation);
+
+    var expensive_lease = try idx.acquireSearchAdmission(100, 51, .{
+        .query = &([_]f32{0} ** 64),
+        .k = 1,
+    });
+    defer idx.releaseSearchAdmission(&expensive_lease);
+    try std.testing.expectEqual(@as(u64, 25_600), expensive_lease.bandwidth.bytes);
+    try std.testing.expect(expensive_lease.generation == expensive_generation);
+
+    const compact_state = try createTestExperimentalPostingReadState(alloc, &.{segment});
+    compact_state.scan_admission = .{
+        .max_leaf_vectors = 2,
+        .max_unfiltered_scan_bytes = 64,
+        .max_filtered_scan_bytes = 64,
+    };
+    const compact_generation = try ExperimentalPostingReadGeneration.createRoot(alloc, compact_state);
+    idx.installExperimentalPostingReadGeneration(compact_generation);
+
+    // The already-admitted request remains bound to the generation whose
+    // larger scan it was charged for, even after CURRENT moves forward.
+    var expensive_txn = try idx.beginRuntimeSearchTxnForCoverageWithAdmission(&expensive_lease, false);
+    try std.testing.expect(HBCIndex.experimentalPostingGenerationFromTxn(&expensive_txn) == expensive_generation);
+    expensive_txn.abort();
+
+    // New requests immediately use the compact generation's lower bound; no
+    // process-lifetime high-water survives an obsolete bootstrap generation.
+    var compact_lease = try idx.acquireSearchAdmission(100, 51, .{
+        .query = &([_]f32{0} ** 64),
+        .k = 1,
+    });
+    defer idx.releaseSearchAdmission(&compact_lease);
+    try std.testing.expectEqual(@as(u64, 128), compact_lease.bandwidth.bytes);
+    try std.testing.expect(compact_lease.generation == compact_generation);
 }
 
 test "hbc resource manager reattachment is idempotent and transfers local cache usage" {
@@ -20445,18 +20571,9 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
         // The compact directory header restores conservative query admission
         // immediately on reopen. Root-only trees use the float32 fallback
         // bound because they have no posting-local projection plane.
-        try std.testing.expectEqual(
-            @as(u64, 2),
-            reopened.dense_search_scan_vectors_per_leaf_floor.load(.acquire),
-        );
-        try std.testing.expectEqual(
-            @as(u64, 16),
-            reopened.dense_search_unfiltered_bytes_per_leaf_floor.load(.acquire),
-        );
-        try std.testing.expectEqual(
-            @as(u64, 16),
-            reopened.dense_search_filtered_bytes_per_leaf_floor.load(.acquire),
-        );
+        try std.testing.expectEqual(@as(u64, 2), reopened.experimental_posting_read_generation.?.scan_admission.max_leaf_vectors);
+        try std.testing.expectEqual(@as(u64, 16), reopened.experimental_posting_read_generation.?.scan_admission.max_unfiltered_scan_bytes);
+        try std.testing.expectEqual(@as(u64, 16), reopened.experimental_posting_read_generation.?.scan_admission.max_filtered_scan_bytes);
 
         var results = try reopened.search(&[_]f32{ 1.0, 0.0 }, 1);
         defer results.deinit();

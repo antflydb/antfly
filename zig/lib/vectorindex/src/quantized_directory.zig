@@ -25,10 +25,10 @@ const hbc_runtime = @import("hbc_runtime.zig");
 
 const Allocator = std.mem.Allocator;
 const magic: [4]u8 = "AFQD".*;
-const version: u16 = 6;
-const min_supported_version: u16 = 1;
-const header_size: usize = 32;
-const current_header_size: usize = 64;
+// First released schema for the native-v2 index. Earlier numeric revisions
+// existed only on this development branch and are intentionally unsupported.
+const version: u16 = 1;
+const header_size: usize = 64;
 const entry_header_size: usize = 32;
 const index_entry_size: usize = 20;
 const entry_alignment: usize = 64;
@@ -61,7 +61,7 @@ pub const AdmissionStats = struct {
     }
 };
 
-fn encodeAdmissionStats(header: *[current_header_size]u8, stats: AdmissionStats) void {
+fn encodeAdmissionStats(header: *[header_size]u8, stats: AdmissionStats) void {
     writeU64(header, 32, stats.max_leaf_vectors);
     writeU64(header, 40, stats.max_unfiltered_scan_bytes);
     writeU64(header, 48, stats.max_filtered_scan_bytes);
@@ -69,9 +69,8 @@ fn encodeAdmissionStats(header: *[current_header_size]u8, stats: AdmissionStats)
     writeU32(header, 60, 0);
 }
 
-fn decodeAdmissionStats(data: []const u8, encoded_version: u16) !AdmissionStats {
-    if (encoded_version < 6) return .{};
-    if (data.len < current_header_size or readU32(data, 60) != 0 or
+fn decodeAdmissionStats(data: []const u8) !AdmissionStats {
+    if (data.len < header_size or readU32(data, 60) != 0 or
         readU32(data, 56) != std.hash.Crc32.hash(data[0..56]))
     {
         return error.QuantizedDirectoryAdmissionChecksumMismatch;
@@ -150,7 +149,7 @@ pub const Writer = struct {
         if (dims == 0 or dims > std.math.maxInt(u32)) return error.InvalidQuantizedDirectoryConfig;
         var self: Writer = .{ .alloc = alloc, .dims = dims, .metric = metric };
         errdefer self.deinit();
-        try appendZeros(alloc, &self.out, current_header_size);
+        try appendZeros(alloc, &self.out, header_size);
         return self;
     }
 
@@ -331,7 +330,7 @@ pub const Writer = struct {
         writeU32(self.out.items, 12, std.hash.Crc32.hash(self.out.items[index_offset..]));
         writeU64(self.out.items, 16, @intCast(self.posting_ids.items.len));
         writeU64(self.out.items, 24, @intCast(index_offset));
-        encodeAdmissionStats(self.out.items[0..current_header_size], self.admission_stats);
+        encodeAdmissionStats(self.out.items[0..header_size], self.admission_stats);
         const owned = try self.out.toOwnedSlice(self.alloc);
         self.out = .empty;
         return owned;
@@ -366,7 +365,7 @@ pub const StreamingWriter = struct {
     pub fn init(alloc: Allocator, sink: anytype, dims: usize, metric: u8) !StreamingWriter {
         if (dims == 0 or dims > std.math.maxInt(u32)) return error.InvalidQuantizedDirectoryConfig;
         const base_offset = sink.len();
-        var zeros: [current_header_size]u8 = @splat(0);
+        var zeros: [header_size]u8 = @splat(0);
         try sink.appendSlice(&zeros);
         return .{
             .alloc = alloc,
@@ -519,7 +518,7 @@ pub const StreamingWriter = struct {
             try sink.appendSlice(&encoded);
             index_crc.update(&encoded);
         }
-        var header: [current_header_size]u8 = @splat(0);
+        var header: [header_size]u8 = @splat(0);
         @memcpy(header[0..4], &magic);
         writeU16(&header, 4, version);
         header[6] = self.metric;
@@ -628,7 +627,6 @@ pub const View = struct {
 
 pub const Reader = struct {
     data: []const u8,
-    encoded_version: u16,
     dims: usize,
     metric: u8,
     posting_count: usize,
@@ -639,14 +637,13 @@ pub const Reader = struct {
         if (data.len < header_size or !std.mem.eql(u8, data[0..4], &magic)) return error.InvalidQuantizedDirectory;
         if (@intFromPtr(data.ptr) % @alignOf(u64) != 0) return error.MisalignedQuantizedDirectory;
         const encoded_version = readU16(data, 4);
-        if (encoded_version < min_supported_version or encoded_version > version)
+        if (encoded_version != version)
             return error.UnsupportedQuantizedDirectoryVersion;
         const dims: usize = readU32(data, 8);
         const posting_count = std.math.cast(usize, readU64(data, 16)) orelse return error.QuantizedDirectoryTooLarge;
         const index_offset = std.math.cast(usize, readU64(data, 24)) orelse return error.QuantizedDirectoryTooLarge;
         const index_bytes = std.math.mul(usize, posting_count, index_entry_size) catch return error.InvalidQuantizedDirectory;
-        const required_header_size: usize = if (encoded_version >= 6) current_header_size else header_size;
-        if (dims == 0 or index_offset < required_header_size or index_offset > data.len or index_bytes != data.len - index_offset) {
+        if (dims == 0 or index_offset < header_size or index_offset > data.len or index_bytes != data.len - index_offset) {
             return error.InvalidQuantizedDirectory;
         }
         if (std.hash.Crc32.hash(data[index_offset..]) != readU32(data, 12)) {
@@ -669,12 +666,11 @@ pub const Reader = struct {
         }
         return .{
             .data = data,
-            .encoded_version = encoded_version,
             .dims = dims,
             .metric = data[6],
             .posting_count = posting_count,
             .index_offset = index_offset,
-            .admission_stats = try decodeAdmissionStats(data, encoded_version),
+            .admission_stats = try decodeAdmissionStats(data),
         };
     }
 
@@ -730,10 +726,9 @@ pub const Reader = struct {
         const count: usize = readU32(self.data, start + 8);
         const width: usize = readU32(self.data, start + 12);
         if (count == 0 or width == 0) return error.InvalidQuantizedDirectory;
-        const flags = if (self.encoded_version >= 2) readU32(self.data, start + 20) else 0;
+        const flags = readU32(self.data, start + 20);
         if (flags & ~known_entry_flags != 0 or
-            (flags & entry_flag_residual_locations != 0 and flags & entry_flag_projection_plane == 0) or
-            (self.encoded_version < 2 and !std.mem.allEqual(u8, self.data[start + 20 .. start + entry_header_size], 0)))
+            (flags & entry_flag_residual_locations != 0 and flags & entry_flag_projection_plane == 0))
         {
             return error.InvalidQuantizedDirectory;
         }
@@ -771,7 +766,7 @@ pub const Reader = struct {
         const centroid_dots_raw: []align(@alignOf(f32)) const u8 = @alignCast(self.data[dots_end..centroid_dots_end]);
         cursor = centroid_dots_end;
         const projections: ?hbc_runtime.NativeProjectionPlane = if (flags & entry_flag_projection_plane != 0) blk: {
-            if (self.encoded_version < 3 or member_ids.len != count) return error.InvalidQuantizedDirectory;
+            if (member_ids.len != count) return error.InvalidQuantizedDirectory;
             cursor = std.mem.alignForward(usize, cursor, @alignOf(f16));
             const projection_values = std.math.mul(usize, count, self.dims) catch return error.InvalidQuantizedDirectory;
             const projection_bytes = std.math.mul(usize, projection_values, @sizeOf(f16)) catch return error.InvalidQuantizedDirectory;
@@ -779,7 +774,7 @@ pub const Reader = struct {
             if (projection_end > end) return error.InvalidQuantizedDirectory;
             const projection_raw: []align(@alignOf(f16)) const u8 = @alignCast(self.data[cursor..projection_end]);
             cursor = std.mem.alignForward(usize, projection_end, @alignOf(f32));
-            const metadata_columns: usize = if (self.encoded_version >= 4) 4 else 3;
+            const metadata_columns: usize = 4;
             const metadata_bytes = std.math.mul(usize, scalar_bytes, metadata_columns) catch return error.InvalidQuantizedDirectory;
             const metadata_end = std.math.add(usize, cursor, metadata_bytes) catch return error.InvalidQuantizedDirectory;
             if (metadata_end > end) return error.InvalidQuantizedDirectory;
@@ -789,13 +784,12 @@ pub const Reader = struct {
             cursor += scalar_bytes;
             const norm_raw: []align(@alignOf(f32)) const u8 = @alignCast(self.data[cursor .. cursor + scalar_bytes]);
             cursor += scalar_bytes;
-            const checksums: []const u32 = if (self.encoded_version >= 4) blk_checksums: {
+            const checksums: []const u32 = blk_checksums: {
                 const checksum_raw: []align(@alignOf(u32)) const u8 = @alignCast(self.data[cursor .. cursor + scalar_bytes]);
                 cursor += scalar_bytes;
                 break :blk_checksums std.mem.bytesAsSlice(u32, checksum_raw);
-            } else &.{};
+            };
             const residual_locations: ?hbc_runtime.NativeResidualLocationPlane = if (flags & entry_flag_residual_locations != 0) blk_locations: {
-                if (self.encoded_version < 5) return error.InvalidQuantizedDirectory;
                 cursor = std.mem.alignForward(usize, cursor, @alignOf(u64));
                 const u64_column_bytes = std.math.mul(usize, count, @sizeOf(u64)) catch return error.InvalidQuantizedDirectory;
                 const u32_column_bytes = std.math.mul(usize, count, @sizeOf(u32)) catch return error.InvalidQuantizedDirectory;
@@ -957,7 +951,7 @@ pub const VerifiedReader = struct {
         @memcpy(encoded[entry_offset..index_offset], entry);
 
         @memcpy(encoded[0..4], &magic);
-        writeU16(encoded, 4, self.reader.encoded_version);
+        writeU16(encoded, 4, version);
         encoded[6] = self.reader.metric;
         writeU32(encoded, 8, @intCast(self.reader.dims));
         writeU64(encoded, 16, 1);
@@ -966,6 +960,7 @@ pub const VerifiedReader = struct {
         writeU64(encoded, index_offset + 8, @intCast(entry_offset));
         writeU32(encoded, index_offset + 16, self.reader.indexChecksum(index));
         writeU32(encoded, 12, std.hash.Crc32.hash(encoded[index_offset..]));
+        encodeAdmissionStats(encoded[0..header_size], self.reader.admission_stats);
 
         const standalone = try Reader.init(encoded);
         const view = (try standalone.get(posting_id)) orelse return error.InvalidQuantizedDirectory;
@@ -1108,6 +1103,11 @@ test "quantized directory persists conservative fallback admission" {
     defer alloc.free(corrupted);
     corrupted[40] ^= 1;
     try std.testing.expectError(error.QuantizedDirectoryAdmissionChecksumMismatch, Reader.init(corrupted));
+
+    const unreleased_prototype = try alloc.dupe(u8, encoded);
+    defer alloc.free(unreleased_prototype);
+    writeU16(unreleased_prototype, 4, 2);
+    try std.testing.expectError(error.UnsupportedQuantizedDirectoryVersion, Reader.init(unreleased_prototype));
 }
 
 test "quantized directory round trips borrowed aligned views" {
