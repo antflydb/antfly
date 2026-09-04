@@ -642,7 +642,6 @@ const (
 	EmbedderProviderVertex     = oapi.EmbedderProviderVertex
 	EmbedderProviderCohere     = oapi.EmbedderProviderCohere
 	EmbedderProviderOpenrouter = oapi.EmbedderProviderOpenrouter
-	EmbedderProviderMock       = oapi.EmbedderProviderMock
 	GeneratorProviderAntfly    = oapi.GeneratorProviderAntfly
 	GeneratorProviderOllama    = oapi.GeneratorProviderOllama
 	GeneratorProviderOpenai    = oapi.GeneratorProviderOpenai

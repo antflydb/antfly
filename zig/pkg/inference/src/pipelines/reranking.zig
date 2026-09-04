@@ -53,6 +53,17 @@ pub const RankedResult = struct {
     score: f32,
 };
 
+/// Optional request-lifetime hook installed by servers. The pipeline checks it
+/// at bounded batch boundaries without depending on an HTTP or API context.
+pub const ExecutionControl = struct {
+    ptr: ?*const anyopaque,
+    check_fn: *const fn (?*const anyopaque) anyerror!void,
+
+    pub fn check(self: ExecutionControl) !void {
+        return self.check_fn(self.ptr);
+    }
+};
+
 pub const RerankingPipeline = struct {
     allocator: std.mem.Allocator,
     session: backends.Session,
@@ -61,6 +72,7 @@ pub const RerankingPipeline = struct {
     /// Optional caller-owned gate for stateful backend execution. Tokenization
     /// remains parallel; only the session forward pass is serialized.
     execution_lock: ?*std.atomic.Mutex = null,
+    execution_control: ?ExecutionControl = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -89,15 +101,35 @@ pub const RerankingPipeline = struct {
     /// Score query-document pairs using the configured reranker mode.
     /// Returns scores in the same order as documents.
     pub fn rerank(self: *RerankingPipeline, query: []const u8, documents: []const []const u8) ![]f32 {
+        try self.checkExecution();
         if (documents.len == 0) return try self.allocator.alloc(f32, 0);
 
-        return switch (self.config.mode) {
+        const scores = try switch (self.config.mode) {
             .cross_encoder => self.rerankCrossEncoder(query, documents),
             .late_interaction => self.rerankLateInteraction(query, documents),
         };
+        errdefer self.allocator.free(scores);
+        try self.checkExecution();
+        return scores;
     }
 
     fn rerankCrossEncoder(self: *RerankingPipeline, query: []const u8, documents: []const []const u8) ![]f32 {
+        const scores = try self.allocator.alloc(f32, documents.len);
+        errdefer self.allocator.free(scores);
+        const chunk_size = @max(@as(usize, 1), self.config.batch_size);
+        var offset: usize = 0;
+        while (offset < documents.len) {
+            try self.checkExecution();
+            const chunk_len = @min(chunk_size, documents.len - offset);
+            const chunk_scores = try self.rerankCrossEncoderBatch(query, documents[offset .. offset + chunk_len]);
+            defer self.allocator.free(chunk_scores);
+            @memcpy(scores[offset .. offset + chunk_len], chunk_scores);
+            offset += chunk_len;
+        }
+        return scores;
+    }
+
+    fn rerankCrossEncoderBatch(self: *RerankingPipeline, query: []const u8, documents: []const []const u8) ![]f32 {
         const alloc = self.allocator;
         const max_len = self.config.max_length;
         const batch = documents.len;
@@ -188,6 +220,7 @@ pub const RerankingPipeline = struct {
             &query_permit,
         );
         defer query_run.deinit();
+        try self.checkExecution();
 
         const query_output = try query_run.output();
         if (query_output.shape.len != 3) return error.UnexpectedOutputShape;
@@ -197,6 +230,7 @@ pub const RerankingPipeline = struct {
 
         var offset: usize = 0;
         while (offset < documents.len) {
+            try self.checkExecution();
             const chunk_len = @min(chunk_size, documents.len - offset);
             var doc_permit = try self.admitTextRun(chunk_len, max_len);
             defer doc_permit.deinit();
@@ -247,6 +281,10 @@ pub const RerankingPipeline = struct {
         }
 
         return scores;
+    }
+
+    fn checkExecution(self: *const RerankingPipeline) !void {
+        if (self.execution_control) |control| try control.check();
     }
 
     /// Rerank and return results sorted by score descending.
@@ -515,6 +553,24 @@ test "cross encoder trims dynamic batches but preserves fixed input shapes" {
     const fixed_scores = try fixed_pipeline.rerank("query", &documents);
     defer allocator.free(fixed_scores);
     try std.testing.expectEqual(@as(usize, 8), fixed_session.last_sequence.load(.acquire));
+}
+
+test "cross encoder bounds working memory with configured batches" {
+    const allocator = std.testing.allocator;
+    var tokenizer_state = FakeRerankingTokenizer{};
+    var session_state = FakeRerankingSession{ .fixed_sequence = false };
+    var pipeline = RerankingPipeline.init(
+        allocator,
+        session_state.session(),
+        tokenizer_state.tokenizer(),
+        .{ .max_length = 8, .batch_size = 2 },
+    );
+    const documents = [_][]const u8{ "one", "two", "three", "four", "five" };
+    const scores = try pipeline.rerank("query", &documents);
+    defer allocator.free(scores);
+    try std.testing.expectEqual(@as(usize, documents.len), scores.len);
+    try std.testing.expectEqual(@as(usize, 3), session_state.run_count.load(.acquire));
+    try std.testing.expectEqual(@as(usize, documents.len * 2), tokenizer_state.encode_count.load(.acquire));
 }
 
 test "cross encoder admission rejects before tokenization" {

@@ -3735,21 +3735,53 @@ pub const Node = struct {
         query: []const u8,
         documents: []const []const u8,
     ) ![]f32 {
+        return self.rerankTextsDirectWithContext(allocator, null, null, model_name, query, documents);
+    }
+
+    pub fn rerankTextsDirectWithContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: ?std.Io,
+        deadline_ns: ?u64,
+        model_name: []const u8,
+        query: []const u8,
+        documents: []const []const u8,
+    ) ![]f32 {
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         if (documents.len == 0) return try allocator.alloc(f32, 0);
         try self.acquireAdmissionUnits(1);
         defer self.releaseAdmission();
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         self.metrics.incRequest("rerank.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
+        var owned_io: ?std.Io.Threaded = if (io == null) std.Io.Threaded.init(allocator, .{}) else null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const request_io = io orelse owned_io.?.io();
 
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rerankers");
+        const model_path = try self.resolveModelPath(request_io, if (model_name.len > 0) model_name else null, "rerankers");
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         var model_handle = try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
         const model = model_handle.get();
         var pipeline = model.rerankingPipeline(allocator);
-        return try pipeline.rerank(query, documents);
+        const DeadlineControl = struct {
+            deadline_ns: ?u64,
+
+            fn check(raw: ?*const anyopaque) !void {
+                const control: *const @This() = @ptrCast(@alignCast(raw.?));
+                return ensureDirectEmbeddingDeadline(control.deadline_ns);
+            }
+        };
+        var deadline_control = DeadlineControl{ .deadline_ns = deadline_ns };
+        pipeline.execution_control = .{
+            .ptr = &deadline_control,
+            .check_fn = DeadlineControl.check,
+        };
+        const scores = try pipeline.rerank(query, documents);
+        errdefer allocator.free(scores);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+        return scores;
     }
 
     pub fn generateTextDirect(

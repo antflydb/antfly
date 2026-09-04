@@ -344,7 +344,6 @@ export const embedderProviderCapabilities = {
   bedrock: { index: true },
   cohere: { index: false },
   gemini: { index: false },
-  mock: { index: false },
   ollama: { index: true },
   openai: { index: true },
   openrouter: { index: false },

@@ -179,7 +179,7 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
     return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
 }
 
-fn gunzipRequestBodyAlloc(alloc: std.mem.Allocator, encoded: []const u8, max_size: usize) ![]u8 {
+fn gunzipRequestBodyAlloc(ctx: ?*httpx.Context, alloc: std.mem.Allocator, encoded: []const u8, max_size: usize) ![]u8 {
     var encoded_reader: std.Io.Reader = .fixed(encoded);
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var decompressor = std.compress.flate.Decompress.init(&encoded_reader, .gzip, &window);
@@ -193,18 +193,79 @@ fn gunzipRequestBodyAlloc(alloc: std.mem.Allocator, encoded: []const u8, max_siz
         };
         if (count == 0) break;
         if (count > max_size -| out.items.len) return error.RequestBodyTooLarge;
-        try out.appendSlice(alloc, buf[0..count]);
+        const required = out.items.len + count;
+        if (required > out.capacity) {
+            const geometric = out.capacity +| @max(out.capacity / 2, @as(usize, 16 * 1024));
+            const new_capacity = @min(max_size, @max(required, geometric));
+            const growth = new_capacity - out.capacity;
+            if (ctx) |request_ctx| {
+                if (!request_ctx.tryReserveRequestBodyBuffer(growth)) return error.BodyCapacityExceeded;
+            }
+            out.ensureTotalCapacityPrecise(alloc, new_capacity) catch |err| {
+                if (ctx) |request_ctx| request_ctx.releaseRequestBodyBuffer(growth);
+                return err;
+            };
+        }
+        out.appendSliceAssumeCapacity(buf[0..count]);
     }
-    return try out.toOwnedSlice(alloc);
+    if (out.capacity == out.items.len) return out.toOwnedSliceAssert();
+
+    // toOwnedSlice may need an exact-size allocation while the growth buffer
+    // is still live. Reserve that transient peak, then retain only the final
+    // decoded length once the old capacity has been released.
+    const old_capacity = out.capacity;
+    if (ctx) |request_ctx| {
+        if (!request_ctx.tryReserveRequestBodyBuffer(out.items.len)) return error.BodyCapacityExceeded;
+    }
+    const owned = out.toOwnedSlice(alloc) catch |err| {
+        if (ctx) |request_ctx| request_ctx.releaseRequestBodyBuffer(out.items.len);
+        return err;
+    };
+    if (ctx) |request_ctx| request_ctx.releaseRequestBodyBuffer(old_capacity);
+    return owned;
 }
 
 test "gzip request bodies are decoded with an expanded-size limit" {
     const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0 };
-    const decoded = try gunzipRequestBodyAlloc(std.testing.allocator, &encoded, 2);
+    const decoded = try gunzipRequestBodyAlloc(null, std.testing.allocator, &encoded, 2);
     defer std.testing.allocator.free(decoded);
     try std.testing.expectEqualStrings("{}", decoded);
-    try std.testing.expectError(error.RequestBodyTooLarge, gunzipRequestBodyAlloc(std.testing.allocator, &encoded, 1));
-    try std.testing.expectError(error.InvalidCompressedBody, gunzipRequestBodyAlloc(std.testing.allocator, "not gzip", 1024));
+    try std.testing.expectError(error.RequestBodyTooLarge, gunzipRequestBodyAlloc(null, std.testing.allocator, &encoded, 1));
+    try std.testing.expectError(error.InvalidCompressedBody, gunzipRequestBodyAlloc(null, std.testing.allocator, "not gzip", 1024));
+}
+
+test "gzip request bodies reserve expanded capacity from the shared server budget" {
+    const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0 };
+    var budget = httpx.SharedBodyBudget.init(1);
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/");
+    defer request.deinit();
+    request.body_budget = &budget;
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    try std.testing.expectError(
+        error.BodyCapacityExceeded,
+        gunzipRequestBodyAlloc(&ctx, std.testing.allocator, &encoded, 2),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+    try std.testing.expectEqual(@as(u64, 1), budget.stats().rejected_total);
+}
+
+test "gzip request body reservation follows the owned decoded buffer lifetime" {
+    const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0 };
+    var budget = httpx.SharedBodyBudget.init(32 * 1024);
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/");
+    request.body_budget = &budget;
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+
+    const decoded = try gunzipRequestBodyAlloc(&ctx, std.testing.allocator, &encoded, 2);
+    request.body = decoded;
+    request.body_owned = true;
+    try std.testing.expectEqual(@as(usize, 2), budget.stats().in_use);
+
+    ctx.deinit();
+    request.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
 }
 
 fn requiresInternalServicePrincipal(path: []const u8) bool {
@@ -311,6 +372,18 @@ fn graphResolverDestinationsAllowed(
 
 pub const RequestAdmission = http_server_mod.RequestAdmission;
 const default_query_body_admission_capacity: usize = 32;
+const authenticated_identity_context_key = "antfly.authenticated-identity";
+
+const CachedAuthenticatedIdentity = struct {
+    alloc: std.mem.Allocator,
+    identity: ?AuthenticatedIdentity,
+
+    fn destroy(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.identity) |*identity| identity.deinit(self.alloc);
+        self.alloc.destroy(self);
+    }
+};
 
 pub const AntflyApiHandler = struct {
     api_server: *ApiHttpServer,
@@ -348,9 +421,45 @@ pub const AntflyApiHandler = struct {
 
     fn installMiddleware(self: *AntflyApiHandler, server: *httpx.Server) !void {
         try server.use(httpx.Middleware.bind("antfly-request-stats", self, recordRequest));
+        try server.use(httpx.Middleware.bind("antfly-internal-service-auth", self, enforceInternalServiceAuth));
+        try server.use(httpx.Middleware.bind("antfly-auth-before-encoded-body", self, authorizeBeforeEncodedBody));
         try server.use(httpx.Middleware.bind("antfly-request-content-encoding", self, decodeRequestContent));
         try server.use(httpx.Middleware.bind("antfly-ha-mutation-policy", self, enforceHaMutationPolicy));
-        try server.use(httpx.Middleware.bind("antfly-internal-service-auth", self, enforceInternalServiceAuth));
+    }
+
+    /// Authenticate and authorize compressed requests before spending CPU or
+    /// expanded-body memory on them. The owned identity is handed to the route
+    /// handler through request context so password/API-key work is not repeated.
+    fn authorizeBeforeEncodedBody(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
+        const raw_encoding = ctx.header("content-encoding") orelse return next.call(ctx);
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw_encoding, " \t"), "identity")) return next.call(ctx);
+        if (self.encodedBodyAuthorizationIsDeferred(ctx)) return next.call(ctx);
+
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const authenticated = identity orelse return next.call(ctx);
+
+        const cached = try self.api_server.alloc.create(CachedAuthenticatedIdentity);
+        cached.* = .{ .alloc = self.api_server.alloc, .identity = authenticated };
+        identity = null;
+        ctx.setData(authenticated_identity_context_key, cached, CachedAuthenticatedIdentity.destroy) catch |err| {
+            CachedAuthenticatedIdentity.destroy(cached);
+            return err;
+        };
+        return next.call(ctx);
+    }
+
+    fn encodedBodyAuthorizationIsDeferred(self: *const AntflyApiHandler, ctx: *const httpx.Context) bool {
+        const path = ctx.request.uri.path;
+        if (requiresInternalServicePrincipal(path)) return true;
+        if (std.mem.eql(u8, path, routes.healthz) or
+            std.mem.eql(u8, path, routes.readyz) or
+            std.mem.eql(u8, path, routes.agent_card)) return true;
+        const public_catalog = std.mem.eql(u8, path, routes.ai_catalog) and self.api_server.cfg.ard_public_catalog_enabled;
+        const carries_authentication = ctx.header("authorization") != null or
+            ctx.header(http_server_mod.trusted_principal_header) != null;
+        return public_catalog and !carries_authentication;
     }
 
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
@@ -371,8 +480,13 @@ pub const AntflyApiHandler = struct {
         }
 
         const encoded = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid gzip request body");
-        const decoded = gunzipRequestBodyAlloc(ctx.allocator, encoded, http_server_mod.public_api_max_request_body_bytes) catch |err| switch (err) {
+        const expanded_limit = @min(ctx.max_request_body_size, http_server_mod.public_api_max_request_body_bytes);
+        const decoded = gunzipRequestBodyAlloc(ctx, ctx.allocator, encoded, expanded_limit) catch |err| switch (err) {
             error.RequestBodyTooLarge => return textResponse(ctx, 413, "request body too large"),
+            error.BodyCapacityExceeded => {
+                try ctx.setHeader("Retry-After", "1");
+                return textResponse(ctx, 503, "request body capacity exhausted");
+            },
             else => return textResponse(ctx, 400, "invalid gzip request body"),
         };
         if (ctx.request.body_owned) {
@@ -2772,15 +2886,21 @@ pub const AntflyApiHandler = struct {
         if (self.api_server.cfg.user_manager == null and self.api_server.cfg.trusted_principal_secret == null) return null;
 
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
-        identity.* = self.api_server.authenticateRequest(.{
-            .authorization = ctx.header("authorization"),
-            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
-        }) catch |err| switch (err) {
-            error.Unauthorized, error.InvalidPassword, error.UserNotFound, error.ApiKeyInvalid, error.ApiKeyNotFound, error.ApiKeyExpired => {
-                return try unauthorizedResponse(ctx);
-            },
-            else => return err,
-        };
+        if (ctx.getData(authenticated_identity_context_key)) |raw| {
+            const cached: *CachedAuthenticatedIdentity = @ptrCast(@alignCast(raw));
+            identity.* = cached.identity;
+            cached.identity = null;
+        } else {
+            identity.* = self.api_server.authenticateRequest(.{
+                .authorization = ctx.header("authorization"),
+                .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+            }) catch |err| switch (err) {
+                error.Unauthorized, error.InvalidPassword, error.UserNotFound, error.ApiKeyInvalid, error.ApiKeyNotFound, error.ApiKeyExpired => {
+                    return try unauthorizedResponse(ctx);
+                },
+                else => return err,
+            };
+        }
         const authenticated = identity.*.?;
         if (authenticated.is_internal_service and
             !std.mem.startsWith(u8, path, "/internal/v1/"))
@@ -6413,6 +6533,61 @@ const AuthStatusSource = struct {
         };
     }
 };
+
+test "compressed requests authenticate before decompression and reuse the identity" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var table_read = try usermgr.Permission.initOwned(alloc, .table, "*", .read);
+    defer table_read.deinit(alloc);
+    var reader = try auth.manager.createUser("reader", "reader", &.{table_read});
+    defer reader.deinit(alloc);
+    const authorization = try encodeBasicAuthorization(alloc, "reader", "reader");
+    defer alloc.free(authorization);
+
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const url = try std.fmt.allocPrint(alloc, "{s}/db/v1/query", .{base_url});
+    defer alloc.free(url);
+
+    const anonymous_headers = [_][2][]const u8{
+        .{ "content-type", "application/json" },
+        .{ "content-encoding", "gzip" },
+    };
+    var anonymous = try requestWithRetry(&client, client_io.io(), .POST, url, "not gzip", &anonymous_headers, 20);
+    defer anonymous.deinit();
+    try std.testing.expectEqual(@as(u16, 401), anonymous.status.code);
+
+    const authenticated_headers = [_][2][]const u8{
+        .{ "content-type", "application/json" },
+        .{ "content-encoding", "gzip" },
+        .{ "authorization", authorization },
+    };
+    var authenticated = try requestWithRetry(&client, client_io.io(), .POST, url, "not gzip", &authenticated_headers, 20);
+    defer authenticated.deinit();
+    try std.testing.expectEqual(@as(u16, 400), authenticated.status.code);
+    try std.testing.expectEqualStrings("invalid gzip request body", authenticated.body.?);
+}
 
 const LookupStatusSource = struct {
     fn iface(_: *@This()) http_server_mod.StatusSource {

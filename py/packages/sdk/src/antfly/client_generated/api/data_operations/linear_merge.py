@@ -120,7 +120,9 @@ def sync_detailed(
             (`Content-Encoding: gzip`).
 
             Request bodies are limited to 64 MiB after decompression. Requests that
-            exceed this limit return HTTP 413.
+            exceed this limit return HTTP 413. Expanded bytes count toward the
+            server-wide request-body memory budget; temporary saturation returns
+            HTTP 503 with `Retry-After` instead of allocating outside that budget.
 
             **How it works:**
             1. Send sorted records from your external source
@@ -186,7 +188,9 @@ def sync(
             (`Content-Encoding: gzip`).
 
             Request bodies are limited to 64 MiB after decompression. Requests that
-            exceed this limit return HTTP 413.
+            exceed this limit return HTTP 413. Expanded bytes count toward the
+            server-wide request-body memory budget; temporary saturation returns
+            HTTP 503 with `Retry-After` instead of allocating outside that budget.
 
             **How it works:**
             1. Send sorted records from your external source
@@ -247,7 +251,9 @@ async def asyncio_detailed(
             (`Content-Encoding: gzip`).
 
             Request bodies are limited to 64 MiB after decompression. Requests that
-            exceed this limit return HTTP 413.
+            exceed this limit return HTTP 413. Expanded bytes count toward the
+            server-wide request-body memory budget; temporary saturation returns
+            HTTP 503 with `Retry-After` instead of allocating outside that budget.
 
             **How it works:**
             1. Send sorted records from your external source
@@ -311,7 +317,9 @@ async def asyncio(
             (`Content-Encoding: gzip`).
 
             Request bodies are limited to 64 MiB after decompression. Requests that
-            exceed this limit return HTTP 413.
+            exceed this limit return HTTP 413. Expanded bytes count toward the
+            server-wide request-body memory budget; temporary saturation returns
+            HTTP 503 with `Retry-After` instead of allocating outside that budget.
 
             **How it works:**
             1. Send sorted records from your external source

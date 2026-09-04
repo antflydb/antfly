@@ -9011,7 +9011,6 @@ components:
         - openrouter
         - bedrock
         - cohere
-        - mock
         - antfly
       description: The embedding provider to use.
     EmbedderConfig:
@@ -16831,7 +16830,11 @@ components:
 
         Request bodies are limited to 64 MiB after decompression. Requests that
 
-        exceed this limit return HTTP 413.
+        exceed this limit return HTTP 413. Expanded bytes count toward the
+
+        server-wide request-body memory budget; temporary saturation returns
+
+        HTTP 503 with `Retry-After` instead of allocating outside that budget.
 
 
         **How it works:**
@@ -23664,14 +23667,18 @@ components:
             candidate_count:
               type: integer
               minimum: 1
+              maximum: 1000
               description: Maximum number of globally highest-ranked retrieval candidates to send to the
                 reranker. In distributed deployments each shard retrieves at most this many candidates,
                 the coordinator retains the global window, and the provider is called once. Defaults to
-                offset plus the effective final result limit. Candidates outside this window are not returned,
-                but hits.total continues to describe the underlying retrieval match count.
+                offset plus the effective final result limit, which must also be at most 1000. Candidates
+                outside this window are not returned, but hits.total continues to describe the underlying
+                retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency,
+                and external API cost.
             top_n:
               type: integer
               minimum: 1
+              maximum: 1000
               deprecated: true
               description: Deprecated compatibility override for QueryRequest.limit. When present, this
                 is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit.

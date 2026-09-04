@@ -15,6 +15,7 @@
 const std = @import("std");
 const ant_json = @import("antfly-json");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const RequestContext = @import("request_context.zig").RequestContext;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const httpx = @import("httpx");
@@ -62,17 +63,7 @@ pub const ProviderKind = enum {
     antfly,
 };
 
-pub const EmbeddingRequestContext = struct {
-    io: std.Io,
-    deadline_ns: ?u64,
-    cancellation: ?CancellationToken = null,
-
-    pub fn check(self: EmbeddingRequestContext) !void {
-        if (self.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
-        const deadline = self.deadline_ns orelse return;
-        if (monotonicNowNs() >= deadline) return error.Timeout;
-    }
-};
+pub const EmbeddingRequestContext = RequestContext;
 
 pub const AntflyProvider = struct {
     ptr: *anyopaque,
@@ -115,6 +106,14 @@ pub const AntflyProvider = struct {
         model: []const u8,
         query: []const u8,
         documents: []const []const u8,
+    ) anyerror![]f32 = null,
+    rerank_texts_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        query: []const u8,
+        documents: []const []const u8,
+        context: RequestContext,
     ) anyerror![]f32 = null,
     generate_text: ?*const fn (
         ptr: *anyopaque,

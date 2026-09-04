@@ -487,7 +487,14 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .rerank_texts => blk: {
             var parsed = try std.json.parseFromSlice(RerankTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            const result = try state.node.rerankTextsDirect(alloc, parsed.value.model, parsed.value.query, parsed.value.documents);
+            const result = try state.node.rerankTextsDirectWithContext(
+                alloc,
+                state.io,
+                deadline_ns,
+                parsed.value.model,
+                parsed.value.query,
+                parsed.value.documents,
+            );
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },

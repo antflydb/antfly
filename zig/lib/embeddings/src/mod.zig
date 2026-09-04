@@ -76,7 +76,7 @@ pub const Config = struct {
 
     pub fn validate(self: Config) !void {
         switch (self.provider) {
-            .antfly, .mock => {},
+            .antfly => {},
             else => if (self.model.len == 0) return error.InvalidEmbedderConfig,
         }
         if (self.request_format.len > 0) {

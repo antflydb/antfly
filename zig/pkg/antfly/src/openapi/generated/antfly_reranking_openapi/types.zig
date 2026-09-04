@@ -84,7 +84,7 @@ pub const RerankerConfig = struct {
     field: ?[]const u8 = null,
     /// Handlebars template to render document text for reranking.
     template: ?[]const u8 = null,
-    /// Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count.
+    /// Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit, which must also be at most 1000. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency, and external API cost.
     candidate_count: ?i64 = null,
     /// Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present.
     top_n: ?i64 = null,

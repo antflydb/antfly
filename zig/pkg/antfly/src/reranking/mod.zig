@@ -16,10 +16,13 @@ const std = @import("std");
 const httpx = @import("httpx");
 const lib = @import("antfly_reranking");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const inference_request_context = @import("../inference/request_context.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const antfly_provider = @import("../inference/local.zig");
 const vertex_provider = @import("../inference/vertex.zig");
 const common_secrets = @import("../common/secrets.zig");
+const request_admission = @import("../common/request_admission.zig");
+const common_cancellation = @import("../common/cancellation.zig");
 const google_auth = @import("antfly_google").auth;
 
 pub const Config = lib.Config;
@@ -31,7 +34,7 @@ pub const Runtime = struct {
     io: std.Io,
     http: httpx.Client,
     credentials: google_auth.CredentialManager,
-    admission: std.Io.Semaphore = .{ .permits = 16 },
+    admission: request_admission.RequestAdmission = request_admission.RequestAdmission.init(16),
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) Runtime {
         return .{
@@ -52,8 +55,13 @@ pub const Runtime = struct {
         query: []const u8,
         documents: []const []const u8,
     ) ![]f32 {
-        try self.admission.wait(self.io);
-        defer self.admission.post(self.io);
+        if (dependencies.execution_context) |context| try context.check();
+        // Provider work is deliberately fail-fast rather than queued. The
+        // parent query already owns admission and a deadline; another hidden
+        // queue only consumes that budget and amplifies tail latency.
+        if (!self.admission.tryAcquire()) return error.RerankRateLimited;
+        defer self.admission.release();
+        if (dependencies.execution_context) |context| try context.check();
         var options = dependencies;
         options.runtime = self;
         return try rerankDocumentsWithOptions(
@@ -84,6 +92,7 @@ pub fn normalizeOperationalError(err: anyerror) anyerror {
         error.Canceled,
         error.Cancelled,
         => err,
+        error.QueueFull => error.RerankRateLimited,
         error.RerankRequestFailed,
         error.EmptyResponse,
         error.InvalidRerankerResponse,
@@ -119,6 +128,31 @@ test "reranking runtime failures use stable query dependency classes" {
     try std.testing.expectEqual(error.RerankTransientFailure, normalizeOperationalError(error.ConnectionRefused));
     try std.testing.expectEqual(error.Timeout, normalizeOperationalError(error.ConnectionTimedOut));
     try std.testing.expectEqual(error.Canceled, normalizeOperationalError(error.Canceled));
+    try std.testing.expectEqual(error.RerankRateLimited, normalizeOperationalError(error.QueueFull));
+}
+
+test "reranking runtime rejects saturation and expired work before provider dispatch" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var runtime = Runtime.init(alloc, io_impl.io());
+    defer runtime.deinit();
+    runtime.admission = request_admission.RequestAdmission.init(1);
+    try std.testing.expect(runtime.admission.tryAcquire());
+    defer runtime.admission.release();
+
+    const cfg = Config{ .provider = .antfly, .field = "body" };
+    try std.testing.expectError(
+        error.RerankRateLimited,
+        runtime.rerank(alloc, cfg, .{}, "query", &.{"document"}),
+    );
+    try std.testing.expectError(
+        error.Timeout,
+        runtime.rerank(alloc, cfg, .{ .execution_context = .{
+            .io = io_impl.io(),
+            .deadline_ns = 0,
+        } }, "query", &.{"document"}),
+    );
 }
 
 pub fn rerankDocuments(
@@ -146,6 +180,7 @@ pub const Options = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     runtime: ?*Runtime = null,
+    execution_context: ?inference_request_context.RequestContext = null,
 };
 
 pub fn rerankDocumentsWithOptions(
@@ -157,6 +192,7 @@ pub fn rerankDocumentsWithOptions(
     documents: []const []const u8,
 ) ![]f32 {
     try cfg.validate();
+    if (options.execution_context) |context| try context.check();
     const configured_secret = switch (cfg.provider) {
         .cohere => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, "COHERE_API_KEY"),
         else => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
@@ -172,20 +208,37 @@ pub fn rerankDocumentsWithOptions(
         .antfly => {
             if (cfg.url.len == 0) {
                 if (options.antfly_provider) |local| {
+                    if (options.execution_context) |context| {
+                        if (local.rerank_texts_with_context) |rerank| {
+                            const scores = try rerank(local.ptr, alloc, cfg.model, query, documents, context);
+                            try context.check();
+                            return scores;
+                        }
+                    }
                     if (local.rerank_texts) |rerank| {
-                        return try rerank(local.ptr, alloc, cfg.model, query, documents);
+                        const scores = try rerank(local.ptr, alloc, cfg.model, query, documents);
+                        if (options.execution_context) |context| try context.check();
+                        return scores;
                     }
                 }
             }
             var provider = antfly_provider.Provider.init(alloc, http, cfg.defaultedUrl());
             defer provider.deinit();
+            if (options.execution_context) |context| {
+                provider.setRequestCancellation(context.cancellation);
+                provider.setRequestTimeoutMs(try context.remainingTimeoutMs());
+            }
             var result = try provider.reranker().rerank(alloc, cfg.model, query, documents);
             defer result.deinit();
+            if (options.execution_context) |context| try context.check();
             return try alloc.dupe(f32, result.scores);
         },
         .cohere => {
             const token = api_key orelse return error.InvalidRerankerConfig;
-            return try rerankCohere(alloc, http, cfg, token, query, documents);
+            const scores = try rerankCohere(alloc, http, cfg, token, options.execution_context, query, documents);
+            errdefer alloc.free(scores);
+            if (options.execution_context) |context| try context.check();
+            return scores;
         },
         .vertex => {
             const token_source = if (api_key == null and options.runtime != null)
@@ -203,7 +256,13 @@ pub fn rerankDocumentsWithOptions(
                 .token_source = token_source,
             });
             defer provider.deinit();
-            return try provider.rerank(alloc, cfg.model, query, documents);
+            const scores = try provider.rerank(alloc, cfg.model, query, documents, .{
+                .timeout_ms = if (options.execution_context) |context| try context.remainingTimeoutMs() else null,
+                .cancellation = httpCancellation(if (options.execution_context) |context| context.cancellation else null),
+            });
+            errdefer alloc.free(scores);
+            if (options.execution_context) |context| try context.check();
+            return scores;
         },
     }
 }
@@ -213,6 +272,7 @@ fn rerankCohere(
     http: *httpx.Client,
     cfg: Config,
     api_key: []const u8,
+    execution_context: ?inference_request_context.RequestContext,
     query: []const u8,
     documents: []const []const u8,
 ) ![]f32 {
@@ -231,7 +291,12 @@ fn rerankCohere(
     const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{api_key});
     defer alloc.free(authorization);
     const headers = [_][2][]const u8{.{ "Authorization", authorization }};
-    var response = try http.post(url, .{ .json = body, .headers = &headers });
+    var response = try http.post(url, .{
+        .json = body,
+        .headers = &headers,
+        .timeout_ms = if (execution_context) |context| try context.remainingTimeoutMs() else null,
+        .cancellation = httpCancellation(if (execution_context) |context| context.cancellation else null),
+    });
     defer response.deinit();
     if (!response.ok()) return statusError(response.status.code);
     const Response = struct {
@@ -243,6 +308,11 @@ fn rerankCohere(
     var parsed = try std.json.parseFromSlice(Response, alloc, response.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     return try scoresByIndexAlloc(alloc, documents.len, parsed.value.results);
+}
+
+fn httpCancellation(cancellation: ?common_cancellation.CancellationToken) ?httpx.CancellationToken {
+    const token = cancellation orelse return null;
+    return httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn);
 }
 
 fn scoresByIndexAlloc(alloc: std.mem.Allocator, count: usize, results: anytype) ![]f32 {

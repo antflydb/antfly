@@ -2243,6 +2243,8 @@ fn applyCommonSearchRequestOptions(
             error.InvalidRerankerConfig => return error.InvalidQueryRequest,
             else => return err,
         };
+        reranking_mod.validateQueryWindow(req.reranker.?, req.offset, req.limit) catch
+            return error.InvalidQueryRequest;
     }
 
     const has_semantic = request.semantic_search != null or request.embeddings != null;

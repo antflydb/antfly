@@ -138,10 +138,13 @@ Antfly retrieves the bounded window from each shard, retains the globally best
 `offset` and `limit` are applied after reranking. The legacy reranker `top_n`
 field remains as a deprecated limit override and is validated against
 `candidate_count`. Reranking changes the returned order and page, while
-`hits.total` continues to report the underlying retrieval match count.
+`hits.total` continues to report the underlying retrieval match count. The
+effective candidate window is capped at 1,000, including when it is derived
+from `offset + limit`; oversized requests are rejected before shard fan-out or
+provider work begins.
 
 <Callout type="tip">
-Set `candidate_count` higher than `offset + limit` (often 50-100) to improve recall while keeping remote scoring cost bounded. Use the normal query `limit` for the final response size. A larger candidate set can improve recall but increases latency.
+Set `candidate_count` higher than `offset + limit` (often 50-100, up to 1,000) to improve recall while keeping remote scoring cost bounded. Use the normal query `limit` for the final response size. A larger candidate set can improve recall but increases latency and external-provider cost.
 </Callout>
 
 ## Pruning

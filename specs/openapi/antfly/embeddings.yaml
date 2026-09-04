@@ -15,7 +15,6 @@ components:
         - openrouter
         - bedrock
         - cohere
-        - mock
         - antfly
       description: "The embedding provider to use."
 

@@ -8513,7 +8513,6 @@ pub const EmbedderProvider = enum {
     openrouter,
     bedrock,
     cohere,
-    mock,
     antfly,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -8525,7 +8524,6 @@ pub const EmbedderProvider = enum {
             .openrouter => "openrouter",
             .bedrock => "bedrock",
             .cohere => "cohere",
-            .mock => "mock",
             .antfly => "antfly",
         };
         try jw.write(s);
@@ -8544,7 +8542,6 @@ pub const EmbedderProvider = enum {
             .{ "openrouter", .openrouter },
             .{ "bedrock", .bedrock },
             .{ "cohere", .cohere },
-            .{ "mock", .mock },
             .{ "antfly", .antfly },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -21719,7 +21716,7 @@ pub const LinearMergePageStatus = enum {
     }
 };
 
-/// Linear merge operation for syncing sorted records from external sources. Use this to keep Antfly in sync with an external database or data source. Requests may be sent as plain JSON or gzip-compressed JSON (`Content-Encoding: gzip`). Request bodies are limited to 64 MiB after decompression. Requests that exceed this limit return HTTP 413. **How it works:** 1. Send sorted records from your external source 2. Server upserts records that exist in your batch 3. Server deletes Antfly records in the key range that are absent from your batch 4. Use next_cursor as last_merged_id for the next request **WARNING:** Not safe for concurrent operations with overlapping key ranges.
+/// Linear merge operation for syncing sorted records from external sources. Use this to keep Antfly in sync with an external database or data source. Requests may be sent as plain JSON or gzip-compressed JSON (`Content-Encoding: gzip`). Request bodies are limited to 64 MiB after decompression. Requests that exceed this limit return HTTP 413. Expanded bytes count toward the server-wide request-body memory budget; temporary saturation returns HTTP 503 with `Retry-After` instead of allocating outside that budget. **How it works:** 1. Send sorted records from your external source 2. Server upserts records that exist in your batch 3. Server deletes Antfly records in the key range that are absent from your batch 4. Use next_cursor as last_merged_id for the next request **WARNING:** Not safe for concurrent operations with overlapping key ranges.
 pub const LinearMergeRequest = struct {
     /// Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}} Requirements: - The server processes keys in lexicographic order - Use consistent key naming (e.g., all start with same prefix) This format avoids duplicate IDs and matches Antfly's batch write interface.
     records: std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)),
@@ -26504,7 +26501,7 @@ pub const RerankerConfig = struct {
     field: ?[]const u8 = null,
     /// Handlebars template to render document text for reranking.
     template: ?[]const u8 = null,
-    /// Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count.
+    /// Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit, which must also be at most 1000. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency, and external API cost.
     candidate_count: ?i64 = null,
     /// Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present.
     top_n: ?i64 = null,

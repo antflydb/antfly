@@ -4969,6 +4969,7 @@ fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) antfl
         .embed_dense_parts = inferenceProviderEmbedDenseParts,
         .embed_dense_parts_with_context = inferenceProviderEmbedDensePartsWithContext,
         .rerank_texts = inferenceProviderRerankTexts,
+        .rerank_texts_with_context = inferenceProviderRerankTextsWithContext,
         .generate_text = inferenceProviderGenerateText,
         .generate_messages = inferenceProviderGenerateMessages,
         .read_images = inferenceProviderReadImages,
@@ -5323,6 +5324,24 @@ fn inferenceProviderRerankTexts(
         .query = query,
         .documents = documents,
     }, null);
+}
+
+fn inferenceProviderRerankTextsWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    query: []const u8,
+    documents: []const []const u8,
+    context: antfly.inference.RequestContext,
+) anyerror![]f32 {
+    try context.check();
+    const scores = try invokeInferenceProvider([]f32, alloc, handle, .rerank_texts, .{
+        .model = model,
+        .query = query,
+        .documents = documents,
+    }, context.deadline_ns);
+    try context.check();
+    return scores;
 }
 
 fn inferenceProviderGenerateText(

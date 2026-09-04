@@ -20,6 +20,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Provider = openapi.RerankerProvider;
 pub const OpenApiConfig = openapi.RerankerConfig;
+pub const max_candidate_count: u32 = 1000;
 
 pub const Config = struct {
     provider: Provider,
@@ -68,10 +69,10 @@ pub const Config = struct {
             },
         }
         if (self.candidate_count) |candidate_count| {
-            if (candidate_count == 0) return error.InvalidRerankerConfig;
+            if (candidate_count == 0 or candidate_count > max_candidate_count) return error.InvalidRerankerConfig;
         }
         if (self.top_n) |top_n| {
-            if (top_n == 0) return error.InvalidRerankerConfig;
+            if (top_n == 0 or top_n > max_candidate_count) return error.InvalidRerankerConfig;
         }
         if (self.candidate_count != null and self.top_n != null and self.top_n.? > self.candidate_count.?) {
             return error.InvalidRerankerConfig;
@@ -86,6 +87,16 @@ pub const Config = struct {
         };
     }
 };
+
+/// Validate the effective retrieval window before any shard fan-out begins.
+/// `candidate_count` is optional for ergonomic small queries, but omitting it
+/// must not let `offset + limit` bypass the same provider-work ceiling.
+pub fn validateQueryWindow(cfg: Config, offset: u32, limit: u32) !void {
+    try cfg.validate();
+    const output_limit = cfg.top_n orelse limit;
+    const effective_candidates = cfg.candidate_count orelse offset +| output_limit;
+    if (effective_candidates > max_candidate_count) return error.InvalidRerankerConfig;
+}
 
 pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
     const parsed = try json.parseFromSlice(openapi.RerankerConfig, alloc, raw, .{});
@@ -174,6 +185,15 @@ test "reranker output count cannot exceed candidate count" {
         .top_n = 5,
     };
     try std.testing.expectError(error.InvalidRerankerConfig, cfg.validate());
+}
+
+test "reranker work is bounded with and without an explicit candidate count" {
+    const base = Config{ .provider = .antfly, .field = "body" };
+    var explicit = base;
+    explicit.candidate_count = max_candidate_count + 1;
+    try std.testing.expectError(error.InvalidRerankerConfig, explicit.validate());
+    try std.testing.expectError(error.InvalidRerankerConfig, validateQueryWindow(base, 1, max_candidate_count));
+    try validateQueryWindow(base, 0, max_candidate_count);
 }
 
 test "reranker config requires field or template" {

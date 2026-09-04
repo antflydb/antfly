@@ -18,6 +18,7 @@ const Headers = @import("headers.zig").Headers;
 const HeaderName = @import("headers.zig").HeaderName;
 const Uri = @import("uri.zig").Uri;
 const PercentEncoding = @import("../util/encoding.zig").PercentEncoding;
+const SharedBodyBudget = @import("../protocol/body_budget.zig").SharedBodyBudget;
 
 /// HTTP request representation.
 pub const Request = struct {
@@ -28,6 +29,12 @@ pub const Request = struct {
     headers: Headers,
     body: ?[]const u8 = null,
     body_owned: bool = false,
+    /// Server-side application allocations that retain a transformed request
+    /// body (for example, a decompressed payload) share the same process-wide
+    /// budget as transport-owned request bytes. Client requests leave this
+    /// unset.
+    body_budget: ?*SharedBodyBudget = null,
+    body_budget_reserved: usize = 0,
     custom_method: ?[]const u8 = null,
     query_owned: bool = false,
     query_builder: ?std.ArrayListUnmanaged(u8) = null,
@@ -72,6 +79,8 @@ pub const Request = struct {
                 self.allocator.free(b);
             }
         }
+        if (self.body_budget) |budget| budget.release(self.body_budget_reserved);
+        self.body_budget_reserved = 0;
         if (self.query_builder) |*builder| {
             builder.deinit(self.allocator);
         } else if (self.query_owned) {
@@ -79,6 +88,23 @@ pub const Request = struct {
                 self.allocator.free(q);
             }
         }
+    }
+
+    /// Reserves retained application-side body capacity before allocating it.
+    /// Keeping the reservation on Request makes teardown ordering exact: the
+    /// owned buffer is freed before its capacity is returned to the budget.
+    pub fn tryReserveBodyBuffer(self: *Self, amount: usize) bool {
+        const budget = self.body_budget orelse return true;
+        if (!budget.tryReserve(amount)) return false;
+        self.body_budget_reserved += amount;
+        return true;
+    }
+
+    pub fn releaseBodyBuffer(self: *Self, amount: usize) void {
+        if (amount == 0) return;
+        std.debug.assert(self.body_budget_reserved >= amount);
+        if (self.body_budget) |budget| budget.release(amount);
+        self.body_budget_reserved -= amount;
     }
 
     /// Sets the request body with ownership.

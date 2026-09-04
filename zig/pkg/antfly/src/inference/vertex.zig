@@ -108,6 +108,11 @@ pub const Options = struct {
     token_source: ?*google_auth.CachedTokenSource = null,
 };
 
+pub const RerankOptions = struct {
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
+};
+
 pub const Provider = struct {
     allocator: Allocator,
     http: *httpx.Client,
@@ -186,6 +191,7 @@ pub const Provider = struct {
         model: []const u8,
         query: []const u8,
         documents: []const []const u8,
+        options: RerankOptions,
     ) ![]f32 {
         const Record = struct {
             id: []const u8,
@@ -224,7 +230,12 @@ pub const Provider = struct {
         try self.appendAuthHeaders(alloc, &headers, &minted_auth);
         try headers.append(alloc, .{ "X-Goog-User-Project", self.project_id });
 
-        var response = try self.http.post(url, .{ .json = request_body, .headers = headers.items });
+        var response = try self.http.post(url, .{
+            .json = request_body,
+            .headers = headers.items,
+            .timeout_ms = options.timeout_ms,
+            .cancellation = options.cancellation,
+        });
         defer response.deinit();
         if (!response.ok()) return switch (response.status.code) {
             408, 504 => error.Timeout,

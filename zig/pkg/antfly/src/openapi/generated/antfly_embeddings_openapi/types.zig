@@ -325,7 +325,6 @@ pub const EmbedderProvider = enum {
     openrouter,
     bedrock,
     cohere,
-    mock,
     antfly,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -337,7 +336,6 @@ pub const EmbedderProvider = enum {
             .openrouter => "openrouter",
             .bedrock => "bedrock",
             .cohere => "cohere",
-            .mock => "mock",
             .antfly => "antfly",
         };
         try jw.write(s);
@@ -356,7 +354,6 @@ pub const EmbedderProvider = enum {
             .{ "openrouter", .openrouter },
             .{ "bedrock", .bedrock },
             .{ "cohere", .cohere },
-            .{ "mock", .mock },
             .{ "antfly", .antfly },
         });
         return map.get(s) orelse error.UnexpectedToken;

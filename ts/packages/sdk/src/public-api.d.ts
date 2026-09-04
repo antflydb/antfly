@@ -3264,7 +3264,7 @@ export interface components {
          * @description The embedding provider to use.
          * @enum {string}
          */
-        EmbedderProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "mock" | "antfly";
+        EmbedderProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "antfly";
         /**
          * @description A unified configuration for an embedding provider.
          *
@@ -8104,7 +8104,9 @@ export interface components {
          *     (`Content-Encoding: gzip`).
          *
          *     Request bodies are limited to 64 MiB after decompression. Requests that
-         *     exceed this limit return HTTP 413.
+         *     exceed this limit return HTTP 413. Expanded bytes count toward the
+         *     server-wide request-body memory budget; temporary saturation returns
+         *     HTTP 503 with `Retry-After` instead of allocating outside that budget.
          *
          *     **How it works:**
          *     1. Send sorted records from your external source
@@ -12386,7 +12388,7 @@ export interface components {
             field?: string;
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
-            /** @description Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. */
+            /** @description Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit, which must also be at most 1000. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency, and external API cost. */
             candidate_count?: number;
             /**
              * @deprecated

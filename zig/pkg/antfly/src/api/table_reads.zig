@@ -28,6 +28,7 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const inference_request_context = @import("../inference/request_context.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
@@ -17266,6 +17267,7 @@ fn applyReranker(
 ) !void {
     const cfg = req.reranker orelse return;
     if (req.reranker_query_text.len == 0) return error.UnsupportedQueryRequest;
+    try checkQueryDeadline(req);
 
     const doc_template = if (cfg.template.len > 0)
         try alloc.dupe(u8, cfg.template)
@@ -17299,16 +17301,29 @@ fn applyReranker(
         fallback_http = httpx.Client.initWithConfig(alloc, fallback_io.?.io(), .{ .keep_alive = false });
         break :blk &fallback_http.?;
     };
+    const inference_context = inference_request_context.RequestContext{
+        .io = if (reranker_runtime) |runtime| runtime.io else fallback_io.?.io(),
+        .deadline_ns = req.execution_deadline_ns,
+        .cancellation = req.cancellation,
+    };
 
     const rerank_start_ns = platform_time.monotonicNs();
     const scores = if (reranker_runtime) |runtime|
-        runtime.rerank(alloc, cfg, .{ .antfly_provider = antfly_provider, .secret_store = secret_store }, req.reranker_query_text, documents)
+        runtime.rerank(alloc, cfg, .{
+            .antfly_provider = antfly_provider,
+            .secret_store = secret_store,
+            .execution_context = inference_context,
+        }, req.reranker_query_text, documents)
     else
         reranking_runtime.rerankDocumentsWithOptions(
             alloc,
             http,
             cfg,
-            .{ .antfly_provider = antfly_provider, .secret_store = secret_store },
+            .{
+                .antfly_provider = antfly_provider,
+                .secret_store = secret_store,
+                .execution_context = inference_context,
+            },
             req.reranker_query_text,
             documents,
         );
@@ -17336,6 +17351,7 @@ fn applyReranker(
         },
     };
     defer alloc.free(owned_scores);
+    try checkQueryDeadline(req);
     if (owned_scores.len != rerank_count) return error.RerankUpstreamFailure;
 
     for (result.hits[0..rerank_count], 0..) |*hit, i| {
