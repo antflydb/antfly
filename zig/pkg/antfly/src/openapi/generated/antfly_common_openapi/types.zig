@@ -1722,6 +1722,8 @@ pub const TransactionSessionConfig = struct {
     max_receipt_count: ?i64 = null,
     /// Aggregate durable byte budget for pending and retained idempotency receipts.
     max_receipt_bytes: ?i64 = null,
+    /// Deployment-controlled generation proving every process that can write the interactive transaction-session namespace maintains principal inventory v1. Leave unset during rolling upgrades. Increase it before reactivation after a rollback so completion requires a fresh canonical audit. Deployment coordination must prevent pre-feature processes, which do not understand this field, from writing.
+    inventory_writer_fence_generation: ?i64 = null,
     max_record_bytes: ?i64 = null,
     max_savepoints: ?i64 = null,
 
@@ -1736,6 +1738,7 @@ pub const TransactionSessionConfig = struct {
         .{ "max_count", "max_count", true },
         .{ "max_receipt_count", "max_receipt_count", true },
         .{ "max_receipt_bytes", "max_receipt_bytes", true },
+        .{ "inventory_writer_fence_generation", "inventory_writer_fence_generation", true },
         .{ "max_record_bytes", "max_record_bytes", true },
         .{ "max_savepoints", "max_savepoints", true },
     };
@@ -1784,6 +1787,10 @@ pub const TransactionSessionConfig = struct {
         }
         if (self.max_receipt_bytes) |value| {
             try jw.objectField("max_receipt_bytes");
+            try jw.write(value);
+        }
+        if (self.inventory_writer_fence_generation) |value| {
+            try jw.objectField("inventory_writer_fence_generation");
             try jw.write(value);
         }
         if (self.max_record_bytes) |value| {

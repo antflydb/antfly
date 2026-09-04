@@ -472,12 +472,24 @@ renewing leases, encoding, or waiting for durable I/O.
 
 Session inventory has two immutable principal-scoped generations: records
 created by index-aware writers and a separately backfilled legacy projection.
-Maintenance publishes a durable completion marker for each canonical
-namespace after its bounded audit reaches the end. New inventory traversals
-then read both principal projections; cursors issued before completion retain
-their bounded canonical compatibility phase. Maintenance continues auditing
-for lagging rolling-upgrade writers, but steady-state indexed rows require only
-bounded reads and do not produce index writes.
+Reaching the end of a scan is not a migration fence. Interactive-session
+completion remains disabled unless `inventory_writer_fence_generation` is set
+after deployment coordination has drained every pre-index writer. Keep the
+same generation while the fence remains continuously active; increase it after
+any rollback or interval in which legacy writers may have returned. Because
+pre-feature processes do not understand this proof, deployment coordination
+must keep them fenced while it is active. Version-isolated receipt writers are
+intrinsically fenced.
+
+Maintenance publishes a generation-qualified durable completion marker only
+after a complete audit has observed no malformed or unprojectable canonical
+records. Discovering either persists migration debt and atomically invalidates
+any earlier completion marker; a later wholly clean audit clears that debt as
+it republishes completion. New inventory traversals can then read both
+principal projections;
+cursors issued before completion retain their bounded canonical compatibility
+phase. Without a valid marker, canonical compatibility remains active and
+continues to surface corrupt records rather than silently hiding them.
 
 ## Validation and safety invariants
 

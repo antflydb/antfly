@@ -2383,6 +2383,7 @@ pub fn runFromIterator(
             .session_max_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_count else standalone_session_max_count,
             .session_max_receipt_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_receipt_count else standalone_session_max_receipt_count,
             .session_max_receipt_bytes = if (loaded_config) |*cfg| cfg.transaction_sessions.max_receipt_bytes else standalone_session_max_receipt_bytes,
+            .session_inventory_writer_fence_generation = if (loaded_config) |*cfg| cfg.transaction_sessions.inventory_writer_fence_generation else null,
             .session_max_record_bytes = if (loaded_config) |*cfg| cfg.transaction_sessions.max_record_bytes else standalone_session_max_record_bytes,
             .session_savepoint_limit = if (loaded_config) |*cfg| cfg.transaction_sessions.max_savepoints else standalone_session_savepoint_limit,
         },

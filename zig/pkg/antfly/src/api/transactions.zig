@@ -48,6 +48,14 @@ const interactive_legacy_inventory_prefix = "\x00\x00__api_txn_session_legacy_in
 const receipt_legacy_inventory_prefix = "\x00\x00__api_idempotent_receipt_legacy_inventory_v1__:";
 const interactive_legacy_inventory_complete_key = "\x00\x00__api_txn_session_legacy_inventory_complete_v1__";
 const receipt_legacy_inventory_complete_key = "\x00\x00__api_idempotent_receipt_legacy_inventory_complete_v1__";
+const interactive_legacy_inventory_debt_key = "\x00\x00__api_txn_session_legacy_inventory_debt_v1__";
+const receipt_legacy_inventory_debt_key = "\x00\x00__api_idempotent_receipt_legacy_inventory_debt_v1__";
+// Receipt writers are intrinsically fenced by their versioned canonical
+// namespace: a pre-feature binary cannot create a receipt row. Interactive
+// sessions share their canonical namespace with older binaries and require an
+// externally activated writer-fence generation before their audit can become
+// authoritative.
+const receipt_inventory_writer_fence_generation: u64 = 1;
 var txn_id_nonce: std.atomic.Value(u64) = .init(0);
 var owner_incarnation_nonce: std.atomic.Value(u64) = .init(1);
 
@@ -1526,6 +1534,7 @@ pub const DurableSessionStore = struct {
         recovery_ids: []db_mod.types.TxnId,
         session_ids: []db_mod.types.TxnId,
         next_after: ?db_mod.types.TxnId,
+        unresolved_records: usize,
     };
 
     /// Reads only compact recovery-index keys. The cursor is exclusive and a
@@ -1586,6 +1595,7 @@ pub const DurableSessionStore = struct {
                 .recovery_ids = owned_recovery_ids,
                 .session_ids = try session_ids.toOwnedSlice(alloc),
                 .next_after = null,
+                .unresolved_records = 0,
             };
         }
         const prefix = sessionPrefix(kind);
@@ -1598,18 +1608,32 @@ pub const DurableSessionStore = struct {
             scan_limit: usize,
             scanned: usize = 0,
             last_txn_id: ?db_mod.types.TxnId = null,
+            unresolved_records: usize = 0,
             recovery_ids: *std.ArrayListUnmanaged(db_mod.types.TxnId),
             session_ids: *std.ArrayListUnmanaged(db_mod.types.TxnId),
 
             fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
                 const scan: *@This() = @ptrCast(@alignCast(raw));
-                if (key.len <= scan.prefix.len) return true;
-                const txn_id = distributed_txn.parseTxnIdHex(key[scan.prefix.len..]) catch return true;
+                // A malformed key cannot be represented by the typed audit
+                // cursor. Fail closed instead of scanning an unbounded number
+                // of keys or publishing completion past hidden data.
+                if (key.len <= scan.prefix.len) return error.InvalidTransactionSessionRecord;
+                const txn_id = distributed_txn.parseTxnIdHex(key[scan.prefix.len..]) catch
+                    return error.InvalidTransactionSessionRecord;
                 scan.scanned += 1;
                 scan.last_txn_id = txn_id;
-                var session = decodeSessionRecord(scan.allocator, txn_id, value) catch return scan.scanned < scan.scan_limit;
+                var session = decodeSessionRecord(scan.allocator, txn_id, value) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {
+                        scan.unresolved_records += 1;
+                        return scan.scanned < scan.scan_limit;
+                    },
+                };
                 defer session.deinit(scan.allocator);
-                if (sessionKind(session) != scan.kind) return scan.scanned < scan.scan_limit;
+                if (sessionKind(session) != scan.kind) {
+                    scan.unresolved_records += 1;
+                    return scan.scanned < scan.scan_limit;
+                }
                 try scan.session_ids.append(scan.allocator, txn_id);
                 if (sessionNeedsRecovery(session)) try scan.recovery_ids.append(scan.allocator, txn_id);
                 return scan.scanned < scan.scan_limit;
@@ -1631,6 +1655,7 @@ pub const DurableSessionStore = struct {
             .recovery_ids = owned_recovery_ids,
             .session_ids = try session_ids.toOwnedSlice(alloc),
             .next_after = next_after,
+            .unresolved_records = scan.unresolved_records,
         };
     }
 
@@ -1770,51 +1795,129 @@ pub const DurableSessionStore = struct {
         }
     }
 
-    pub fn markLegacySessionInventoryComplete(self: *DurableSessionStore, kind: SessionKind) !void {
-        if (try self.legacySessionInventoryKindComplete(kind)) return;
+    pub fn markLegacySessionInventoryComplete(
+        self: *DurableSessionStore,
+        kind: SessionKind,
+        writer_fence_generation: u64,
+    ) !void {
+        if (try self.legacySessionInventoryKindComplete(kind, writer_fence_generation)) return;
         const key = sessionLegacyInventoryCompleteKey(kind);
+        const debt_key = sessionLegacyInventoryDebtKey(kind);
+        var marker_buffer: [64]u8 = undefined;
+        const marker = try std.fmt.bufPrint(&marker_buffer, "v2:{d}", .{writer_fence_generation});
         switch (self.backend) {
             .docstore => |store| {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
-                try txn.put(key, "1");
+                try txn.put(key, marker);
+                txn.delete(debt_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
                 try txn.commit();
             },
             .runtime => |store| {
                 var txn = try store.beginWrite();
                 errdefer txn.abort();
-                try txn.put(key, "1");
+                try txn.put(key, marker);
+                txn.delete(debt_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
                 try txn.commit();
             },
         }
     }
 
-    fn legacySessionInventoryKindComplete(self: *DurableSessionStore, kind: SessionKind) !bool {
+    /// Persists migration debt and invalidates any completion proof in the
+    /// same storage transaction. This state survives restart and ensures that
+    /// discovering corruption after a prior audit immediately restores the
+    /// canonical compatibility path.
+    pub fn recordLegacySessionInventoryDebt(
+        self: *DurableSessionStore,
+        kind: SessionKind,
+        writer_fence_generation: ?u64,
+        unresolved_records: usize,
+    ) !void {
+        std.debug.assert(unresolved_records > 0);
+        const complete_key = sessionLegacyInventoryCompleteKey(kind);
+        const debt_key = sessionLegacyInventoryDebtKey(kind);
+        var debt_buffer: [96]u8 = undefined;
+        const debt = try std.fmt.bufPrint(
+            &debt_buffer,
+            "v1:{d}:{d}",
+            .{ writer_fence_generation orelse 0, unresolved_records },
+        );
+        switch (self.backend) {
+            .docstore => |store| {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                try txn.put(debt_key, debt);
+                txn.delete(complete_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                try txn.commit();
+            },
+            .runtime => |store| {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                try txn.put(debt_key, debt);
+                txn.delete(complete_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                try txn.commit();
+            },
+        }
+    }
+
+    fn legacySessionInventoryKindComplete(
+        self: *DurableSessionStore,
+        kind: SessionKind,
+        writer_fence_generation: u64,
+    ) !bool {
         const key = sessionLegacyInventoryCompleteKey(kind);
+        const debt_key = sessionLegacyInventoryDebtKey(kind);
+        var expected_buffer: [64]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_buffer, "v2:{d}", .{writer_fence_generation});
         return switch (self.backend) {
             .docstore => |store| blk: {
-                const raw = store.get(self.alloc, key) catch |err| switch (err) {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                if (txn.get(debt_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                } != null) break :blk false;
+                const raw = txn.get(key) catch |err| switch (err) {
                     error.NotFound => break :blk false,
                     else => return err,
                 };
-                defer self.alloc.free(raw);
-                break :blk true;
+                break :blk std.mem.eql(u8, raw, expected);
             },
             .runtime => |store| blk: {
                 var txn = try store.beginRead();
                 defer txn.abort();
-                _ = txn.get(key) catch |err| switch (err) {
+                if (txn.get(debt_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                } != null) break :blk false;
+                const raw = txn.get(key) catch |err| switch (err) {
                     error.NotFound => break :blk false,
                     else => return err,
                 };
-                break :blk true;
+                break :blk std.mem.eql(u8, raw, expected);
             },
         };
     }
 
-    fn legacySessionInventoryComplete(self: *DurableSessionStore) !bool {
-        return try self.legacySessionInventoryKindComplete(.interactive) and
-            try self.legacySessionInventoryKindComplete(.idempotent_receipt);
+    fn legacySessionInventoryComplete(
+        self: *DurableSessionStore,
+        interactive_writer_fence_generation: ?u64,
+    ) !bool {
+        const interactive_generation = interactive_writer_fence_generation orelse return false;
+        return try self.legacySessionInventoryKindComplete(.interactive, interactive_generation) and
+            try self.legacySessionInventoryKindComplete(.idempotent_receipt, receipt_inventory_writer_fence_generation);
     }
 
     /// Rechecks the current durable row under a write transaction before
@@ -2205,6 +2308,7 @@ pub const DurableSessionStore = struct {
         principal: ?[]const u8,
         after: ?SessionListCursor,
         limit: usize,
+        interactive_writer_fence_generation: ?u64,
     ) !SessionPage {
         if (after) |cursor| {
             if (cursor.phase == .legacy)
@@ -2295,7 +2399,7 @@ pub const DurableSessionStore = struct {
             // older rolling-upgrade writer left no canonical-only sessions.
             // The opaque cursor therefore enters a bounded compatibility
             // phase before it can ever report traversal completion.
-            next_cursor = if (try self.legacySessionInventoryComplete())
+            next_cursor = if (try self.legacySessionInventoryComplete(interactive_writer_fence_generation))
                 .{
                     .phase = .legacy_index,
                     .kind = .interactive,
@@ -2552,6 +2656,7 @@ pub const SessionRegistry = struct {
     pending_lease_publications: u32 = 0,
     recovery_index_cursors: [2]?db_mod.types.TxnId = .{ null, null },
     recovery_audit_cursors: [2]?db_mod.types.TxnId = .{ null, null },
+    recovery_audit_unresolved: [2]usize = .{ 0, 0 },
     recovery_namespace_cursor: SessionKind = .interactive,
     expiry_cleanup_cursors: [2]?SessionExpiryCursor = .{ null, null },
     expiry_namespace_cursor: SessionKind = .interactive,
@@ -2565,6 +2670,11 @@ pub const SessionRegistry = struct {
     lease_renewal_io_for_test: ?std.Io = null,
     lease_renewal_entered_for_test: ?*std.Io.Event = null,
     lease_renewal_release_for_test: ?*std.Io.Event = null,
+    /// Activated only after deployment coordination has drained every writer
+    /// that predates the principal inventory index. The generation is part of
+    /// the durable completion proof, so a later activation must use a new
+    /// value and perform a fresh canonical audit.
+    inventory_writer_fence_generation: ?u64 = null,
 
     pub fn init(durable: ?*DurableSessionStore) SessionRegistry {
         return initWithOptions(durable, null, null, null, null, null, null, null);
@@ -3365,11 +3475,13 @@ pub const SessionRegistry = struct {
             self.mutex.lock();
             const index_after = self.recovery_index_cursors;
             const audit_after = self.recovery_audit_cursors;
+            const audit_unresolved = self.recovery_audit_unresolved;
             const first_kind = self.recovery_namespace_cursor;
             self.mutex.unlock();
 
             var next_index_after = index_after;
             var next_audit_after = audit_after;
+            var next_audit_unresolved = audit_unresolved;
             var kind = first_kind;
             for (0..2) |_| {
                 const kind_index = sessionKindIndex(kind);
@@ -3384,10 +3496,25 @@ pub const SessionRegistry = struct {
                 // backfills records written before the compact index and
                 // self-heals a missing index key even while the index is full.
                 const audit_budget = @min(limit, 8);
-                const audited = try durable.scanLegacyRecoveryIds(alloc, kind, audit_after[kind_index], audit_budget);
+                const writer_fence_generation: ?u64 = switch (kind) {
+                    .interactive => self.inventory_writer_fence_generation,
+                    .idempotent_receipt => receipt_inventory_writer_fence_generation,
+                };
+                const audited = durable.scanLegacyRecoveryIds(alloc, kind, audit_after[kind_index], audit_budget) catch |err| {
+                    if (err == error.InvalidTransactionSessionRecord)
+                        try durable.recordLegacySessionInventoryDebt(kind, writer_fence_generation, 1);
+                    return err;
+                };
                 defer alloc.free(audited.recovery_ids);
                 defer alloc.free(audited.session_ids);
                 next_audit_after[kind_index] = audited.next_after;
+                next_audit_unresolved[kind_index] = audit_unresolved[kind_index] +| audited.unresolved_records;
+                if (audited.unresolved_records > 0)
+                    try durable.recordLegacySessionInventoryDebt(
+                        kind,
+                        writer_fence_generation,
+                        next_audit_unresolved[kind_index],
+                    );
                 // Pre-index rows have a distinct immutable inventory
                 // generation. Backfill that generation without moving rows
                 // into the current-writer index; once this namespace reaches
@@ -3396,8 +3523,16 @@ pub const SessionRegistry = struct {
                 // canonical namespace and remain valid during migration.
                 for (audited.session_ids) |txn_id|
                     try durable.refreshLegacySessionInventory(txn_id, kind);
-                if (audited.next_after == null)
-                    try durable.markLegacySessionInventoryComplete(kind);
+                if (audited.next_after == null) {
+                    if (next_audit_unresolved[kind_index] == 0) {
+                        if (writer_fence_generation) |generation|
+                            try durable.markLegacySessionInventoryComplete(kind, generation);
+                    }
+                    // EOF begins a new independent audit. Repaired corruption
+                    // may clear the debt on that next pass; a clean tail page
+                    // can never erase debt seen earlier in this pass.
+                    next_audit_unresolved[kind_index] = 0;
+                }
                 for (audited.recovery_ids) |txn_id| {
                     try durable.refreshRecoveryIndex(txn_id, kind);
                     if (pending.items.len >= limit) continue;
@@ -3416,6 +3551,7 @@ pub const SessionRegistry = struct {
             self.mutex.lock();
             self.recovery_index_cursors = next_index_after;
             self.recovery_audit_cursors = next_audit_after;
+            self.recovery_audit_unresolved = next_audit_unresolved;
             self.recovery_namespace_cursor = nextSessionKind(first_kind);
             self.mutex.unlock();
         } else {
@@ -3643,7 +3779,13 @@ pub const SessionRegistry = struct {
         limit: usize,
     ) !SessionDetailsPage {
         if (self.durable) |durable| {
-            var stored = try durable.scanSessionPage(alloc, principal, after, limit);
+            var stored = try durable.scanSessionPage(
+                alloc,
+                principal,
+                after,
+                limit,
+                self.inventory_writer_fence_generation,
+            );
             defer stored.deinit(alloc);
             var details = try alloc.alloc(SessionDetails, stored.sessions.len);
             var initialized: usize = 0;
@@ -6543,6 +6685,13 @@ fn sessionLegacyInventoryCompleteKey(kind: SessionKind) []const u8 {
     };
 }
 
+fn sessionLegacyInventoryDebtKey(kind: SessionKind) []const u8 {
+    return switch (kind) {
+        .interactive => interactive_legacy_inventory_debt_key,
+        .idempotent_receipt => receipt_legacy_inventory_debt_key,
+    };
+}
+
 fn sessionLegacyInventoryPrincipalDigest(kind: SessionKind, principal: ?[]const u8) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(switch (kind) {
@@ -8719,6 +8868,7 @@ test "transaction inventory is principal bounded and legacy rows remain exhausti
     defer store.close();
     var durable = DurableSessionStore.init(alloc, &store);
     var registry = SessionRegistry.init(&durable);
+    registry.inventory_writer_fence_generation = 7;
     defer registry.deinit(alloc);
 
     for (0..64) |_| _ = try registry.beginForPrincipal(alloc, .{ .sync_level = .write }, 7, "bob");
@@ -8749,7 +8899,7 @@ test "transaction inventory is principal bounded and legacy rows remain exhausti
     }
 
     try std.testing.expectError(error.NotFound, store.get(alloc, legacy_inventory_key));
-    try std.testing.expect(try durable.legacySessionInventoryComplete());
+    try std.testing.expect(try durable.legacySessionInventoryComplete(7));
     const migrated_legacy_key = try makeSessionLegacyInventoryKey(alloc, .interactive, "alice", alice_first.txn_id);
     defer alloc.free(migrated_legacy_key);
     const migrated_legacy_raw = try store.get(alloc, migrated_legacy_key);
@@ -8810,6 +8960,7 @@ test "transaction inventory preserves canonical-only sessions across restart" {
         defer store.close();
         var durable = DurableSessionStore.init(alloc, &store);
         var writer = SessionRegistry.init(&durable);
+        writer.inventory_writer_fence_generation = 11;
         defer writer.deinit(alloc);
         legacy_id = (try writer.beginForPrincipal(alloc, .{ .sync_level = .write }, 7, "alice")).txn_id;
         indexed_id = (try writer.beginForPrincipal(alloc, .{ .sync_level = .write }, 7, "alice")).txn_id;
@@ -8821,13 +8972,14 @@ test "transaction inventory preserves canonical-only sessions across restart" {
         try txn.commit();
         const audited = try writer.listPendingRecoveryIds(alloc, 8);
         alloc.free(audited);
-        try std.testing.expect(try durable.legacySessionInventoryComplete());
+        try std.testing.expect(try durable.legacySessionInventoryComplete(11));
     }
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
     var durable = DurableSessionStore.init(alloc, &store);
     var reader = SessionRegistry.init(&durable);
+    reader.inventory_writer_fence_generation = 11;
     defer reader.deinit(alloc);
     var cursor: ?SessionListCursor = null;
     var legacy_seen: usize = 0;
@@ -8850,6 +9002,139 @@ test "transaction inventory preserves canonical-only sessions across restart" {
     try std.testing.expectEqual(@as(usize, 1), legacy_seen);
     try std.testing.expectEqual(@as(usize, 1), indexed_seen);
     try std.testing.expect(used_persisted_legacy_index);
+}
+
+test "transaction inventory requires a new writer fence after a legacy writer returns" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-inventory-fence", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    var registry = SessionRegistry.init(&durable);
+    defer registry.deinit(alloc);
+
+    // Generation 3 represents a completed rollout. A rollback disables the
+    // fence, and a pre-index writer is modeled by removing the index entry it
+    // would never have created.
+    try durable.markLegacySessionInventoryComplete(.interactive, 3);
+    try durable.markLegacySessionInventoryComplete(.idempotent_receipt, receipt_inventory_writer_fence_generation);
+    registry.inventory_writer_fence_generation = null;
+    const late = try registry.beginForPrincipal(alloc, .{ .sync_level = .write }, 7, "alice");
+    const current_key = try makeSessionInventoryKey(alloc, .interactive, "alice", late.txn_id);
+    defer alloc.free(current_key);
+    {
+        var remove_index = try store.beginWriteTxn();
+        errdefer remove_index.abort();
+        try remove_index.delete(current_key);
+        try remove_index.commit();
+    }
+
+    var current_page = try registry.listDetailsPageForPrincipal(alloc, "alice", null, 4);
+    defer current_page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), current_page.sessions.len);
+    try std.testing.expectEqual(SessionListCursorPhase.legacy, current_page.next_cursor.?.phase);
+    var compatibility_page = try registry.listDetailsPageForPrincipal(alloc, "alice", current_page.next_cursor, 4);
+    defer compatibility_page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), compatibility_page.sessions.len);
+    try std.testing.expectEqualSlices(u8, &late.txn_id, &compatibility_page.sessions[0].status.txn_id);
+
+    // Reusing the stale completion proof is forbidden. A new deployment fence
+    // generation first falls back to canonical inventory, then becomes
+    // principal-scoped only after its own clean audit reaches EOF.
+    registry.inventory_writer_fence_generation = 4;
+    var stale_generation_page = try registry.listDetailsPageForPrincipal(alloc, "alice", null, 4);
+    defer stale_generation_page.deinit(alloc);
+    try std.testing.expectEqual(SessionListCursorPhase.legacy, stale_generation_page.next_cursor.?.phase);
+    const pending = try registry.listPendingRecoveryIds(alloc, 8);
+    alloc.free(pending);
+    try std.testing.expect(try durable.legacySessionInventoryComplete(4));
+
+    var fenced_page = try registry.listDetailsPageForPrincipal(alloc, "alice", null, 4);
+    defer fenced_page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), fenced_page.sessions.len);
+    try std.testing.expectEqual(SessionListCursorPhase.legacy_index, fenced_page.next_cursor.?.phase);
+    var migrated_page = try registry.listDetailsPageForPrincipal(alloc, "alice", fenced_page.next_cursor, 4);
+    defer migrated_page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), migrated_page.sessions.len);
+    try std.testing.expectEqualSlices(u8, &late.txn_id, &migrated_page.sessions[0].status.txn_id);
+}
+
+test "transaction inventory completion retains corruption debt across audit pages" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-inventory-debt", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    var registry = SessionRegistry.init(&durable);
+    registry.inventory_writer_fence_generation = 7;
+    defer registry.deinit(alloc);
+
+    var ids: [9]db_mod.types.TxnId = undefined;
+    for (&ids) |*txn_id| txn_id.* = (try registry.beginForPrincipal(alloc, .{ .sync_level = .write }, 7, "alice")).txn_id;
+    var corrupt_id = ids[0];
+    for (ids[1..]) |txn_id| if (std.mem.order(u8, &txn_id, &corrupt_id) == .lt) {
+        corrupt_id = txn_id;
+    };
+    const corrupt_key = try makeSessionKeyForKind(alloc, corrupt_id, .interactive);
+    defer alloc.free(corrupt_key);
+    const original = try store.get(alloc, corrupt_key);
+    defer alloc.free(original);
+    {
+        var corrupt_txn = try store.beginWriteTxn();
+        errdefer corrupt_txn.abort();
+        try corrupt_txn.put(corrupt_key, "{}");
+        try corrupt_txn.commit();
+    }
+
+    // The first page records debt and the clean tail page must not erase it.
+    for (0..2) |_| {
+        const pending = try registry.listPendingRecoveryIds(alloc, 8);
+        alloc.free(pending);
+    }
+    try std.testing.expect(!try durable.legacySessionInventoryKindComplete(.interactive, 7));
+    const debt_key = sessionLegacyInventoryDebtKey(.interactive);
+    const debt = try store.get(alloc, debt_key);
+    alloc.free(debt);
+
+    // Once repaired, a wholly clean generation may publish completion.
+    {
+        var repair_txn = try store.beginWriteTxn();
+        errdefer repair_txn.abort();
+        try repair_txn.put(corrupt_key, original);
+        try repair_txn.commit();
+    }
+    for (0..2) |_| {
+        const pending = try registry.listPendingRecoveryIds(alloc, 8);
+        alloc.free(pending);
+    }
+    try std.testing.expect(try durable.legacySessionInventoryKindComplete(.interactive, 7));
+    try std.testing.expectError(error.NotFound, store.get(alloc, debt_key));
+
+    // Malformed keys cannot be represented by the typed cursor and therefore
+    // fail closed instead of being skipped or causing an unbounded audit.
+    {
+        var malformed_txn = try store.beginWriteTxn();
+        errdefer malformed_txn.abort();
+        try malformed_txn.put(session_prefix ++ "!not-a-transaction-id", "{}");
+        try malformed_txn.commit();
+    }
+    registry.recovery_audit_cursors[sessionKindIndex(.interactive)] = null;
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, registry.listPendingRecoveryIds(alloc, 8));
+    try std.testing.expect(!try durable.legacySessionInventoryKindComplete(.interactive, 7));
+    const malformed_debt = try store.get(alloc, debt_key);
+    alloc.free(malformed_debt);
 }
 
 test "session cleanup response encodes removed count and cutoff" {

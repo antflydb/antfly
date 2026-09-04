@@ -1113,6 +1113,11 @@ pub const ApiHttpServerConfig = struct {
     session_max_record_bytes: ?usize = null,
     session_max_receipt_count: ?usize = null,
     session_max_receipt_bytes: ?usize = null,
+    /// Deployment-activated generation proving that every process capable of
+    /// writing the shared interactive-session namespace maintains principal
+    /// inventory v1. Leave null throughout a rolling upgrade. A later
+    /// reactivation after rollback must use a new generation.
+    session_inventory_writer_fence_generation: ?u64 = null,
     /// Optional node-wide resource owner. The owner must outlive ApiHttpServer.
     /// Cache budgets and concurrency are intentionally not HTTP/API config.
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -2906,6 +2911,7 @@ pub const ApiHttpServer = struct {
                     cfg.session_max_receipt_bytes,
                 );
                 registry.durable_scope = cfg.session_store_scope;
+                registry.inventory_writer_fence_generation = cfg.session_inventory_writer_fence_generation;
                 break :blk registry;
             },
             .join_job_store = distributed_join.JoinJobStore.init(owner_alloc, .{
@@ -3227,6 +3233,7 @@ pub const ApiHttpServer = struct {
                 effective_cfg.session_max_receipt_bytes,
             );
             server.txn_sessions.durable_scope = effective_cfg.session_store_scope;
+            server.txn_sessions.inventory_writer_fence_generation = effective_cfg.session_inventory_writer_fence_generation;
         }
         if (cfg.join_job_store_path orelse cfg.session_store_path) |base_path| {
             const join_job_path = if (cfg.join_job_store_path != null)

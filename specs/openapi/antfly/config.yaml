@@ -1076,6 +1076,15 @@ components:
           maximum: 68719476736
           default: 536870912
           description: Aggregate durable byte budget for pending and retained idempotency receipts.
+        inventory_writer_fence_generation:
+          type: integer
+          minimum: 1
+          description: >-
+            Deployment-controlled generation proving every process that can write the
+            interactive transaction-session namespace maintains principal inventory v1.
+            Leave unset during rolling upgrades. Increase it before reactivation after a
+            rollback so completion requires a fresh canonical audit. Deployment coordination
+            must prevent pre-feature processes, which do not understand this field, from writing.
         max_record_bytes:
           type: integer
           minimum: 65536

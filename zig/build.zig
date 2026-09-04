@@ -5990,6 +5990,8 @@ pub fn build(b: *std.Build) void {
             "transaction session inventory cursor traverses durable namespaces without duplicates",
             "transaction inventory is principal bounded and legacy rows remain exhaustively visible",
             "transaction inventory preserves canonical-only sessions across restart",
+            "transaction inventory requires a new writer fence after a legacy writer returns",
+            "transaction inventory completion retains corruption debt across audit pages",
             "transaction session registry enforces savepoint limits and reports remaining capacity",
             "transaction session registry can renew owned leases opportunistically",
             "terminal idempotent receipt replay does not require mutation lease ownership",
