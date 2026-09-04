@@ -3994,7 +3994,11 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
     };
 }
 
-fn isHAStandbyUpstreamTransportError(err: anyerror) bool {
+/// Portable transport failures that can be retried by bounded control-plane
+/// loops. Keep metadata bootstrap and HA replication on one classification so
+/// resolver/platform error additions cannot make one loop terminate while the
+/// other correctly backs off.
+fn isRetryableControlPlaneTransportError(err: anyerror) bool {
     return switch (haStandbyReplicationErrorCode(err)) {
         .HttpConnectionClosing,
         .ConnectionResetByPeer,
@@ -4014,6 +4018,10 @@ fn isHAStandbyUpstreamTransportError(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+fn isHAStandbyUpstreamTransportError(err: anyerror) bool {
+    return isRetryableControlPlaneTransportError(err);
 }
 
 fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
@@ -4146,15 +4154,9 @@ test "data server keeps upstream replication availability failures nonfatal" {
 }
 
 fn isRetryableMetadataBootstrapError(err: anyerror) bool {
+    if (isRetryableControlPlaneTransportError(err)) return true;
     return switch (err) {
-        error.HttpConnectionClosing,
-        error.ConnectionResetByPeer,
-        error.ConnectionRefused,
-        error.BrokenPipe,
-        error.EndOfStream,
-        error.Timeout,
         error.UnexpectedHttpStatus,
-        error.NotListening,
         error.NotLeader,
         error.ProposalDropped,
         error.LeaderTransferInProgress,
@@ -4221,11 +4223,29 @@ fn chooseStoreStatusReportKind(
 }
 
 test "data runtime treats transient metadata failures as retryable bootstrap failures" {
+    inline for (.{
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.ConnectionRefused,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.NoAddressReturned,
+        error.Timeout,
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.NetworkDown,
+        error.AddressUnavailable,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.NotListening,
+    }) |err| {
+        try std.testing.expect(isRetryableControlPlaneTransportError(err));
+        try std.testing.expect(isRetryableMetadataBootstrapError(err));
+    }
     try std.testing.expect(isRetryableMetadataBootstrapError(error.NotLeader));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.ProposalDropped));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.LeaderTransferInProgress));
-    try std.testing.expect(isRetryableMetadataBootstrapError(error.ConnectionRefused));
-    try std.testing.expect(isRetryableMetadataBootstrapError(error.Timeout));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.StoreRegistrationNotVisible));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataSnapshotHeadMismatch));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataIncarnationUnavailable));
