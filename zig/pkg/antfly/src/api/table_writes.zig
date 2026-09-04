@@ -7763,6 +7763,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     const TargetedStatusFence = struct {
         index_name: []u8,
+        authority_token: ?runtime_status.TableRuntimeSnapshotCache.TargetedIndexTransitionToken,
         count: usize = 1,
 
         fn deinit(self: *TargetedStatusFence) void {
@@ -9761,13 +9762,15 @@ pub const ProvisionedTableWriteSource = struct {
             target.count += 1;
             return;
         }
+        const authority_token = if (self.runtime_status_cache) |snapshot_cache|
+            snapshot_cache.fenceTargetedIndexPublications(table_name, index_name)
+        else
+            null;
         entry.targeted_structural_reconcile_indexes.append(std.heap.page_allocator, .{
             .index_name = std.heap.page_allocator.dupe(u8, index_name) catch
                 @panic("failed to allocate targeted status fence"),
+            .authority_token = authority_token,
         }) catch @panic("failed to retain targeted status fence");
-        if (self.runtime_status_cache) |snapshot_cache| {
-            snapshot_cache.fenceTargetedIndexPublications(table_name, index_name);
-        }
     }
 
     fn releaseStructuralReconcileStatus(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -9812,13 +9815,31 @@ pub const ProvisionedTableWriteSource = struct {
             target.count -= 1;
             if (target.count == 0) {
                 if (self.runtime_status_cache) |snapshot_cache| {
-                    snapshot_cache.releaseTargetedIndexPublications(table_name, index_name);
+                    if (target.authority_token) |token| {
+                        snapshot_cache.releaseTargetedIndexPublications(table_name, index_name, token);
+                    }
                 }
                 var removed = entry.targeted_structural_reconcile_indexes.swapRemove(target_index);
                 removed.deinit();
             }
             break;
         } else unreachable;
+    }
+
+    fn targetedStructuralTransitionToken(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) ?runtime_status.TableRuntimeSnapshotCache.TargetedIndexTransitionToken {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, null) orelse return null;
+        const entry = &self.active_table_activities.items[index];
+        for (entry.targeted_structural_reconcile_indexes.items) |target| {
+            if (std.mem.eql(u8, target.index_name, index_name)) return target.authority_token;
+        }
+        return null;
     }
 
     fn releaseStructuralReconcileRequestStatus(
@@ -11313,7 +11334,9 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginTargetedStructuralTableActivity(table_name, index_name);
         self.publishResidentRuntimeStatusBeforeTargetedMutationBestEffort(table_name);
         if (self.runtime_status_cache) |snapshot_cache| {
-            snapshot_cache.armTargetedIndexPublications(table_name, index_name);
+            if (self.targetedStructuralTransitionToken(table_name, index_name)) |token| {
+                _ = snapshot_cache.armTargetedIndexPublications(table_name, index_name, token);
+            }
         }
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
@@ -22204,6 +22227,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         index_name: []const u8,
+        transition_token: runtime_status.TableRuntimeSnapshotCache.TargetedIndexTransitionToken,
     ) !void {
         var metadata: ?struct { indexes_json: []u8, schema_json: []u8 } = null;
         defer if (metadata) |loaded| {
@@ -22272,6 +22296,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 alloc,
                 table_name,
                 index_name,
+                transition_token,
                 group_id,
                 cached.db,
             );
@@ -22398,12 +22423,14 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        hosted_cache.runtime_status_cache.fenceTargetedIndexPublications(table_name, index_name);
-        hosted_cache.runtime_status_cache.armTargetedIndexPublications(table_name, index_name);
-        defer hosted_cache.runtime_status_cache.releaseTargetedIndexPublications(table_name, index_name);
+        const transition_token = hosted_cache.runtime_status_cache.fenceTargetedIndexPublications(table_name, index_name) orelse
+            return error.OutOfMemory;
+        if (!hosted_cache.runtime_status_cache.armTargetedIndexPublications(table_name, index_name, transition_token))
+            return error.RuntimeStatusPublicationFenced;
+        defer hosted_cache.runtime_status_cache.releaseTargetedIndexPublications(table_name, index_name, transition_token);
         const deadline_ns = platform_time.monotonicNs() + replicated_apply_writer_open_timeout_ns;
         while (true) {
-            self.reconcileCachedIndexCreate(alloc, table_name, index_name) catch |err| switch (err) {
+            self.reconcileCachedIndexCreate(alloc, table_name, index_name, transition_token) catch |err| switch (err) {
                 error.LsmRootWriterAlreadyOpen, error.WriterLocked, error.PersistentDescriptorAdmissionExhausted => {
                     self.invalidateManagedWriteCache(table_name);
                     if (platform_time.monotonicNs() >= deadline_ns) return err;
@@ -22452,9 +22479,11 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        hosted_cache.runtime_status_cache.fenceTargetedIndexPublications(table_name, index_name);
-        hosted_cache.runtime_status_cache.armTargetedIndexPublications(table_name, index_name);
-        defer hosted_cache.runtime_status_cache.releaseTargetedIndexPublications(table_name, index_name);
+        const transition_token = hosted_cache.runtime_status_cache.fenceTargetedIndexPublications(table_name, index_name) orelse
+            return error.OutOfMemory;
+        if (!hosted_cache.runtime_status_cache.armTargetedIndexPublications(table_name, index_name, transition_token))
+            return error.RuntimeStatusPublicationFenced;
+        defer hosted_cache.runtime_status_cache.releaseTargetedIndexPublications(table_name, index_name, transition_token);
         const deadline_ns = platform_time.monotonicNs() + replicated_apply_writer_open_timeout_ns;
         while (true) {
             self.invalidateManagedWriteCache(table_name);
@@ -22467,7 +22496,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 else => return err,
             };
             self.invalidateManagedWriteCache(table_name);
-            hosted_cache.runtime_status_cache.acknowledgeTargetedIndexAbsence(table_name, index_name);
+            hosted_cache.runtime_status_cache.acknowledgeTargetedIndexAbsence(table_name, index_name, transition_token);
             return;
         }
     }
@@ -27734,7 +27763,14 @@ fn publishStructuralRuntimeObservations(
     const result = if (lifecycle_transition and target_index_name == null)
         try snapshot_cache.publishLifecycleTransition(completed, table_name, statuses[0..observations.len])
     else if (target_index_name) |index_name|
-        try snapshot_cache.publishTargetedGroups(completed, table_name, index_name, statuses[0..observations.len])
+        try snapshot_cache.publishTargetedGroupsForTransition(
+            completed,
+            source.targetedStructuralTransitionToken(table_name, index_name) orelse
+                return error.RuntimeStatusPublicationFenced,
+            table_name,
+            index_name,
+            statuses[0..observations.len],
+        )
     else
         try snapshot_cache.publishGroups(completed, table_name, statuses[0..observations.len]);
     try acceptRuntimeStatusPublication(result);
@@ -27814,6 +27850,11 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
         }
         return;
     };
+    const target_transition_token = if (target_index_name) |index_name|
+        source.targetedStructuralTransitionToken(table_name, index_name) orelse
+            return error.RuntimeStatusPublicationFenced
+    else
+        null;
     const publication_token = try snapshot_cache.capturePublicationToken(table_name);
     const visible_root_generation = source.visibleRootGeneration(group_id);
     const opened_root_generation = db.core.index_manager.lsm_root_generation;
@@ -27832,6 +27873,7 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
         mode,
         .runtime,
         target_index_name,
+        target_transition_token,
         db,
     );
     // The cache now contains an observation captured after the durable repair
@@ -27881,6 +27923,7 @@ fn publishTerminalStartupRuntimeStatusSnapshot(
         .consistent,
         .terminal_startup,
         null,
+        null,
         db,
     ) catch |err| switch (err) {
         error.RuntimeStatusPublicationFenced => return false,
@@ -27897,6 +27940,7 @@ fn publishRuntimeStatusSnapshotToCacheConsistent(
     alloc: std.mem.Allocator,
     table_name: []const u8,
     index_name: []const u8,
+    transition_token: runtime_status.TableRuntimeSnapshotCache.TargetedIndexTransitionToken,
     group_id: u64,
     db: *db_mod.DB,
 ) !void {
@@ -27912,6 +27956,7 @@ fn publishRuntimeStatusSnapshotToCacheConsistent(
         .consistent,
         .runtime,
         index_name,
+        transition_token,
         db,
     );
 }
@@ -27927,6 +27972,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
     mode: RuntimeStatusSnapshotMode,
     publication_kind: RuntimeStatusPublicationKind,
     target_index_name: ?[]const u8,
+    target_transition_token: ?runtime_status.TableRuntimeSnapshotCache.TargetedIndexTransitionToken,
     db: *db_mod.DB,
 ) !void {
     const async_stats = db.snapshotAsyncIndexingStats();
@@ -27948,7 +27994,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
-            try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, target_index_name, status);
+            try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, target_index_name, target_transition_token, status);
         } else {
             var status = runtime_status.LocalTableRuntimeStatus{
                 .group_id = group_id,
@@ -27959,7 +28005,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
-            try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, target_index_name, status);
+            try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, target_index_name, target_transition_token, status);
         }
         return;
     }
@@ -28063,14 +28109,14 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         !statusHasRuntimeFactsIgnoringMetadataSource(status))
     {
         markClearedStartupRuntimeStatus(&status);
-        try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, target_index_name, status);
+        try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, target_index_name, target_transition_token, status);
     } else {
         if (publication_kind == .terminal_startup)
             markStartupRuntimeStatus(&status, startup)
         else
             markRuntimeStatusFromDb(&status, phase);
         status.metadata.lsm_root_generation = lsm_root_generation;
-        try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, target_index_name, status);
+        try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, target_index_name, target_transition_token, status);
     }
 }
 
@@ -28079,6 +28125,7 @@ fn publishRuntimeStatusGroupAfterObservation(
     publication_fence: runtime_status.TableRuntimeSnapshotCache.PublicationToken,
     table_name: []const u8,
     target_index_name: ?[]const u8,
+    target_transition_token: ?runtime_status.TableRuntimeSnapshotCache.TargetedIndexTransitionToken,
     status: runtime_status.LocalTableRuntimeStatus,
 ) !void {
     // The first token fences table invalidation while DB state is sampled. A
@@ -28097,7 +28144,13 @@ fn publishRuntimeStatusGroupAfterObservation(
     // that no target-advance event raced the sampled durable sequence.
     completed.target_observation_revision = publication_fence.target_observation_revision;
     const result = if (target_index_name) |index_name|
-        try snapshot_cache.publishTargetedGroups(completed, table_name, index_name, &.{status})
+        try snapshot_cache.publishTargetedGroupsForTransition(
+            completed,
+            target_transition_token orelse return error.RuntimeStatusPublicationFenced,
+            table_name,
+            index_name,
+            &.{status},
+        )
     else
         try snapshot_cache.publishGroup(completed, table_name, status);
     try acceptRuntimeStatusPublication(result);
@@ -28776,7 +28829,7 @@ fn publishTerminalStartupCatchUpRuntimeStatus(
     var status = try syntheticStartupRuntimeStatusFromConfiguredIndexes(alloc, group_id, summary, terminal_startup, message);
     defer status.deinit(alloc);
     setRuntimeStatusMetadata(&status, .startup_catch_up, .stale);
-    publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, null, status) catch |publish_err| switch (publish_err) {
+    publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, null, null, status) catch |publish_err| switch (publish_err) {
         error.RuntimeStatusPublicationFenced => return false,
         else => return publish_err,
     };
@@ -45291,7 +45344,7 @@ test "runtime status hook orders completed observation without crossing invalida
             .stats = .{ .source_doc_count = 0 },
         }),
     );
-    try publishRuntimeStatusGroupAfterObservation(&cache, hook_fence, "docs", null, .{
+    try publishRuntimeStatusGroupAfterObservation(&cache, hook_fence, "docs", null, null, .{
         .group_id = 7001,
         .stats = .{ .source_doc_count = 1 },
     });
@@ -45309,6 +45362,7 @@ test "runtime status hook orders completed observation without crossing invalida
         &cache,
         stale_epoch,
         "docs",
+        null,
         null,
         .{ .group_id = 7001, .stats = .{ .source_doc_count = 2 } },
     ));
@@ -45531,8 +45585,10 @@ test "targeted repair publication preserves sibling authority fence" {
             .stats = .{ .source_doc_count = 2, .index_count = ready_indexes.len, .indexes = &ready_indexes },
         }),
     );
-    cache.fenceTargetedIndexPublications("docs", "thumbnail");
-    cache.armTargetedIndexPublications("docs", "thumbnail");
+    source.reserveTargetedStructuralReconcileStatus("docs", "thumbnail");
+    defer source.releaseTargetedStructuralReconcileStatus("docs", "thumbnail");
+    const transition = source.targetedStructuralTransitionToken("docs", "thumbnail").?;
+    try std.testing.expect(cache.armTargetedIndexPublications("docs", "thumbnail", transition));
 
     var repairing_indexes = [_]db_mod.types.DBIndexStats{
         .{ .name = "title_body", .kind = .dense_vector },

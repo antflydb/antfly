@@ -6569,7 +6569,7 @@ pub fn build(b: *std.Build) void {
             "table runtime snapshot cache batch publication is table epoch atomic",
             "table runtime snapshot cache publication fence preserves the last snapshot",
             "targeted publication fence preserves only untouched siblings during catch up",
-            "targeted publication fence waits for every overlapping owner",
+            "new targeted transition supersedes delayed controls from an older owner",
             "targeted catch up hands off same incarnation serving authority",
             "target authority settles only after every group acknowledges the exact incarnation",
             "targeted publication rejects a completed stale incarnation until structural acknowledgement",

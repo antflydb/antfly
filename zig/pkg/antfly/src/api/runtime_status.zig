@@ -210,6 +210,7 @@ pub const TableRuntimeSummary = struct {
 
 const TargetedIndexAuthority = struct {
     const Identity = struct {
+        kind: db_mod.types.IndexKind,
         incarnation: u64,
         config_hash: u64,
     };
@@ -226,13 +227,18 @@ const TargetedIndexAuthority = struct {
         exact: Identity,
     };
 
-    // This record survives transition settlement. Retaining the accepted
-    // desired identity (or deletion tombstone) prevents an arbitrarily late
-    // same-name publisher from resurrecting a superseded incarnation.
+    // Globally unique operation revision. Every control-plane mutation gets a
+    // new revision, so a delayed arm/acknowledgement/release from an older
+    // owner cannot modify the authority selected by a newer mutation.
+    transition_revision: u64,
+    // Exact records survive transition settlement so a late same-name
+    // publisher cannot replace a live incarnation. Settled absence records are
+    // reclaimed: the deleted name is not addressable through the catalog, and
+    // a future same-name create installs a new revision before it is visible.
     transition_active: bool = true,
-    // Multiple mutation owners may overlap at hosted/public boundaries that
-    // do not share the provisioned writer's structural activity queue.
-    owner_count: usize = 1,
+    // Coalesced work for one revision shares one owner. A newer revision
+    // supersedes the old owner rather than joining its lifetime.
+    owner_active: bool = true,
     // Only observations captured after the mutation boundary may hand target
     // authority back. This excludes the resident sibling snapshot deliberately
     // published between fencing and applying the target.
@@ -262,6 +268,13 @@ pub const TableRuntimeSnapshotCache = struct {
         table_epoch: TableEpoch,
         observation_generation: u64,
         target_observation_revision: u64,
+    };
+
+    pub const TargetedIndexTransitionToken = struct {
+        // Root replacement invalidates every target-local authority token.
+        root_generation: u64,
+        // Globally unique, so name reuse and overlapping DDL cannot alias.
+        revision: u64,
     };
 
     pub const PublishResult = enum {
@@ -319,10 +332,10 @@ pub const TableRuntimeSnapshotCache = struct {
         // Latest commit watermark that each group must have observed before
         // its coverage may be treated as current.
         required_target_observation_revisions: std.AutoHashMapUnmanaged(u64, TargetObservationRequirement) = .empty,
-        // Current catalog authority by index name. Settled identities and
-        // absence tombstones remain here so delayed same-name publishers
-        // cannot regain serving authority. Whole-table invalidation is the
-        // garbage-collection boundary for names that are no longer relevant.
+        // Current catalog authority by index name. Settled live identities
+        // remain as watermarks; settled deletion entries are reclaimed. The
+        // map is therefore bounded by live indexes plus active transitions,
+        // rather than by historical DDL names.
         index_authorities: std.StringHashMapUnmanaged(TargetedIndexAuthority) = .empty,
         // Keep the normal publication path O(indexes in the observation), not
         // O(historical index names), when no structural transition is active.
@@ -345,6 +358,7 @@ pub const TableRuntimeSnapshotCache = struct {
     topology_revision: u64 = 1,
     next_invalidation_epoch: u64 = 1,
     next_observation_generation: u64 = 1,
+    next_targeted_index_transition_revision: u64 = 1,
     target_observation_revision: u64 = 1,
     tables: std.StringHashMapUnmanaged(TableState) = .empty,
 
@@ -436,6 +450,12 @@ pub const TableRuntimeSnapshotCache = struct {
             self.invalidateTableStateLocked(state);
             return false;
         };
+        if (!fence.owner_active) {
+            // A repair discovered after structural ownership ended is its own
+            // authority transition. Retiring DDL tokens must not be able to
+            // arm, acknowledge, or release this repair boundary.
+            fence.transition_revision = self.takeTargetedIndexTransitionRevisionLocked();
+        }
         // A repair edge is a new authority boundary even when the structural
         // owner has already handed off an earlier observation. Re-arm the
         // exact target under the same cache lock used to classify its scope;
@@ -445,7 +465,7 @@ pub const TableRuntimeSnapshotCache = struct {
         if (!fence.transition_active) state.active_index_transition_count += 1;
         fence.transition_active = true;
         fence.target_authority_handed_off = false;
-        if (fence.owner_count == 0) {
+        if (!fence.owner_active) {
             fence.release_after_observation_generation = self.next_observation_generation;
         }
         var status_it = state.groups.valueIterator();
@@ -467,7 +487,7 @@ pub const TableRuntimeSnapshotCache = struct {
         self: *@This(),
         table_name: []const u8,
         index_name: []const u8,
-    ) void {
+    ) ?TargetedIndexTransitionToken {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         self.advanceInvalidationEpochLocked();
@@ -476,15 +496,13 @@ pub const TableRuntimeSnapshotCache = struct {
         const state = self.ensureTableLocked(table_name) catch {
             self.clearTablesLocked();
             self.advanceInvalidationEpochLocked();
-            return;
+            return null;
         };
+        const transition_revision = self.takeTargetedIndexTransitionRevisionLocked();
         if (state.index_authorities.getPtr(index_name)) |fence| {
-            if (fence.transition_active) {
-                fence.owner_count += 1;
-            } else {
-                fence.owner_count = 1;
-                state.active_index_transition_count += 1;
-            }
+            if (!fence.transition_active) state.active_index_transition_count += 1;
+            fence.transition_revision = transition_revision;
+            fence.owner_active = true;
             fence.transition_active = true;
             fence.accept_target_after_observation_generation = self.next_observation_generation;
             fence.expectation = .unknown;
@@ -496,9 +514,10 @@ pub const TableRuntimeSnapshotCache = struct {
                 self.clearGroupsLocked(state);
                 self.clearIndexAuthoritiesLocked(state);
                 state.epoch.invalidation_epoch = self.next_invalidation_epoch;
-                return;
+                return null;
             };
             state.index_authorities.put(self.alloc, owned_name, .{
+                .transition_revision = transition_revision,
                 .accept_target_after_observation_generation = self.next_observation_generation,
                 .expectation_observation_generation = self.next_observation_generation,
             }) catch {
@@ -506,7 +525,7 @@ pub const TableRuntimeSnapshotCache = struct {
                 self.clearGroupsLocked(state);
                 self.clearIndexAuthoritiesLocked(state);
                 state.epoch.invalidation_epoch = self.next_invalidation_epoch;
-                return;
+                return null;
             };
             state.active_index_transition_count += 1;
         }
@@ -517,6 +536,10 @@ pub const TableRuntimeSnapshotCache = struct {
             }
         }
         state.epoch.invalidation_epoch = self.next_invalidation_epoch;
+        return .{
+            .root_generation = state.epoch.root_generation,
+            .revision = transition_revision,
+        };
     }
 
     /// Advances the target's observation boundary after the resident writer
@@ -525,12 +548,13 @@ pub const TableRuntimeSnapshotCache = struct {
         self: *@This(),
         table_name: []const u8,
         index_name: []const u8,
-    ) void {
+        token: TargetedIndexTransitionToken,
+    ) bool {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        const state = self.tables.getPtr(table_name) orelse return;
-        const fence = state.index_authorities.getPtr(index_name) orelse return;
-        if (!fence.transition_active) return;
+        const state = self.tables.getPtr(table_name) orelse return false;
+        const fence = currentTargetedIndexAuthority(state, index_name, token) orelse return false;
+        if (!fence.owner_active) return false;
         fence.accept_target_after_observation_generation = self.next_observation_generation;
         fence.expectation = .unknown;
         fence.expectation_observation_generation = self.next_observation_generation;
@@ -541,6 +565,7 @@ pub const TableRuntimeSnapshotCache = struct {
                 if (std.mem.eql(u8, item.name, index_name)) item.runtime_observation_stale = true;
             }
         }
+        return true;
     }
 
     /// Requests release after the named mutation's last synchronous/queued
@@ -551,15 +576,14 @@ pub const TableRuntimeSnapshotCache = struct {
         self: *@This(),
         table_name: []const u8,
         index_name: []const u8,
+        token: TargetedIndexTransitionToken,
     ) void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const state = self.tables.getPtr(table_name) orelse return;
-        const fence = state.index_authorities.getPtr(index_name) orelse return;
-        if (!fence.transition_active) return;
-        std.debug.assert(fence.owner_count > 0);
-        fence.owner_count -= 1;
-        if (fence.owner_count != 0) return;
+        const fence = currentTargetedIndexAuthority(state, index_name, token) orelse return;
+        if (!fence.owner_active) return;
+        fence.owner_active = false;
         fence.release_after_observation_generation = self.next_observation_generation;
         self.advanceTargetedIndexAuthorityLocked(state);
         self.settleReleasedIndexAuthoritiesLocked(state);
@@ -573,12 +597,17 @@ pub const TableRuntimeSnapshotCache = struct {
         self: *@This(),
         table_name: []const u8,
         index_name: []const u8,
+        token: TargetedIndexTransitionToken,
     ) void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const state = self.tables.getPtr(table_name) orelse return;
-        const fence = state.index_authorities.getPtr(index_name) orelse return;
-        if (!fence.transition_active) return;
+        const fence = currentTargetedIndexAuthority(state, index_name, token) orelse return;
+        if (!fence.owner_active) return;
+        // Desired identity is write-once for a transition. A successful create
+        // acknowledgement cannot subsequently be converted into absence by a
+        // delayed drop callback carrying the same operation token.
+        if (fence.expectation != .unknown and fence.expectation != .absent) return;
         fence.expectation = .absent;
         fence.expectation_observation_generation = self.next_observation_generation;
         fence.target_authority_handed_off = false;
@@ -642,8 +671,9 @@ pub const TableRuntimeSnapshotCache = struct {
         return token;
     }
 
-    /// Publishes one owned observation in O(1). The status is cloned before
-    /// locking so DBStats ownership never crosses the caller/cache boundary.
+    /// Publishes one owned observation in O(indexes in that group), independent
+    /// of table group count and historical mutation count. The status is cloned
+    /// before locking so DBStats ownership never crosses the caller/cache boundary.
     pub fn publishGroup(
         self: *@This(),
         token: PublicationToken,
@@ -677,6 +707,10 @@ pub const TableRuntimeSnapshotCache = struct {
                 owned.deinit(self.alloc);
                 return .stale_observation;
             }
+            if (observationWouldWithdrawAcceptedIndexAuthority(previous.*, owned, &state.index_authorities)) {
+                owned.deinit(self.alloc);
+                return .stale_observation;
+            }
             // Single-group lifecycle publications must obey the same merge
             // contract as catalog refreshes. In particular, a synthetic
             // startup/status placeholder may withdraw convergence authority,
@@ -694,7 +728,7 @@ pub const TableRuntimeSnapshotCache = struct {
         } else {
             try state.groups.put(self.alloc, status.group_id, owned);
         }
-        self.enforceIndexAuthoritiesLocked(state);
+        self.enforceIndexAuthoritiesInStatusLocked(state, state.groups.getPtr(status.group_id).?);
         self.advanceTargetedIndexAuthorityLocked(state);
         self.settleReleasedIndexAuthoritiesLocked(state);
         return .published;
@@ -711,20 +745,42 @@ pub const TableRuntimeSnapshotCache = struct {
         table_name: []const u8,
         statuses: []const LocalTableRuntimeStatus,
     ) !PublishResult {
-        return self.publishGroupsForStructuralTarget(token, table_name, null, statuses);
+        return self.publishGroupsForStructuralTarget(token, table_name, null, null, statuses);
     }
 
     /// Publish a targeted structural observation without allowing its bounded
     /// DB snapshot to replace stronger serving facts owned by untouched index
     /// siblings. The target name is cache-local scope, not wire metadata.
-    pub fn publishTargetedGroups(
+    // Internal convenience for cache-focused tests which predate operation
+    // handles. Production call sites use publishTargetedGroupsForTransition.
+    fn publishTargetedGroups(
         self: *@This(),
         token: PublicationToken,
         table_name: []const u8,
         target_index_name: []const u8,
         statuses: []const LocalTableRuntimeStatus,
     ) !PublishResult {
-        return self.publishGroupsForStructuralTarget(token, table_name, target_index_name, statuses);
+        return self.publishGroupsForStructuralTarget(token, table_name, target_index_name, null, statuses);
+    }
+
+    /// Production structural publishers must present the mutation handle that
+    /// authorized their DB work. This closes the gap where an old owner could
+    /// sample after a newer fence and accidentally borrow its table epoch.
+    pub fn publishTargetedGroupsForTransition(
+        self: *@This(),
+        token: PublicationToken,
+        transition_token: TargetedIndexTransitionToken,
+        table_name: []const u8,
+        target_index_name: []const u8,
+        statuses: []const LocalTableRuntimeStatus,
+    ) !PublishResult {
+        return self.publishGroupsForStructuralTarget(
+            token,
+            table_name,
+            target_index_name,
+            transition_token,
+            statuses,
+        );
     }
 
     fn publishGroupsForStructuralTarget(
@@ -732,6 +788,7 @@ pub const TableRuntimeSnapshotCache = struct {
         token: PublicationToken,
         table_name: []const u8,
         target_index_name: ?[]const u8,
+        transition_token: ?TargetedIndexTransitionToken,
         statuses: []const LocalTableRuntimeStatus,
     ) !PublishResult {
         for (statuses, 0..) |status, index| {
@@ -758,6 +815,10 @@ pub const TableRuntimeSnapshotCache = struct {
         defer self.mutex.unlock();
         const state = self.tables.getPtr(table_name) orelse return .stale_table;
         if (!std.meta.eql(state.epoch, token.table_epoch)) return .stale_table;
+        if (transition_token) |transition| {
+            const name = target_index_name orelse return .stale_observation;
+            _ = currentTargetedIndexAuthority(state, name, transition) orelse return .stale_observation;
+        }
 
         var new_groups: usize = 0;
         for (statuses) |status| {
@@ -821,6 +882,10 @@ pub const TableRuntimeSnapshotCache = struct {
                     next.deinit(self.alloc);
                     continue;
                 }
+                if (observationWouldWithdrawAcceptedIndexAuthority(previous.*, next.*, &state.index_authorities)) {
+                    next.deinit(self.alloc);
+                    continue;
+                }
                 try preserveArtifactVisibilityOnReplayRegression(
                     self.alloc,
                     previous.*,
@@ -834,10 +899,10 @@ pub const TableRuntimeSnapshotCache = struct {
             } else {
                 state.groups.putAssumeCapacity(status.group_id, next.*);
             }
+            self.enforceIndexAuthoritiesInStatusLocked(state, state.groups.getPtr(status.group_id).?);
             next.* = undefined;
             published = true;
         }
-        self.enforceIndexAuthoritiesLocked(state);
         self.advanceTargetedIndexAuthorityLocked(state);
         self.settleReleasedIndexAuthoritiesLocked(state);
         return if (published or statuses.len == 0) .published else .stale_observation;
@@ -1119,6 +1184,12 @@ pub const TableRuntimeSnapshotCache = struct {
             status.* = cloned;
             return;
         }
+        if (observationWouldWithdrawAcceptedIndexAuthority(cached.*, status.*, index_authorities)) {
+            const cloned = try cached.clone(self.alloc);
+            status.deinit(self.alloc);
+            status.* = cloned;
+            return;
+        }
         if (status.metadata.source == .synthetic_config and runtimeStatusWorthPreserving(cached.*)) {
             const merged = try mergeCachedStatusWithSyntheticPlaceholder(
                 self.alloc,
@@ -1221,6 +1292,7 @@ pub const TableRuntimeSnapshotCache = struct {
                 &state.index_authorities,
                 state.active_index_transition_count != 0,
             );
+            self.enforceIndexAuthoritiesInStatusLocked(state, &owned);
             if (replacement.getPtr(owned.group_id)) |duplicate| {
                 duplicate.deinit(self.alloc);
                 duplicate.* = owned;
@@ -1231,7 +1303,6 @@ pub const TableRuntimeSnapshotCache = struct {
 
         var old_groups = state.groups;
         state.groups = replacement;
-        self.enforceIndexAuthoritiesLocked(state);
         self.advanceTargetedIndexAuthorityLocked(state);
         self.settleReleasedIndexAuthoritiesLocked(state);
         var old_it = old_groups.valueIterator();
@@ -1295,14 +1366,13 @@ pub const TableRuntimeSnapshotCache = struct {
     }
 
     fn settleReleasedIndexAuthoritiesLocked(self: *@This(), state: *TableState) void {
-        _ = self;
         if (state.groups.count() == 0 or state.active_index_transition_count == 0) return;
         while (true) {
             var settled_name: ?[]const u8 = null;
             var fence_it = state.index_authorities.iterator();
             while (fence_it.next()) |entry| {
                 if (!entry.value_ptr.transition_active) continue;
-                if (entry.value_ptr.owner_count != 0) continue;
+                if (entry.value_ptr.owner_active) continue;
                 if (!entry.value_ptr.target_authority_handed_off) continue;
                 const release_generation = entry.value_ptr.release_after_observation_generation orelse continue;
                 var all_groups_authoritative = true;
@@ -1322,10 +1392,15 @@ pub const TableRuntimeSnapshotCache = struct {
             }
             const name = settled_name orelse return;
             const authority = state.index_authorities.getPtr(name).?;
-            authority.transition_active = false;
-            authority.release_after_observation_generation = null;
             std.debug.assert(state.active_index_transition_count > 0);
             state.active_index_transition_count -= 1;
+            if (targetExpectationIsAbsent(authority.expectation)) {
+                const removed = state.index_authorities.fetchRemove(name).?;
+                self.alloc.free(@constCast(removed.key));
+            } else {
+                authority.transition_active = false;
+                authority.release_after_observation_generation = null;
+            }
         }
     }
 
@@ -1375,26 +1450,38 @@ pub const TableRuntimeSnapshotCache = struct {
         }
     }
 
-    /// Applies the persistent catalog watermark independently of transition
-    /// ownership. Settling a fence must not make a deleted or superseded
-    /// incarnation eligible for a later generic status publication.
-    fn enforceIndexAuthoritiesLocked(self: *@This(), state: *TableState) void {
+    /// Applies persistent live-index authority independently of transition
+    /// ownership. Settling a fence must not make a superseded incarnation
+    /// eligible for a later generic status publication.
+    fn enforceIndexAuthoritiesInStatusLocked(
+        self: *@This(),
+        state: *const TableState,
+        status: *LocalTableRuntimeStatus,
+    ) void {
         _ = self;
         if (state.index_authorities.count() == 0) return;
-        var status_it = state.groups.valueIterator();
-        while (status_it.next()) |status| {
-            for (status.stats.indexes) |*item| {
-                const authority = state.index_authorities.get(item.name) orelse continue;
-                const accepted = switch (authority.expectation) {
-                    .unknown, .absent => false,
-                    .exact => targetAuthorityAcceptsIdentity(authority, item.*),
-                };
-                if (accepted) continue;
-                item.runtime_observation_stale = true;
-                item.runtime_observation_serviceable = false;
-                item.runtime_observation_targeted_sibling = false;
-            }
+        for (status.stats.indexes) |*item| {
+            const authority = state.index_authorities.get(item.name) orelse continue;
+            const accepted = switch (authority.expectation) {
+                .unknown, .absent => false,
+                .exact => targetAuthorityAcceptsIdentity(authority, item.*),
+            };
+            if (accepted) continue;
+            item.runtime_observation_stale = true;
+            item.runtime_observation_serviceable = false;
+            item.runtime_observation_targeted_sibling = false;
         }
+    }
+
+    fn currentTargetedIndexAuthority(
+        state: *TableState,
+        index_name: []const u8,
+        token: TargetedIndexTransitionToken,
+    ) ?*TargetedIndexAuthority {
+        if (state.epoch.root_generation != token.root_generation) return null;
+        const authority = state.index_authorities.getPtr(index_name) orelse return null;
+        if (!authority.transition_active or authority.transition_revision != token.revision) return null;
+        return authority;
     }
 
     fn clearTablesLocked(self: *@This()) void {
@@ -1421,6 +1508,13 @@ pub const TableRuntimeSnapshotCache = struct {
         self.next_observation_generation +%= 1;
         if (self.next_observation_generation == 0) self.next_observation_generation = 1;
         return generation;
+    }
+
+    fn takeTargetedIndexTransitionRevisionLocked(self: *@This()) u64 {
+        const revision = self.next_targeted_index_transition_revision;
+        self.next_targeted_index_transition_revision +%= 1;
+        if (self.next_targeted_index_transition_revision == 0) self.next_targeted_index_transition_revision = 1;
+        return revision;
     }
 
     fn advanceTargetObservationRevisionLocked(self: *@This()) void {
@@ -1468,8 +1562,7 @@ fn preserveArtifactVisibilityOnReplayRegression(
         const accepted_authority_continuity = if (index_authorities) |authorities|
             if (authorities.get(dst.name)) |authority|
                 (!authority.transition_active or authority.target_authority_handed_off) and
-                    targetAuthorityAcceptsIdentity(authority, cached) and
-                    !targetAuthorityAcceptsIdentity(authority, dst.*)
+                    targetAuthorityAcceptsIdentity(authority, cached)
             else
                 false
         else
@@ -1814,8 +1907,39 @@ fn targetAuthorityAcceptsIdentity(
         .unknown, .absent => return false,
     };
     return item.coverage_identity_ready and
+        item.kind == expected.kind and
         item.coverage_generation == expected.incarnation and
         item.coverage_config_hash == expected.config_hash;
+}
+
+/// A runtime owner that predates a catalog mutation may publish a perfectly
+/// fresh observation which omits the replacement index entirely (or reports a
+/// different kind under the reused name). Once exact authority has handed off,
+/// replacing the whole group with that observation would erase the only safe
+/// serving snapshot. Reject that structurally stale group as a unit. This walks
+/// only indexes in both group observations and performs O(1) authority lookups;
+/// it is independent of historical mutation/tombstone count.
+fn observationWouldWithdrawAcceptedIndexAuthority(
+    previous: LocalTableRuntimeStatus,
+    incoming: LocalTableRuntimeStatus,
+    index_authorities: *const std.StringHashMapUnmanaged(TargetedIndexAuthority),
+) bool {
+    if (index_authorities.count() == 0) return false;
+    var accepted_cached: usize = 0;
+    for (previous.stats.indexes) |cached| {
+        const authority = index_authorities.get(cached.name) orelse continue;
+        if (authority.transition_active and !authority.target_authority_handed_off) continue;
+        if (!targetAuthorityAcceptsIdentity(authority, cached)) continue;
+        accepted_cached += 1;
+    }
+    if (accepted_cached == 0) return false;
+    var accepted_incoming: usize = 0;
+    for (incoming.stats.indexes) |candidate| {
+        const authority = index_authorities.get(candidate.name) orelse continue;
+        if (authority.transition_active and !authority.target_authority_handed_off) continue;
+        if (targetAuthorityAcceptsIdentity(authority, candidate)) accepted_incoming += 1;
+    }
+    return accepted_incoming < accepted_cached;
 }
 
 fn targetedIndexExpectationForPublishableGroups(
@@ -1841,6 +1965,7 @@ fn targetedIndexExpectationForPublishableGroups(
         if (observed_absent) return error.InconsistentTargetedIndexObservation;
         if (!item.coverage_identity_ready) return error.MissingTargetedIndexIdentity;
         const identity: TargetedIndexAuthority.Identity = .{
+            .kind = item.kind,
             .incarnation = item.coverage_generation,
             .config_hash = item.coverage_config_hash,
         };
@@ -3588,7 +3713,7 @@ test "targeted publication fence preserves only untouched siblings during catch 
         }),
     );
 
-    cache.fenceTargetedIndexPublications("docs", "thumbnail");
+    const transition = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
     var fenced = (try cache.snapshot(alloc, "docs")).?;
     defer fenced.deinit(alloc);
     try std.testing.expect(findMatchingIndexStatus(fenced.items[0].stats.indexes, "thumbnail", .dense_vector).?.runtime_observation_stale);
@@ -3624,7 +3749,7 @@ test "targeted publication fence preserves only untouched siblings during catch 
     try std.testing.expect(!thumbnail.runtime_observation_serviceable);
     try std.testing.expect(!thumbnail.runtime_observation_targeted_sibling);
 
-    cache.releaseTargetedIndexPublications("docs", "thumbnail");
+    cache.releaseTargetedIndexPublications("docs", "thumbnail", transition);
     try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.transition_active);
     var fresh_indexes = [_]db_mod.types.DBIndexStats{
         .{
@@ -3675,24 +3800,54 @@ test "targeted publication fence preserves only untouched siblings during catch 
     try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.transition_active);
 }
 
-test "targeted publication fence waits for every overlapping owner" {
+test "new targeted transition supersedes delayed controls from an older owner" {
     var cache = TableRuntimeSnapshotCache.init(std.testing.allocator);
     defer cache.deinit();
 
-    cache.fenceTargetedIndexPublications("docs", "thumbnail");
-    cache.fenceTargetedIndexPublications("docs", "thumbnail");
+    const older = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
+    const newer = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
     var fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
-    try std.testing.expectEqual(@as(usize, 2), fence.owner_count);
+    try std.testing.expect(older.revision != newer.revision);
+    try std.testing.expect(fence.owner_active);
     try std.testing.expectEqual(@as(?u64, null), fence.release_after_observation_generation);
 
-    cache.releaseTargetedIndexPublications("docs", "thumbnail");
+    // The old owner's completion cannot release or otherwise alter the newer
+    // mutation's authority.
+    try std.testing.expect(!cache.armTargetedIndexPublications("docs", "thumbnail", older));
+    cache.acknowledgeTargetedIndexAbsence("docs", "thumbnail", older);
     fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
-    try std.testing.expectEqual(@as(usize, 1), fence.owner_count);
+    try std.testing.expect(fence.expectation == .unknown);
+    var current_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .coverage_generation = 13,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+    }};
+    const publication = try cache.capturePublicationToken("docs");
+    const current_status = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .index_count = 1, .indexes = current_indexes[0..] },
+    };
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.stale_observation,
+        try cache.publishTargetedGroupsForTransition(publication, older, "docs", "thumbnail", &.{current_status}),
+    );
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishTargetedGroupsForTransition(publication, newer, "docs", "thumbnail", &.{current_status}),
+    );
+    fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    try std.testing.expect(fence.expectation == .exact);
+    cache.releaseTargetedIndexPublications("docs", "thumbnail", older);
+    fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    try std.testing.expect(fence.owner_active);
     try std.testing.expectEqual(@as(?u64, null), fence.release_after_observation_generation);
 
-    cache.releaseTargetedIndexPublications("docs", "thumbnail");
+    cache.releaseTargetedIndexPublications("docs", "thumbnail", newer);
     fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
-    try std.testing.expectEqual(@as(usize, 0), fence.owner_count);
+    try std.testing.expect(!fence.owner_active);
     try std.testing.expect(fence.release_after_observation_generation != null);
 
     // A token captured after owner release but before the repair callback is
@@ -3700,8 +3855,11 @@ test "targeted publication fence waits for every overlapping owner" {
     const racing_token = try cache.capturePublicationToken("docs");
     try std.testing.expect(cache.fenceIndexRepairPublications("docs", "thumbnail"));
     fence = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    try std.testing.expect(fence.transition_revision != newer.revision);
     try std.testing.expect(!fence.target_authority_handed_off);
     try std.testing.expect(fence.accept_target_after_observation_generation > racing_token.observation_generation);
+    cache.releaseTargetedIndexPublications("docs", "thumbnail", newer);
+    try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.owner_active);
 }
 
 test "targeted catch up hands off same incarnation serving authority" {
@@ -3731,7 +3889,7 @@ test "targeted catch up hands off same incarnation serving authority" {
         }),
     );
 
-    cache.fenceTargetedIndexPublications("docs", "thumbnail");
+    _ = cache.fenceTargetedIndexPublications("docs", "thumbnail");
     const catch_up_token = try cache.capturePublicationToken("docs");
     var catching_up_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = @constCast("thumbnail"),
@@ -3792,8 +3950,8 @@ test "target authority settles only after every group acknowledges the exact inc
         }),
     );
 
-    cache.fenceTargetedIndexPublications("docs", "thumbnail");
-    cache.armTargetedIndexPublications("docs", "thumbnail");
+    const transition = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
+    try std.testing.expect(cache.armTargetedIndexPublications("docs", "thumbnail", transition));
     var desired_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = @constCast("thumbnail"),
         .kind = .dense_vector,
@@ -3812,7 +3970,7 @@ test "target authority settles only after every group acknowledges the exact inc
             .stats = .{ .index_count = 1, .indexes = desired_indexes[0..] },
         }}),
     );
-    cache.releaseTargetedIndexPublications("docs", "thumbnail");
+    cache.releaseTargetedIndexPublications("docs", "thumbnail", transition);
     var authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expect(authority.transition_active);
     try std.testing.expect(!authority.target_authority_handed_off);
@@ -3872,8 +4030,8 @@ test "targeted publication rejects a completed stale incarnation until structura
         }),
     );
 
-    cache.fenceTargetedIndexPublications("docs", "semantic_idx");
-    cache.armTargetedIndexPublications("docs", "semantic_idx");
+    const transition = cache.fenceTargetedIndexPublications("docs", "semantic_idx").?;
+    try std.testing.expect(cache.armTargetedIndexPublications("docs", "semantic_idx", transition));
 
     // A retiring worker can complete after the catalog mutation boundary. Its
     // post-fence timestamp does not make the deleted incarnation current.
@@ -3945,8 +4103,8 @@ test "settled target authority preserves the accepted incarnation against late p
         }),
     );
 
-    cache.fenceTargetedIndexPublications("docs", "semantic_idx");
-    cache.armTargetedIndexPublications("docs", "semantic_idx");
+    const transition = cache.fenceTargetedIndexPublications("docs", "semantic_idx").?;
+    try std.testing.expect(cache.armTargetedIndexPublications("docs", "semantic_idx", transition));
     var new_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = @constCast("semantic_idx"),
         .kind = .dense_vector,
@@ -3967,7 +4125,7 @@ test "settled target authority preserves the accepted incarnation against late p
             .stats = .{ .source_doc_count = 3, .doc_count = 1, .index_count = 1, .indexes = new_indexes[0..] },
         }}),
     );
-    cache.releaseTargetedIndexPublications("docs", "semantic_idx");
+    cache.releaseTargetedIndexPublications("docs", "semantic_idx", transition);
     const settle = try cache.capturePublicationToken("docs");
     try std.testing.expectEqual(
         TableRuntimeSnapshotCache.PublishResult.published,
@@ -3979,15 +4137,40 @@ test "settled target authority preserves the accepted incarnation against late p
     );
     try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?.transition_active);
 
-    // The retiring owner can publish indefinitely late. The registry keeps
-    // the accepted generation serviceable instead of forgetting the fence.
+    // The retiring owner's structurally stale group is rejected as a unit. It
+    // cannot erase the accepted row or replace fresh sibling/table facts.
     const late = try cache.capturePublicationToken("docs");
     try std.testing.expectEqual(
-        TableRuntimeSnapshotCache.PublishResult.published,
+        TableRuntimeSnapshotCache.PublishResult.stale_observation,
         try cache.publishGroup(late, "docs", .{
             .group_id = 7,
             .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
             .stats = .{ .source_doc_count = 3, .doc_count = 3, .index_count = 1, .indexes = old_indexes[0..] },
+        }),
+    );
+    const omitted = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.stale_observation,
+        try cache.publishGroup(omitted, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .source_doc_count = 999 },
+        }),
+    );
+    var wrong_kind_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .full_text,
+        .coverage_generation = 13,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+    }};
+    const wrong_kind = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.stale_observation,
+        try cache.publishGroup(wrong_kind, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .source_doc_count = 999, .index_count = 1, .indexes = wrong_kind_indexes[0..] },
         }),
     );
     var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
@@ -3995,6 +4178,7 @@ test "settled target authority preserves the accepted incarnation against late p
     const current = findIndexStatusByName(observed.stats.indexes, "semantic_idx").?;
     try std.testing.expectEqual(@as(u64, 13), current.coverage_generation);
     try std.testing.expectEqual(@as(u64, 1), current.doc_count);
+    try std.testing.expectEqual(@as(u64, 3), observed.stats.source_doc_count);
     try std.testing.expect(!current.runtime_observation_stale);
     try std.testing.expect(current.runtime_observation_serviceable);
 }
@@ -4004,8 +4188,8 @@ test "targeted authority binding is monotonic under reversed publication order" 
     var cache = TableRuntimeSnapshotCache.init(alloc);
     defer cache.deinit();
 
-    cache.fenceTargetedIndexPublications("docs", "semantic_idx");
-    cache.armTargetedIndexPublications("docs", "semantic_idx");
+    const transition = cache.fenceTargetedIndexPublications("docs", "semantic_idx").?;
+    try std.testing.expect(cache.armTargetedIndexPublications("docs", "semantic_idx", transition));
     const older_token = try cache.capturePublicationToken("docs");
     const newer_token = try cache.capturePublicationToken("docs");
     var older_indexes = [_]db_mod.types.DBIndexStats{.{
@@ -4076,8 +4260,8 @@ test "wholly stale targeted publication cannot bind unknown authority" {
         }),
     );
 
-    cache.fenceTargetedIndexPublications("docs", "semantic_idx");
-    cache.armTargetedIndexPublications("docs", "semantic_idx");
+    const transition = cache.fenceTargetedIndexPublications("docs", "semantic_idx").?;
+    try std.testing.expect(cache.armTargetedIndexPublications("docs", "semantic_idx", transition));
     const delayed_structural = try cache.capturePublicationToken("docs");
     const newer_owner = try cache.capturePublicationToken("docs");
     try std.testing.expectEqual(
@@ -4146,11 +4330,11 @@ test "targeted deletion hands off only after authoritative absence" {
         }),
     );
 
-    cache.fenceTargetedIndexPublications("docs", "semantic_idx");
-    cache.armTargetedIndexPublications("docs", "semantic_idx");
-    cache.acknowledgeTargetedIndexAbsence("docs", "semantic_idx");
+    const transition = cache.fenceTargetedIndexPublications("docs", "semantic_idx").?;
+    try std.testing.expect(cache.armTargetedIndexPublications("docs", "semantic_idx", transition));
+    cache.acknowledgeTargetedIndexAbsence("docs", "semantic_idx", transition);
     try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?.target_authority_handed_off);
-    cache.releaseTargetedIndexPublications("docs", "semantic_idx");
+    cache.releaseTargetedIndexPublications("docs", "semantic_idx", transition);
 
     const absent = try cache.capturePublicationToken("docs");
     try std.testing.expectEqual(
@@ -4161,15 +4345,15 @@ test "targeted deletion hands off only after authoritative absence" {
             .stats = .{},
         }),
     );
-    const authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx").?;
-    try std.testing.expect(authority.target_authority_handed_off);
-    try std.testing.expect(!authority.transition_active);
+    // Settled deletion state is represented by the authoritative catalog and
+    // group absence; it does not leave an unbounded per-name tombstone behind.
+    try std.testing.expect(cache.tables.getPtr("docs").?.index_authorities.getPtr("semantic_idx") == null);
     var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
     defer observed.deinit(alloc);
     try std.testing.expect(findIndexStatusByName(observed.stats.indexes, "semantic_idx") == null);
 
-    // A deleted name retains an absence watermark. A retiring writer may be
-    // observed for diagnostics, but it can never regain serving authority.
+    // A retiring writer may still be observed internally, but the deleted name
+    // is not catalog-addressable and cannot become serviceable by itself.
     const late = try cache.capturePublicationToken("docs");
     try std.testing.expectEqual(
         TableRuntimeSnapshotCache.PublishResult.published,
@@ -4181,9 +4365,15 @@ test "targeted deletion hands off only after authoritative absence" {
     );
     var resurrected = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
     defer resurrected.deinit(alloc);
-    const stale = findIndexStatusByName(resurrected.stats.indexes, "semantic_idx").?;
-    try std.testing.expect(stale.runtime_observation_stale);
-    try std.testing.expect(!stale.runtime_observation_serviceable);
+    const retired = findIndexStatusByName(resurrected.stats.indexes, "semantic_idx").?;
+    try std.testing.expect(!retired.runtime_observation_serviceable);
+
+    // Reusing the name establishes a new revision before the create becomes
+    // visible, immediately fencing the retired row without relying on history.
+    _ = cache.fenceTargetedIndexPublications("docs", "semantic_idx").?;
+    var recreated = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer recreated.deinit(alloc);
+    try std.testing.expect(findIndexStatusByName(recreated.stats.indexes, "semantic_idx").?.runtime_observation_stale);
 }
 
 test "table runtime snapshot cache batch publication is table epoch atomic" {
@@ -4243,7 +4433,7 @@ test "targeted structural publication cannot regress an untouched sibling genera
         }),
     );
 
-    cache.fenceTargetedIndexPublications("docs", "thumbnail");
+    _ = cache.fenceTargetedIndexPublications("docs", "thumbnail");
     const structural_token = try cache.capturePublicationToken("docs");
     var structural_indexes = [_]db_mod.types.DBIndexStats{
         .{
@@ -4318,7 +4508,7 @@ test "synthetic refresh cannot outrank targeted structural owner observation" {
         }),
     );
 
-    cache.fenceTargetedIndexPublications("docs", "thumbnail");
+    _ = cache.fenceTargetedIndexPublications("docs", "thumbnail");
     const structural_token = try cache.capturePublicationToken("docs");
     const synthetic_token = try cache.capturePublicationToken("docs");
     var synthetic_indexes = [_]db_mod.types.DBIndexStats{.{
@@ -4374,7 +4564,7 @@ test "synthetic refresh preserves post-fence target facts before serving handoff
     defer cache.deinit();
 
     _ = try cache.capturePublicationToken("docs");
-    cache.fenceTargetedIndexPublications("docs", "thumbnail");
+    const transition = cache.fenceTargetedIndexPublications("docs", "thumbnail").?;
     const owner_token = try cache.capturePublicationToken("docs");
     var owner_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = @constCast("thumbnail"),
@@ -4396,7 +4586,7 @@ test "synthetic refresh preserves post-fence target facts before serving handoff
         }}),
     );
     try std.testing.expect(!cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?.target_authority_handed_off);
-    cache.releaseTargetedIndexPublications("docs", "thumbnail");
+    cache.releaseTargetedIndexPublications("docs", "thumbnail", transition);
 
     const synthetic_token = try cache.capturePublicationToken("docs");
     var synthetic_indexes = [_]db_mod.types.DBIndexStats{.{
