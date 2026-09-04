@@ -2176,6 +2176,72 @@ func TestProxyRejectsMixedModelGenerateBatchBeforeForwarding(t *testing.T) {
 	}
 }
 
+func TestProxyBoundsGenerateBatchModelScan(t *testing.T) {
+	t.Parallel()
+
+	var body strings.Builder
+	body.WriteString(`{"requests":[`)
+	for i := 0; i < maxProxyGenerateBatchItems; i++ {
+		if i != 0 {
+			body.WriteByte(',')
+		}
+		body.WriteString(`{"body":{"model":"model-a"},"ignored":"payload"}`)
+	}
+	body.WriteString(`]}`)
+
+	model, err := proxyRequestModel([]byte(body.String()), "generate.batch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model != "model-a" {
+		t.Fatalf("model = %q, want model-a", model)
+	}
+
+	body.Reset()
+	body.WriteString(`{"requests":[`)
+	for i := 0; i <= maxProxyGenerateBatchItems; i++ {
+		if i != 0 {
+			body.WriteByte(',')
+		}
+		body.WriteString(`{"body":{"model":"model-a"}}`)
+	}
+	body.WriteString(`]}`)
+	if _, err := proxyRequestModel([]byte(body.String()), "generate.batch"); !errors.Is(err, errProxyGenerateBatchTooLarge) {
+		t.Fatalf("error = %v, want %v", err, errProxyGenerateBatchTooLarge)
+	}
+}
+
+func TestProxyRejectsOversizedGenerateBatchBeforeForwarding(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	forwarded := false
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		forwarded = true
+		return nil, errors.New("must not forward")
+	})}
+	p.RegisterEndpoint("http://inference.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModels("http://inference.internal", []string{"model-a"})
+
+	var body strings.Builder
+	body.WriteString(`{"requests":[`)
+	for i := 0; i <= maxProxyGenerateBatchItems; i++ {
+		if i != 0 {
+			body.WriteByte(',')
+		}
+		body.WriteString(`{"body":{"model":"model-a"}}`)
+	}
+	body.WriteString(`]}`)
+	recorder := httptest.NewRecorder()
+	p.handleGenerateBatch(recorder, httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", strings.NewReader(body.String())))
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", recorder.Code)
+	}
+	if forwarded {
+		t.Fatal("oversized batch was forwarded")
+	}
+}
+
 func TestProxyBoundsRetainedInferenceRequestBody(t *testing.T) {
 	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, MaxRequestBodyBytes: 16, Logger: zap.NewNop()})
 	p.RegisterEndpoint("http://inference.internal", "primary", WorkloadTypeGeneral)

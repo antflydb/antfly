@@ -875,7 +875,7 @@ def api(base_url):
             _check(r)
             return r.json()
 
-        def transcribe(self, audio: str, model: str = "", **kwargs):
+        def transcribe(self, audio: str, model: str, **kwargs):
             body = {"model": model, "audio": audio, **kwargs}
             r = self.post("/transcribe", json=body)
             _check(r)

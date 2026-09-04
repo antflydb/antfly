@@ -323,18 +323,21 @@ const AntflyTranscriberState = struct {
     auth_header: ?[2][]const u8 = null,
     capability_token: ?[]const u8 = null,
     capability_revision: ?[]const u8 = null,
-    model: ?[]const u8 = null,
+    model: []const u8,
     language_code: ?[]const u8 = null,
     max_response_bytes: ?usize = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
+        const configured_model = cfg.model orelse return error.InvalidTranscribingConfig;
+        const model_name = std.mem.trim(u8, configured_model, " \t\r\n");
+        if (model_name.len == 0) return error.InvalidTranscribingConfig;
         const state = try alloc.create(AntflyTranscriberState);
         errdefer alloc.destroy(state);
 
         const api_url = try alloc.dupe(u8, cfg.resolvedUrl() orelse "http://127.0.0.1:8080");
         errdefer alloc.free(api_url);
-        const model = try dupOpt(alloc, cfg.model);
-        errdefer freeOpt(alloc, model);
+        const model = try alloc.dupe(u8, model_name);
+        errdefer alloc.free(model);
         const capability_token = try dupOpt(alloc, cfg.capability_token);
         errdefer freeOpt(alloc, capability_token);
         const capability_revision = try dupOpt(alloc, cfg.capability_revision);
@@ -368,7 +371,7 @@ const AntflyTranscriberState = struct {
     fn deinit(ptr: *anyopaque) void {
         const self: *AntflyTranscriberState = @ptrCast(@alignCast(ptr));
         self.alloc.free(self.api_url);
-        freeOpt(self.alloc, self.model);
+        self.alloc.free(self.model);
         freeOpt(self.alloc, self.language_code);
         freeOpt(self.alloc, self.capability_token);
         freeOpt(self.alloc, self.capability_revision);
@@ -911,6 +914,24 @@ test "transcribing registry duplicate provider error does not double free config
         .project_id = "proj",
         .credentials_path = "/tmp/does-not-matter.json",
     }));
+}
+
+test "transcribing runtime rejects an Antfly provider without a routing model" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    var registry = Registry.init(alloc);
+    defer registry.deinit();
+    try registry.registerConfig("speech", .{ .provider = .antfly });
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+
+    try std.testing.expectError(
+        error.InvalidTranscribingConfig,
+        runtime.loadFromRegistry(&client, &registry),
+    );
 }
 
 test "transcribing runtime loads antfly provider and transcribes data uri input" {

@@ -3402,6 +3402,10 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 
 	model, err := proxyRequestModel(body, operation)
 	if err != nil {
+		if errors.Is(err, errProxyGenerateBatchTooLarge) {
+			http.Error(w, "invalid inference request: "+err.Error(), http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "invalid inference request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -3521,7 +3525,9 @@ var errProxyRequestBodyTooLarge = errors.New("inference request body is too larg
 var errCapabilityLeaseCapacity = errors.New("inference capability lease capacity is exhausted")
 
 // proxyBodyAdmissionBytes accounts for the retained replay body plus a
-// two-body JSON decode allowance (batch slice metadata and decoded strings).
+// two-body transport/streaming-decode allowance. Batch routing scans one item
+// at a time, so cardinality cannot turn that allowance into an unbounded typed
+// request slice.
 // Saturation keeps configuration arithmetic safe even when a caller supplies
 // an unreasonable ceiling.
 func proxyBodyAdmissionBytes(bodyBytes int64) int64 {
@@ -3634,29 +3640,129 @@ func proxyRequestModel(body []byte, operation string) (string, error) {
 		return strings.TrimSpace(request.Model), nil
 	}
 
-	var batch struct {
-		Requests []struct {
-			Body struct {
-				Model string `json:"model"`
-			} `json:"body"`
-		} `json:"requests"`
-	}
-	if err := json.Unmarshal(body, &batch); err != nil {
+	return proxyGenerateBatchModel(body)
+}
+
+const maxProxyGenerateBatchItems = 128 // GenerateBatchRequest.requests maxItems in the inference OpenAPI.
+
+var errProxyGenerateBatchTooLarge = errors.New("generate batch is too large")
+
+// proxyGenerateBatchModel reads one request item at a time. The proxy retains
+// the request body for bounded retries, but must not materialize a second
+// body-sized []Request merely to choose a route.
+func proxyGenerateBatchModel(body []byte) (string, error) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	opening, err := decoder.Token()
+	if err != nil {
 		return "", err
 	}
-	if len(batch.Requests) == 0 {
-		return "", errors.New("batch requests must not be empty")
+	if opening != json.Delim('{') {
+		return "", errors.New("batch request must be a JSON object")
 	}
-	model := strings.TrimSpace(batch.Requests[0].Body.Model)
-	if model == "" {
-		return "", errors.New("batch request model is required")
-	}
-	for _, item := range batch.Requests[1:] {
-		if strings.TrimSpace(item.Body.Model) != model {
-			return "", errors.New("mixed-model batches must be partitioned before routing")
+
+	requestsSeen := false
+	requestCount := 0
+	model := ""
+	for decoder.More() {
+		fieldToken, err := decoder.Token()
+		if err != nil {
+			return "", err
+		}
+		field, ok := fieldToken.(string)
+		if !ok {
+			return "", errors.New("batch request field name must be a string")
+		}
+		if field != "requests" {
+			if err := skipProxyJSONValue(decoder); err != nil {
+				return "", err
+			}
+			continue
+		}
+		if requestsSeen {
+			return "", errors.New("batch request contains duplicate requests fields")
+		}
+		requestsSeen = true
+		arrayOpening, err := decoder.Token()
+		if err != nil {
+			return "", err
+		}
+		if arrayOpening != json.Delim('[') {
+			return "", errors.New("batch requests must be an array")
+		}
+		for decoder.More() {
+			if requestCount == maxProxyGenerateBatchItems {
+				return "", fmt.Errorf("%w: requests must contain at most %d items", errProxyGenerateBatchTooLarge, maxProxyGenerateBatchItems)
+			}
+			var item struct {
+				Body struct {
+					Model string `json:"model"`
+				} `json:"body"`
+			}
+			if err := decoder.Decode(&item); err != nil {
+				return "", err
+			}
+			itemModel := strings.TrimSpace(item.Body.Model)
+			if itemModel == "" {
+				return "", errors.New("batch request model is required")
+			}
+			if requestCount == 0 {
+				model = itemModel
+			} else if itemModel != model {
+				return "", errors.New("mixed-model batches must be partitioned before routing")
+			}
+			requestCount++
+		}
+		if _, err := decoder.Token(); err != nil {
+			return "", err
 		}
 	}
+	if _, err := decoder.Token(); err != nil {
+		return "", err
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return "", errors.New("batch request must contain exactly one JSON value")
+	}
+	if !requestsSeen || requestCount == 0 {
+		return "", errors.New("batch requests must not be empty")
+	}
 	return model, nil
+}
+
+// skipProxyJSONValue consumes one value without retaining a RawMessage copy.
+// Decoder may buffer the current token, but memory does not grow with unknown
+// object or array cardinality.
+func skipProxyJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	if delim != json.Delim('{') && delim != json.Delim('[') {
+		return errors.New("unexpected JSON delimiter")
+	}
+	depth := 1
+	for depth > 0 {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delim, ok := token.(json.Delim)
+		if !ok {
+			continue
+		}
+		switch delim {
+		case '{', '[':
+			depth++
+		case '}', ']':
+			depth--
+		default:
+			return errors.New("unexpected JSON delimiter")
+		}
+	}
+	return nil
 }
 
 func canonicalChunkModel(model string) string {

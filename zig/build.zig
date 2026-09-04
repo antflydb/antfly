@@ -1975,6 +1975,8 @@ pub fn build(b: *std.Build) void {
             .ml_tabular = ml_tabular_mod,
             .onnx_graph = inference_onnx_graph_mod,
             .pjrt = inference_pjrt_mod,
+            .audio_openapi = audio_openapi_mod,
+            .s3_openapi = s3_openapi_mod,
             .generating_openapi = generating_openapi_mod,
             .extraction_openapi = extraction_openapi_mod,
             .extracting = extracting_mod,
@@ -2008,16 +2010,7 @@ pub fn build(b: *std.Build) void {
     );
     hf_tokenizer_test_step.dependOn(&run_hf_tokenizer_tests.step);
 
-    const transcribing_mod = b.createModule(.{
-        .root_source_file = b.path("lib/transcribing/src/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    transcribing_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
-    transcribing_mod.addImport("httpx", httpx_mod);
-    transcribing_mod.addImport("inference_api", inference_api_mod);
-    transcribing_mod.addImport("antfly_scraping", scraping_mod);
-    transcribing_mod.addImport("antfly_google", google_mod);
+    const transcribing_mod = inference_graph.transcribing_mod;
     const reader_config_mod = inference_graph.reader_config_mod;
     const readers_mod = b.createModule(.{
         .root_source_file = b.path("lib/readers/src/mod.zig"),
@@ -2031,7 +2024,6 @@ pub fn build(b: *std.Build) void {
     readers_mod.addImport("antfly_scraping", scraping_mod);
     inference_server_mod.addImport("antfly_readers", readers_mod);
     inference_server_mod.addImport("antfly_reader_config", reader_config_mod);
-    inference_server_mod.addImport("antfly_transcribing", transcribing_mod);
     inference_server_mod.addImport("antfly_extracting", extracting_mod);
     const synthesizing_mod = b.createModule(.{
         .root_source_file = b.path("lib/synthesizing/src/mod.zig"),

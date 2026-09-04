@@ -1435,6 +1435,44 @@ document. They are architectural requirements, not Florence-specific cleanup:
     reservation retains the admitted endpoint and breaker identities through
     completion. Task-scoped routes never fall back to bootstrap or arbitrary
     pool endpoints merely because the requested model has no exact executor.
+155. **A stale PDF worker could delete its replacement's private stages.**
+    Request unwind now deletes only the exact attempt namespace it owns.
+    Abandoned attempt keys are discovered without mutation and transferred
+    with the replacement generation; promotion and garbage collection execute
+    in one lease-fenced storage transaction. An old owner may observe newer
+    keys, but losing the fence prevents it from deleting or publishing any of
+    them. Stage discovery has a bounded scan-work ceiling and transfers at most
+    one fixed-size garbage page per successful replacement, so cleanup memory
+    and transaction size do not grow with crash history. The promotion/delete
+    ownership transfer reserves both replay-window destinations before moving
+    any key.
+156. **Generation-batch routing materialized the entire typed request a second
+    time.** The proxy now scans `requests` incrementally, retains only one
+    item's routing model, rejects a 129th item at the OpenAPI `maxItems: 128`
+    boundary, and never allocates a request slice proportional to attacker
+    supplied cardinality. Oversized batches fail at the proxy before endpoint
+    selection or forwarding.
+157. **Transcription model defaults diverged across direct and distributed
+    execution.** The public transcription schema now requires a nonempty model.
+    The inference node checks it before admission, audio decoding, or model
+    resolution; the direct linked boundary rejects an empty model as well; and
+    Antfly transcriber adapters require the same identity before capability
+    discovery. Generated SDK contracts, handwritten clients, and integration
+    helpers expose the model as required rather than restoring an implicit
+    default. Provider-specific defaults remain private to providers such as
+    OpenAI and Vertex and can no longer alter Antfly routing semantics.
+158. **Direct transcription compiled only through monorepo dependency
+    injection.** The reusable inference runtime graph now constructs and
+    exports its transcriber module, including the audio and S3 schema
+    dependencies, and installs it in both the runtime and package test roots.
+    The standalone inference package can therefore compile and test its direct
+    transcription API without relying on a later root-build mutation.
+159. **Paused managed-index activation dropped distributed capability state.**
+    The reconfiguration boundary now accepts and forwards the shared remote
+    capability cache into every recreated embedder and asset executor. Index
+    activation therefore preserves the same resolved-model contracts as steady
+    state execution, and the Linux storage/e2e build paths compile the identical
+    distributed configuration instead of a reduced local-only signature.
 
 ### Post-review implementation contract
 

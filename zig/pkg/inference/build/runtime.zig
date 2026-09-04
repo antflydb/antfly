@@ -69,6 +69,8 @@ pub const SharedModules = struct {
     onnx_graph: ?*std.Build.Module = null,
     pjrt: ?*std.Build.Module = null,
     inference_api: ?*std.Build.Module = null,
+    audio_openapi: ?*std.Build.Module = null,
+    s3_openapi: ?*std.Build.Module = null,
     generating_openapi: ?*std.Build.Module = null,
     chunking_api_openapi: ?*std.Build.Module = null,
     extraction_openapi: ?*std.Build.Module = null,
@@ -110,6 +112,7 @@ pub const Graph = struct {
     onnx_graph_mod: *std.Build.Module,
     pjrt_mod: *std.Build.Module,
     inference_api_mod: *std.Build.Module,
+    transcribing_mod: *std.Build.Module,
     inference_client_mod: ?*std.Build.Module,
     inference_tokenizer_mod: *std.Build.Module,
     inference_hf_tokenizer_mod: *std.Build.Module,
@@ -231,6 +234,22 @@ pub fn create(config: Config) Graph {
     };
     const reader_config_mod = shared.reader_config orelse createSharedModule(config, "lib/readers/src/config.zig");
     const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared_with_generating);
+    const s3_openapi_mod = shared.s3_openapi orelse createSharedModule(config, "pkg/antfly/src/openapi/generated/antfly_s3_openapi/root.zig");
+    const audio_openapi_mod = shared.audio_openapi orelse blk: {
+        const mod = createSharedModule(config, "pkg/antfly/src/openapi/generated/antfly_audio_openapi/root.zig");
+        mod.addImport("antfly_s3_openapi", s3_openapi_mod);
+        break :blk mod;
+    };
+    const transcribing_mod = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/transcribing/src/mod.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+    transcribing_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
+    transcribing_mod.addImport("httpx", httpx_mod);
+    transcribing_mod.addImport("inference_api", inference_api_mod);
+    transcribing_mod.addImport("antfly_scraping", scraping_mod);
+    transcribing_mod.addImport("antfly_google", google_mod);
     const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
         const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{
             .root_source_file = b.path(pathJoin(b, paths.inference_root, "../inference-client/src/root.zig")),
@@ -319,6 +338,7 @@ pub fn create(config: Config) Graph {
     inference_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     inference_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     inference_mod.addImport("antfly_extracting", extracting_mod);
+    inference_mod.addImport("antfly_transcribing", transcribing_mod);
     configureRuntimeLinks(b, inference_mod, target, backend, paths);
     inference_mod.link_libc = backend.link_libc;
 
@@ -369,6 +389,7 @@ pub fn create(config: Config) Graph {
         .onnx_graph_mod = onnx_graph_mod,
         .pjrt_mod = pjrt_mod,
         .inference_api_mod = inference_api_mod,
+        .transcribing_mod = transcribing_mod,
         .inference_client_mod = inference_client_mod,
         .inference_tokenizer_mod = inference_tokenizer_mod,
         .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,

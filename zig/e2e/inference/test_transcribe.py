@@ -34,7 +34,7 @@ def test_transcribe_audio(api):
     """Transcribing audio should return text output."""
     wav_b64 = make_wav_b64(0.5)
     audio_uri = f"data:audio/wav;base64,{wav_b64}"
-    resp = api.transcribe(audio=audio_uri)
+    resp = api.transcribe(audio=audio_uri, model="openai/whisper-tiny")
     assert_openai_list_response(resp, expected_len=1)
     assert "text" in resp["data"][0]
     # Silent audio may return empty text, but should not error
@@ -45,7 +45,7 @@ def test_transcribe_returns_text_key(api):
     """Response should always contain a 'text' field."""
     wav_b64 = make_wav_b64(0.1)
     audio_uri = f"data:audio/wav;base64,{wav_b64}"
-    resp = api.transcribe(audio=audio_uri)
+    resp = api.transcribe(audio=audio_uri, model="openai/whisper-tiny")
     assert "text" in resp["data"][0]
 
 

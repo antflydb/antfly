@@ -5314,6 +5314,8 @@ pub const Node = struct {
         model_name: []const u8,
         request: transcribing_api.Request,
     ) !transcribing_api.Response {
+        const resolved_model_name = std.mem.trim(u8, model_name, " \t\r\n");
+        if (resolved_model_name.len == 0) return error.ModelRequired;
         var media_shape: RequestMediaAdmissionShape = .{};
         if (data_uri_mod.hasScheme(request.url))
             media_shape.addInline(request.url.len, false)
@@ -5329,7 +5331,7 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
 
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "transcribers");
+        const model_path = try self.resolveModelPath(io_impl.io(), resolved_model_name, "transcribers");
         defer self.allocator.free(model_path);
         var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
         defer admission_manifest.deinit();
@@ -12177,6 +12179,10 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
+        const transcribe_model_name = std.mem.trim(u8, body.model, " \t\r\n");
+        if (transcribe_model_name.len == 0) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model is required" });
+        }
 
         var media_shape: RequestMediaAdmissionShape = .{};
         media_shape.addInline(body.audio.len, false);
@@ -12221,7 +12227,6 @@ pub const Node = struct {
         defer decoded.deinit();
 
         // Resolve model
-        const transcribe_model_name: ?[]const u8 = if (body.model) |m| (if (m.len > 0) m else null) else null;
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, transcribe_model_name, "transcribers") catch |err|
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
@@ -12346,7 +12351,6 @@ pub const Node = struct {
         };
         defer result.deinit();
 
-        const model_str = body.model orelse "default";
         const data = [_]api.TranscribeObject{.{
             .object = "transcription",
             .index = 0,
@@ -12356,7 +12360,7 @@ pub const Node = struct {
         return ctx.json(api.TranscribeResponse{
             .object = "list",
             .data = &data,
-            .model = model_str,
+            .model = transcribe_model_name,
             .usage = tokenUsage(0, countTokenizerTokens(ctx.allocator, self.session_manager.io, tokenizer, result.text) catch estimateTextTokens(result.text)),
         });
     }
@@ -17772,6 +17776,33 @@ test "transcribe validates encoded audio before model resolution and releases ad
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+}
+
+test "transcribe requires an explicit model before admission or media work" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    resetRequestWorkTestCounters();
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcribe");
+    defer request.deinit();
+    try request.setJson("{\"model\":\" \\t\",\"audio\":\"%%%\"}");
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try node.transcribeAudio(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "model is required") != null);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+
+    try std.testing.expectError(
+        error.ModelRequired,
+        node.transcribeAudioDirect(allocator, " \t", .{ .url = "data:audio/wav;base64,%%%" }),
+    );
 }
 
 test "transcribe bounded-decodes corrupt and metadata-amplified audio before model resolution" {

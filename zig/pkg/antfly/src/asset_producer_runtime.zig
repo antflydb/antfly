@@ -1326,6 +1326,7 @@ pub const Runtime = struct {
         });
         defer cfg_parsed.deinit();
         if (!isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) return error.BatchIncompatible;
+        const model = requiredAntflyTranscriberModel(cfg_parsed.value) catch return error.BatchIncompatible;
         const local = self.antfly_provider orelse return error.BatchIncompatible;
         const transcribe_audio = local.transcribe_audio orelse return error.BatchIncompatible;
 
@@ -1338,7 +1339,7 @@ pub const Runtime = struct {
         }
         for (out) |*item| item.* = "";
         for (requests, 0..) |request, i| {
-            var result = try transcribe_audio(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
+            var result = try transcribe_audio(local.ptr, alloc, model, .{
                 .url = request.source_text,
                 .language = cfg_parsed.value.language_code,
             });
@@ -1892,11 +1893,15 @@ pub const Runtime = struct {
         });
         defer cfg_parsed.deinit();
         cfg_parsed.value.max_response_bytes = self.responseLimitForTask(.transcriber, 1);
+        const antfly_model = if (cfg_parsed.value.provider == .antfly)
+            try requiredAntflyTranscriberModel(cfg_parsed.value)
+        else
+            null;
 
         if (isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) {
             const local = self.antfly_provider orelse return error.UnsupportedTranscriberProvider;
             const transcribe_audio = local.transcribe_audio orelse return error.UnsupportedTranscriberProvider;
-            var result = try transcribe_audio(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
+            var result = try transcribe_audio(local.ptr, alloc, antfly_model.?, .{
                 .url = request.source_text,
                 .language = cfg_parsed.value.language_code,
             });
@@ -1927,7 +1932,7 @@ pub const Runtime = struct {
             const lease = try self.capabilityCache().getOrDiscoverLease(
                 self.http,
                 endpoint,
-                cfg_parsed.value.model orelse "",
+                antfly_model.?,
                 .transcribe,
                 capability_auth_headers,
             );
@@ -1955,7 +1960,7 @@ pub const Runtime = struct {
                 const endpoint = cfg_parsed.value.resolvedUrl() orelse return err;
                 try self.capabilityCache().invalidate(
                     endpoint,
-                    cfg_parsed.value.model orelse "",
+                    antfly_model.?,
                     .transcribe,
                     capability_auth_headers,
                 );
@@ -2165,6 +2170,29 @@ fn isLocalReaderProvider(provider: readers.Provider, url: ?[]const u8) bool {
 
 fn isLocalTranscriberProvider(provider: transcribing.Provider, url: ?[]const u8) bool {
     return provider == .antfly and url == null;
+}
+
+fn requiredAntflyTranscriberModel(cfg: transcribing.Config) ![]const u8 {
+    if (cfg.provider != .antfly) return error.InvalidTranscribingConfig;
+    const model = cfg.model orelse return error.InvalidTranscribingConfig;
+    const canonical = std.mem.trim(u8, model, " \t\r\n");
+    if (canonical.len == 0) return error.InvalidTranscribingConfig;
+    return canonical;
+}
+
+test "antfly transcription requires an explicit routing model" {
+    try std.testing.expectError(
+        error.InvalidTranscribingConfig,
+        requiredAntflyTranscriberModel(.{ .provider = .antfly }),
+    );
+    try std.testing.expectError(
+        error.InvalidTranscribingConfig,
+        requiredAntflyTranscriberModel(.{ .provider = .antfly, .model = " \t" }),
+    );
+    try std.testing.expectEqualStrings(
+        "openai/whisper-tiny",
+        try requiredAntflyTranscriberModel(.{ .provider = .antfly, .model = "openai/whisper-tiny" }),
+    );
 }
 
 fn isLocalExtractionProvider(provider: extracting.Provider, url: ?[]const u8) bool {

@@ -12112,16 +12112,6 @@ fn processPdfPageImageEmbedding(
         stage_attempt_id,
     ) catch {};
 
-    // A fenced owner may retire abandoned attempts without sharing their key
-    // namespace. A superseded owner can no longer publish because the final
-    // promotion transaction validates its lease epoch.
-    try clearPdfPageEmbeddingStages(
-        runtime,
-        request.doc_key,
-        requestArtifactName(request),
-        embedding_name,
-    );
-
     var desired_page_keys = std.ArrayListUnmanaged([]u8).empty;
     defer freeKeyList(runtime.alloc, desired_page_keys.items);
     var staged_page_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -12295,15 +12285,28 @@ fn processPdfPageImageEmbedding(
     try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale);
     try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
     try appendOwnedDenseEmbeddingsToWindow(runtime, window, &expanded);
-    // Transfer stage ownership last. Once promotions enter the replay window,
-    // no later fallible operation may orphan this attempt outside its commit
-    // cleanup path.
-    try queuePdfPageEmbeddingPromotions(
+    // Discover abandoned attempts without mutating storage. Their deletion is
+    // transferred together with this attempt's promotions and runs inside the
+    // same lease-fenced publication transaction. A superseded worker therefore
+    // cannot delete stages written by its replacement.
+    var obsolete_stage_keys = try collectObsoletePdfPageEmbeddingStageKeys(
+        runtime,
+        request.doc_key,
+        requestArtifactName(request),
+        embedding_name,
+        stage_attempt_id,
+    );
+    defer freeKeyList(runtime.alloc, obsolete_stage_keys);
+    // Transfer every stage-related owner in one allocation-safe operation and
+    // keep it last: no later fallible operation may orphan this attempt outside
+    // the commit cleanup path.
+    try queuePdfPageEmbeddingCommit(
         runtime,
         window,
         desired_page_keys.items,
         staged_page_keys.items,
         embedding_name,
+        &obsolete_stage_keys,
     );
     attempt_stages_owned = false;
 }
@@ -12344,12 +12347,13 @@ fn clearPdfPageEmbeddingAttemptStages(
     try clearPdfPageEmbeddingStagesWithPrefix(runtime, root);
 }
 
-fn clearPdfPageEmbeddingStages(
+fn collectObsoletePdfPageEmbeddingStageKeys(
     runtime: *EnrichmentRuntime,
     doc_key: []const u8,
     page_artifact_name: []const u8,
     embedding_name: []const u8,
-) !void {
+    current_attempt_id: []const u8,
+) ![][]u8 {
     const root = try internal_keys.pdfPageEmbeddingStageRootPrefixAlloc(
         runtime.alloc,
         doc_key,
@@ -12357,7 +12361,51 @@ fn clearPdfPageEmbeddingStages(
         embedding_name,
     );
     defer runtime.alloc.free(root);
-    try clearPdfPageEmbeddingStagesWithPrefix(runtime, root);
+    const current_root = try internal_keys.pdfPageEmbeddingStageAttemptRootPrefixAlloc(
+        runtime.alloc,
+        doc_key,
+        page_artifact_name,
+        embedding_name,
+        current_attempt_id,
+    );
+    defer runtime.alloc.free(current_root);
+
+    var obsolete = std.ArrayListUnmanaged([]u8).empty;
+    errdefer freeKeyList(runtime.alloc, obsolete.items);
+    const ScanState = struct {
+        alloc: Allocator,
+        root: []const u8,
+        current_root: []const u8,
+        scanned: usize = 0,
+        obsolete: *std.ArrayListUnmanaged([]u8),
+
+        fn visit(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!backend_scan.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (!std.mem.startsWith(u8, key, state.root)) return .stop;
+            state.scanned = std.math.add(usize, state.scanned, 1) catch
+                return error.PdfEmbeddingArtifactScanBudgetExceeded;
+            if (state.scanned > generated_pdf_artifact_scan_work_max_keys)
+                return error.PdfEmbeddingArtifactScanBudgetExceeded;
+            if (std.mem.startsWith(u8, key, state.current_root)) return .@"continue";
+            const owned = try state.alloc.dupe(u8, key);
+            state.obsolete.append(state.alloc, owned) catch |err| {
+                state.alloc.free(owned);
+                return err;
+            };
+            return if (state.obsolete.items.len >= generated_pdf_stage_cleanup_page_keys)
+                .stop
+            else
+                .@"continue";
+        }
+    };
+    var state = ScanState{
+        .alloc = runtime.alloc,
+        .root = root,
+        .current_root = current_root,
+        .obsolete = &obsolete,
+    };
+    try backend_scan.scanWithContext(&runtime.store, root, "", .{}, &state, ScanState.visit);
+    return try obsolete.toOwnedSlice(runtime.alloc);
 }
 
 fn clearPdfPageEmbeddingStagesWithPrefix(runtime: *EnrichmentRuntime, root: []const u8) !void {
@@ -12378,24 +12426,59 @@ fn clearPdfPageEmbeddingStagesWithPrefix(runtime: *EnrichmentRuntime, root: []co
     }
 }
 
-fn queuePdfPageEmbeddingPromotions(
+fn queuePdfPageEmbeddingCommit(
     runtime: *EnrichmentRuntime,
     window: *GeneratedReplayWindow,
     desired_page_keys: []const []const u8,
     staged_page_keys: []const []const u8,
     embedding_name: []const u8,
+    obsolete_stage_keys: *[][]u8,
 ) !void {
     if (staged_page_keys.len != desired_page_keys.len) return error.InvalidPdfPageEmbeddingStage;
-    for (desired_page_keys, staged_page_keys) |page_key, stage_key| {
+    const promotions = try runtime.alloc.alloc(GeneratedArtifactPromotion, staged_page_keys.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (promotions[0..initialized]) |promotion| {
+            runtime.alloc.free(@constCast(promotion.staged_key));
+            runtime.alloc.free(@constCast(promotion.final_key));
+        }
+        if (promotions.len > 0) runtime.alloc.free(promotions);
+    }
+    for (desired_page_keys, staged_page_keys, 0..) |page_key, stage_key, index| {
         const final_key = try embeddingArtifactKey(runtime, page_key, embedding_name);
         errdefer runtime.alloc.free(final_key);
         const owned_stage_key = try runtime.alloc.dupe(u8, stage_key);
         errdefer runtime.alloc.free(owned_stage_key);
-        try window.artifact_promotions.append(runtime.alloc, .{
+        promotions[index] = .{
             .staged_key = owned_stage_key,
             .final_key = final_key,
-        });
+        };
+        initialized += 1;
     }
+
+    // Reserve both destinations before transferring any owned key. Once the
+    // reservations succeed, the transfer cannot partially fail and leave the
+    // replay window referring to stages that request cleanup still owns.
+    try window.artifact_promotions.ensureUnusedCapacity(runtime.alloc, promotions.len);
+    try window.artifact_delete_keys.ensureUnusedCapacity(runtime.alloc, obsolete_stage_keys.*.len);
+    window.artifact_promotions.appendSliceAssumeCapacity(promotions);
+    for (obsolete_stage_keys.*) |key| {
+        var duplicate = false;
+        for (window.artifact_delete_keys.items) |candidate| {
+            if (std.mem.eql(u8, candidate, key)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            runtime.alloc.free(key);
+            continue;
+        }
+        window.artifact_delete_keys.appendAssumeCapacity(key);
+    }
+    if (promotions.len > 0) runtime.alloc.free(promotions);
+    if (obsolete_stage_keys.*.len > 0) runtime.alloc.free(obsolete_stage_keys.*);
+    obsolete_stage_keys.* = &.{};
 }
 
 test "durable enrichment PDF page embedding rejects partial and missing results" {
@@ -12507,6 +12590,8 @@ test "durable enrichment PDF page embedding queues complete staged generations w
     defer alloc.free(stage_one);
     const stage_two = try pdfPageEmbeddingStageKeyAlloc(alloc, "doc:1", "pdf_pages_v1", "visual_v1", "attempt-2", "page:000002");
     defer alloc.free(stage_two);
+    const abandoned_stage = try pdfPageEmbeddingStageKeyAlloc(alloc, "doc:1", "pdf_pages_v1", "visual_v1", "attempt-1", "page:000001");
+    defer alloc.free(abandoned_stage);
 
     const old_one = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 0.1, 0.2 });
     defer alloc.free(old_one);
@@ -12517,6 +12602,7 @@ test "durable enrichment PDF page embedding queues complete staged generations w
     try storePutWithRetry(&runtime, final_one, old_one);
     try storePutWithRetry(&runtime, final_three, old_one);
     try storePutWithRetry(&runtime, stage_one, new_one);
+    try storePutWithRetry(&runtime, abandoned_stage, new_one);
     const unrelated_state = try assetStateKeyAlloc(
         alloc,
         "doc:1",
@@ -12536,10 +12622,13 @@ test "durable enrichment PDF page embedding queues complete staged generations w
     defer alloc.free(still_old);
     try std.testing.expectEqualSlices(u8, old_one, still_old);
 
-    // Starting the retry discards all private output from the failed attempt,
-    // while leaving the last complete public generation intact.
-    try clearPdfPageEmbeddingStages(&runtime, "doc:1", "pdf_pages_v1", "visual_v1");
-    try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, stage_one));
+    // Cleanup is attempt-scoped: a stale owner's unwind cannot remove private
+    // output already written by its replacement.
+    try clearPdfPageEmbeddingAttemptStages(&runtime, "doc:1", "pdf_pages_v1", "visual_v1", "attempt-1");
+    try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, abandoned_stage));
+    const replacement_stage = try storeGetAlloc(&runtime, stage_one);
+    defer alloc.free(replacement_stage);
+    try std.testing.expectEqualSlices(u8, new_one, replacement_stage);
     const old_after_retry_start = try storeGetAlloc(&runtime, final_one);
     defer alloc.free(old_after_retry_start);
     try std.testing.expectEqualSlices(u8, old_one, old_after_retry_start);
@@ -12547,18 +12636,33 @@ test "durable enrichment PDF page embedding queues complete staged generations w
     defer alloc.free(unrelated_after_retry_start);
     try std.testing.expectEqualStrings("unrelated", unrelated_after_retry_start);
 
-    try storePutWithRetry(&runtime, stage_one, new_one);
+    // Crash residue is discovered read-only and queued for deletion in the
+    // replacement generation's fenced publication transaction.
+    try storePutWithRetry(&runtime, abandoned_stage, new_one);
     try storePutWithRetry(&runtime, stage_two, new_two);
+    var obsolete_stage_keys = try collectObsoletePdfPageEmbeddingStageKeys(
+        &runtime,
+        "doc:1",
+        "pdf_pages_v1",
+        "visual_v1",
+        "attempt-2",
+    );
+    defer freeKeyList(alloc, obsolete_stage_keys);
+    try std.testing.expectEqual(@as(usize, 1), obsolete_stage_keys.len);
+    try std.testing.expectEqualStrings(abandoned_stage, obsolete_stage_keys[0]);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
-    try queuePdfPageEmbeddingPromotions(
+    try queuePdfPageEmbeddingCommit(
         &runtime,
         &window,
         &.{ page_one, page_two },
         &.{ stage_one, stage_two },
         "visual_v1",
+        &obsolete_stage_keys,
     );
     try std.testing.expectEqual(@as(usize, 2), window.artifact_promotions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), window.artifact_delete_keys.items.len);
+    try std.testing.expectEqualStrings(abandoned_stage, window.artifact_delete_keys.items[0]);
     try std.testing.expectEqualStrings(stage_one, window.artifact_promotions.items[0].staged_key);
     try std.testing.expectEqualStrings(final_one, window.artifact_promotions.items[0].final_key);
     const unpublished_one = try storeGetAlloc(&runtime, final_one);
@@ -12568,6 +12672,9 @@ test "durable enrichment PDF page embedding queues complete staged generations w
     const staged_one = try storeGetAlloc(&runtime, stage_one);
     defer alloc.free(staged_one);
     try std.testing.expectEqualSlices(u8, new_one, staged_one);
+    const abandoned_before_commit = try storeGetAlloc(&runtime, abandoned_stage);
+    defer alloc.free(abandoned_before_commit);
+    try std.testing.expectEqualSlices(u8, new_one, abandoned_before_commit);
     const stale_still_visible = try storeGetAlloc(&runtime, final_three);
     defer alloc.free(stale_still_visible);
     try std.testing.expectEqualSlices(u8, old_one, stale_still_visible);

@@ -13680,10 +13680,10 @@ export interface components {
         };
         InferenceTranscribeRequest: {
             /**
-             * @description Name of transcriber model from models_dir/transcribers/
+             * @description Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
              * @example openai/whisper-tiny
              */
-            model?: string;
+            model: string;
             /**
              * Format: byte
              * @description Base64-encoded audio data (WAV, MP3, FLAC, etc.)

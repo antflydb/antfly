@@ -473,11 +473,13 @@ components:
     TranscribeRequest:
       type: object
       required:
+        - model
         - audio
       properties:
         model:
           type: string
-          description: Name of transcriber model from models_dir/transcribers/
+          minLength: 1
+          description: Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
           example: "openai/whisper-tiny"
         audio:
           type: string

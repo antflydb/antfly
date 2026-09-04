@@ -81843,7 +81843,7 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
             append_ctx,
             .{},
             &.{.{ .staged_key = stage_key, .final_key = final_key }},
-            &.{},
+            &.{stale_key},
             .{ .lease_key = fence_key, .owner_id = "worker-a", .epoch = acquired.epoch - 1 },
         ),
     );
@@ -81853,18 +81853,22 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
     const final_after_fence_rejection = try db.core.store.get(alloc, final_key);
     defer alloc.free(final_after_fence_rejection);
     try std.testing.expectEqualStrings("stable-vector", final_after_fence_rejection);
+    const stale_after_fence_rejection = try db.core.store.get(alloc, stale_key);
+    defer alloc.free(stale_after_fence_rejection);
+    try std.testing.expectEqualStrings("stable-stale-vector", stale_after_fence_rejection);
 
     _ = try appendGeneratedBatchFromEnrichment(
         append_ctx,
         .{},
         &.{.{ .staged_key = stage_key, .final_key = final_key }},
-        &.{},
+        &.{stale_key},
         .{ .lease_key = fence_key, .owner_id = "worker-a", .epoch = acquired.epoch },
     );
     const fenced_promoted = try db.core.store.get(alloc, final_key);
     defer alloc.free(fenced_promoted);
     try std.testing.expectEqualStrings("fenced-vector", fenced_promoted);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stage_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
 }
 
 test "db encodeThinReplayRecordPayload marks generated enrichment replay for async writes" {

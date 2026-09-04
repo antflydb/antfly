@@ -2057,8 +2057,8 @@ pub const ToolCallFunctionDelta = struct {
 pub const ToolChoice = std.json.Value;
 
 pub const TranscribeRequest = struct {
-    /// Name of transcriber model from models_dir/transcribers/
-    model: ?[]const u8 = null,
+    /// Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
+    model: []const u8,
     /// Base64-encoded audio data (WAV, MP3, FLAC, etc.)
     audio: []const u8,
     /// Force specific language for transcription (optional, model-dependent)
@@ -2066,7 +2066,7 @@ pub const TranscribeRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "model", "model", true },
+        .{ "model", "model", false },
         .{ "audio", "audio", false },
         .{ "language", "language", true },
     };
@@ -2081,10 +2081,8 @@ pub const TranscribeRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.model) |value| {
-            try jw.objectField("model");
-            try jw.write(value);
-        }
+        try jw.objectField("model");
+        try jw.write(self.model);
         try jw.objectField("audio");
         try jw.write(self.audio);
         if (self.language) |value| {

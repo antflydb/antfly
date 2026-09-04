@@ -1516,6 +1516,7 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addImport("antfly_generating_openapi", generating_openapi_mod);
     tests.root_module.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     tests.root_module.addImport("antfly_extracting", extracting_mod);
+    tests.root_module.addImport("antfly_transcribing", runtime_graph.transcribing_mod);
     tests.root_module.addImport("inference_audio", inference_audio_mod);
     tests.root_module.addImport("inference_chunker", inference_chunker_mod);
     tests.root_module.addImport("jinja", jinja_mod);

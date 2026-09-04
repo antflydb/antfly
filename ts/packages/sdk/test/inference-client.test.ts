@@ -1185,7 +1185,9 @@ describe("InferenceClient with mock fetch", () => {
       } as Response);
 
       const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
-      await expect(client.transcribe("bad-data")).rejects.toMatchObject({
+      await expect(
+        client.transcribe("bad-data", { model: "openai/whisper-tiny" })
+      ).rejects.toMatchObject({
         status: 400,
         code: "Invalid audio",
       });
