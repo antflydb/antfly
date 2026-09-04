@@ -1284,6 +1284,15 @@ pub const WasmCompute = struct {
         return geluOp(ctx, input);
     }
 
+    fn geluExactOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const self: *WasmCompute = @ptrCast(@alignCast(ctx));
+        const inp = toBuf(input);
+        const out = try self.allocator.alloc(f32, inp.len);
+        @memcpy(out, inp.data);
+        activations.geluExact(out);
+        return fromBuf(try copyBufShape(WasmBuf.fromSlice(self.allocator, out, true), inp));
+    }
+
     fn reluOp(ctx: *anyopaque, input: CT) anyerror!CT {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const inp = toBuf(input);
@@ -4999,6 +5008,7 @@ pub const WasmCompute = struct {
         .layerNorm = layerNormOp,
         .rmsNorm = rmsNormOp,
         .gelu = geluOp,
+        .geluExact = geluExactOp,
         .geluNew = geluNewOp,
         .relu = reluOp,
         .silu = siluOp,
