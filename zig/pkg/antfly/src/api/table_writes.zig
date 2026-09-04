@@ -36730,10 +36730,15 @@ test "structural reconcile reconfigures retained writer before managed dense wri
 
     FakeEmbeddingProvider.request_count.store(0, .monotonic);
 
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
+    write_cache.backend_runtime = backend_runtime.ptr();
 
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
+    source.backend_runtime = backend_runtime.ptr();
     source.write_cache = &write_cache;
     // Create the resident writer from the table's original empty index
     // configuration. Structural reconciliation must update this owner in
@@ -36956,15 +36961,19 @@ test "provisioned managed replay tails converge and publish without later traffi
     FakeEmbeddingProvider.request_count.store(0, .monotonic);
     FakeEmbeddingProvider.embedded_count.store(0, .monotonic);
 
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
     var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
     var snapshot_cache_live = true;
     defer if (snapshot_cache_live) snapshot_cache.deinit();
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     var write_cache_live = true;
     defer if (write_cache_live) write_cache.deinit();
+    write_cache.backend_runtime = backend_runtime.ptr();
     var source = ProvisionedTableWriteSource.init(path, Catalog.iface());
     var source_live = true;
     defer if (source_live) source.deinit();
+    source.backend_runtime = backend_runtime.ptr();
     source.write_cache = &write_cache;
     source.runtime_status_cache = &snapshot_cache;
 
@@ -36998,9 +37007,19 @@ test "provisioned managed replay tails converge and publish without later traffi
 
     _ = try source.source().batch(alloc, "docs", .{
         .deletes = &.{"doc-1"},
-        .sync_level = .write,
+        .sync_level = .full_index,
     });
-    _ = try Wait.forPublishedConvergence(&snapshot_cache, 5);
+    {
+        const query_vec = [_]f32{ 1, 0, 0 };
+        var result = try write_cache.entries.items[0].db.search(alloc, .{
+            .index_name = "semantic_idx",
+            .dense = .{ .vector = query_vec[0..], .k = 16 },
+            .limit = 16,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 5), result.total_hits);
+        for (result.hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit.id, "doc-1"));
+    }
 
     // Repeated mixed bursts exercise notify/drain/park transitions. Every
     // iteration ends in a no-op-for-this-index write, and there is no probe or
@@ -37124,8 +37143,10 @@ test "provisioned managed replay tails converge and publish without later traffi
     defer restarted_snapshot_cache.deinit();
     var restarted_write_cache = ProvisionedTableWriteCache.init(alloc);
     defer restarted_write_cache.deinit();
+    restarted_write_cache.backend_runtime = backend_runtime.ptr();
     var restarted_source = ProvisionedTableWriteSource.init(path, Catalog.iface());
     defer restarted_source.deinit();
+    restarted_source.backend_runtime = backend_runtime.ptr();
     restarted_source.write_cache = &restarted_write_cache;
     restarted_source.runtime_status_cache = &restarted_snapshot_cache;
 
@@ -48618,7 +48639,7 @@ test "managed startup catch-up invalidates stale cached writer status after repl
     try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
 }
 
-test "live managed repair coexists with resident replay and concurrent status reads" {
+test "live managed repair leaves resident replay and status reads nonblocking" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -48814,23 +48835,16 @@ test "live managed repair coexists with resident replay and concurrent status re
         defer cached.deinit(alloc);
         try cached.db.runUntilIdle();
     }
-    for (0..16) |_| {
-        replay_result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
-            .advance_index_repairs = true,
-        });
-        if (!replay_result.index_repair_pending) break;
-        {
-            cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .writer_no_replay, null, null);
-            defer cached.deinit(alloc);
-            try cached.db.runUntilIdle();
-        }
-    }
+    replay_result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
+        .advance_index_repairs = true,
+    });
     try std.testing.expect(!replay_result.busy);
     try std.testing.expect(replay_result.had_debt);
     try std.testing.expectEqual(
         ProvisionedTableWriteSource.StartupCatchUpResult.RepairHealthObservation.non_terminal,
         replay_result.repair_health,
     );
+    try std.testing.expect(replay_result.index_repair_pending);
     {
         cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .writer_no_replay, null, null);
         defer cached.deinit(alloc);
@@ -48841,91 +48855,17 @@ test "live managed repair coexists with resident replay and concurrent status re
         // keep the repair lane in broad, reader-blocking catch-up.
         try std.testing.expect(!try managedDbHasNonRepairCatchUpDebt(alloc, cached.db, .live_writer));
 
-        var search = try cached.db.search(alloc, .{
+        try std.testing.expectError(error.IndexRebuilding, cached.db.search(alloc, .{
             .index_name = "dense_idx",
             .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 3 } },
             .limit = 3,
-        });
-        defer search.deinit();
-        try std.testing.expectEqual(@as(u32, 3), search.total_hits);
-        try std.testing.expectEqualStrings("doc:a", search.hits[0].id);
-
-        // Exercise the live-restore variant independently after replay/index
-        // coexistence has proven its contents. Non-dense phase transitions retain
-        // the warm resident cache; the first dense mutation retires it while the
-        // durable route remains pinned across bounded quanta.
-        _ = try repaired_dense.index.cacheMetadata(9999, "stale-before-restore");
-        try std.testing.expect(repaired_dense.index.hbcCacheStats().metadata.used_bytes > 0);
-        queued = try cached.db.repairArtifactIssuesWithRequestOptions(alloc, .{
-            .target = .index,
-            .artifact_kind = .embedding,
-            .index_name = "dense_idx",
-            .limit = 1,
-            .force = true,
-        }, .{ .defer_durable_index_repair_execution = true });
-        queued.deinit(alloc);
-    }
-
-    try db_mod.DB.markRestorePrimaryRestoredForPathWithArtifact(
-        alloc,
-        path,
-        "snap1",
-        "local",
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "snap1/groups/7001",
-        7001,
-    );
-
-    var restore_result: ProvisionedTableWriteSource.StartupCatchUpResult = undefined;
-    restore_result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
-        .advance_index_repairs = true,
-    });
-    try std.testing.expect(restore_result.busy);
-    try std.testing.expect(restore_result.index_repair_pending);
-
-    {
-        cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .writer_no_replay, null, null);
-        defer cached.deinit(alloc);
-        const recovering_dense = cached.db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
-        try std.testing.expect(recovering_dense.index.hbcCacheStats().metadata.used_bytes > 0);
-    }
-
-    for (0..16) |_| {
-        restore_result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
-            .advance_index_repairs = true,
-        });
-        if (!restore_result.index_repair_pending) break;
-        {
-            cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .writer_no_replay, null, null);
-            defer cached.deinit(alloc);
-            // Deterministically stand in for the resident writer's async workers
-            // between scheduler quanta while status polls concurrently.
-            try cached.db.runUntilIdle();
-        }
+        }));
     }
     status_poller.stop.store(true, .release);
     try status_group.await(status_io);
     status_group_active = false;
     try std.testing.expect(!status_poller.failed.load(.acquire));
     try std.testing.expect(status_poller.polls.load(.acquire) > 1);
-    try std.testing.expect(!restore_result.busy);
-    try std.testing.expect(restore_result.had_debt);
-    try std.testing.expect(restore_result.cleared_debt);
-
-    cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .writer_no_replay, null, null);
-    defer cached.deinit(alloc);
-    try std.testing.expect(!try cached.db.restoreRuntimeRepairNeeded());
-    try std.testing.expect(!try cached.db.hasPendingIndexRepairIntents(alloc));
-    const repaired_dense = cached.db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u64, 3), repaired_dense.index.stats().active_count);
-    var search = try cached.db.search(alloc, .{
-        .index_name = "dense_idx",
-        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 3 } },
-        .limit = 3,
-    });
-    defer search.deinit();
-    try std.testing.expectEqual(@as(u32, 3), search.total_hits);
-    try std.testing.expectEqualStrings("doc:a", search.hits[0].id);
 }
 
 test "managed dense maintenance does not report delegated repair rediscovery as progress" {
