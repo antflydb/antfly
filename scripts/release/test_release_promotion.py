@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import io
@@ -167,6 +168,51 @@ class ReleasePromotionTests(unittest.TestCase):
                     verifier.sha256(ledger_path),
                     None,
                 )
+
+    def test_schema_five_ledger_survives_release_line_handoff(self) -> None:
+        verifier = load_module(
+            "verify_release_ledger_handoff_test", "verify_release_ledger.py"
+        )
+        release_lines = load_module("release_lines_handoff_test", "release_lines.py")
+        policy = copy.deepcopy(release_lines.load_policy())
+        policy["lines"]["0.3"]["source_ref"] = "refs/heads/v0.3.x"
+        policy["lines"]["0.3"]["trusted_source_refs"].append("refs/heads/v0.3.x")
+        release_lines.validate_policy(policy)
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            artifact = root / "antfly.tar.gz"
+            artifact.write_bytes(b"release")
+            ledger_path = root / "artifacts.json"
+            ledger = {
+                "schema_version": 5,
+                "tag": "v0.3.0",
+                "commit": COMMIT,
+                "release_line": "0.3",
+                "source_ref": "refs/heads/main",
+                "source_ref_head": COMMIT,
+                "build_controller_commit": "e" * 40,
+                "promotion_controller_commit": "f" * 40,
+                "artifacts": [
+                    {
+                        "name": artifact.name,
+                        "size": artifact.stat().st_size,
+                        "sha256": verifier.sha256(artifact),
+                        "scope": "runtime",
+                    }
+                ],
+            }
+            ledger_path.write_text(json.dumps(ledger))
+
+            verifier.verify_payload(
+                ledger_path,
+                root,
+                "v0.3.0",
+                COMMIT,
+                verifier.sha256(ledger_path),
+                None,
+                policy,
+            )
 
     def test_schema_four_release_spec_remains_compatible(self) -> None:
         channels = load_module("release_channels_v4_compat_test", "release_channels.py")

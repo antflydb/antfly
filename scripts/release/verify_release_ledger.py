@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 from release_channels import NIGHTLY_PATTERN
-from release_lines import nightly_line, resolve_tag
+from release_lines import nightly_line, validate_provenance
 
 
 def inferred_scope(entry: dict[str, object]) -> str:
@@ -40,6 +40,7 @@ def verify_payload(
     commit: str,
     ledger_sha256: str,
     scope: str | None = None,
+    release_line_policy: dict[str, object] | None = None,
 ) -> str:
     expected_ledger_digest = ledger_sha256.lower()
     if not re.fullmatch(r"[0-9a-f]{64}", expected_ledger_digest):
@@ -74,9 +75,13 @@ def verify_payload(
             if release_line != expected.name or source_ref != expected.source_ref:
                 raise SystemExit("release ledger has invalid nightly source provenance")
         else:
-            expected = resolve_tag(tag, allow_closed=True)
-            if release_line != expected.name or source_ref != expected.source_ref:
-                raise SystemExit("release ledger has invalid release-line provenance")
+            validate_provenance(
+                tag,
+                release_line,
+                source_ref,
+                release_line_policy,
+                allow_closed=True,
+            )
             if source_ref_head != commit:
                 raise SystemExit(
                     "release ledger source head differs from release commit"

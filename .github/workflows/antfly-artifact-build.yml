@@ -86,12 +86,16 @@ jobs:
           [[ "$SOURCE_REF_HEAD" =~ ^[0-9a-f]{40}$ ]]
           if [ "$RELEASE_CHANNEL" = nightly ]; then
             resolved="$(python scripts/release/release_lines.py nightly)"
+            test "$RELEASE_LINE" = "$(jq -r .release_line <<<"$resolved")"
+            test "$SOURCE_REF" = "$(jq -r .source_ref <<<"$resolved")"
           else
-            resolved="$(python scripts/release/release_lines.py resolve --tag "$RELEASE_TAG")"
+            python scripts/release/release_lines.py verify-provenance \
+              --tag "$RELEASE_TAG" \
+              --release-line "$RELEASE_LINE" \
+              --source-ref "$SOURCE_REF" \
+              --allow-closed >/dev/null
             test "$SOURCE_COMMIT" = "$SOURCE_REF_HEAD"
           fi
-          test "$RELEASE_LINE" = "$(jq -r .release_line <<<"$resolved")"
-          test "$SOURCE_REF" = "$(jq -r .source_ref <<<"$resolved")"
           git fetch --no-tags origin "$SOURCE_REF"
           current_source_head="$(git rev-parse FETCH_HEAD)"
           git merge-base --is-ancestor "$SOURCE_REF_HEAD" "$current_source_head"

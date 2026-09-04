@@ -64,7 +64,8 @@ credentials; those refs provide only versioned source objects.
    is loaded through `workflow_run` from the default branch. It re-derives the
    source branch from current controller policy and requires the tag, source
    commit, and recorded branch head to agree. Direct tag pushes do not trigger
-   a release.
+   a release. If `main` or the selected source branch moves after approval, the
+   request fails before tag creation and must be dispatched again.
 2. The build controller pins its exact commit and calls
    `.github/workflows/antfly-artifact-build.yml`, the sole reusable artifact
    builder, from that same commit. The requested source commit supplies only
@@ -365,6 +366,12 @@ The tag's major/minor version selects its source through
 cannot cut new releases. Recovery may continue to resolve a closed line so an
 already sealed ledger does not become unusable.
 
+Each line records one current `source_ref` for new cuts and an append-only
+`trusted_source_refs` provenance list. When ownership moves from `main` to a
+maintenance branch, change `source_ref` and add the maintenance ref without
+removing `main`; retained ledgers and already approved requests remain valid
+against the branch that originally supplied their source.
+
 ## Maintenance Release Lines
 
 Before `main` advances to the next minor line, synchronize the maintenance
@@ -382,7 +389,10 @@ branch one final time and merge the release-policy support into it. After
 Adding a future line is a reviewed controller-policy change. When a line is no
 longer supported, retain its mapping but change its status to `closed`; deleting
 the mapping would also disable provenance validation for retained releases. A
-line's source ref is immutable after its first schema-v5 release.
+line's trusted source refs are append-only after its first schema-v5 release.
+Before `main` advances beyond a supported line, create and synchronize the
+matching `v<major>.<minor>.x` branch, change that line's current `source_ref`,
+and retain both refs in `trusted_source_refs`.
 
 Run a snapshot for the current default-branch head with
 `gh workflow run antfly-nightly.yml`. To reproduce a snapshot from a specific

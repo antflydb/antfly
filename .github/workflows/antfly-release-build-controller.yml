@@ -66,9 +66,11 @@ jobs:
               release_line="$(jq -r .release_line "$request")"
               source_ref="$(jq -r .source_ref "$request")"
               source_ref_head="$(jq -r .source_ref_head "$request")"
-              resolved="$(python scripts/release/release_lines.py resolve --tag "$tag")"
-              test "$release_line" = "$(jq -r .release_line <<<"$resolved")"
-              test "$source_ref" = "$(jq -r .source_ref <<<"$resolved")"
+              python scripts/release/release_lines.py verify-provenance \
+                --tag "$tag" \
+                --release-line "$release_line" \
+                --source-ref "$source_ref" \
+                --allow-closed >/dev/null
               test "$source_commit" = "$source_ref_head"
               git fetch --no-tags origin "$source_ref"
               current_source_head="$(git rev-parse FETCH_HEAD)"
