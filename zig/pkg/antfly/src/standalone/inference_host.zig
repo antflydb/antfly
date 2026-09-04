@@ -487,10 +487,22 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .rerank_texts => blk: {
             var parsed = try std.json.parseFromSlice(RerankTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
+            const CancellationControl = struct {
+                fn check(raw: ?*anyopaque) !void {
+                    const cancellation: *const http_abi.CancellationView = @ptrCast(@alignCast(raw.?));
+                    if (cancellation.requested()) return error.Cancelled;
+                }
+            };
+            var cancellation = context.cancellation;
+            const execution_control: ?inference.pipelines.RerankingExecutionControl = if (cancellation.is_cancelled != null)
+                .{ .ptr = &cancellation, .check_fn = CancellationControl.check }
+            else
+                null;
             const result = try state.node.rerankTextsDirectWithContext(
                 alloc,
                 state.io,
                 deadline_ns,
+                execution_control,
                 parsed.value.model,
                 parsed.value.query,
                 parsed.value.documents,

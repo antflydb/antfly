@@ -4985,7 +4985,7 @@ fn invokeInferenceProvider(
     provider_context: *anyopaque,
     operation: inference_bridge.ProviderOperation,
     request: anytype,
-    deadline_ns: ?u64,
+    request_context: ?antfly.inference.RequestContext,
 ) !Result {
     const lifetime: *EmbeddedInferenceProviderLifetime = @ptrCast(@alignCast(provider_context));
     var call_guard = try lifetime.acquire();
@@ -4995,7 +4995,15 @@ fn invokeInferenceProvider(
     defer alloc.free(request_json);
     var response_handle: ?*anyopaque = null;
     var response_json: inference_bridge.String = undefined;
+    const deadline_ns = if (request_context) |context| context.deadline_ns else null;
     const effective_deadline_ns = deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_min;
+    const RequestCancellation = struct {
+        fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
+            const context: *const ?antfly.inference.RequestContext = @ptrCast(@alignCast(raw orelse return 1));
+            const active = context.* orelse return 0;
+            return @intFromBool(if (active.cancellation) |token| token.isCancelled() else false);
+        }
+    };
     const context = inference_bridge.ProviderInvokeContext{
         .abi_version = inference_bridge.abi_version,
         .handle = handle,
@@ -5005,6 +5013,10 @@ fn invokeInferenceProvider(
         .has_deadline = 1,
         .out_response_handle = &response_handle,
         .out_response_json = &response_json,
+        .cancellation = if (request_context != null and request_context.?.cancellation != null)
+            .{ .context = &request_context, .is_cancelled = RequestCancellation.requested }
+        else
+            .{},
     };
     if (comptime inline_inference_codegen) {
         try inference_host.linkedInferenceInvokeProvider(&context);
@@ -5271,7 +5283,7 @@ fn inferenceProviderEmbedDenseTextsWithContext(
     return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_texts_with_context, .{
         .model = model,
         .texts = texts,
-    }, context.deadline_ns);
+    }, context);
 }
 
 fn inferenceProviderEmbedSparseTexts(
@@ -5309,7 +5321,7 @@ fn inferenceProviderEmbedDensePartsWithContext(
     return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_parts_with_context, .{
         .model = model,
         .parts = parts,
-    }, context.deadline_ns);
+    }, context);
 }
 
 fn inferenceProviderRerankTexts(
@@ -5339,7 +5351,7 @@ fn inferenceProviderRerankTextsWithContext(
         .model = model,
         .query = query,
         .documents = documents,
-    }, context.deadline_ns);
+    }, context);
     try context.check();
     return scores;
 }

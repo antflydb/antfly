@@ -56,8 +56,8 @@ pub const RankedResult = struct {
 /// Optional request-lifetime hook installed by servers. The pipeline checks it
 /// at bounded batch boundaries without depending on an HTTP or API context.
 pub const ExecutionControl = struct {
-    ptr: ?*const anyopaque,
-    check_fn: *const fn (?*const anyopaque) anyerror!void,
+    ptr: ?*anyopaque,
+    check_fn: *const fn (?*anyopaque) anyerror!void,
 
     pub fn check(self: ExecutionControl) !void {
         return self.check_fn(self.ptr);
@@ -571,6 +571,32 @@ test "cross encoder bounds working memory with configured batches" {
     try std.testing.expectEqual(@as(usize, documents.len), scores.len);
     try std.testing.expectEqual(@as(usize, 3), session_state.run_count.load(.acquire));
     try std.testing.expectEqual(@as(usize, documents.len * 2), tokenizer_state.encode_count.load(.acquire));
+}
+
+test "cross encoder observes cancellation between bounded batches" {
+    const Control = struct {
+        checks: std.atomic.Value(usize) = .init(0),
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const count = self.checks.fetchAdd(1, .acq_rel) + 1;
+            if (count >= 3) return error.Cancelled;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var tokenizer_state = FakeRerankingTokenizer{};
+    var session_state = FakeRerankingSession{ .fixed_sequence = false };
+    var control = Control{};
+    var pipeline = RerankingPipeline.init(
+        allocator,
+        session_state.session(),
+        tokenizer_state.tokenizer(),
+        .{ .max_length = 8, .batch_size = 2 },
+    );
+    pipeline.execution_control = .{ .ptr = &control, .check_fn = Control.check };
+    try std.testing.expectError(error.Cancelled, pipeline.rerank("query", &.{ "one", "two", "three" }));
+    try std.testing.expectEqual(@as(usize, 1), session_state.run_count.load(.acquire));
 }
 
 test "cross encoder admission rejects before tokenization" {

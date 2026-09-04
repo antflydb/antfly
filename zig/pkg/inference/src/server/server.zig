@@ -49,6 +49,7 @@ const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
 const generation = @import("../pipelines/generation.zig");
 const multimodal_reranker = @import("../pipelines/multimodal_reranker.zig");
+const reranking_pipeline = @import("../pipelines/reranking.zig");
 const multimodal_qwen_adapter = @import("../pipelines/multimodal_qwen_adapter.zig");
 const document_classification = @import("../pipelines/document_classification.zig");
 const document_token_classification = @import("../pipelines/document_token_classification.zig");
@@ -3735,7 +3736,7 @@ pub const Node = struct {
         query: []const u8,
         documents: []const []const u8,
     ) ![]f32 {
-        return self.rerankTextsDirectWithContext(allocator, null, null, model_name, query, documents);
+        return self.rerankTextsDirectWithContext(allocator, null, null, null, model_name, query, documents);
     }
 
     pub fn rerankTextsDirectWithContext(
@@ -3743,14 +3744,17 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         io: ?std.Io,
         deadline_ns: ?u64,
+        upstream_control: ?reranking_pipeline.ExecutionControl,
         model_name: []const u8,
         query: []const u8,
         documents: []const []const u8,
     ) ![]f32 {
+        if (upstream_control) |control| try control.check();
         try ensureDirectEmbeddingDeadline(deadline_ns);
         if (documents.len == 0) return try allocator.alloc(f32, 0);
         try self.acquireAdmissionUnits(1);
         defer self.releaseAdmission();
+        if (upstream_control) |control| try control.check();
         try ensureDirectEmbeddingDeadline(deadline_ns);
         self.metrics.incRequest("rerank.local");
         defer self.metrics.decActive();
@@ -3767,13 +3771,15 @@ pub const Node = struct {
         var pipeline = model.rerankingPipeline(allocator);
         const DeadlineControl = struct {
             deadline_ns: ?u64,
+            upstream: ?reranking_pipeline.ExecutionControl,
 
-            fn check(raw: ?*const anyopaque) !void {
+            fn check(raw: ?*anyopaque) !void {
                 const control: *const @This() = @ptrCast(@alignCast(raw.?));
+                if (control.upstream) |upstream| try upstream.check();
                 return ensureDirectEmbeddingDeadline(control.deadline_ns);
             }
         };
-        var deadline_control = DeadlineControl{ .deadline_ns = deadline_ns };
+        var deadline_control = DeadlineControl{ .deadline_ns = deadline_ns, .upstream = upstream_control };
         pipeline.execution_control = .{
             .ptr = &deadline_control,
             .check_fn = DeadlineControl.check,
