@@ -44,7 +44,6 @@ curl -s http://localhost:8080/db/v1/tables/users/documents/user-1 -u admin:admin
 { "id": "user-1", "name": "Alice", "email": "alice@example.com", "score": 100 }
 ```
 
-Five steps get you there.
 
 ## 1. Turn On Logical Replication
 
@@ -238,7 +237,7 @@ CREATE PUBLICATION antfly_pub_users FOR TABLE users;
 
 ## Why PostgreSQL Stays the System of Record
 
-Replication runs one way. Antfly never writes back, so your application keeps its transactions, constraints, and backups exactly where they are, and Antfly holds a searchable copy that is as current as the stream. Write to PostgreSQL; query Antfly.
+Replication runs one way. Antfly never writes back, so your application keeps its transactions, constraints, and backups exactly where they are, and Antfly holds a searchable copy that is as current as the stream.
 
 The cost of that arrangement is the replication slot. A slot makes PostgreSQL retain WAL until the subscriber has consumed it. While Antfly is up, that is a few seconds of WAL. While Antfly is down for a long stretch, PostgreSQL keeps every change since the last checkpoint, and disk usage grows until the stream resumes. Monitor slot lag the way you would for any logical subscriber, and if you decommission an Antfly table, drop its slot in PostgreSQL rather than leaving it to hold WAL forever.
 

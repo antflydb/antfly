@@ -56,7 +56,6 @@ antfly agents retrieval --table help \
 }
 ```
 
-Three steps get you there.
 
 ## 1. Create the Help Table
 
@@ -190,7 +189,7 @@ The pruner is what stops that:
 - `min_score_ratio: 0.6` drops anything scoring under 60% of the best match. If the best match is itself weak, everything goes, `hits` comes back empty, and your code can hand the conversation to a person instead of answering.
 - `max_score_gap_percent: 40` finds the elbow where relevance falls off and cuts there.
 
-Retrieve generously and prune hard. A `limit` of 20 with a strict pruner beats a `limit` of 3 with no pruner: the reranker sees more candidates, and the model sees only the survivors. Start strict, watch what gets pruned on real questions, and loosen only when good articles are being cut.
+Retrieve more than you need and let the pruner cut. A `limit` of 20 with a strict pruner beats a `limit` of 3 with no pruner, because the reranker sees more candidates and the model sees only the survivors. Start strict, watch what gets pruned on real questions, and loosen only when good articles are being cut.
 
 ## Let Your Agent Drive
 

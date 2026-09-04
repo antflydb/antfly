@@ -13,7 +13,7 @@ sidebar: getting-started
 - How do I use RAG with Antfly Inference for AI-powered answers?
 </Questions>
 
-By the end of this page you have Antfly running on your machine with 10,000 Wikipedia articles loaded, and you have searched them by keyword, by meaning, and by what their pictures show, then asked a local model to answer a question from them. Every step runs on your laptop. Nothing leaves it.
+By the end of this page you have Antfly running on your machine with 10,000 Wikipedia articles loaded, and you have searched them by keyword, by meaning, and by what their pictures show, then asked a local model to answer a question from them, all on your own machine with no hosted service involved.
 
 ## Install Antfly
 
@@ -925,7 +925,7 @@ let resp = client
   </TabsContent>
 </Tabs>
 
-Concrete visual descriptions ("red sports car", "mountain landscape") work better than abstract ones. To search with an image instead of words, see [Search Images by What's in Them](/docs/guides/multimodal).
+Concrete visual descriptions ("red sports car", "mountain landscape") work better than abstract ones. To search with an image instead of words, see [Build Image Search](/docs/guides/multimodal).
 </Steps>
 
 ## RAG (Retrieval-Augmented Generation)
@@ -1309,14 +1309,14 @@ From here your agent can create tables, build indexes, and write queries against
 
 ## Next Steps
 
-You have a running instance, an indexed table, and an agent that knows Antfly. Pick an outcome. Each guide ends with a prompt you can hand straight to that agent:
+You have a running instance, an indexed table, and an agent that knows Antfly. Each of these guides builds one thing on top of that and ends with a prompt you can hand to the agent:
 
 - [Build a Support Answer Agent](/docs/guides/support-answer-agent): one call that answers a customer's question from your help articles
 - [Add Search and AI Answers to Your Site](/docs/guides/site-search-and-answers): a React search page with facets and a streaming answer box
 - [Use Antfly from n8n](/docs/guides/n8n): an n8n agent that answers from your table over hosted MCP
 - [Route Tickets with Retrieval](/docs/guides/ticket-routing): tickets stream out of Postgres and get a team from the resolved ones that look like them
 - [Power a Coding Copilot's Retrieval](/docs/guides/coding-copilot-retrieval): a repo index that answers symbol lookups and intent questions, sized to a context budget
-- [Search Images by What's in Them](/docs/guides/multimodal): the image index from this page, plus searching with an image instead of words
+- [Build Image Search](/docs/guides/multimodal): the image index from this page, plus searching with an image instead of words
 - [Tune Hybrid Search](/docs/guides/hybrid-search): fusion, reranking, and pruning, and which of them your data needs
 
 For production, the [Antfly Operator](/docs/operator/getting-started/quickstart) deploys on Kubernetes, and [backup and restore](/docs/api/data-operations) protects what you loaded.

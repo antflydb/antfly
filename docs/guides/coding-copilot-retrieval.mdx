@@ -63,7 +63,6 @@ curl -X POST http://localhost:8080/db/v1/agents/retrieval \
 }
 ```
 
-Four steps get you there.
 
 ## 1. Index the Repo
 
@@ -127,7 +126,7 @@ antfly query --table repo \
   --limit 30
 ```
 
-Build the keyword side from the literal tokens in the copilot's request (identifiers, error strings, file names) and the semantic side from its description of the task. They catch different misses.
+Build the keyword side from the literal tokens in the copilot's request (identifiers, error strings, file names) and the semantic side from its description of the task, since each side finds what the other misses.
 
 ## 3. Rerank Against the Task
 
@@ -154,9 +153,9 @@ The retrieval agent does the budgeting. Give it the same query plus `max_context
 
 ## Why More Context Is Not the Goal
 
-A copilot can't know what it failed to retrieve. If the function that already solves the problem never reaches its context, it reinvents that function, and the failure looks like a bad model rather than a bad lookup. The fix is not a bigger window. A bigger window filled with near-misses buries the one file that mattered and spends tokens doing it.
+A copilot can't know what it failed to retrieve. If the function that already solves the problem never reaches its context, it reinvents that function, and the failure looks like a bad model rather than a bad lookup. A bigger window does not fix this, because a window filled with near-misses buries the one file that mattered and spends tokens doing it.
 
-The budget is what makes retrieval choosy. `max_context_tokens: 2048` is a good starting point for a copilot that also carries the user's open file; raise it for a model with a large window, lower it when the copilot's own prompt is already long. Watch what gets cut on real tasks. If the right file is being dropped, the pruner is too tight, not the budget.
+The budget forces a choice among candidates, which is the point. `max_context_tokens: 2048` is a good starting point for a copilot that also carries the user's open file; raise it for a model with a large window, lower it when the copilot's own prompt is already long. Watch what gets cut on real tasks. If the right file is being dropped, the pruner is too tight, not the budget.
 
 ## Let Your Agent Drive
 
