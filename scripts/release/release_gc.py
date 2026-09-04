@@ -34,7 +34,7 @@ RELEASE_ROOT = "antfly/"
 CONTENT_ROOT = "antfly/artifacts/sha256/"
 CONTAINER_IDENTITY_ROOT = "antfly/container-identities/"
 LEDGER_NAME = "artifacts.json"
-SUPPORTED_LEDGER_SCHEMAS = {1, 2, 3, 4}
+SUPPORTED_LEDGER_SCHEMAS = {1, 2, 3, 4, 5}
 SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -388,7 +388,7 @@ def plan_gc(
                 retained[tag] = "newest-nightly-count"
             elif release.published_at >= nightly_cutoff:
                 retained[tag] = "nightly-age-window"
-            elif release.schema_version == 4 and tag not in container_records:
+            elif release.schema_version in {4, 5} and tag not in container_records:
                 retained[tag] = "missing-container-identity"
             else:
                 expired[tag] = "nightly-retention-expired"
@@ -398,7 +398,7 @@ def plan_gc(
                 retained[tag] = "awaiting-matching-stable"
             elif now < matching_stable_completed_at + prerelease_grace:
                 retained[tag] = "matching-stable-grace-window"
-            elif release.schema_version == 4 and tag not in container_records:
+            elif release.schema_version in {4, 5} and tag not in container_records:
                 retained[tag] = "missing-container-identity"
             else:
                 expired[tag] = "prerelease-grace-expired"
