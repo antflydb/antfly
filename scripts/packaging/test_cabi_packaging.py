@@ -429,13 +429,13 @@ class CAbiPackagingTests(unittest.TestCase):
         sdk_npm_workflow = (
             REPO_ROOT / ".github" / "workflows" / "ts-npm-publish.yml"
         ).read_text()
-        self.assertIn("NPM_VERSION: 11.19.1", sdk_npm_workflow)
+        self.assertIn("steps.toolchain.outputs.npm_version", sdk_npm_workflow)
         self.assertIn('npm install -g "npm@$NPM_VERSION"', sdk_npm_workflow)
-        ts_ci_workflow = (
-            REPO_ROOT / ".github" / "workflows" / "ts-ci.yml"
+        sdks_ci_workflow = (
+            REPO_ROOT / ".github" / "workflows" / "sdks-ci.yml"
         ).read_text()
         for workflow, expected_jobs in (
-            (ts_ci_workflow, 2),
+            (sdks_ci_workflow, 2),
             (sdk_npm_workflow, 1),
         ):
             lines = workflow.splitlines()
@@ -481,18 +481,15 @@ class CAbiPackagingTests(unittest.TestCase):
     def test_release_scripting_target_discovers_the_complete_suite(self) -> None:
         makefile = (REPO_ROOT / "Makefile").read_text()
         test_script = (REPO_ROOT / "scripts" / "release" / "test.sh").read_text()
-        workflow = (REPO_ROOT / ".github" / "workflows" / "zig-tests.yml").read_text()
-        release_job = workflow.split("  release-tooling:", 1)[1].split(
-            "\n  backup-s3-integration:", 1
-        )[0]
+        workflow = (REPO_ROOT / ".github" / "workflows" / "sdks-ci.yml").read_text()
+        check_script = (REPO_ROOT / "scripts" / "ci" / "check.sh").read_text()
 
-        self.assertIn("run: scripts/release/test.sh", release_job)
-        self.assertNotIn("run: make ", release_job)
-        self.assertNotIn("scripts/release/test_", release_job)
-        self.assertIn('python-version: "3.13"', release_job)
-        self.assertIn("sudo apt-get install -y xz-utils", release_job)
-        self.assertIn("uses: mlugg/setup-zig@", release_job)
-        self.assertIn("version: 0.16.0", release_job)
+        self.assertIn("run: scripts/ci/check.sh release", workflow)
+        self.assertNotIn("run: make ", workflow)
+        self.assertIn("uses: mlugg/setup-zig@", workflow)
+        self.assertIn("steps.toolchain.outputs.zig_version", workflow)
+        self.assertIn("xz-utils", workflow)
+        self.assertIn('"$repo_root/scripts/release/test.sh"', check_script)
         self.assertIn("release-scripting-test:", makefile)
         self.assertIn("scripts/release/test.sh", makefile)
         self.assertIn(
@@ -546,7 +543,7 @@ class CAbiPackagingTests(unittest.TestCase):
             fake_bin = root / "bin"
             fake_bin.mkdir()
             npm = fake_bin / "npm"
-            npm.write_text("#!/bin/sh\n" 'printf \'%s\\n\' "$*" >> "$FAKE_NPM_LOG"\n')
+            npm.write_text('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$FAKE_NPM_LOG"\n')
             npm.chmod(0o755)
             python = fake_bin / "python3"
             python.write_text(
@@ -646,7 +643,7 @@ class CAbiPackagingTests(unittest.TestCase):
                 repo / "py" / "packages" / "cli" / "src" / "antfly_cli" / "__init__.py"
             ).write_text("def main(): return 0\n")
             (repo / "py" / "packages" / "cli" / "pyproject.toml").write_text(
-                '[project]\nname = "antfly-cli"\nrequires-python = ">=3.10"\n'
+                '[project]\nname = "antfly-cli"\nrequires-python = ">=3.11"\n'
             )
 
             package_cli_release.extract_archive(
@@ -673,7 +670,7 @@ class CAbiPackagingTests(unittest.TestCase):
             self.assertIn("antfly_cli/include/antfly.h", names)
             self.assertIn("antfly_cli/lib/libantfly.so", names)
             self.assertIn("antfly_cli/share/antfly/asset.txt", names)
-            self.assertIn("Requires-Python: >=3.10", metadata)
+            self.assertIn("Requires-Python: >=3.11", metadata)
 
     def test_homebrew_formula_installs_cabi_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

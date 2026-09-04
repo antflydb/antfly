@@ -156,22 +156,47 @@ def parse_args() -> argparse.Namespace:
     repo = repo_root()
     inference = repo / "zig/pkg/inference"
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=pathlib.Path, default=inference / "zig-out/bin/antfly-inference")
-    parser.add_argument("--llama-cpp-bin", type=pathlib.Path, default=pathlib.Path("/tmp/llama.cpp/build/bin/llama-completion"))
+    parser.add_argument(
+        "--binary",
+        type=pathlib.Path,
+        default=inference / "zig-out/bin/antfly-inference",
+    )
+    parser.add_argument(
+        "--llama-cpp-bin",
+        type=pathlib.Path,
+        default=pathlib.Path("/tmp/llama.cpp/build/bin/llama-completion"),
+    )
     parser.add_argument(
         "--e2b-model",
         type=pathlib.Path,
-        default=repo / ".models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
+        default=repo
+        / ".models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
     )
     parser.add_argument(
         "--gemma12b-q4-model",
         type=pathlib.Path,
         default=repo / ".models/google/gemma-4-12B-it-q4_k/gemma-4-12B-it-Q4_K_M.gguf",
     )
-    parser.add_argument("--wrapper", type=pathlib.Path, default=inference / "scripts/gemma4/with_gemma4_qat_cuda_tuning.sh")
-    parser.add_argument("--matrix-script", type=pathlib.Path, default=inference / "scripts/gemma4/benchmark_gemma4_cuda_matrix.py")
-    parser.add_argument("--artifact-check-script", type=pathlib.Path, default=inference / "scripts/regen-cuda-artifacts.sh")
-    parser.add_argument("--output-dir", type=pathlib.Path, default=pathlib.Path("/tmp/antfly-gemma4-cuda-l4-release"))
+    parser.add_argument(
+        "--wrapper",
+        type=pathlib.Path,
+        default=inference / "scripts/gemma4/with_gemma4_qat_cuda_tuning.sh",
+    )
+    parser.add_argument(
+        "--matrix-script",
+        type=pathlib.Path,
+        default=inference / "scripts/gemma4/benchmark_gemma4_cuda_matrix.py",
+    )
+    parser.add_argument(
+        "--artifact-check-script",
+        type=pathlib.Path,
+        default=inference / "scripts/regen-cuda-artifacts.sh",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=pathlib.Path,
+        default=pathlib.Path("/tmp/antfly-gemma4-cuda-l4-release"),
+    )
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--timeout-sec", type=int, default=720)
@@ -180,7 +205,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="fail unless the fixed E2B benchmark reaches --min-comparable-ratio",
     )
-    parser.add_argument("--min-comparable-ratio", type=float, default=DEFAULT_MIN_COMPARABLE_RATIO)
+    parser.add_argument(
+        "--min-comparable-ratio", type=float, default=DEFAULT_MIN_COMPARABLE_RATIO
+    )
     parser.add_argument(
         "--verify-artifacts",
         action="store_true",
@@ -202,7 +229,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def canonical_sha256(value: object) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -220,7 +249,9 @@ def path_provenance(path: pathlib.Path) -> dict[str, Any]:
     if not path.exists():
         return result
     if path.is_file():
-        result.update({"kind": "file", "bytes": path.stat().st_size, "sha256": sha256_file(path)})
+        result.update(
+            {"kind": "file", "bytes": path.stat().st_size, "sha256": sha256_file(path)}
+        )
         return result
     if not path.is_dir():
         result["kind"] = "other"
@@ -238,18 +269,25 @@ def path_provenance(path: pathlib.Path) -> dict[str, Any]:
         digest.update(b"\n")
         total_bytes += child.stat().st_size
         count += 1
-    result.update({
-        "kind": "directory",
-        "file_count": count,
-        "bytes": total_bytes,
-        "sha256": digest.hexdigest(),
-    })
+    result.update(
+        {
+            "kind": "directory",
+            "file_count": count,
+            "bytes": total_bytes,
+            "sha256": digest.hexdigest(),
+        }
+    )
     return result
 
 
 def command_output(*command: str) -> str | None:
     try:
-        return subprocess.check_output(command, text=True, stderr=subprocess.DEVNULL).strip() or None
+        return (
+            subprocess.check_output(
+                command, text=True, stderr=subprocess.DEVNULL
+            ).strip()
+            or None
+        )
     except (OSError, subprocess.CalledProcessError):
         return None
 
@@ -265,11 +303,13 @@ def command_capture(*command: str) -> dict[str, Any]:
         completed = subprocess.run(command, text=True, capture_output=True, check=False)
     except OSError:
         return result
-    result.update({
-        "returncode": completed.returncode,
-        "stdout": completed.stdout.strip() or None,
-        "stderr": completed.stderr.strip() or None,
-    })
+    result.update(
+        {
+            "returncode": completed.returncode,
+            "stdout": completed.stdout.strip() or None,
+            "stderr": completed.stderr.strip() or None,
+        }
+    )
     return result
 
 
@@ -294,16 +334,23 @@ def command_capture_bytes(*command: str) -> dict[str, Any]:
     except OSError as exc:
         result["stderr"] = str(exc)
         return result
-    result.update({
-        "returncode": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr.decode("utf-8", errors="replace").strip() or None,
-    })
+    result.update(
+        {
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr.decode("utf-8", errors="replace").strip()
+            or None,
+        }
+    )
     return result
 
 
 def _status_sha256(status: str | None) -> str | None:
-    return hashlib.sha256(status.encode("utf-8")).hexdigest() if status is not None else None
+    return (
+        hashlib.sha256(status.encode("utf-8")).hexdigest()
+        if status is not None
+        else None
+    )
 
 
 def _untracked_paths(status: str | None) -> list[str]:
@@ -336,7 +383,9 @@ def _tracked_diff_provenance(repo: pathlib.Path) -> dict[str, Any]:
     return {
         "tracked_diff_returncode": capture.get("returncode"),
         "tracked_diff_bytes": len(output) if available else None,
-        "tracked_diff_sha256": hashlib.sha256(output).hexdigest() if available else None,
+        "tracked_diff_sha256": hashlib.sha256(output).hexdigest()
+        if available
+        else None,
         "tracked_diff_error": capture.get("stderr") if not available else None,
     }
 
@@ -349,6 +398,7 @@ def _stable_regular_file_provenance(path: pathlib.Path) -> dict[str, Any]:
             digest.update(chunk)
         after = os.fstat(source.fileno())
     final = path.stat()
+
     def identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
         return (
             value.st_dev,
@@ -357,6 +407,7 @@ def _stable_regular_file_provenance(path: pathlib.Path) -> dict[str, Any]:
             value.st_size,
             value.st_mtime_ns,
         )
+
     if identity(before) != identity(after) or identity(after) != identity(final):
         raise RuntimeError(f"untracked file changed while hashing: {path}")
     return {
@@ -428,7 +479,8 @@ def _untracked_content_provenance(repo: pathlib.Path) -> dict[str, Any]:
             "untracked_inventory_sha256": None,
             "untracked_file_count": None,
             "untracked_files": None,
-            "untracked_inventory_error": before.get("stderr") or "could not list untracked files",
+            "untracked_inventory_error": before.get("stderr")
+            or "could not list untracked files",
         }
     raw_paths = sorted(path for path in raw.split(b"\0") if path)
     try:
@@ -519,21 +571,38 @@ def git_content_provenance_errors(git: dict[str, Any]) -> list[str]:
         "files": files,
     }
     if git.get("untracked_inventory_sha256") != canonical_sha256(identity):
-        errors.append("Git untracked-content inventory hash does not match its contents")
+        errors.append(
+            "Git untracked-content inventory hash does not match its contents"
+        )
     return errors
 
 
 def git_provenance(repo: pathlib.Path) -> dict[str, Any]:
     commit = command_capture("git", "-C", str(repo), "rev-parse", "HEAD")
-    describe = command_capture("git", "-C", str(repo), "describe", "--always", "--dirty", "--long")
-    tracked = command_capture("git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=no")
-    source = command_capture(
-        "git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all", "--", *SOURCE_PATHS,
+    describe = command_capture(
+        "git", "-C", str(repo), "describe", "--always", "--dirty", "--long"
     )
-    worktree = command_capture("git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all")
+    tracked = command_capture(
+        "git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=no"
+    )
+    source = command_capture(
+        "git",
+        "-C",
+        str(repo),
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--",
+        *SOURCE_PATHS,
+    )
+    worktree = command_capture(
+        "git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all"
+    )
     tracked_status = (tracked["stdout"] or "") if tracked["returncode"] == 0 else None
     source_status = (source["stdout"] or "") if source["returncode"] == 0 else None
-    worktree_status = (worktree["stdout"] or "") if worktree["returncode"] == 0 else None
+    worktree_status = (
+        (worktree["stdout"] or "") if worktree["returncode"] == 0 else None
+    )
     tracked_content = _tracked_diff_provenance(repo)
     untracked_content = _untracked_content_provenance(repo)
     return {
@@ -568,11 +637,15 @@ def _configured_cuda_tool(env_name: str, binary_name: str) -> str:
 
 def executable_provenance(executable: str, *version_args: str) -> dict[str, Any]:
     resolved = shutil.which(executable)
-    capture = command_capture(resolved or executable, *version_args) if resolved else {
-        "returncode": None,
-        "stdout": None,
-        "stderr": None,
-    }
+    capture = (
+        command_capture(resolved or executable, *version_args)
+        if resolved
+        else {
+            "returncode": None,
+            "stdout": None,
+            "stderr": None,
+        }
+    )
     artifact = path_provenance(pathlib.Path(resolved)) if resolved else {}
     return {
         "command": [executable, *version_args],
@@ -588,8 +661,12 @@ def toolchain_provenance() -> dict[str, Any]:
         "python": executable_provenance(sys.executable, "--version"),
         "git": executable_provenance("git", "--version"),
         "zig": executable_provenance("zig", "version"),
-        "nvcc": executable_provenance(_configured_cuda_tool("NVCC", "nvcc"), "--version"),
-        "cuobjdump": executable_provenance(_configured_cuda_tool("CUOBJDUMP", "cuobjdump"), "--version"),
+        "nvcc": executable_provenance(
+            _configured_cuda_tool("NVCC", "nvcc"), "--version"
+        ),
+        "cuobjdump": executable_provenance(
+            _configured_cuda_tool("CUOBJDUMP", "cuobjdump"), "--version"
+        ),
         "nvidia_smi": executable_provenance("nvidia-smi", "--version"),
         "platform": {
             "system": platform.system(),
@@ -604,7 +681,11 @@ def provenance_errors(provenance: dict[str, Any]) -> list[str]:
     errors = []
     git = provenance.get("git") or {}
     commit = git.get("commit")
-    if git.get("commit_returncode") != 0 or not isinstance(commit, str) or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit) is None:
+    if (
+        git.get("commit_returncode") != 0
+        or not isinstance(commit, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit) is None
+    ):
         errors.append("Git commit provenance is unavailable or invalid")
     if git.get("tracked_status_returncode") != 0 or git.get("tracked_dirty") is None:
         errors.append("Git tracked-source status is unavailable")
@@ -613,13 +694,21 @@ def provenance_errors(provenance: dict[str, Any]) -> list[str]:
     if git.get("source_status_returncode") != 0:
         errors.append("Git untracked-source status is unavailable")
     elif git.get("source_untracked_paths"):
-        errors.append("untracked source files are present: " + ", ".join(git["source_untracked_paths"]))
+        errors.append(
+            "untracked source files are present: "
+            + ", ".join(git["source_untracked_paths"])
+        )
     errors.extend(git_content_provenance_errors(git))
 
     toolchains = provenance.get("toolchains") or {}
     for name in ("python", "git", "zig", "nvcc", "cuobjdump", "nvidia_smi"):
         tool = toolchains.get(name) or {}
-        if tool.get("returncode") != 0 or not tool.get("path") or not tool.get("sha256") or not tool.get("version"):
+        if (
+            tool.get("returncode") != 0
+            or not tool.get("path")
+            or not tool.get("sha256")
+            or not tool.get("version")
+        ):
             errors.append(f"{name} toolchain provenance is unavailable")
     zig_version = (toolchains.get("zig") or {}).get("version")
     if zig_version and zig_version.strip() != "0.16.0":
@@ -641,18 +730,22 @@ def gpu_provenance() -> dict[str, Any]:
         for line in output.splitlines():
             fields = [field.strip() for field in line.split(",")]
             if len(fields) >= 4:
-                all_devices.append({
-                    "index": fields[0],
-                    "name": fields[1],
-                    "driver_version": fields[2],
-                    "compute_capability": fields[3],
-                })
+                all_devices.append(
+                    {
+                        "index": fields[0],
+                        "name": fields[1],
+                        "driver_version": fields[2],
+                        "compute_capability": fields[3],
+                    }
+                )
             else:
                 all_devices.append({"raw": line})
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     requested_indexes = [item.strip() for item in visible.split(",")] if visible else []
     if requested_indexes and all(item.isdecimal() for item in requested_indexes):
-        devices = [device for device in all_devices if device.get("index") in requested_indexes]
+        devices = [
+            device for device in all_devices if device.get("index") in requested_indexes
+        ]
     else:
         devices = all_devices
     return {
@@ -671,8 +764,13 @@ def l4_errors(gpu: dict[str, Any]) -> list[str]:
     if device.get("name") != "NVIDIA L4":
         return [f"expected NVIDIA L4, got {device.get('name')!r}"]
     if device.get("compute_capability") not in {"8.9", "8.9 "}:
-        return [f"expected compute capability 8.9, got {device.get('compute_capability')!r}"]
-    if not isinstance(device.get("driver_version"), str) or not device["driver_version"].strip():
+        return [
+            f"expected compute capability 8.9, got {device.get('compute_capability')!r}"
+        ]
+    if (
+        not isinstance(device.get("driver_version"), str)
+        or not device["driver_version"].strip()
+    ):
         return ["NVIDIA driver version is missing from GPU provenance"]
     return []
 
@@ -680,9 +778,13 @@ def l4_errors(gpu: dict[str, Any]) -> list[str]:
 def diagnostic_mode_errors(require_l4: bool, skip_12b: bool) -> list[str]:
     errors = []
     if not require_l4:
-        errors.append("--no-require-l4 is diagnostic-only; release evidence requires NVIDIA L4 / SM89")
+        errors.append(
+            "--no-require-l4 is diagnostic-only; release evidence requires NVIDIA L4 / SM89"
+        )
     if skip_12b:
-        errors.append("--skip-12b is diagnostic-only; release evidence requires 12B Q4_K_M replay proof")
+        errors.append(
+            "--skip-12b is diagnostic-only; release evidence requires 12B Q4_K_M replay proof"
+        )
     return errors
 
 
@@ -718,19 +820,21 @@ def release_environment(args: argparse.Namespace) -> dict[str, str]:
         if name.startswith(controlled_prefixes) or name in controlled_names:
             environment.pop(name)
     environment.update(frozen_profile())
-    environment.update({
-        "ANTFLY_BIN": str(args.binary.resolve()),
-        "LLAMA_CPP_BIN": str(args.llama_cpp_bin.resolve()),
-        "MODEL": str(args.e2b_model.resolve()),
-        "PROMPT": E2B_PROMPT,
-        "ANTFLY_TOKENS": str(E2B_ANTFLY_TOKENS),
-        "LLAMA_TOKENS": str(E2B_LLAMA_TOKENS),
-        "MIN_LLAMA_THROUGHPUT_RATIO": "0",
-        "MIN_COMPARABLE_THROUGHPUT_RATIO": "0",
-        "MIN_ANTFLY_TOK_S": "0",
-        "MAX_ANTFLY_TOK_S_CV": str(MAX_TOK_S_CV),
-        "TIMEOUT": str(args.timeout_sec),
-    })
+    environment.update(
+        {
+            "ANTFLY_BIN": str(args.binary.resolve()),
+            "LLAMA_CPP_BIN": str(args.llama_cpp_bin.resolve()),
+            "MODEL": str(args.e2b_model.resolve()),
+            "PROMPT": E2B_PROMPT,
+            "ANTFLY_TOKENS": str(E2B_ANTFLY_TOKENS),
+            "LLAMA_TOKENS": str(E2B_LLAMA_TOKENS),
+            "MIN_LLAMA_THROUGHPUT_RATIO": "0",
+            "MIN_COMPARABLE_THROUGHPUT_RATIO": "0",
+            "MIN_ANTFLY_TOK_S": "0",
+            "MAX_ANTFLY_TOK_S_CV": str(MAX_TOK_S_CV),
+            "TIMEOUT": str(args.timeout_sec),
+        }
+    )
     return environment
 
 
@@ -755,15 +859,24 @@ def matrix_command(args: argparse.Namespace) -> list[str]:
     return [
         sys.executable,
         str(args.matrix_script),
-        "--output-dir", str(args.output_dir / "e2b"),
-        "--prompt", E2B_PROMPT,
-        "--lengths", str(E2B_LLAMA_TOKENS),
-        "--target-length", str(E2B_LLAMA_TOKENS),
-        "--warmups", str(args.warmups),
-        "--repeats", str(args.repeats),
-        "--min-antfly-tok-s", "0",
-        "--min-comparable-ratio", str(minimum_ratio),
-        "--max-cv", str(MAX_TOK_S_CV),
+        "--output-dir",
+        str(args.output_dir / "e2b"),
+        "--prompt",
+        E2B_PROMPT,
+        "--lengths",
+        str(E2B_LLAMA_TOKENS),
+        "--target-length",
+        str(E2B_LLAMA_TOKENS),
+        "--warmups",
+        str(args.warmups),
+        "--repeats",
+        str(args.repeats),
+        "--min-antfly-tok-s",
+        "0",
+        "--min-comparable-ratio",
+        str(minimum_ratio),
+        "--max-cv",
+        str(MAX_TOK_S_CV),
         "--require-graph-replay",
         "--no-require-generated-attention",
         "--no-require-generated-q6-lm-head-argmax",
@@ -788,10 +901,18 @@ def matrix_timeout_sec(args: argparse.Namespace) -> int:
 
 
 def write_json(path: pathlib.Path, value: object) -> None:
-    path.write_text(json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
-def run_logged(command: list[str], environment: dict[str, str], log_path: pathlib.Path, timeout_sec: int) -> tuple[int, str]:
+def run_logged(
+    command: list[str],
+    environment: dict[str, str],
+    log_path: pathlib.Path,
+    timeout_sec: int,
+) -> tuple[int, str]:
     try:
         process = subprocess.Popen(
             command,
@@ -862,7 +983,9 @@ def route_counter_value(
     return value
 
 
-def e2b_contract_errors(matrix: dict[str, Any], enforce_performance: bool, minimum_ratio: float) -> list[str]:
+def e2b_contract_errors(
+    matrix: dict[str, Any], enforce_performance: bool, minimum_ratio: float
+) -> list[str]:
     errors: list[str] = []
     entries = matrix.get("entries")
     if not isinstance(entries, list) or len(entries) != 1:
@@ -871,22 +994,34 @@ def e2b_contract_errors(matrix: dict[str, Any], enforce_performance: bool, minim
     if int_value(entry.get("output_tokens")) != E2B_LLAMA_TOKENS:
         errors.append(f"expected {E2B_LLAMA_TOKENS}-token E2B matrix entry")
     if not bool(entry.get("pair_ok")):
-        errors.append("fixed E2B paired benchmark did not pass its replay/route contract")
+        errors.append(
+            "fixed E2B paired benchmark did not pass its replay/route contract"
+        )
     if not bool(entry.get("graph_replay_ok")):
-        errors.append("fixed E2B paired benchmark did not retain persistent graph replay")
+        errors.append(
+            "fixed E2B paired benchmark did not retain persistent graph replay"
+        )
     ratio = float_value(entry.get("comparable_ratio"))
     if ratio <= 0.0:
-        errors.append("fixed E2B benchmark reported non-positive comparable throughput ratio")
+        errors.append(
+            "fixed E2B benchmark reported non-positive comparable throughput ratio"
+        )
     if enforce_performance and ratio < minimum_ratio:
-        errors.append(f"E2B comparable throughput ratio {ratio:.3f} is below required {minimum_ratio:.3f}")
+        errors.append(
+            f"E2B comparable throughput ratio {ratio:.3f} is below required {minimum_ratio:.3f}"
+        )
     if enforce_performance and not bool(matrix.get("passed")):
-        errors.append("E2B performance matrix did not pass its configured release threshold")
+        errors.append(
+            "E2B performance matrix did not pass its configured release threshold"
+        )
     return errors
 
 
 def e2b_pair_contract_errors(pair: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    comparison = pair.get("comparison") if isinstance(pair.get("comparison"), dict) else {}
+    comparison = (
+        pair.get("comparison") if isinstance(pair.get("comparison"), dict) else {}
+    )
     expected = {
         "antfly_tokens": E2B_ANTFLY_TOKENS,
         "llama_tokens": E2B_LLAMA_TOKENS,
@@ -902,13 +1037,17 @@ def e2b_pair_contract_errors(pair: dict[str, Any]) -> list[str]:
     }
     for key, value in expected.items():
         if str(comparison.get(key)) != str(value):
-            errors.append(f"E2B fixed profile drifted: {key}={comparison.get(key)!r}, expected {value!r}")
+            errors.append(
+                f"E2B fixed profile drifted: {key}={comparison.get(key)!r}, expected {value!r}"
+            )
     if not bool(pair.get("ok")):
         errors.append("E2B paired summary did not pass")
     if not bool(pair.get("ok_graph_replay")):
         errors.append("E2B paired summary did not pass persistent graph replay")
     if not bool(pair.get("ok_lm_head_argmax")):
-        errors.append("E2B paired summary did not pass the production Q4_0 LM-head route")
+        errors.append(
+            "E2B paired summary did not pass the production Q4_0 LM-head route"
+        )
     rows = pair.get("rows")
     if not isinstance(rows, list) or not rows:
         errors.append("E2B paired summary has no measured rows")
@@ -920,11 +1059,15 @@ def e2b_pair_contract_errors(pair: dict[str, Any]) -> list[str]:
         for key in REQUIRED_Q8_PREFILL_ROUTE_COUNTERS:
             value = route_counter_value(row, key, index, errors)
             if value is not None and value <= 0:
-                errors.append(f"E2B sample {index} did not use required Q8_1 prefill route {key}")
+                errors.append(
+                    f"E2B sample {index} did not use required Q8_1 prefill route {key}"
+                )
         for key in FORBIDDEN_GENERATED_Q4_0_ROUTE_COUNTERS:
             value = route_counter_value(row, key, index, errors)
             if value is not None and value != 0:
-                errors.append(f"E2B sample {index} unexpectedly used generated Q4_0 route counter {key}")
+                errors.append(
+                    f"E2B sample {index} unexpectedly used generated Q4_0 route counter {key}"
+                )
         if int_value(row.get("antfly_generated_q6_lm_head_argmax")) != 0:
             errors.append(f"E2B sample {index} unexpectedly used generated Q6 LM-head")
         if int_value(row.get("antfly_generated_q6_lm_head_argmax_fallbacks")) != 0:
@@ -943,33 +1086,51 @@ def e2b_pair_contract_errors(pair: dict[str, Any]) -> list[str]:
             "antfly_generated_attention",
         ):
             if int_value(row.get(key)) != 0:
-                errors.append(f"E2B sample {index} unexpectedly used disabled candidate counter {key}")
+                errors.append(
+                    f"E2B sample {index} unexpectedly used disabled candidate counter {key}"
+                )
     return errors
 
 
-def generation_command(args: argparse.Namespace, model: pathlib.Path, prompt: str, tokens: int, timing_path: pathlib.Path) -> list[str]:
+def generation_command(
+    args: argparse.Namespace,
+    model: pathlib.Path,
+    prompt: str,
+    tokens: int,
+    timing_path: pathlib.Path,
+) -> list[str]:
     return [
         str(args.wrapper),
         str(args.binary),
         "generate",
         str(model),
         prompt,
-        "--backend", "cuda",
-        "--combined-budget-mb", "22000",
-        "--backend-budget-mb", "19000",
-        "--kv-budget-mb", "1024",
-        "--scratch-budget-mb", "2048",
-        "--prefill-chunk-size", "32",
-        "--max-tokens", str(tokens),
-        "--temperature", "0",
+        "--backend",
+        "cuda",
+        "--combined-budget-mb",
+        "22000",
+        "--backend-budget-mb",
+        "19000",
+        "--kv-budget-mb",
+        "1024",
+        "--scratch-budget-mb",
+        "2048",
+        "--prefill-chunk-size",
+        "32",
+        "--max-tokens",
+        str(tokens),
+        "--temperature",
+        "0",
         "--raw-prompt",
         "--no-chat-template",
         "--ignore-eos",
-        "--cache-dtype", "f32",
+        "--cache-dtype",
+        "f32",
         "--print-token-count",
         "--print-token-ids",
         "--print-timing",
-        "--json-timing", str(timing_path),
+        "--json-timing",
+        str(timing_path),
     ]
 
 
@@ -1030,7 +1191,11 @@ def disabled_candidate_errors(timing: dict[str, Any], label: str) -> list[str]:
         "q4_0_generated_e2b_exact_pair_f32_fallbacks",
         "q4_0_generated_e2b_exact_down_f32_fallbacks",
     )
-    return [f"{label} unexpectedly used disabled candidate counter {counter}" for counter in counters if int_value(cuda.get(counter)) != 0]
+    return [
+        f"{label} unexpectedly used disabled candidate counter {counter}"
+        for counter in counters
+        if int_value(cuda.get(counter)) != 0
+    ]
 
 
 def generation_replay_errors(run: dict[str, Any], tokens: int, label: str) -> list[str]:
@@ -1043,9 +1208,13 @@ def generation_replay_errors(run: dict[str, Any], tokens: int, label: str) -> li
         return errors
     ids = run.get("token_ids")
     if not isinstance(ids, list) or len(ids) != tokens:
-        errors.append(f"{label} emitted {len(ids) if isinstance(ids, list) else 0} token IDs, expected {tokens}")
+        errors.append(
+            f"{label} emitted {len(ids) if isinstance(ids, list) else 0} token IDs, expected {tokens}"
+        )
     if int_value(timing.get("tokens")) != tokens:
-        errors.append(f"{label} timing reported {timing.get('tokens')!r} tokens, expected {tokens}")
+        errors.append(
+            f"{label} timing reported {timing.get('tokens')!r} tokens, expected {tokens}"
+        )
     if float_value(timing.get("decode_tok_per_s")) <= 0.0:
         errors.append(f"{label} reported non-positive decode throughput")
     cuda = timing.get("cuda") if isinstance(timing.get("cuda"), dict) else {}
@@ -1068,19 +1237,39 @@ def gemma12b_evidence(
     output_dir = args.output_dir / "gemma12b"
     output_dir.mkdir(parents=True, exist_ok=True)
     first = run_generation_case(
-        args, environment, args.gemma12b_q4_model, GEMMA12B_PROMPT, GEMMA12B_TOKENS, output_dir, "run-1"
+        args,
+        environment,
+        args.gemma12b_q4_model,
+        GEMMA12B_PROMPT,
+        GEMMA12B_TOKENS,
+        output_dir,
+        "run-1",
     )
     second = run_generation_case(
-        args, environment, args.gemma12b_q4_model, GEMMA12B_PROMPT, GEMMA12B_TOKENS, output_dir, "run-2"
+        args,
+        environment,
+        args.gemma12b_q4_model,
+        GEMMA12B_PROMPT,
+        GEMMA12B_TOKENS,
+        output_dir,
+        "run-2",
     )
     replay_errors = generation_replay_errors(first, GEMMA12B_TOKENS, "12B run 1")
     replay_errors.extend(generation_replay_errors(second, GEMMA12B_TOKENS, "12B run 2"))
     errors = list(replay_errors)
-    first_ids = first.get("token_ids") if isinstance(first.get("token_ids"), list) else []
-    second_ids = second.get("token_ids") if isinstance(second.get("token_ids"), list) else []
+    first_ids = (
+        first.get("token_ids") if isinstance(first.get("token_ids"), list) else []
+    )
+    second_ids = (
+        second.get("token_ids") if isinstance(second.get("token_ids"), list) else []
+    )
     if first_ids != second_ids:
         mismatch = next(
-            (index for index, pair in enumerate(zip(first_ids, second_ids)) if pair[0] != pair[1]),
+            (
+                index
+                for index, pair in enumerate(zip(first_ids, second_ids))
+                if pair[0] != pair[1]
+            ),
             min(len(first_ids), len(second_ids)),
         )
         errors.append(f"12B deterministic token IDs differ at index {mismatch}")
@@ -1093,7 +1282,8 @@ def gemma12b_evidence(
         "token_ids_equal": first_ids == second_ids,
         "token_ids_sha256": token_sha256,
         "checks": {
-            "deterministic_tokens": first_ids == second_ids and len(first_ids) == GEMMA12B_TOKENS,
+            "deterministic_tokens": first_ids == second_ids
+            and len(first_ids) == GEMMA12B_TOKENS,
             "replay_and_routes": not replay_errors,
         },
         "errors": errors,
@@ -1101,11 +1291,18 @@ def gemma12b_evidence(
     }
 
 
-def artifact_check(args: argparse.Namespace, environment: dict[str, str]) -> dict[str, Any]:
+def artifact_check(
+    args: argparse.Namespace, environment: dict[str, str]
+) -> dict[str, Any]:
     log_path = args.output_dir / "artifact_check.log"
     command = [str(args.artifact_check_script), "--check", "--all"]
     returncode, _ = run_logged(command, environment, log_path, args.timeout_sec)
-    return {"command": command, "log": str(log_path), "returncode": returncode, "passed": returncode == 0}
+    return {
+        "command": command,
+        "log": str(log_path),
+        "returncode": returncode,
+        "passed": returncode == 0,
+    }
 
 
 def require_paths(args: argparse.Namespace) -> list[str]:
@@ -1120,13 +1317,17 @@ def require_paths(args: argparse.Namespace) -> list[str]:
         paths["CUDA artifact check script"] = args.artifact_check_script
     if not args.skip_12b:
         paths["12B Q4_K_M GGUF"] = args.gemma12b_q4_model
-    return [f"missing {label}: {path}" for label, path in paths.items() if not path.exists()]
+    return [
+        f"missing {label}: {path}" for label, path in paths.items() if not path.exists()
+    ]
 
 
 def main() -> None:
     args = parse_args()
     if args.warmups < 0 or args.repeats < 1 or args.timeout_sec < 1:
-        raise SystemExit("warmups must be non-negative; repeats and timeout-sec must be positive")
+        raise SystemExit(
+            "warmups must be non-negative; repeats and timeout-sec must be positive"
+        )
     if not math.isfinite(args.min_comparable_ratio) or args.min_comparable_ratio <= 0.0:
         raise SystemExit("min-comparable-ratio must be a finite positive number")
 
@@ -1164,9 +1365,13 @@ def main() -> None:
     errors.extend(provenance_errors(provenance))
     if args.require_l4:
         errors.extend(l4_errors(gpu))
-    missing_artifacts = [name for name, value in artifacts.items() if not value.get("exists")]
+    missing_artifacts = [
+        name for name, value in artifacts.items() if not value.get("exists")
+    ]
     if missing_artifacts:
-        errors.append(f"missing CUDA provenance artifacts: {', '.join(missing_artifacts)}")
+        errors.append(
+            f"missing CUDA provenance artifacts: {', '.join(missing_artifacts)}"
+        )
 
     artifact_result: dict[str, Any] | None = None
     if args.verify_artifacts:
@@ -1176,7 +1381,9 @@ def main() -> None:
 
     matrix_path, pair_path = reset_matrix_outputs(args.output_dir)
     matrix_log = args.output_dir / "e2b_matrix.log"
-    matrix_returncode, _ = run_logged(matrix_command(args), environment, matrix_log, matrix_timeout_sec(args))
+    matrix_returncode, _ = run_logged(
+        matrix_command(args), environment, matrix_log, matrix_timeout_sec(args)
+    )
     errors.extend(matrix_process_errors(matrix_returncode))
     matrix: dict[str, Any] = {}
     if matrix_path.is_file():
@@ -1187,7 +1394,11 @@ def main() -> None:
     else:
         errors.append("E2B matrix did not write matrix_summary.json")
     if matrix:
-        errors.extend(e2b_contract_errors(matrix, args.enforce_performance, args.min_comparable_ratio))
+        errors.extend(
+            e2b_contract_errors(
+                matrix, args.enforce_performance, args.min_comparable_ratio
+            )
+        )
 
     pair: dict[str, Any] = {}
     if pair_path.is_file():

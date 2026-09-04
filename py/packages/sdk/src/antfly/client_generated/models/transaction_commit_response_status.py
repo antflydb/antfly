@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TransactionCommitResponseStatus(str, Enum):
+class TransactionCommitResponseStatus(StrEnum):
     ABORTED = "aborted"
     COMMITTED = "committed"
     COMMITTED_RECOVERY_PENDING = "committed_recovery_pending"

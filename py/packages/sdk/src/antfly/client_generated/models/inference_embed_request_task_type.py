@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceEmbedRequestTaskType(str, Enum):
+class InferenceEmbedRequestTaskType(StrEnum):
     CLASSIFICATION = "CLASSIFICATION"
     CLUSTERING = "CLUSTERING"
     CODE_RETRIEVAL_QUERY = "CODE_RETRIEVAL_QUERY"

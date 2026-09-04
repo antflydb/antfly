@@ -51,8 +51,15 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--search-template", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--concurrency", type=parse_csv_int, default=parse_csv_int("1,2,4,8,16,32,64"))
-    parser.add_argument("--offered-rps", type=parse_csv_float, required=True, help="one value or one per concurrency point")
+    parser.add_argument(
+        "--concurrency", type=parse_csv_int, default=parse_csv_int("1,2,4,8,16,32,64")
+    )
+    parser.add_argument(
+        "--offered-rps",
+        type=parse_csv_float,
+        required=True,
+        help="one value or one per concurrency point",
+    )
     parser.add_argument("--duration-seconds", type=float, default=30)
     parser.add_argument("--warmup-seconds", type=float, default=5)
     parser.add_argument("--timeout-seconds", type=float, default=10)
@@ -62,26 +69,45 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--freshness-search-template", type=Path)
     parser.add_argument("--freshness-probes", type=int, default=0)
     parser.add_argument("--freshness-poll-ms", type=float, default=10)
-    parser.add_argument("--durability-profile", required=True, choices=("unsafe-throughput", "process-durable", "machine-durable"))
+    parser.add_argument(
+        "--durability-profile",
+        required=True,
+        choices=("unsafe-throughput", "process-durable", "machine-durable"),
+    )
     parser.add_argument("--durability-config", required=True, type=Path)
     parser.add_argument("--readiness-template", type=Path)
     parser.add_argument("--graceful-restart-command")
     parser.add_argument("--crash-restart-command")
     parser.add_argument("--server-pid", type=int)
-    parser.add_argument("--docker-container", help="sample server RSS/CPU with docker stats")
-    parser.add_argument("--server-metrics-url", help="sample Antfly Prometheus metrics for physical-footprint and allocator peaks")
+    parser.add_argument(
+        "--docker-container", help="sample server RSS/CPU with docker stats"
+    )
+    parser.add_argument(
+        "--server-metrics-url",
+        help="sample Antfly Prometheus metrics for physical-footprint and allocator peaks",
+    )
     parser.add_argument("--server-data-dir", type=Path)
-    parser.add_argument("--index-command", help="optional corpus load command, timed before warmup")
-    parser.add_argument("--index-seconds", type=float, help="record a previously completed reusable index load")
+    parser.add_argument(
+        "--index-command", help="optional corpus load command, timed before warmup"
+    )
+    parser.add_argument(
+        "--index-seconds",
+        type=float,
+        help="record a previously completed reusable index load",
+    )
     parser.add_argument("--indexed-documents", type=int)
     args = parser.parse_args()
     if len(args.offered_rps) not in (1, len(args.concurrency)):
-        parser.error("--offered-rps must contain one value or one per concurrency point")
+        parser.error(
+            "--offered-rps must contain one value or one per concurrency point"
+        )
     if not (0 <= args.write_fraction < 1):
         parser.error("--write-fraction must be in [0,1)")
     if args.write_fraction and not args.write_template:
         parser.error("mixed workload requires --write-template")
-    if args.freshness_probes and not (args.freshness_write_template and args.freshness_search_template):
+    if args.freshness_probes and not (
+        args.freshness_write_template and args.freshness_search_template
+    ):
         parser.error("freshness probes require write and search templates")
     if args.indexed_documents is not None and args.indexed_documents <= 0:
         parser.error("--indexed-documents must be positive")
@@ -89,7 +115,9 @@ def arguments() -> argparse.Namespace:
         parser.error("--index-seconds must be positive")
     if args.index_command and args.index_seconds is not None:
         parser.error("--index-command and --index-seconds are mutually exclusive")
-    if args.indexed_documents is not None and not (args.index_command or args.index_seconds is not None):
+    if args.indexed_documents is not None and not (
+        args.index_command or args.index_seconds is not None
+    ):
         parser.error("--indexed-documents requires --index-command or --index-seconds")
     if args.server_pid is not None and args.docker_container:
         parser.error("--server-pid and --docker-container are mutually exclusive")
@@ -109,7 +137,10 @@ def substitute(value: Any, marker: str) -> Any:
     if isinstance(value, list):
         return [substitute(item, marker) for item in value]
     if isinstance(value, dict):
-        return {substitute(key, marker): substitute(item, marker) for key, item in value.items()}
+        return {
+            substitute(key, marker): substitute(item, marker)
+            for key, item in value.items()
+        }
     return value
 
 
@@ -146,7 +177,9 @@ def response_hit_count(payload: bytes) -> int | None:
         if not isinstance(response, dict):
             return None
         response_hits = response.get("hits")
-        if not isinstance(response_hits, dict) or not isinstance(response_hits.get("hits"), list):
+        if not isinstance(response_hits, dict) or not isinstance(
+            response_hits.get("hits"), list
+        ):
             return None
         count += len(response_hits["hits"])
     return count
@@ -183,32 +216,56 @@ class Client:
     def connect(self) -> None:
         port = self.parsed.port or (443 if self.parsed.scheme == "https" else 80)
         if self.parsed.scheme == "https":
-            self.connection = http.client.HTTPSConnection(self.parsed.hostname, port, timeout=self.timeout, context=ssl.create_default_context())
+            self.connection = http.client.HTTPSConnection(
+                self.parsed.hostname,
+                port,
+                timeout=self.timeout,
+                context=ssl.create_default_context(),
+            )
         else:
-            self.connection = http.client.HTTPConnection(self.parsed.hostname, port, timeout=self.timeout)
+            self.connection = http.client.HTTPConnection(
+                self.parsed.hostname, port, timeout=self.timeout
+            )
 
-    def request(self, template: dict[str, Any], scheduled_ns: int, operation: str) -> Observation:
+    def request(
+        self, template: dict[str, Any], scheduled_ns: int, operation: str
+    ) -> Observation:
         if self.connection is None:
             self.connect()
         if "raw_body" in template:
             body = str(template["raw_body"]).encode()
         else:
             body_value = template.get("body")
-            body = None if body_value is None else json.dumps(body_value, separators=(",", ":")).encode()
+            body = (
+                None
+                if body_value is None
+                else json.dumps(body_value, separators=(",", ":")).encode()
+            )
         headers = {str(k): str(v) for k, v in template.get("headers", {}).items()}
         if body is not None:
-            headers.setdefault("Content-Type", "application/json" if "raw_body" not in template else "application/octet-stream")
+            headers.setdefault(
+                "Content-Type",
+                "application/json"
+                if "raw_body" not in template
+                else "application/octet-stream",
+            )
         path = self.parsed.path.rstrip("/") + str(template["path"])
         started = time.perf_counter_ns()
         try:
             assert self.connection
-            self.connection.request(str(template.get("method", "POST")), path, body=body, headers=headers)
+            self.connection.request(
+                str(template.get("method", "POST")), path, body=body, headers=headers
+            )
             response = self.connection.getresponse()
             payload = response.read()
             completed = time.perf_counter_ns()
             error = None if 200 <= response.status < 300 else f"HTTP {response.status}"
             expected = template.get("expect_contains")
-            if error is None and expected is not None and str(expected).encode() not in payload:
+            if (
+                error is None
+                and expected is not None
+                and str(expected).encode() not in payload
+            ):
                 error = "expected marker absent"
             if error is None and template.get("expect_nonempty_hits"):
                 hit_count = response_hit_count(payload)
@@ -216,13 +273,23 @@ class Client:
                     error = "unrecognized search response"
                 elif hit_count == 0:
                     error = "search returned no hits"
-            return Observation(scheduled_ns, started, completed, response.status, len(payload), operation, error)
+            return Observation(
+                scheduled_ns,
+                started,
+                completed,
+                response.status,
+                len(payload),
+                operation,
+                error,
+            )
         except Exception as exc:  # Preserve failures as benchmark observations.
             completed = time.perf_counter_ns()
             if self.connection:
                 self.connection.close()
             self.connection = None
-            return Observation(scheduled_ns, started, completed, None, 0, operation, type(exc).__name__)
+            return Observation(
+                scheduled_ns, started, completed, None, 0, operation, type(exc).__name__
+            )
 
     def close(self) -> None:
         if self.connection:
@@ -278,7 +345,12 @@ class ProcessSampler:
         "antfly_data_replay_debt_",
     )
 
-    def __init__(self, pid: int | None, docker_container: str | None = None, metrics_url: str | None = None):
+    def __init__(
+        self,
+        pid: int | None,
+        docker_container: str | None = None,
+        metrics_url: str | None = None,
+    ):
         self.pid = pid
         self.docker_container = docker_container
         self.metrics_url = metrics_url
@@ -315,7 +387,9 @@ class ProcessSampler:
 
         elapsed = time.monotonic() - self.started
         footprint = observed.get("antfly_process_footprint_bytes", 0)
-        previous_footprint = self.metrics_at_peak_footprint.get("antfly_process_footprint_bytes", -1)
+        previous_footprint = self.metrics_at_peak_footprint.get(
+            "antfly_process_footprint_bytes", -1
+        )
         if footprint > previous_footprint:
             self.metrics_at_peak_footprint = observed.copy()
             self.peak_footprint_sample_seconds = elapsed
@@ -327,18 +401,31 @@ class ProcessSampler:
             self.peak_rss_sample_seconds = elapsed
 
         malloc = observed.get("antfly_process_malloc_allocated_bytes", 0)
-        previous_malloc = self.metrics_at_peak_malloc.get("antfly_process_malloc_allocated_bytes", -1)
+        previous_malloc = self.metrics_at_peak_malloc.get(
+            "antfly_process_malloc_allocated_bytes", -1
+        )
         if malloc > previous_malloc:
             self.metrics_at_peak_malloc = observed.copy()
             self.peak_malloc_sample_seconds = elapsed
 
     def _run(self) -> None:
-        assert self.pid is not None or self.docker_container is not None or self.metrics_url is not None
+        assert (
+            self.pid is not None
+            or self.docker_container is not None
+            or self.metrics_url is not None
+        )
         while not self.stop.wait(0.5):
             try:
                 if self.docker_container:
                     raw = subprocess.check_output(
-                        ["docker", "stats", "--no-stream", "--format", "{{.MemUsage}}|{{.CPUPerc}}", self.docker_container],
+                        [
+                            "docker",
+                            "stats",
+                            "--no-stream",
+                            "--format",
+                            "{{.MemUsage}}|{{.CPUPerc}}",
+                            self.docker_container,
+                        ],
                         text=True,
                         stderr=subprocess.DEVNULL,
                     ).strip()
@@ -346,7 +433,9 @@ class ProcessSampler:
                         memory, cpu = raw.split("|", 1)
                         rss = parse_byte_size(memory.split("/", 1)[0])
                         self.peak_rss_bytes = max(self.peak_rss_bytes, rss)
-                        self.cpu_percent_samples.append(float(cpu.strip().removesuffix("%")))
+                        self.cpu_percent_samples.append(
+                            float(cpu.strip().removesuffix("%"))
+                        )
                 else:
                     raw = subprocess.check_output(
                         ["ps", "-o", "rss=,%cpu=", "-p", str(self.pid)],
@@ -368,7 +457,11 @@ class ProcessSampler:
                     pass
 
     def __enter__(self) -> "ProcessSampler":
-        if self.pid is not None or self.docker_container is not None or self.metrics_url is not None:
+        if (
+            self.pid is not None
+            or self.docker_container is not None
+            or self.metrics_url is not None
+        ):
             self.thread = threading.Thread(target=self._run, daemon=True)
             self.thread.start()
         return self
@@ -381,11 +474,17 @@ class ProcessSampler:
     def summary(self) -> dict[str, Any]:
         return {
             "peak_rss_bytes": self.peak_rss_bytes or None,
-            "cpu_percent_mean": statistics.mean(self.cpu_percent_samples) if self.cpu_percent_samples else None,
-            "cpu_percent_max": max(self.cpu_percent_samples) if self.cpu_percent_samples else None,
+            "cpu_percent_mean": statistics.mean(self.cpu_percent_samples)
+            if self.cpu_percent_samples
+            else None,
+            "cpu_percent_max": max(self.cpu_percent_samples)
+            if self.cpu_percent_samples
+            else None,
             "metrics_latest": dict(sorted(self.metrics_latest.items())),
             "metrics_peak": dict(sorted(self.metrics_peak.items())),
-            "metrics_at_peak_footprint": dict(sorted(self.metrics_at_peak_footprint.items())),
+            "metrics_at_peak_footprint": dict(
+                sorted(self.metrics_at_peak_footprint.items())
+            ),
             "metrics_at_peak_rss": dict(sorted(self.metrics_at_peak_rss.items())),
             "metrics_at_peak_malloc": dict(sorted(self.metrics_at_peak_malloc.items())),
             "peak_footprint_sample_seconds": self.peak_footprint_sample_seconds,
@@ -479,7 +578,9 @@ def directory_inventory(path: Path | None, limit: int = 32) -> dict[str, Any] | 
             lsm_manifest_paths.append(item)
         largest_files.append((size, str(relative)))
         category = storage_category(relative)
-        category_stats = storage_categories.setdefault(category, {"files": 0, "bytes": 0})
+        category_stats = storage_categories.setdefault(
+            category, {"files": 0, "bytes": 0}
+        )
         category_stats["files"] += 1
         category_stats["bytes"] += size
         parts = relative.parts[:-1]
@@ -496,11 +597,15 @@ def directory_inventory(path: Path | None, limit: int = 32) -> dict[str, Any] | 
         ],
         "largest_subtrees": [
             {"path": name, "bytes": size}
-            for name, size in sorted(subtree_bytes.items(), key=lambda item: (-item[1], item[0]))[:limit]
+            for name, size in sorted(
+                subtree_bytes.items(), key=lambda item: (-item[1], item[0])
+            )[:limit]
         ],
         "largest_files": [
             {"path": name, "bytes": size}
-            for size, name in sorted(largest_files, key=lambda item: (-item[0], item[1]))[:limit]
+            for size, name in sorted(
+                largest_files, key=lambda item: (-item[0], item[1])
+            )[:limit]
         ],
     }
 
@@ -549,7 +654,13 @@ def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | 
             offset += 20
             entry_count = struct.unpack_from("<I", raw, offset)[0]
             offset += 4
-            path_length, smallest_namespace_length, smallest_key_length, largest_namespace_length, largest_key_length = lengths
+            (
+                path_length,
+                smallest_namespace_length,
+                smallest_key_length,
+                largest_namespace_length,
+                largest_key_length,
+            ) = lengths
             run_path = raw[offset : offset + path_length].decode("utf-8")
             offset += path_length
             smallest_namespace = raw[offset : offset + smallest_namespace_length]
@@ -591,7 +702,9 @@ def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | 
             offset += 12
             obsolete_path = raw[offset : offset + path_length].decode("utf-8")
             offset += path_length
-            obsolete_paths.append(resolve_manifest_path(manifest_path.parent, obsolete_path))
+            obsolete_paths.append(
+                resolve_manifest_path(manifest_path.parent, obsolete_path)
+            )
         if offset != len(raw):
             return None
     except (OSError, UnicodeDecodeError, struct.error):
@@ -680,7 +793,12 @@ def run_index_command(
     server_metrics_url: str | None = None,
 ) -> tuple[float, dict[str, Any], dict[str, float]]:
     started = time.perf_counter()
-    with ProcessSampler(server_pid, docker_container, server_metrics_url) as process_sampler, DiskSampler(server_data_dir) as disk_sampler:
+    with (
+        ProcessSampler(
+            server_pid, docker_container, server_metrics_url
+        ) as process_sampler,
+        DiskSampler(server_data_dir) as disk_sampler,
+    ):
         process = subprocess.Popen(shlex.split(raw_command))
         _, status, usage = os.wait4(process.pid, 0)
         process.returncode = os.waitstatus_to_exitcode(status)
@@ -705,7 +823,9 @@ def percentile(values: list[int], quantile: float) -> int | None:
     return ordered[min(len(ordered) - 1, math.ceil(quantile * len(ordered)) - 1)]
 
 
-def summarize_operation(observations: list[Observation], duration: float, offered: float) -> dict[str, Any]:
+def summarize_operation(
+    observations: list[Observation], duration: float, offered: float
+) -> dict[str, Any]:
     success = [obs for obs in observations if obs.error is None]
     end_to_end = [obs.end_to_end_ns for obs in success]
     service = [obs.service_ns for obs in success]
@@ -718,30 +838,68 @@ def summarize_operation(observations: list[Observation], duration: float, offere
         "successes": len(success),
         "errors": len(observations) - len(success),
         "response_bytes": sum(obs.response_bytes for obs in success),
-        "latency_ns": {"p50": percentile(end_to_end, 0.50), "p95": percentile(end_to_end, 0.95), "p99": percentile(end_to_end, 0.99), "max": max(end_to_end) if end_to_end else None},
-        "service_ns": {"p50": percentile(service, 0.50), "p95": percentile(service, 0.95), "p99": percentile(service, 0.99)},
-        "queue_delay_ns": {"p50": percentile(queue_delay, 0.50), "p95": percentile(queue_delay, 0.95), "p99": percentile(queue_delay, 0.99)},
+        "latency_ns": {
+            "p50": percentile(end_to_end, 0.50),
+            "p95": percentile(end_to_end, 0.95),
+            "p99": percentile(end_to_end, 0.99),
+            "max": max(end_to_end) if end_to_end else None,
+        },
+        "service_ns": {
+            "p50": percentile(service, 0.50),
+            "p95": percentile(service, 0.95),
+            "p99": percentile(service, 0.99),
+        },
+        "queue_delay_ns": {
+            "p50": percentile(queue_delay, 0.50),
+            "p95": percentile(queue_delay, 0.95),
+            "p99": percentile(queue_delay, 0.99),
+        },
     }
 
 
-def summarize(observations: list[Observation], duration: float, offered: float) -> dict[str, Any]:
+def summarize(
+    observations: list[Observation], duration: float, offered: float
+) -> dict[str, Any]:
     elapsed = duration
     if observations:
-        elapsed = max(duration, (max(observation.completed_ns for observation in observations) - min(observation.scheduled_ns for observation in observations)) / 1_000_000_000)
+        elapsed = max(
+            duration,
+            (
+                max(observation.completed_ns for observation in observations)
+                - min(observation.scheduled_ns for observation in observations)
+            )
+            / 1_000_000_000,
+        )
     result = summarize_operation(observations, elapsed, offered)
     result["operations"] = {
         operation: summarize_operation(
-            [observation for observation in observations if observation.operation == operation],
+            [
+                observation
+                for observation in observations
+                if observation.operation == operation
+            ],
             elapsed,
-            sum(observation.operation == operation for observation in observations) / elapsed,
+            sum(observation.operation == operation for observation in observations)
+            / elapsed,
         )
         for operation in sorted({observation.operation for observation in observations})
     }
     return result
 
 
-def run_open_loop(base_url: str, timeout: float, search: dict[str, Any], write: dict[str, Any] | None, write_fraction: float, concurrency: int, offered_rps: float, duration: float) -> list[Observation]:
-    jobs: queue.Queue[tuple[int, int] | None] = queue.Queue(maxsize=max(1024, concurrency * 16))
+def run_open_loop(
+    base_url: str,
+    timeout: float,
+    search: dict[str, Any],
+    write: dict[str, Any] | None,
+    write_fraction: float,
+    concurrency: int,
+    offered_rps: float,
+    duration: float,
+) -> list[Observation]:
+    jobs: queue.Queue[tuple[int, int] | None] = queue.Queue(
+        maxsize=max(1024, concurrency * 16)
+    )
     output: list[Observation] = []
     output_lock = threading.Lock()
     write_ratio = Fraction(str(write_fraction))
@@ -754,8 +912,18 @@ def run_open_loop(base_url: str, timeout: float, search: dict[str, Any], write: 
             if job is None:
                 break
             sequence, scheduled = job
-            is_write = write is not None and (sequence * write_ratio.numerator) % write_ratio.denominator < write_ratio.numerator
-            local.append(client.request(write if is_write else search, scheduled, "write" if is_write else "search"))
+            is_write = (
+                write is not None
+                and (sequence * write_ratio.numerator) % write_ratio.denominator
+                < write_ratio.numerator
+            )
+            local.append(
+                client.request(
+                    write if is_write else search,
+                    scheduled,
+                    "write" if is_write else "search",
+                )
+            )
         client.close()
         with output_lock:
             output.extend(local)
@@ -797,7 +965,9 @@ def readiness(base_url: str, timeout: float, template: dict[str, Any]) -> float:
     raise TimeoutError("server did not become ready")
 
 
-def request_readiness(base_url: str, timeout: float, template: dict[str, Any], operation: str) -> tuple[float, Observation, int]:
+def request_readiness(
+    base_url: str, timeout: float, template: dict[str, Any], operation: str
+) -> tuple[float, Observation, int]:
     client = Client(base_url, timeout)
     started = time.perf_counter()
     attempts = 0
@@ -814,11 +984,17 @@ def request_readiness(base_url: str, timeout: float, template: dict[str, Any], o
     raise TimeoutError(f"server request did not become ready: {error}")
 
 
-def freshness(args: argparse.Namespace, write_template: dict[str, Any], search_template: dict[str, Any]) -> list[int]:
+def freshness(
+    args: argparse.Namespace,
+    write_template: dict[str, Any],
+    search_template: dict[str, Any],
+) -> list[int]:
     if not template_has_marker(write_template):
         raise ValueError("freshness write template must contain {marker}")
     if not template_has_marker(search_template.get("expect_contains")):
-        raise ValueError("freshness search template expect_contains must contain {marker}")
+        raise ValueError(
+            "freshness search template expect_contains must contain {marker}"
+        )
     client = Client(args.base_url, args.timeout_seconds)
     results: list[int] = []
     for _ in range(args.freshness_probes):
@@ -831,7 +1007,9 @@ def freshness(args: argparse.Namespace, write_template: dict[str, Any], search_t
         ack_ns = acknowledged.completed_ns
         deadline = time.perf_counter() + args.timeout_seconds
         while True:
-            observed = client.request(search, time.perf_counter_ns(), "freshness_search")
+            observed = client.request(
+                search, time.perf_counter_ns(), "freshness_search"
+            )
             if observed.error is None and observed.response_bytes > 0:
                 results.append(observed.completed_ns - ack_ns)
                 break
@@ -848,7 +1026,9 @@ def main() -> int:
     search = load_template(args.search_template)
     write = load_template(args.write_template) if args.write_template else None
     disk_before_inventory = directory_inventory(args.server_data_dir)
-    disk_before_load = disk_before_inventory["total_bytes"] if disk_before_inventory else None
+    disk_before_load = (
+        disk_before_inventory["total_bytes"] if disk_before_inventory else None
+    )
     index_server: dict[str, Any] | None = None
     index_loader: dict[str, float] | None = None
     if args.index_command:
@@ -862,44 +1042,100 @@ def main() -> int:
     else:
         index_seconds = args.index_seconds
     disk_after_inventory = directory_inventory(args.server_data_dir)
-    disk_after_load = disk_after_inventory["total_bytes"] if disk_after_inventory else None
+    disk_after_load = (
+        disk_after_inventory["total_bytes"] if disk_after_inventory else None
+    )
     # Warmup uses the first load point and is intentionally excluded.
-    run_open_loop(args.base_url, args.timeout_seconds, search, write, args.write_fraction, args.concurrency[0], args.offered_rps[0], args.warmup_seconds)
+    run_open_loop(
+        args.base_url,
+        args.timeout_seconds,
+        search,
+        write,
+        args.write_fraction,
+        args.concurrency[0],
+        args.offered_rps[0],
+        args.warmup_seconds,
+    )
 
     raw_file = args.output / "requests.jsonl"
     summaries: list[dict[str, Any]] = []
     with raw_file.open("w", encoding="utf-8") as raw:
         for index, concurrency in enumerate(args.concurrency):
-            offered = args.offered_rps[0] if len(args.offered_rps) == 1 else args.offered_rps[index]
+            offered = (
+                args.offered_rps[0]
+                if len(args.offered_rps) == 1
+                else args.offered_rps[index]
+            )
             client_cpu_started = time.process_time()
-            with ProcessSampler(args.server_pid, args.docker_container, args.server_metrics_url) as process_sampler:
-                observations = run_open_loop(args.base_url, args.timeout_seconds, search, write, args.write_fraction, concurrency, offered, args.duration_seconds)
+            with ProcessSampler(
+                args.server_pid, args.docker_container, args.server_metrics_url
+            ) as process_sampler:
+                observations = run_open_loop(
+                    args.base_url,
+                    args.timeout_seconds,
+                    search,
+                    write,
+                    args.write_fraction,
+                    concurrency,
+                    offered,
+                    args.duration_seconds,
+                )
             client_cpu_seconds = time.process_time() - client_cpu_started
             for obs in observations:
-                raw.write(json.dumps({**obs.__dict__, "service_ns": obs.service_ns, "end_to_end_ns": obs.end_to_end_ns, "concurrency": concurrency, "offered_rps": offered}, sort_keys=True) + "\n")
+                raw.write(
+                    json.dumps(
+                        {
+                            **obs.__dict__,
+                            "service_ns": obs.service_ns,
+                            "end_to_end_ns": obs.end_to_end_ns,
+                            "concurrency": concurrency,
+                            "offered_rps": offered,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
             load_summary = summarize(observations, args.duration_seconds, offered)
-            summaries.append({
-                "concurrency": concurrency,
-                **load_summary,
-                "server": process_sampler.summary(),
-                "client_cpu_seconds": client_cpu_seconds,
-                "client_cpu_utilization": client_cpu_seconds / load_summary["measurement_elapsed_seconds"],
-            })
-    (args.output / "loads.json").write_text(json.dumps(summaries, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            summaries.append(
+                {
+                    "concurrency": concurrency,
+                    **load_summary,
+                    "server": process_sampler.summary(),
+                    "client_cpu_seconds": client_cpu_seconds,
+                    "client_cpu_utilization": client_cpu_seconds
+                    / load_summary["measurement_elapsed_seconds"],
+                }
+            )
+    (args.output / "loads.json").write_text(
+        json.dumps(summaries, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
     freshness_values: list[int] = []
     if args.freshness_probes:
-        freshness_values = freshness(args, load_template(args.freshness_write_template), load_template(args.freshness_search_template))
-    (args.output / "freshness.json").write_text(json.dumps(freshness_values, indent=2) + "\n", encoding="utf-8")
+        freshness_values = freshness(
+            args,
+            load_template(args.freshness_write_template),
+            load_template(args.freshness_search_template),
+        )
+    (args.output / "freshness.json").write_text(
+        json.dumps(freshness_values, indent=2) + "\n", encoding="utf-8"
+    )
 
     recovery: dict[str, Any] = {}
-    readiness_template = load_template(args.readiness_template) if args.readiness_template else None
-    for label, raw_command in (("graceful", args.graceful_restart_command), ("crash", args.crash_restart_command)):
+    readiness_template = (
+        load_template(args.readiness_template) if args.readiness_template else None
+    )
+    for label, raw_command in (
+        ("graceful", args.graceful_restart_command),
+        ("crash", args.crash_restart_command),
+    ):
         if raw_command:
             if readiness_template is None:
                 raise ValueError("restart commands require --readiness-template")
             command_seconds = run_timed_command(raw_command)
-            ready_seconds = readiness(args.base_url, args.timeout_seconds, readiness_template)
+            ready_seconds = readiness(
+                args.base_url, args.timeout_seconds, readiness_template
+            )
             search_ready_seconds, observation, search_attempts = request_readiness(
                 args.base_url,
                 args.timeout_seconds,
@@ -911,13 +1147,17 @@ def main() -> int:
                 "readiness_seconds": ready_seconds,
                 "search_ready_seconds": search_ready_seconds,
                 "search_attempts": search_attempts,
-                "recovery_seconds": command_seconds + ready_seconds + search_ready_seconds,
+                "recovery_seconds": command_seconds
+                + ready_seconds
+                + search_ready_seconds,
                 "first_search_service_ns": observation.service_ns,
                 "first_search_end_to_end_ns": observation.end_to_end_ns,
                 "first_search_status": observation.status,
                 "first_search_error": observation.error,
             }
-            (args.output / "recovery.json").write_text(json.dumps(recovery, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            (args.output / "recovery.json").write_text(
+                json.dumps(recovery, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
 
     durability_config = json.loads(args.durability_config.read_text(encoding="utf-8"))
     manifest = {
@@ -944,17 +1184,26 @@ def main() -> int:
         "index_server": index_server,
         "index_loader": index_loader,
     }
-    (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (args.output / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     disk_end_inventory = directory_inventory(args.server_data_dir)
     result = {
         "schema_version": 1,
         "loads": summaries,
-        "freshness_ns": {"samples": len(freshness_values), "p50": percentile(freshness_values, 0.50), "p95": percentile(freshness_values, 0.95), "p99": percentile(freshness_values, 0.99)},
+        "freshness_ns": {
+            "samples": len(freshness_values),
+            "p50": percentile(freshness_values, 0.50),
+            "p95": percentile(freshness_values, 0.95),
+            "p99": percentile(freshness_values, 0.99),
+        },
         "recovery": recovery,
         "indexing": {
             "seconds": index_seconds,
             "documents": args.indexed_documents,
-            "documents_per_second": (args.indexed_documents / index_seconds) if index_seconds and args.indexed_documents else None,
+            "documents_per_second": (args.indexed_documents / index_seconds)
+            if index_seconds and args.indexed_documents
+            else None,
             "server": index_server,
             "loader": index_loader,
         },
@@ -969,7 +1218,9 @@ def main() -> int:
             "end": disk_end_inventory,
         },
     }
-    (args.output / "summary.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (args.output / "summary.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     print(json.dumps(result, sort_keys=True))
     return 0
 

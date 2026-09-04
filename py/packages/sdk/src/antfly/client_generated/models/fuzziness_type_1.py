@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class FuzzinessType1(str, Enum):
+class FuzzinessType1(StrEnum):
     AUTO = "auto"
 
     def __str__(self) -> str:

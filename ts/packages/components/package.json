@@ -28,10 +28,10 @@
   "scripts": {
     "build": "vite build",
     "dev": "vite build --watch",
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers=2",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "lint": "biome check . --write --unsafe",
+    "lint": "biome check .",
     "storybook": "sb dev",
     "build-storybook": "sb build",
     "clean": "rm -rf dist types",

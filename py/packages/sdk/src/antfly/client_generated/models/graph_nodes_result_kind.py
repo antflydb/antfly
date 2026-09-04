@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphNodesResultKind(str, Enum):
+class GraphNodesResultKind(StrEnum):
     NODES = "nodes"
 
     def __str__(self) -> str:

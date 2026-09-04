@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TransactionConflictKind(str, Enum):
+class TransactionConflictKind(StrEnum):
     DOC_IDENTITY_UNAVAILABLE = "doc_identity_unavailable"
     INTENT_CONFLICT = "intent_conflict"
     PARTICIPANT_UNAVAILABLE = "participant_unavailable"

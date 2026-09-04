@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class IndexPublicationPolicy(str, Enum):
+class IndexPublicationPolicy(StrEnum):
     ATOMIC = "atomic"
     PROGRESSIVE = "progressive"
 

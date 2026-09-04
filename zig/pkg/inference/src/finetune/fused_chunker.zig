@@ -577,14 +577,14 @@ test "decode boundaries smoke test" {
 
     // logits layout: [logit0_pos0, logit1_pos0, logit0_pos1, logit1_pos1, ...]
     const logits = [seq_len * 2]f32{
-        1.0,  -1.0, // pos 0: not boundary
-        1.0,  -1.0, // pos 1: not boundary
-        1.0,  -1.0, // pos 2: not boundary
-        -5.0, 5.0,  // pos 3: strong boundary
-        1.0,  -1.0, // pos 4: not boundary
-        1.0,  -1.0, // pos 5: not boundary
-        1.0,  -1.0, // pos 6: not boundary
-        1.0,  -1.0, // pos 7: not boundary
+        1.0, -1.0, // pos 0: not boundary
+        1.0, -1.0, // pos 1: not boundary
+        1.0, -1.0, // pos 2: not boundary
+        -5.0, 5.0, // pos 3: strong boundary
+        1.0, -1.0, // pos 4: not boundary
+        1.0, -1.0, // pos 5: not boundary
+        1.0, -1.0, // pos 6: not boundary
+        1.0, -1.0, // pos 7: not boundary
     };
 
     const spans = try decodeBoundaries(allocator, cfg, &logits, &attention_mask, seq_len);
@@ -612,12 +612,12 @@ test "decode boundaries — short chunks are dropped" {
     const attention_mask = [seq_len]i32{ 1, 1, 1, 1, 1, 1 };
 
     const logits = [seq_len * 2]f32{
-        1.0,  -1.0, // 0: not boundary
-        1.0,  -1.0, // 1: not boundary
-        -5.0, 5.0,  // 2: boundary
-        1.0,  -1.0, // 3: not boundary
-        1.0,  -1.0, // 4: not boundary
-        1.0,  -1.0, // 5: not boundary
+        1.0, -1.0, // 0: not boundary
+        1.0, -1.0, // 1: not boundary
+        -5.0, 5.0, // 2: boundary
+        1.0, -1.0, // 3: not boundary
+        1.0, -1.0, // 4: not boundary
+        1.0, -1.0, // 5: not boundary
     };
 
     const spans = try decodeBoundaries(allocator, cfg, &logits, &attention_mask, seq_len);

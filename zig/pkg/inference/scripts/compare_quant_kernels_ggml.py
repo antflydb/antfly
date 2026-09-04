@@ -56,7 +56,9 @@ import time
 from pathlib import Path
 
 
-def run_command(cmd: list[str], cwd: Path | None, env: dict[str, str]) -> dict[str, object]:
+def run_command(
+    cmd: list[str], cwd: Path | None, env: dict[str, str]
+) -> dict[str, object]:
     started = time.time()
     try:
         proc = subprocess.run(
@@ -180,7 +182,9 @@ def comparison_key_json(key: ComparisonKey) -> dict[str, int | str]:
     }
 
 
-def parse_termite_gliner_rows(output: str) -> dict[ComparisonKey, dict[str, float | str]]:
+def parse_termite_gliner_rows(
+    output: str,
+) -> dict[ComparisonKey, dict[str, float | str]]:
     rows: dict[ComparisonKey, dict[str, float | str]] = {}
     for line in output.splitlines():
         stripped = line.strip()
@@ -190,7 +194,11 @@ def parse_termite_gliner_rows(output: str) -> dict[ComparisonKey, dict[str, floa
         key, source, match = parsed
         direct_ns = int(match.group("direct_ns"))
         dequant_ns = int(match.group("dequant_ns"))
-        if key in rows and rows[key].get("termite_source") == "nativeGliner" and source == "nativeGlinerDirectDefault":
+        if (
+            key in rows
+            and rows[key].get("termite_source") == "nativeGliner"
+            and source == "nativeGlinerDirectDefault"
+        ):
             continue
         rows[key] = {
             "termite_source": source,
@@ -218,7 +226,9 @@ def merge_phase_rows(
             target_phases[phase_source] = phase
 
 
-def parse_termite_line_key(line: str) -> tuple[ComparisonKey, str, re.Match[str]] | None:
+def parse_termite_line_key(
+    line: str,
+) -> tuple[ComparisonKey, str, re.Match[str]] | None:
     match = TERMITE_GLINER_RE.match(line)
     projections = 1
     source = "nativeGliner"
@@ -264,7 +274,9 @@ def parse_termite_label_key(line: str) -> tuple[ComparisonKey, str] | None:
     return key, source
 
 
-def parse_termite_linear_phase_rows(output: str) -> dict[ComparisonKey, dict[str, dict[str, float]]]:
+def parse_termite_linear_phase_rows(
+    output: str,
+) -> dict[ComparisonKey, dict[str, dict[str, float]]]:
     rows: dict[ComparisonKey, dict[str, dict[str, float]]] = {}
     for line in output.splitlines():
         match = TERMITE_LINEAR_PHASE_RE.match(line.strip())
@@ -278,21 +290,36 @@ def parse_termite_linear_phase_rows(output: str) -> dict[ComparisonKey, dict[str
             "termite_phase_measured_ms": int(match.group("measured_ns")) / 1.0e6,
             "termite_phase_q8k_alloc_ms": int(match.group("q8k_alloc_ns")) / 1.0e6,
             "termite_phase_q8k_quant_ms": int(match.group("q8k_quant_ns")) / 1.0e6,
-            "termite_phase_q8_0_alloc_ms": int(match.group("q8_0_alloc_ns") or 0) / 1.0e6,
-            "termite_phase_q8_0_quant_ms": int(match.group("q8_0_quant_ns") or 0) / 1.0e6,
-            "termite_phase_q8_0_compute_ms": int(match.group("q8_0_compute_ns") or 0) / 1.0e6,
-            "termite_phase_legacy_alloc_ms": int(match.group("legacy_alloc_ns") or 0) / 1.0e6,
-            "termite_phase_legacy_quant_ms": int(match.group("legacy_quant_ns") or 0) / 1.0e6,
-            "termite_phase_legacy_compute_ms": int(match.group("legacy_compute_ns") or 0) / 1.0e6,
-            "termite_phase_q4q5_compute_ms": int(match.group("q4q5_compute_ns")) / 1.0e6,
-            "termite_phase_dequant_fetch_ms": int(match.group("dequant_fetch_ns")) / 1.0e6,
-            "termite_phase_dequant_sgemm_compute_ms": int(match.group("dequant_sgemm_compute_ns")) / 1.0e6,
+            "termite_phase_q8_0_alloc_ms": int(match.group("q8_0_alloc_ns") or 0)
+            / 1.0e6,
+            "termite_phase_q8_0_quant_ms": int(match.group("q8_0_quant_ns") or 0)
+            / 1.0e6,
+            "termite_phase_q8_0_compute_ms": int(match.group("q8_0_compute_ns") or 0)
+            / 1.0e6,
+            "termite_phase_legacy_alloc_ms": int(match.group("legacy_alloc_ns") or 0)
+            / 1.0e6,
+            "termite_phase_legacy_quant_ms": int(match.group("legacy_quant_ns") or 0)
+            / 1.0e6,
+            "termite_phase_legacy_compute_ms": int(
+                match.group("legacy_compute_ns") or 0
+            )
+            / 1.0e6,
+            "termite_phase_q4q5_compute_ms": int(match.group("q4q5_compute_ns"))
+            / 1.0e6,
+            "termite_phase_dequant_fetch_ms": int(match.group("dequant_fetch_ns"))
+            / 1.0e6,
+            "termite_phase_dequant_sgemm_compute_ms": int(
+                match.group("dequant_sgemm_compute_ns")
+            )
+            / 1.0e6,
         }
         rows.setdefault(key, {})[source] = phase
     return rows
 
 
-def parse_termite_triple_phase_rows(output: str) -> dict[ComparisonKey, dict[str, dict[str, float]]]:
+def parse_termite_triple_phase_rows(
+    output: str,
+) -> dict[ComparisonKey, dict[str, dict[str, float]]]:
     rows: dict[ComparisonKey, dict[str, dict[str, float]]] = {}
     for line in output.splitlines():
         match = TERMITE_TRIPLE_PHASE_RE.match(line.strip())
@@ -306,11 +333,22 @@ def parse_termite_triple_phase_rows(output: str) -> dict[ComparisonKey, dict[str
             "termite_phase_measured_ms": int(match.group("measured_ns")) / 1.0e6,
             "termite_phase_q8k_alloc_ms": int(match.group("q8k_alloc_ns")) / 1.0e6,
             "termite_phase_q8k_quant_ms": int(match.group("q8k_quant_ns")) / 1.0e6,
-            "termite_phase_q4q5_compute_ms": int(match.group("q4q5_compute_ns")) / 1.0e6,
-            "termite_phase_q4q5_pair_compute_ms": int(match.group("q4q5_pair_compute_ns")) / 1.0e6,
-            "termite_phase_q4q5_triple_compute_ms": int(match.group("q4q5_triple_compute_ns")) / 1.0e6,
-            "termite_phase_dequant_fetch_ms": int(match.group("dequant_fetch_ns")) / 1.0e6,
-            "termite_phase_dequant_sgemm_compute_ms": int(match.group("dequant_sgemm_compute_ns")) / 1.0e6,
+            "termite_phase_q4q5_compute_ms": int(match.group("q4q5_compute_ns"))
+            / 1.0e6,
+            "termite_phase_q4q5_pair_compute_ms": int(
+                match.group("q4q5_pair_compute_ns")
+            )
+            / 1.0e6,
+            "termite_phase_q4q5_triple_compute_ms": int(
+                match.group("q4q5_triple_compute_ns")
+            )
+            / 1.0e6,
+            "termite_phase_dequant_fetch_ms": int(match.group("dequant_fetch_ns"))
+            / 1.0e6,
+            "termite_phase_dequant_sgemm_compute_ms": int(
+                match.group("dequant_sgemm_compute_ns")
+            )
+            / 1.0e6,
             "termite_phase_packed_mr8": int(match.group("packed_mr8")),
             "termite_phase_packed_mr4": int(match.group("packed_mr4")),
             "termite_phase_packed_mr2": int(match.group("packed_mr2")),
@@ -366,7 +404,9 @@ def add_phase_fractions(row: dict[str, object]) -> None:
             row[fraction_key] = value / measured
 
 
-def worst_ratio_row(comparisons: list[dict[str, object]], ratio_key: str) -> dict[str, object] | None:
+def worst_ratio_row(
+    comparisons: list[dict[str, object]], ratio_key: str
+) -> dict[str, object] | None:
     worst: dict[str, object] | None = None
     worst_ratio = -1.0
     for comparison in comparisons:
@@ -379,7 +419,9 @@ def worst_ratio_row(comparisons: list[dict[str, object]], ratio_key: str) -> dic
     return worst
 
 
-def write_comparison_summary(out_dir: Path, manifest: dict[str, object], args: argparse.Namespace | None = None) -> list[dict[str, object]]:
+def write_comparison_summary(
+    out_dir: Path, manifest: dict[str, object], args: argparse.Namespace | None = None
+) -> list[dict[str, object]]:
     ggml_path = out_dir / "ggml_gliner_kernels.json"
     if not ggml_path.exists():
         manifest["comparison_rows"] = 0
@@ -387,15 +429,26 @@ def write_comparison_summary(out_dir: Path, manifest: dict[str, object], args: a
 
     ggml_result = json.loads(ggml_path.read_text(encoding="utf-8"))
     termite_rows: dict[ComparisonKey, dict[str, float | str]] = {}
-    for termite_path in (out_dir / "termite_gliner_quant_kernels.json", out_dir / "termite_clipclap_kernels.json"):
+    for termite_path in (
+        out_dir / "termite_gliner_quant_kernels.json",
+        out_dir / "termite_clipclap_kernels.json",
+    ):
         if not termite_path.exists():
             continue
         termite_result = json.loads(termite_path.read_text(encoding="utf-8"))
-        termite_rows.update(parse_termite_gliner_rows(str(termite_result.get("output", ""))))
+        termite_rows.update(
+            parse_termite_gliner_rows(str(termite_result.get("output", "")))
+        )
     ggml_rows = parse_ggml_gliner_rows(str(ggml_result.get("output", "")))
     matched_keys = termite_rows.keys() & ggml_rows.keys()
-    unmatched_termite = [comparison_key_json(key) for key in sorted(termite_rows.keys() - ggml_rows.keys())]
-    unmatched_ggml = [comparison_key_json(key) for key in sorted(ggml_rows.keys() - termite_rows.keys())]
+    unmatched_termite = [
+        comparison_key_json(key)
+        for key in sorted(termite_rows.keys() - ggml_rows.keys())
+    ]
+    unmatched_ggml = [
+        comparison_key_json(key)
+        for key in sorted(ggml_rows.keys() - termite_rows.keys())
+    ]
 
     comparisons = []
     for key in sorted(matched_keys):
@@ -413,8 +466,12 @@ def write_comparison_summary(out_dir: Path, manifest: dict[str, object], args: a
             "projections": projections,
             **termite,
             **ggml,
-            "termite_direct_vs_ggml_avg": termite_direct_ms / ggml_avg_ms if ggml_avg_ms else None,
-            "termite_direct_vs_dequant_sgemm": termite_direct_ms / termite_dequant_ms if termite_dequant_ms else None,
+            "termite_direct_vs_ggml_avg": termite_direct_ms / ggml_avg_ms
+            if ggml_avg_ms
+            else None,
+            "termite_direct_vs_dequant_sgemm": termite_direct_ms / termite_dequant_ms
+            if termite_dequant_ms
+            else None,
         }
         add_phase_fractions(comparison)
         comparisons.append(comparison)
@@ -444,15 +501,39 @@ def write_comparison_summary(out_dir: Path, manifest: dict[str, object], args: a
         manifest["worst_termite_sgemm_gap"] = None
         return []
     gate_failures = []
-    max_ggml_ratio = getattr(args, "max_termite_ggml_ratio", None) if args is not None else None
-    max_sgemm_ratio = getattr(args, "max_termite_sgemm_ratio", None) if args is not None else None
+    max_ggml_ratio = (
+        getattr(args, "max_termite_ggml_ratio", None) if args is not None else None
+    )
+    max_sgemm_ratio = (
+        getattr(args, "max_termite_sgemm_ratio", None) if args is not None else None
+    )
     for comparison in comparisons:
         ggml_ratio = comparison.get("termite_direct_vs_ggml_avg")
-        if max_ggml_ratio is not None and ggml_ratio is not None and float(ggml_ratio) > float(max_ggml_ratio):
-            gate_failures.append({ "gate": "max_termite_ggml_ratio", "limit": max_ggml_ratio, **comparison })
+        if (
+            max_ggml_ratio is not None
+            and ggml_ratio is not None
+            and float(ggml_ratio) > float(max_ggml_ratio)
+        ):
+            gate_failures.append(
+                {
+                    "gate": "max_termite_ggml_ratio",
+                    "limit": max_ggml_ratio,
+                    **comparison,
+                }
+            )
         sgemm_ratio = comparison.get("termite_direct_vs_dequant_sgemm")
-        if max_sgemm_ratio is not None and sgemm_ratio is not None and float(sgemm_ratio) > float(max_sgemm_ratio):
-            gate_failures.append({ "gate": "max_termite_sgemm_ratio", "limit": max_sgemm_ratio, **comparison })
+        if (
+            max_sgemm_ratio is not None
+            and sgemm_ratio is not None
+            and float(sgemm_ratio) > float(max_sgemm_ratio)
+        ):
+            gate_failures.append(
+                {
+                    "gate": "max_termite_sgemm_ratio",
+                    "limit": max_sgemm_ratio,
+                    **comparison,
+                }
+            )
 
     summary_path = out_dir / "comparison_summary.json"
     worst_ggml_gap = worst_ratio_row(comparisons, "termite_direct_vs_ggml_avg")
@@ -480,25 +561,54 @@ def write_comparison_summary(out_dir: Path, manifest: dict[str, object], args: a
     return gate_failures
 
 
-def fail_after_result(out_dir: Path, manifest: dict[str, object], label: str, result: dict[str, object]) -> int | None:
+def fail_after_result(
+    out_dir: Path, manifest: dict[str, object], label: str, result: dict[str, object]
+) -> int | None:
     exit_code = int(result["exit_code"])
     if exit_code == 0:
         return None
     write_comparison_summary(out_dir, manifest)
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(f"{label} failed with exit code {exit_code}; wrote artifacts to {out_dir}", file=sys.stderr)
+    (out_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+    print(
+        f"{label} failed with exit code {exit_code}; wrote artifacts to {out_dir}",
+        file=sys.stderr,
+    )
     return exit_code
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--termite-dir", default="pkg/inference", help="Path to the termite package directory.")
+    parser.add_argument(
+        "--termite-dir",
+        default="pkg/inference",
+        help="Path to the termite package directory.",
+    )
     parser.add_argument("--out", help="Output directory for captured JSON/log files.")
-    parser.add_argument("--skip-native", action="store_true", help="Skip termite native benchmarks.")
-    parser.add_argument("--skip-ggml", action="store_true", help="Skip the external ggml command.")
-    parser.add_argument("--include-clipclap", action="store_true", default=True, help="Capture CLIP/CLAP termite benches.")
-    parser.add_argument("--no-clipclap", dest="include_clipclap", action="store_false", help="Do not capture CLIP/CLAP termite benches.")
-    parser.add_argument("--include-gliner", action="store_true", help="Capture termite's end-to-end GLiNER2 native bench.")
+    parser.add_argument(
+        "--skip-native", action="store_true", help="Skip termite native benchmarks."
+    )
+    parser.add_argument(
+        "--skip-ggml", action="store_true", help="Skip the external ggml command."
+    )
+    parser.add_argument(
+        "--include-clipclap",
+        action="store_true",
+        default=True,
+        help="Capture CLIP/CLAP termite benches.",
+    )
+    parser.add_argument(
+        "--no-clipclap",
+        dest="include_clipclap",
+        action="store_false",
+        help="Do not capture CLIP/CLAP termite benches.",
+    )
+    parser.add_argument(
+        "--include-gliner",
+        action="store_true",
+        help="Capture termite's end-to-end GLiNER2 native bench.",
+    )
     parser.add_argument(
         "--include-ggml-gliner-kernels",
         action="store_true",
@@ -637,7 +747,9 @@ def main() -> int:
     termite_dir = Path(args.termite_dir)
 
     env = os.environ.copy()
-    env.setdefault("ZIG_GLOBAL_CACHE_DIR", str((out_dir / "zig-global-cache").resolve()))
+    env.setdefault(
+        "ZIG_GLOBAL_CACHE_DIR", str((out_dir / "zig-global-cache").resolve())
+    )
     env.setdefault("ZIG_LOCAL_CACHE_DIR", str((out_dir / "zig-local-cache").resolve()))
     env.setdefault("GGML_PREFIX", str(Path(args.ggml_prefix).resolve()))
     if args.ggml_cpu_plugin:
@@ -656,7 +768,9 @@ def main() -> int:
     }
     native_args = shlex.split(args.native_args)
     native_kernel_is_gliner_quant = "--only-gliner-quant" in native_args
-    native_kernel_only = native_kernel_is_gliner_quant or "--only-packed-qkv" in native_args
+    native_kernel_only = (
+        native_kernel_is_gliner_quant or "--only-packed-qkv" in native_args
+    )
 
     if not args.skip_native and args.include_clipclap:
         native_kernel_cmd = [
@@ -671,10 +785,16 @@ def main() -> int:
             native_kernel_cmd.append("-Denable-native-quant-dispatch-stats=true")
         native_kernel_cmd.extend(["--", *native_args])
         result = run_command(native_kernel_cmd, termite_dir, env)
-        native_kernel_result = "termite_gliner_quant_kernels.json" if native_kernel_is_gliner_quant else "termite_clipclap_kernels.json"
+        native_kernel_result = (
+            "termite_gliner_quant_kernels.json"
+            if native_kernel_is_gliner_quant
+            else "termite_clipclap_kernels.json"
+        )
         write_result(out_dir / native_kernel_result, result)
         manifest["results"].append(native_kernel_result)
-        failed = fail_after_result(out_dir, manifest, "termite CLIP/CLAP kernel benchmark", result)
+        failed = fail_after_result(
+            out_dir, manifest, "termite CLIP/CLAP kernel benchmark", result
+        )
         if failed is not None:
             return failed
 
@@ -692,7 +812,9 @@ def main() -> int:
         result = run_command(native_model_cmd, termite_dir, env)
         write_result(out_dir / "termite_clipclap_native.json", result)
         manifest["results"].append("termite_clipclap_native.json")
-        failed = fail_after_result(out_dir, manifest, "termite CLIP/CLAP native benchmark", result)
+        failed = fail_after_result(
+            out_dir, manifest, "termite CLIP/CLAP native benchmark", result
+        )
         if failed is not None:
             return failed
 
@@ -710,7 +832,9 @@ def main() -> int:
         result = run_command(native_gliner_cmd, termite_dir, env)
         write_result(out_dir / "termite_gliner2_native.json", result)
         manifest["results"].append("termite_gliner2_native.json")
-        failed = fail_after_result(out_dir, manifest, "termite GLiNER2 native benchmark", result)
+        failed = fail_after_result(
+            out_dir, manifest, "termite GLiNER2 native benchmark", result
+        )
         if failed is not None:
             return failed
 
@@ -736,7 +860,9 @@ def main() -> int:
         result = run_command(compile_cmd, None, env)
         write_result(out_dir / "ggml_gliner_kernel_compile.json", result)
         manifest["results"].append("ggml_gliner_kernel_compile.json")
-        failed = fail_after_result(out_dir, manifest, "ggml GLiNER kernel benchmark compile", result)
+        failed = fail_after_result(
+            out_dir, manifest, "ggml GLiNER kernel benchmark compile", result
+        )
         if failed is not None:
             return failed
 
@@ -744,14 +870,19 @@ def main() -> int:
         result = run_command(run_cmd, None, env)
         write_result(out_dir / "ggml_gliner_kernels.json", result)
         manifest["results"].append("ggml_gliner_kernels.json")
-        failed = fail_after_result(out_dir, manifest, "ggml GLiNER kernel benchmark", result)
+        failed = fail_after_result(
+            out_dir, manifest, "ggml GLiNER kernel benchmark", result
+        )
         if failed is not None:
             return failed
         write_comparison_summary(out_dir, manifest, args)
 
     if not args.skip_ggml:
         if not args.ggml_command:
-            print("missing --ggml-command; use --skip-ggml to capture termite-only baselines", file=sys.stderr)
+            print(
+                "missing --ggml-command; use --skip-ggml to capture termite-only baselines",
+                file=sys.stderr,
+            )
             return 2
         result = run_command(args.ggml_command, None, env)
         write_result(out_dir / "ggml.json", result)
@@ -760,26 +891,43 @@ def main() -> int:
         if failed is not None:
             return failed
 
-    gates_requested = args.max_termite_ggml_ratio is not None or args.max_termite_sgemm_ratio is not None
+    gates_requested = (
+        args.max_termite_ggml_ratio is not None
+        or args.max_termite_sgemm_ratio is not None
+    )
     comparison_rows = int(manifest.get("comparison_rows", 0))
     if args.min_comparison_rows > 0 and comparison_rows < args.min_comparison_rows:
-        (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        (out_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
         print(
             f"expected at least {args.min_comparison_rows} comparison row(s), found {comparison_rows}; wrote artifacts to {out_dir}",
             file=sys.stderr,
         )
         return 3
     if gates_requested and comparison_rows == 0:
-        (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        print(f"comparison gates requested but no matched Termite/ggml rows were found; wrote artifacts to {out_dir}", file=sys.stderr)
+        (out_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+        print(
+            f"comparison gates requested but no matched Termite/ggml rows were found; wrote artifacts to {out_dir}",
+            file=sys.stderr,
+        )
         return 3
     gate_failures = manifest.get("comparison_gate_failures", 0)
     if isinstance(gate_failures, int) and gate_failures > 0:
-        (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        print(f"comparison gates failed for {gate_failures} row(s); wrote artifacts to {out_dir}", file=sys.stderr)
+        (out_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+        print(
+            f"comparison gates failed for {gate_failures} row(s); wrote artifacts to {out_dir}",
+            file=sys.stderr,
+        )
         return 3
 
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (out_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
     print(f"wrote comparison artifacts to {out_dir}")
     return 0
 

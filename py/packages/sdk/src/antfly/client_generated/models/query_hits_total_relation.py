@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class QueryHitsTotalRelation(str, Enum):
+class QueryHitsTotalRelation(StrEnum):
     EXACT = "exact"
     GTE = "gte"
 
