@@ -55,12 +55,35 @@ pub const Runtime = struct {
         query: []const u8,
         documents: []const []const u8,
     ) ![]f32 {
-        if (dependencies.execution_context) |context| try context.check();
+        var lease = try self.acquire(dependencies.execution_context);
+        defer lease.release();
+        return try self.rerankAdmitted(alloc, cfg, dependencies, query, documents);
+    }
+
+    /// Admits the complete reranking phase, including document rendering that
+    /// callers may need to perform before invoking the provider.
+    pub fn acquire(
+        self: *Runtime,
+        execution_context: ?inference_request_context.RequestContext,
+    ) !AdmissionLease {
+        if (execution_context) |context| try context.check();
         // Provider work is deliberately fail-fast rather than queued. The
         // parent query already owns admission and a deadline; another hidden
         // queue only consumes that budget and amplifies tail latency.
-        if (!self.admission.tryAcquire()) return error.RerankRateLimited;
-        defer self.admission.release();
+        return self.admission.tryAcquireLease() orelse error.RerankRateLimited;
+    }
+
+    /// Executes provider work for a caller that already owns an admission
+    /// lease. Keeping this separate prevents a second admission attempt after
+    /// the caller has rendered the candidate documents.
+    pub fn rerankAdmitted(
+        self: *Runtime,
+        alloc: std.mem.Allocator,
+        cfg: Config,
+        dependencies: Options,
+        query: []const u8,
+        documents: []const []const u8,
+    ) ![]f32 {
         if (dependencies.execution_context) |context| try context.check();
         var options = dependencies;
         options.runtime = self;
@@ -81,6 +104,8 @@ pub const Runtime = struct {
     }
 };
 
+pub const AdmissionLease = request_admission.RequestAdmission.Lease;
+
 /// Collapses provider and transport failures into the stable query-layer
 /// taxonomy shared by table, global, and retrieval-agent queries.
 pub fn normalizeOperationalError(err: anyerror) anyerror {
@@ -89,9 +114,12 @@ pub fn normalizeOperationalError(err: anyerror) anyerror {
         error.RerankTransientFailure,
         error.RerankUpstreamFailure,
         error.Timeout,
+        // httpx spells transport cancellation `Canceled`; collapse both
+        // spellings to the process-wide semantic cancellation before this
+        // error crosses into query dependency classification.
         error.Canceled,
         error.Cancelled,
-        => err,
+        => error.Cancelled,
         error.QueueFull => error.RerankRateLimited,
         error.RerankRequestFailed,
         error.EmptyResponse,
@@ -127,7 +155,8 @@ test "reranking runtime failures use stable query dependency classes" {
     try std.testing.expectEqual(error.RerankUpstreamFailure, normalizeOperationalError(error.InvalidRerankerResponse));
     try std.testing.expectEqual(error.RerankTransientFailure, normalizeOperationalError(error.ConnectionRefused));
     try std.testing.expectEqual(error.Timeout, normalizeOperationalError(error.ConnectionTimedOut));
-    try std.testing.expectEqual(error.Canceled, normalizeOperationalError(error.Canceled));
+    try std.testing.expectEqual(error.Cancelled, normalizeOperationalError(error.Canceled));
+    try std.testing.expectEqual(error.Cancelled, normalizeOperationalError(error.Cancelled));
     try std.testing.expectEqual(error.RerankRateLimited, normalizeOperationalError(error.QueueFull));
 }
 

@@ -179,7 +179,17 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
     return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
 }
 
-fn gunzipRequestBodyAlloc(ctx: ?*httpx.Context, alloc: std.mem.Allocator, encoded: []const u8, max_size: usize) ![]u8 {
+const DecodedRequestBody = struct {
+    body: []u8,
+    allocation: []u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.allocation);
+        self.* = undefined;
+    }
+};
+
+fn gunzipRequestBodyAlloc(ctx: ?*httpx.Context, alloc: std.mem.Allocator, encoded: []const u8, max_size: usize) !DecodedRequestBody {
     var encoded_reader: std.Io.Reader = .fixed(encoded);
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var decompressor = std.compress.flate.Decompress.init(&encoded_reader, .gzip, &window);
@@ -208,28 +218,17 @@ fn gunzipRequestBodyAlloc(ctx: ?*httpx.Context, alloc: std.mem.Allocator, encode
         }
         out.appendSliceAssumeCapacity(buf[0..count]);
     }
-    if (out.capacity == out.items.len) return out.toOwnedSliceAssert();
-
-    // toOwnedSlice may need an exact-size allocation while the growth buffer
-    // is still live. Reserve that transient peak, then retain only the final
-    // decoded length once the old capacity has been released.
-    const old_capacity = out.capacity;
-    if (ctx) |request_ctx| {
-        if (!request_ctx.tryReserveRequestBodyBuffer(out.items.len)) return error.BodyCapacityExceeded;
-    }
-    const owned = out.toOwnedSlice(alloc) catch |err| {
-        if (ctx) |request_ctx| request_ctx.releaseRequestBodyBuffer(out.items.len);
-        return err;
-    };
-    if (ctx) |request_ctx| request_ctx.releaseRequestBodyBuffer(old_capacity);
-    return owned;
+    const body = out.items;
+    const allocation = out.allocatedSlice();
+    out = .empty;
+    return .{ .body = body, .allocation = allocation };
 }
 
 test "gzip request bodies are decoded with an expanded-size limit" {
     const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0 };
-    const decoded = try gunzipRequestBodyAlloc(null, std.testing.allocator, &encoded, 2);
-    defer std.testing.allocator.free(decoded);
-    try std.testing.expectEqualStrings("{}", decoded);
+    var decoded = try gunzipRequestBodyAlloc(null, std.testing.allocator, &encoded, 2);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{}", decoded.body);
     try std.testing.expectError(error.RequestBodyTooLarge, gunzipRequestBodyAlloc(null, std.testing.allocator, &encoded, 1));
     try std.testing.expectError(error.InvalidCompressedBody, gunzipRequestBodyAlloc(null, std.testing.allocator, "not gzip", 1024));
 }
@@ -259,12 +258,31 @@ test "gzip request body reservation follows the owned decoded buffer lifetime" {
     var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
 
     const decoded = try gunzipRequestBodyAlloc(&ctx, std.testing.allocator, &encoded, 2);
-    request.body = decoded;
-    request.body_owned = true;
+    try request.replaceOwnedBodyAllocation(decoded.body, decoded.allocation);
     try std.testing.expectEqual(@as(usize, 2), budget.stats().in_use);
 
     ctx.deinit();
     request.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+}
+
+test "gzip request completes with combined encoded and decoded budget" {
+    const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0 };
+    var budget = httpx.SharedBodyBudget.init(encoded.len + 2);
+    try std.testing.expect(budget.tryReserve(encoded.len));
+
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/");
+    request.body_budget = &budget;
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+
+    const decoded = try gunzipRequestBodyAlloc(&ctx, std.testing.allocator, &encoded, 2);
+    try request.replaceOwnedBodyAllocation(decoded.body, decoded.allocation);
+    try std.testing.expectEqual(encoded.len + 2, budget.stats().in_use);
+
+    ctx.deinit();
+    request.deinit();
+    try std.testing.expectEqual(encoded.len, budget.stats().in_use);
+    budget.release(encoded.len);
     try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
 }
 
@@ -489,13 +507,8 @@ pub const AntflyApiHandler = struct {
             },
             else => return textResponse(ctx, 400, "invalid gzip request body"),
         };
-        if (ctx.request.body_owned) {
-            if (ctx.request.body) |owned| ctx.request.allocator.free(owned);
-        }
-        ctx.request.body = decoded;
-        ctx.request.body_owned = true;
+        try ctx.request.replaceOwnedBodyAllocation(decoded.body, decoded.allocation);
         _ = ctx.request.headers.remove("content-encoding");
-        try ctx.request.headers.setContentLength(decoded.len);
         return next.call(ctx);
     }
 

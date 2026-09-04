@@ -17269,26 +17269,8 @@ fn applyReranker(
     if (req.reranker_query_text.len == 0) return error.UnsupportedQueryRequest;
     try checkQueryDeadline(req);
 
-    const doc_template = if (cfg.template.len > 0)
-        try alloc.dupe(u8, cfg.template)
-    else
-        try std.fmt.allocPrint(alloc, "{{{{{s}}}}}", .{cfg.field});
-    defer alloc.free(doc_template);
-
     const output_limit = rerankerOutputLimit(req.limit, cfg.top_n);
     const rerank_count = rerankerCandidateCount(result.hits.len, cfg.candidate_count, req.offset, output_limit);
-
-    const documents = try alloc.alloc([]const u8, rerank_count);
-    defer alloc.free(documents);
-    var initialized_docs: usize = 0;
-    defer {
-        for (documents[0..initialized_docs]) |document| alloc.free(document);
-    }
-
-    for (result.hits[0..rerank_count], 0..) |hit, i| {
-        documents[i] = try renderRerankerDocument(alloc, doc_template, hit);
-        initialized_docs += 1;
-    }
 
     var fallback_io: ?std.Io.Threaded = null;
     defer if (fallback_io) |*io_impl| io_impl.deinit();
@@ -17306,10 +17288,34 @@ fn applyReranker(
         .deadline_ns = req.execution_deadline_ns,
         .cancellation = req.cancellation,
     };
-
+    var admission_lease: ?reranking_runtime.AdmissionLease = if (reranker_runtime) |runtime|
+        try runtime.acquire(inference_context)
+    else
+        null;
+    defer if (admission_lease) |*lease| lease.release();
     const rerank_start_ns = platform_time.monotonicNs();
+
+    const doc_template = if (cfg.template.len > 0)
+        try alloc.dupe(u8, cfg.template)
+    else
+        try std.fmt.allocPrint(alloc, "{{{{{s}}}}}", .{cfg.field});
+    defer alloc.free(doc_template);
+
+    const documents = try alloc.alloc([]const u8, rerank_count);
+    defer alloc.free(documents);
+    var initialized_docs: usize = 0;
+    defer {
+        for (documents[0..initialized_docs]) |document| alloc.free(document);
+    }
+
+    for (result.hits[0..rerank_count], 0..) |hit, i| {
+        if ((i & 31) == 0) try inference_context.check();
+        documents[i] = try renderRerankerDocument(alloc, doc_template, hit);
+        initialized_docs += 1;
+    }
+
     const scores = if (reranker_runtime) |runtime|
-        runtime.rerank(alloc, cfg, .{
+        runtime.rerankAdmitted(alloc, cfg, .{
             .antfly_provider = antfly_provider,
             .secret_store = secret_store,
             .execution_context = inference_context,
@@ -17394,6 +17400,42 @@ test "reranker candidate and output windows have distinct bounds" {
     try std.testing.expectEqual(@as(usize, 15), rerankerCandidateCount(100, null, 5, 10));
     try std.testing.expectEqual(@as(u32, 10), rerankerOutputLimit(25, 10));
     try std.testing.expectEqual(@as(u32, 25), rerankerOutputLimit(25, null));
+}
+
+test "reranker admission precedes candidate rendering" {
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var runtime = reranking_runtime.Runtime.init(std.testing.allocator, io_impl.io());
+    defer runtime.deinit();
+    runtime.admission = .init(1);
+    var held = runtime.admission.tryAcquireLease().?;
+    defer held.release();
+
+    var hits = [_]db_mod.types.SearchHit{.{
+        .id = @constCast("doc:1"),
+        .stored_data = @constCast("{\"body\":\"candidate\"}"),
+    }};
+    var result = db_mod.types.SearchResult{
+        .alloc = std.testing.allocator,
+        .hits = &hits,
+        .total_hits = 1,
+    };
+    var meta = query_api.QueryResponseMeta{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    try std.testing.expectError(error.RerankRateLimited, applyReranker(
+        failing.allocator(),
+        .{
+            .reranker = .{ .provider = .antfly, .model = "model", .field = "body" },
+            .reranker_query_text = "query",
+        },
+        &result,
+        &meta,
+        null,
+        null,
+        &runtime,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), runtime.admission.stats().in_flight);
 }
 
 fn renderRerankerDocument(

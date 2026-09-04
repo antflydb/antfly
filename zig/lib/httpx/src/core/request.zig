@@ -29,6 +29,10 @@ pub const Request = struct {
     headers: Headers,
     body: ?[]const u8 = null,
     body_owned: bool = false,
+    /// Full allocation backing an owned body when its capacity is larger than
+    /// the visible body length. This lets body-transform middleware retain a
+    /// geometrically-grown buffer without an exact-size copy.
+    body_allocation: ?[]u8 = null,
     /// Server-side application allocations that retain a transformed request
     /// body (for example, a decompressed payload) share the same process-wide
     /// budget as transport-owned request bytes. Client requests leave this
@@ -74,11 +78,7 @@ pub const Request = struct {
     /// Releases all allocated memory.
     pub fn deinit(self: *Self) void {
         self.headers.deinit();
-        if (self.body_owned) {
-            if (self.body) |b| {
-                self.allocator.free(b);
-            }
-        }
+        self.freeOwnedBody();
         if (self.body_budget) |budget| budget.release(self.body_budget_reserved);
         self.body_budget_reserved = 0;
         if (self.query_builder) |*builder| {
@@ -107,15 +107,38 @@ pub const Request = struct {
         self.body_budget_reserved -= amount;
     }
 
+    fn freeOwnedBody(self: *Self) void {
+        if (!self.body_owned) return;
+        if (self.body_allocation) |allocation| {
+            self.allocator.free(allocation);
+        } else if (self.body) |body| {
+            self.allocator.free(body);
+        }
+        self.body = null;
+        self.body_owned = false;
+        self.body_allocation = null;
+    }
+
+    /// Replaces the body with an already-owned allocation. `body` may expose
+    /// only the initialized prefix of `allocation`; both slices must start at
+    /// the same address. Ownership transfers even if updating Content-Length
+    /// fails, so normal request teardown remains sufficient on every path.
+    pub fn replaceOwnedBodyAllocation(self: *Self, body: []u8, allocation: []u8) !void {
+        std.debug.assert(body.len <= allocation.len);
+        std.debug.assert(body.ptr == allocation.ptr);
+        self.freeOwnedBody();
+        self.body = body;
+        self.body_owned = true;
+        self.body_allocation = allocation;
+        try self.headers.setContentLength(body.len);
+    }
+
     /// Sets the request body with ownership.
     pub fn setBody(self: *Self, body: []const u8) !void {
-        if (self.body_owned) {
-            if (self.body) |b| {
-                self.allocator.free(b);
-            }
-        }
+        self.freeOwnedBody();
         self.body = try self.allocator.dupe(u8, body);
         self.body_owned = true;
+        self.body_allocation = null;
         try self.headers.setContentLength(body.len);
     }
 
