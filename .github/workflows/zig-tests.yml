@@ -113,6 +113,8 @@ jobs:
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/zig-*.sh' \
+            scripts/ci/toolchain-policy.json \
+            .github/actions/load-toolchain-policy/action.yml \
             scripts/test-backup-s3-integration.sh \
             Makefile \
             .github/workflows/zig-tests.yml \
@@ -127,6 +129,8 @@ jobs:
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/zig-*.sh' \
+            scripts/ci/toolchain-policy.json \
+            .github/actions/load-toolchain-policy/action.yml \
             scripts/test-backup-s3-integration.sh \
             Makefile \
             .github/workflows/zig-tests.yml \
@@ -193,13 +197,17 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Run backup listing against MinIO
@@ -224,11 +232,14 @@ jobs:
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 20
     env:
-      ZIG_VERSION: "0.16.0"
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-arm64-codec
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-arm64-codec
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
 
       - name: Verify native Linux ARM64 runner
         run: |
@@ -238,6 +249,9 @@ jobs:
           test "$(uname -m)" = "aarch64"
 
       - name: Install Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_AARCH64_LINUX_SHA256: ${{ steps.toolchain.outputs.zig_aarch64_linux_sha256 }}
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -245,6 +259,7 @@ jobs:
           curl -fsSL \
             "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
             -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "$ZIG_AARCH64_LINUX_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check --strict
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" \
             -C "$RUNNER_TEMP/zig" \
@@ -252,6 +267,8 @@ jobs:
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
       - name: Verify Zig version
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
         run: test "$(zig version)" = "$ZIG_VERSION"
 
       - name: Run StreamVByte codec tests
@@ -279,6 +296,10 @@ jobs:
           fetch-depth: 0
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file
 
@@ -288,7 +309,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC Zig cache dirs
@@ -557,6 +578,10 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
@@ -566,7 +591,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC Zig cache dirs
@@ -755,13 +780,17 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC Zig cache dirs
@@ -813,13 +842,17 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC cache dirs
@@ -925,13 +958,17 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC cache dirs
@@ -982,6 +1019,10 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
@@ -1009,6 +1050,7 @@ jobs:
         if: matrix.suite == 'antfly'
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: ${{ steps.toolchain.outputs.rust_version }}
           targets: wasm32-wasip2
 
       - name: Build MemoryAF extension package

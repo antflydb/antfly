@@ -429,11 +429,13 @@ class CAbiPackagingTests(unittest.TestCase):
         sdk_npm_workflow = (
             REPO_ROOT / ".github" / "workflows" / "ts-npm-publish.yml"
         ).read_text()
-        self.assertIn("NPM_VERSION: 11.19.1", sdk_npm_workflow)
+        self.assertIn("steps.toolchain.outputs.npm_version", sdk_npm_workflow)
         self.assertIn('npm install -g "npm@$NPM_VERSION"', sdk_npm_workflow)
-        ts_ci_workflow = (REPO_ROOT / ".github" / "workflows" / "ts-ci.yml").read_text()
+        sdks_ci_workflow = (
+            REPO_ROOT / ".github" / "workflows" / "sdks-ci.yml"
+        ).read_text()
         for workflow, expected_jobs in (
-            (ts_ci_workflow, 2),
+            (sdks_ci_workflow, 2),
             (sdk_npm_workflow, 1),
         ):
             lines = workflow.splitlines()
@@ -479,15 +481,13 @@ class CAbiPackagingTests(unittest.TestCase):
     def test_release_scripting_target_discovers_the_complete_suite(self) -> None:
         makefile = (REPO_ROOT / "Makefile").read_text()
         test_script = (REPO_ROOT / "scripts" / "release" / "test.sh").read_text()
-        workflow = (
-            REPO_ROOT / ".github" / "workflows" / "repository-validation.yml"
-        ).read_text()
+        workflow = (REPO_ROOT / ".github" / "workflows" / "sdks-ci.yml").read_text()
         check_script = (REPO_ROOT / "scripts" / "ci" / "check.sh").read_text()
 
         self.assertIn("run: scripts/ci/check.sh release", workflow)
         self.assertNotIn("run: make ", workflow)
         self.assertIn("uses: mlugg/setup-zig@", workflow)
-        self.assertIn("steps.policy.outputs.zig_version", workflow)
+        self.assertIn("steps.toolchain.outputs.zig_version", workflow)
         self.assertIn("xz-utils", workflow)
         self.assertIn('"$repo_root/scripts/release/test.sh"', check_script)
         self.assertIn("release-scripting-test:", makefile)

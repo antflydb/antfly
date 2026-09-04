@@ -1,4 +1,4 @@
-name: Repository Validation
+name: SDK CI
 
 on:
   push:
@@ -20,10 +20,12 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  validation:
-    name: repository-validation
+  sdks:
+    name: sdks-ci
     runs-on: arc-antfly-standard
-    timeout-minutes: 45
+    timeout-minutes: 60
+    outputs:
+      antfarm_e2e: ${{ steps.scopes.outputs.antfarm_e2e }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,16 +46,8 @@ jobs:
           fi
 
       - name: Load pinned toolchain policy
-        id: policy
-        run: |
-          policy=scripts/ci/check_sdk_policy.py
-          {
-            echo "python_build=$(python3 "$policy" --get python-build)"
-            echo "python_supported=$(python3 "$policy" --get python-supported)"
-            echo "go_version=$(python3 "$policy" --get go)"
-            echo "zig_version=$(python3 "$policy" --get zig)"
-            echo "rust_version=$(python3 "$policy" --get rust)"
-          } >> "$GITHUB_OUTPUT"
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
 
       - name: Test validation scope classification
         run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
@@ -62,20 +56,24 @@ jobs:
         if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.format_python == 'true' || steps.scopes.outputs.release == 'true'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ steps.policy.outputs.python_build }}
+          python-version: ${{ steps.toolchain.outputs.python_build }}
+
+      - name: Validate repository toolchain policy
+        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.format_python == 'true' || steps.scopes.outputs.release == 'true'
+        run: python scripts/ci/check_toolchain_policy.py
 
       - name: Install uv
         if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.format_python == 'true'
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
       - name: Set up Node.js
-        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.format_typescript == 'true'
+        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.typescript == 'true' || steps.scopes.outputs.format_typescript == 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: ts/package.json
 
       - name: Install pnpm
-        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.format_typescript == 'true'
+        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.typescript == 'true' || steps.scopes.outputs.format_typescript == 'true'
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           package_json_file: ts/package.json
@@ -84,7 +82,7 @@ jobs:
         if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memoryaf == 'true' || steps.scopes.outputs.format_go == 'true'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: ${{ steps.policy.outputs.go_version }}
+          go-version: ${{ steps.toolchain.outputs.go_version }}
           cache: true
           cache-dependency-path: |
             go/pkg/sdk/go.sum
@@ -94,7 +92,7 @@ jobs:
         if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.format_rust == 'true'
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
-          toolchain: ${{ steps.policy.outputs.rust_version }}
+          toolchain: ${{ steps.toolchain.outputs.rust_version }}
           components: rustfmt
 
       # setup-zig extracts an .xz archive, so xz-utils must exist before that
@@ -120,20 +118,20 @@ jobs:
         if: steps.scopes.outputs.format_zig == 'true' || steps.scopes.outputs.release == 'true'
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: ${{ steps.policy.outputs.zig_version }}
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Install Python tooling
         if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.format_python == 'true'
         run: |
-          uv python install ${{ steps.policy.outputs.python_supported }}
+          uv python install ${{ steps.toolchain.outputs.python_supported }}
           uv sync \
             --project py/packages/sdk \
-            --python "${{ steps.policy.outputs.python_build }}" \
+            --python "${{ steps.toolchain.outputs.python_build }}" \
             --locked
 
       - name: Install TypeScript tooling
-        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.format_typescript == 'true'
+        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.typescript == 'true' || steps.scopes.outputs.format_typescript == 'true'
         working-directory: ts
         run: pnpm install --frozen-lockfile
 
@@ -161,10 +159,113 @@ jobs:
         if: steps.scopes.outputs.sdk == 'true'
         run: scripts/ci/check.sh sdk
 
+      - name: Check TypeScript SDK consumers
+        if: steps.scopes.outputs.typescript == 'true' && steps.scopes.outputs.sdk != 'true'
+        run: scripts/ci/check.sh typescript
+
       - name: Check memoryaf
-        if: steps.scopes.outputs.memoryaf == 'true'
+        if: steps.scopes.outputs.memoryaf == 'true' && steps.scopes.outputs.sdk != 'true'
         run: scripts/ci/check.sh memoryaf
 
       - name: Check release packaging and scripts
         if: steps.scopes.outputs.release == 'true'
         run: scripts/ci/check.sh release
+
+      - name: Upload canonical Antfarm bundle
+        if: steps.scopes.outputs.antfarm_e2e == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: antfarm-linux-node-${{ github.sha }}
+          path: ts/apps/antfarm/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  playwright:
+    name: Antfarm Playwright
+    needs: sdks
+    if: needs.sdks.outputs.antfarm_e2e == 'true'
+    timeout-minutes: 60
+    runs-on: arc-antfly-heavy
+    env:
+      PNPM_STORE_PATH: /mnt/cache/pnpm-store
+    defaults:
+      run:
+        working-directory: ts
+    steps:
+      - name: Configure cache directories
+        run: |
+          playwright_browsers_path="${RUNNER_TEMP}/playwright-browsers"
+          xdg_cache_home="${RUNNER_TEMP}/xdg"
+          tmpdir="${RUNNER_TEMP}/tmp"
+
+          {
+            echo "PLAYWRIGHT_BROWSERS_PATH=${playwright_browsers_path}"
+            echo "XDG_CACHE_HOME=${xdg_cache_home}"
+            echo "TMPDIR=${tmpdir}"
+          } >> "$GITHUB_ENV"
+
+          mkdir -p "$PNPM_STORE_PATH" "$playwright_browsers_path" "$xdg_cache_home" "$tmpdir"
+        working-directory: .
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: ts/package.json
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          package_json_file: ts/package.json
+
+      - name: Configure pnpm cache
+        run: pnpm config set store-dir "$PNPM_STORE_PATH"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download canonical Antfarm bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: antfarm-linux-node-${{ github.sha }}
+          path: ts/apps/antfarm/dist
+
+      - name: Install Playwright OS Dependencies
+        working-directory: ts/apps/antfarm
+        timeout-minutes: 20
+        run: |
+          set -euxo pipefail
+          time pnpm exec playwright install-deps chromium
+
+      # ARC hangs extracting Playwright-managed browser archives, so use apt-installed Chrome.
+      - name: Install Google Chrome
+        working-directory: .
+        timeout-minutes: 10
+        run: |
+          set -euxo pipefail
+          chrome_deb="${RUNNER_TEMP}/google-chrome-stable_current_amd64.deb"
+          curl -fsSL -o "$chrome_deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y "$chrome_deb"
+          google-chrome --version
+
+      - name: Preview server
+        working-directory: ts/apps/antfarm
+        run: pnpm preview &
+
+      - name: Wait for Server
+        working-directory: ts/apps/antfarm
+        run: pnpm exec wait-on http://localhost:4173
+
+      - name: Run Playwright tests
+        working-directory: ts/apps/antfarm
+        run: pnpm exec playwright test --project=chromium --reporter=list
+        env:
+          ANTFARM_PLAYWRIGHT_USE_SYSTEM_CHROME: "1"
+          BASE_URL: http://localhost:4173
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report
+          path: ts/apps/antfarm/playwright-report/
+          retention-days: 30

@@ -16,7 +16,7 @@
 set -euo pipefail
 
 repo_root=$(CDPATH='' cd "$(dirname "$0")/../.." && pwd -P)
-policy="$repo_root/scripts/ci/check_sdk_policy.py"
+policy="$repo_root/scripts/ci/check_toolchain_policy.py"
 policy_python=${ANTFLY_POLICY_PYTHON:-python3}
 
 section() {
@@ -34,6 +34,30 @@ check_generated_status() {
   fi
 }
 
+check_typescript() {
+  section "Checking the TypeScript SDK and its consumers"
+  (
+    cd "$repo_root/ts"
+    node scripts/run-pinned-toolchain.mjs pnpm --filter @antfly/sdk generate
+    check_generated_status \
+      packages/sdk/src/public-api.d.ts \
+      packages/sdk/src/query.d.ts
+    node scripts/run-pinned-toolchain.mjs pnpm exec turbo run lint typecheck build test
+    diff -qr apps/antfarm/dist ../zig/pkg/antfly/antfarm
+  )
+}
+
+check_memoryaf() {
+  section "Checking memoryaf"
+  (
+    cd "$repo_root/go/pkg/memoryaf"
+    GOWORK=off go mod tidy
+    git diff --exit-code -- go.mod go.sum
+    GOWORK=off go vet ./...
+    CGO_ENABLED=0 GOWORK=off go test -count=1 ./...
+  )
+}
+
 check_sdk() {
   if [[ -z ${ANTFLY_POLICY_PYTHON:-} ]]; then
     local build_python
@@ -41,7 +65,7 @@ check_sdk() {
     policy_python=$(uv python find "$build_python")
   fi
 
-  section "Checking the SDK support policy"
+  section "Checking the repository toolchain policy"
   "$policy_python" "$policy"
 
   section "Checking the joined public OpenAPI contract"
@@ -76,18 +100,7 @@ check_sdk() {
   section "Building the Python SDK distributions"
   (cd "$repo_root/py/packages/sdk" && uv build)
 
-  section "Checking the TypeScript SDK"
-  (
-    cd "$repo_root/ts"
-    node scripts/run-pinned-toolchain.mjs pnpm --filter @antfly/sdk generate
-    check_generated_status \
-      packages/sdk/src/public-api.d.ts \
-      packages/sdk/src/query.d.ts
-    node scripts/run-pinned-toolchain.mjs pnpm --filter @antfly/sdk exec biome check .
-    node scripts/run-pinned-toolchain.mjs pnpm --filter @antfly/sdk typecheck
-    node scripts/run-pinned-toolchain.mjs pnpm --filter @antfly/sdk build
-    node scripts/run-pinned-toolchain.mjs pnpm --filter @antfly/sdk test
-  )
+  check_typescript
 
   section "Checking the Go SDK"
   (
@@ -106,20 +119,13 @@ check_sdk() {
     CGO_ENABLED=1 GOWORK=off go test -race -count=1 ./...
   )
 
+  # memoryaf is an in-repository SDK consumer and must remain source-compatible
+  # with every Go SDK change.
+  check_memoryaf
+
   section "Checking the Rust SDK"
   cargo fmt --manifest-path "$repo_root/rs/Cargo.toml" --all --check
   cargo test --locked --manifest-path "$repo_root/rs/Cargo.toml" --package antfly-sdk
-}
-
-check_memoryaf() {
-  section "Checking memoryaf"
-  (
-    cd "$repo_root/go/pkg/memoryaf"
-    GOWORK=off go mod tidy
-    git diff --exit-code -- go.mod go.sum
-    GOWORK=off go vet ./...
-    CGO_ENABLED=0 GOWORK=off go test -count=1 ./...
-  )
 }
 
 check_release() {
@@ -128,7 +134,7 @@ check_release() {
 }
 
 usage() {
-  echo "usage: $0 {format|sdk|memoryaf|release|all} [format language ...]" >&2
+  echo "usage: $0 {format|sdk|typescript|memoryaf|release|all} [format language ...]" >&2
   exit 2
 }
 
@@ -141,6 +147,9 @@ case "$command" in
   sdk)
     check_sdk
     ;;
+  typescript)
+    check_typescript
+    ;;
   memoryaf)
     check_memoryaf
     ;;
@@ -150,7 +159,6 @@ case "$command" in
   all)
     "$repo_root/scripts/format.sh" --check
     check_sdk
-    check_memoryaf
     check_release
     ;;
   *)

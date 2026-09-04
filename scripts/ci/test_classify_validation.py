@@ -36,22 +36,65 @@ class ClassifyValidationTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(classify([path])["sdk"])
 
+    def test_openapi_tool_environment_runs_the_sdk_suite(self) -> None:
+        for path in ("scripts/pyproject.toml", "scripts/uv.lock"):
+            with self.subTest(path=path):
+                scopes = classify([path])
+                self.assertTrue(scopes["sdk"])
+
+    def test_typescript_changes_check_consumers_and_antfarm(self) -> None:
+        for path in (
+            "ts/packages/sdk/src/client.ts",
+            "ts/packages/components/src/QueryBox.tsx",
+            "ts/apps/antfarm/src/api.ts",
+            "openapi.yaml",
+            "zig/pkg/antfly/antfarm/index.html",
+        ):
+            with self.subTest(path=path):
+                scopes = classify([path])
+                self.assertTrue(scopes["typescript"])
+                self.assertTrue(scopes["antfarm_e2e"])
+
+    def test_non_typescript_sdk_change_does_not_require_browser_e2e(self) -> None:
+        scopes = classify(["go/pkg/sdk/client.go"])
+        self.assertTrue(scopes["sdk"])
+        self.assertFalse(scopes["antfarm_e2e"])
+
     def test_formatter_infrastructure_checks_every_language(self) -> None:
         scopes = classify(["scripts/format.sh"])
         for language in ("zig", "go", "python", "typescript", "rust"):
             self.assertTrue(scopes[f"format_{language}"])
 
-    def test_workflow_changes_run_all_contracts(self) -> None:
-        scopes = classify([".github/workflows/repository-validation.yml"])
-        self.assertTrue(scopes["sdk"])
-        self.assertTrue(scopes["release"])
-        for language in ("zig", "go", "python", "typescript", "rust"):
-            self.assertTrue(scopes[f"format_{language}"])
+    def test_shared_validation_infrastructure_runs_every_contract(self) -> None:
+        for path in (
+            ".github/workflows/sdks-ci.yml",
+            ".github/actions/load-toolchain-policy/action.yml",
+            "scripts/ci/check.sh",
+            "scripts/ci/toolchain-policy.json",
+            "Makefile",
+        ):
+            with self.subTest(path=path):
+                scopes = classify([path])
+                for scope in (
+                    "sdk",
+                    "typescript",
+                    "memoryaf",
+                    "release",
+                    "antfarm_e2e",
+                ):
+                    self.assertTrue(scopes[scope])
+                for language in ("zig", "go", "python", "typescript", "rust"):
+                    self.assertTrue(scopes[f"format_{language}"])
 
     def test_release_change_runs_release_and_its_language_formatter(self) -> None:
         scopes = classify(["scripts/packaging/package_cli_release.py"])
         self.assertTrue(scopes["release"])
         self.assertTrue(scopes["format_python"])
+
+    def test_cli_change_runs_sdk_and_release_contracts(self) -> None:
+        scopes = classify(["py/packages/cli/src/antfly_cli/__main__.py"])
+        self.assertTrue(scopes["sdk"])
+        self.assertTrue(scopes["release"])
 
 
 if __name__ == "__main__":

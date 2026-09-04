@@ -13,14 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Classify a Git diff into the serial repository-validation scopes."""
+"""Classify a Git diff into the serial SDK CI scopes."""
 
 from __future__ import annotations
 
 import argparse
 import subprocess
 from pathlib import Path
-
 
 SCOPES = (
     "format_zig",
@@ -29,8 +28,10 @@ SCOPES = (
     "format_typescript",
     "format_rust",
     "sdk",
+    "typescript",
     "memoryaf",
     "release",
+    "antfarm_e2e",
 )
 
 SDK_PREFIXES = (
@@ -55,16 +56,16 @@ SDK_FILES = {
     "scripts/openapi_joiner.py",
     "scripts/public_openapi_overlays.py",
     "scripts/generate_graph_identifier_policy.py",
-    "scripts/ci/check.sh",
-    "scripts/ci/check_sdk_policy.py",
-    "scripts/ci/sdk-policy.json",
-    ".github/workflows/repository-validation.yml",
+    "scripts/ci/check_toolchain_policy.py",
+    "scripts/pyproject.toml",
+    "scripts/uv.lock",
     ".github/workflows/py-pypi-publish.yml",
 }
 RELEASE_PREFIXES = (
+    "py/packages/cli/",
     "scripts/packaging/",
     "scripts/release/",
-    "ts/packages/cli",
+    "ts/packages/cli/",
 )
 RELEASE_FILES = {
     "scripts/install.sh",
@@ -78,13 +79,9 @@ RELEASE_FILES = {
     "zig/cloudbuild.manifest.yaml",
     "zig/cloudbuild.runtime.yaml",
     ".github/dependabot.yml",
-    "scripts/ci/sdk-policy.json",
 }
 FORMAT_INFRASTRUCTURE = {
-    "Makefile",
     "scripts/format.sh",
-    "scripts/ci/sdk-policy.json",
-    ".github/workflows/repository-validation.yml",
     "py/packages/sdk/pyproject.toml",
     "py/packages/sdk/uv.lock",
     "ts/biome.json",
@@ -92,6 +89,17 @@ FORMAT_INFRASTRUCTURE = {
     "ts/pnpm-lock.yaml",
     "rs/Cargo.toml",
 }
+FULL_VALIDATION_FILES = {
+    "Makefile",
+    "scripts/ci/check.sh",
+    "scripts/ci/toolchain-policy.json",
+    ".github/workflows/sdks-ci.yml",
+}
+FULL_VALIDATION_PREFIXES = (".github/actions/",)
+
+
+def matches(path: str, files: set[str], prefixes: tuple[str, ...]) -> bool:
+    return path in files or path.startswith(prefixes)
 
 
 def changed_paths(base: str, head: str) -> list[str]:
@@ -109,6 +117,11 @@ def classify(paths: list[str], force_all: bool = False) -> dict[str, bool]:
         return scopes
 
     for path in paths:
+        if matches(path, FULL_VALIDATION_FILES, FULL_VALIDATION_PREFIXES):
+            for scope in SCOPES:
+                scopes[scope] = True
+            continue
+
         suffix = Path(path).suffix
         scopes["format_zig"] |= suffix == ".zig"
         scopes["format_go"] |= suffix == ".go"
@@ -120,13 +133,23 @@ def classify(paths: list[str], force_all: bool = False) -> dict[str, bool]:
             for language in ("zig", "go", "python", "typescript", "rust"):
                 scopes[f"format_{language}"] = True
 
-        scopes["sdk"] |= path in SDK_FILES or path.startswith(SDK_PREFIXES)
-        scopes["memoryaf"] |= path.startswith("go/pkg/memoryaf/")
-        scopes["release"] |= (
-            path in RELEASE_FILES
-            or path.startswith(RELEASE_PREFIXES)
-            or path.startswith(".github/workflows/")
+        sdk_input = matches(path, SDK_FILES, SDK_PREFIXES)
+        typescript_input = (
+            path.startswith("ts/")
+            or sdk_input
+            and (path == "openapi.yaml" or path.startswith("specs/openapi/"))
         )
+        antfarm_input = typescript_input or path.startswith("zig/pkg/antfly/antfarm/")
+
+        scopes["sdk"] |= sdk_input
+        # A checked-in embedded bundle change must rebuild its TypeScript
+        # producer before the byte-for-byte and browser checks can run.
+        scopes["typescript"] |= antfarm_input
+        scopes["memoryaf"] |= path.startswith("go/pkg/memoryaf/")
+        scopes["antfarm_e2e"] |= antfarm_input
+        scopes["release"] |= matches(
+            path, RELEASE_FILES, RELEASE_PREFIXES
+        ) or path.startswith(".github/workflows/")
 
     return scopes
 

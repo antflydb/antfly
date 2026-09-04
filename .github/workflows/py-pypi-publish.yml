@@ -24,16 +24,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Load the SDK support policy
-        id: sdk-policy
-        run: |
-          python_version=$(python3 scripts/ci/check_sdk_policy.py --get python-build)
-          echo "python_version=$python_version" >> "$GITHUB_OUTPUT"
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ steps.sdk-policy.outputs.python_version }}
+          python-version: ${{ steps.toolchain.outputs.python_build }}
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Build a binary wheel and a source tarball

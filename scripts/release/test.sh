@@ -6,7 +6,7 @@ cd "$REPO_ROOT"
 
 policy_python=${ANTFLY_POLICY_PYTHON:-python3}
 zig_required=$(
-  "$policy_python" scripts/ci/check_sdk_policy.py --get zig
+  "$policy_python" scripts/ci/check_toolchain_policy.py --get zig
 )
 zig_exe=${ANTFLY_ZIG:-zig}
 if ! command -v "$zig_exe" >/dev/null 2>&1; then

@@ -26,7 +26,7 @@
     "test:ui": "vitest --ui",
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsc -p tsconfig.typecheck.json",
-    "lint": "biome check . --write --unsafe",
+    "lint": "biome check .",
     "generate": "openapi-typescript ../../../openapi.yaml -o ./src/public-api.d.ts --default-non-nullable=false && openapi-typescript ../../../specs/openapi/antfly/query.yaml --client fetch -o ./src/query.d.ts --default-non-nullable=false",
     "clean": "rm -rf dist",
     "prepare": "pnpm run build",

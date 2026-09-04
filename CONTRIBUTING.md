@@ -37,8 +37,12 @@ docs/                Hand-written documentation (synced to docs site at build ti
 - **Rust** — required for the Rust SDK and extensions; CI pins the exact version
 - **Node.js and pnpm versions pinned in `ts/package.json`** — for reproducible TypeScript SDK and Antfarm artifacts; `make generate` uses Volta automatically when available
 
-Exact CI toolchains and supported Python minors are recorded in
-`scripts/ci/sdk-policy.json`.
+Versions for Python, Go, Zig, Rust, the macOS cross-compilation SDK, and the
+publishing npm client are recorded in `scripts/ci/toolchain-policy.json`;
+workflows consume them through the shared
+`.github/actions/load-toolchain-policy` action. The `SDK CI` workflow runs
+repository formatting, all SDKs and their in-repository consumers, Antfarm,
+and release-script validation from the same change classifier.
 
 ## Makefile Targets
 

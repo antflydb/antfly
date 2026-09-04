@@ -12,7 +12,7 @@
     "generate:commands": "node scripts/sync-command-index.mjs",
     "check:commands": "node scripts/sync-command-index.mjs --check",
     "update-deps": "npx npm-check-updates -u && npm install",
-    "lint": "biome check . --write --unsafe",
+    "lint": "biome check .",
     "preview": "vite preview",
     "storybook": "storybook dev -p 6006",
     "build-storybook": "storybook build",
