@@ -4324,6 +4324,81 @@ deep tree; a bulk-balanced/recursive initial topology or bounded rebuild fixes
 that structural problem, but mixing it into the directory qualification would
 change routing, candidate work, and recall at the same time.
 
+The final row-block 1M public qualification completed without capture,
+publication, restart, or query failures. All 1,000,000 rows were query-visible
+at source sequence 10001, recall was 0.9929, and restart preserved the same
+recall. The final directory occupies 27,516,934 bytes in 3,907 blocks:
+17,888,890 value bytes, 9,362,320 index bytes, and 265,676 root bytes. Compared
+with the final kind-separated V2, this removes 8,391,870 bytes (23.4 percent),
+halves the block count, and reduces the complete posting segment from
+1,837,047,621 to 1,828,383,201 bytes. Compared with the equivalent V1
+directory, it removes approximately 48.4 MB (63.7 percent).
+
+| Public 1M directory A/B | Kind-separated V2 | Row-block V2 | Change |
+| --- | ---: | ---: | ---: |
+| Insert | 630.01 s | 636.06 s | +1.0% |
+| Finalize | 86.45 s | 74.18 s | -14.2% |
+| Total ready | 716.46 s | 710.24 s | -0.9% |
+| Recall | 0.9927 | 0.9929 | +0.02 pp |
+| QPS, concurrency 1 / 10 / 20 / 30 | 58 / 568 / 596 / 585 | 71 / 636 / 642 / 534 | +20.8% / +11.9% / +7.7% / -8.7% |
+| p95 ms, concurrency 1 / 10 / 20 / 30 | 15.05 / 27.96 / 78.99 / 105.61 | 13.95 / 23.82 / 75.17 / 111.86 | -7.3% / -14.8% / -4.8% / +5.9% |
+| Attributable demand after live phase | 1.90 GB | 1.80 GB | -5.3% |
+| Cache-inclusive live peak RSS | 5.73 GB | 6.72 GB | +17.2% |
+| Restart peak RSS | 2.37 GB | 2.12 GB | -10.6% |
+
+The detailed profile kept quality/work essentially constant: 240,156
+approximate and 146.5 exact vectors per query versus 238,867 and 146.5. Mean
+server search time improved from 9.995 to 9.823 ms and leaf scoring from 6.372
+to 6.187 ms. At concurrency 20, the row run sustained 642 QPS at 31.07 ms mean
+latency, which accounts for essentially all 20 clients. Raising concurrency to
+30 increased mean latency to 55.73 ms while throughput fell to 534 QPS; all 30
+clients were still active. This is a memory-bandwidth/cache-contention knee,
+not request rejection, less search work, or a rerank shortcut. The row format
+changes directory publication and lookup rather than the 240K-vector scoring
+plane, so it cannot by itself explain or repair this serving limit. A
+query-only 1M repetition with normalized cache state and phase ordering is
+warranted, but the measured regression must remain visible.
+
+The row qualification is not an overall performance improvement over r126.
+Its 710.24-second readiness is 0.6 percent slower than r126's 706.25 seconds,
+with recall within 0.03 percentage points. It improves concurrency-1 and
+concurrency-10 QPS over r126's inferred 59.55/600.34 QPS, but its 642/534 QPS
+at concurrency 20/30 is approximately 5.4/20.8 percent below r126's
+679.27/673.72 QPS, and its concurrency-30 p95 is 20.4 percent above r126's
+92.88 ms. It is farther behind the best post-r126 qualification's 617.37-second
+readiness and 794/828 QPS at concurrency 20/30. The row directory passes the
+correctness, compactness, and restart-memory experiment gates; it does not yet
+pass the full replacement performance gate.
+
+Both 1M runs reached their cache-inclusive RSS maximum at the final full
+checkpoint, not while querying. The row run's lower attributable demand,
+smaller final segment, and lower restart RSS rule out a retained row-directory
+buffer. Its higher live maximum is reclaimable old-generation/source/output
+page residency during generation exchange. The immediate durable follow-up is
+to stream final publication through bounded extents, evict consumed source and
+fsynced staged-output pages, install the new generation without prefaulting its
+payload, and unmap or advise-away retired payloads as soon as their query lease
+count reaches zero. The resource governor must account resident bytes by
+generation and component, including staged output and file cache, rather than
+only allocator-owned demand. Longer term, the 1.83-GB monolithic posting
+segment should become a manifest over immutable independently checksummed
+chunks so consolidation rewrites only dirty chunks and atomically publishes a
+new manifest. That bounds copy-on-write and cache overlap while preserving
+generation leases, source-sequence coverage, and contiguous posting-local
+scans. Weakening generation leases or making the directory less compact would
+solve the wrong problem.
+
+The load crossed the primary LSM's 2-GiB hard-byte boundary once. One pressure
+compaction made progress, moved about 2.0 GB to lower levels, and admitted the
+remaining writes without overload or a write stall. Cumulative primary mutable
+snapshot copies were 1.16 GB and read-snapshot rotations were 3.85 GB. These
+remain independent primary document/embedding-store costs; V2 neither hides nor
+amplifies them. The run also observed one transient zero-count runtime-status
+placeholder while the managed writer was busy. The next sample reported the
+correct monotonically advancing counts, and query/durable state never regressed;
+status UX should distinguish `temporarily_unavailable` from a literal empty
+index in a separate change.
+
 ## Next checks
 
 1. Narrow broad persisted L0 source ranges with adaptive, workload-independent
