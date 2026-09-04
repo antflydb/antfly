@@ -44,7 +44,9 @@ class ServerBenchmarkTest(unittest.TestCase):
         self.assertEqual(2500000000, benchmark.parse_byte_size("2.5GB"))
 
     def test_index_command_reports_loader_and_server_resources(self):
-        elapsed, server, loader = benchmark.run_index_command("/usr/bin/true", None, None)
+        elapsed, server, loader = benchmark.run_index_command(
+            "/usr/bin/true", None, None
+        )
         self.assertGreater(elapsed, 0)
         self.assertEqual(
             {
@@ -102,11 +104,15 @@ class ServerBenchmarkTest(unittest.TestCase):
         summary = sampler.summary()
         self.assertEqual(
             40,
-            summary["metrics_at_peak_footprint"]['antfly_resource_used_bytes{slice="lsm.in_memory_state"}'],
+            summary["metrics_at_peak_footprint"][
+                'antfly_resource_used_bytes{slice="lsm.in_memory_state"}'
+            ],
         )
         self.assertEqual(
             30,
-            summary["metrics_at_peak_rss"]['antfly_resource_used_bytes{slice="lsm.in_memory_state"}'],
+            summary["metrics_at_peak_rss"][
+                'antfly_resource_used_bytes{slice="lsm.in_memory_state"}'
+            ],
         )
         self.assertEqual(150, summary["metrics_peak"]["antfly_process_footprint_bytes"])
         self.assertNotIn("unrelated_metric", summary["metrics_latest"])
@@ -121,10 +127,17 @@ class ServerBenchmarkTest(unittest.TestCase):
             (table / "runs" / "1.tbl").write_bytes(b"y" * 3)
             inventory = benchmark.directory_inventory(root)
         self.assertEqual(10, inventory["total_bytes"])
-        self.assertEqual({"files": 1, "bytes": 3}, inventory["storage_categories"]["primary_runs"])
-        self.assertEqual({"files": 1, "bytes": 7}, inventory["storage_categories"]["text_segments"])
         self.assertEqual(
-            {"path": "data/replicas/group-1/table-db/indexes/text/segments/1.seg", "bytes": 7},
+            {"files": 1, "bytes": 3}, inventory["storage_categories"]["primary_runs"]
+        )
+        self.assertEqual(
+            {"files": 1, "bytes": 7}, inventory["storage_categories"]["text_segments"]
+        )
+        self.assertEqual(
+            {
+                "path": "data/replicas/group-1/table-db/indexes/text/segments/1.seg",
+                "bytes": 7,
+            },
             inventory["largest_files"][0],
         )
 
@@ -140,7 +153,9 @@ class ServerBenchmarkTest(unittest.TestCase):
             sampler._sample()
             summary = sampler.summary()
         self.assertEqual(8, summary["peak_total_bytes"])
-        self.assertEqual({"files": 2, "bytes": 8}, summary["peak_storage_categories"]["primary_runs"])
+        self.assertEqual(
+            {"files": 2, "bytes": 8}, summary["peak_storage_categories"]["primary_runs"]
+        )
 
     def test_directory_inventory_reconciles_lsm_manifest_generations(self):
         with tempfile.TemporaryDirectory() as raw_root:
@@ -196,6 +211,7 @@ class ServerBenchmarkTest(unittest.TestCase):
         self.assertEqual({"files": 1, "bytes": 13, "missing": 0}, manifest["obsolete"])
         self.assertEqual({"files": 3, "bytes": 41, "missing": 0}, manifest["physical"])
         self.assertEqual({"files": 1, "bytes": 17, "missing": 0}, manifest["untracked"])
+
     def test_freshness_requires_marker_in_expectation(self):
         self.assertTrue(benchmark.template_has_marker({"expect_contains": "{marker}"}))
         self.assertFalse(benchmark.template_has_marker({"body": {"query": "constant"}}))
@@ -209,7 +225,7 @@ class ServerBenchmarkTest(unittest.TestCase):
             ),
         )
         self.assertEqual(0, benchmark.response_hit_count(b'{"hits":[]}'))
-        self.assertIsNone(benchmark.response_hit_count(b'not-json'))
+        self.assertIsNone(benchmark.response_hit_count(b"not-json"))
 
     def test_client_rejects_empty_search_results_when_required(self):
         class EmptyHandler(Handler):
@@ -267,7 +283,12 @@ class ServerBenchmarkTest(unittest.TestCase):
             thread.join()
         self.assertEqual(4, len(observations))
         self.assertTrue(all(observation.error is None for observation in observations))
-        self.assertTrue(all(observation.end_to_end_ns >= observation.service_ns for observation in observations))
+        self.assertTrue(
+            all(
+                observation.end_to_end_ns >= observation.service_ns
+                for observation in observations
+            )
+        )
         summary = benchmark.summarize(observations, 0.2, 20)
         self.assertEqual(0, summary["errors"])
         self.assertGreater(summary["latency_ns"]["p99"], 0)
@@ -289,7 +310,7 @@ class ServerBenchmarkTest(unittest.TestCase):
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", "0"))
                 received.append(self.rfile.read(length))
-                payload = b'{}'
+                payload = b"{}"
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
@@ -323,7 +344,9 @@ def lsm_manifest(active_paths, obsolete_paths, active_size_bytes):
         largest = b"z"
         raw.extend(struct.pack("<QIQ", index, 0, active_size_bytes))
         raw.extend(struct.pack("<QQQQQ", 0, 0, 0, 0, 0))
-        raw.extend(struct.pack("<IIIIII", len(encoded), 0, len(smallest), 0, len(largest), 1))
+        raw.extend(
+            struct.pack("<IIIIII", len(encoded), 0, len(smallest), 0, len(largest), 1)
+        )
         raw.extend(encoded + smallest + largest)
     for path in obsolete_paths:
         encoded = str(path).encode()

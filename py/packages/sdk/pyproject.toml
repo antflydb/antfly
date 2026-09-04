@@ -7,7 +7,7 @@ name = "antfly-sdk"
 version = "0.0.2-dev2"
 description = "Python SDK for Antfly distributed key-value store and search engine"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "Antfly, Inc.", email = "ajroetker@antfly.io"},
@@ -18,10 +18,10 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
     "httpx>=0.23.0,<0.29.0",
@@ -51,7 +51,7 @@ packages = ["src/antfly"]
 
 [tool.ruff]
 line-length = 120
-target-version =  "py313"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["F", "I", "UP"]
@@ -65,7 +65,7 @@ line-ending = "auto"
 [tool.pyright]
 include = ["src"]
 exclude = ["src/antfly/client_generated"]
-pythonVersion = "3.13"
+pythonVersion = "3.11"
 reportMissingImports = "warning"
 reportUndefinedVariable = "warning"
 reportGeneralTypeIssues = "warning"

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TransactionConflictParticipantPhase(str, Enum):
+class TransactionConflictParticipantPhase(StrEnum):
     BEGIN = "begin"
     PREPARE = "prepare"
     RESOLVE = "resolve"

@@ -23,7 +23,6 @@
 /// Variables are created lazily on first access and cached for reuse.
 /// The Context tracks whether the model is in training or inference mode
 /// so that ops like dropout can behave differently.
-
 const std = @import("std");
 const Shape = @import("graph/shape.zig").Shape;
 const DType = @import("graph/shape.zig").DType;

@@ -98,8 +98,7 @@ export function createPixelateSystem(
   const duration = config.duration ?? 0.9;
   const defaultOrigin = config.origin ?? "same";
   const rippleAmp = config.rippleAmp ?? 0.05;
-  const dpr =
-    typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, 2) : 1;
+  const dpr = typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, 2) : 1;
 
   const driver = { front: 0, invert: 0, time: 0, amp: 0 };
   let prog: QuadProgram | null = null;

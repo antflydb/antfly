@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphWorkBudgetExceededErrorDimension(str, Enum):
+class GraphWorkBudgetExceededErrorDimension(StrEnum):
     EXPLORED_EDGES = "explored_edges"
     EXPLORED_EDGE_BYTES = "explored_edge_bytes"
     EXPLORED_NODES = "explored_nodes"

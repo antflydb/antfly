@@ -418,9 +418,9 @@ pub fn computeLossAndGrads(
 /// via a deeper surrogate or switch to full autodiff.
 const candidate_lora_modules = [_][]const u8{
     // Qwen2 HF naming
-    "q_proj",     "k_proj",     "v_proj",   "o_proj",
+    "q_proj",     "k_proj",   "v_proj",     "o_proj",
     // Fused-chunker naming (in case the caller reused the reranker defaults)
-    "query_proj", "key_proj",   "value_proj", "out_proj",
+    "query_proj", "key_proj", "value_proj", "out_proj",
 };
 
 const lora_grad_helpers = @import("lora_grad_helpers.zig");

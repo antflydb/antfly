@@ -43,19 +43,41 @@ DEFAULT_BINARY = REPO_ROOT / "zig-out" / "bin" / "antfly"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", default=str(DEFAULT_BINARY), help="Path to the antfly binary")
-    parser.add_argument("--tables", type=int, default=25, help="Number of tables to create")
-    parser.add_argument("--indexes-per-table", type=int, default=1, help="Number of secondary indexes to create per table")
+    parser.add_argument(
+        "--binary", default=str(DEFAULT_BINARY), help="Path to the antfly binary"
+    )
+    parser.add_argument(
+        "--tables", type=int, default=25, help="Number of tables to create"
+    )
+    parser.add_argument(
+        "--indexes-per-table",
+        type=int,
+        default=1,
+        help="Number of secondary indexes to create per table",
+    )
     parser.add_argument(
         "--schema-updates-per-table",
         type=int,
         default=1,
         help="Number of schema updates to apply per table",
     )
-    parser.add_argument("--settle-seconds", type=float, default=3.0, help="Seconds to wait before and after the workload")
-    parser.add_argument("--host", default="127.0.0.1", help="Bind host for local servers")
-    parser.add_argument("--keep-tempdir", action="store_true", help="Keep the temporary data directory for inspection")
-    parser.add_argument("--json", action="store_true", help="Emit the final report as JSON")
+    parser.add_argument(
+        "--settle-seconds",
+        type=float,
+        default=3.0,
+        help="Seconds to wait before and after the workload",
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="Bind host for local servers"
+    )
+    parser.add_argument(
+        "--keep-tempdir",
+        action="store_true",
+        help="Keep the temporary data directory for inspection",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Emit the final report as JSON"
+    )
     return parser.parse_args()
 
 
@@ -78,7 +100,9 @@ def wait_for_http(url: str, timeout_s: float, path: str) -> None:
     raise RuntimeError(f"timed out waiting for {url}{path}: {last_error}")
 
 
-def request_json(method: str, url: str, payload: dict | None = None) -> dict | list | None:
+def request_json(
+    method: str, url: str, payload: dict | None = None
+) -> dict | list | None:
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method=method)
     if body is not None:
@@ -88,7 +112,9 @@ def request_json(method: str, url: str, payload: dict | None = None) -> dict | l
             data = resp.read()
     except urllib.error.HTTPError as exc:
         err_body = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(f"{method} {url} failed with {exc.code}: {err_body}") from exc
+        raise RuntimeError(
+            f"{method} {url} failed with {exc.code}: {err_body}"
+        ) from exc
     if not data:
         return None
     return json.loads(data)
@@ -119,7 +145,9 @@ class ManagedProc:
     def __init__(self, args: list[str], cwd: Path, log_path: Path):
         self.log_path = log_path
         self.log_file = log_path.open("w")
-        self.proc = subprocess.Popen(args, cwd=str(cwd), stdout=self.log_file, stderr=subprocess.STDOUT)
+        self.proc = subprocess.Popen(
+            args, cwd=str(cwd), stdout=self.log_file, stderr=subprocess.STDOUT
+        )
 
     def stop(self) -> None:
         if self.proc.poll() is None:
@@ -142,7 +170,9 @@ class ManagedProc:
         return data[-max_chars:]
 
 
-def metadata_command(binary: str, host: str, raft_port: int, admin_port: int, root: Path) -> list[str]:
+def metadata_command(
+    binary: str, host: str, raft_port: int, admin_port: int, root: Path
+) -> list[str]:
     return [
         binary,
         "metadata",
@@ -163,7 +193,9 @@ def metadata_command(binary: str, host: str, raft_port: int, admin_port: int, ro
     ]
 
 
-def data_command(binary: str, host: str, port: int, metadata_admin_url: str, root: Path) -> list[str]:
+def data_command(
+    binary: str, host: str, port: int, metadata_admin_url: str, root: Path
+) -> list[str]:
     return [
         binary,
         "data",
@@ -217,7 +249,12 @@ def build_schema(version: int) -> dict:
     }
 
 
-def run_workload(base_url: str, table_count: int, indexes_per_table: int, schema_updates_per_table: int) -> None:
+def run_workload(
+    base_url: str,
+    table_count: int,
+    indexes_per_table: int,
+    schema_updates_per_table: int,
+) -> None:
     for i in range(table_count):
         table_name = f"mem_bench_{i:04d}"
         request_json(
@@ -255,7 +292,9 @@ def main() -> int:
         print(f"binary not found: {binary}", file=sys.stderr)
         return 1
     if shutil.which("vmmap") is None:
-        print("vmmap not found; this tool currently supports macOS only", file=sys.stderr)
+        print(
+            "vmmap not found; this tool currently supports macOS only", file=sys.stderr
+        )
         return 1
 
     tmp = tempfile.TemporaryDirectory(prefix="antfly-metadata-memory-")
@@ -272,7 +311,9 @@ def main() -> int:
         data_url = f"http://{args.host}:{data_port}"
 
         metadata_proc = ManagedProc(
-            metadata_command(binary, args.host, metadata_port, metadata_admin_port, root),
+            metadata_command(
+                binary, args.host, metadata_port, metadata_admin_port, root
+            ),
             root,
             root / "metadata.log",
         )
@@ -291,7 +332,9 @@ def main() -> int:
         before_data = run_vmmap_summary(data_proc.pid())
 
         workload_started = time.monotonic()
-        run_workload(data_url, args.tables, args.indexes_per_table, args.schema_updates_per_table)
+        run_workload(
+            data_url, args.tables, args.indexes_per_table, args.schema_updates_per_table
+        )
         workload_seconds = time.monotonic() - workload_started
 
         time.sleep(args.settle_seconds)

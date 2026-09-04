@@ -133,7 +133,9 @@ def parse_roofline_operation(fields: dict[str, str], path: Path) -> dict[str, An
     try:
         layer = int(fields["layer"])
     except (KeyError, ValueError) as exc:
-        raise ProfileError(f"invalid layer in roofline operation in {path}: {exc}") from exc
+        raise ProfileError(
+            f"invalid layer in roofline operation in {path}: {exc}"
+        ) from exc
     layer_kind = parse_identifier(fields, "layer_kind", path)
     if layer == -1:
         if layer_kind != "model":
@@ -205,7 +207,9 @@ def parse_roofline_operation(fields: dict[str, str], path: Path) -> dict[str, An
             "reason": barrier_reason,
         },
         "metadata": {
-            key: value for key, value in sorted(fields.items()) if key not in known_fields
+            key: value
+            for key, value in sorted(fields.items())
+            if key not in known_fields
         },
     }
 
@@ -239,7 +243,9 @@ def parse_roofline_frame(fields: dict[str, str], path: Path) -> dict[str, Any]:
         "timing_method": fields.get("timing", "unspecified"),
         "logical_convention": fields.get("logical_convention", "unspecified"),
         "metadata": {
-            key: value for key, value in sorted(fields.items()) if key not in known_fields
+            key: value
+            for key, value in sorted(fields.items())
+            if key not in known_fields
         },
     }
     if "planned_barrier_count" in fields:
@@ -256,7 +262,9 @@ def parse_roofline_frame(fields: dict[str, str], path: Path) -> dict[str, Any]:
         and result["planned_barrier_count"] + result["nonplanned_barrier_count"]
         != result["barrier_count"]
     ):
-        raise ProfileError(f"roofline planner barrier counts do not reconcile in {path}")
+        raise ProfileError(
+            f"roofline planner barrier counts do not reconcile in {path}"
+        )
     return result
 
 
@@ -289,12 +297,12 @@ def summarize_roofline_records(
     barrier_before_total = 0
     barrier_after_total = 0
     timing_methods = sorted({str(frame["timing_method"]) for frame in frames})
-    logical_conventions = sorted(
-        {str(frame["logical_convention"]) for frame in frames}
-    )
+    logical_conventions = sorted({str(frame["logical_convention"]) for frame in frames})
     for frame_id, frame in sorted(frames_by_id.items()):
         frame_operations = operations_by_frame[frame_id]
-        operation_gpu_ns = sum(int(operation["gpu_ns"]) for operation in frame_operations)
+        operation_gpu_ns = sum(
+            int(operation["gpu_ns"]) for operation in frame_operations
+        )
         computed_barriers = sum(
             int(bool(operation["barrier"][side]))
             for operation in frame_operations
@@ -313,7 +321,9 @@ def summarize_roofline_records(
             )
         kv_positions = {int(operation["kv_position"]) for operation in frame_operations}
         if len(kv_positions) != 1:
-            raise ProfileError(f"roofline frame {frame_id} mixes KV positions in {path}")
+            raise ProfileError(
+                f"roofline frame {frame_id} mixes KV positions in {path}"
+            )
         barrier_total += computed_barriers
         for operation in frame_operations:
             barrier_before_total += int(operation["barrier"]["before"])
@@ -324,7 +334,9 @@ def summarize_roofline_records(
                 boundary_count = int(operation["barrier"]["before"]) + int(
                     operation["barrier"]["after"]
                 )
-                barrier_reasons[reason] = barrier_reasons.get(reason, 0) + boundary_count
+                barrier_reasons[reason] = (
+                    barrier_reasons.get(reason, 0) + boundary_count
+                )
                 barrier_scopes[scope] = barrier_scopes.get(scope, 0) + boundary_count
         reconciliation.append(
             {
@@ -347,7 +359,11 @@ def summarize_roofline_records(
         )
 
     layers = sorted(
-        {int(operation["layer"]) for operation in operations if int(operation["layer"]) >= 0}
+        {
+            int(operation["layer"])
+            for operation in operations
+            if int(operation["layer"]) >= 0
+        }
     )
     local_layers = [layer for layer in layers if layer not in A4B_GLOBAL_LAYERS]
     global_layers = [layer for layer in layers if layer in A4B_GLOBAL_LAYERS]
@@ -382,7 +398,9 @@ def summarize_roofline_records(
                 1 for operation in operations if int(operation["layer"]) == -1
             ),
             "operation_counts_by_layer_kind": {
-                kind: sum(1 for operation in operations if operation["layer_kind"] == kind)
+                kind: sum(
+                    1 for operation in operations if operation["layer_kind"] == kind
+                )
                 for kind in ("local", "global", "model")
             },
             "complete_30_layer_coverage": layers == list(range(A4B_LAYER_COUNT)),
@@ -399,8 +417,12 @@ def summarize_roofline_records(
             "frame_count": len(reconciliation),
             "frame_gpu_ns": sum(frame["frame_gpu_ns"] for frame in reconciliation),
             "frame_gpu_us": sum(frame["frame_gpu_us"] for frame in reconciliation),
-            "operation_gpu_ns": sum(frame["operation_gpu_ns"] for frame in reconciliation),
-            "operation_gpu_us": sum(frame["operation_gpu_us"] for frame in reconciliation),
+            "operation_gpu_ns": sum(
+                frame["operation_gpu_ns"] for frame in reconciliation
+            ),
+            "operation_gpu_us": sum(
+                frame["operation_gpu_us"] for frame in reconciliation
+            ),
             "unattributed_gpu_ns": sum(
                 frame["unattributed_gpu_ns"] for frame in reconciliation
             ),
@@ -585,9 +607,13 @@ def aggregate_roofline(samples: list[dict[str, Any]]) -> dict[str, Any]:
         for frame in roofline["frames"]:
             frames.append({**frame, "sample_label": label})
         for reason, count in roofline["barriers"]["reasons"].items():
-            aggregate_barrier_reasons[reason] = aggregate_barrier_reasons.get(reason, 0) + count
+            aggregate_barrier_reasons[reason] = (
+                aggregate_barrier_reasons.get(reason, 0) + count
+            )
         for scope, count in roofline["barriers"]["scopes"].items():
-            aggregate_barrier_scopes[scope] = aggregate_barrier_scopes.get(scope, 0) + count
+            aggregate_barrier_scopes[scope] = (
+                aggregate_barrier_scopes.get(scope, 0) + count
+            )
 
     operation_totals: list[dict[str, Any]] = []
     for key in sorted(totals):
@@ -618,10 +644,16 @@ def aggregate_roofline(samples: list[dict[str, Any]]) -> dict[str, Any]:
             "frame_count": len(frames),
             "kv_positions": sorted(kv_positions),
             "layers": sorted(layers),
-            "local_layers": sorted(layer for layer in layers if layer not in A4B_GLOBAL_LAYERS),
-            "global_layers": sorted(layer for layer in layers if layer in A4B_GLOBAL_LAYERS),
+            "local_layers": sorted(
+                layer for layer in layers if layer not in A4B_GLOBAL_LAYERS
+            ),
+            "global_layers": sorted(
+                layer for layer in layers if layer in A4B_GLOBAL_LAYERS
+            ),
             "operation_counts_by_layer_kind": {
-                kind: sum(1 for operation in operations if operation["layer_kind"] == kind)
+                kind: sum(
+                    1 for operation in operations if operation["layer_kind"] == kind
+                )
                 for kind in ("local", "global", "model")
             },
             "complete_30_layer_coverage": layers == set(range(A4B_LAYER_COUNT)),
@@ -774,7 +806,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--output-tokens", type=int, default=64)
     parser.add_argument("--budget-mb", type=int, default=16384)
-    parser.add_argument("--specialized", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--specialized", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument(
         "--prompt",
         default=(

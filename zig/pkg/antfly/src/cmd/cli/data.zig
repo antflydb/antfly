@@ -34,12 +34,14 @@ const MutationOptions = struct {
     table_name: ?[]const u8 = null,
     key: ?[]const u8 = null,
     value_json: ?[]const u8 = null,
+    sync_level: ?antfly_client.types.SyncLevel = null,
 };
 
 const MutationParseIssue = union(enum) {
     missing_value: []const u8,
     duplicate: []const u8,
     unknown: []const u8,
+    invalid_sync_level: []const u8,
 };
 
 const MutationParseResult = union(enum) {
@@ -60,6 +62,10 @@ fn parseMutationOptions(iterator: std.process.Args.Iterator, allow_document: boo
         } else if (allow_document and (std.mem.eql(u8, arg, "--document") or std.mem.eql(u8, arg, "--value"))) {
             if (options.value_json != null) return .{ .issue = .{ .duplicate = arg } };
             options.value_json = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+        } else if (std.mem.eql(u8, arg, "--sync-level")) {
+            if (options.sync_level != null) return .{ .issue = .{ .duplicate = arg } };
+            const raw = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+            options.sync_level = parseSyncLevel(raw) orelse return .{ .issue = .{ .invalid_sync_level = raw } };
         } else {
             return .{ .issue = .{ .unknown = arg } };
         }
@@ -72,6 +78,7 @@ fn fatalMutationParseIssue(issue: MutationParseIssue) noreturn {
         .missing_value => |flag| cli.fatal("{s} requires a value", .{flag}),
         .duplicate => |flag| cli.fatal("{s} may only be provided once", .{flag}),
         .unknown => |flag| cli.fatal("unknown mutation option: {s}", .{flag}),
+        .invalid_sync_level => |value| cli.fatal("invalid --sync-level value: {s}", .{value}),
     }
 }
 
@@ -93,7 +100,10 @@ pub fn insert(allocator: std.mem.Allocator, _: std.Io, client: *antfly_client.An
 
     var resp = try client.batch(tbl, .{
         .inserts = inserts,
-        .sync_level = .full_index,
+        // A point mutation is durable primary work by default. Generated
+        // indexes are supervised asynchronous projections; callers that need
+        // a stronger visibility barrier can request it explicitly.
+        .sync_level = options.sync_level orelse .write,
     });
     defer resp.deinit();
     std.debug.print("Insert successful.\n", .{});
@@ -110,7 +120,7 @@ pub fn delete(_: std.mem.Allocator, _: std.Io, client: *antfly_client.AntflyClie
     const deletes = [_][]const u8{k};
     var resp = try client.batch(tbl, .{
         .deletes = &deletes,
-        .sync_level = .full_index,
+        .sync_level = options.sync_level orelse .write,
     });
     defer resp.deinit();
     if (resp.data) |data| {
@@ -1045,11 +1055,16 @@ fn writeCheckpointAtomically(alloc: std.mem.Allocator, io: std.Io, path: []const
     };
 }
 
-test "mutation parser rejects unknown duplicate and missing options" {
+test "mutation parser defaults to write and accepts an explicit visibility barrier" {
     var valid_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a", "--document", "{}" };
     const valid = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = valid_argv[0..] }), true);
     try std.testing.expectEqualStrings("docs", valid.value.table_name.?);
     try std.testing.expectEqualStrings("{}", valid.value.value_json.?);
+    try std.testing.expectEqual(antfly_client.types.SyncLevel.write, valid.value.sync_level orelse .write);
+
+    var full_index_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a", "--document", "{}", "--sync-level", "full_index" };
+    const full_index = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = full_index_argv[0..] }), true);
+    try std.testing.expectEqual(antfly_client.types.SyncLevel.full_index, full_index.value.sync_level.?);
 
     var unknown_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a", "--typo", "value" };
     const unknown = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = unknown_argv[0..] }), false);
@@ -1066,6 +1081,10 @@ test "mutation parser rejects unknown duplicate and missing options" {
     var delete_document_argv = [_][*:0]const u8{ "--document", "{}" };
     const delete_document = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = delete_document_argv[0..] }), false);
     try std.testing.expectEqualStrings("--document", delete_document.issue.unknown);
+
+    var invalid_sync_argv = [_][*:0]const u8{ "--sync-level", "eventual" };
+    const invalid_sync = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = invalid_sync_argv[0..] }), false);
+    try std.testing.expectEqualStrings("eventual", invalid_sync.issue.invalid_sync_level);
 }
 
 test "load parser rejects missing duplicate conflicting and malformed options" {

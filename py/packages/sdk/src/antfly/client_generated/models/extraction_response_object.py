@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ExtractionResponseObject(str, Enum):
+class ExtractionResponseObject(StrEnum):
     EXTRACTION = "extraction"
 
     def __str__(self) -> str:

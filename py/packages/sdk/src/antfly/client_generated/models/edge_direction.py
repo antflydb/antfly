@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class EdgeDirection(str, Enum):
+class EdgeDirection(StrEnum):
     BOTH = "both"
     IN = "in"
     OUT = "out"

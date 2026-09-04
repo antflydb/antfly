@@ -82,6 +82,334 @@ const table_topology_protocol_probe_wait_ns: u64 = 25 * std.time.ns_per_ms;
 const table_topology_protocol_probe_failure_cache_ns: u64 = std.time.ns_per_s;
 const runtime_status_protocol_probe_min_backoff_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_max_backoff_ns: u64 = 60 * std.time.ns_per_s;
+// The data owner sends clean idle heartbeats every 30 seconds. Keep telemetry
+// through two missed intervals plus scheduling jitter; leadership changes use
+// a new service-local cache and therefore still become unavailable promptly.
+const embedding_activity_ttl_ns: u64 = db_mod.types.embedding_activity_retention_ms * std.time.ns_per_ms;
+const embedding_activity_protocol_version = metadata_table_manager.embedding_activity_protocol_version;
+
+const EmbeddingActivityCache = struct {
+    const shard_count = 16;
+    const max_entries_per_shard = 8 * 1024;
+    const max_owner_fences_per_shard = 8 * 1024;
+
+    const OwnerFence = struct {
+        reporter_incarnation: u64,
+        status_generation: u64,
+        activity_sequence: u64,
+    };
+
+    const ActivityKey = struct {
+        store_id: u64,
+        reporter_incarnation: u64,
+        group_id: u64,
+        coverage_generation: u64,
+        coverage_config_hash: u64,
+        index_name: []const u8,
+        index_kind: []const u8,
+    };
+
+    const ActivityKeyContext = struct {
+        pub fn hash(_: @This(), key: ActivityKey) u64 {
+            var hasher = std.hash.Wyhash.init(0x414e_5446_4c59_4143);
+            hasher.update(std.mem.asBytes(&key.store_id));
+            hasher.update(std.mem.asBytes(&key.reporter_incarnation));
+            hasher.update(std.mem.asBytes(&key.group_id));
+            hasher.update(std.mem.asBytes(&key.coverage_generation));
+            hasher.update(std.mem.asBytes(&key.coverage_config_hash));
+            hasher.update(key.index_name);
+            hasher.update("\x00");
+            hasher.update(key.index_kind);
+            return hasher.final();
+        }
+
+        pub fn eql(_: @This(), lhs: ActivityKey, rhs: ActivityKey) bool {
+            return lhs.store_id == rhs.store_id and
+                lhs.reporter_incarnation == rhs.reporter_incarnation and
+                lhs.group_id == rhs.group_id and
+                lhs.coverage_generation == rhs.coverage_generation and
+                lhs.coverage_config_hash == rhs.coverage_config_hash and
+                std.mem.eql(u8, lhs.index_name, rhs.index_name) and
+                std.mem.eql(u8, lhs.index_kind, rhs.index_kind);
+        }
+    };
+
+    const Entry = struct {
+        activity: metadata_table_manager.RuntimeEmbeddingActivityStatusReport,
+        observed_at_ns: u64,
+    };
+
+    const EntryMap = std.HashMapUnmanaged(ActivityKey, Entry, ActivityKeyContext, 80);
+    const KeySet = std.HashMapUnmanaged(ActivityKey, void, ActivityKeyContext, 80);
+
+    const Shard = struct {
+        mutex: std.Io.Mutex = .init,
+        owner_fences: std.AutoHashMapUnmanaged(u64, OwnerFence) = .empty,
+        entries: EntryMap = .empty,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            var entries = self.entries.iterator();
+            while (entries.next()) |entry| {
+                alloc.free(@constCast(entry.key_ptr.index_name));
+                alloc.free(@constCast(entry.key_ptr.index_kind));
+            }
+            self.entries.deinit(alloc);
+            self.owner_fences.deinit(alloc);
+            self.* = .{};
+        }
+    };
+
+    shards: [shard_count]Shard = [_]Shard{.{}} ** shard_count,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (&self.shards) |*shard| shard.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn shardIndex(store_id: u64) usize {
+        return @intCast(store_id % shard_count);
+    }
+
+    fn shardForStore(self: *@This(), store_id: u64) *Shard {
+        return &self.shards[shardIndex(store_id)];
+    }
+
+    fn activityAvailable(index_status: metadata_table_manager.RuntimeIndexStatusReport) bool {
+        return index_status.embedding_activity_observed and
+            index_status.embedding_activity.epoch != 0 and
+            index_status.embedding_activity.sample_sequence != 0;
+    }
+
+    fn removeEntryAssumeLocked(shard: *Shard, alloc: std.mem.Allocator, key: ActivityKey) void {
+        const removed = shard.entries.fetchRemove(key) orelse return;
+        alloc.free(@constCast(removed.key.index_name));
+        alloc.free(@constCast(removed.key.index_kind));
+    }
+
+    fn removeStoreAssumeLocked(shard: *Shard, alloc: std.mem.Allocator, store_id: u64) void {
+        var entries = shard.entries.iterator();
+        while (entries.next()) |entry| {
+            if (entry.key_ptr.store_id != store_id) continue;
+            const key = entry.key_ptr.*;
+            shard.entries.removeByPtr(entry.key_ptr);
+            alloc.free(@constCast(key.index_name));
+            alloc.free(@constCast(key.index_kind));
+        }
+    }
+
+    fn expireAssumeLocked(shard: *Shard, alloc: std.mem.Allocator, now_ns: u64) void {
+        var entries = shard.entries.iterator();
+        while (entries.next()) |entry| {
+            if (now_ns -| entry.value_ptr.observed_at_ns < embedding_activity_ttl_ns) continue;
+            const key = entry.key_ptr.*;
+            shard.entries.removeByPtr(entry.key_ptr);
+            alloc.free(@constCast(key.index_name));
+            alloc.free(@constCast(key.index_kind));
+        }
+    }
+
+    fn keyForIndex(
+        store_id: u64,
+        reporter_incarnation: u64,
+        group_id: u64,
+        index_status: metadata_table_manager.RuntimeIndexStatusReport,
+    ) ActivityKey {
+        return .{
+            .store_id = store_id,
+            .reporter_incarnation = reporter_incarnation,
+            .group_id = group_id,
+            .coverage_generation = index_status.coverage_generation,
+            .coverage_config_hash = index_status.coverage_config_hash,
+            .index_name = index_status.name,
+            .index_kind = index_status.kind,
+        };
+    }
+
+    fn mergeObservedActivitiesAssumeLocked(
+        shard: *Shard,
+        alloc: std.mem.Allocator,
+        report: metadata_table_manager.StoreStatusReport,
+        admitted: *const KeySet,
+        now_ns: u64,
+    ) !void {
+        for (report.runtime_statuses) |runtime_status| {
+            for (runtime_status.indexes) |index_status| {
+                if (!index_status.embedding_activity_observed) continue;
+                const key = keyForIndex(
+                    report.store_id,
+                    report.reporter_incarnation,
+                    runtime_status.group_id,
+                    index_status,
+                );
+                // Volatile telemetry cannot manufacture catalog identities or
+                // consume the bounded cache with unknown groups/indexes.
+                if (!admitted.contains(key)) continue;
+                if (!activityAvailable(index_status)) {
+                    removeEntryAssumeLocked(shard, alloc, key);
+                    continue;
+                }
+                if (shard.entries.getPtr(key)) |entry| {
+                    const incoming = index_status.embedding_activity;
+                    if (incoming.epoch == entry.activity.epoch and
+                        incoming.sample_sequence < entry.activity.sample_sequence) continue;
+                    entry.activity = incoming;
+                    entry.observed_at_ns = now_ns;
+                    continue;
+                }
+                if (shard.entries.count() >= max_entries_per_shard) continue;
+                const index_name = try alloc.dupe(u8, index_status.name);
+                errdefer alloc.free(index_name);
+                const index_kind = try alloc.dupe(u8, index_status.kind);
+                errdefer alloc.free(index_kind);
+                const owned_key: ActivityKey = .{
+                    .store_id = report.store_id,
+                    .reporter_incarnation = report.reporter_incarnation,
+                    .group_id = runtime_status.group_id,
+                    .coverage_generation = index_status.coverage_generation,
+                    .coverage_config_hash = index_status.coverage_config_hash,
+                    .index_name = index_name,
+                    .index_kind = index_kind,
+                };
+                try shard.entries.putNoClobber(alloc, owned_key, .{
+                    .activity = index_status.embedding_activity,
+                    .observed_at_ns = now_ns,
+                });
+            }
+        }
+    }
+
+    fn update(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        projected: []const metadata_table_manager.StoreRecord,
+        reports: []const metadata_table_manager.StoreStatusReport,
+        now_ns: u64,
+    ) !void {
+        var expired_shards = [_]bool{false} ** shard_count;
+        for (reports) |report| {
+            if (report.embedding_activity_protocol_version != embedding_activity_protocol_version) continue;
+            if (report.reporter_incarnation == 0 or report.embedding_activity_sequence == 0) continue;
+            const store_index = metadata_store_observer.findStoreIndex(projected, report.store_id) orelse continue;
+            const store = projected[store_index];
+            if (report.reporter_incarnation != store.reporter_incarnation or
+                report.status_generation < store.status_generation) continue;
+
+            var admitted = KeySet.empty;
+            defer admitted.deinit(alloc);
+            for (store.runtime_statuses) |runtime_status| {
+                for (runtime_status.indexes) |index_status| {
+                    try admitted.put(alloc, keyForIndex(
+                        store.store_id,
+                        store.reporter_incarnation,
+                        runtime_status.group_id,
+                        index_status,
+                    ), {});
+                }
+            }
+
+            const shard = self.shardForStore(report.store_id);
+            shard.mutex.lockUncancelable(std.Options.debug_io);
+            defer shard.mutex.unlock(std.Options.debug_io);
+            const shard_index = shardIndex(report.store_id);
+            if (!expired_shards[shard_index]) {
+                expireAssumeLocked(shard, alloc, now_ns);
+                expired_shards[shard_index] = true;
+            }
+            if (!shard.owner_fences.contains(report.store_id) and
+                shard.owner_fences.count() >= max_owner_fences_per_shard) continue;
+            const fence_entry = try shard.owner_fences.getOrPut(alloc, report.store_id);
+            if (fence_entry.found_existing) {
+                const fence = fence_entry.value_ptr;
+                if (fence.reporter_incarnation == report.reporter_incarnation) {
+                    if (report.status_generation < fence.status_generation) continue;
+                    if (report.status_generation > fence.status_generation) {
+                        fence.status_generation = report.status_generation;
+                    }
+                    if (report.embedding_activity_sequence <= fence.activity_sequence) continue;
+                } else removeStoreAssumeLocked(shard, alloc, report.store_id);
+            }
+            fence_entry.value_ptr.* = .{
+                .reporter_incarnation = report.reporter_incarnation,
+                .status_generation = report.status_generation,
+                .activity_sequence = report.embedding_activity_sequence,
+            };
+            try mergeObservedActivitiesAssumeLocked(shard, alloc, report, &admitted, now_ns);
+        }
+    }
+
+    fn overlay(
+        self: *@This(),
+        cache_alloc: std.mem.Allocator,
+        stores: []metadata_table_manager.StoreRecord,
+        now_ns: u64,
+    ) void {
+        // Pruning is best-effort observability housekeeping. Build one sorted
+        // live-store set outside shard locks; allocation pressure may defer the
+        // cleanup but never fail a status read.
+        const maybe_live_store_ids = cache_alloc.alloc(u64, stores.len) catch null;
+        defer if (maybe_live_store_ids) |ids| cache_alloc.free(ids);
+        if (maybe_live_store_ids) |ids| {
+            for (stores, 0..) |store, i| ids[i] = store.store_id;
+            std.sort.pdq(u64, ids, {}, std.sort.asc(u64));
+        }
+        for (&self.shards, 0..) |*shard, shard_index| {
+            shard.mutex.lockUncancelable(std.Options.debug_io);
+            defer shard.mutex.unlock(std.Options.debug_io);
+            if (maybe_live_store_ids) |live_store_ids| {
+                var fences = shard.owner_fences.iterator();
+                while (fences.next()) |fence| {
+                    if (std.sort.binarySearch(
+                        u64,
+                        live_store_ids,
+                        fence.key_ptr.*,
+                        struct {
+                            fn compare(key: u64, value: u64) std.math.Order {
+                                return std.math.order(key, value);
+                            }
+                        }.compare,
+                    ) != null) continue;
+                    const retired_store_id = fence.key_ptr.*;
+                    removeStoreAssumeLocked(shard, cache_alloc, retired_store_id);
+                    shard.owner_fences.removeByPtr(fence.key_ptr);
+                }
+            }
+            expireAssumeLocked(shard, cache_alloc, now_ns);
+            for (stores) |*store| {
+                if (shardIndex(store.store_id) != shard_index) continue;
+                const fence = shard.owner_fences.get(store.store_id) orelse continue;
+                if (fence.reporter_incarnation != store.reporter_incarnation) {
+                    removeStoreAssumeLocked(shard, cache_alloc, store.store_id);
+                    _ = shard.owner_fences.remove(store.store_id);
+                    continue;
+                }
+                for (store.runtime_statuses) |*runtime_status| {
+                    for (runtime_status.indexes) |*index_status| {
+                        const key = keyForIndex(
+                            store.store_id,
+                            store.reporter_incarnation,
+                            runtime_status.group_id,
+                            index_status.*,
+                        );
+                        const entry = shard.entries.get(key) orelse continue;
+                        index_status.embedding_activity_observed = true;
+                        index_status.embedding_activity = entry.activity;
+                    }
+                }
+            }
+        }
+    }
+
+    fn entryCount(self: *@This()) usize {
+        var total: usize = 0;
+        for (&self.shards) |*shard| {
+            shard.mutex.lockUncancelable(std.Options.debug_io);
+            total += shard.entries.count();
+            shard.mutex.unlock(std.Options.debug_io);
+        }
+        return total;
+    }
+};
+
 const table_catalog_mutation_lane_count: usize = 64;
 
 fn listActiveRestoreRangesRepairing(
@@ -1448,12 +1776,16 @@ fn runtimeStatusProtocolCompatible(
     metadata_group_id: u64,
     node_id: u64,
     incarnation: metadata_mod.MetadataClusterIncarnation,
+    required_version: u16,
 ) bool {
     const peer_incarnation = peer_status.metadata_incarnation orelse return false;
     return peer_status.metadata_group_id == metadata_group_id and
         peer_status.metadata_raft_local_node_id == node_id and
         std.mem.eql(u8, &peer_incarnation, &incarnation) and
-        peer_status.runtime_status_record_version >= metadata_runtime_status_protocol.current_record_version;
+        metadata_runtime_status_protocol.profileSatisfies(
+            peer_status.runtime_status_record_version,
+            required_version,
+        );
 }
 
 const RuntimeStatusMembershipFingerprint = [std.crypto.hash.sha2.Sha256.digest_length]u8;
@@ -1539,6 +1871,26 @@ fn storeHasRuntimeArtifactSourceStatus(record: metadata_table_manager.StoreRecor
     return false;
 }
 
+fn storesHaveRuntimeArtifactSourceStatus(stores: []const metadata_table_manager.StoreRecord) bool {
+    for (stores) |store| {
+        if (store.artifact_sources_protocol_version != 0 or
+            storeHasRuntimeArtifactSourceStatus(store)) return true;
+    }
+    return false;
+}
+
+fn reportsHaveRuntimeArtifactSourceStatus(reports: []const metadata_table_manager.StoreStatusReport) bool {
+    for (reports) |report| {
+        if (report.artifact_sources_protocol_version != 0) return true;
+        for (report.runtime_statuses) |runtime_status| {
+            for (runtime_status.indexes) |index_status| {
+                if (index_status.source_replay.len != 0) return true;
+            }
+        }
+    }
+    return false;
+}
+
 fn reportsHaveRuntimeRepairStatus(reports: []const metadata_table_manager.StoreStatusReport) bool {
     for (reports) |report| {
         for (report.runtime_statuses) |runtime_status| {
@@ -1557,9 +1909,30 @@ fn storesHaveRuntimeRepairStatus(stores: []const metadata_table_manager.StoreRec
     return false;
 }
 
+fn runtimeEmbeddingActivityPresent(activity: metadata_table_manager.RuntimeEmbeddingActivityStatusReport) bool {
+    return activity.epoch != 0;
+}
+
+fn storeHasRuntimeEmbeddingActivity(record: metadata_table_manager.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.embedding_activity_observed or
+                runtimeEmbeddingActivityPresent(index_status.embedding_activity)) return true;
+        }
+    }
+    return false;
+}
+
 fn storesHaveRuntimeReporterFence(stores: []const metadata_table_manager.StoreRecord) bool {
     for (stores) |store| {
         if (store.reporter_incarnation != 0) return true;
+    }
+    return false;
+}
+
+fn storesHaveNativeGenerationRestoreCapability(stores: []const metadata_table_manager.StoreRecord) bool {
+    for (stores) |store| {
+        if (store.native_generation_restore_version != 0) return true;
     }
     return false;
 }
@@ -1574,8 +1947,28 @@ fn reportsHaveRuntimeReporterFence(reports: []const metadata_table_manager.Store
 fn stripRuntimeRepairStatus(record: *metadata_table_manager.StoreRecord) void {
     for (record.runtime_statuses) |*runtime_status| {
         for (runtime_status.indexes) |*index_status| {
+            index_status.lifecycle_work_class = .none;
             index_status.repair_status = null;
             index_status.repair_active_generation_serviceable = false;
+        }
+    }
+}
+
+fn stripRuntimePublicationStatus(record: *metadata_table_manager.StoreRecord) void {
+    for (record.runtime_statuses) |*runtime_status| {
+        for (runtime_status.indexes) |*index_status| {
+            index_status.publication_target_count = 0;
+            index_status.publication_target_ready = false;
+            index_status.serving_snapshot_ready = false;
+        }
+    }
+}
+
+fn stripRuntimeEmbeddingActivity(record: *metadata_table_manager.StoreRecord) void {
+    for (record.runtime_statuses) |*runtime_status| {
+        for (runtime_status.indexes) |*index_status| {
+            index_status.embedding_activity_observed = false;
+            index_status.embedding_activity = .{};
         }
     }
 }
@@ -1600,6 +1993,56 @@ fn stripRuntimeReporterFence(record: *metadata_table_manager.StoreRecord) void {
     record.native_generation_restore_version = 0;
 }
 
+fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
+    if (metadata_table_manager.storeRequiresCurrentRuntimeStatusProfile(record))
+        return metadata_runtime_status_protocol.current_record_version;
+    return metadata_runtime_status_protocol.v0_2_0_record_version;
+}
+
+/// Every durable fact beyond v12 participates in admission or restore safety
+/// and cannot be erased merely to cross an older proposal boundary. Embedding
+/// activity is deliberately absent: it is an ephemeral observability overlay.
+fn runtimeStatusMandatoryRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
+    return runtimeStatusRequiredRecordVersion(record);
+}
+
+fn stripRuntimeStatusAboveVersion(
+    alloc: std.mem.Allocator,
+    record: *metadata_table_manager.StoreRecord,
+    supported_version: u16,
+) void {
+    if (supported_version == metadata_runtime_status_protocol.current_record_version) return;
+    stripRuntimePublicationStatus(record);
+    stripRuntimeRepairStatus(record);
+    stripRuntimeArtifactSourceStatus(alloc, record);
+    stripRuntimeReporterFence(record);
+}
+
+fn runtimeStatusProtocolVersionReady(service: anytype, required_version: u16) bool {
+    if (required_version == metadata_runtime_status_protocol.v0_2_0_record_version)
+        return true;
+    const Service = @TypeOf(service.*);
+    if (comptime @hasDecl(Service, "runtimeStatusProtocolReady"))
+        return service.runtimeStatusProtocolReady(required_version);
+    // Narrow adapter for topology-only test/service implementations that
+    // predate versioned negotiation. The legacy capability represented the
+    // same current repair format; unknown future versions still fail closed.
+    if (required_version == metadata_runtime_status_protocol.repair_status_record_version) {
+        if (comptime @hasDecl(Service, "runtimeStatusRepairProtocolReady"))
+            return service.runtimeStatusRepairProtocolReady();
+    }
+    return false;
+}
+
+fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16) u16 {
+    if (required_version == metadata_runtime_status_protocol.v0_2_0_record_version)
+        return required_version;
+    if (required_version == metadata_runtime_status_protocol.current_record_version and
+        runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.current_record_version))
+        return metadata_runtime_status_protocol.current_record_version;
+    return metadata_runtime_status_protocol.v0_2_0_record_version;
+}
+
 fn runtimeStatusProtocolSafeCommand(
     service: anytype,
     command: metadata_storage.TransitionCommand,
@@ -1616,24 +2059,17 @@ fn runtimeStatusProtocolSafeCommand(
                 record.reporter_incarnation,
                 record.status_generation,
             )) return error.InvalidStoreReporterFence;
-            const needs_current_protocol = storeHasRuntimeRepairStatus(record) or
-                storeHasRuntimeArtifactSourceStatus(record) or
-                record.reporter_incarnation != 0 or record.status_generation != 0 or
-                record.artifact_sources_protocol_version != 0 or
-                record.native_generation_restore_version != 0;
-            if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
-            // Unlike registration, an upsert carrying an incarnation may be a
-            // clone of already-committed v13 state. Downgrading it would erase
-            // causal authority. Retry after readiness can be proven instead.
-            if (record.reporter_incarnation != 0 or
-                record.native_generation_restore_version != 0)
-            {
+            const required_version = runtimeStatusRequiredRecordVersion(record);
+            const supported_version = highestSupportedRuntimeStatusVersion(service, required_version);
+            if (supported_version == required_version and !storeHasRuntimeEmbeddingActivity(record)) return command;
+            // Unlike registration, an upsert can be a clone of committed
+            // safety state. Never downgrade those facts; only optional
+            // observability fields may be projected away.
+            if (runtimeStatusMandatoryRecordVersion(record) > supported_version)
                 return error.RuntimeStatusProtocolUnavailable;
-            }
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
-            stripRuntimeRepairStatus(&legacy_record);
-            stripRuntimeArtifactSourceStatus(service.alloc, &legacy_record);
-            stripRuntimeReporterFence(&legacy_record);
+            stripRuntimeStatusAboveVersion(service.alloc, &legacy_record, supported_version);
+            stripRuntimeEmbeddingActivity(&legacy_record);
             owned_legacy_store.* = legacy_record;
             return .{ .upsert_store = legacy_record };
         },
@@ -1642,16 +2078,12 @@ fn runtimeStatusProtocolSafeCommand(
                 record.reporter_incarnation,
                 record.status_generation,
             )) return error.InvalidStoreReporterFence;
-            const needs_current_protocol = storeHasRuntimeRepairStatus(record) or
-                storeHasRuntimeArtifactSourceStatus(record) or
-                record.reporter_incarnation != 0 or record.status_generation != 0 or
-                record.artifact_sources_protocol_version != 0 or
-                record.native_generation_restore_version != 0;
-            if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
+            const required_version = runtimeStatusRequiredRecordVersion(record);
+            const supported_version = highestSupportedRuntimeStatusVersion(service, required_version);
+            if (supported_version == required_version and !storeHasRuntimeEmbeddingActivity(record)) return command;
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
-            stripRuntimeRepairStatus(&legacy_record);
-            stripRuntimeArtifactSourceStatus(service.alloc, &legacy_record);
-            stripRuntimeReporterFence(&legacy_record);
+            stripRuntimeStatusAboveVersion(service.alloc, &legacy_record, supported_version);
+            stripRuntimeEmbeddingActivity(&legacy_record);
             owned_legacy_store.* = legacy_record;
             return .{ .register_store = legacy_record };
         },
@@ -1955,6 +2387,10 @@ fn nativeRestoreIdentityProtocolReady(service: anytype) bool {
     const Service = @TypeOf(service.*);
     if (comptime @hasDecl(Service, "nativeRestoreIdentityProtocolReady"))
         return service.nativeRestoreIdentityProtocolReady();
+    if (comptime @hasDecl(Service, "runtimeStatusProtocolReady"))
+        return service.runtimeStatusProtocolReady(
+            metadata_runtime_status_protocol.native_restore_identity_record_version,
+        );
     return service.runtimeStatusRepairProtocolReady();
 }
 
@@ -3073,6 +3509,7 @@ pub const MetadataService = struct {
     local_replica_root_reconcile_permit_hook: ?LocalReplicaRootReconcilePermitHook = null,
     lifecycle_listener_mutex: std.Io.Mutex = .init,
     lifecycle_listener_registered: bool = false,
+    embedding_activity_cache: EmbeddingActivityCache = .{},
     catalog_mutation_mutex: std.Io.RwLock = .init,
     table_catalog_mutation_lanes: [table_catalog_mutation_lane_count]std.Io.Mutex = @splat(.init),
     catalog_projection_reader: catalog_projection_reader.CatalogProjectionReader = .{},
@@ -3159,6 +3596,7 @@ pub const MetadataService = struct {
         // Projection listeners retain `self`; stop and drain their Raft apply
         // producer before releasing any callback-owned service state.
         self.raft.deinit();
+        self.embedding_activity_cache.deinit(self.alloc);
         self.catalog_projection_reader.deinit(self.alloc);
         self.store_status_backfill_marker_cache.deinit(self.alloc);
         self.cdc_backfill_registry.deinit(self.alloc);
@@ -3939,7 +4377,11 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .upsert_store = record });
     }
 
-    fn runtimeStatusRepairProtocolReady(self: *MetadataService) bool {
+    fn runtimeStatusProtocolReady(self: *MetadataService, required_version: u16) bool {
+        if (!metadata_runtime_status_protocol.profileSatisfies(
+            metadata_runtime_status_protocol.current_record_version,
+            required_version,
+        )) return false;
         const raft_status = self.raft.host.host.raftStatus(self.metadata_group_id) orelse return false;
         const local_node_id = self.raft.host.host.cfg.local_node_id;
         const membership_sets = [_][]const u64{
@@ -3960,8 +4402,10 @@ pub const MetadataService = struct {
 
     fn nativeRestoreIdentityProtocolReady(self: *MetadataService) bool {
         // The in-process service supports only a local metadata membership;
-        // current-protocol readiness proves the complete V14 restore contract.
-        return self.runtimeStatusRepairProtocolReady();
+        // Version-specific readiness proves the complete V15 restore contract.
+        return self.runtimeStatusProtocolReady(
+            metadata_runtime_status_protocol.native_restore_identity_record_version,
+        );
     }
 
     pub fn registerStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
@@ -4950,7 +5394,9 @@ pub const MetadataService = struct {
 
     pub fn listProjectedStores(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.StoreRecord {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        return try store.listStores(alloc, self.metadata_group_id);
+        const records = try store.listStores(alloc, self.metadata_group_id);
+        self.embedding_activity_cache.overlay(self.alloc, records, platform_time.monotonicNs());
+        return records;
     }
 
     pub fn freeProjectedStores(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.StoreRecord) void {
@@ -5121,7 +5567,7 @@ pub const MetadataService = struct {
         }
         self.unlockRuntime();
         if (finish_error) |err| return err;
-        if (reconcile_result.?.hasPlacementFailures()) return error.ReplicaReconcileIncomplete;
+        if (reconcile_result.?.placementFailureError()) |err| return err;
     }
 
     fn refreshLocalTransitions(self: *MetadataService) !void {
@@ -5583,6 +6029,7 @@ pub const MetadataHttpService = struct {
     local_replica_root_reconcile_permit_hook: ?LocalReplicaRootReconcilePermitHook = null,
     lifecycle_listener_mutex: std.Io.Mutex = .init,
     lifecycle_listener_registered: bool = false,
+    embedding_activity_cache: EmbeddingActivityCache = .{},
     catalog_projection_reader: catalog_projection_reader.CatalogProjectionReader = .{},
     cdc_write_source_override: ?api_table_writes.TableWriteSource = null,
     local_group_status_provider: ?LocalGroupStatusProvider = null,
@@ -5603,6 +6050,7 @@ pub const MetadataHttpService = struct {
     runtime_status_protocol_cache_mutex: std.Io.Mutex = .init,
     runtime_status_protocol_ready_fingerprint: RuntimeStatusMembershipFingerprint =
         [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+    runtime_status_protocol_ready_version: u16 = 0,
     runtime_status_protocol_probe_mutex: std.Io.Mutex = .init,
     runtime_status_protocol_activated_version: std.atomic.Value(u16) = .init(0),
     runtime_status_protocol_probe_in_flight: std.atomic.Value(bool) = .init(false),
@@ -5697,6 +6145,7 @@ pub const MetadataHttpService = struct {
         // Projection listeners retain `self`; stop and drain their Raft apply
         // producer before releasing any callback-owned service state.
         self.raft.deinit();
+        self.embedding_activity_cache.deinit(self.alloc);
         self.catalog_projection_reader.deinit(self.alloc);
         self.projected_core_snapshot_cache.deinit(self.alloc);
         self.transition_readiness_cache.deinit(self.alloc);
@@ -6223,9 +6672,13 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_store = record });
     }
 
-    fn runtimeStatusRepairProtocolReady(self: *MetadataHttpService) bool {
-        if (self.runtimeStatusProtocolActivationVersion() >=
-            metadata_runtime_status_protocol.current_record_version) return true;
+    fn runtimeStatusProtocolReady(self: *MetadataHttpService, required_version: u16) bool {
+        if (metadata_runtime_status_protocol.profileSatisfies(
+            self.runtimeStatusProtocolActivationVersion(),
+            required_version,
+        )) return true;
+        const required_profile = metadata_runtime_status_protocol.profileForVersion(required_version) orelse return false;
+        const canonical_required_version = required_profile.wireVersion();
         const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return false;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
         if (std.mem.indexOfScalar(u64, raft_status.conf_state.voters, local_node_id) == null and
@@ -6239,34 +6692,63 @@ pub const MetadataHttpService = struct {
             self.reallocation_protocol_peers,
             incarnation,
         );
-        if (self.runtimeStatusProtocolFingerprintReady(membership_fingerprint)) return true;
+        if (self.runtimeStatusProtocolFingerprintReady(membership_fingerprint, canonical_required_version)) return true;
         if (runtimeStatusProtocolMembershipIsLocalOnly(
             raft_status.conf_state,
             self.reallocation_protocol_peers,
             local_node_id,
         )) {
-            self.storeRuntimeStatusProtocolFingerprint(membership_fingerprint);
+            self.storeRuntimeStatusProtocolFingerprint(membership_fingerprint, canonical_required_version);
             return true;
         }
 
-        self.scheduleRuntimeStatusProtocolProbe(membership_fingerprint, incarnation);
+        self.scheduleRuntimeStatusProtocolProbe(membership_fingerprint, incarnation, canonical_required_version);
         return false;
     }
 
     fn runtimeStatusProtocolActivationVersion(self: *MetadataHttpService) u16 {
         const cached = self.runtime_status_protocol_activated_version.load(.acquire);
-        if (cached >= metadata_runtime_status_protocol.current_record_version) return cached;
+        if (cached == metadata_runtime_status_protocol.current_record_version) return cached;
         const store = self.projectedStore() orelse return cached;
         const version = store.getRuntimeStatusProtocolActivationVersion(self.metadata_group_id) catch return cached;
-        if (version > cached) {
+        if (version == metadata_runtime_status_protocol.current_record_version) {
             self.runtime_status_protocol_activated_version.store(version, .release);
+            return version;
         }
-        return @max(cached, version);
+        return cached;
+    }
+
+    fn runtimeStatusProtocolReadyVersion(self: *MetadataHttpService) u16 {
+        const activated_version = self.runtimeStatusProtocolActivationVersion();
+        if (self.runtimeStatusProtocolReady(metadata_runtime_status_protocol.current_record_version))
+            return metadata_runtime_status_protocol.current_record_version;
+
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
+            return activated_version;
+        const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
+        if (std.mem.indexOfScalar(u64, raft_status.conf_state.voters, local_node_id) == null and
+            std.mem.indexOfScalar(u64, raft_status.conf_state.voters_outgoing, local_node_id) == null)
+        {
+            return activated_version;
+        }
+        const incarnation = (self.metadataIncarnation() catch return activated_version) orelse
+            return activated_version;
+        const membership_fingerprint = runtimeStatusProtocolMembershipFingerprint(
+            raft_status.conf_state,
+            self.reallocation_protocol_peers,
+            incarnation,
+        );
+        return @max(
+            activated_version,
+            self.runtimeStatusProtocolFingerprintReadyVersion(membership_fingerprint),
+        );
     }
 
     fn nativeRestoreIdentityProtocolReady(self: *MetadataHttpService) bool {
-        if (self.runtimeStatusProtocolActivationVersion() >=
-            metadata_runtime_status_protocol.native_restore_identity_record_version) return true;
+        if (metadata_runtime_status_protocol.profileSatisfies(
+            self.runtimeStatusProtocolActivationVersion(),
+            metadata_runtime_status_protocol.native_restore_identity_record_version,
+        )) return true;
 
         const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return false;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
@@ -6277,9 +6759,11 @@ pub const MetadataHttpService = struct {
         )) return true;
 
         // Drive the existing asynchronous all-voter probe. Native identity is
-        // admitted only after a V14 store transition has durably activated the
+        // admitted only after a V15 store transition has durably activated the
         // protocol, never from the process-local probe cache alone.
-        _ = self.runtimeStatusRepairProtocolReady();
+        _ = self.runtimeStatusProtocolReady(
+            metadata_runtime_status_protocol.native_restore_identity_record_version,
+        );
         return false;
     }
 
@@ -6287,6 +6771,7 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         membership_fingerprint: RuntimeStatusMembershipFingerprint,
         incarnation: metadata_mod.MetadataClusterIncarnation,
+        required_version: u16,
     ) void {
         if (self.runtime_status_protocol_probe_shutdown.load(.acquire)) return;
         const now_ns = platform_time.monotonicNs();
@@ -6319,19 +6804,28 @@ pub const MetadataHttpService = struct {
             service: *MetadataHttpService,
             membership_fingerprint: RuntimeStatusMembershipFingerprint,
             incarnation: metadata_mod.MetadataClusterIncarnation,
+            required_version: u16,
             completed: bool = false,
 
             fn run(ptr: *anyopaque) !void {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
                 if (ctx.service.runtime_status_protocol_probe_shutdown.load(.acquire)) return;
-                const ready = ctx.service.probeRuntimeStatusRepairProtocol(
+                const common_version = ctx.service.probeRuntimeStatusProtocol(
                     ctx.membership_fingerprint,
                     ctx.incarnation,
+                    ctx.required_version,
                 );
-                if (ready) ctx.service.storeRuntimeStatusProtocolFingerprint(ctx.membership_fingerprint);
+                if (common_version) |version| ctx.service.storeRuntimeStatusProtocolFingerprint(
+                    ctx.membership_fingerprint,
+                    version,
+                );
+                const ready = if (common_version) |version| version >= ctx.required_version else false;
                 ctx.completed = true;
                 ctx.service.finishRuntimeStatusProtocolProbe(ready);
-                if (ready) ctx.service.lifecycle_signal.notify(null);
+                // A lower common version is useful too: status ingestion can
+                // immediately project optional fields to it while the newer
+                // capability remains on the bounded re-probe schedule.
+                if (common_version != null) ctx.service.lifecycle_signal.notify(null);
             }
 
             fn deinit(ptr: *anyopaque) void {
@@ -6361,6 +6855,7 @@ pub const MetadataHttpService = struct {
             .service = self,
             .membership_fingerprint = membership_fingerprint,
             .incarnation = incarnation,
+            .required_version = required_version,
         };
         runtime.durable_jobs.submit(.{
             .owner_id = self.runtime_status_protocol_probe_owner_id,
@@ -6399,44 +6894,70 @@ pub const MetadataHttpService = struct {
     fn runtimeStatusProtocolFingerprintReady(
         self: *MetadataHttpService,
         membership_fingerprint: RuntimeStatusMembershipFingerprint,
+        required_version: u16,
     ) bool {
+        return metadata_runtime_status_protocol.profileSatisfies(
+            self.runtimeStatusProtocolFingerprintReadyVersion(membership_fingerprint),
+            required_version,
+        );
+    }
+
+    fn runtimeStatusProtocolFingerprintReadyVersion(
+        self: *MetadataHttpService,
+        membership_fingerprint: RuntimeStatusMembershipFingerprint,
+    ) u16 {
         self.runtime_status_protocol_cache_mutex.lockUncancelable(std.Options.debug_io);
         defer self.runtime_status_protocol_cache_mutex.unlock(std.Options.debug_io);
-        return std.mem.eql(
+        if (!std.mem.eql(
             u8,
             &self.runtime_status_protocol_ready_fingerprint,
             &membership_fingerprint,
-        );
+        )) return 0;
+        return self.runtime_status_protocol_ready_version;
     }
 
     fn storeRuntimeStatusProtocolFingerprint(
         self: *MetadataHttpService,
         membership_fingerprint: RuntimeStatusMembershipFingerprint,
+        ready_version: u16,
     ) void {
         self.runtime_status_protocol_cache_mutex.lockUncancelable(std.Options.debug_io);
         defer self.runtime_status_protocol_cache_mutex.unlock(std.Options.debug_io);
+        const same_membership = std.mem.eql(
+            u8,
+            &self.runtime_status_protocol_ready_fingerprint,
+            &membership_fingerprint,
+        );
         self.runtime_status_protocol_ready_fingerprint = membership_fingerprint;
+        self.runtime_status_protocol_ready_version = if (same_membership and
+            self.runtime_status_protocol_ready_version == metadata_runtime_status_protocol.current_record_version)
+            metadata_runtime_status_protocol.current_record_version
+        else
+            ready_version;
     }
 
-    fn probeRuntimeStatusRepairProtocol(
+    fn probeRuntimeStatusProtocol(
         self: *MetadataHttpService,
         expected_membership_fingerprint: RuntimeStatusMembershipFingerprint,
         incarnation: metadata_mod.MetadataClusterIncarnation,
-    ) bool {
-        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return false;
+        required_version: u16,
+    ) ?u16 {
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return null;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
         if (std.mem.indexOfScalar(u64, raft_status.conf_state.voters, local_node_id) == null and
             std.mem.indexOfScalar(u64, raft_status.conf_state.voters_outgoing, local_node_id) == null)
         {
-            return false;
+            return null;
         }
         const required_node_ids = collectReallocationBarrierNodeIds(
             self.alloc,
             raft_status.conf_state,
             self.reallocation_protocol_peers,
-        ) catch return false;
+        ) catch return null;
         defer if (required_node_ids.len > 0) self.alloc.free(required_node_ids);
-        if (required_node_ids.len == 0) return false;
+        if (required_node_ids.len == 0) return null;
+
+        var all_voters_current = true;
 
         var client = metadata_http_client.MetadataHttpClient.init(
             self.alloc,
@@ -6449,44 +6970,63 @@ pub const MetadataHttpService = struct {
             if (node_id == local_node_id) continue;
             const peer = findReallocationProtocolPeer(self.reallocation_protocol_peers, node_id) orelse {
                 std.log.warn("runtime-status protocol activation blocked: metadata member {d} is not configured", .{node_id});
-                return false;
+                return null;
             };
             const orchestration_url = peer.orchestration_url orelse {
                 std.log.warn("runtime-status protocol activation blocked: metadata member {d} has no orchestration URL", .{node_id});
-                return false;
+                return null;
             };
             if (orchestration_url.len == 0) {
                 std.log.warn("runtime-status protocol activation blocked: metadata member {d} has an empty orchestration URL", .{node_id});
-                return false;
+                return null;
             }
             const peer_status = client.fetchStatusWithBudget(orchestration_url, probe_budget) catch |err| {
                 std.log.warn(
                     "runtime-status protocol activation probe failed for metadata member {d}: {s}",
                     .{ node_id, @errorName(err) },
                 );
-                return false;
+                return null;
             };
-            if (!runtimeStatusProtocolCompatible(peer_status, self.metadata_group_id, node_id, incarnation)) {
+            if (!runtimeStatusProtocolCompatible(
+                peer_status,
+                self.metadata_group_id,
+                node_id,
+                incarnation,
+                metadata_runtime_status_protocol.v0_2_0_record_version,
+            )) {
                 std.log.warn(
                     "runtime-status protocol activation blocked: metadata member {d} reports node={d} group={d} version={d}",
                     .{ node_id, peer_status.metadata_raft_local_node_id, peer_status.metadata_group_id, peer_status.runtime_status_record_version },
                 );
-                return false;
+                return null;
             }
+            if (peer_status.runtime_status_record_version != metadata_runtime_status_protocol.current_record_version)
+                all_voters_current = false;
         }
-        const final_raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return false;
-        const final_incarnation = (self.metadataIncarnation() catch return false) orelse return false;
+        const common_version = if (all_voters_current)
+            metadata_runtime_status_protocol.current_record_version
+        else
+            metadata_runtime_status_protocol.v0_2_0_record_version;
+        if (common_version < required_version) {
+            std.log.info(
+                "runtime-status protocol activation awaiting upgrade: requested={d} common={d}",
+                .{ required_version, common_version },
+            );
+        }
+        const final_raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return null;
+        const final_incarnation = (self.metadataIncarnation() catch return null) orelse return null;
         const final_membership_fingerprint = runtimeStatusProtocolMembershipFingerprint(
             final_raft_status.conf_state,
             self.reallocation_protocol_peers,
             final_incarnation,
         );
-        return std.mem.eql(u8, &final_incarnation, &incarnation) and
-            std.mem.eql(
+        if (!std.mem.eql(u8, &final_incarnation, &incarnation) or
+            !std.mem.eql(
                 u8,
                 &final_membership_fingerprint,
                 &expected_membership_fingerprint,
-            );
+            )) return null;
+        return common_version;
     }
 
     pub fn registerStore(self: *MetadataHttpService, record: metadata_table_manager.StoreRecord) !void {
@@ -7729,12 +8269,8 @@ pub const MetadataHttpService = struct {
         snapshot: *MetadataStatus,
     ) void {
         snapshot.runtime_status_protocol_activated_version = self.runtimeStatusProtocolActivationVersion();
-        snapshot.runtime_status_protocol_ready_version =
-            if (self.runtimeStatusRepairProtocolReady())
-                metadata_runtime_status_protocol.current_record_version
-            else
-                snapshot.runtime_status_protocol_activated_version;
-        if (snapshot.runtime_status_protocol_activated_version >=
+        snapshot.runtime_status_protocol_ready_version = self.runtimeStatusProtocolReadyVersion();
+        if (snapshot.runtime_status_protocol_activated_version ==
             metadata_runtime_status_protocol.current_record_version)
         {
             snapshot.runtime_status_protocol_probe_in_flight = false;
@@ -8118,7 +8654,7 @@ pub const MetadataHttpService = struct {
             snapshot.tables = try cloneProjectedTablesOwned(self.alloc, catalog.tables);
             snapshot.ranges = try cloneProjectedRangesOwned(self.alloc, catalog.ranges);
             snapshot.nodes = try store.listNodes(self.alloc, self.metadata_group_id);
-            snapshot.stores = try cloneProjectedStoresOwned(self.alloc, core.stores);
+            snapshot.stores = try self.cloneProjectedStoresWithActivityLocked(self.alloc, core.stores);
             snapshot.placement_intents = try cloneProjectedPlacementIntentsOwned(self.alloc, core.placement_intents);
             snapshot.shuffle_join_leases = try cloneProjectedShuffleJoinLeasesOwned(self.alloc, core.shuffle_join_leases);
             snapshot.restore_progresses = try cloneProjectedRestoreProgressesOwned(self.alloc, core.restore_progresses);
@@ -8722,7 +9258,26 @@ pub const MetadataHttpService = struct {
         self.lockRuntime();
         defer self.unlockRuntime();
         const snapshot = try self.projectedCoreSnapshotLocked();
-        return try cloneProjectedStoresOwned(alloc, snapshot.stores);
+        return try self.cloneProjectedStoresWithActivityLocked(alloc, snapshot.stores);
+    }
+
+    /// Clone the exact durable store projection and apply optional owner
+    /// telemetry as one read contract. Both the generic projection API and the
+    /// optimized admin snapshot path use this helper; otherwise callers can
+    /// flicker between activity and `unavailable` solely because they reached
+    /// different snapshot implementations.
+    ///
+    /// Requires `runtime_mutex` so `projected` remains tied to the caller's
+    /// catalog/core snapshot while it is cloned. Activity has its own bounded,
+    /// incarnation-scoped cache locks and is intentionally best effort.
+    fn cloneProjectedStoresWithActivityLocked(
+        self: *MetadataHttpService,
+        alloc: std.mem.Allocator,
+        projected: []const metadata_table_manager.StoreRecord,
+    ) ![]metadata_table_manager.StoreRecord {
+        const records = try cloneProjectedStoresOwned(alloc, projected);
+        self.embedding_activity_cache.overlay(self.alloc, records, platform_time.monotonicNs());
+        return records;
     }
 
     pub fn freeProjectedStores(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.StoreRecord) void {
@@ -8967,7 +9522,7 @@ pub const MetadataHttpService = struct {
         }
         self.unlockRuntime();
         if (finish_error) |err| return err;
-        if (reconcile_result.?.hasPlacementFailures()) return error.ReplicaReconcileIncomplete;
+        if (reconcile_result.?.placementFailureError()) |err| return err;
     }
 
     fn refreshLocalTransitions(self: *MetadataHttpService, round_inputs: ?*const LocalTransitionInputs) !void {
@@ -9503,7 +10058,7 @@ test "metadata table topology protocol checks the command's required version and
     ));
 }
 
-test "metadata runtime status protocol requires the exact current metadata replica" {
+test "metadata runtime status protocol negotiates only released v12 and current v15" {
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var status = MetadataStatus{
         .metadata_group_id = 42,
@@ -9511,14 +10066,30 @@ test "metadata runtime status protocol requires the exact current metadata repli
         .metadata_raft_local_node_id = 7,
         .metrics = .{},
     };
-    try std.testing.expect(!runtimeStatusProtocolCompatible(status, 42, 7, incarnation));
+    try std.testing.expect(!runtimeStatusProtocolCompatible(
+        status,
+        42,
+        7,
+        incarnation,
+        metadata_runtime_status_protocol.repair_status_record_version,
+    ));
 
+    status.runtime_status_record_version = metadata_runtime_status_protocol.v0_2_0_record_version;
+    try std.testing.expect(runtimeStatusProtocolCompatible(status, 42, 7, incarnation, 12));
+    try std.testing.expect(!runtimeStatusProtocolCompatible(status, 42, 7, incarnation, 15));
+    status.runtime_status_record_version = 13;
+    try std.testing.expect(!runtimeStatusProtocolCompatible(status, 42, 7, incarnation, 12));
+    try std.testing.expect(!runtimeStatusProtocolCompatible(status, 42, 7, incarnation, 15));
+    status.runtime_status_record_version = 14;
+    try std.testing.expect(!runtimeStatusProtocolCompatible(status, 42, 7, incarnation, 12));
+    try std.testing.expect(!runtimeStatusProtocolCompatible(status, 42, 7, incarnation, 15));
     status.runtime_status_record_version = metadata_runtime_status_protocol.current_record_version;
-    try std.testing.expect(runtimeStatusProtocolCompatible(status, 42, 7, incarnation));
-    try std.testing.expect(!runtimeStatusProtocolCompatible(status, 43, 7, incarnation));
-    try std.testing.expect(!runtimeStatusProtocolCompatible(status, 42, 8, incarnation));
+    try std.testing.expect(runtimeStatusProtocolCompatible(status, 42, 7, incarnation, 12));
+    try std.testing.expect(runtimeStatusProtocolCompatible(status, 42, 7, incarnation, 15));
+    try std.testing.expect(!runtimeStatusProtocolCompatible(status, 43, 7, incarnation, 15));
+    try std.testing.expect(!runtimeStatusProtocolCompatible(status, 42, 8, incarnation, 15));
     status.metadata_incarnation = null;
-    try std.testing.expect(!runtimeStatusProtocolCompatible(status, 42, 7, incarnation));
+    try std.testing.expect(!runtimeStatusProtocolCompatible(status, 42, 7, incarnation, 15));
 }
 
 test "metadata runtime status capability cache is scoped to incarnation and membership" {
@@ -9585,6 +10156,7 @@ test "metadata runtime repair status downgrade clears state and serviceability p
     var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
         .name = "visual_idx",
         .kind = "dense_vector",
+        .lifecycle_work_class = .repair,
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
     }};
@@ -9602,20 +10174,33 @@ test "metadata runtime repair status downgrade clears state and serviceability p
     try std.testing.expect(!indexes[0].repair_active_generation_serviceable);
 }
 
-test "metadata service transition commands downgrade runtime repair status until protocol activation" {
+test "metadata service transition commands negotiate runtime status payload versions" {
     const FakeService = struct {
         alloc: std.mem.Allocator,
-        ready: bool,
+        ready_version: u16,
 
-        fn runtimeStatusRepairProtocolReady(self: *@This()) bool {
-            return self.ready;
+        fn runtimeStatusProtocolReady(self: *@This(), required_version: u16) bool {
+            return self.ready_version >= required_version;
         }
     };
+    var source_replay = [_]metadata_table_manager.RuntimeIndexSourceReplayStatusReport{.{
+        .artifact_name = "chunks",
+        .published_sequence = 7,
+        .target_sequence = 9,
+        .failed = true,
+    }};
     var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
         .name = "visual_idx",
         .kind = "dense_vector",
+        .lifecycle_work_class = .repair,
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
+        .publication_target_count = 17,
+        .publication_target_ready = true,
+        .serving_snapshot_ready = true,
+        .embedding_activity_observed = true,
+        .embedding_activity = .{ .epoch = 9, .embeddings_computed = 17 },
+        .source_replay = source_replay[0..],
     }};
     var runtime_statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
         .indexes = indexes[0..],
@@ -9624,11 +10209,14 @@ test "metadata service transition commands downgrade runtime repair status until
         .store_id = 1,
         .node_id = 2,
         .reporter_incarnation = 77,
-        .native_generation_restore_version = metadata_table_manager.native_generation_restore_protocol_version,
+        .artifact_sources_protocol_version = metadata_table_manager.artifact_sources_protocol_version,
         .runtime_statuses = runtime_statuses[0..],
     };
 
-    var legacy_service = FakeService{ .alloc = std.testing.allocator, .ready = false };
+    var legacy_service = FakeService{
+        .alloc = std.testing.allocator,
+        .ready_version = metadata_runtime_status_protocol.v0_2_0_record_version,
+    };
     var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
     defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(std.testing.allocator, record);
     const safe_command = try runtimeStatusProtocolSafeCommand(
@@ -9637,7 +10225,16 @@ test "metadata service transition commands downgrade runtime repair status until
         &owned_legacy_store,
     );
     try std.testing.expect(!storeHasRuntimeRepairStatus(safe_command.register_store));
+    try std.testing.expect(!storeHasRuntimeArtifactSourceStatus(safe_command.register_store));
+    try std.testing.expect(!storeHasRuntimeEmbeddingActivity(safe_command.register_store));
+    try std.testing.expect(!safe_command.register_store.runtime_statuses[0].indexes[0].publication_target_ready);
+    try std.testing.expect(!safe_command.register_store.runtime_statuses[0].indexes[0].serving_snapshot_ready);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        safe_command.register_store.runtime_statuses[0].indexes[0].publication_target_count,
+    );
     try std.testing.expectEqual(@as(u64, 0), safe_command.register_store.reporter_incarnation);
+    try std.testing.expectEqual(@as(u16, 0), safe_command.register_store.artifact_sources_protocol_version);
     try std.testing.expectEqual(@as(u16, 0), safe_command.register_store.native_generation_restore_version);
     try std.testing.expect(storeHasRuntimeRepairStatus(store));
 
@@ -9666,19 +10263,349 @@ test "metadata service transition commands downgrade runtime repair status until
         ),
     );
 
-    var current_service = FakeService{ .alloc = std.testing.allocator, .ready = true };
+    var repair_service = FakeService{
+        .alloc = std.testing.allocator,
+        .ready_version = metadata_runtime_status_protocol.repair_status_record_version,
+    };
+    var owned_repair_store: ?metadata_table_manager.StoreRecord = null;
+    defer if (owned_repair_store) |record| metadata_table_manager.freeStore(std.testing.allocator, record);
+    const repair_command = try runtimeStatusProtocolSafeCommand(
+        &repair_service,
+        .{ .upsert_store = store },
+        &owned_repair_store,
+    );
+    try std.testing.expect(storeHasRuntimeRepairStatus(repair_command.upsert_store));
+    try std.testing.expect(storeHasRuntimeArtifactSourceStatus(repair_command.upsert_store));
+    try std.testing.expect(repair_command.upsert_store.runtime_statuses[0].indexes[0].publication_target_ready);
+    try std.testing.expect(repair_command.upsert_store.runtime_statuses[0].indexes[0].serving_snapshot_ready);
+    try std.testing.expect(!storeHasRuntimeEmbeddingActivity(repair_command.upsert_store));
+    try std.testing.expectEqual(@as(u64, 77), repair_command.upsert_store.reporter_incarnation);
+
+    var current_store = store;
+    current_store.native_generation_restore_version = metadata_table_manager.native_generation_restore_protocol_version;
+    var native_service = FakeService{
+        .alloc = std.testing.allocator,
+        .ready_version = metadata_runtime_status_protocol.native_restore_identity_record_version,
+    };
+    var owned_native_store: ?metadata_table_manager.StoreRecord = null;
+    defer if (owned_native_store) |record| metadata_table_manager.freeStore(std.testing.allocator, record);
+    const native_command = try runtimeStatusProtocolSafeCommand(
+        &native_service,
+        .{ .upsert_store = current_store },
+        &owned_native_store,
+    );
+    try std.testing.expect(storeHasRuntimeRepairStatus(native_command.upsert_store));
+    try std.testing.expect(!storeHasRuntimeEmbeddingActivity(native_command.upsert_store));
+    try std.testing.expectEqual(
+        metadata_table_manager.native_generation_restore_protocol_version,
+        native_command.upsert_store.native_generation_restore_version,
+    );
+
+    var current_service = FakeService{
+        .alloc = std.testing.allocator,
+        .ready_version = metadata_runtime_status_protocol.current_record_version,
+    };
     var unexpectedly_owned: ?metadata_table_manager.StoreRecord = null;
+    defer if (unexpectedly_owned) |record| metadata_table_manager.freeStore(std.testing.allocator, record);
     const current_command = try runtimeStatusProtocolSafeCommand(
         &current_service,
-        .{ .upsert_store = store },
+        .{ .upsert_store = current_store },
         &unexpectedly_owned,
     );
-    try std.testing.expect(unexpectedly_owned == null);
+    try std.testing.expect(unexpectedly_owned != null);
     try std.testing.expect(storeHasRuntimeRepairStatus(current_command.upsert_store));
+    try std.testing.expect(storeHasRuntimeArtifactSourceStatus(current_command.upsert_store));
+    try std.testing.expect(!storeHasRuntimeEmbeddingActivity(current_command.upsert_store));
     try std.testing.expectEqual(@as(u64, 77), current_command.upsert_store.reporter_incarnation);
     try std.testing.expectEqual(
         metadata_table_manager.native_generation_restore_protocol_version,
         current_command.upsert_store.native_generation_restore_version,
+    );
+}
+
+test "metadata service projects optional activity without freezing older status" {
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+        ready_version: u16,
+        upserts: usize = 0,
+        proposed_capacity_bytes: u64 = 0,
+        proposed_repair_status: bool = false,
+        proposed_activity: bool = false,
+        proposed_native_restore_version: u16 = 0,
+
+        fn runtimeStatusProtocolReady(self: *@This(), required_version: u16) bool {
+            return self.ready_version >= required_version;
+        }
+
+        fn upsertStore(self: *@This(), record: metadata_table_manager.StoreRecord) !void {
+            self.upserts += 1;
+            self.proposed_capacity_bytes = record.capacity_bytes;
+            self.proposed_repair_status = storeHasRuntimeRepairStatus(record);
+            self.proposed_activity = storeHasRuntimeEmbeddingActivity(record);
+            self.proposed_native_restore_version = record.native_generation_restore_version;
+        }
+    };
+
+    var existing_indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
+        .name = "visual_idx",
+        .kind = "dense_vector",
+        .doc_count = 10,
+        .lifecycle_work_class = .repair,
+        .repair_status = .rebuilding,
+        .embedding_activity = .{ .epoch = 7, .embeddings_computed = 11 },
+    }};
+    var existing_runtime = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .table_id = 1,
+        .group_id = 2,
+        .store_id = 3,
+        .indexes = existing_indexes[0..],
+    }};
+    var projected = [_]metadata_table_manager.StoreRecord{try metadata_table_manager.cloneStore(std.testing.allocator, .{
+        .store_id = 3,
+        .node_id = 4,
+        .reporter_incarnation = 0x1234,
+        .status_generation = 5,
+        .capacity_bytes = 100,
+        .native_generation_restore_version = metadata_table_manager.native_generation_restore_protocol_version,
+        .runtime_statuses = existing_runtime[0..],
+    })};
+    defer metadata_table_manager.freeStore(std.testing.allocator, projected[0]);
+
+    var observed_indexes = existing_indexes;
+    observed_indexes[0].doc_count = 12;
+    observed_indexes[0].embedding_activity.embeddings_computed = 13;
+    var observed_runtime = existing_runtime;
+    observed_runtime[0].indexes = observed_indexes[0..];
+    const reports = [_]metadata_table_manager.StoreStatusReport{.{
+        .store_id = 3,
+        .reporter_incarnation = 0x1234,
+        .status_generation = 6,
+        .capacity_bytes = 200,
+        .runtime_statuses = observed_runtime[0..],
+    }};
+    var service = FakeService{
+        .alloc = std.testing.allocator,
+        .ready_version = metadata_runtime_status_protocol.native_restore_identity_record_version,
+    };
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try reportStoreStatusesWithProjected(&service, &projected, &reports),
+    );
+    try std.testing.expectEqual(@as(usize, 1), service.upserts);
+    try std.testing.expectEqual(@as(u64, 200), service.proposed_capacity_bytes);
+    try std.testing.expect(service.proposed_repair_status);
+    try std.testing.expect(!service.proposed_activity);
+    try std.testing.expectEqual(
+        metadata_table_manager.native_generation_restore_protocol_version,
+        service.proposed_native_restore_version,
+    );
+    // Durable projection is scrubbed; the real services retain activity only
+    // in their TTL-bound heartbeat cache.
+    try std.testing.expect(!storeHasRuntimeEmbeddingActivity(projected[0]));
+}
+
+test "metadata service activity cache is versioned TTL-bound and incarnation scoped" {
+    const alloc = std.testing.allocator;
+    var committed_indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
+        .name = "semantic",
+        .kind = "dense_vector",
+        .coverage_generation = 7,
+        .coverage_config_hash = 9,
+    }};
+    var committed_runtime = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .group_id = 11,
+        .indexes = committed_indexes[0..],
+    }};
+    const committed = metadata_table_manager.StoreRecord{
+        .store_id = 3,
+        .node_id = 4,
+        .reporter_incarnation = 0x1234,
+        .status_generation = 5,
+        .runtime_statuses = committed_runtime[0..],
+    };
+    var observed_indexes = committed_indexes;
+    observed_indexes[0].embedding_activity_observed = true;
+    observed_indexes[0].embedding_activity = .{
+        .epoch = 77,
+        .sample_sequence = 1,
+        .phase = .embedding,
+        .embeddings_computed = 12,
+        .active_batch_size = 4,
+    };
+    var observed_runtime = committed_runtime;
+    observed_runtime[0].indexes = observed_indexes[0..];
+    const report = metadata_table_manager.StoreStatusReport{
+        .store_id = 3,
+        .embedding_activity_protocol_version = embedding_activity_protocol_version,
+        .embedding_activity_sequence = 1,
+        .reporter_incarnation = 0x1234,
+        .status_generation = 6,
+        .runtime_statuses = observed_runtime[0..],
+    };
+
+    var cache: EmbeddingActivityCache = .{};
+    defer cache.deinit(alloc);
+    try cache.update(alloc, &.{committed}, &.{report}, 100);
+    try std.testing.expectEqual(@as(usize, 1), cache.entryCount());
+
+    // A valid owner report cannot populate telemetry for a catalog identity
+    // that is absent from the accepted durable projection.
+    var unknown_indexes = observed_indexes;
+    unknown_indexes[0].name = "unknown";
+    unknown_indexes[0].embedding_activity.sample_sequence = 2;
+    var unknown_runtime = observed_runtime;
+    unknown_runtime[0].indexes = unknown_indexes[0..];
+    var unknown_report = report;
+    unknown_report.embedding_activity_sequence = 2;
+    unknown_report.runtime_statuses = unknown_runtime[0..];
+    try cache.update(alloc, &.{committed}, &.{unknown_report}, 100);
+    try std.testing.expectEqual(@as(usize, 1), cache.entryCount());
+
+    var current = [_]metadata_table_manager.StoreRecord{try metadata_table_manager.cloneStore(alloc, committed)};
+    defer metadata_table_manager.freeStore(alloc, current[0]);
+    cache.overlay(alloc, &current, 101);
+    try std.testing.expectEqual(@as(u64, 77), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+    try std.testing.expectEqual(metadata_table_manager.RuntimeEmbeddingActivityStatusReport.Phase.embedding, current[0].runtime_statuses[0].indexes[0].embedding_activity.phase);
+
+    // Leadership does not transfer ephemeral observations. A newly elected
+    // metadata service starts unavailable, then resumes projection from the
+    // next current-incarnation owner heartbeat.
+    var new_leader_cache: EmbeddingActivityCache = .{};
+    defer new_leader_cache.deinit(alloc);
+    current[0].runtime_statuses[0].indexes[0].embedding_activity = .{};
+    new_leader_cache.overlay(alloc, &current, 102);
+    try std.testing.expectEqual(@as(u64, 0), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+    try new_leader_cache.update(alloc, &.{committed}, &.{report}, 103);
+    new_leader_cache.overlay(alloc, &current, 104);
+    try std.testing.expectEqual(@as(u64, 77), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+
+    // Activity-only reports do not advance durable StoreRecord state. The
+    // cache's own sequence fence must reject reordered observations.
+    var stale_report = report;
+    stale_report.status_generation = report.status_generation - 1;
+    stale_report.embedding_activity_sequence = report.embedding_activity_sequence + 1;
+    var stale_indexes = observed_indexes;
+    stale_indexes[0].embedding_activity.embeddings_computed = 999;
+    var stale_runtime = observed_runtime;
+    stale_runtime[0].indexes = stale_indexes[0..];
+    stale_report.runtime_statuses = stale_runtime[0..];
+    try cache.update(alloc, &.{committed}, &.{stale_report}, 102);
+    current[0].runtime_statuses[0].indexes[0].embedding_activity = .{};
+    cache.overlay(alloc, &current, 103);
+    try std.testing.expectEqual(@as(u64, 12), current[0].runtime_statuses[0].indexes[0].embedding_activity.embeddings_computed);
+
+    // A recreated generation cannot inherit the prior owner's telemetry.
+    current[0].runtime_statuses[0].indexes[0].embedding_activity = .{};
+    current[0].runtime_statuses[0].indexes[0].coverage_generation = 8;
+    cache.overlay(alloc, &current, 104);
+    try std.testing.expectEqual(@as(u64, 0), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+
+    // A new owner sample refreshes liveness; an idempotent replay cannot.
+    current[0].runtime_statuses[0].indexes[0].coverage_generation = 7;
+    var refreshed_report = report;
+    refreshed_report.embedding_activity_sequence += 2;
+    refreshed_report.runtime_statuses[0].indexes[0].embedding_activity.sample_sequence += 1;
+    try cache.update(alloc, &.{committed}, &.{refreshed_report}, 100 + embedding_activity_ttl_ns - 1);
+    cache.overlay(alloc, &current, 100 + embedding_activity_ttl_ns + 1);
+    try std.testing.expectEqual(@as(u64, 77), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+
+    // Expiry models missed heartbeats: status becomes unavailable, never
+    // synthetic idle or inferred embedding.
+    current[0].runtime_statuses[0].indexes[0].embedding_activity = .{};
+    cache.overlay(alloc, &current, 100 + 2 * embedding_activity_ttl_ns);
+    try std.testing.expectEqual(@as(u64, 0), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+
+    var legacy_report = report;
+    legacy_report.embedding_activity_protocol_version = 0;
+    try cache.update(alloc, &.{committed}, &.{legacy_report}, 200);
+    cache.overlay(alloc, &current, 201);
+    try std.testing.expectEqual(@as(u64, 0), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+}
+
+test "metadata service activity cache distinguishes observation gaps from observed idle" {
+    const alloc = std.testing.allocator;
+    var committed_indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
+        .name = "semantic",
+        .kind = "dense_vector",
+        .coverage_generation = 7,
+        .coverage_config_hash = 9,
+    }};
+    var committed_runtime = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .group_id = 11,
+        .indexes = committed_indexes[0..],
+    }};
+    const committed = metadata_table_manager.StoreRecord{
+        .store_id = 3,
+        .node_id = 4,
+        .reporter_incarnation = 0x1234,
+        .status_generation = 5,
+        .runtime_statuses = committed_runtime[0..],
+    };
+
+    var active_indexes = committed_indexes;
+    active_indexes[0].embedding_activity_observed = true;
+    active_indexes[0].embedding_activity = .{
+        .epoch = 77,
+        .sample_sequence = 1,
+        .phase = .embedding,
+        .embeddings_computed = 12,
+    };
+    var active_runtime = committed_runtime;
+    active_runtime[0].indexes = active_indexes[0..];
+    const active_report = metadata_table_manager.StoreStatusReport{
+        .store_id = 3,
+        .embedding_activity_protocol_version = embedding_activity_protocol_version,
+        .embedding_activity_sequence = 1,
+        .reporter_incarnation = 0x1234,
+        .status_generation = 6,
+        .runtime_statuses = active_runtime[0..],
+    };
+
+    var cache: EmbeddingActivityCache = .{};
+    defer cache.deinit(alloc);
+    try cache.update(alloc, &.{committed}, &.{active_report}, 100);
+
+    // A newer durable snapshot can miss the lifecycle lock. Preserve the last
+    // explicit owner sample, but do not turn the miss into a heartbeat.
+    var unavailable_runtime = committed_runtime;
+    unavailable_runtime[0].indexes = committed_indexes[0..];
+    var unavailable_report = active_report;
+    unavailable_report.status_generation = 7;
+    unavailable_report.embedding_activity_sequence = 2;
+    unavailable_report.runtime_statuses = unavailable_runtime[0..];
+    try cache.update(alloc, &.{committed}, &.{unavailable_report}, 120);
+
+    var current = [_]metadata_table_manager.StoreRecord{try metadata_table_manager.cloneStore(alloc, committed)};
+    defer metadata_table_manager.freeStore(alloc, current[0]);
+    cache.overlay(alloc, &current, 121);
+    try std.testing.expectEqual(@as(u64, 77), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+    current[0].runtime_statuses[0].indexes[0].embedding_activity = .{};
+    cache.overlay(alloc, &current, 100 + embedding_activity_ttl_ns);
+    try std.testing.expectEqual(@as(u64, 0), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+
+    // Idle is an observed owner state, not an absence. It replaces active
+    // telemetry immediately and remains distinguishable from unavailable.
+    var resumed_report = active_report;
+    resumed_report.status_generation = 8;
+    resumed_report.embedding_activity_sequence = 3;
+    try cache.update(alloc, &.{committed}, &.{resumed_report}, 200 + embedding_activity_ttl_ns);
+    var idle_indexes = active_indexes;
+    idle_indexes[0].embedding_activity.phase = .idle;
+    idle_indexes[0].embedding_activity.sample_sequence = 2;
+    idle_indexes[0].embedding_activity.active_batch_size = 0;
+    var idle_runtime = committed_runtime;
+    idle_runtime[0].indexes = idle_indexes[0..];
+    var idle_report = active_report;
+    idle_report.status_generation = 9;
+    idle_report.embedding_activity_sequence = 4;
+    idle_report.runtime_statuses = idle_runtime[0..];
+    try cache.update(alloc, &.{committed}, &.{idle_report}, 201 + embedding_activity_ttl_ns);
+    cache.overlay(alloc, &current, 202 + embedding_activity_ttl_ns);
+    try std.testing.expectEqual(@as(u64, 77), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+    try std.testing.expectEqual(
+        metadata_table_manager.RuntimeEmbeddingActivityStatusReport.Phase.idle,
+        current[0].runtime_statuses[0].indexes[0].embedding_activity.phase,
     );
 }
 
@@ -9688,6 +10615,11 @@ test "metadata service gates mandatory native restore identity until protocol ac
         ready: bool,
 
         fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
+            return true;
+        }
+
+        fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
+            _ = required_version;
             return true;
         }
 
@@ -9722,7 +10654,8 @@ test "metadata service defers reporter fence transitions while activation is unk
         upserts: usize = 0,
         last_reporter_incarnation: u64 = 0,
 
-        fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
+        fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
+            _ = required_version;
             return false;
         }
 
@@ -9782,7 +10715,8 @@ test "metadata service status reporting never proposes deletion of committed rep
         upserts: usize = 0,
         proposed_repair_status: bool = false,
 
-        fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
+        fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
+            _ = required_version;
             return false;
         }
 
@@ -9799,6 +10733,7 @@ test "metadata service status reporting never proposes deletion of committed rep
         .coverage_generation = 7,
         .coverage_config_hash = 8,
         .coverage_identity_ready = true,
+        .lifecycle_work_class = .repair,
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
     }};
@@ -9838,6 +10773,7 @@ test "metadata service status reporting never proposes deletion of committed rep
     // Absence is also a repair-state transition. A legacy/null heartbeat must
     // not clear a committed repair fact while activation is unavailable.
     observed_indexes[0].doc_count = 12;
+    observed_indexes[0].lifecycle_work_class = .none;
     observed_indexes[0].repair_status = null;
     observed_indexes[0].repair_active_generation_serviceable = false;
     try std.testing.expectEqual(
@@ -10028,6 +10964,21 @@ fn ensureCdcWorkPermit(service: anytype) !void {
         return;
     }
 
+    const locked_now_ms = service.reconcile_lease.nowMs();
+    if (cdcLocalLeaseHasRenewalMargin(&service.reconcile_lease, locked_now_ms)) {
+        // Leadership plus an applied, unexpired local lease is already the
+        // authority needed by this owner. No other node can acquire the lease
+        // before expiry, so re-reading the projected store on every provider
+        // checkpoint adds latency and can turn a transient projection miss
+        // into a false work failure. Projection I/O remains mandatory once
+        // the renewal margin is reached.
+        service.cdc_permit_check_after_ns.store(
+            locked_now_ns +| permit_cache_ns,
+            .release,
+        );
+        return;
+    }
+
     const renew_timeout_ns = @min(
         linearizable_metadata_read_timeout_ns,
         service.reconcile_lease.config.lease_ttl_ms *| std.time.ns_per_ms,
@@ -10072,6 +11023,40 @@ fn ensureCdcWorkPermit(service: anytype) !void {
         platform_clock.Clock.real().sleepMs(1);
     }
     return error.CdcWorkLeaseRenewalTimeout;
+}
+
+fn cdcLocalLeaseHasRenewalMargin(
+    lease: *const metadata_reconcile_lease.State,
+    now_ms: u64,
+) bool {
+    if (!lease.config.enabled or !lease.held_by_local or
+        lease.owner_node_id != lease.local_node_id)
+        return false;
+    const minimum_remaining_ms = @max(
+        @as(u64, 1),
+        lease.config.lease_ttl_ms / 2,
+    );
+    return lease.expires_at_ms > now_ms +| minimum_remaining_ms;
+}
+
+test "cdc work permit reuses an applied local lease only before its renewal margin" {
+    var lease = metadata_reconcile_lease.State.init(7, .{
+        .lease_ttl_ms = 5_000,
+    });
+    try std.testing.expect(!cdcLocalLeaseHasRenewalMargin(&lease, 10_000));
+
+    _ = lease.observe(true, .{
+        .owner_node_id = 7,
+        .expires_at_ms = 15_001,
+    }, 10_000);
+    try std.testing.expect(cdcLocalLeaseHasRenewalMargin(&lease, 10_000));
+    try std.testing.expect(!cdcLocalLeaseHasRenewalMargin(&lease, 12_501));
+
+    _ = lease.observe(true, .{
+        .owner_node_id = 8,
+        .expires_at_ms = 20_000,
+    }, 12_501);
+    try std.testing.expect(!cdcLocalLeaseHasRenewalMargin(&lease, 12_501));
 }
 
 fn cdcWorkDeadlineNs(service: anytype) !u64 {
@@ -10663,25 +11648,39 @@ fn reportStoreStatusesWithProjected(
     projected: []metadata_table_manager.StoreRecord,
     reports: []const metadata_table_manager.StoreStatusReport,
 ) !usize {
-    // Reporter fences and both publishing and clearing repair facts are v13
-    // transitions. Avoid the activation lookup for the overwhelmingly common
-    // all-v12 case, but fail closed as soon as either side carries v13 state.
-    // Otherwise a status report could introduce an unreadable record or erase
-    // committed causal authority during startup or a transient marker failure.
+    // Runtime activity is a volatile heartbeat projection and never reaches
+    // this durable proposal path. All new admission/restore safety facts move
+    // together at the V15 profile boundary; V12 remains the only downgrade.
     const repair_status_transition_possible = reportsHaveRuntimeRepairStatus(reports) or
         storesHaveRuntimeRepairStatus(projected);
-    const current_protocol_transition_possible = repair_status_transition_possible or
-        reportsHaveRuntimeReporterFence(reports) or
+    const artifact_source_transition_possible = reportsHaveRuntimeArtifactSourceStatus(reports) or
+        storesHaveRuntimeArtifactSourceStatus(projected);
+    const reporter_fence_transition_possible = reportsHaveRuntimeReporterFence(reports) or
         storesHaveRuntimeReporterFence(projected);
-    const current_protocol_ready = !current_protocol_transition_possible or
-        service.runtimeStatusRepairProtocolReady();
-    const include_repair_status = !repair_status_transition_possible or current_protocol_ready;
+    const required_version = if (storesHaveNativeGenerationRestoreCapability(projected) or
+        repair_status_transition_possible or artifact_source_transition_possible or
+        reporter_fence_transition_possible)
+        metadata_runtime_status_protocol.current_record_version
+    else
+        metadata_runtime_status_protocol.v0_2_0_record_version;
+    const supported_version = highestSupportedRuntimeStatusVersion(service, required_version);
+    const include_repair_status = !repair_status_transition_possible or
+        supported_version == metadata_runtime_status_protocol.current_record_version;
     var changed_indices = std.ArrayListUnmanaged(usize).empty;
     defer changed_indices.deinit(service.alloc);
     for (reports) |report| {
         if (!metadata_table_manager.reporterFenceValid(
             report.reporter_incarnation,
             report.status_generation,
+        )) return error.InvalidStoreReporterFence;
+        if (!metadata_table_manager.embeddingActivityReportValid(
+            report.reporter_incarnation,
+            report.embedding_activity_protocol_version,
+            report.embedding_activity_sequence,
+        )) return error.InvalidStoreReporterFence;
+        if (!metadata_table_manager.embeddingActivitySamplesValid(
+            report.embedding_activity_protocol_version,
+            report.runtime_statuses,
         )) return error.InvalidStoreReporterFence;
         const index = metadata_store_observer.findStoreIndex(projected, report.store_id) orelse return error.UnknownStore;
         if (!metadata_store_observer.observationChangesRecordWithRepairStatus(
@@ -10699,14 +11698,36 @@ fn reportStoreStatusesWithProjected(
         include_repair_status,
     );
     for (changed_indices.items) |index| {
-        // If committed v13 facts were preserved while activation is unknown,
-        // do not feed them through the proposal-boundary downgrade (which has
-        // no prior-record context and would erase them). The heartbeat is
-        // retried after the background probe or durable marker becomes visible.
-        if (!current_protocol_ready and
-            (storeHasRuntimeRepairStatus(projected[index]) or
-                projected[index].reporter_incarnation != 0)) continue;
-        try service.upsertStore(projected[index]);
+        const record = projected[index];
+        // Never feed a preserved committed fact through a lower-version
+        // proposal boundary. The heartbeat is retried after the background
+        // capability probe or durable activation marker becomes visible.
+        if (runtimeStatusMandatoryRecordVersion(record) > supported_version) continue;
+        if (runtimeStatusRequiredRecordVersion(record) <= supported_version) {
+            try service.upsertStore(record);
+            continue;
+        }
+        var proposal = try metadata_table_manager.cloneStore(service.alloc, record);
+        defer metadata_table_manager.freeStore(service.alloc, proposal);
+        stripRuntimeStatusAboveVersion(service.alloc, &proposal, supported_version);
+        try service.upsertStore(proposal);
+    }
+    // Cache owner heartbeats only after every required durable proposal was
+    // accepted. A follower or failed request must not retain an observation
+    // that its leader never accepted. Counter-only reports still reach this
+    // point without producing a Raft proposal.
+    if (comptime @hasField(@TypeOf(service.*), "embedding_activity_cache")) {
+        service.embedding_activity_cache.update(
+            service.alloc,
+            projected,
+            reports,
+            platform_time.monotonicNs(),
+        ) catch |err| {
+            // Telemetry is deliberately best-effort. Durable status has
+            // already been accepted and must never fail because this bounded
+            // volatile cache is under memory pressure.
+            std.log.warn("embedding activity cache update skipped err={s}", .{@errorName(err)});
+        };
     }
     return applied;
 }

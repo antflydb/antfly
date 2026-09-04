@@ -27,7 +27,9 @@ SPARSE_MODEL = "sparse-encoder-testing/splade-bert-tiny-nq-onnx"
 
 
 def assert_sparse_close(a, b, tol=1e-2):
-    assert a["indices"] == b["indices"], "Repeated text should activate the same sparse indices"
+    assert a["indices"] == b["indices"], (
+        "Repeated text should activate the same sparse indices"
+    )
     assert len(a["values"]) == len(b["values"])
     max_delta = max(abs(av - bv) for av, bv in zip(a["values"], b["values"]))
     assert max_delta <= tol, f"Repeated text values differ by {max_delta:.6f}"
@@ -68,7 +70,9 @@ def test_sparse_indices_sorted(sparse_resp):
     """Indices should be sorted ascending."""
     sv = sparse_resp["data"][0]["embedding"]
     for i in range(1, len(sv["indices"])):
-        assert sv["indices"][i] > sv["indices"][i - 1], "Indices should be sorted ascending"
+        assert sv["indices"][i] > sv["indices"][i - 1], (
+            "Indices should be sorted ascending"
+        )
 
 
 def test_sparse_values_positive(sparse_resp):
@@ -91,10 +95,13 @@ def test_sparse_batch_is_deterministic_and_text_sensitive(api):
         "tomorrow rain weather forecast",
         "neural network training",
     ]
-    r = api.post("/embed", json={
-        "model": SPARSE_MODEL,
-        "input": texts,
-    })
+    r = api.post(
+        "/embed",
+        json={
+            "model": SPARSE_MODEL,
+            "input": texts,
+        },
+    )
     if r.status_code == 404:
         pytest.skip(f"Sparse model {SPARSE_MODEL} not available")
     r.raise_for_status()

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceEmbedRequestEncodingFormat(str, Enum):
+class InferenceEmbedRequestEncodingFormat(StrEnum):
     FLOAT = "float"
 
     def __str__(self) -> str:

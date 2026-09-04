@@ -30,6 +30,8 @@ pub const RenderError = error{
 };
 
 pub const RenderConfig = struct {
+    remote_content: ?*const scraping.RemoteContentConfig = null,
+    secret_store: ?*common_secrets.FileStore = null,
     io: ?std.Io = null,
     deadline_ns: ?u64 = null,
     max_media_parts: ?usize = null,
@@ -196,6 +198,23 @@ pub fn downloadRemoteContentOutcomeAllocWithConfig(
         &security,
         null,
         null,
+    );
+}
+
+pub fn downloadRemoteContentOutcomeAllocWithRenderConfig(
+    alloc: Allocator,
+    config: RenderConfig,
+    url: []const u8,
+    credential_name: ?[]const u8,
+) !scraping.DownloadOutcome {
+    _ = config.io;
+    _ = config.deadline_ns;
+    return try downloadRemoteContentOutcomeAllocWithConfig(
+        alloc,
+        config.remote_content,
+        config.secret_store,
+        url,
+        credential_name,
     );
 }
 

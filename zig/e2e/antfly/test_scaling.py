@@ -63,11 +63,15 @@ class MetadataMutationNotAdmitted(requests.HTTPError):
     """The contacted replica explicitly rejected a mutation before admission."""
 
 
-def _raise_for_metadata_mutation(response: requests.Response, *, operation: str) -> None:
+def _raise_for_metadata_mutation(
+    response: requests.Response, *, operation: str
+) -> None:
     status = response.status_code
     if (
         status == 503
-        and response.headers.get(METADATA_MUTATION_NOT_ADMITTED_HEADER, "").strip().lower()
+        and response.headers.get(METADATA_MUTATION_NOT_ADMITTED_HEADER, "")
+        .strip()
+        .lower()
         == METADATA_MUTATION_NOT_ADMITTED_VALUE
     ):
         raise MetadataMutationNotAdmitted(
@@ -77,7 +81,9 @@ def _raise_for_metadata_mutation(response: requests.Response, *, operation: str)
     if 400 <= status < 500 and status not in AMBIGUOUS_METADATA_CLIENT_STATUSES:
         detail = response.text.strip()[:512]
         suffix = f": {detail}" if detail else ""
-        raise MetadataMutationRejected(f"{operation} rejected with HTTP {status}{suffix}")
+        raise MetadataMutationRejected(
+            f"{operation} rejected with HTTP {status}{suffix}"
+        )
     response.raise_for_status()
 
 
@@ -202,21 +208,29 @@ def test_metadata_mutation_response_distinguishes_rejection_from_ambiguity():
 
     follower = requests.Response()
     follower.status_code = 503
-    follower.headers[METADATA_MUTATION_NOT_ADMITTED_HEADER] = METADATA_MUTATION_NOT_ADMITTED_VALUE
+    follower.headers[METADATA_MUTATION_NOT_ADMITTED_HEADER] = (
+        METADATA_MUTATION_NOT_ADMITTED_VALUE
+    )
     with pytest.raises(MetadataMutationNotAdmitted, match="before admission"):
         _raise_for_metadata_mutation(follower, operation="trigger reallocation")
 
 
-def test_metadata_mutation_routes_only_explicit_non_admission_proof(monkeypatch: pytest.MonkeyPatch):
+def test_metadata_mutation_routes_only_explicit_non_admission_proof(
+    monkeypatch: pytest.MonkeyPatch,
+):
     attempted: list[str] = []
 
-    def explicit_rejection_then_admission(method: str, url: str, **kwargs: Any) -> requests.Response:
+    def explicit_rejection_then_admission(
+        method: str, url: str, **kwargs: Any
+    ) -> requests.Response:
         del method, kwargs
         attempted.append(url)
         response = requests.Response()
         if len(attempted) == 1:
             response.status_code = 503
-            response.headers[METADATA_MUTATION_NOT_ADMITTED_HEADER] = METADATA_MUTATION_NOT_ADMITTED_VALUE
+            response.headers[METADATA_MUTATION_NOT_ADMITTED_HEADER] = (
+                METADATA_MUTATION_NOT_ADMITTED_VALUE
+            )
         else:
             response.status_code = 202
         return response
@@ -267,13 +281,17 @@ def test_metadata_mutation_submission_is_state_driven_and_at_most_once():
         nonlocal submissions
         submissions += 1
 
-    observed, error = _submit_metadata_mutation_if_unobserved(observe=observe, submit=submit)
+    observed, error = _submit_metadata_mutation_if_unobserved(
+        observe=observe, submit=submit
+    )
     assert observed == {"ready": True}
     assert error is None
     assert submissions == 0
 
     state = None
-    observed, error = _submit_metadata_mutation_if_unobserved(observe=observe, submit=submit)
+    observed, error = _submit_metadata_mutation_if_unobserved(
+        observe=observe, submit=submit
+    )
     assert observed is None
     assert error is None
     assert submissions == 1
@@ -342,7 +360,9 @@ def test_metadata_mutation_submission_is_state_driven_and_at_most_once():
         submissions += 1
         raise requests.Timeout("response lost after submission")
 
-    observed, error = _submit_metadata_mutation_if_unobserved(observe=observe, submit=lose_response)
+    observed, error = _submit_metadata_mutation_if_unobserved(
+        observe=observe, submit=lose_response
+    )
     assert observed is None
     assert error is not None and "response lost after submission" in error
     assert submissions == 6
@@ -504,7 +524,9 @@ def _metadata_admin_url(stateful_api) -> str:
     server = getattr(stateful_api, "_server", None)
     admin_url = getattr(server, "metadata_admin_url", None)
     if not admin_url:
-        pytest.skip("node shutdown e2e requires the local stateful metadata admin server")
+        pytest.skip(
+            "node shutdown e2e requires the local stateful metadata admin server"
+        )
     return str(admin_url).rstrip("/")
 
 
@@ -518,7 +540,9 @@ def _find_store(snapshot: dict, store_id: int) -> dict:
     for store in snapshot.get("stores", []):
         if isinstance(store, dict) and store.get("store_id") == store_id:
             return store
-    raise AssertionError(f"store {store_id} not found in metadata snapshot: {snapshot!r}")
+    raise AssertionError(
+        f"store {store_id} not found in metadata snapshot: {snapshot!r}"
+    )
 
 
 def _maybe_find_store(snapshot: dict, store_id: int) -> dict | None:
@@ -850,7 +874,9 @@ class MultiNodeScalingCluster:
         self.root = Path(self.tempdir.name)
         self.max_shard_size_bytes = max_shard_size_bytes
         self.startup_deadline = (
-            _ClusterStartupDeadline(startup_deadline_at) if startup_deadline_at is not None else None
+            _ClusterStartupDeadline(startup_deadline_at)
+            if startup_deadline_at is not None
+            else None
         )
         self.port_reservations = LoopbackPortReservations(self.host)
         self.metadata_nodes: list[dict[str, int]] = []
@@ -886,12 +912,16 @@ class MultiNodeScalingCluster:
 
     @property
     def metadata_urls(self) -> list[str]:
-        return [f"http://{self.host}:{node['api_port']}" for node in self.metadata_nodes]
+        return [
+            f"http://{self.host}:{node['api_port']}" for node in self.metadata_nodes
+        ]
 
     @property
     def data_api_urls(self) -> list[str]:
         return [
-            antfly_public_api_url(f"http://{self.host}:{node['api_port']}", binary=self.binary)
+            antfly_public_api_url(
+                f"http://{self.host}:{node['api_port']}", binary=self.binary
+            )
             for node in self.data_nodes
         ]
 
@@ -909,7 +939,9 @@ class MultiNodeScalingCluster:
         return urls
 
     def data_api_url_for_node(self, node: dict[str, int]) -> str:
-        return antfly_public_api_url(self.data_base_url_for_node(node), binary=self.binary)
+        return antfly_public_api_url(
+            self.data_base_url_for_node(node), binary=self.binary
+        )
 
     def data_base_url_for_node(self, node: dict[str, int]) -> str:
         return f"http://{self.host}:{node['api_port']}"
@@ -990,14 +1022,20 @@ class MultiNodeScalingCluster:
             )
 
         for url in self.metadata_urls:
-            if not wait_for_server(url, timeout=self.startup_timeout(30.0), path="/metadata/v1/status"):
-                raise RuntimeError(f"Metadata node failed to start at {url}\n{self.debug_logs()}")
+            if not wait_for_server(
+                url, timeout=self.startup_timeout(30.0), path="/metadata/v1/status"
+            ):
+                raise RuntimeError(
+                    f"Metadata node failed to start at {url}\n{self.debug_logs()}"
+                )
         self.startup_sleep(1.0)
 
         for node in self.data_nodes:
             self._start_data_node(node)
 
-        self._wait_for_data_nodes_http(self.data_nodes, max_timeout_s=60.0, label="Data node process")
+        self._wait_for_data_nodes_http(
+            self.data_nodes, max_timeout_s=60.0, label="Data node process"
+        )
         if not self.wait_for_all_data_nodes_registered(
             timeout_s=self.startup_timeout(DATA_NODE_REGISTRATION_TIMEOUT_S)
         ):
@@ -1029,7 +1067,11 @@ class MultiNodeScalingCluster:
         node_id = int(node["id"])
         attempt = self.data_start_attempts.get(node_id, 0) + 1
         self.data_start_attempts[node_id] = attempt
-        log_name = f"data-{node_id}.log" if attempt == 1 else f"data-{node_id}-attempt-{attempt}.log"
+        log_name = (
+            f"data-{node_id}.log"
+            if attempt == 1
+            else f"data-{node_id}-attempt-{attempt}.log"
+        )
         log = self._open_log(log_name)
         self.data_log_handles[node_id] = log
         self.data_log_paths[node_id] = self.root / log_name
@@ -1105,10 +1147,14 @@ class MultiNodeScalingCluster:
         return True
 
     def add_data_node(self) -> dict[str, int]:
-        node = self._new_data_node(max(int(existing["id"]) for existing in self.data_nodes) + 1)
+        node = self._new_data_node(
+            max(int(existing["id"]) for existing in self.data_nodes) + 1
+        )
         self.data_nodes.append(node)
         self._start_data_node(node)
-        self._wait_for_data_nodes_http([node], max_timeout_s=60.0, label="Added data node process")
+        self._wait_for_data_nodes_http(
+            [node], max_timeout_s=60.0, label="Added data node process"
+        )
         if not self.wait_for_data_nodes_registered({int(node["id"])}, timeout_s=60.0):
             raise RuntimeError(
                 f"Added data node {node['id']} did not register on all metadata nodes\n"
@@ -1143,7 +1189,9 @@ class MultiNodeScalingCluster:
             for node_id, node in list(pending.items()):
                 proc = self.data_proc_by_node_id.get(node_id)
                 if proc is not None and proc.poll() is not None:
-                    if not public_api and self._retry_data_node_after_bind_collision(node):
+                    if not public_api and self._retry_data_node_after_bind_collision(
+                        node
+                    ):
                         consecutive_successes[node_id] = 0
                         last_probe[node_id] = (
                             f"startup attempt {self.data_start_attempts[node_id] - 1} "
@@ -1155,7 +1203,11 @@ class MultiNodeScalingCluster:
                         f"{self.debug_logs()}"
                     )
 
-                url = self.data_api_url_for_node(node) if public_api else self.data_base_url_for_node(node)
+                url = (
+                    self.data_api_url_for_node(node)
+                    if public_api
+                    else self.data_base_url_for_node(node)
+                )
                 try:
                     response = requests.get(f"{url}{path}", timeout=request_timeout)
                     if response.ok:
@@ -1164,7 +1216,9 @@ class MultiNodeScalingCluster:
                             del pending[node_id]
                         continue
                     consecutive_successes[node_id] = 0
-                    last_probe[node_id] = f"{response.status_code}: {response.text[:500]}"
+                    last_probe[node_id] = (
+                        f"{response.status_code}: {response.text[:500]}"
+                    )
                 except requests.RequestException as exc:
                     consecutive_successes[node_id] = 0
                     last_probe[node_id] = repr(exc)
@@ -1174,7 +1228,9 @@ class MultiNodeScalingCluster:
         if pending:
             pending_urls = {
                 node_id: (
-                    self.data_api_url_for_node(node) if public_api else self.data_base_url_for_node(node)
+                    self.data_api_url_for_node(node)
+                    if public_api
+                    else self.data_base_url_for_node(node)
                 )
                 for node_id, node in pending.items()
             }
@@ -1185,11 +1241,15 @@ class MultiNodeScalingCluster:
                 f"{self.debug_logs()}"
             )
 
-    def _ensure_data_nodes_running(self, expected_node_ids: set[int], *, label: str) -> None:
+    def _ensure_data_nodes_running(
+        self, expected_node_ids: set[int], *, label: str
+    ) -> None:
         for node_id in sorted(expected_node_ids):
             proc = self.data_proc_by_node_id.get(node_id)
             if proc is None:
-                raise RuntimeError(f"{label} {node_id} has no process\n{self.debug_logs()}")
+                raise RuntimeError(
+                    f"{label} {node_id} has no process\n{self.debug_logs()}"
+                )
             if proc.poll() is not None:
                 raise RuntimeError(
                     f"{label} {node_id} exited while waiting for registration rc={proc.returncode}\n"
@@ -1210,7 +1270,9 @@ class MultiNodeScalingCluster:
 
     def metadata_snapshot(self, index: int | None = None) -> dict[str, Any]:
         if index is not None:
-            response = requests.get(f"{self.metadata_urls[index]}/metadata/v1/admin/snapshot", timeout=10)
+            response = requests.get(
+                f"{self.metadata_urls[index]}/metadata/v1/admin/snapshot", timeout=10
+            )
             response.raise_for_status()
             payload = response.json()
             assert isinstance(payload, dict)
@@ -1236,7 +1298,9 @@ class MultiNodeScalingCluster:
         except Exception as exc:
             return f"<metadata snapshot unavailable: {exc!r}>"
 
-    def post_metadata(self, path: str, *, json_body: dict[str, Any] | None = None) -> requests.Response:
+    def post_metadata(
+        self, path: str, *, json_body: dict[str, Any] | None = None
+    ) -> requests.Response:
         last_error: Exception | None = None
         for url in self.metadata_urls:
             try:
@@ -1255,7 +1319,9 @@ class MultiNodeScalingCluster:
             raise last_error
         raise AssertionError("cluster has no metadata URLs")
 
-    def put_metadata(self, path: str, *, json_body: dict[str, Any] | None = None) -> requests.Response:
+    def put_metadata(
+        self, path: str, *, json_body: dict[str, Any] | None = None
+    ) -> requests.Response:
         last_error: Exception | None = None
         for url in self.metadata_urls:
             try:
@@ -1310,25 +1376,42 @@ class MultiNodeScalingCluster:
         )
 
     def metadata_snapshot_from(self, index: int) -> dict[str, Any]:
-        response = requests.get(f"{self.metadata_urls[index]}/metadata/v1/admin/snapshot", timeout=10)
+        response = requests.get(
+            f"{self.metadata_urls[index]}/metadata/v1/admin/snapshot", timeout=10
+        )
         response.raise_for_status()
         payload = response.json()
         assert isinstance(payload, dict)
         return payload
 
-    def wait_for_all_data_nodes_registered(self, *, timeout_s: float) -> dict[str, Any] | None:
-        return self.wait_for_data_nodes_registered({int(node["id"]) for node in self.data_nodes}, timeout_s=timeout_s)
+    def wait_for_all_data_nodes_registered(
+        self, *, timeout_s: float
+    ) -> dict[str, Any] | None:
+        return self.wait_for_data_nodes_registered(
+            {int(node["id"]) for node in self.data_nodes}, timeout_s=timeout_s
+        )
 
-    def wait_for_data_nodes_registered(self, expected_node_ids: set[int], *, timeout_s: float) -> dict[str, Any] | None:
+    def wait_for_data_nodes_registered(
+        self, expected_node_ids: set[int], *, timeout_s: float
+    ) -> dict[str, Any] | None:
         def registered_on_all_metadata_nodes() -> dict[str, Any] | None:
-            self._ensure_data_nodes_running(expected_node_ids, label="Data node process")
+            self._ensure_data_nodes_running(
+                expected_node_ids, label="Data node process"
+            )
             try:
-                snapshots = [self.metadata_snapshot(index) for index in range(len(self.metadata_urls))]
+                snapshots = [
+                    self.metadata_snapshot(index)
+                    for index in range(len(self.metadata_urls))
+                ]
             except (AssertionError, requests.RequestException):
                 return None
             nodes_by_id = {int(node["id"]): node for node in self.data_nodes}
             for snapshot in snapshots:
-                stores = [store for store in snapshot.get("stores", []) if isinstance(store, dict)]
+                stores = [
+                    store
+                    for store in snapshot.get("stores", [])
+                    if isinstance(store, dict)
+                ]
                 by_node = {int(store.get("node_id", 0)): store for store in stores}
                 if not expected_node_ids.issubset(by_node):
                     return None
@@ -1337,11 +1420,16 @@ class MultiNodeScalingCluster:
                     store = by_node[node["id"]]
                     if store.get("api_url") != f"http://{self.host}:{node['api_port']}":
                         return None
-                    if store.get("raft_url") != f"http://{self.host}:{node['raft_port']}":
+                    if (
+                        store.get("raft_url")
+                        != f"http://{self.host}:{node['raft_port']}"
+                    ):
                         return None
             return snapshots[0]
 
-        return wait_until(registered_on_all_metadata_nodes, timeout_s=timeout_s, interval_s=0.5)
+        return wait_until(
+            registered_on_all_metadata_nodes, timeout_s=timeout_s, interval_s=0.5
+        )
 
     def create_table(self, table_name: str, *, num_shards: int) -> None:
         last_error: str | None = None
@@ -1384,20 +1472,31 @@ class MultiNodeScalingCluster:
         def intent_visible_on_all_metadata_nodes() -> dict[str, Any] | None:
             nonlocal last_observation_error
             try:
-                snapshots = [self.metadata_snapshot(index) for index in range(len(self.metadata_urls))]
+                snapshots = [
+                    self.metadata_snapshot(index)
+                    for index in range(len(self.metadata_urls))
+                ]
             except (AssertionError, requests.RequestException) as exc:
                 last_observation_error = repr(exc)
                 return None
             last_observation_error = None
             for snapshot in snapshots:
-                nodes = [node for node in snapshot.get("nodes", []) if isinstance(node, dict)]
-                stores = [store for store in snapshot.get("stores", []) if isinstance(store, dict)]
+                nodes = [
+                    node for node in snapshot.get("nodes", []) if isinstance(node, dict)
+                ]
+                stores = [
+                    store
+                    for store in snapshot.get("stores", [])
+                    if isinstance(store, dict)
+                ]
                 node_draining = any(
-                    int(node.get("node_id", 0)) == node_id and node.get("lifecycle") == "draining"
+                    int(node.get("node_id", 0)) == node_id
+                    and node.get("lifecycle") == "draining"
                     for node in nodes
                 )
                 store_draining = any(
-                    int(store.get("node_id", 0)) == node_id and store.get("drain_requested") is True
+                    int(store.get("node_id", 0)) == node_id
+                    and store.get("drain_requested") is True
                     for store in stores
                 )
                 if not node_draining and not store_draining:
@@ -1414,7 +1513,11 @@ class MultiNodeScalingCluster:
             ),
         )
         if visible is None:
-            visible = wait_until(intent_visible_on_all_metadata_nodes, timeout_s=timeout_s, interval_s=0.5)
+            visible = wait_until(
+                intent_visible_on_all_metadata_nodes,
+                timeout_s=timeout_s,
+                interval_s=0.5,
+            )
 
         assert visible is not None, (
             f"node shutdown intent did not become visible on all metadata nodes for {node_id}\n"
@@ -1431,14 +1534,23 @@ class MultiNodeScalingCluster:
         def finalized_visible_on_all_metadata_nodes() -> dict[str, Any] | None:
             nonlocal last_observation_error
             try:
-                snapshots = [self.metadata_snapshot(index) for index in range(len(self.metadata_urls))]
+                snapshots = [
+                    self.metadata_snapshot(index)
+                    for index in range(len(self.metadata_urls))
+                ]
             except (AssertionError, requests.RequestException) as exc:
                 last_observation_error = repr(exc)
                 return None
             last_observation_error = None
             for snapshot in snapshots:
-                nodes = [node for node in snapshot.get("nodes", []) if isinstance(node, dict)]
-                stores = [store for store in snapshot.get("stores", []) if isinstance(store, dict)]
+                nodes = [
+                    node for node in snapshot.get("nodes", []) if isinstance(node, dict)
+                ]
+                stores = [
+                    store
+                    for store in snapshot.get("stores", [])
+                    if isinstance(store, dict)
+                ]
                 if any(int(node.get("node_id", 0)) == node_id for node in nodes):
                     return None
                 if any(int(store.get("node_id", 0)) == node_id for store in stores):
@@ -1454,7 +1566,11 @@ class MultiNodeScalingCluster:
             ),
         )
         if finalized is None:
-            finalized = wait_until(finalized_visible_on_all_metadata_nodes, timeout_s=timeout_s, interval_s=0.5)
+            finalized = wait_until(
+                finalized_visible_on_all_metadata_nodes,
+                timeout_s=timeout_s,
+                interval_s=0.5,
+            )
 
         assert finalized is not None, (
             f"node shutdown finalization did not become visible on all metadata nodes for {node_id}\n"
@@ -1478,7 +1594,10 @@ class MultiNodeScalingCluster:
         _retry_metadata_mutation_until_admitted(self.trigger_reallocate_once)
 
     def request_split(self, table_name: str, split_key: str) -> None:
-        response = self.post_metadata(f"/internal/v1/tables/{table_name}/split", json_body={"split_key": split_key})
+        response = self.post_metadata(
+            f"/internal/v1/tables/{table_name}/split",
+            json_body={"split_key": split_key},
+        )
         response.raise_for_status()
 
     def metadata_statuses(self) -> list[dict[str, Any]]:
@@ -1497,7 +1616,9 @@ class MultiNodeScalingCluster:
     def debug_logs(self) -> str:
         for handle in self.log_files:
             handle.flush()
-        return "\n".join(f"[{path.name}]\n{_read_log_tail(path)}" for path in self.log_paths)
+        return "\n".join(
+            f"[{path.name}]\n{_read_log_tail(path)}" for path in self.log_paths
+        )
 
     def native_stack_dumps(self, *, per_process_timeout_s: float = 25.0) -> str:
         """Best-effort `gdb thread apply all bt` for every live node process.
@@ -1509,10 +1630,15 @@ class MultiNodeScalingCluster:
         if shutil.which("gdb") is None:
             return "<gdb not available>"
         parts: list[str] = []
-        for label, procs in (("metadata", self.metadata_procs), ("data", self.data_procs)):
+        for label, procs in (
+            ("metadata", self.metadata_procs),
+            ("data", self.data_procs),
+        ):
             for proc in procs:
                 if proc.poll() is not None:
-                    parts.append(f"[{label} pid {proc.pid}] exited rc={proc.returncode}")
+                    parts.append(
+                        f"[{label} pid {proc.pid}] exited rc={proc.returncode}"
+                    )
                     continue
                 try:
                     result = subprocess.run(
@@ -1532,7 +1658,9 @@ class MultiNodeScalingCluster:
                     )
                     body = result.stdout[-250000:]
                     if result.returncode != 0:
-                        body += f"\n<gdb rc={result.returncode}>\n{result.stderr[-2000:]}"
+                        body += (
+                            f"\n<gdb rc={result.returncode}>\n{result.stderr[-2000:]}"
+                        )
                     parts.append(f"[{label} pid {proc.pid}]\n{body}")
                 except Exception as exc:
                     parts.append(f"[{label} pid {proc.pid}] gdb failed: {exc!r}")
@@ -1545,17 +1673,23 @@ class MultiNodeScalingCluster:
             "node_shutdown_statuses": [],
             "processes": {
                 "metadata": [
-                    {"pid": proc.pid, "returncode": proc.poll()} for proc in self.metadata_procs
+                    {"pid": proc.pid, "returncode": proc.poll()}
+                    for proc in self.metadata_procs
                 ],
                 "data": [
-                    {"pid": proc.pid, "returncode": proc.poll()} for proc in self.data_procs
+                    {"pid": proc.pid, "returncode": proc.poll()}
+                    for proc in self.data_procs
                 ],
             },
         }
         for index, url in enumerate(self.metadata_urls):
             try:
                 diagnostics["metadata_snapshots"].append(
-                    {"index": index, "url": url, "snapshot": self.metadata_snapshot(index)}
+                    {
+                        "index": index,
+                        "url": url,
+                        "snapshot": self.metadata_snapshot(index),
+                    }
                 )
             except Exception as exc:
                 diagnostics["metadata_snapshots"].append(
@@ -1592,7 +1726,11 @@ class MultiNodeScalingCluster:
         self.port_reservations.close()
         if test_failed:
             self.preserve_failure_diagnostics()
-        procs = [proc for proc in [*self.data_procs, *self.metadata_procs] if proc.poll() is None]
+        procs = [
+            proc
+            for proc in [*self.data_procs, *self.metadata_procs]
+            if proc.poll() is None
+        ]
         for proc in procs:
             proc.send_signal(signal.SIGTERM)
         deadline = time.monotonic() + timeout_s
@@ -1664,7 +1802,9 @@ def test_scaling_cluster_retries_data_node_after_bind_collision(tmp_path: Path):
 
 
 @pytest.fixture
-def multi_node_scaling_cluster(request: pytest.FixtureRequest) -> MultiNodeScalingCluster:
+def multi_node_scaling_cluster(
+    request: pytest.FixtureRequest,
+) -> MultiNodeScalingCluster:
     cluster = MultiNodeScalingCluster(_scaling_antfly_binary())
     try:
         yield cluster
@@ -1675,7 +1815,9 @@ def multi_node_scaling_cluster(request: pytest.FixtureRequest) -> MultiNodeScali
 
 @pytest.fixture
 def compact_scaling_cluster(request: pytest.FixtureRequest) -> MultiNodeScalingCluster:
-    cluster = MultiNodeScalingCluster(_scaling_antfly_binary(), initial_data_node_count=3)
+    cluster = MultiNodeScalingCluster(
+        _scaling_antfly_binary(), initial_data_node_count=3
+    )
     try:
         yield cluster
     finally:
@@ -1707,11 +1849,15 @@ def _scaling_antfly_binary() -> str:
     return str(resolved)
 
 
-def _table_group_ids(cluster: MultiNodeScalingCluster, table_name: str) -> set[int] | None:
+def _table_group_ids(
+    cluster: MultiNodeScalingCluster, table_name: str
+) -> set[int] | None:
     return _table_group_ids_from_snapshot(cluster.metadata_snapshot(), table_name)
 
 
-def _table_group_ids_from_snapshot(snapshot: dict[str, Any], table_name: str) -> set[int] | None:
+def _table_group_ids_from_snapshot(
+    snapshot: dict[str, Any], table_name: str
+) -> set[int] | None:
     table_id = None
     for table in snapshot.get("tables", []):
         if isinstance(table, dict) and table.get("name") == table_name:
@@ -1761,11 +1907,17 @@ def _oversized_table_group_ids(
     return oversized_group_ids if oversized_group_ids else None
 
 
-def _placed_nodes_for_groups(cluster: MultiNodeScalingCluster, group_ids: set[int]) -> set[int]:
-    return _placed_nodes_for_groups_from_snapshot(cluster.metadata_snapshot(), group_ids)
+def _placed_nodes_for_groups(
+    cluster: MultiNodeScalingCluster, group_ids: set[int]
+) -> set[int]:
+    return _placed_nodes_for_groups_from_snapshot(
+        cluster.metadata_snapshot(), group_ids
+    )
 
 
-def _placed_nodes_for_groups_from_snapshot(snapshot: dict[str, Any], group_ids: set[int]) -> set[int]:
+def _placed_nodes_for_groups_from_snapshot(
+    snapshot: dict[str, Any], group_ids: set[int]
+) -> set[int]:
     return {
         int(intent["record"]["local_node_id"])
         for intent in snapshot.get("placement_intents", [])
@@ -1775,9 +1927,14 @@ def _placed_nodes_for_groups_from_snapshot(snapshot: dict[str, Any], group_ids: 
     }
 
 
-def _all_metadata_snapshots(cluster: MultiNodeScalingCluster) -> list[dict[str, Any]] | None:
+def _all_metadata_snapshots(
+    cluster: MultiNodeScalingCluster,
+) -> list[dict[str, Any]] | None:
     try:
-        return [cluster.metadata_snapshot(index) for index in range(len(cluster.metadata_urls))]
+        return [
+            cluster.metadata_snapshot(index)
+            for index in range(len(cluster.metadata_urls))
+        ]
     except (AssertionError, requests.RequestException, ValueError):
         return None
 
@@ -1799,7 +1956,11 @@ def _table_write_route_diagnostic(
             "table_name": table_name,
             "table_found": False,
             "min_group_count": min_group_count,
-            "projected_tables": [table.get("name") for table in snapshot.get("tables", []) if isinstance(table, dict)],
+            "projected_tables": [
+                table.get("name")
+                for table in snapshot.get("tables", [])
+                if isinstance(table, dict)
+            ],
         }
 
     group_ids = sorted(
@@ -1827,14 +1988,18 @@ def _table_write_route_diagnostic(
         if leader_store_id != 0:
             leader_store_by_group[group_id] = leader_store_id
 
-    placed_nodes_by_group: dict[int, list[int]] = {group_id: [] for group_id in group_ids}
+    placed_nodes_by_group: dict[int, list[int]] = {
+        group_id: [] for group_id in group_ids
+    }
     for intent in snapshot.get("placement_intents", []):
         if not isinstance(intent, dict) or not isinstance(intent.get("record"), dict):
             continue
         group_id = int(intent["record"].get("group_id", 0))
         if group_id not in placed_nodes_by_group:
             continue
-        placed_nodes_by_group[group_id].append(int(intent["record"].get("local_node_id", 0)))
+        placed_nodes_by_group[group_id].append(
+            int(intent["record"].get("local_node_id", 0))
+        )
     for nodes in placed_nodes_by_group.values():
         nodes.sort()
 
@@ -1846,7 +2011,9 @@ def _table_write_route_diagnostic(
         "group_count": len(group_ids),
         "group_ids": group_ids,
         "missing_group_count": max(0, min_group_count - len(group_ids)),
-        "missing_leader_group_ids": [group_id for group_id in group_ids if group_id not in leader_store_by_group],
+        "missing_leader_group_ids": [
+            group_id for group_id in group_ids if group_id not in leader_store_by_group
+        ],
         "leader_store_by_group": leader_store_by_group,
         "group_statuses": group_statuses,
         "placed_nodes_by_group": placed_nodes_by_group,
@@ -1899,7 +2066,9 @@ def _insert_docs(
                 return api_url
         return None
 
-    api_url = wait_until(route_ready, timeout_s=MULTI_SHARD_WRITE_ROUTE_TIMEOUT_S, interval_s=0.5)
+    api_url = wait_until(
+        route_ready, timeout_s=MULTI_SHARD_WRITE_ROUTE_TIMEOUT_S, interval_s=0.5
+    )
     assert api_url is not None, (
         f"table {table_name} never exposed a live write endpoint before seed batch\n"
         f"route readiness: {json.dumps(_table_write_route_diagnostic(cluster, table_name, min_group_count=min_group_count), indent=2, sort_keys=True)}\n"
@@ -1974,7 +2143,10 @@ def _data_api_urls_for_table(
         return []
     group_ids: list[int] = []
     for table_range in snapshot.get("ranges", []):
-        if isinstance(table_range, dict) and int(table_range.get("table_id", 0)) == table_id:
+        if (
+            isinstance(table_range, dict)
+            and int(table_range.get("table_id", 0)) == table_id
+        ):
             group_ids.append(int(table_range.get("group_id", 0)))
     if len(group_ids) < min_group_count:
         return []
@@ -1990,7 +2162,9 @@ def _data_api_urls_for_table(
         raw_leader = int(status.get("leader_store_id", 0))
         if raw_leader != 0:
             leader_store_by_group[group_id] = raw_leader
-    if require_all_group_leaders and any(group_id not in leader_store_by_group for group_id in group_ids):
+    if require_all_group_leaders and any(
+        group_id not in leader_store_by_group for group_id in group_ids
+    ):
         return []
 
     urls: list[str] = []
@@ -2022,7 +2196,8 @@ def _data_api_urls_for_table(
     placed_node_ids = {
         int(intent.get("record", {}).get("local_node_id", 0))
         for intent in snapshot.get("placement_intents", [])
-        if isinstance(intent, dict) and int(intent.get("record", {}).get("group_id", 0)) == group_id
+        if isinstance(intent, dict)
+        and int(intent.get("record", {}).get("group_id", 0)) == group_id
     }
     for node in cluster.data_nodes:
         if int(node["id"]) in placed_node_ids:
@@ -2061,7 +2236,8 @@ def _wait_for_group_count(
     group_ids = wait_until(
         lambda: (
             groups
-            if (groups := _table_group_ids(cluster, table_name)) is not None and len(groups) >= min_count
+            if (groups := _table_group_ids(cluster, table_name)) is not None
+            and len(groups) >= min_count
             else None
         ),
         timeout_s=timeout_s,
@@ -2106,7 +2282,10 @@ def _wait_node_owns_group(
             snapshot = cluster.metadata_snapshot()
         except (AssertionError, requests.RequestException):
             return None
-        if snapshot_owns_group(snapshot) or active_reallocation_request_id(snapshot) is not None:
+        if (
+            snapshot_owns_group(snapshot)
+            or active_reallocation_request_id(snapshot) is not None
+        ):
             return snapshot
         return None
 
@@ -2144,7 +2323,9 @@ def _wait_node_owns_group(
                 # completed without the desired placement, the next outer
                 # observation may safely establish a successor generation.
                 remaining = max(0.0, deadline - time.monotonic())
-                return wait_until(owns_group, timeout_s=remaining, interval_s=0.5), submission_error
+                return wait_until(
+                    owns_group, timeout_s=remaining, interval_s=0.5
+                ), submission_error
             continue
         if snapshot_owns_group(observed):
             return observed, submission_error
@@ -2181,15 +2362,22 @@ def _wait_node_drained_for_groups(
         if snapshots is None:
             return None
         for snapshot in snapshots:
-            stores = [store for store in snapshot.get("stores", []) if isinstance(store, dict)]
+            stores = [
+                store for store in snapshot.get("stores", []) if isinstance(store, dict)
+            ]
             drained_store = next(
                 (store for store in stores if int(store.get("node_id", 0)) == node_id),
                 None,
             )
-            if drained_store is not None and drained_store.get("drain_requested") is not True:
+            if (
+                drained_store is not None
+                and drained_store.get("drain_requested") is not True
+            ):
                 return None
             for intent in snapshot.get("placement_intents", []):
-                if not isinstance(intent, dict) or not isinstance(intent.get("record"), dict):
+                if not isinstance(intent, dict) or not isinstance(
+                    intent.get("record"), dict
+                ):
                     continue
                 record = intent["record"]
                 if int(record.get("group_id", 0)) not in group_ids:
@@ -2283,7 +2471,9 @@ def test_autoscaling_drains_data_node_and_replaces_placements(
     docs = {f"doc-{i:02d}": {"title": f"doc {i}", "rank": i} for i in range(10)}
     _insert_docs(cluster, table_name, docs, min_group_count=5)
 
-    group_ids = wait_until(lambda: _table_group_ids(cluster, table_name), timeout_s=60.0, interval_s=0.5)
+    group_ids = wait_until(
+        lambda: _table_group_ids(cluster, table_name), timeout_s=60.0, interval_s=0.5
+    )
     assert group_ids is not None and len(group_ids) >= 5, (
         "table groups were not created before node drain\n"
         f"snapshot: {cluster.metadata_snapshot()}\n"
@@ -2291,7 +2481,11 @@ def test_autoscaling_drains_data_node_and_replaces_placements(
     )
 
     initial_nodes = wait_until(
-        lambda: (nodes if len(nodes := _placed_nodes_for_groups(cluster, group_ids)) >= 5 else None),
+        lambda: (
+            nodes
+            if len(nodes := _placed_nodes_for_groups(cluster, group_ids)) >= 5
+            else None
+        ),
         timeout_s=60.0,
         interval_s=0.5,
     )
@@ -2303,7 +2497,9 @@ def test_autoscaling_drains_data_node_and_replaces_placements(
     node_to_drain = sorted(initial_nodes)[0]
     cluster.request_node_shutdown(node_to_drain)
 
-    drained = _wait_node_drained_for_groups(cluster, node_to_drain, group_ids, timeout_s=90.0)
+    drained = _wait_node_drained_for_groups(
+        cluster, node_to_drain, group_ids, timeout_s=90.0
+    )
     assert drained is not None, (
         "drained data node still owned table placements\n"
         f"node_to_drain: {node_to_drain}\n"
@@ -2336,7 +2532,11 @@ def test_autoscaling_adds_data_node_and_assigns_placements(
 
     initial_groups = _wait_for_group_count(cluster, table_name, min_count=8)
     initial_nodes = wait_until(
-        lambda: (nodes if len(nodes := _placed_nodes_for_groups(cluster, initial_groups)) >= 3 else None),
+        lambda: (
+            nodes
+            if len(nodes := _placed_nodes_for_groups(cluster, initial_groups)) >= 3
+            else None
+        ),
         timeout_s=60.0,
         interval_s=0.5,
     )
@@ -2347,7 +2547,9 @@ def test_autoscaling_adds_data_node_and_assigns_placements(
     )
 
     new_node = cluster.add_data_node()
-    assigned, reallocation_error = _wait_node_owns_group(cluster, table_name, int(new_node["id"]))
+    assigned, reallocation_error = _wait_node_owns_group(
+        cluster, table_name, int(new_node["id"])
+    )
     assert assigned is not None, (
         "added data node did not receive any table placement\n"
         f"new_node: {new_node['id']}\n"
@@ -2370,7 +2572,11 @@ def test_autoscaling_drains_stops_and_finalizes_data_node_without_losing_reads(
 
     group_ids = _wait_for_group_count(cluster, table_name, min_count=5)
     initial_nodes = wait_until(
-        lambda: (nodes if len(nodes := _placed_nodes_for_groups(cluster, group_ids)) >= 5 else None),
+        lambda: (
+            nodes
+            if len(nodes := _placed_nodes_for_groups(cluster, group_ids)) >= 5
+            else None
+        ),
         timeout_s=60.0,
         interval_s=0.5,
     )
@@ -2390,7 +2596,9 @@ def test_autoscaling_drains_stops_and_finalizes_data_node_without_losing_reads(
         f"snapshot: {cluster.metadata_snapshot()}\n"
         f"{cluster.debug_logs()}"
     )
-    complete, complete_status = _wait_node_shutdown_phase(cluster, node_to_stop, "complete")
+    complete, complete_status = _wait_node_shutdown_phase(
+        cluster, node_to_stop, "complete"
+    )
     assert complete is not None and complete.get("safe_to_terminate") is True, (
         "node shutdown never became safe to terminate\n"
         f"node_to_stop: {node_to_stop}\n"
@@ -2402,7 +2610,9 @@ def test_autoscaling_drains_stops_and_finalizes_data_node_without_losing_reads(
 
     cluster.stop_data_node(node_to_stop)
     cluster.finalize_node_shutdown(node_to_stop)
-    finalized, finalized_status = _wait_node_shutdown_phase(cluster, node_to_stop, "not_found")
+    finalized, finalized_status = _wait_node_shutdown_phase(
+        cluster, node_to_stop, "not_found"
+    )
     assert finalized is not None and finalized.get("safe_to_terminate") is True, (
         "finalized node still appeared as shutdown debt\n"
         f"node_to_stop: {node_to_stop}\n"
@@ -2497,13 +2707,19 @@ class _ScalingPhaseTimings:
     def record(self, name: str, started: float) -> None:
         elapsed = time.monotonic() - started
         if self.enabled:
-            print(f"E2E_PHASE table={self.table_name} phase={name} seconds={elapsed:.3f}", flush=True)
+            print(
+                f"E2E_PHASE table={self.table_name} phase={name} seconds={elapsed:.3f}",
+                flush=True,
+            )
 
     def finish(self, cluster: MultiNodeScalingCluster) -> None:
         total = time.monotonic() - self.started
         if not self.enabled:
             return
-        print(f"E2E_PHASE table={self.table_name} phase=total seconds={total:.3f}", flush=True)
+        print(
+            f"E2E_PHASE table={self.table_name} phase=total seconds={total:.3f}",
+            flush=True,
+        )
         slow_threshold = float(os.getenv("ANTFLY_E2E_SLOW_LOG_THRESHOLD_S", "30"))
         if total < slow_threshold:
             return
@@ -2529,7 +2745,11 @@ def test_autoscaling_node_churn_keeps_reads_available(
 
     group_ids = _wait_for_group_count(cluster, table_name, min_count=6)
     initial_nodes = wait_until(
-        lambda: (nodes if len(nodes := _placed_nodes_for_groups(cluster, group_ids)) >= 3 else None),
+        lambda: (
+            nodes
+            if len(nodes := _placed_nodes_for_groups(cluster, group_ids)) >= 3
+            else None
+        ),
         timeout_s=60.0,
         interval_s=0.5,
     )
@@ -2553,7 +2773,9 @@ def test_autoscaling_node_churn_keeps_reads_available(
     _assert_docs_readable(cluster, table_name, docs)
 
     replacement = cluster.add_data_node()
-    assigned, reallocation_error = _wait_node_owns_group(cluster, table_name, int(replacement["id"]))
+    assigned, reallocation_error = _wait_node_owns_group(
+        cluster, table_name, int(replacement["id"])
+    )
     assert assigned is not None, (
         "replacement data node did not receive placement during churn\n"
         f"replacement: {replacement['id']}\n"

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphQueryType(str, Enum):
+class GraphQueryType(StrEnum):
     K_SHORTEST_PATHS = "k_shortest_paths"
     NEIGHBORS = "neighbors"
     PATTERN = "pattern"
