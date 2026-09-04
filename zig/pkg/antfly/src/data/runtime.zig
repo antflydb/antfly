@@ -713,19 +713,17 @@ fn indexRepairQueueScheduleFromResult(
     };
 }
 
-const IndexRepairOperatorTransition = enum { none, entered_terminal, recovered };
+const IndexRepairOperatorTransition = enum { none, entered_terminal, left_terminal };
 
 fn indexRepairOperatorTransition(
     terminal_was_observed: bool,
-    outcome: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome,
+    observation: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.RepairHealthObservation,
 ) IndexRepairOperatorTransition {
-    if (outcome == .terminal_degraded) {
-        return if (terminal_was_observed) .none else .entered_terminal;
-    }
-    // A deferred pass did not reach the authoritative final audit, so it
-    // cannot prove that a previously observed terminal state recovered.
-    if (outcome == .deferred) return .none;
-    return if (terminal_was_observed) .recovered else .none;
+    return switch (observation) {
+        .unknown => .none,
+        .terminal_degraded => if (terminal_was_observed) .none else .entered_terminal,
+        .non_terminal => if (terminal_was_observed) .left_terminal else .none,
+    };
 }
 
 fn pruneIndexRepairTerminalLogGroups(
@@ -751,50 +749,62 @@ test "data runtime preserves tagged aggregate index repair wake semantics" {
 
 test "index repair no-op audit stays below operator log level" {
     try std.testing.expectEqual(
-        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome.noop,
-        (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{}).outcome(),
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Activity.noop,
+        (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{}).activity(),
     );
     try std.testing.expectEqual(
-        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome.deferred,
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Activity.deferred,
         (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
             .had_debt = true,
             .index_repair_pending = true,
             .busy = true,
             .index_repair_disk_wait = true,
-        }).outcome(),
+        }).activity(),
     );
     try std.testing.expectEqual(
-        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome.progressed,
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Activity.progressed,
         (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
             .made_progress = true,
-        }).outcome(),
+        }).activity(),
     );
     try std.testing.expectEqual(
-        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome.attempted,
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Activity.attempted,
         (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
             .index_repair_attempted = true,
-        }).outcome(),
+        }).activity(),
     );
     try std.testing.expectEqual(
-        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome.progressed,
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Activity.progressed,
         (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
             .cleared_debt = true,
-        }).outcome(),
-    );
-    try std.testing.expectEqual(
-        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome.terminal_degraded,
-        (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
-            .terminal_degraded = true,
-        }).outcome(),
+        }).activity(),
     );
 }
 
 test "index repair terminal operator events are transition based" {
-    const Outcome = antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome;
-    try std.testing.expectEqual(IndexRepairOperatorTransition.entered_terminal, indexRepairOperatorTransition(false, Outcome.terminal_degraded));
-    try std.testing.expectEqual(IndexRepairOperatorTransition.none, indexRepairOperatorTransition(true, Outcome.terminal_degraded));
-    try std.testing.expectEqual(IndexRepairOperatorTransition.none, indexRepairOperatorTransition(true, Outcome.deferred));
-    try std.testing.expectEqual(IndexRepairOperatorTransition.recovered, indexRepairOperatorTransition(true, Outcome.noop));
+    const Observation = antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.RepairHealthObservation;
+    try std.testing.expectEqual(IndexRepairOperatorTransition.entered_terminal, indexRepairOperatorTransition(false, Observation.terminal_degraded));
+    try std.testing.expectEqual(IndexRepairOperatorTransition.none, indexRepairOperatorTransition(true, Observation.terminal_degraded));
+    try std.testing.expectEqual(IndexRepairOperatorTransition.none, indexRepairOperatorTransition(true, Observation.unknown));
+    try std.testing.expectEqual(IndexRepairOperatorTransition.left_terminal, indexRepairOperatorTransition(true, Observation.non_terminal));
+}
+
+test "repair activity without a final audit cannot clear terminal log state" {
+    const Result = antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult;
+    const cases = [_]Result{
+        .{ .busy = true, .index_repair_pending = true, .index_repair_attempted = true },
+        .{ .busy = true, .index_repair_pending = true, .made_progress = true },
+        .{ .busy = true, .index_repair_pending = true, .index_repair_repaired = true },
+    };
+    const expected_activity = [_]Result.Activity{ .attempted, .progressed, .repaired };
+    for (cases, expected_activity) |result, activity| {
+        try std.testing.expectEqual(activity, result.activity());
+        try std.testing.expectEqual(Result.RepairHealthObservation.unknown, result.repair_health);
+        try std.testing.expectEqual(
+            IndexRepairOperatorTransition.none,
+            indexRepairOperatorTransition(true, result.repair_health),
+        );
+    }
 }
 
 test "index repair terminal log state survives metadata churn for local groups" {
@@ -14505,7 +14515,7 @@ pub const DataServer = struct {
                 }
                 if (!result.had_debt) continue;
                 stats.groups_with_debt += 1;
-                if (result.terminal_degraded) {
+                if (result.terminalDegraded()) {
                     std.log.warn("provisioned startup catch-up found terminal degraded state group={} table={s}", .{ group_id, table.name });
                     self.runtime_status_dirty.store(true, .release);
                     self.store_status_dirty.store(true, .release);
@@ -14543,11 +14553,11 @@ pub const DataServer = struct {
     fn observeProvisionedIndexRepairOperatorTransition(
         self: *DataServer,
         group_id: u64,
-        outcome: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Outcome,
+        observation: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.RepairHealthObservation,
     ) IndexRepairOperatorTransition {
         const terminal_was_observed = self.provisioned_index_repair_terminal_log_groups.contains(group_id);
-        const transition = indexRepairOperatorTransition(terminal_was_observed, outcome);
-        if (outcome == .terminal_degraded) {
+        const transition = indexRepairOperatorTransition(terminal_was_observed, observation);
+        if (observation == .terminal_degraded) {
             if (transition == .entered_terminal) {
                 self.provisioned_index_repair_terminal_log_groups.put(self.alloc, group_id, {}) catch {
                     // Logging must never make repair scheduling fallible. If
@@ -14556,7 +14566,7 @@ pub const DataServer = struct {
                     return .entered_terminal;
                 };
             }
-        } else if (transition == .recovered) {
+        } else if (transition == .left_terminal) {
             _ = self.provisioned_index_repair_terminal_log_groups.remove(group_id);
         }
         return transition;
@@ -14914,43 +14924,43 @@ pub const DataServer = struct {
                 );
                 continue;
             };
-            const outcome = result.outcome();
+            const activity = result.activity();
             const operator_transition = self.observeProvisionedIndexRepairOperatorTransition(
                 group_id,
-                outcome,
+                result.repair_health,
             );
             const repair_log_args = .{
                 group_id,
                 table_name,
                 (platform_time.monotonicNs() -| attempt_started_ns) / std.time.ns_per_ms,
-                @tagName(outcome),
+                @tagName(activity),
+                @tagName(result.repair_health),
                 result.index_repair_attempted,
                 result.index_repair_repaired,
                 result.index_repair_degraded,
-                result.terminal_degraded,
                 result.index_repair_pending,
                 result.busy,
                 result.index_repair_disk_wait,
             };
             std.log.debug(
-                "provisioned index repair pass group={} table={s} duration_ms={} outcome={s} attempted={} repaired={} degraded={} terminal_degraded={} pending={} busy={} disk_wait={}",
+                "provisioned index repair pass group={} table={s} duration_ms={} activity={s} repair_health={s} attempted={} repaired={} degraded={} pending={} busy={} disk_wait={}",
                 repair_log_args,
             );
             switch (operator_transition) {
                 .entered_terminal => std.log.warn(
-                    "provisioned index repair entered terminal degradation group={} table={s} metadata_epoch={} outcome={s}",
-                    .{ group_id, table_name, candidate.metadata_epoch, @tagName(outcome) },
+                    "provisioned index repair entered terminal degradation group={} table={s} metadata_epoch={} activity={s}",
+                    .{ group_id, table_name, candidate.metadata_epoch, @tagName(activity) },
                 ),
-                .recovered => std.log.info(
-                    "provisioned index repair recovered from terminal degradation group={} table={s} metadata_epoch={} outcome={s}",
-                    .{ group_id, table_name, candidate.metadata_epoch, @tagName(outcome) },
+                .left_terminal => std.log.info(
+                    "provisioned index repair left terminal degradation group={} table={s} metadata_epoch={} activity={s}",
+                    .{ group_id, table_name, candidate.metadata_epoch, @tagName(activity) },
                 ),
-                .none => switch (outcome) {
+                .none => switch (activity) {
                     .progressed, .repaired => std.log.info(
-                        "provisioned index repair operator activity group={} table={s} duration_ms={} outcome={s} attempted={} repaired={} degraded={} terminal_degraded={} pending={} busy={} disk_wait={}",
+                        "provisioned index repair operator activity group={} table={s} duration_ms={} activity={s} repair_health={s} attempted={} repaired={} degraded={} pending={} busy={} disk_wait={}",
                         repair_log_args,
                     ),
-                    .noop, .deferred, .attempted, .terminal_degraded => {},
+                    .noop, .deferred, .attempted => {},
                 },
             }
             found_pending = found_pending or result.index_repair_pending;
