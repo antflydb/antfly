@@ -104,10 +104,20 @@ def classification_prediction_key(config: dict[str, Any]) -> str:
     return key
 
 
-def rows(path: Path, max_records: int | None = None) -> Iterator[tuple[str, dict[str, Any]]]:
-    sources = [path] if path.is_file() else sorted(path.glob("*.jsonl")) if path.is_dir() else []
+def rows(
+    path: Path, max_records: int | None = None
+) -> Iterator[tuple[str, dict[str, Any]]]:
+    sources = (
+        [path]
+        if path.is_file()
+        else sorted(path.glob("*.jsonl"))
+        if path.is_dir()
+        else []
+    )
     if not sources:
-        raise ValueError(f"{path}: expected a JSONL file or directory containing JSONL files")
+        raise ValueError(
+            f"{path}: expected a JSONL file or directory containing JSONL files"
+        )
     emitted = 0
     for source in sources:
         with source.open(encoding="utf-8") as lines:
@@ -131,8 +141,12 @@ class Gold:
     entities: Counter[tuple[str, str]] = field(default_factory=Counter)
     entities_present: bool = False
     classifications: OrderedDict[str, Counter[str]] = field(default_factory=OrderedDict)
-    structures: OrderedDict[str, list[tuple[tuple[str, tuple[str, ...]], ...]]] = field(default_factory=OrderedDict)
-    relations: OrderedDict[str, list[tuple[str, str]]] = field(default_factory=OrderedDict)
+    structures: OrderedDict[str, list[tuple[tuple[str, tuple[str, ...]], ...]]] = field(
+        default_factory=OrderedDict
+    )
+    relations: OrderedDict[str, list[tuple[str, str]]] = field(
+        default_factory=OrderedDict
+    )
 
 
 def schema_and_gold(record: dict[str, Any]) -> tuple[str, dict[str, Any], Gold]:
@@ -150,7 +164,9 @@ def schema_and_gold(record: dict[str, Any]) -> tuple[str, dict[str, Any], Gold]:
                     or not clean_text(item.get("text"))
                 ):
                     raise ValueError("legacy entity entries require label and text")
-                output["entities"].setdefault(item["label"], []).append(item.get("text"))
+                output["entities"].setdefault(item["label"], []).append(
+                    item.get("text")
+                )
         else:
             raise ValueError("record requires output object")
 
@@ -197,22 +213,37 @@ def schema_and_gold(record: dict[str, Any]) -> tuple[str, dict[str, Any], Gold]:
             task = clean_text(item.get("task"))
             raw_labels = item.get("labels")
             raw_true_labels = item.get("true_label")
-            if not isinstance(raw_labels, list) or not isinstance(raw_true_labels, list):
+            if not isinstance(raw_labels, list) or not isinstance(
+                raw_true_labels, list
+            ):
                 raise ValueError("classification labels and true_label must be arrays")
             labels = [clean_text(label) for label in raw_labels]
             true_labels = values(raw_true_labels)
             normalized_labels = [label.casefold() for label in labels]
-            if not task or len(labels) < 2 or len(labels) != len(set(normalized_labels)) or not all(labels):
-                raise ValueError("classification task and labels must be non-empty and unique")
+            if (
+                not task
+                or len(labels) < 2
+                or len(labels) != len(set(normalized_labels))
+                or not all(labels)
+            ):
+                raise ValueError(
+                    "classification task and labels must be non-empty and unique"
+                )
             task_key = task.casefold()
-            if task_key in seen_classification_tasks or not set(true_labels) <= set(normalized_labels):
-                raise ValueError("classification true labels must be subsets of unique tasks")
+            if task_key in seen_classification_tasks or not set(true_labels) <= set(
+                normalized_labels
+            ):
+                raise ValueError(
+                    "classification true labels must be subsets of unique tasks"
+                )
             seen_classification_tasks.add(task_key)
             multi_label = item.get("multi_label", len(true_labels) > 1)
             if not isinstance(multi_label, bool):
                 raise ValueError("classification multi_label must be boolean")
             if not multi_label and len(true_labels) > 1:
-                raise ValueError("single-label classification allows at most one true label")
+                raise ValueError(
+                    "single-label classification allows at most one true label"
+                )
             config: dict[str, Any] = {
                 "task": task,
                 "labels": labels,
@@ -239,13 +270,19 @@ def schema_and_gold(record: dict[str, Any]) -> tuple[str, dict[str, Any], Gold]:
                         or len(example) != 2
                         or not all(isinstance(part, str) for part in example)
                     ):
-                        raise ValueError("classification examples must be string input/output pairs")
+                        raise ValueError(
+                            "classification examples must be string input/output pairs"
+                        )
                     if example[1] not in labels:
-                        raise ValueError("classification example outputs must belong to labels")
+                        raise ValueError(
+                            "classification example outputs must belong to labels"
+                        )
                     examples.append([example[0], example[1]])
                 config["examples"] = examples
             classification_schema.append(config)
-            gold.classifications[classification_prediction_key(config)] = Counter(true_labels)
+            gold.classifications[classification_prediction_key(config)] = Counter(
+                true_labels
+            )
         if classification_schema:
             schema["classifications"] = classification_schema
 
@@ -265,7 +302,9 @@ def schema_and_gold(record: dict[str, Any]) -> tuple[str, dict[str, Any], Gold]:
         structure_schema: list[dict[str, Any]] = []
         structure_descriptions: OrderedDict[str, OrderedDict[str, str]] = OrderedDict()
         raw_structure_descriptions = output.get("json_descriptions")
-        if raw_structure_descriptions is not None and not isinstance(raw_structure_descriptions, dict):
+        if raw_structure_descriptions is not None and not isinstance(
+            raw_structure_descriptions, dict
+        ):
             raise ValueError("output.json_descriptions must be an object")
         raw_structure_descriptions = raw_structure_descriptions or {}
         unknown_parents = set(raw_structure_descriptions) - set(grouped)
@@ -284,27 +323,47 @@ def schema_and_gold(record: dict[str, Any]) -> tuple[str, dict[str, Any], Gold]:
                     if isinstance(value, dict):
                         choices = value.get("choices")
                         if not isinstance(choices, list) or len(choices) < 2:
-                            raise ValueError("choice fields require at least two choices")
+                            raise ValueError(
+                                "choice fields require at least two choices"
+                            )
                         clean_choices = [clean_text(choice) for choice in choices]
-                        normalized_choices = [choice.casefold() for choice in clean_choices]
-                        if not all(clean_choices) or len(clean_choices) != len(set(normalized_choices)):
-                            raise ValueError("choice values must be non-empty and unique")
+                        normalized_choices = [
+                            choice.casefold() for choice in clean_choices
+                        ]
+                        if not all(clean_choices) or len(clean_choices) != len(
+                            set(normalized_choices)
+                        ):
+                            raise ValueError(
+                                "choice values must be non-empty and unique"
+                            )
                         if not set(values(value)) <= set(normalized_choices):
-                            raise ValueError("selected choice values must belong to choices")
+                            raise ValueError(
+                                "selected choice values must belong to choices"
+                            )
                         template = {"value": "", "choices": clean_choices}
                     previous = templates.get(field_name)
                     if previous is not None and previous != template:
-                        raise ValueError(f"inconsistent schema for {parent}.{field_name}")
+                        raise ValueError(
+                            f"inconsistent schema for {parent}.{field_name}"
+                        )
                     templates.setdefault(field_name, template)
             canonical: list[tuple[tuple[str, tuple[str, ...]], ...]] = []
             seen: set[tuple[tuple[str, tuple[str, ...]], ...]] = set()
             for occurrence in occurrences:
-                by_name = {clean_text(name): value for name, value in occurrence.items()}
-                instance = tuple((name, values(by_name.get(name))) for name in templates)
+                by_name = {
+                    clean_text(name): value for name, value in occurrence.items()
+                }
+                instance = tuple(
+                    (name, values(by_name.get(name))) for name in templates
+                )
                 if instance not in seen:
                     seen.add(instance)
                     canonical.append(instance)
-            if canonical and all(not field_values for instance in canonical for _, field_values in instance):
+            if canonical and all(
+                not field_values
+                for instance in canonical
+                for _, field_values in instance
+            ):
                 canonical = []
             structure_schema.append({parent: templates})
             if parent in raw_structure_descriptions:
@@ -323,7 +382,9 @@ def schema_and_gold(record: dict[str, Any]) -> tuple[str, dict[str, Any], Gold]:
     elif "json_descriptions" in output:
         parsed_json_descriptions = output["json_descriptions"]
         if not isinstance(parsed_json_descriptions, dict) or parsed_json_descriptions:
-            raise ValueError("output.json_descriptions requires matching json_structures")
+            raise ValueError(
+                "output.json_descriptions requires matching json_structures"
+            )
 
     relations = output.get("relations")
     if relations is not None:
@@ -342,7 +403,9 @@ def schema_and_gold(record: dict[str, Any]) -> tuple[str, dict[str, Any], Gold]:
                     f"relation {parent!r} has non-head/tail fields unsupported by the upstream public decoder"
                 )
             if set(fields) != {"head", "tail"}:
-                raise ValueError(f"relation {parent!r} must contain exactly head and tail")
+                raise ValueError(
+                    f"relation {parent!r} must contain exactly head and tail"
+                )
             for field_name in ("head", "tail"):
                 if len(values(fields[field_name])) != 1:
                     raise ValueError(
@@ -354,14 +417,19 @@ def schema_and_gold(record: dict[str, Any]) -> tuple[str, dict[str, Any], Gold]:
             pairs: list[tuple[str, str]] = []
             seen_pairs: set[tuple[str, str]] = set()
             for occurrence in occurrences:
-                heads, tails = values(occurrence.get("head")), values(occurrence.get("tail"))
+                heads, tails = (
+                    values(occurrence.get("head")),
+                    values(occurrence.get("tail")),
+                )
                 assert len(heads) == 1 and len(tails) == 1
                 pair = (heads[0], tails[0])
                 if pair not in seen_pairs:
                     seen_pairs.add(pair)
                     pairs.append(pair)
             if pairs:
-                relation_schema.append({parent: OrderedDict((field, "") for field in ("head", "tail"))})
+                relation_schema.append(
+                    {parent: OrderedDict((field, "") for field in ("head", "tail"))}
+                )
                 gold.relations[parent] = pairs
         if relation_schema:
             schema["relations"] = relation_schema
@@ -380,7 +448,9 @@ class PRF:
     exact_cases: int = 0
     gold_atoms: int = 0
 
-    def add(self, gold: Counter[Any], predicted: Counter[Any], *, exact: bool | None = None) -> None:
+    def add(
+        self, gold: Counter[Any], predicted: Counter[Any], *, exact: bool | None = None
+    ) -> None:
         overlap = gold & predicted
         self.true_positive += overlap.total()
         self.false_positive += (predicted - gold).total()
@@ -392,14 +462,20 @@ class PRF:
     def result(self) -> dict[str, Any]:
         precision_denominator = self.true_positive + self.false_positive
         recall_denominator = self.true_positive + self.false_negative
-        precision = self.true_positive / precision_denominator if precision_denominator else 1.0
+        precision = (
+            self.true_positive / precision_denominator if precision_denominator else 1.0
+        )
         recall = self.true_positive / recall_denominator if recall_denominator else 1.0
-        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        f1 = (
+            2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        )
         return {
             "micro_f1": f1,
             "micro_precision": precision,
             "micro_recall": recall,
-            "exact_match": self.exact_correct / self.exact_cases if self.exact_cases else None,
+            "exact_match": self.exact_correct / self.exact_cases
+            if self.exact_cases
+            else None,
             "cases": self.exact_cases,
             "gold_atoms": self.gold_atoms,
             "true_positive": self.true_positive,
@@ -422,7 +498,9 @@ class CountScore:
     def result(self) -> dict[str, Any]:
         return {
             "accuracy": self.correct / self.cases if self.cases else None,
-            "mean_absolute_error": self.absolute_error / self.cases if self.cases else None,
+            "mean_absolute_error": self.absolute_error / self.cases
+            if self.cases
+            else None,
             "cases": self.cases,
         }
 
@@ -451,7 +529,9 @@ class Scores:
         }
 
 
-def counter_from_values(prefix: tuple[str, ...], value: Any) -> Counter[tuple[str, ...]]:
+def counter_from_values(
+    prefix: tuple[str, ...], value: Any
+) -> Counter[tuple[str, ...]]:
     return Counter((*prefix, item) for item in values(value))
 
 
@@ -461,9 +541,15 @@ def score_prediction(scores: Scores, gold: Gold, prediction: dict[str, Any]) -> 
 
     predicted_entities: Counter[tuple[str, str]] = Counter()
     entity_result = prediction.get("entities", [])
-    if isinstance(entity_result, list) and entity_result and isinstance(entity_result[0], dict):
+    if (
+        isinstance(entity_result, list)
+        and entity_result
+        and isinstance(entity_result[0], dict)
+    ):
         for label, result in entity_result[0].items():
-            predicted_entities.update(counter_from_values((normalized_text(label),), result))
+            predicted_entities.update(
+                counter_from_values((normalized_text(label),), result)
+            )
     if gold.entities_present:
         scores.entities.add(gold.entities, predicted_entities)
 
@@ -473,7 +559,10 @@ def score_prediction(scores: Scores, gold: Gold, prediction: dict[str, Any]) -> 
         if isinstance(result, tuple) and result:
             predicted[normalized_text(result[0])] += 1
         elif isinstance(result, list):
-            predicted.update(normalized_text(item[0] if isinstance(item, tuple) else item) for item in result)
+            predicted.update(
+                normalized_text(item[0] if isinstance(item, tuple) else item)
+                for item in result
+            )
         scores.classifications.add(expected, predicted)
 
     for parent, instances in gold.structures.items():
@@ -482,8 +571,12 @@ def score_prediction(scores: Scores, gold: Gold, prediction: dict[str, Any]) -> 
         expected_atoms: Counter[tuple[str, str, str]] = Counter()
         for instance in instances:
             for name, field_values in instance:
-                expected_atoms.update((parent_key, normalized_text(name), value) for value in field_values)
-        predicted_instances: Counter[tuple[tuple[str, tuple[str, ...]], ...]] = Counter()
+                expected_atoms.update(
+                    (parent_key, normalized_text(name), value) for value in field_values
+                )
+        predicted_instances: Counter[tuple[tuple[str, tuple[str, ...]], ...]] = (
+            Counter()
+        )
         predicted_atoms: Counter[tuple[str, str, str]] = Counter()
         result = prediction.get(parent, [])
         if isinstance(result, list):
@@ -496,7 +589,10 @@ def score_prediction(scores: Scores, gold: Gold, prediction: dict[str, Any]) -> 
                 instance = tuple((name, values(by_name.get(name))) for name in names)
                 predicted_instances[instance] += 1
                 for name, field_values in instance:
-                    predicted_atoms.update((parent_key, normalized_text(name), value) for value in field_values)
+                    predicted_atoms.update(
+                        (parent_key, normalized_text(name), value)
+                        for value in field_values
+                    )
         scores.structures.add(
             expected_atoms,
             predicted_atoms,
@@ -513,7 +609,9 @@ def score_prediction(scores: Scores, gold: Gold, prediction: dict[str, Any]) -> 
         if isinstance(result, list):
             for item in result:
                 if isinstance(item, (tuple, list)) and len(item) == 2:
-                    predicted[(parent_key, normalized_text(item[0]), normalized_text(item[1]))] += 1
+                    predicted[
+                        (parent_key, normalized_text(item[0]), normalized_text(item[1]))
+                    ] += 1
                 elif isinstance(item, dict) and {"head", "tail"} <= item.keys():
                     head, tail = values(item["head"]), values(item["tail"])
                     if len(head) == len(tail) == 1:
@@ -534,11 +632,15 @@ def parse_minima(items: list[str]) -> dict[str, float]:
         except ValueError as exc:
             raise ValueError(f"invalid --min-metric value {item!r}") from exc
         if not math.isfinite(value) or not 0 < value <= 1:
-            raise ValueError(f"--min-metric values must be finite numbers in (0,1]: {item!r}")
+            raise ValueError(
+                f"--min-metric values must be finite numbers in (0,1]: {item!r}"
+            )
         minima[key] = value
     missing = REQUIRED_MINIMA - minima.keys()
     if missing:
-        raise ValueError(f"missing required --min-metric values: {','.join(sorted(missing))}")
+        raise ValueError(
+            f"missing required --min-metric values: {','.join(sorted(missing))}"
+        )
     return minima
 
 
@@ -555,7 +657,9 @@ def verify_upstream(source: Path, expected_commit: str = UPSTREAM_COMMIT) -> str
     return verify_upstream_checkout(source)["commit"]
 
 
-def batches(items: Iterable[tuple[str, dict[str, Any]]], size: int) -> Iterator[list[tuple[str, dict[str, Any]]]]:
+def batches(
+    items: Iterable[tuple[str, dict[str, Any]]], size: int
+) -> Iterator[list[tuple[str, dict[str, Any]]]]:
     batch: list[tuple[str, dict[str, Any]]] = []
     for item in items:
         batch.append(item)
@@ -595,18 +699,24 @@ def main() -> int:
             raise ValueError("--max-records must be positive")
         if args.comparison_report:
             if args.model_dir or args.adapter_dir:
-                raise ValueError("--comparison-report cannot be combined with --model-dir/--adapter-dir")
+                raise ValueError(
+                    "--comparison-report cannot be combined with --model-dir/--adapter-dir"
+                )
             comparison = json.loads(args.comparison_report.read_text(encoding="utf-8"))
             comparison_config = comparison.get("config")
             if not isinstance(comparison_config, dict):
                 raise ValueError("comparison report has no config object")
-            model_value = comparison_config.get("python_model") or comparison_config.get("model_dir")
+            model_value = comparison_config.get(
+                "python_model"
+            ) or comparison_config.get("model_dir")
             if not isinstance(model_value, str) or not model_value:
                 raise ValueError("comparison report has no base model path/id")
             args.model_dir = Path(model_value)
             args.adapter_dir = args.comparison_report.parent / "zig"
         if args.model_dir is None or args.adapter_dir is None:
-            raise ValueError("provide --comparison-report or both --model-dir and --adapter-dir")
+            raise ValueError(
+                "provide --comparison-report or both --model-dir and --adapter-dir"
+            )
         minima = parse_minima(args.min_metric)
         normalization_runtime = verify_canonical_python_runtime()
         package_versions = verify_canonical_oracle_packages()
@@ -614,8 +724,13 @@ def main() -> int:
         for name in ("adapter_config.json", "adapter_model.safetensors"):
             if not (args.adapter_dir / name).is_file():
                 raise ValueError(f"adapter is missing {name}")
-        adapter_config = json.loads((args.adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
-        if adapter_config.get("peft_type") != "LORA" or adapter_config.get("task_type") is not None:
+        adapter_config = json.loads(
+            (args.adapter_dir / "adapter_config.json").read_text(encoding="utf-8")
+        )
+        if (
+            adapter_config.get("peft_type") != "LORA"
+            or adapter_config.get("task_type") is not None
+        ):
             raise ValueError("adapter must use standard task-agnostic PEFT LoRA format")
 
         sys.dont_write_bytecode = True
@@ -632,7 +747,9 @@ def main() -> int:
         torch.manual_seed(0)
         torch.use_deterministic_algorithms(True)
         base = GLiNER2.from_pretrained(str(args.model_dir), map_location="cpu")
-        model = PeftModel.from_pretrained(base, str(args.adapter_dir), is_trainable=False)
+        model = PeftModel.from_pretrained(
+            base, str(args.adapter_dir), is_trainable=False
+        )
         model.eval()
 
         scores = Scores()
@@ -681,7 +798,9 @@ def main() -> int:
         ]
         if metrics["count"]["cases"] == 0:
             coverage_failures.append("count")
-        failures = [f"eval data has no positive {task} coverage" for task in coverage_failures]
+        failures = [
+            f"eval data has no positive {task} coverage" for task in coverage_failures
+        ]
         for key, minimum in sorted(minima.items()):
             actual = metric(metrics, key)
             if actual is None or actual < minimum:
@@ -690,7 +809,9 @@ def main() -> int:
         for task in ("json_structures", "relations"):
             actual = metrics[task]["count"]["accuracy"]
             if actual is None or actual < count_minimum:
-                failures.append(f"{task}.count.accuracy={actual} below minimum {count_minimum}")
+                failures.append(
+                    f"{task}.count.accuracy={actual} below minimum {count_minimum}"
+                )
         report = {
             "contract": EVALUATION_CONTRACT,
             "pass": not failures,
@@ -719,13 +840,19 @@ def main() -> int:
             },
             # Retain the old report key for readers while making its checkout
             # and imported-module meanings unambiguous in ``oracle`` above.
-            "upstream": {"commit": oracle["commit"], "version": gliner2_version, "source": imported_from},
+            "upstream": {
+                "commit": oracle["commit"],
+                "version": gliner2_version,
+                "source": imported_from,
+            },
             "model_dir": str(args.model_dir),
             "adapter_dir": str(args.adapter_dir),
             "eval_data": str(args.eval_data),
             "artifacts": {
                 "base_model_fingerprint_sha256": base_model_fingerprint(args.model_dir),
-                "peft_adapter_fingerprint_sha256": peft_adapter_fingerprint(args.adapter_dir),
+                "peft_adapter_fingerprint_sha256": peft_adapter_fingerprint(
+                    args.adapter_dir
+                ),
                 "adapter_bundle_fingerprint_sha256": (
                     adapter_bundle_fingerprint(args.adapter_dir)
                     if (args.adapter_dir / "task_head.safetensors").is_file()
@@ -735,11 +862,22 @@ def main() -> int:
             },
         }
     except Exception as exc:
-        report = {"contract": EVALUATION_CONTRACT, "pass": False, "failures": [str(exc)]}
+        report = {
+            "contract": EVALUATION_CONTRACT,
+            "pass": False,
+            "failures": [str(exc)],
+        }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
-    print(json.dumps({"pass": report["pass"], "failures": report.get("failures", [])}, sort_keys=True))
+    args.output.write_text(
+        json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    print(
+        json.dumps(
+            {"pass": report["pass"], "failures": report.get("failures", [])},
+            sort_keys=True,
+        )
+    )
     print(f"held-out quality report: {args.output}")
     return 0 if report["pass"] else 1
 

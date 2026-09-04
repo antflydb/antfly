@@ -535,11 +535,15 @@ def test_stateful_managed_algebraic_generation_rebuild_catches_up_and_reopens(
         timeout_s=60.0,
         interval_s=0.25,
     )
-    assert ready is not None, json.dumps(
-        stateful_api.get_index(table_name, index_name),
-        indent=2,
-        sort_keys=True,
-    ) + "\nserver logs:\n" + stateful_api.debug_logs()
+    assert ready is not None, (
+        json.dumps(
+            stateful_api.get_index(table_name, index_name),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\nserver logs:\n"
+        + stateful_api.debug_logs()
+    )
     aggregations = _algebraic_aggregations(stateful_api, table_name)
     assert aggregations["amount_sum"]["value"] == 15
     assert {

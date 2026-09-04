@@ -51,7 +51,9 @@ def encode_document(raw_line: bytes, ordinal: int) -> bytes:
     )
 
 
-def batches(stream: BinaryIO, target_bytes: int, max_documents: int | None = None) -> Iterator[tuple[bytes, int]]:
+def batches(
+    stream: BinaryIO, target_bytes: int, max_documents: int | None = None
+) -> Iterator[tuple[bytes, int]]:
     payload = bytearray()
     documents = 0
     for raw_line in stream:
@@ -61,7 +63,9 @@ def batches(stream: BinaryIO, target_bytes: int, max_documents: int | None = Non
             break
         encoded = encode_document(raw_line, documents)
         if len(encoded) >= 10 * 1024 * 1024:
-            raise ValueError(f"document {documents} exceeds Quickwit's ingest payload limit")
+            raise ValueError(
+                f"document {documents} exceeds Quickwit's ingest payload limit"
+            )
         if payload and len(payload) + len(encoded) > target_bytes:
             yield bytes(payload), documents
             payload.clear()
@@ -80,7 +84,9 @@ class QuickwitClient:
         self.port = parsed.port or 80
         self.prefix = parsed.path.rstrip("/")
         self.index = quote(index, safe="")
-        self.connection = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
+        self.connection = http.client.HTTPConnection(
+            self.host, self.port, timeout=timeout
+        )
 
     def ingest(self, payload: bytes, force: bool) -> int:
         commit = "force" if force else "auto"
@@ -94,13 +100,19 @@ class QuickwitClient:
         response = self.connection.getresponse()
         body = response.read()
         if not 200 <= response.status < 300:
-            raise RuntimeError(f"Quickwit ingest failed with HTTP {response.status}: {body[:1000]!r}")
+            raise RuntimeError(
+                f"Quickwit ingest failed with HTTP {response.status}: {body[:1000]!r}"
+            )
         result = json.loads(body)
         rejected = int(result.get("num_rejected_docs", 0))
         failures = result.get("parse_failures", [])
         if rejected or failures:
-            raise RuntimeError(f"Quickwit rejected {rejected} documents: {failures[:3]!r}")
-        return int(result.get("num_docs_for_processing", result.get("num_ingested_docs", 0)))
+            raise RuntimeError(
+                f"Quickwit rejected {rejected} documents: {failures[:3]!r}"
+            )
+        return int(
+            result.get("num_docs_for_processing", result.get("num_ingested_docs", 0))
+        )
 
     def close(self) -> None:
         self.connection.close()
@@ -123,7 +135,9 @@ def main() -> int:
                 acknowledged = client.ingest(payload, force=False)
                 expected = cumulative_documents - submitted
                 if acknowledged != expected:
-                    raise RuntimeError(f"Quickwit acknowledged {acknowledged} of {expected} documents")
+                    raise RuntimeError(
+                        f"Quickwit acknowledged {acknowledged} of {expected} documents"
+                    )
                 submitted = cumulative_documents
                 batch_count += 1
                 pending = following
@@ -131,7 +145,9 @@ def main() -> int:
             acknowledged = client.ingest(payload, force=True)
             expected = cumulative_documents - submitted
             if acknowledged != expected:
-                raise RuntimeError(f"Quickwit acknowledged {acknowledged} of {expected} documents")
+                raise RuntimeError(
+                    f"Quickwit acknowledged {acknowledged} of {expected} documents"
+                )
             submitted = cumulative_documents
             batch_count += 1
         finally:

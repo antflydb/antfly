@@ -233,7 +233,9 @@ class ResourceMonitor:
 
     def check(self) -> None:
         if self.probe_failure is not None:
-            raise AcceptanceError(f"resource monitoring failed closed: {self.probe_failure}")
+            raise AcceptanceError(
+                f"resource monitoring failed closed: {self.probe_failure}"
+            )
         if self.violation is not None:
             raise AcceptanceError(self.violation)
 
@@ -256,9 +258,9 @@ class ResourceMonitor:
                     self.probe_failure = str(exc)
                     self._terminate_server()
                 return
-            swapout_growth_mib = max(
-                swapout_bytes - self.baseline_swapout_bytes, 0
-            ) / (1024 * 1024)
+            swapout_growth_mib = max(swapout_bytes - self.baseline_swapout_bytes, 0) / (
+                1024 * 1024
+            )
             sample = ResourceSample(
                 elapsed_seconds=time.monotonic() - self.started_at,
                 free_percent=free_percent,
@@ -410,7 +412,9 @@ def _wait_for_health(
     while time.monotonic() < deadline:
         monitor.check()
         if process.poll() is not None:
-            raise AcceptanceError(f"server exited during startup with {process.returncode}")
+            raise AcceptanceError(
+                f"server exited during startup with {process.returncode}"
+            )
         try:
             with urllib.request.urlopen(url, timeout=1.0) as response:
                 if 200 <= response.status < 300:
@@ -426,7 +430,9 @@ def _health_check(port: int, timeout_seconds: float) -> None:
     try:
         with urllib.request.urlopen(url, timeout=timeout_seconds) as response:
             if response.status != 200:
-                raise AcceptanceError(f"post-request health returned HTTP {response.status}")
+                raise AcceptanceError(
+                    f"post-request health returned HTTP {response.status}"
+                )
     except (OSError, urllib.error.URLError) as exc:
         raise AcceptanceError(f"post-request health failed: {exc}") from exc
 
@@ -462,9 +468,7 @@ def _post_generation(
     body: dict[str, Any],
     timeout_seconds: float,
 ) -> tuple[dict[str, Any], float]:
-    connection = http.client.HTTPConnection(
-        "127.0.0.1", port, timeout=timeout_seconds
-    )
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout_seconds)
     payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
     started = time.monotonic()
     try:
@@ -525,9 +529,7 @@ def summarize_response(
                 f"completion_tokens={completion_tokens!r}, expected {expected_tokens}"
             )
         if finish_reason != "length":
-            raise AcceptanceError(
-                f"finish_reason={finish_reason!r}, expected 'length'"
-            )
+            raise AcceptanceError(f"finish_reason={finish_reason!r}, expected 'length'")
     else:
         if (
             not isinstance(completion_tokens, int)
@@ -652,11 +654,11 @@ def validate_server_log(
         if (
             selected_page_moe["logical_bytes"]
             != SELECTED_PAGE_LOGICAL_BYTES_PER_ATTEMPT
-            or selected_page_moe["mapped_page_bytes"] < selected_page_moe["logical_bytes"]
+            or selected_page_moe["mapped_page_bytes"]
+            < selected_page_moe["logical_bytes"]
             or selected_page_moe["mapped_page_bytes"]
             > SELECTED_PAGE_MAX_MAPPED_BYTES_PER_ATTEMPT
-            or selected_page_moe["allocations"]
-            != SELECTED_PAGE_ALLOCATIONS_PER_ATTEMPT
+            or selected_page_moe["allocations"] != SELECTED_PAGE_ALLOCATIONS_PER_ATTEMPT
             or selected_page_moe["persistent_cache"] != 0
             or selected_page_moe["weight_copies"] != 0
         ):
@@ -887,9 +889,13 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
 
 def _git_provenance(repo: Path) -> dict[str, Any]:
     environment = {**os.environ, "LC_ALL": "C"}
-    revision = subprocess.check_output(
-        ("git", "-C", str(repo), "rev-parse", "HEAD"), env=environment
-    ).decode().strip()
+    revision = (
+        subprocess.check_output(
+            ("git", "-C", str(repo), "rev-parse", "HEAD"), env=environment
+        )
+        .decode()
+        .strip()
+    )
     status = subprocess.check_output(
         ("git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all"),
         env=environment,
@@ -1169,7 +1175,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--models-dir", type=Path)
     parser.add_argument("--output-dir", type=Path, default=default_output)
-    parser.add_argument("--residency-mode", choices=("auto", "streamed"), default="streamed")
+    parser.add_argument(
+        "--residency-mode", choices=("auto", "streamed"), default="streamed"
+    )
     parser.add_argument("--memory-budget-mb", type=int, default=2048)
     parser.add_argument("--host-budget-mb", type=int, default=2048)
     # The resident A4B lease accounts the full 2 GiB model envelope. Leave a
@@ -1228,7 +1236,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--min-free-percent must be between 1 and 90")
     if args.max_rss_mb <= 0 or args.max_swapout_growth_mb < 0:
         parser.error("resource ceilings must be positive/non-negative")
-    if args.monitor_interval <= 0 or args.startup_timeout <= 0 or args.request_timeout <= 0:
+    if (
+        args.monitor_interval <= 0
+        or args.startup_timeout <= 0
+        or args.request_timeout <= 0
+    ):
         parser.error("timeouts and monitor interval must be positive")
     if args.expected_content_sha256 is not None:
         args.expected_content_sha256 = args.expected_content_sha256.lower()

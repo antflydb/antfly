@@ -17,7 +17,10 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.root = pathlib.Path(self.temp_dir.name)
         self.repo = pathlib.Path(__file__).resolve().parents[5]
-        self.pair_script = self.repo / "zig/pkg/inference/scripts/gemma4/gemma4_qat_llamacpp_pair_benchmark.sh"
+        self.pair_script = (
+            self.repo
+            / "zig/pkg/inference/scripts/gemma4/gemma4_qat_llamacpp_pair_benchmark.sh"
+        )
         self.model = self.root / "model.gguf"
         self.model.write_bytes(b"test-model")
         self.antfly = self.write_executable(
@@ -102,7 +105,9 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def run_case(self, **overrides: str) -> tuple[subprocess.CompletedProcess[str], pathlib.Path]:
+    def run_case(
+        self, **overrides: str
+    ) -> tuple[subprocess.CompletedProcess[str], pathlib.Path]:
         self.case_index += 1
         output_dir = self.root / f"case-{self.case_index}"
         env = os.environ.copy()
@@ -119,20 +124,22 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
             env.pop(f"ANTFLY_GQA_PREFILL_{suffix}", None)
             env.pop(f"ANTFLY_INFERENCE_CUDA_GQA_PREFILL_{suffix}", None)
             env.pop(f"antfly_gqa_prefill_{suffix.lower()}", None)
-        env.update({
-            "ANTFLY_BIN": str(self.antfly),
-            "LLAMA_CPP_BIN": str(self.llama),
-            "MODEL": str(self.model),
-            "OUT_DIR": str(output_dir),
-            "WARMUPS": "0",
-            "REPEATS": "1",
-            "TIMEOUT": "off",
-            "ANTFLY_TOKENS": "3",
-            "LLAMA_TOKENS": "4",
-            "MIN_LLAMA_THROUGHPUT_RATIO": "0",
-            "MIN_COMPARABLE_THROUGHPUT_RATIO": "0",
-            "ANTFLY_DECODE_GRAPH_REPLAY": "off",
-        })
+        env.update(
+            {
+                "ANTFLY_BIN": str(self.antfly),
+                "LLAMA_CPP_BIN": str(self.llama),
+                "MODEL": str(self.model),
+                "OUT_DIR": str(output_dir),
+                "WARMUPS": "0",
+                "REPEATS": "1",
+                "TIMEOUT": "off",
+                "ANTFLY_TOKENS": "3",
+                "LLAMA_TOKENS": "4",
+                "MIN_LLAMA_THROUGHPUT_RATIO": "0",
+                "MIN_COMPARABLE_THROUGHPUT_RATIO": "0",
+                "ANTFLY_DECODE_GRAPH_REPLAY": "off",
+            }
+        )
         env.update(overrides)
         completed = subprocess.run(
             [str(self.pair_script)],
@@ -155,7 +162,9 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
         self.assertEqual([3], summary["actual_token_counts"]["llama_eval_runs"])
         self.assertEqual(3, summary["rows"][0]["antfly_generated_tokens"])
         self.assertTrue(summary["ok_lm_head_argmax"])
-        self.assertEqual("0", summary["comparison"]["antfly_generated_q4_0_e2b_ffn_exact"])
+        self.assertEqual(
+            "0", summary["comparison"]["antfly_generated_q4_0_e2b_ffn_exact"]
+        )
         self.assertEqual(0, summary["rows"][0]["antfly_generated_e2b_exact_pair"])
         self.assertEqual(11, summary["rows"][0]["antfly_generated_q4_0_mmv"])
         self.assertEqual(12, summary["rows"][0]["antfly_generated_q4_0_mm"])
@@ -207,7 +216,9 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
         self.assertIn("LLAMA_TOKENS = ANTFLY_TOKENS + 1", completed.stderr)
         self.assertFalse(output_dir.exists())
 
-    def test_gqa_prefill_profile_defaults_to_required_fast_without_legacy_vars(self) -> None:
+    def test_gqa_prefill_profile_defaults_to_required_fast_without_legacy_vars(
+        self,
+    ) -> None:
         profile_log = self.root / "gqa-profile-default.log"
         completed, output_dir = self.run_case(GQA_PROFILE_LOG=str(profile_log))
         self.assertEqual(0, completed.returncode, completed.stderr)
@@ -216,7 +227,9 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
             profile_log.read_text(encoding="utf-8").splitlines(),
         )
         summary = json.loads((output_dir / "paired_summary.json").read_text())
-        self.assertEqual("required-fast", summary["comparison"]["antfly_gqa_prefill_profile"])
+        self.assertEqual(
+            "required-fast", summary["comparison"]["antfly_gqa_prefill_profile"]
+        )
 
     def test_gqa_prefill_profile_can_exercise_the_unset_runtime_default(self) -> None:
         profile_log = self.root / "gqa-profile-runtime-default.log"
@@ -230,7 +243,9 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
             profile_log.read_text(encoding="utf-8").splitlines(),
         )
         summary = json.loads((output_dir / "paired_summary.json").read_text())
-        self.assertEqual("automatic", summary["comparison"]["antfly_gqa_prefill_profile"])
+        self.assertEqual(
+            "automatic", summary["comparison"]["antfly_gqa_prefill_profile"]
+        )
 
     def test_gqa_prefill_profile_preserves_explicit_legacy_bridge(self) -> None:
         profile_log = self.root / "gqa-profile-legacy.log"

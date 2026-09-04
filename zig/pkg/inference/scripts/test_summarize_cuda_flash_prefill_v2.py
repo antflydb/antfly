@@ -53,7 +53,9 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual([512, 512, 512, 512, 3], summary["locked_fixture"]["chunks"])
         self.assertAlmostEqual(2.0, summary["projected_35_layer_attention"]["speedup"])
         self.assertTrue(summary["projected_35_layer_attention"]["material_pass"])
-        self.assertEqual([28, 7], [item["layers"] for item in summary["per_head_dimension"]])
+        self.assertEqual(
+            [28, 7], [item["layers"] for item in summary["per_head_dimension"]]
+        )
 
     def test_rejects_non_bitwise_or_incomplete_evidence(self):
         payload = fixture()

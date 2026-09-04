@@ -32,6 +32,9 @@ help:
 	@echo "  build-antfarm      Build the antfarm frontend (React admin UI)"
 	@echo "  build-docs         Join OpenAPI specifications"
 	@echo "  generate           Generate Zig OpenAPI modules and client SDKs"
+	@echo "  fmt                Format Zig, Go, Python, TypeScript, and Rust sources"
+	@echo "  fmt-check          Check Zig, Go, Python, TypeScript, and Rust formatting"
+	@echo "  repository-check   Run repository formatting, SDK, and release checks"
 	@echo "  lint               Run linters across retained Go modules and TypeScript"
 	@echo "  tidy               Run go mod tidy across retained Go modules"
 	@echo "  tidy-check         Verify retained Go modules are tidy"
@@ -69,7 +72,7 @@ help:
 # Build and Generation Commands
 # ====================================================================================
 
-.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-antfarm-main release-scripting-test
+.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check fmt fmt-check repository-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-antfarm-main release-scripting-test
 .PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main
@@ -147,6 +150,15 @@ zig-license-check:
 
 zig-tla-check:
 	$(ZIG_MAKE) tla-check
+
+fmt:
+	scripts/format.sh
+
+fmt-check:
+	scripts/format.sh --check
+
+repository-check:
+	scripts/ci/check.sh all
 
 lint:
 	@for mod in $(GO_MODULES); do \

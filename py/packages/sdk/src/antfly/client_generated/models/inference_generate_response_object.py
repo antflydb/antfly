@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceGenerateResponseObject(str, Enum):
+class InferenceGenerateResponseObject(StrEnum):
     CHAT_COMPLETION = "chat.completion"
 
     def __str__(self) -> str:
