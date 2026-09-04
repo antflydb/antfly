@@ -20,7 +20,9 @@ def merge(
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     evidence_bytes = evidence_path.read_bytes() if evidence_path.is_file() else None
     evidence: dict[str, object] = {}
-    evidence_parse_error = "evidence file is missing" if evidence_bytes is None else None
+    evidence_parse_error = (
+        "evidence file is missing" if evidence_bytes is None else None
+    )
     if evidence_bytes is not None:
         try:
             parsed_evidence = json.loads(evidence_bytes)
@@ -31,13 +33,19 @@ def merge(
                 evidence = parsed_evidence
             else:
                 evidence_parse_error = "evidence root must be a JSON object"
-    passed = benchmark_exit_code == 0 and evidence_parse_error is None and bool(evidence.get("passed"))
+    passed = (
+        benchmark_exit_code == 0
+        and evidence_parse_error is None
+        and bool(evidence.get("passed"))
+    )
     summary[lane_field] = {
         "required": True,
         "enabled": True,
         "benchmark_exit_code": benchmark_exit_code,
         "path": str(evidence_path),
-        "sha256": hashlib.sha256(evidence_bytes).hexdigest() if evidence_bytes is not None else None,
+        "sha256": hashlib.sha256(evidence_bytes).hexdigest()
+        if evidence_bytes is not None
+        else None,
         "parse_error": evidence_parse_error,
         "schema": evidence.get("schema"),
         "contract": evidence.get("contract"),
@@ -84,7 +92,11 @@ def main() -> int:
         lane_label=args.lane_label,
     )
     lane = result.get(args.lane_field)
-    if bool(result.get("passed")) and isinstance(lane, dict) and bool(lane.get("passed")):
+    if (
+        bool(result.get("passed"))
+        and isinstance(lane, dict)
+        and bool(lane.get("passed"))
+    ):
         return 0
     return args.benchmark_exit_code if args.benchmark_exit_code != 0 else 1
 

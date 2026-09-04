@@ -6478,6 +6478,9 @@ pub const MetadataAdminSimSource = struct {
                 .linearizable_snapshot = linearizableSnapshot,
                 .status = status,
                 .admin_snapshot = adminSnapshot,
+                .routing_snapshot = routingSnapshot,
+                .linearizable_routing_snapshot = linearizableRoutingSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
                 .validate_publication = validatePublication,
                 .validate_table_publication = validateTablePublication,
                 .free_admin_snapshot = freeAdminSnapshot,
@@ -6536,6 +6539,27 @@ pub const MetadataAdminSimSource = struct {
         return try self.node.adminSnapshot();
     }
 
+    fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.node.catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn linearizableRoutingSnapshot(
+        ptr: *anyopaque,
+        request: api_operation.RequestContext,
+    ) !metadata_api.CatalogRoutingSnapshot {
+        try request.ensureActive();
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = currentMetadataMutationNode(self.node);
+        if (target.index != self.node.index) return error.NotLeader;
+        return try target.catalogRoutingSnapshot(request.deadline_ns);
+    }
+
+    fn freeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.node.freeCatalogRoutingSnapshot(snapshot);
+    }
+
     fn validatePublication(
         ptr: *anyopaque,
         contract: metadata_api.CatalogPublicationContract,
@@ -6581,7 +6605,7 @@ pub const MetadataAdminSimSource = struct {
         table_name: []const u8,
     ) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        try applyDropTableMutation(self.node, alloc, table_name);
+        _ = try applyDropTableMutation(self.node, alloc, table_name);
     }
 
     fn updateSchema(

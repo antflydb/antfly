@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class FilterSpecOperator(str, Enum):
+class FilterSpecOperator(StrEnum):
     CONTAINS = "contains"
     EQ = "eq"
     GT = "gt"

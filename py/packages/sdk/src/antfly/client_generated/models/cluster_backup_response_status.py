@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ClusterBackupResponseStatus(str, Enum):
+class ClusterBackupResponseStatus(StrEnum):
     AMBIGUOUS = "ambiguous"
     COMPLETED = "completed"
     FAILED = "failed"

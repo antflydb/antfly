@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TableRepairJobRepairStatus(str, Enum):
+class TableRepairJobRepairStatus(StrEnum):
     COMPLETE = "complete"
     DEBT_REMAINING = "debt_remaining"
     IN_PROGRESS = "in_progress"

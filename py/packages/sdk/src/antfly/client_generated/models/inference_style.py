@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceStyle(str, Enum):
+class InferenceStyle(StrEnum):
     JSON = "json"
     LOGFMT = "logfmt"
     NOOP = "noop"

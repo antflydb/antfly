@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class LinkupSearchConfigOutputType(str, Enum):
+class LinkupSearchConfigOutputType(StrEnum):
     SEARCHRESULTS = "searchResults"
     SOURCEDANSWER = "sourcedAnswer"
 

@@ -124,10 +124,12 @@ def strict_provenance_fixture() -> dict:
         "tracked_diff_error": None,
         "untracked_inventory_schema": "antfly.git_untracked_inventory.v1",
         "untracked_inventory_returncode": 0,
-        "untracked_inventory_sha256": canonical_sha256({
-            "schema": "antfly.git_untracked_inventory.v1",
-            "files": untracked_files,
-        }),
+        "untracked_inventory_sha256": canonical_sha256(
+            {
+                "schema": "antfly.git_untracked_inventory.v1",
+                "files": untracked_files,
+            }
+        ),
         "untracked_file_count": 0,
         "untracked_files": untracked_files,
         "untracked_inventory_error": None,
@@ -147,26 +149,28 @@ def strict_provenance_fixture() -> dict:
             "version": "Cuda compilation tools, release 13.2, V13.2.0",
         },
     }
-    toolchains["sha256"] = canonical_sha256({
-        name: toolchains[name] for name in ("zig", "nvcc")
-    })
+    toolchains["sha256"] = canonical_sha256(
+        {name: toolchains[name] for name in ("zig", "nvcc")}
+    )
     gpu_state = {
         "cuda_visible_devices": "GPU-test",
-        "selected_gpus": [{
-            "index": 0,
-            "uuid": "GPU-test",
-            "name": "NVIDIA L4",
-            "driver_version": "580.159.03",
-            "compute_cap": 8.9,
-            "memory.total": 23034,
-            "persistence_mode": "Enabled",
-            "power.limit": 72.0,
-            "clocks.max.graphics": 2040,
-            "clocks.max.memory": 6251,
-            "clocks.applications.graphics": 2040,
-            "clocks.applications.memory": 6251,
-            "mig.mode.current": "N/A",
-        }],
+        "selected_gpus": [
+            {
+                "index": 0,
+                "uuid": "GPU-test",
+                "name": "NVIDIA L4",
+                "driver_version": "580.159.03",
+                "compute_cap": 8.9,
+                "memory.total": 23034,
+                "persistence_mode": "Enabled",
+                "power.limit": 72.0,
+                "clocks.max.graphics": 2040,
+                "clocks.max.memory": 6251,
+                "clocks.applications.graphics": 2040,
+                "clocks.applications.memory": 6251,
+                "mig.mode.current": "N/A",
+            }
+        ],
         "error": None,
     }
     processes = {"selected_gpu_processes": [], "error": None}
@@ -206,15 +210,19 @@ def strict_provenance_fixture() -> dict:
             },
         },
     }
-    provenance["runtime_environment"]["sha256"] = canonical_sha256({
-        "schema": provenance["runtime_environment"]["schema"],
-        "values": provenance["runtime_environment"]["values"],
-    })
-    provenance["sha256"] = canonical_sha256({
-        name: item.get("sha256")
-        for name, item in sorted(provenance.items())
-        if isinstance(item, dict)
-    })
+    provenance["runtime_environment"]["sha256"] = canonical_sha256(
+        {
+            "schema": provenance["runtime_environment"]["schema"],
+            "values": provenance["runtime_environment"]["values"],
+        }
+    )
+    provenance["sha256"] = canonical_sha256(
+        {
+            name: item.get("sha256")
+            for name, item in sorted(provenance.items())
+            if isinstance(item, dict)
+        }
+    )
     return provenance
 
 
@@ -372,7 +380,11 @@ class CandidateParityTest(unittest.TestCase):
         with mock.patch.object(
             sys,
             "argv",
-            ["validate_gemma4_cuda_candidate.py", "--qualification-profile", "screening"],
+            [
+                "validate_gemma4_cuda_candidate.py",
+                "--qualification-profile",
+                "screening",
+            ],
         ):
             screening = parse_args()
         self.assertEqual(5, screening.repeats)
@@ -383,7 +395,11 @@ class CandidateParityTest(unittest.TestCase):
         with mock.patch.object(
             sys,
             "argv",
-            ["validate_gemma4_cuda_candidate.py", "--qualification-profile", "promotion"],
+            [
+                "validate_gemma4_cuda_candidate.py",
+                "--qualification-profile",
+                "promotion",
+            ],
         ):
             promotion = parse_args()
         self.assertEqual(10, promotion.repeats)
@@ -394,7 +410,11 @@ class CandidateParityTest(unittest.TestCase):
         with mock.patch.object(
             sys,
             "argv",
-            ["validate_gemma4_cuda_candidate.py", "--qualification-profile", "prefill-screening"],
+            [
+                "validate_gemma4_cuda_candidate.py",
+                "--qualification-profile",
+                "prefill-screening",
+            ],
         ):
             prefill_screening = parse_args()
         self.assertEqual(5, prefill_screening.repeats)
@@ -408,7 +428,11 @@ class CandidateParityTest(unittest.TestCase):
         with mock.patch.object(
             sys,
             "argv",
-            ["validate_gemma4_cuda_candidate.py", "--qualification-profile", "prefill-promotion"],
+            [
+                "validate_gemma4_cuda_candidate.py",
+                "--qualification-profile",
+                "prefill-promotion",
+            ],
         ):
             prefill_promotion = parse_args()
         self.assertEqual(10, prefill_promotion.repeats)
@@ -455,15 +479,21 @@ class CandidateParityTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "forbids unlocked --prompt"):
             validate_qualification_contract(strict)
         strict.prompt = []
-        strict.max_ttft_ratio = QUALIFICATION_PROFILES["prefill-promotion"]["max_ttft_ratio"] + 0.01
+        strict.max_ttft_ratio = (
+            QUALIFICATION_PROFILES["prefill-promotion"]["max_ttft_ratio"] + 0.01
+        )
         with self.assertRaisesRegex(ValueError, "max-ttft-ratio cannot be looser"):
             validate_qualification_contract(strict)
-        strict.max_ttft_ratio = QUALIFICATION_PROFILES["prefill-promotion"]["max_ttft_ratio"]
+        strict.max_ttft_ratio = QUALIFICATION_PROFILES["prefill-promotion"][
+            "max_ttft_ratio"
+        ]
         strict.bootstrap_samples = 9_999
         with self.assertRaisesRegex(ValueError, "at least 10000 bootstrap samples"):
             validate_qualification_contract(strict)
 
-    def test_fixed_profiles_reject_phase_mismatch_catalog_mutation_and_loose_decode_gates(self):
+    def test_fixed_profiles_reject_phase_mismatch_catalog_mutation_and_loose_decode_gates(
+        self,
+    ):
         with mock.patch.object(
             sys,
             "argv",
@@ -512,7 +542,9 @@ class CandidateParityTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "max-decode-ci-upper cannot be looser"):
             validate_qualification_contract(loose)
 
-    def test_fixed_profiles_require_canonical_scripts_and_forbid_candidate_overrides(self):
+    def test_fixed_profiles_require_canonical_scripts_and_forbid_candidate_overrides(
+        self,
+    ):
         with mock.patch.object(
             sys,
             "argv",
@@ -562,28 +594,37 @@ class CandidateParityTest(unittest.TestCase):
             suffix = "<turn|>\n<|turn>model\n<|channel>final\n<channel|>"
             reference = (prefix + prompt + suffix).encode("utf-8")
             path.write_text(
-                json.dumps({
-                    "schema": "antfly.prompt_fixture.v1",
-                    "id": "long-prompt-v1",
-                    "segment": "evidence ",
-                    "repeat": 4,
-                    "suffix": "question",
-                    "expected_user_utf8_bytes": len(encoded),
-                    "expected_user_sha256": hashlib.sha256(encoded).hexdigest(),
-                    "reference_chat_prefix": prefix,
-                    "reference_chat_suffix": suffix,
-                    "expected_reference_prompt_utf8_bytes": len(reference),
-                    "expected_reference_prompt_sha256": hashlib.sha256(reference).hexdigest(),
-                    "expected_reference_prompt_tokens": 17,
-                }),
+                json.dumps(
+                    {
+                        "schema": "antfly.prompt_fixture.v1",
+                        "id": "long-prompt-v1",
+                        "segment": "evidence ",
+                        "repeat": 4,
+                        "suffix": "question",
+                        "expected_user_utf8_bytes": len(encoded),
+                        "expected_user_sha256": hashlib.sha256(encoded).hexdigest(),
+                        "reference_chat_prefix": prefix,
+                        "reference_chat_suffix": suffix,
+                        "expected_reference_prompt_utf8_bytes": len(reference),
+                        "expected_reference_prompt_sha256": hashlib.sha256(
+                            reference
+                        ).hexdigest(),
+                        "expected_reference_prompt_tokens": 17,
+                    }
+                ),
                 encoding="utf-8",
             )
             rendered, metadata = load_prompt_fixture(path)
             self.assertEqual(reference.decode("utf-8"), rendered)
             self.assertEqual("long-prompt-v1", metadata["id"])
             self.assertEqual(17, metadata["benchmark_prompt_tokens"])
-            self.assertEqual(hashlib.sha256(reference).hexdigest(), metadata["benchmark_prompt_sha256"])
-            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), metadata["file_sha256"])
+            self.assertEqual(
+                hashlib.sha256(reference).hexdigest(),
+                metadata["benchmark_prompt_sha256"],
+            )
+            self.assertEqual(
+                hashlib.sha256(path.read_bytes()).hexdigest(), metadata["file_sha256"]
+            )
 
             payload = json.loads(path.read_text(encoding="utf-8"))
             payload["expected_user_sha256"] = "0" * 64
@@ -600,7 +641,10 @@ class CandidateParityTest(unittest.TestCase):
             bundle = input_path_provenance(root)
             self.assertEqual(hashlib.sha256(b"model").hexdigest(), model["sha256"])
             self.assertEqual(2, bundle["file_count"])
-            self.assertEqual(["model.gguf", "tokenizer.json"], [item["path"] for item in bundle["files"]])
+            self.assertEqual(
+                ["model.gguf", "tokenizer.json"],
+                [item["path"] for item in bundle["files"]],
+            )
 
     def test_strict_provenance_accepts_bound_dirty_state_and_fails_closed(self):
         provenance = strict_provenance_fixture()
@@ -608,89 +652,115 @@ class CandidateParityTest(unittest.TestCase):
         self.assertTrue(provenance["git"]["dirty"])
 
         fixed_environment = json.loads(json.dumps(provenance))
-        fixed_environment["runtime_environment"]["values"].update({
-            "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "1",
-            "TERMITE_CUDA_DEQUANTIZE_QUANT_WEIGHTS": "0",
-        })
+        fixed_environment["runtime_environment"]["values"].update(
+            {
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "1",
+                "TERMITE_CUDA_DEQUANTIZE_QUANT_WEIGHTS": "0",
+            }
+        )
         runtime_identity = {
             "schema": fixed_environment["runtime_environment"]["schema"],
             "values": fixed_environment["runtime_environment"]["values"],
         }
-        fixed_environment["runtime_environment"]["sha256"] = canonical_sha256(runtime_identity)
-        fixed_environment["sha256"] = canonical_sha256({
-            name: item.get("sha256")
-            for name, item in sorted(fixed_environment.items())
-            if isinstance(item, dict)
-        })
+        fixed_environment["runtime_environment"]["sha256"] = canonical_sha256(
+            runtime_identity
+        )
+        fixed_environment["sha256"] = canonical_sha256(
+            {
+                name: item.get("sha256")
+                for name, item in sorted(fixed_environment.items())
+                if isinstance(item, dict)
+            }
+        )
         self.assertEqual([], strict_qualification_provenance_errors(fixed_environment))
 
         missing_content = json.loads(json.dumps(provenance))
         missing_content["git"]["tracked_diff_sha256"] = None
-        missing_content["git"]["sha256"] = canonical_sha256({
-            name: value
-            for name, value in missing_content["git"].items()
-            if name != "sha256"
-        })
-        missing_content["sha256"] = canonical_sha256({
-            name: item.get("sha256")
-            for name, item in sorted(missing_content.items())
-            if isinstance(item, dict)
-        })
-        self.assertTrue(any(
-            "tracked-content" in error
-            for error in strict_qualification_provenance_errors(missing_content)
-        ))
+        missing_content["git"]["sha256"] = canonical_sha256(
+            {
+                name: value
+                for name, value in missing_content["git"].items()
+                if name != "sha256"
+            }
+        )
+        missing_content["sha256"] = canonical_sha256(
+            {
+                name: item.get("sha256")
+                for name, item in sorted(missing_content.items())
+                if isinstance(item, dict)
+            }
+        )
+        self.assertTrue(
+            any(
+                "tracked-content" in error
+                for error in strict_qualification_provenance_errors(missing_content)
+            )
+        )
 
         unbound = json.loads(json.dumps(provenance))
         unbound["sha256"] = "0" * 64
-        self.assertTrue(any(
-            "top-level provenance hash" in error
-            for error in strict_qualification_provenance_errors(unbound)
-        ))
+        self.assertTrue(
+            any(
+                "top-level provenance hash" in error
+                for error in strict_qualification_provenance_errors(unbound)
+            )
+        )
 
         missing_artifact = json.loads(json.dumps(provenance))
         del missing_artifact["cuda_artifacts"]["files"]["runtime_sm89_cubin"]
         errors = strict_qualification_provenance_errors(missing_artifact)
         self.assertTrue(any("runtime_sm89_cubin" in error for error in errors))
-        self.assertTrue(any("artifact-set hash does not match" in error for error in errors))
+        self.assertTrue(
+            any("artifact-set hash does not match" in error for error in errors)
+        )
 
         busy = json.loads(json.dumps(provenance))
         processes = {
-            "selected_gpu_processes": [{
-                "gpu_uuid": "GPU-test",
-                "pid": 42,
-                "process_name": "competing-job",
-            }],
+            "selected_gpu_processes": [
+                {
+                    "gpu_uuid": "GPU-test",
+                    "pid": 42,
+                    "process_name": "competing-job",
+                }
+            ],
             "error": None,
         }
         busy["gpu"]["selected_compute_processes"] = processes
-        busy["gpu"]["sha256"] = canonical_sha256({
-            "execution_state": busy["gpu"]["execution_state"],
-            "selected_compute_processes": processes,
-        })
+        busy["gpu"]["sha256"] = canonical_sha256(
+            {
+                "execution_state": busy["gpu"]["execution_state"],
+                "selected_compute_processes": processes,
+            }
+        )
         errors = strict_qualification_provenance_errors(busy)
         self.assertTrue(any("competing processes" in error for error in errors))
 
         wrong_toolchain = json.loads(json.dumps(provenance))
         wrong_toolchain["toolchains"]["zig"]["version"] = "0.15.2"
-        wrong_toolchain["toolchains"]["sha256"] = canonical_sha256({
-            name: wrong_toolchain["toolchains"][name] for name in ("zig", "nvcc")
-        })
+        wrong_toolchain["toolchains"]["sha256"] = canonical_sha256(
+            {name: wrong_toolchain["toolchains"][name] for name in ("zig", "nvcc")}
+        )
         errors = strict_qualification_provenance_errors(wrong_toolchain)
         self.assertTrue(any("Zig 0.16.0" in error for error in errors))
 
         wrong_gpu = json.loads(json.dumps(provenance))
-        wrong_gpu["gpu"]["execution_state"]["selected_gpus"][0]["name"] = "NVIDIA GeForce RTX 4090"
+        wrong_gpu["gpu"]["execution_state"]["selected_gpus"][0]["name"] = (
+            "NVIDIA GeForce RTX 4090"
+        )
         gpu_identity = {
             "execution_state": wrong_gpu["gpu"]["execution_state"],
-            "selected_compute_processes": wrong_gpu["gpu"]["selected_compute_processes"],
+            "selected_compute_processes": wrong_gpu["gpu"][
+                "selected_compute_processes"
+            ],
         }
         wrong_gpu["gpu"]["sha256"] = canonical_sha256(gpu_identity)
-        wrong_gpu["sha256"] = canonical_sha256({
-            name: item.get("sha256")
-            for name, item in sorted(wrong_gpu.items())
-            if isinstance(item, dict)
-        })
+        wrong_gpu["sha256"] = canonical_sha256(
+            {
+                name: item.get("sha256")
+                for name, item in sorted(wrong_gpu.items())
+                if isinstance(item, dict)
+            }
+        )
         errors = strict_qualification_provenance_errors(wrong_gpu)
         self.assertTrue(any("requires NVIDIA L4" in error for error in errors))
 
@@ -698,16 +768,22 @@ class CandidateParityTest(unittest.TestCase):
         numeric_selector["gpu"]["execution_state"]["cuda_visible_devices"] = "0"
         gpu_identity = {
             "execution_state": numeric_selector["gpu"]["execution_state"],
-            "selected_compute_processes": numeric_selector["gpu"]["selected_compute_processes"],
+            "selected_compute_processes": numeric_selector["gpu"][
+                "selected_compute_processes"
+            ],
         }
         numeric_selector["gpu"]["sha256"] = canonical_sha256(gpu_identity)
-        numeric_selector["sha256"] = canonical_sha256({
-            name: item.get("sha256")
-            for name, item in sorted(numeric_selector.items())
-            if isinstance(item, dict)
-        })
+        numeric_selector["sha256"] = canonical_sha256(
+            {
+                name: item.get("sha256")
+                for name, item in sorted(numeric_selector.items())
+                if isinstance(item, dict)
+            }
+        )
         errors = strict_qualification_provenance_errors(numeric_selector)
-        self.assertTrue(any("UUID-based CUDA_VISIBLE_DEVICES" in error for error in errors))
+        self.assertTrue(
+            any("UUID-based CUDA_VISIBLE_DEVICES" in error for error in errors)
+        )
 
     def test_artifact_freshness_attestation_binds_before_after_hashes(self):
         before = strict_provenance_fixture()
@@ -733,7 +809,9 @@ class CandidateParityTest(unittest.TestCase):
         self.assertFalse(attestation["passed"])
 
         checks["canonical_cuda_artifacts"]["passed"] = False
-        self.assertFalse(artifact_freshness_attestation(before, after, checks)["passed"])
+        self.assertFalse(
+            artifact_freshness_attestation(before, after, checks)["passed"]
+        )
 
     def test_freshness_checks_run_each_canonical_check_once(self):
         provenance = strict_provenance_fixture()
@@ -745,14 +823,16 @@ class CandidateParityTest(unittest.TestCase):
                 binary=root / "antfly-inference",
                 artifact_check_script=SCRIPTS.parent / "regen-cuda-artifacts.sh",
             )
-            artifact_identity = "\n".join((
-                "cuda_artifact_identity_schema: antfly.cuda_artifact_identity.v1",
-                "cuda_artifact_mode: sm89",
-                "cuda_artifact_format: cubin",
-                "cuda_artifact_target: sm_89",
-                "cuda_artifact_image_bytes: 1",
-                f"cuda_artifact_image_sha256: {'a' * 64}",
-            ))
+            artifact_identity = "\n".join(
+                (
+                    "cuda_artifact_identity_schema: antfly.cuda_artifact_identity.v1",
+                    "cuda_artifact_mode: sm89",
+                    "cuda_artifact_format: cubin",
+                    "cuda_artifact_target: sm_89",
+                    "cuda_artifact_image_bytes: 1",
+                    f"cuda_artifact_image_sha256: {'a' * 64}",
+                )
+            )
             with (
                 mock.patch(
                     "validate_gemma4_cuda_candidate._run_logged_in_directory",
@@ -813,11 +893,13 @@ class CandidateParityTest(unittest.TestCase):
         self.assertTrue(any("clocks, or power" in error for error in guard["errors"]))
 
         busy = {
-            "selected_gpu_processes": [{
-                "gpu_uuid": "GPU-test",
-                "pid": 42,
-                "process_name": "competing-job",
-            }],
+            "selected_gpu_processes": [
+                {
+                    "gpu_uuid": "GPU-test",
+                    "pid": 42,
+                    "process_name": "competing-job",
+                }
+            ],
             "error": None,
         }
         with (
@@ -831,7 +913,9 @@ class CandidateParityTest(unittest.TestCase):
             ),
         ):
             guard = capture_qualification_runtime_guard(provenance, "before-pair")
-        self.assertTrue(any("unexpected selected-GPU" in error for error in guard["errors"]))
+        self.assertTrue(
+            any("unexpected selected-GPU" in error for error in guard["errors"])
+        )
 
     def test_candidate_artifact_hash_covers_release_outputs_renderer_and_compiler(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -951,7 +1035,9 @@ class CandidateParityTest(unittest.TestCase):
 
     def test_controlled_release_build_pins_binary_and_build_flags(self):
         with tempfile.TemporaryDirectory() as temporary:
-            canonical_binary = (SCRIPTS.parents[1] / "zig-out/bin/antfly-inference").resolve()
+            canonical_binary = (
+                SCRIPTS.parents[1] / "zig-out/bin/antfly-inference"
+            ).resolve()
             args = argparse.Namespace(
                 binary=canonical_binary,
                 output_dir=pathlib.Path(temporary),
@@ -964,13 +1050,16 @@ class CandidateParityTest(unittest.TestCase):
                     return True
                 return real_is_file(path)
 
-            with mock.patch(
-                "validate_gemma4_cuda_candidate._run_logged_in_directory",
-                return_value=(0, "ok"),
-            ) as run, mock.patch.object(
-                pathlib.Path,
-                "is_file",
-                controlled_build_output_exists,
+            with (
+                mock.patch(
+                    "validate_gemma4_cuda_candidate._run_logged_in_directory",
+                    return_value=(0, "ok"),
+                ) as run,
+                mock.patch.object(
+                    pathlib.Path,
+                    "is_file",
+                    controlled_build_output_exists,
+                ),
             ):
                 result = run_controlled_release_build(args)
             self.assertTrue(result["passed"])
@@ -984,11 +1073,15 @@ class CandidateParityTest(unittest.TestCase):
             args.binary = pathlib.Path(temporary) / "unbound-binary"
             result = run_controlled_release_build(args)
             self.assertFalse(result["passed"])
-            self.assertTrue(any("binary must be" in error for error in result["errors"]))
+            self.assertTrue(
+                any("binary must be" in error for error in result["errors"])
+            )
 
     def test_controlled_release_build_rejects_missing_output_binary(self):
         with tempfile.TemporaryDirectory() as temporary:
-            canonical_binary = (SCRIPTS.parents[1] / "zig-out/bin/antfly-inference").resolve()
+            canonical_binary = (
+                SCRIPTS.parents[1] / "zig-out/bin/antfly-inference"
+            ).resolve()
             args = argparse.Namespace(
                 binary=canonical_binary,
                 output_dir=pathlib.Path(temporary),
@@ -1001,13 +1094,16 @@ class CandidateParityTest(unittest.TestCase):
                     return False
                 return real_is_file(path)
 
-            with mock.patch(
-                "validate_gemma4_cuda_candidate._run_logged_in_directory",
-                return_value=(0, "ok"),
-            ), mock.patch.object(
-                pathlib.Path,
-                "is_file",
-                controlled_build_output_is_missing,
+            with (
+                mock.patch(
+                    "validate_gemma4_cuda_candidate._run_logged_in_directory",
+                    return_value=(0, "ok"),
+                ),
+                mock.patch.object(
+                    pathlib.Path,
+                    "is_file",
+                    controlled_build_output_is_missing,
+                ),
             ):
                 result = run_controlled_release_build(args)
 
@@ -1062,8 +1158,11 @@ class CandidateParityTest(unittest.TestCase):
             / "zig/e2e/inference/run_cuda_gemma4_l4_e2e.sh"
         ).read_text(encoding="utf-8")
         lane = runner[
-            runner.index("scripts/gemma4/validate_gemma4_cuda_candidate.py"):
-            runner.index('python3 "$inference_dir/scripts/gemma4/benchmark_gemma4_cuda_batching.py"')
+            runner.index(
+                "scripts/gemma4/validate_gemma4_cuda_candidate.py"
+            ) : runner.index(
+                'python3 "$inference_dir/scripts/gemma4/benchmark_gemma4_cuda_batching.py"'
+            )
         ]
         self.assertIn("--kernel-id cuda.attention.gqa.decode.score_prework", lane)
         self.assertIn("--qualification-profile screening", lane)
@@ -1108,7 +1207,9 @@ class CandidateParityTest(unittest.TestCase):
         self.assertEqual("polar4", args.cache_dtype)
         self.assertEqual(
             "polar4",
-            result_config_metadata(args, timing_metadata_from_args(args))["cache_dtype"],
+            result_config_metadata(args, timing_metadata_from_args(args))[
+                "cache_dtype"
+            ],
         )
 
     def test_cli_accepts_repeatable_common_environment(self):
@@ -1144,49 +1245,71 @@ class CandidateParityTest(unittest.TestCase):
         spec = resolve_candidate_spec(args)
         self.assertEqual(
             EXACT_E2B_FFN_F32_COMPARISON_ENVIRONMENT,
-            resolve_common_environment(args, spec, resolve_candidate_environment(args, spec)),
+            resolve_common_environment(
+                args, spec, resolve_candidate_environment(args, spec)
+            ),
         )
 
     def test_pair_only_e2b_ffn_pins_competing_routes_off(self):
         with mock.patch.object(
             sys,
             "argv",
-            ["validate_gemma4_cuda_candidate.py", "--candidate", "q4-0-q8-1-e2b-ffn-pair-only"],
+            [
+                "validate_gemma4_cuda_candidate.py",
+                "--candidate",
+                "q4-0-q8-1-e2b-ffn-pair-only",
+            ],
         ):
             args = parse_args()
         spec = resolve_candidate_spec(args)
         self.assertEqual(
             E2B_FFN_PAIR_ONLY_COMPARISON_ENVIRONMENT,
-            resolve_common_environment(args, spec, resolve_candidate_environment(args, spec)),
+            resolve_common_environment(
+                args, spec, resolve_candidate_environment(args, spec)
+            ),
         )
 
     def test_score_prework_catalog_pins_the_paged_f32_value_comparison_profile(self):
         with mock.patch.object(
             sys,
             "argv",
-            ["validate_gemma4_cuda_candidate.py", "--kernel-id", SCORE_PREWORK_ATTENTION_KERNEL_ID],
+            [
+                "validate_gemma4_cuda_candidate.py",
+                "--kernel-id",
+                SCORE_PREWORK_ATTENTION_KERNEL_ID,
+            ],
         ):
             args = parse_args()
         spec = resolve_candidate_spec(args)
         self.assertEqual(CANDIDATE_CATALOG[SCORE_PREWORK_ATTENTION_KERNEL_ID], spec)
         self.assertEqual(
             SCORE_PREWORK_ATTENTION_COMPARISON_ENVIRONMENT,
-            resolve_common_environment(args, spec, resolve_candidate_environment(args, spec)),
+            resolve_common_environment(
+                args, spec, resolve_candidate_environment(args, spec)
+            ),
         )
         self.assertEqual(
             "launch_attention_gqa_decode_score_prework",
             spec.route_counter,
         )
 
-    def test_tiled64_score_prework_catalog_is_isolated_and_requires_both_head_dims(self):
+    def test_tiled64_score_prework_catalog_is_isolated_and_requires_both_head_dims(
+        self,
+    ):
         with mock.patch.object(
             sys,
             "argv",
-            ["validate_gemma4_cuda_candidate.py", "--kernel-id", SCORE_PREWORK_TILED64_ATTENTION_KERNEL_ID],
+            [
+                "validate_gemma4_cuda_candidate.py",
+                "--kernel-id",
+                SCORE_PREWORK_TILED64_ATTENTION_KERNEL_ID,
+            ],
         ):
             args = parse_args()
             spec = resolve_candidate_spec(args)
-        self.assertEqual(CANDIDATE_CATALOG[SCORE_PREWORK_TILED64_ATTENTION_KERNEL_ID], spec)
+        self.assertEqual(
+            CANDIDATE_CATALOG[SCORE_PREWORK_TILED64_ATTENTION_KERNEL_ID], spec
+        )
         self.assertEqual(
             "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER",
             spec.environment_variable,
@@ -1230,12 +1353,20 @@ class CandidateParityTest(unittest.TestCase):
         with mock.patch.object(
             sys,
             "argv",
-            ["validate_gemma4_cuda_candidate.py", "--kernel-id", GQA_DECODE_SPLITK_ONLINE_SM89_KERNEL_ID],
+            [
+                "validate_gemma4_cuda_candidate.py",
+                "--kernel-id",
+                GQA_DECODE_SPLITK_ONLINE_SM89_KERNEL_ID,
+            ],
         ):
             args = parse_args()
             spec = resolve_candidate_spec(args)
-        self.assertEqual(CANDIDATE_CATALOG[GQA_DECODE_SPLITK_ONLINE_SM89_KERNEL_ID], spec)
-        self.assertEqual("ANTFLY_INFERENCE_CUDA_GQA_DECODE_PROFILE", spec.environment_variable)
+        self.assertEqual(
+            CANDIDATE_CATALOG[GQA_DECODE_SPLITK_ONLINE_SM89_KERNEL_ID], spec
+        )
+        self.assertEqual(
+            "ANTFLY_INFERENCE_CUDA_GQA_DECODE_PROFILE", spec.environment_variable
+        )
         self.assertEqual("off", spec.baseline_gate_value)
         self.assertEqual("required-splitk-online-sm89", spec.candidate_gate_value)
         self.assertEqual(GEMMA4_LONG_CONTEXT_WORKLOAD, spec.qualification_workload)
@@ -1267,12 +1398,16 @@ class CandidateParityTest(unittest.TestCase):
             ],
         ):
             replay_disabled = parse_args()
-        with self.assertRaisesRegex(ValueError, "requires persistent replay validation"):
+        with self.assertRaisesRegex(
+            ValueError, "requires persistent replay validation"
+        ):
             validate_qualification_contract(replay_disabled)
         fixed_environment = dict(spec.fixed_comparison_environment)
         self.assertEqual(
             "1",
-            fixed_environment["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK"],
+            fixed_environment[
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK"
+            ],
         )
         self.assertEqual(
             "required-tiled64",
@@ -1308,10 +1443,16 @@ class CandidateParityTest(unittest.TestCase):
         )
         self.assertEqual(
             [],
-            validate_pair(baseline, candidate, 300, spec, require_full_route_coverage=True),
+            validate_pair(
+                baseline, candidate, 300, spec, require_full_route_coverage=True
+            ),
         )
-        candidate["cuda"]["launch_attention_gqa_decode_splitk_online_sm89_symbol_fallbacks"] = 1
-        errors = validate_pair(baseline, candidate, 300, spec, require_full_route_coverage=True)
+        candidate["cuda"][
+            "launch_attention_gqa_decode_splitk_online_sm89_symbol_fallbacks"
+        ] = 1
+        errors = validate_pair(
+            baseline, candidate, 300, spec, require_full_route_coverage=True
+        )
         self.assertTrue(any("symbol fallbacks" in error for error in errors))
 
     def test_gqa_prefill_catalog_profiles_require_both_gemma4_head_dims(self):
@@ -1332,16 +1473,23 @@ class CandidateParityTest(unittest.TestCase):
             ),
         }
         for kernel_id, (candidate_value, counters) in expected.items():
-            with self.subTest(kernel_id=kernel_id), mock.patch.object(
-                sys,
-                "argv",
-                ["validate_gemma4_cuda_candidate.py", "--kernel-id", kernel_id],
+            with (
+                self.subTest(kernel_id=kernel_id),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["validate_gemma4_cuda_candidate.py", "--kernel-id", kernel_id],
+                ),
             ):
                 spec = resolve_candidate_spec(parse_args())
-            self.assertEqual("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE", spec.environment_variable)
+            self.assertEqual(
+                "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE", spec.environment_variable
+            )
             self.assertEqual("required-fast", spec.baseline_gate_value)
             self.assertEqual(candidate_value, spec.candidate_gate_value)
-            self.assertEqual(counters, [counter.name for counter in spec.required_route_counters])
+            self.assertEqual(
+                counters, [counter.name for counter in spec.required_route_counters]
+            )
             if kernel_id == GQA_PREFILL_TILED_F16_WARP_KERNEL_ID:
                 self.assertEqual(
                     [140, 35],
@@ -1350,7 +1498,9 @@ class CandidateParityTest(unittest.TestCase):
 
     def test_flash_prefill_catalog_locks_all_head_and_query_buckets(self):
         spec = CANDIDATE_CATALOG[GQA_PREFILL_FLASH_F16_SM89_KERNEL_ID]
-        self.assertEqual("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE", spec.environment_variable)
+        self.assertEqual(
+            "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE", spec.environment_variable
+        )
         self.assertEqual("required-fast", spec.baseline_gate_value)
         self.assertEqual("required-flash-f16-sm89", spec.candidate_gate_value)
         self.assertEqual("prefill", spec.route_phase)
@@ -1402,10 +1552,16 @@ class CandidateParityTest(unittest.TestCase):
             spec,
             require_full_route_coverage=True,
         )
-        self.assertIn("candidate reported Flash F16 SM89 GQA prefill fallbacks: 1", errors)
+        self.assertIn(
+            "candidate reported Flash F16 SM89 GQA prefill fallbacks: 1", errors
+        )
 
-    def test_warp_and_tiled64_fixed_profiles_require_the_exact_long_context_workload(self):
-        def parsed(kernel_id: str, profile: str, fixture: pathlib.Path = LONG_CONTEXT_FIXTURE):
+    def test_warp_and_tiled64_fixed_profiles_require_the_exact_long_context_workload(
+        self,
+    ):
+        def parsed(
+            kernel_id: str, profile: str, fixture: pathlib.Path = LONG_CONTEXT_FIXTURE
+        ):
             with mock.patch.object(
                 sys,
                 "argv",
@@ -1467,16 +1623,27 @@ class CandidateParityTest(unittest.TestCase):
             substitute.write_text(json.dumps(fixture_json), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "exact fixture file_sha256"):
                 validate_qualification_contract(
-                    parsed(SCORE_PREWORK_TILED64_ATTENTION_KERNEL_ID, "promotion", substitute)
+                    parsed(
+                        SCORE_PREWORK_TILED64_ATTENTION_KERNEL_ID,
+                        "promotion",
+                        substitute,
+                    )
                 )
 
     def test_ggml_and_cublaslt_catalog_profiles_are_typed_and_default_off(self):
         ggml = CANDIDATE_CATALOG[Q4_0_GGML_Q8_1_E2B_FFN_KERNEL_ID]
-        self.assertEqual("ANTFLY_INFERENCE_CUDA_SM89_Q4_0_Q8_1", ggml.environment_variable)
+        self.assertEqual(
+            "ANTFLY_INFERENCE_CUDA_SM89_Q4_0_Q8_1", ggml.environment_variable
+        )
         self.assertEqual("off", ggml.baseline_gate_value)
         self.assertEqual("ggml-ffn-v1", ggml.candidate_gate_value)
-        self.assertEqual(GGML_Q8_1_E2B_FFN_COMPARISON_ENVIRONMENT, ggml.fixed_comparison_environment)
-        self.assertEqual(["q4_0_ggml_q8_1_e2b_ffn_hits"], [item.name for item in ggml.required_route_counters])
+        self.assertEqual(
+            GGML_Q8_1_E2B_FFN_COMPARISON_ENVIRONMENT, ggml.fixed_comparison_environment
+        )
+        self.assertEqual(
+            ["q4_0_ggml_q8_1_e2b_ffn_hits"],
+            [item.name for item in ggml.required_route_counters],
+        )
         self.assertEqual(
             ["q4_0_ggml_q8_1_e2b_ffn_fallbacks"],
             [item.name for item in ggml.forbidden_route_counters],
@@ -1578,11 +1745,18 @@ class CandidateParityTest(unittest.TestCase):
             args = parse_args()
         spec = resolve_candidate_spec(args)
         with self.assertRaisesRegex(ValueError, "fixed comparison environment"):
-            resolve_common_environment(args, spec, resolve_candidate_environment(args, spec))
+            resolve_common_environment(
+                args, spec, resolve_candidate_environment(args, spec)
+            )
 
     def test_candidate_environment_parser_rejects_malformed_or_unsafe_values(self):
-        self.assertEqual(("ANTFLY_TEST", "with=equals"), parse_candidate_environment("ANTFLY_TEST=with=equals"))
-        self.assertEqual(("ANTFLY_EMPTY", ""), parse_candidate_environment("ANTFLY_EMPTY="))
+        self.assertEqual(
+            ("ANTFLY_TEST", "with=equals"),
+            parse_candidate_environment("ANTFLY_TEST=with=equals"),
+        )
+        self.assertEqual(
+            ("ANTFLY_EMPTY", ""), parse_candidate_environment("ANTFLY_EMPTY=")
+        )
         for value, message in (
             ("ANTFLY_TEST", "NAME=VALUE"),
             ("antfly_test=value", "name is invalid"),
@@ -1593,11 +1767,18 @@ class CandidateParityTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, message):
                 parse_candidate_environment(value)
         with self.assertRaisesRegex(ValueError, "must be unique"):
-            parse_candidate_environment_list(["ANTFLY_TEST=first", "ANTFLY_TEST=second"])
+            parse_candidate_environment_list(
+                ["ANTFLY_TEST=first", "ANTFLY_TEST=second"]
+            )
 
     def test_common_environment_parser_rejects_malformed_or_unsafe_values(self):
-        self.assertEqual(("ANTFLY_TEST", "with=equals"), parse_common_environment("ANTFLY_TEST=with=equals"))
-        self.assertEqual(("ANTFLY_EMPTY", ""), parse_common_environment("ANTFLY_EMPTY="))
+        self.assertEqual(
+            ("ANTFLY_TEST", "with=equals"),
+            parse_common_environment("ANTFLY_TEST=with=equals"),
+        )
+        self.assertEqual(
+            ("ANTFLY_EMPTY", ""), parse_common_environment("ANTFLY_EMPTY=")
+        )
         for value, message in (
             ("ANTFLY_TEST", "NAME=VALUE"),
             ("antfly_test=value", "name is invalid"),
@@ -1621,7 +1802,9 @@ class CandidateParityTest(unittest.TestCase):
             ],
         ):
             args = parse_args()
-        with self.assertRaisesRegex(ValueError, "must not override selected candidate gate"):
+        with self.assertRaisesRegex(
+            ValueError, "must not override selected candidate gate"
+        ):
             resolve_candidate_environment(args, resolve_candidate_spec(args))
 
     def test_common_environment_cannot_override_gate_or_capture_capacity(self):
@@ -1630,15 +1813,22 @@ class CandidateParityTest(unittest.TestCase):
             CAPTURE_KV_CAPACITY_ENV,
             RUNTIME_CAPTURE_KV_CAPACITY_ENV,
         ):
-            with self.subTest(name=name), mock.patch.object(
-                sys,
-                "argv",
-                ["validate_gemma4_cuda_candidate.py", "--common-env", f"{name}=0"],
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["validate_gemma4_cuda_candidate.py", "--common-env", f"{name}=0"],
+                ),
             ):
                 args = parse_args()
                 spec = resolve_candidate_spec(args)
                 candidate_environment = resolve_candidate_environment(args, spec)
-                expected = "selected candidate gate" if name == spec.environment_variable else "capture KV capacity"
+                expected = (
+                    "selected candidate gate"
+                    if name == spec.environment_variable
+                    else "capture KV capacity"
+                )
                 with self.assertRaisesRegex(ValueError, expected):
                     resolve_common_environment(args, spec, candidate_environment)
 
@@ -1668,7 +1858,10 @@ class CandidateParityTest(unittest.TestCase):
         ):
             args = parse_args()
         self.assertEqual(
-            (768 + DEFAULT_CAPTURE_KV_PROMPT_HEADROOM, "max-output-plus-prompt-headroom"),
+            (
+                768 + DEFAULT_CAPTURE_KV_PROMPT_HEADROOM,
+                "max-output-plus-prompt-headroom",
+            ),
             resolve_capture_kv_capacity(args),
         )
         args.capture_kv_capacity = 0
@@ -1695,15 +1888,25 @@ class CandidateParityTest(unittest.TestCase):
         with mock.patch.object(
             sys,
             "argv",
-            ["validate_gemma4_cuda_candidate.py", "--candidate", "q4-0-q8-1-e2b-ffn-pair-only"],
+            [
+                "validate_gemma4_cuda_candidate.py",
+                "--candidate",
+                "q4-0-q8-1-e2b-ffn-pair-only",
+            ],
         ):
-            self.assertEqual(CandidateKind.Q4_0_Q8_1_E2B_FFN_PAIR_ONLY, parse_args().candidate)
+            self.assertEqual(
+                CandidateKind.Q4_0_Q8_1_E2B_FFN_PAIR_ONLY, parse_args().candidate
+            )
 
     def test_cli_selects_pair_only_e2b_ffn_catalog_kernel(self):
         with mock.patch.object(
             sys,
             "argv",
-            ["validate_gemma4_cuda_candidate.py", "--kernel-id", Q4_0_Q8_1_E2B_FFN_PAIR_ONLY_KERNEL_ID],
+            [
+                "validate_gemma4_cuda_candidate.py",
+                "--kernel-id",
+                Q4_0_Q8_1_E2B_FFN_PAIR_ONLY_KERNEL_ID,
+            ],
         ):
             args = parse_args()
         self.assertEqual(
@@ -1715,7 +1918,11 @@ class CandidateParityTest(unittest.TestCase):
         with mock.patch.object(
             sys,
             "argv",
-            ["validate_gemma4_cuda_candidate.py", "--candidate", "q6-k-q8-1-lm-head-argmax"],
+            [
+                "validate_gemma4_cuda_candidate.py",
+                "--candidate",
+                "q6-k-q8-1-lm-head-argmax",
+            ],
         ):
             args = parse_args()
         self.assertEqual(CandidateKind.Q6_K_Q8_1_LM_HEAD_ARGMAX, args.candidate)
@@ -1726,7 +1933,11 @@ class CandidateParityTest(unittest.TestCase):
         with mock.patch.object(
             sys,
             "argv",
-            ["validate_gemma4_cuda_candidate.py", "--kernel-id", Q4_0_Q8_1_FFN_KERNEL_ID],
+            [
+                "validate_gemma4_cuda_candidate.py",
+                "--kernel-id",
+                Q4_0_Q8_1_FFN_KERNEL_ID,
+            ],
         ):
             args = parse_args()
             self.assertIsNone(args.candidate)
@@ -1735,13 +1946,19 @@ class CandidateParityTest(unittest.TestCase):
                 CANDIDATE_CATALOG[Q4_0_Q8_1_FFN_KERNEL_ID],
                 resolve_candidate_spec(args),
             )
-            self.assertEqual(resolve_candidate_spec(args), candidate_spec(Q4_0_Q8_1_FFN_KERNEL_ID))
+            self.assertEqual(
+                resolve_candidate_spec(args), candidate_spec(Q4_0_Q8_1_FFN_KERNEL_ID)
+            )
 
     def test_cli_selects_exact_e2b_ffn_catalog_kernel(self):
         with mock.patch.object(
             sys,
             "argv",
-            ["validate_gemma4_cuda_candidate.py", "--kernel-id", Q4_0_E2B_FFN_EXACT_KERNEL_ID],
+            [
+                "validate_gemma4_cuda_candidate.py",
+                "--kernel-id",
+                Q4_0_E2B_FFN_EXACT_KERNEL_ID,
+            ],
         ):
             args = parse_args()
         self.assertIsNone(args.candidate)
@@ -1755,7 +1972,11 @@ class CandidateParityTest(unittest.TestCase):
         with mock.patch.object(
             sys,
             "argv",
-            ["validate_gemma4_cuda_candidate.py", "--kernel-id", Q6_K_Q8_1_LM_HEAD_ARGMAX_KERNEL_ID],
+            [
+                "validate_gemma4_cuda_candidate.py",
+                "--kernel-id",
+                Q6_K_Q8_1_LM_HEAD_ARGMAX_KERNEL_ID,
+            ],
         ):
             args = parse_args()
         self.assertIsNone(args.candidate)
@@ -1808,7 +2029,9 @@ class CandidateParityTest(unittest.TestCase):
             {"ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "0"},
             config["candidate_environment"]["common_overrides"],
         )
-        self.assertEqual({"tokens": 4096, "source": "explicit"}, config["capture_kv_capacity"])
+        self.assertEqual(
+            {"tokens": 4096, "source": "explicit"}, config["capture_kv_capacity"]
+        )
 
     def test_candidate_environment_metadata_records_split_threshold_provenance(self):
         attention = candidate_spec(CandidateKind.GENERATED_ATTENTION)
@@ -1820,8 +2043,12 @@ class CandidateParityTest(unittest.TestCase):
                 ("ANTFLY_TEST_SCHEDULE", "split8"),
             ),
         )
-        self.assertEqual({attention.environment_variable: "0"}, metadata["baseline_gate"])
-        self.assertEqual({attention.environment_variable: "1"}, metadata["candidate_gate"])
+        self.assertEqual(
+            {attention.environment_variable: "0"}, metadata["baseline_gate"]
+        )
+        self.assertEqual(
+            {attention.environment_variable: "1"}, metadata["candidate_gate"]
+        )
         self.assertEqual(
             "128",
             metadata["generated_attention_split_kv_min_tokens"]["value"],
@@ -1831,8 +2058,12 @@ class CandidateParityTest(unittest.TestCase):
             metadata["generated_attention_split_kv_min_tokens"]["source"],
         )
         self.assertEqual("4", metadata["generated_attention_split_kv_splits"]["value"])
-        self.assertEqual("candidate-env", metadata["generated_attention_split_kv_splits"]["source"])
-        self.assertEqual("split8", metadata["candidate_overrides"]["ANTFLY_TEST_SCHEDULE"])
+        self.assertEqual(
+            "candidate-env", metadata["generated_attention_split_kv_splits"]["source"]
+        )
+        self.assertEqual(
+            "split8", metadata["candidate_overrides"]["ANTFLY_TEST_SCHEDULE"]
+        )
 
         common = candidate_environment_metadata(
             attention,
@@ -1852,10 +2083,14 @@ class CandidateParityTest(unittest.TestCase):
             common["generated_attention_split_kv_min_tokens"]["source"],
         )
         self.assertEqual("2", common["generated_attention_split_kv_splits"]["value"])
-        self.assertEqual("common-env", common["generated_attention_split_kv_splits"]["source"])
+        self.assertEqual(
+            "common-env", common["generated_attention_split_kv_splits"]["source"]
+        )
         self.assertEqual(
             "0",
-            common["common_overrides"]["ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING"],
+            common["common_overrides"][
+                "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING"
+            ],
         )
 
         with mock.patch.dict(
@@ -1867,27 +2102,45 @@ class CandidateParityTest(unittest.TestCase):
             clear=False,
         ):
             inherited = candidate_environment_metadata(attention, ())
-        self.assertEqual("384", inherited["generated_attention_split_kv_min_tokens"]["value"])
-        self.assertEqual("inherited-environment", inherited["generated_attention_split_kv_min_tokens"]["source"])
+        self.assertEqual(
+            "384", inherited["generated_attention_split_kv_min_tokens"]["value"]
+        )
+        self.assertEqual(
+            "inherited-environment",
+            inherited["generated_attention_split_kv_min_tokens"]["source"],
+        )
         self.assertEqual("8", inherited["generated_attention_split_kv_splits"]["value"])
-        self.assertEqual("inherited-environment", inherited["generated_attention_split_kv_splits"]["source"])
+        self.assertEqual(
+            "inherited-environment",
+            inherited["generated_attention_split_kv_splits"]["source"],
+        )
 
     def test_parses_cli_token_ids(self):
         match = TOKEN_IDS_RE.search("timing\ntoken_ids: 4 -2 17\ndone\n")
         self.assertIsNotNone(match)
-        self.assertEqual([4, -2, 17], [int(value) for value in match.group("ids").split()])
+        self.assertEqual(
+            [4, -2, 17], [int(value) for value in match.group("ids").split()]
+        )
 
     def test_accepts_equal_tokens_and_expected_routes(self):
-        self.assertEqual([], validate_pair(timing(generated=0), timing(generated=7), 64))
+        self.assertEqual(
+            [], validate_pair(timing(generated=0), timing(generated=7), 64)
+        )
 
     def test_accepts_score_prework_with_dedicated_route_counter(self):
         spec = CANDIDATE_CATALOG[SCORE_PREWORK_ATTENTION_KERNEL_ID]
-        self.assertEqual([], validate_pair(timing(), timing(score_prework=64), 64, spec))
+        self.assertEqual(
+            [], validate_pair(timing(), timing(score_prework=64), 64, spec)
+        )
 
-    def test_tiled64_score_prework_requires_baseline_and_candidate_head_dim_routes(self):
+    def test_tiled64_score_prework_requires_baseline_and_candidate_head_dim_routes(
+        self,
+    ):
         spec = CANDIDATE_CATALOG[SCORE_PREWORK_TILED64_ATTENTION_KERNEL_ID]
         baseline = timing(score_prework_serial_hd256=18, score_prework_serial_hd512=9)
-        candidate = timing(score_prework_tiled64_hd256=18, score_prework_tiled64_hd512=9)
+        candidate = timing(
+            score_prework_tiled64_hd256=18, score_prework_tiled64_hd512=9
+        )
         self.assertEqual([], validate_pair(baseline, candidate, 64, spec))
         attestation = pair_attestation(baseline, candidate, 64, spec)
         self.assertTrue(attestation["all_required_baseline_routes_attested"])
@@ -1899,7 +2152,10 @@ class CandidateParityTest(unittest.TestCase):
             64,
             spec,
         )
-        self.assertIn("baseline did not use serial score-prework consumer HD512 route", missing_baseline)
+        self.assertIn(
+            "baseline did not use serial score-prework consumer HD512 route",
+            missing_baseline,
+        )
 
         wrong_candidate = validate_pair(
             baseline,
@@ -1913,9 +2169,17 @@ class CandidateParityTest(unittest.TestCase):
             64,
             spec,
         )
-        self.assertIn("candidate reported serial score-prework consumer HD512 route: 1", wrong_candidate)
-        self.assertIn("candidate reported tiled64 score-prework symbol fallbacks: 1", wrong_candidate)
-        self.assertIn("candidate reported fast decode attention route: 1", wrong_candidate)
+        self.assertIn(
+            "candidate reported serial score-prework consumer HD512 route: 1",
+            wrong_candidate,
+        )
+        self.assertIn(
+            "candidate reported tiled64 score-prework symbol fallbacks: 1",
+            wrong_candidate,
+        )
+        self.assertIn(
+            "candidate reported fast decode attention route: 1", wrong_candidate
+        )
 
     def test_gqa_prefill_candidates_require_hd256_and_hd512_route_evidence(self):
         exact = CANDIDATE_CATALOG[GQA_PREFILL_TILED_F16_EXACT_KERNEL_ID]
@@ -1929,7 +2193,9 @@ class CandidateParityTest(unittest.TestCase):
             ),
         )
         errors = validate_pair(timing(), timing(gqa_prefill_exact_hd256=18), 64, exact)
-        self.assertIn("candidate did not use tiled F16 exact GQA prefill HD512 route", errors)
+        self.assertIn(
+            "candidate did not use tiled F16 exact GQA prefill HD512 route", errors
+        )
 
         warp = CANDIDATE_CATALOG[GQA_PREFILL_TILED_F16_WARP_KERNEL_ID]
         self.assertEqual(
@@ -2037,7 +2303,9 @@ class CandidateParityTest(unittest.TestCase):
             64,
             cublaslt,
         )
-        self.assertIn("candidate reported SM89 BF16 cuBLASLt tuning API fallbacks: 1", errors)
+        self.assertIn(
+            "candidate reported SM89 BF16 cuBLASLt tuning API fallbacks: 1", errors
+        )
 
     def test_ple_gate_mirror_first_attestation_requires_baseline_and_zero_misses(self):
         spec = CANDIDATE_CATALOG[PLE_GATE_BF16_MIRROR_FIRST_SM89_E2B_KERNEL_ID]
@@ -2056,7 +2324,9 @@ class CandidateParityTest(unittest.TestCase):
             64,
             spec,
         )
-        self.assertIn("baseline did not use baseline fused Q4_0 PLE-gate route", missing_baseline)
+        self.assertIn(
+            "baseline did not use baseline fused Q4_0 PLE-gate route", missing_baseline
+        )
         missing_decode_preservation = validate_pair(
             timing(ple_gate_fused_q4=175),
             timing(ple_gate_mirror_first=175),
@@ -2085,7 +2355,10 @@ class CandidateParityTest(unittest.TestCase):
     def test_rejects_token_mismatch(self):
         candidate = timing(generated=7)
         candidate["token_ids"][10] = 999
-        self.assertIn("token IDs differ at index 10", validate_pair(timing(generated=0), candidate, 64))
+        self.assertIn(
+            "token IDs differ at index 10",
+            validate_pair(timing(generated=0), candidate, 64),
+        )
 
     def test_rejects_route_and_replay_failures(self):
         candidate = timing(generated=0)
@@ -2106,12 +2379,18 @@ class CandidateParityTest(unittest.TestCase):
 
     def test_rejects_lm_head_candidate_fallback(self):
         spec = candidate_spec(CandidateKind.Q4_0_Q8_1_LM_HEAD_ARGMAX)
-        errors = validate_pair(timing(), timing(lm_argmax=4, lm_argmax_fallbacks=1), 64, spec)
-        self.assertIn("candidate reported Q4_0 x Q8_1 LM-head argmax fallbacks: 1", errors)
+        errors = validate_pair(
+            timing(), timing(lm_argmax=4, lm_argmax_fallbacks=1), 64, spec
+        )
+        self.assertIn(
+            "candidate reported Q4_0 x Q8_1 LM-head argmax fallbacks: 1", errors
+        )
 
     def test_accepts_generated_q6_lm_head_candidate_with_exact_tokens_and_route(self):
         spec = candidate_spec(CandidateKind.Q6_K_Q8_1_LM_HEAD_ARGMAX)
-        self.assertEqual([], validate_pair(timing(), timing(generated_q6_lm_argmax=64), 64, spec))
+        self.assertEqual(
+            [], validate_pair(timing(), timing(generated_q6_lm_argmax=64), 64, spec)
+        )
 
     def test_rejects_generated_q6_lm_head_baseline_hit_missing_route_and_fallback(self):
         spec = candidate_spec(CandidateKind.Q6_K_Q8_1_LM_HEAD_ARGMAX)
@@ -2121,13 +2400,22 @@ class CandidateParityTest(unittest.TestCase):
             64,
             spec,
         )
-        self.assertIn("baseline unexpectedly used generated Q6_K x Q8_1 LM-head argmax", errors)
-        self.assertIn("candidate did not use generated Q6_K x Q8_1 LM-head argmax", errors)
-        self.assertIn("candidate reported generated Q6_K x Q8_1 LM-head argmax fallbacks: 1", errors)
+        self.assertIn(
+            "baseline unexpectedly used generated Q6_K x Q8_1 LM-head argmax", errors
+        )
+        self.assertIn(
+            "candidate did not use generated Q6_K x Q8_1 LM-head argmax", errors
+        )
+        self.assertIn(
+            "candidate reported generated Q6_K x Q8_1 LM-head argmax fallbacks: 1",
+            errors,
+        )
 
     def test_accepts_e2b_ffn_candidate_when_both_routes_are_covered(self):
         spec = candidate_spec(CandidateKind.Q4_0_Q8_1_E2B_FFN)
-        self.assertEqual([], validate_pair(timing(), timing(ffn_pair=32, ffn_down=16), 64, spec))
+        self.assertEqual(
+            [], validate_pair(timing(), timing(ffn_pair=32, ffn_down=16), 64, spec)
+        )
 
     def test_rejects_e2b_ffn_baseline_hits_independently(self):
         spec = candidate_spec(CandidateKind.Q4_0_Q8_1_E2B_FFN)
@@ -2137,32 +2425,58 @@ class CandidateParityTest(unittest.TestCase):
             64,
             spec,
         )
-        self.assertIn("baseline unexpectedly used Q4_0 x Q8_1 generated E2B FFN pair route", errors)
-        self.assertIn("baseline unexpectedly used Q4_0 x Q8_1 generated E2B FFN down route", errors)
+        self.assertIn(
+            "baseline unexpectedly used Q4_0 x Q8_1 generated E2B FFN pair route",
+            errors,
+        )
+        self.assertIn(
+            "baseline unexpectedly used Q4_0 x Q8_1 generated E2B FFN down route",
+            errors,
+        )
 
     def test_rejects_e2b_ffn_partial_candidate_coverage(self):
         spec = candidate_spec(CandidateKind.Q4_0_Q8_1_E2B_FFN)
         pair_missing = validate_pair(timing(), timing(ffn_down=16), 64, spec)
         down_missing = validate_pair(timing(), timing(ffn_pair=32), 64, spec)
-        self.assertIn("candidate did not use Q4_0 x Q8_1 generated E2B FFN pair route", pair_missing)
-        self.assertNotIn("candidate did not use Q4_0 x Q8_1 generated E2B FFN down route", pair_missing)
-        self.assertIn("candidate did not use Q4_0 x Q8_1 generated E2B FFN down route", down_missing)
-        self.assertNotIn("candidate did not use Q4_0 x Q8_1 generated E2B FFN pair route", down_missing)
+        self.assertIn(
+            "candidate did not use Q4_0 x Q8_1 generated E2B FFN pair route",
+            pair_missing,
+        )
+        self.assertNotIn(
+            "candidate did not use Q4_0 x Q8_1 generated E2B FFN down route",
+            pair_missing,
+        )
+        self.assertIn(
+            "candidate did not use Q4_0 x Q8_1 generated E2B FFN down route",
+            down_missing,
+        )
+        self.assertNotIn(
+            "candidate did not use Q4_0 x Q8_1 generated E2B FFN pair route",
+            down_missing,
+        )
 
     def test_rejects_each_e2b_ffn_candidate_fallback(self):
         spec = candidate_spec(CandidateKind.Q4_0_Q8_1_E2B_FFN)
         errors = validate_pair(
             timing(),
-            timing(ffn_pair=32, ffn_down=16, ffn_pair_fallbacks=2, ffn_down_fallbacks=3),
+            timing(
+                ffn_pair=32, ffn_down=16, ffn_pair_fallbacks=2, ffn_down_fallbacks=3
+            ),
             64,
             spec,
         )
-        self.assertIn("candidate reported Q4_0 x Q8_1 generated E2B FFN pair fallbacks: 2", errors)
-        self.assertIn("candidate reported Q4_0 x Q8_1 generated E2B FFN down fallbacks: 3", errors)
+        self.assertIn(
+            "candidate reported Q4_0 x Q8_1 generated E2B FFN pair fallbacks: 2", errors
+        )
+        self.assertIn(
+            "candidate reported Q4_0 x Q8_1 generated E2B FFN down fallbacks: 3", errors
+        )
 
     def test_pair_only_e2b_ffn_requires_hits_without_fallback_or_coupled_routes(self):
         spec = candidate_spec(CandidateKind.Q4_0_Q8_1_E2B_FFN_PAIR_ONLY)
-        self.assertEqual([], validate_pair(timing(), timing(ffn_pair_only=32), 64, spec))
+        self.assertEqual(
+            [], validate_pair(timing(), timing(ffn_pair_only=32), 64, spec)
+        )
 
         errors = validate_pair(
             timing(),
@@ -2170,12 +2484,19 @@ class CandidateParityTest(unittest.TestCase):
             64,
             spec,
         )
-        self.assertIn("candidate reported generated E2B FFN pair-only fallbacks: 1", errors)
+        self.assertIn(
+            "candidate reported generated E2B FFN pair-only fallbacks: 1", errors
+        )
         self.assertIn("candidate reported generated E2B FFN down route: 1", errors)
 
     def test_accepts_exact_e2b_ffn_candidate_when_both_routes_are_covered(self):
         spec = candidate_spec(CandidateKind.Q4_0_E2B_FFN_EXACT)
-        self.assertEqual([], validate_pair(timing(), timing(exact_ffn_pair=32, exact_ffn_down=16), 64, spec))
+        self.assertEqual(
+            [],
+            validate_pair(
+                timing(), timing(exact_ffn_pair=32, exact_ffn_down=16), 64, spec
+            ),
+        )
 
     def test_rejects_exact_e2b_ffn_baseline_hits_independently(self):
         spec = candidate_spec(CandidateKind.Q4_0_E2B_FFN_EXACT)
@@ -2185,17 +2506,29 @@ class CandidateParityTest(unittest.TestCase):
             64,
             spec,
         )
-        self.assertIn("baseline unexpectedly used exact F32 generated E2B FFN pair route", errors)
-        self.assertIn("baseline unexpectedly used exact F32 generated E2B FFN down route", errors)
+        self.assertIn(
+            "baseline unexpectedly used exact F32 generated E2B FFN pair route", errors
+        )
+        self.assertIn(
+            "baseline unexpectedly used exact F32 generated E2B FFN down route", errors
+        )
 
     def test_rejects_exact_e2b_ffn_partial_candidate_coverage(self):
         spec = candidate_spec(CandidateKind.Q4_0_E2B_FFN_EXACT)
         pair_missing = validate_pair(timing(), timing(exact_ffn_down=16), 64, spec)
         down_missing = validate_pair(timing(), timing(exact_ffn_pair=32), 64, spec)
-        self.assertIn("candidate did not use exact F32 generated E2B FFN pair route", pair_missing)
-        self.assertNotIn("candidate did not use exact F32 generated E2B FFN down route", pair_missing)
-        self.assertIn("candidate did not use exact F32 generated E2B FFN down route", down_missing)
-        self.assertNotIn("candidate did not use exact F32 generated E2B FFN pair route", down_missing)
+        self.assertIn(
+            "candidate did not use exact F32 generated E2B FFN pair route", pair_missing
+        )
+        self.assertNotIn(
+            "candidate did not use exact F32 generated E2B FFN down route", pair_missing
+        )
+        self.assertIn(
+            "candidate did not use exact F32 generated E2B FFN down route", down_missing
+        )
+        self.assertNotIn(
+            "candidate did not use exact F32 generated E2B FFN pair route", down_missing
+        )
 
     def test_rejects_each_exact_e2b_ffn_candidate_fallback(self):
         spec = candidate_spec(CandidateKind.Q4_0_E2B_FFN_EXACT)
@@ -2210,8 +2543,12 @@ class CandidateParityTest(unittest.TestCase):
             64,
             spec,
         )
-        self.assertIn("candidate reported exact F32 generated E2B FFN pair fallbacks: 2", errors)
-        self.assertIn("candidate reported exact F32 generated E2B FFN down fallbacks: 3", errors)
+        self.assertIn(
+            "candidate reported exact F32 generated E2B FFN pair fallbacks: 2", errors
+        )
+        self.assertIn(
+            "candidate reported exact F32 generated E2B FFN down fallbacks: 3", errors
+        )
 
     def test_candidate_spec_requires_unique_route_counters(self):
         with self.assertRaisesRegex(ValueError, "at least one route counter"):
@@ -2263,12 +2600,18 @@ class CandidateParityTest(unittest.TestCase):
             )
 
     def test_candidate_metadata_preserves_primary_counter_and_lists_all(self):
-        attention = candidate_metadata(candidate_spec(CandidateKind.GENERATED_ATTENTION))
+        attention = candidate_metadata(
+            candidate_spec(CandidateKind.GENERATED_ATTENTION)
+        )
         self.assertEqual(GENERATED_ATTENTION_KERNEL_ID, attention["kernel_id"])
         self.assertEqual(attention["kernel_id"], attention["catalog_id"])
-        self.assertEqual("launch_attention_gqa_decode_generated", attention["route_counter"])
+        self.assertEqual(
+            "launch_attention_gqa_decode_generated", attention["route_counter"]
+        )
         self.assertEqual([attention["route_counter"]], attention["route_counters"])
-        self.assertEqual(attention["route_counters"], attention["required_route_counters"])
+        self.assertEqual(
+            attention["route_counters"], attention["required_route_counters"]
+        )
         self.assertEqual([], attention["candidate_forbidden_counters"])
         self.assertEqual([], attention["forbidden_route_counters"])
         self.assertEqual("0", attention["baseline_gate_value"])
@@ -2282,14 +2625,24 @@ class CandidateParityTest(unittest.TestCase):
             e2b_ffn["route_counters"],
         )
         self.assertEqual(
-            ["q4_0_generated_e2b_pair_q8_fallbacks", "q4_0_generated_e2b_down_q8_fallbacks"],
+            [
+                "q4_0_generated_e2b_pair_q8_fallbacks",
+                "q4_0_generated_e2b_down_q8_fallbacks",
+            ],
             e2b_ffn["candidate_forbidden_counters"],
         )
 
-        exact_e2b_ffn = candidate_metadata(candidate_spec(CandidateKind.Q4_0_E2B_FFN_EXACT))
-        self.assertEqual("q4_0_generated_e2b_exact_pair_f32_hits", exact_e2b_ffn["route_counter"])
+        exact_e2b_ffn = candidate_metadata(
+            candidate_spec(CandidateKind.Q4_0_E2B_FFN_EXACT)
+        )
         self.assertEqual(
-            ["q4_0_generated_e2b_exact_pair_f32_hits", "q4_0_generated_e2b_exact_down_f32_hits"],
+            "q4_0_generated_e2b_exact_pair_f32_hits", exact_e2b_ffn["route_counter"]
+        )
+        self.assertEqual(
+            [
+                "q4_0_generated_e2b_exact_pair_f32_hits",
+                "q4_0_generated_e2b_exact_down_f32_hits",
+            ],
             exact_e2b_ffn["route_counters"],
         )
         self.assertEqual(
@@ -2300,8 +2653,12 @@ class CandidateParityTest(unittest.TestCase):
             exact_e2b_ffn["candidate_forbidden_counters"],
         )
 
-        q6_lm_head = candidate_metadata(candidate_spec(CandidateKind.Q6_K_Q8_1_LM_HEAD_ARGMAX))
-        self.assertEqual("lm_head_argmax_generated_q6_k_q8_1_hits", q6_lm_head["route_counter"])
+        q6_lm_head = candidate_metadata(
+            candidate_spec(CandidateKind.Q6_K_Q8_1_LM_HEAD_ARGMAX)
+        )
+        self.assertEqual(
+            "lm_head_argmax_generated_q6_k_q8_1_hits", q6_lm_head["route_counter"]
+        )
         self.assertTrue(q6_lm_head["requires_explicit_model"])
         self.assertEqual(
             ["lm_head_argmax_generated_q6_k_q8_1_fallbacks"],
@@ -2353,8 +2710,12 @@ class CandidateParityTest(unittest.TestCase):
         candidate_only = (("ANTFLY_TEST_CANDIDATE", "candidate"),)
         baseline = {}
         candidate = {}
-        configure_candidate_environment(baseline, attention, False, candidate_only, common)
-        configure_candidate_environment(candidate, attention, True, candidate_only, common)
+        configure_candidate_environment(
+            baseline, attention, False, candidate_only, common
+        )
+        configure_candidate_environment(
+            candidate, attention, True, candidate_only, common
+        )
         self.assertEqual("shared", baseline["ANTFLY_TEST_COMMON"])
         self.assertEqual("shared", candidate["ANTFLY_TEST_COMMON"])
         self.assertNotIn("ANTFLY_TEST_CANDIDATE", baseline)
@@ -2369,7 +2730,9 @@ class CandidateParityTest(unittest.TestCase):
         configure_candidate_environment(baseline, spec, False)
         configure_candidate_environment(candidate, spec, True)
         self.assertEqual("required-fast", baseline[spec.environment_variable])
-        self.assertEqual("required-tiled-f16-exact", candidate[spec.environment_variable])
+        self.assertEqual(
+            "required-tiled-f16-exact", candidate[spec.environment_variable]
+        )
 
         metadata = candidate_environment_metadata(spec, ())
         self.assertEqual(
@@ -2381,7 +2744,9 @@ class CandidateParityTest(unittest.TestCase):
             metadata["candidate_gate"],
         )
 
-    def test_run_case_applies_common_and_candidate_environment_with_explicit_capture_capacity(self):
+    def test_run_case_applies_common_and_candidate_environment_with_explicit_capture_capacity(
+        self,
+    ):
         attention = candidate_spec(CandidateKind.GENERATED_ATTENTION)
         overrides = ((GENERATED_ATTENTION_SPLIT_KV_MIN_TOKENS_ENV, "128"),)
         common = (("ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING", "0"),)
@@ -2403,28 +2768,67 @@ class CandidateParityTest(unittest.TestCase):
             def fake_run(command, **kwargs):
                 seen_environments.append(kwargs["env"])
                 timing_path = pathlib.Path(command[command.index("--json-timing") + 1])
-                timing_path.write_text(json.dumps(timing(generated=1)), encoding="utf-8")
+                timing_path.write_text(
+                    json.dumps(timing(generated=1)), encoding="utf-8"
+                )
                 return subprocess.CompletedProcess(
                     command,
                     0,
                     "prompt_token_ids: 10 11 12\ntoken_ids: 0 1 2\n",
                 )
 
-            with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
-                "validate_gemma4_cuda_candidate.subprocess.run",
-                side_effect=fake_run,
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch(
+                    "validate_gemma4_cuda_candidate.subprocess.run",
+                    side_effect=fake_run,
+                ),
             ):
-                baseline = run_case(args, "prompt", 64, False, "baseline", attention, overrides, 4096, common)
-                candidate = run_case(args, "prompt", 64, True, "candidate", attention, overrides, 4096, common)
+                baseline = run_case(
+                    args,
+                    "prompt",
+                    64,
+                    False,
+                    "baseline",
+                    attention,
+                    overrides,
+                    4096,
+                    common,
+                )
+                candidate = run_case(
+                    args,
+                    "prompt",
+                    64,
+                    True,
+                    "candidate",
+                    attention,
+                    overrides,
+                    4096,
+                    common,
+                )
 
         self.assertEqual("0", seen_environments[0][attention.environment_variable])
-        self.assertNotIn(GENERATED_ATTENTION_SPLIT_KV_MIN_TOKENS_ENV, seen_environments[0])
+        self.assertNotIn(
+            GENERATED_ATTENTION_SPLIT_KV_MIN_TOKENS_ENV, seen_environments[0]
+        )
         self.assertEqual("1", seen_environments[1][attention.environment_variable])
-        self.assertEqual("128", seen_environments[1][GENERATED_ATTENTION_SPLIT_KV_MIN_TOKENS_ENV])
-        self.assertEqual("0", seen_environments[0]["ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING"])
-        self.assertEqual("0", seen_environments[1]["ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING"])
-        self.assertEqual("4096", seen_environments[0]["ANTFLY_CAPTURE_FORCE_KV_CAPACITY"])
-        self.assertEqual("4096", seen_environments[1]["ANTFLY_CAPTURE_FORCE_KV_CAPACITY"])
+        self.assertEqual(
+            "128", seen_environments[1][GENERATED_ATTENTION_SPLIT_KV_MIN_TOKENS_ENV]
+        )
+        self.assertEqual(
+            "0",
+            seen_environments[0]["ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING"],
+        )
+        self.assertEqual(
+            "0",
+            seen_environments[1]["ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING"],
+        )
+        self.assertEqual(
+            "4096", seen_environments[0]["ANTFLY_CAPTURE_FORCE_KV_CAPACITY"]
+        )
+        self.assertEqual(
+            "4096", seen_environments[1]["ANTFLY_CAPTURE_FORCE_KV_CAPACITY"]
+        )
         self.assertEqual([10, 11, 12], baseline["prompt_token_ids"])
         self.assertEqual([10, 11, 12], candidate["prompt_token_ids"])
 
@@ -2457,9 +2861,13 @@ class CandidateParityTest(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
-            self.assertEqual((invocation_dir / "zig-out/bin/antfly-inference").resolve(), args.binary)
             self.assertEqual(
-                (invocation_dir / "scripts/gemma4/with_gemma4_qat_cuda_tuning.sh").resolve(),
+                (invocation_dir / "zig-out/bin/antfly-inference").resolve(), args.binary
+            )
+            self.assertEqual(
+                (
+                    invocation_dir / "scripts/gemma4/with_gemma4_qat_cuda_tuning.sh"
+                ).resolve(),
                 args.wrapper,
             )
             self.assertEqual((invocation_dir / "models/e2b.gguf").resolve(), args.model)
@@ -2468,7 +2876,9 @@ class CandidateParityTest(unittest.TestCase):
             def fake_run(command, **_kwargs):
                 seen_commands.append(command)
                 timing_path = pathlib.Path(command[command.index("--json-timing") + 1])
-                timing_path.write_text(json.dumps(timing(generated=1)), encoding="utf-8")
+                timing_path.write_text(
+                    json.dumps(timing(generated=1)), encoding="utf-8"
+                )
                 return subprocess.CompletedProcess(command, 0, "token_ids: 0 1 2\n")
 
             with mock.patch(
@@ -2506,12 +2916,18 @@ class CandidateParityTest(unittest.TestCase):
             def fake_run(command, **kwargs):
                 seen_environments.append(kwargs["env"])
                 timing_path = pathlib.Path(command[command.index("--json-timing") + 1])
-                timing_path.write_text(json.dumps(timing(exact_ffn_pair=1, exact_ffn_down=1)), encoding="utf-8")
+                timing_path.write_text(
+                    json.dumps(timing(exact_ffn_pair=1, exact_ffn_down=1)),
+                    encoding="utf-8",
+                )
                 return subprocess.CompletedProcess(command, 0, "token_ids: 0 1 2\n")
 
-            with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
-                "validate_gemma4_cuda_candidate.subprocess.run",
-                side_effect=fake_run,
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch(
+                    "validate_gemma4_cuda_candidate.subprocess.run",
+                    side_effect=fake_run,
+                ),
             ):
                 run_case(
                     args,
@@ -2596,9 +3012,16 @@ class CandidateParityTest(unittest.TestCase):
                 resolve_candidate_spec(parse_args())
 
     def test_route_counter_list_supports_repeated_and_comma_separated_values(self):
-        counters = parse_route_counter_list(["first=First route,second", "third=Third route"])
-        self.assertEqual(["first", "second", "third"], [counter.name for counter in counters])
-        self.assertEqual(["First route", "second", "Third route"], [counter.label for counter in counters])
+        counters = parse_route_counter_list(
+            ["first=First route,second", "third=Third route"]
+        )
+        self.assertEqual(
+            ["first", "second", "third"], [counter.name for counter in counters]
+        )
+        self.assertEqual(
+            ["First route", "second", "Third route"],
+            [counter.label for counter in counters],
+        )
 
     def test_generic_timing_metadata_controls_counter_group_and_throughput_field(self):
         metadata = TimingMetadata(
@@ -2610,8 +3033,12 @@ class CandidateParityTest(unittest.TestCase):
         spec = CandidateSpec(
             kernel_id="cuda.quant.e4b-12b.test",
             environment_variable="ANTFLY_TEST_E4B",
-            required_route_counters=(RouteCounter("candidate_hits", "candidate route"),),
-            forbidden_route_counters=(RouteCounter("candidate_fallbacks", "candidate fallback"),),
+            required_route_counters=(
+                RouteCounter("candidate_hits", "candidate route"),
+            ),
+            forbidden_route_counters=(
+                RouteCounter("candidate_fallbacks", "candidate fallback"),
+            ),
         )
 
         baseline = {
@@ -2627,7 +3054,9 @@ class CandidateParityTest(unittest.TestCase):
         self.assertEqual([], validate_pair(baseline, candidate, 64, spec, metadata))
         self.assertEqual(64, timing_counter(candidate, "candidate_hits", metadata))
         self.assertEqual(100.0, timing_throughput(candidate, metadata))
-        self.assertEqual(1.25, paired_throughput(baseline, candidate, metadata)["candidate_ratio"])
+        self.assertEqual(
+            1.25, paired_throughput(baseline, candidate, metadata)["candidate_ratio"]
+        )
         self.assertEqual(
             {
                 "counter_group": "device.routes",
@@ -2663,7 +3092,9 @@ class CandidateParityTest(unittest.TestCase):
         self.assertIn("missing prompt token IDs for the locked prompt fixture", errors)
 
     def test_phase_metrics_and_paired_log_ratio_summary(self):
-        metrics = timing_latency_metrics(timing(prefill_ms=20.0, decode_ms=80.0, total_ms=100.0))
+        metrics = timing_latency_metrics(
+            timing(prefill_ms=20.0, decode_ms=80.0, total_ms=100.0)
+        )
         self.assertTrue(metrics["available"])
         self.assertEqual(100.0, metrics["total_latency_ms"])
         self.assertEqual(20.0, metrics["ttft_ms"])
@@ -2676,11 +3107,15 @@ class CandidateParityTest(unittest.TestCase):
                 timing(prefill_ms=20.0, decode_ms=72.0, total_ms=92.0),
             )
             pairs.append({"repetition": repetition, "latency": latency})
-        summary = summarize_latency_pairs(pairs, bootstrap_samples=500, bootstrap_seed=7)
+        summary = summarize_latency_pairs(
+            pairs, bootstrap_samples=500, bootstrap_seed=7
+        )
         self.assertTrue(summary["available"])
         self.assertAlmostEqual(
             0.9,
-            summary["metrics"]["decode_ms"]["candidate_baseline_paired_log_ratio_95_ci"]["median"],
+            summary["metrics"]["decode_ms"][
+                "candidate_baseline_paired_log_ratio_95_ci"
+            ]["median"],
         )
 
         args = argparse.Namespace(
@@ -2698,14 +3133,18 @@ class CandidateParityTest(unittest.TestCase):
     def test_prefill_promotion_requires_ttft_and_total_gain_but_not_decode_gain(self):
         pairs = []
         for repetition in range(1, 11):
-            pairs.append({
-                "repetition": repetition,
-                "latency": paired_latency(
-                    timing(prefill_ms=20.0, decode_ms=80.0, total_ms=100.0),
-                    timing(prefill_ms=17.0, decode_ms=80.8, total_ms=97.8),
-                ),
-            })
-        summary = summarize_latency_pairs(pairs, bootstrap_samples=500, bootstrap_seed=9)
+            pairs.append(
+                {
+                    "repetition": repetition,
+                    "latency": paired_latency(
+                        timing(prefill_ms=20.0, decode_ms=80.0, total_ms=100.0),
+                        timing(prefill_ms=17.0, decode_ms=80.8, total_ms=97.8),
+                    ),
+                }
+            )
+        summary = summarize_latency_pairs(
+            pairs, bootstrap_samples=500, bootstrap_seed=9
+        )
         profile = QUALIFICATION_PROFILES["prefill-promotion"]
         args = argparse.Namespace(
             require_phase_metrics=True,
@@ -2721,29 +3160,38 @@ class CandidateParityTest(unittest.TestCase):
 
         regressed_pairs = []
         for repetition in range(1, 11):
-            regressed_pairs.append({
-                "repetition": repetition,
-                "latency": paired_latency(
-                    timing(prefill_ms=20.0, decode_ms=80.0, total_ms=100.0),
-                    timing(prefill_ms=14.0, decode_ms=82.4, total_ms=96.4),
-                ),
-            })
+            regressed_pairs.append(
+                {
+                    "repetition": repetition,
+                    "latency": paired_latency(
+                        timing(prefill_ms=20.0, decode_ms=80.0, total_ms=100.0),
+                        timing(prefill_ms=14.0, decode_ms=82.4, total_ms=96.4),
+                    ),
+                }
+            )
         errors = latency_promotion_errors(
-            summarize_latency_pairs(regressed_pairs, bootstrap_samples=500, bootstrap_seed=9),
+            summarize_latency_pairs(
+                regressed_pairs, bootstrap_samples=500, bootstrap_seed=9
+            ),
             args,
         )
-        self.assertTrue(any(error.startswith("decode_ms paired median ratio") for error in errors))
+        self.assertTrue(
+            any(error.startswith("decode_ms paired median ratio") for error in errors)
+        )
 
     def test_full_route_coverage_and_attestation_are_explicit(self):
         baseline = timing(generated=0, tokens=64)
         candidate = timing(generated=7, tokens=64)
         self.assertEqual([], validate_pair(baseline, candidate, 64))
-        self.assertEqual([], validate_pair(
-            baseline,
-            candidate,
-            64,
-            require_full_route_coverage=True,
-        ))
+        self.assertEqual(
+            [],
+            validate_pair(
+                baseline,
+                candidate,
+                64,
+                require_full_route_coverage=True,
+            ),
+        )
         attestation = pair_attestation(baseline, candidate, 64)
         route = attestation["required_routes"]["launch_attention_gqa_decode_generated"]
         self.assertEqual(7, route["candidate"])
@@ -2762,7 +3210,9 @@ class CandidateParityTest(unittest.TestCase):
             timing_info=no_replay_metadata,
             require_full_route_coverage=True,
         )
-        self.assertIn("full route coverage requires persistent replay validation", errors)
+        self.assertIn(
+            "full route coverage requires persistent replay validation", errors
+        )
 
     def test_prefill_route_attestation_does_not_claim_decode_graph_construction(self):
         spec = CANDIDATE_CATALOG[GQA_PREFILL_TILED_F16_EXACT_KERNEL_ID]
@@ -2804,7 +3254,9 @@ class CandidateParityTest(unittest.TestCase):
             ((100.0, 110.0), (110.0, 121.0), (90.0, 99.0)),
             start=1,
         ):
-            throughput = paired_throughput(timing(tok_s=baseline_tps), timing(tok_s=candidate_tps))
+            throughput = paired_throughput(
+                timing(tok_s=baseline_tps), timing(tok_s=candidate_tps)
+            )
             pairs.append(
                 {
                     "repetition": repetition,
@@ -2821,8 +3273,12 @@ class CandidateParityTest(unittest.TestCase):
         self.assertEqual(110.0, case["candidate_tok_s"])
         self.assertAlmostEqual(1.1, case["candidate_ratio"])
         self.assertAlmostEqual(1.1, case["min_candidate_ratio"])
-        self.assertAlmostEqual(coefficient_of_variation([100.0, 110.0, 90.0]), case["baseline_tok_s_cv"])
-        self.assertAlmostEqual(coefficient_of_variation([110.0, 121.0, 99.0]), case["candidate_tok_s_cv"])
+        self.assertAlmostEqual(
+            coefficient_of_variation([100.0, 110.0, 90.0]), case["baseline_tok_s_cv"]
+        )
+        self.assertAlmostEqual(
+            coefficient_of_variation([110.0, 121.0, 99.0]), case["candidate_tok_s_cv"]
+        )
         self.assertEqual(3, case["repeats"])
         self.assertTrue(case["token_ids_equal"])
 
@@ -2849,7 +3305,9 @@ class CandidateParityTest(unittest.TestCase):
             },
         ]
         case = summarize_case("prompt", 64, pairs)
-        self.assertEqual(["repeat 1: first failure", "repeat 2: second failure"], case["errors"])
+        self.assertEqual(
+            ["repeat 1: first failure", "repeat 2: second failure"], case["errors"]
+        )
         self.assertFalse(case["token_ids_equal"])
 
     def test_promotion_gates_use_min_paired_ratio_and_both_cvs(self):
@@ -2859,9 +3317,28 @@ class CandidateParityTest(unittest.TestCase):
             "candidate_tok_s_cv": 0.02,
         }
         self.assertEqual([], case_promotion_errors(case, 1.0, 0.02))
-        self.assertTrue(any("minimum candidate ratio" in error for error in case_promotion_errors(case, 1.02, 0.02)))
-        self.assertTrue(any("baseline throughput CV" in error for error in case_promotion_errors(case | {"baseline_tok_s_cv": 0.03}, 1.0, 0.02)))
-        self.assertTrue(any("candidate throughput CV" in error for error in case_promotion_errors(case | {"candidate_tok_s_cv": 0.03}, 1.0, 0.02)))
+        self.assertTrue(
+            any(
+                "minimum candidate ratio" in error
+                for error in case_promotion_errors(case, 1.02, 0.02)
+            )
+        )
+        self.assertTrue(
+            any(
+                "baseline throughput CV" in error
+                for error in case_promotion_errors(
+                    case | {"baseline_tok_s_cv": 0.03}, 1.0, 0.02
+                )
+            )
+        )
+        self.assertTrue(
+            any(
+                "candidate throughput CV" in error
+                for error in case_promotion_errors(
+                    case | {"candidate_tok_s_cv": 0.03}, 1.0, 0.02
+                )
+            )
+        )
 
     def test_non_positive_throughput_fails_pair_validation(self):
         candidate = timing(generated=1, tok_s=0.0)

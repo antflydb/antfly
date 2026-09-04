@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class CardinalityMode(str, Enum):
+class CardinalityMode(StrEnum):
     APPROXIMATE = "approximate"
     AUTO = "auto"
     EXACT = "exact"

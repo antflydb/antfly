@@ -110,7 +110,7 @@ pub fn encodeProjectedImageTokensDebug(
         const soft_norm_data = try cb.toFloat32(soft_norm_w, allocator);
         defer allocator.free(soft_norm_data);
         for (soft_norm_data) |*value| value.* += cfg.norm_weight_offset;
-        const soft_norm_shape = [_]i32{ @intCast(vision_hidden) };
+        const soft_norm_shape = [_]i32{@intCast(vision_hidden)};
         break :blk try cb.fromFloat32Shape(soft_norm_data, &soft_norm_shape);
     };
     defer if (soft_norm != soft_norm_w) cb.free(soft_norm);

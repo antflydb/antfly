@@ -32,7 +32,9 @@ class CudaHardwareQualificationTest(unittest.TestCase):
                     run_line,
                     encoding="utf-8",
                 )
-            self.assertEqual(executable.resolve(), standalone_test_executable(package_dir, log_dir))
+            self.assertEqual(
+                executable.resolve(), standalone_test_executable(package_dir, log_dir)
+            )
 
     def test_resolves_standalone_target_from_configured_absolute_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -44,10 +46,7 @@ class CudaHardwareQualificationTest(unittest.TestCase):
             executable.parent.mkdir(parents=True)
             executable.write_text("test executable\n", encoding="utf-8")
             log_dir.mkdir()
-            run_line = (
-                f"{executable} --cache-dir={cache_dir} "
-                "--seed=0x1 --listen=-\n"
-            )
+            run_line = f"{executable} --cache-dir={cache_dir} --seed=0x1 --listen=-\n"
             for test_filter in FULL_PARITY_FILTERS:
                 (log_dir / f"full-parity-{test_filter}.log").write_text(
                     run_line,
@@ -106,7 +105,9 @@ class CudaHardwareQualificationTest(unittest.TestCase):
 
                 def command(log_name: str) -> dict[str, object]:
                     log_path = log_dir / log_name
-                    log_path.write_text(f"passing {architecture} {log_name}\n", encoding="utf-8")
+                    log_path.write_text(
+                        f"passing {architecture} {log_name}\n", encoding="utf-8"
+                    )
                     return {
                         "pass": True,
                         "returncode": 0,
@@ -117,40 +118,46 @@ class CudaHardwareQualificationTest(unittest.TestCase):
                     }
 
                 parity_subchecks = {
-                    name: command(f"full-parity-{name}.log") for name in FULL_PARITY_FILTERS
+                    name: command(f"full-parity-{name}.log")
+                    for name in FULL_PARITY_FILTERS
                 }
-                path.write_text(json.dumps({
-                    "contract": LANE_CONTRACT,
-                    "pass": True,
-                    "training_precision": "fp32",
-                    "optimizer_state_precision": "fp32",
-                    "cuda_artifacts": "fatbin",
-                    "source_fingerprint_sha256": fingerprint,
-                    "source_files": source_files,
-                    "gpu": {
-                        "architecture": architecture,
-                        "family": family,
-                        "compute_capability": capability,
-                        "name": f"NVIDIA {family}",
-                        "driver_version": "999.0",
-                        "memory_mib": "40960",
-                    },
-                    "failures": [],
-                    "checks": {
-                        "embedded_artifacts": command("embedded-artifacts.log"),
-                        "full_parity": {
+                path.write_text(
+                    json.dumps(
+                        {
+                            "contract": LANE_CONTRACT,
                             "pass": True,
-                            "returncode": 0,
-                            "timed_out": False,
-                            "argv": ["zig", "build"],
+                            "training_precision": "fp32",
+                            "optimizer_state_precision": "fp32",
+                            "cuda_artifacts": "fatbin",
+                            "source_fingerprint_sha256": fingerprint,
+                            "source_files": source_files,
+                            "gpu": {
+                                "architecture": architecture,
+                                "family": family,
+                                "compute_capability": capability,
+                                "name": f"NVIDIA {family}",
+                                "driver_version": "999.0",
+                                "memory_mib": "40960",
+                            },
                             "failures": [],
-                            "subchecks": parity_subchecks,
-                        },
-                        "memcheck": command("memcheck.log"),
-                        "initcheck": command("initcheck.log"),
-                        "racecheck": command("racecheck.log"),
-                    },
-                }), encoding="utf-8")
+                            "checks": {
+                                "embedded_artifacts": command("embedded-artifacts.log"),
+                                "full_parity": {
+                                    "pass": True,
+                                    "returncode": 0,
+                                    "timed_out": False,
+                                    "argv": ["zig", "build"],
+                                    "failures": [],
+                                    "subchecks": parity_subchecks,
+                                },
+                                "memcheck": command("memcheck.log"),
+                                "initcheck": command("initcheck.log"),
+                                "racecheck": command("racecheck.log"),
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
                 paths.append(path)
             result = summarize(paths, package_dir)
             self.assertTrue(result["pass"], result["failures"])
@@ -180,7 +187,9 @@ class CudaHardwareQualificationTest(unittest.TestCase):
             tampered = result.copy()
             tampered["lanes"] = dict(result["lanes"])
             tampered["lanes"]["sm89"] = dict(result["lanes"]["sm89"])
-            tampered["lanes"]["sm89"]["report"] = dict(result["lanes"]["sm89"]["report"])
+            tampered["lanes"]["sm89"]["report"] = dict(
+                result["lanes"]["sm89"]["report"]
+            )
             tampered["lanes"]["sm89"]["report"]["checks"] = dict(
                 result["lanes"]["sm89"]["report"]["checks"]
             )

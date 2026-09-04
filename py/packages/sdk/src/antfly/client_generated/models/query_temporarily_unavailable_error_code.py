@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class QueryTemporarilyUnavailableErrorCode(str, Enum):
+class QueryTemporarilyUnavailableErrorCode(StrEnum):
     DISTRIBUTED_QUERY_UNAVAILABLE = "distributed_query_unavailable"
     DOC_IDENTITY_UNAVAILABLE = "doc_identity_unavailable"
     INDEX_REBUILDING = "index_rebuilding"

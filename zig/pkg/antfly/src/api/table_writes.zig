@@ -9954,9 +9954,10 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
-    fn retireDroppedTablePublicationAuthority(
+    fn retireDroppedTablePublicationAuthorityForGroups(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
+        group_ids: []const u64,
     ) void {
         const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
@@ -9964,14 +9965,17 @@ pub const ProvisionedTableWriteSource = struct {
 
         // The successful drop owns the table-wide structural fence, so no new
         // reconcile can install publication authority while this allocation-free
-        // cleanup retires every old group incarnation. Exact catalog
-        // validation has already proven that no replacement owns this name.
+        // cleanup retires the captured old group incarnations. A replacement
+        // table with the same name may already own other groups; preserve its
+        // handoffs and status authority.
         const table_index = self.findTableActivityLocked(table_name, null) orelse unreachable;
         std.debug.assert(self.active_table_activities.items[table_index].structural_active);
         var index: usize = 0;
         while (index < self.active_table_activities.items.len) {
             const entry = &self.active_table_activities.items[index];
             if (!std.mem.eql(u8, entry.table_name, table_name) or
+                entry.group_id == null or
+                std.mem.indexOfScalar(u64, group_ids, entry.group_id.?) == null or
                 (entry.repair_handoff_status_pending == 0 and entry.publication_handoffs.items.len == 0))
             {
                 index += 1;
@@ -18521,7 +18525,7 @@ pub const ProvisionedTableWriteSource = struct {
         // while the committed catalog still confirms absence; a delayed
         // initial cleanup must not revoke authority from a replacement table.
         if (retire_publication_authority and validation.table_name_absent) {
-            self.retireDroppedTablePublicationAuthority(table_name);
+            self.retireDroppedTablePublicationAuthorityForGroups(table_name, group_ids);
         }
 
         // The keyed structural reservation above prevents new opens for this

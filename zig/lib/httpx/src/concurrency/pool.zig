@@ -186,7 +186,6 @@ pub fn all(allocator: Allocator, client: *Client, specs: []const RequestSpec) ![
     return results;
 }
 
-
 /// Executes all requests concurrently and returns the first successful response.
 /// Uses Io fibers when available, falls back to sequential execution.
 pub fn any(allocator: Allocator, client: *Client, specs: []const RequestSpec) !?Response {
@@ -301,7 +300,6 @@ test "RequestSpec" {
     try std.testing.expectEqual(types.Method.POST, spec.method);
     try std.testing.expect(spec.body != null);
 }
-
 
 test "any empty" {
     const allocator = std.testing.allocator;

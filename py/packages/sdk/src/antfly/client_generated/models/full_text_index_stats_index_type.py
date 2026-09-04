@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class FullTextIndexStatsIndexType(str, Enum):
+class FullTextIndexStatsIndexType(StrEnum):
     FULL_TEXT = "full_text"
 
     def __str__(self) -> str:

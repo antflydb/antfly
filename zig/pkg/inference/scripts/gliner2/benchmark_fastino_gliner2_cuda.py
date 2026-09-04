@@ -57,7 +57,11 @@ def tensors_in(value: object) -> list[torch.Tensor]:
     if isinstance(value, torch.Tensor):
         return [value]
     if is_dataclass(value):
-        return [tensor for field in fields(value) for tensor in tensors_in(getattr(value, field.name))]
+        return [
+            tensor
+            for field in fields(value)
+            for tensor in tensors_in(getattr(value, field.name))
+        ]
     if isinstance(value, dict):
         return [tensor for child in value.values() for tensor in tensors_in(child)]
     if isinstance(value, (list, tuple)):
@@ -91,8 +95,14 @@ def verify_forward_residency(
         # approximating tokens from text length; schema labels are part of the
         # actual encoder sequence and must be included in a fair comparison.
         for tensor in tensors:
-            if tensor.device == device and not tensor.is_floating_point() and tensor.ndim >= 2:
-                observed_encoder_tokens = max(observed_encoder_tokens, int(tensor.shape[-1]))
+            if (
+                tensor.device == device
+                and not tensor.is_floating_point()
+                and tensor.ndim >= 2
+            ):
+                observed_encoder_tokens = max(
+                    observed_encoder_tokens, int(tensor.shape[-1])
+                )
 
     handles = [module.register_forward_pre_hook(hook) for module in model.modules()]
     try:
@@ -105,7 +115,10 @@ def verify_forward_residency(
         raise RuntimeError("Fastino CUDA forward hook was not reached")
     if observed_encoder_tokens <= 0:
         raise RuntimeError("Fastino encoder token-count hook was not reached")
-    if expected_token_count is not None and observed_encoder_tokens != expected_token_count:
+    if (
+        expected_token_count is not None
+        and observed_encoder_tokens != expected_token_count
+    ):
         raise RuntimeError(
             f"expected {expected_token_count} encoder tokens, got {observed_encoder_tokens}"
         )
@@ -152,7 +165,9 @@ def measure(
         torch.cuda.synchronize(device)
         api_ms.append((time.perf_counter_ns() - start) / 1_000_000.0)
         gpu_ms.append(start_event.elapsed_time(end_event))
-        entity_count = sum(len(group) for item in result for group in item["entities"].values())
+        entity_count = sum(
+            len(group) for item in result for group in item["entities"].values()
+        )
 
     if max(gpu_ms) <= 0.0:
         raise RuntimeError("CUDA events observed no GPU execution")
@@ -204,7 +219,9 @@ def main() -> None:
     torch.cuda.set_device(device)
     device_name = torch.cuda.get_device_name(device)
     if args.require_device_name and device_name != args.require_device_name:
-        raise RuntimeError(f"expected GPU {args.require_device_name!r}, got {device_name!r}")
+        raise RuntimeError(
+            f"expected GPU {args.require_device_name!r}, got {device_name!r}"
+        )
 
     model = GLiNER2.from_pretrained(args.model, map_location=device, quantize=True)
     assert_cuda_fp16_model(model, device)
@@ -233,16 +250,20 @@ def main() -> None:
 
     if args.mode in ("eager", "both"):
         report["batches"]["eager_fp16"] = [
-            measure(model, text, labels, batch, args.warmups, args.repeats, device) for batch in (1, 8)
+            measure(model, text, labels, batch, args.warmups, args.repeats, device)
+            for batch in (1, 8)
         ]
     if args.mode in ("compiled", "both"):
         compile_start = time.perf_counter_ns()
         model.compile()
         model.batch_extract_entities([text], labels, batch_size=1)
         torch.cuda.synchronize(device)
-        report["compile_first_ms"] = (time.perf_counter_ns() - compile_start) / 1_000_000.0
+        report["compile_first_ms"] = (
+            time.perf_counter_ns() - compile_start
+        ) / 1_000_000.0
         report["batches"]["torch_compile_fp16"] = [
-            measure(model, text, labels, batch, args.warmups, args.repeats, device) for batch in (1, 8)
+            measure(model, text, labels, batch, args.warmups, args.repeats, device)
+            for batch in (1, 8)
         ]
     print(json.dumps(report, indent=2, sort_keys=True))
 

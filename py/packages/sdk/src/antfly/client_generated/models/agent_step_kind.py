@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class AgentStepKind(str, Enum):
+class AgentStepKind(StrEnum):
     CLARIFICATION = "clarification"
     CLASSIFICATION = "classification"
     GENERATION = "generation"

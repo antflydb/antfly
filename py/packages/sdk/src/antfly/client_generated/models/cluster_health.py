@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ClusterHealth(str, Enum):
+class ClusterHealth(StrEnum):
     DEGRADED = "degraded"
     ERROR = "error"
     HEALTHY = "healthy"
