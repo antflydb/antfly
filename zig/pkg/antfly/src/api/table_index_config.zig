@@ -93,6 +93,34 @@ pub fn validateIndexConfigWithOptions(
     }
 }
 
+/// Validate the complete producer registry for a table before catalog commit.
+/// Per-index parsing cannot prove that artifact-backed embedding indexes have
+/// a runnable producer because their authoritative enrichment may already be
+/// stored at table scope.
+pub fn validateManagedEmbeddingRuntimeConfigJsonWithOptions(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    options: managed_embedder.InitOptions,
+) !void {
+    var managed = managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(
+        alloc,
+        indexes_json,
+        options,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.ModelNotFound => return err,
+        error.EmbeddingProbeUnavailable => return err,
+        error.MissingEmbeddingArtifactEnrichment,
+        error.MissingEmbeddingArtifactProducer,
+        error.InvalidEmbeddingArtifactProducer,
+        error.EmbeddingArtifactDimensionRequired,
+        error.ConflictingEmbeddingArtifactDimensions,
+        => return err,
+        else => return error.InvalidCreateTableRequest,
+    };
+    managed.deinit();
+}
+
 fn validateGraphConfig(alloc: std.mem.Allocator, config_json: []const u8) !void {
     index_manager.validateGraphConfig(alloc, config_json) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -190,10 +218,63 @@ pub fn normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
     return try alloc.dupe(u8, index_json);
 }
 
+pub fn normalizeManagedEmbeddingIndexDimensionForCatalogJsonWithOptions(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    index_json: []const u8,
+    catalog_indexes_json: []const u8,
+    options: managed_embedder.InitOptions,
+) ![]u8 {
+    var parsed_index = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
+    defer parsed_index.deinit();
+    var parsed_catalog = try std.json.parseFromSlice(std.json.Value, alloc, catalog_indexes_json, .{});
+    defer parsed_catalog.deinit();
+    if (try managed_embedder.normalizeEmbeddingsIndexDimensionJsonForCatalogWithOptions(
+        alloc,
+        index_name,
+        parsed_index.value,
+        parsed_catalog.value,
+        options,
+    )) |normalized| {
+        return normalized;
+    }
+    return try alloc.dupe(u8, index_json);
+}
+
 pub fn normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
     options: managed_embedder.InitOptions,
+) ![]u8 {
+    return try normalizeManagedEmbeddingIndexDimensionsInternal(
+        alloc,
+        indexes_json,
+        options,
+        false,
+    );
+}
+
+/// Normalize a catalog whose executable owners have already passed public
+/// admission. This stamps durable identities without re-probing every existing
+/// provider during an unrelated index or enrichment mutation.
+pub fn normalizeAdmittedManagedEmbeddingIndexDimensionsJsonWithOptions(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    options: managed_embedder.InitOptions,
+) ![]u8 {
+    return try normalizeManagedEmbeddingIndexDimensionsInternal(
+        alloc,
+        indexes_json,
+        options,
+        true,
+    );
+}
+
+fn normalizeManagedEmbeddingIndexDimensionsInternal(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    options: managed_embedder.InitOptions,
+    owners_already_admitted: bool,
 ) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
@@ -212,7 +293,23 @@ pub fn normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
         try out.append(alloc, ':');
-        if (try managed_embedder.normalizeEmbeddingsIndexDimensionJsonWithOptions(alloc, entry.key_ptr.*, entry.value_ptr.*, options)) |normalized| {
+        const normalized_value = if (owners_already_admitted)
+            try managed_embedder.normalizeAdmittedEmbeddingsIndexDimensionJsonForCatalogWithOptions(
+                alloc,
+                entry.key_ptr.*,
+                entry.value_ptr.*,
+                parsed.value,
+                options,
+            )
+        else
+            try managed_embedder.normalizeEmbeddingsIndexDimensionJsonForCatalogWithOptions(
+                alloc,
+                entry.key_ptr.*,
+                entry.value_ptr.*,
+                parsed.value,
+                options,
+            );
+        if (normalized_value) |normalized| {
             defer alloc.free(normalized);
             try out.appendSlice(alloc, normalized);
         } else {
@@ -254,6 +351,66 @@ test "runtime index config strips catalog-only lifecycle metadata" {
         try std.testing.expect(runtime.value.object.get("_index_incarnation") == null);
         try std.testing.expect(runtime.value.object.get("_coverage_incarnation") == null);
     }
+}
+
+test "managed embedding catalog normalization persists stable producer identity" {
+    const alloc = std.testing.allocator;
+    const original =
+        "{\"semantic\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"validation\":\"defer_probe\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"model-a\"}}}";
+    const normalized = try normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+        alloc,
+        original,
+        .{ .inference_api_url = "http://127.0.0.1:1" },
+    );
+    defer alloc.free(normalized);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized, .{});
+    defer parsed.deinit();
+    const semantic = parsed.value.object.get("semantic").?.object.get("semantic_producer").?;
+    try std.testing.expect(semantic == .string);
+    try std.testing.expect(std.mem.indexOf(u8, semantic.string, "http://127.0.0.1:1/ai/v1") != null);
+
+    const renormalized = try normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+        alloc,
+        normalized,
+        .{ .inference_api_url = "http://127.0.0.1:2" },
+    );
+    defer alloc.free(renormalized);
+    var reparsed = try std.json.parseFromSlice(std.json.Value, alloc, renormalized, .{});
+    defer reparsed.deinit();
+    try std.testing.expectEqualStrings(
+        semantic.string,
+        reparsed.value.object.get("semantic").?.object.get("semantic_producer").?.string,
+    );
+
+    const runtime_json = try extractIndexConfigJsonWithOptions(
+        alloc,
+        "semantic",
+        reparsed.value.object.get("semantic").?,
+        .{ .inference_api_url = "http://127.0.0.1:3" },
+    );
+    defer alloc.free(runtime_json);
+    var runtime = try std.json.parseFromSlice(std.json.Value, alloc, runtime_json, .{});
+    defer runtime.deinit();
+    try std.testing.expectEqualStrings(
+        semantic.string,
+        runtime.value.object.get("semantic_producer").?.string,
+    );
+
+    // Existing catalogs may predate semantic producer identity. Migrating
+    // them during an unrelated mutation must not contact providers whose
+    // dense/sparse shape is already durable.
+    const legacy =
+        "{\"dense\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"model-a\",\"url\":\"http://127.0.0.1:1/ai/v1\"}},\"sparse\":{\"type\":\"embeddings\",\"field\":\"body\",\"sparse\":true,\"embedder\":{\"provider\":\"antfly\",\"model\":\"model-sparse\",\"url\":\"http://127.0.0.1:1/ai/v1\"}}}";
+    const migrated = try normalizeAdmittedManagedEmbeddingIndexDimensionsJsonWithOptions(
+        alloc,
+        legacy,
+        .{},
+    );
+    defer alloc.free(migrated);
+    var migrated_parsed = try std.json.parseFromSlice(std.json.Value, alloc, migrated, .{});
+    defer migrated_parsed.deinit();
+    try std.testing.expect(migrated_parsed.value.object.get("dense").?.object.get("semantic_producer") != null);
+    try std.testing.expect(migrated_parsed.value.object.get("sparse").?.object.get("semantic_producer") != null);
 }
 
 test "graph index validation runs the runtime parser before catalog admission" {

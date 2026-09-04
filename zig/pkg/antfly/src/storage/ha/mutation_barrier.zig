@@ -20,11 +20,14 @@ threadlocal var shared_depth: usize = 0;
 /// Process-wide HA capture barrier.
 ///
 /// Every primary-side persistent mutation holds a shared lease from before its
-/// first durable side effect until its HA WAL record and durability decision are
-/// complete. Seed capture holds the exclusive lease while it selects the exact
-/// checkpoint and snapshots every catalog/data store. The reader gate is held
-/// by a queued exclusive locker, preventing an unbounded stream of new writes
-/// from starving capture.
+/// first durable side effect until its matching HA WAL record is complete. The
+/// mutation lease is released before waiting for remote durability: the local
+/// commit and HA tail are already atomically ordered at that point, and holding
+/// it would deadlock the seed capture needed to restore that durability. Seed
+/// capture holds the exclusive lease while it selects the exact checkpoint and
+/// snapshots every catalog/data store. The reader gate is held by a queued
+/// exclusive locker, preventing an unbounded stream of new writes from starving
+/// capture.
 pub const MutationBarrier = struct {
     reader_gate: std.atomic.Mutex = .unlocked,
     reader_mutex: std.atomic.Mutex = .unlocked,

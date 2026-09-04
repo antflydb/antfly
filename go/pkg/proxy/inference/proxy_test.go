@@ -465,6 +465,315 @@ func TestProxyQueueFallbackWaitsForEligibleDestination(t *testing.T) {
 	}
 }
 
+type testPoolActivator struct {
+	enabled  func(string, string) bool
+	activate func(context.Context, string, string) (time.Duration, bool, error)
+}
+
+func (a testPoolActivator) IsEnabled(namespace, pool string) bool {
+	if a.enabled == nil {
+		return true
+	}
+	return a.enabled(namespace, pool)
+}
+
+func (a testPoolActivator) Activate(ctx context.Context, namespace, pool string) (time.Duration, bool, error) {
+	return a.activate(ctx, namespace, pool)
+}
+
+func TestResolveRequestActivatesZeroPoolBeforeRedirectFallback(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:       "default/gpu",
+		Operations: map[OperationType]bool{OperationType("extract"): true},
+		Destinations: []Destination{
+			{Pool: "gpu", Weight: 100},
+		},
+		Fallback: &Fallback{Action: "redirect", RedirectPool: "cpu"},
+	})
+
+	var calls atomic.Int32
+	p.SetPoolActivator(testPoolActivator{activate: func(_ context.Context, namespace, pool string) (time.Duration, bool, error) {
+		if namespace != "default" {
+			t.Fatalf("activation namespace = %q, want default", namespace)
+		}
+		if pool != "gpu" {
+			return 0, false, nil
+		}
+		if calls.Add(1) == 1 {
+			go func() {
+				time.Sleep(20 * time.Millisecond)
+				p.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
+			}()
+		}
+		return 500 * time.Millisecond, true, nil
+	}})
+
+	resolved, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: OperationType("extract"), Model: "gliner2"})
+	if err != nil {
+		t.Fatalf("ResolveRequest: %v", err)
+	}
+	if resolved.Pool != "gpu" || resolved.Endpoint.Address != "http://gpu.internal" {
+		t.Fatalf("expected activated GPU pool, got pool=%q endpoint=%q", resolved.Pool, resolved.Endpoint.Address)
+	}
+	if calls.Load() == 0 {
+		t.Fatal("expected GPU activation")
+	}
+}
+
+func TestResolveRequestUsesFallbackAfterActivationTimeout(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:         "default/gpu-timeout",
+		Operations:   map[OperationType]bool{OperationType("extract"): true},
+		Destinations: []Destination{{Pool: "gpu", Weight: 100}},
+		Fallback:     &Fallback{Action: "redirect", RedirectPool: "cpu"},
+	})
+	p.SetPoolActivator(testPoolActivator{activate: func(_ context.Context, _ string, pool string) (time.Duration, bool, error) {
+		if pool == "gpu" {
+			return 20 * time.Millisecond, true, nil
+		}
+		return 0, false, nil
+	}})
+
+	resolved, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: OperationType("extract"), Model: "gliner2"})
+	if err != nil {
+		t.Fatalf("ResolveRequest: %v", err)
+	}
+	if resolved.Pool != "cpu" {
+		t.Fatalf("expected CPU fallback after activation timeout, got %q", resolved.Pool)
+	}
+}
+
+func TestSynchronousColdActivationCannotBypassDynamicConditions(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:         "default/model-gated-cold",
+		Operations:   map[OperationType]bool{OperationType("extract"): true},
+		Destinations: []Destination{{Pool: "gpu", Weight: 100, RequireModelLoaded: true}},
+		Fallback:     &Fallback{Action: "redirect", RedirectPool: "cpu"},
+	})
+	p.SetPoolActivator(testPoolActivator{activate: func(_ context.Context, _ string, pool string) (time.Duration, bool, error) {
+		if pool != "gpu" {
+			return 0, false, nil
+		}
+		// The endpoint becomes healthy inside Activate, but the requested model
+		// is deliberately not loaded there.
+		p.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
+		return 20 * time.Millisecond, true, nil
+	}})
+
+	resolved, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: OperationType("extract"), Model: "not-loaded"})
+	if err != nil {
+		t.Fatalf("ResolveRequest: %v", err)
+	}
+	if resolved.Pool != "cpu" {
+		t.Fatalf("expected CPU fallback when activated endpoint fails model condition, got %q", resolved.Pool)
+	}
+}
+
+func TestRuntimeIneligiblePoolFallsBackWithoutColdStartWait(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
+	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:         "default/runtime-ineligible",
+		Operations:   map[OperationType]bool{OperationType("extract"): true},
+		Destinations: []Destination{{Pool: "gpu", Weight: 100, RequireModelLoaded: true}},
+		Fallback:     &Fallback{Action: "redirect", RedirectPool: "cpu"},
+	})
+
+	var gpuActivations atomic.Int32
+	p.SetPoolActivator(testPoolActivator{activate: func(_ context.Context, _ string, pool string) (time.Duration, bool, error) {
+		if pool == "gpu" {
+			gpuActivations.Add(1)
+			return time.Second, true, nil
+		}
+		return 0, false, nil
+	}})
+
+	start := time.Now()
+	resolved, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: OperationType("extract"), Model: "not-loaded"})
+	if err != nil {
+		t.Fatalf("ResolveRequest: %v", err)
+	}
+	if resolved.Pool != "cpu" {
+		t.Fatalf("expected immediate CPU fallback, got %q", resolved.Pool)
+	}
+	if gpuActivations.Load() != 0 {
+		t.Fatalf("runtime-ineligible GPU pool was treated as cold; activations=%d", gpuActivations.Load())
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("runtime-ineligible fallback spent a cold-start wait: %s", elapsed)
+	}
+}
+
+func TestResolveRequestActivatesColdRedirectFallback(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:         "default/cold-fallback",
+		Operations:   map[OperationType]bool{OperationType("extract"): true},
+		Destinations: []Destination{{Pool: "gpu", Weight: 100, RequireModelLoaded: true}},
+		Fallback:     &Fallback{Action: "redirect", RedirectPool: "cpu"},
+	})
+
+	var fallbackActivations atomic.Int32
+	p.SetPoolActivator(testPoolActivator{
+		enabled: func(_ string, pool string) bool { return pool == "cpu" },
+		activate: func(_ context.Context, _ string, pool string) (time.Duration, bool, error) {
+			if pool != "cpu" {
+				return 0, false, nil
+			}
+			if fallbackActivations.Add(1) == 1 {
+				go func() {
+					time.Sleep(20 * time.Millisecond)
+					p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+				}()
+			}
+			return 500 * time.Millisecond, true, nil
+		},
+	})
+
+	resolved, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: OperationType("extract"), Model: "not-loaded"})
+	if err != nil {
+		t.Fatalf("ResolveRequest: %v", err)
+	}
+	if resolved.Pool != "cpu" || resolved.Endpoint.Address != "http://cpu.internal" {
+		t.Fatalf("expected activated CPU fallback, got pool=%q endpoint=%q", resolved.Pool, resolved.Endpoint.Address)
+	}
+	if fallbackActivations.Load() != 1 {
+		t.Fatalf("expected one fallback activation, got %d", fallbackActivations.Load())
+	}
+}
+
+func TestColdRouteActivationUsesDestinationWeights(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	counts := map[string]int{}
+	p.SetPoolActivator(testPoolActivator{
+		enabled: func(namespace, _ string) bool { return namespace == "team-a" },
+		activate: func(_ context.Context, namespace, pool string) (time.Duration, bool, error) {
+			if namespace != "team-a" {
+				t.Fatalf("activation namespace = %q, want team-a", namespace)
+			}
+			counts[pool]++
+			return time.Second, true, nil
+		},
+	})
+	route := &Route{
+		Name: "team-a/weighted-cold",
+		Destinations: []Destination{
+			{Pool: "gpu-a", Weight: 80},
+			{Pool: "gpu-b", Weight: 20},
+		},
+	}
+
+	for i := 0; i < 1000; i++ {
+		destination, _ := p.activateRouteDestination(context.Background(), route, &RouteRequest{
+			Operation: OperationType("embed"),
+			Model:     "model-a",
+			Timestamp: time.Unix(0, int64(i)),
+		})
+		if destination == nil {
+			t.Fatal("expected a cold destination to be activated")
+		}
+	}
+	if counts["gpu-a"] < 700 || counts["gpu-a"] > 900 {
+		t.Fatalf("expected weighted cold activation to favor gpu-a, got %v", counts)
+	}
+	if counts["gpu-a"]+counts["gpu-b"] != 1000 {
+		t.Fatalf("expected one activation per request, got %v", counts)
+	}
+}
+
+func TestColdRouteActivationHonorsDestinationTimeCondition(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	var activated string
+	p.SetPoolActivator(testPoolActivator{
+		activate: func(_ context.Context, _ string, pool string) (time.Duration, bool, error) {
+			activated = pool
+			return time.Second, true, nil
+		},
+	})
+	route := &Route{
+		Name: "default/time-window",
+		Destinations: []Destination{
+			{Pool: "inactive", Weight: 100, TimeCondition: &TimeWindow{StartHour: 13, EndHour: 14}},
+			{Pool: "active", Weight: 1, TimeCondition: &TimeWindow{StartHour: 11, EndHour: 13}},
+		},
+	}
+	destination, _ := p.activateRouteDestination(context.Background(), route, &RouteRequest{
+		Timestamp: time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC),
+	})
+	if destination == nil || destination.Pool != "active" || activated != "active" {
+		t.Fatalf("expected only the active time-window destination, got destination=%v activated=%q", destination, activated)
+	}
+}
+
+func TestColdRouteWaitRemainsBoundToSelectedDestination(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	selected := make(chan string, 1)
+	var calls atomic.Int32
+	p.SetPoolActivator(testPoolActivator{
+		activate: func(_ context.Context, _ string, pool string) (time.Duration, bool, error) {
+			if calls.Add(1) == 1 {
+				selected <- pool
+				other := "gpu-a"
+				if pool == other {
+					other = "gpu-b"
+				}
+				go func() {
+					time.Sleep(20 * time.Millisecond)
+					p.RegisterEndpoint("http://other.internal", other, WorkloadTypeGeneral)
+					time.Sleep(330 * time.Millisecond)
+					p.RegisterEndpoint("http://selected.internal", pool, WorkloadTypeGeneral)
+				}()
+			}
+			return time.Second, true, nil
+		},
+	})
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:       "default/bound-cold",
+		Operations: map[OperationType]bool{OperationType("embed"): true},
+		Destinations: []Destination{
+			{Pool: "gpu-a", Weight: 50},
+			{Pool: "gpu-b", Weight: 50},
+		},
+	})
+
+	resolved, err := p.ResolveRequest(context.Background(), ResolveRequest{
+		Operation: OperationType("embed"),
+		Model:     "model-a",
+		Timestamp: time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ResolveRequest: %v", err)
+	}
+	want := <-selected
+	if resolved.Pool != want || resolved.Endpoint.Address != "http://selected.internal" {
+		t.Fatalf("resolution drifted from selected cold pool %q: pool=%q endpoint=%q", want, resolved.Pool, resolved.Endpoint.Address)
+	}
+}
+
 func TestBurstRoutingDistributesAcrossEligibleEndpoints(t *testing.T) {
 	t.Parallel()
 
@@ -812,6 +1121,49 @@ func TestRouteRequestClaimsRecoveredCircuitOnce(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&cb.state); got != 2 {
 		t.Fatalf("expected recovered request to claim half-open probe, got state=%d", got)
+	}
+}
+
+func TestAcquireRoutedRequestOwnsRecoveredCircuitProbe(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{
+		DefaultPool:     "primary",
+		RefreshInterval: time.Minute,
+		Logger:          zap.NewNop(),
+	})
+	p.RegisterEndpoint("http://recovering.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModels("http://recovering.internal", []string{"model-a"})
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:       "default/recovering",
+		Operations: map[OperationType]bool{OperationType("embed"): true},
+		Destinations: []Destination{{
+			Pool:             "primary",
+			Weight:           100,
+			ReplicaCondition: &ThresholdCondition{Operator: ">=", Value: 1},
+		}},
+	})
+
+	cb := p.registry.GetCircuitBreaker("http://recovering.internal")
+	cb.threshold = 1
+	cb.timeout = 10 * time.Millisecond
+	cb.RecordFailure()
+	time.Sleep(20 * time.Millisecond)
+
+	lease, err := p.AcquireRequestResolution(context.Background(), ResolveRequest{
+		Operation: OperationType("embed"),
+		Model:     "model-a",
+		Timestamp: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("AcquireRequestResolution: %v", err)
+	}
+	if got := atomic.LoadInt32(&cb.state); got != 2 {
+		t.Fatalf("expected acquired route to own half-open probe, got state=%d", got)
+	}
+	lease.RecordSuccess()
+	if got := atomic.LoadInt32(&cb.state); got != 0 {
+		t.Fatalf("expected successful routed probe to close breaker, got state=%d", got)
 	}
 }
 

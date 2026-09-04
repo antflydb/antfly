@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""Validate and resolve the canonical release-channel policy."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+POLICY_PATH = Path(__file__).with_name("channels.json")
+CHANNEL_NAMES = {"stable", "next", "nightly"}
+REQUIRED_FIELDS = {
+    "tag_kind",
+    "ordering",
+    "journal_key",
+    "bootstrap_sources",
+    "npm_tag",
+    "publish_npm",
+    "publish_pypi",
+    "publish_homebrew",
+    "container_alias",
+    "object_alias",
+    "object_static_files",
+    "github_release",
+    "recovery_sources",
+    "retention",
+}
+TAG_PATTERN = re.compile(
+    r"^v(?P<major>0|[1-9][0-9]*)\."
+    r"(?P<minor>0|[1-9][0-9]*)\."
+    r"(?P<patch>0|[1-9][0-9]*)"
+    r"(?:-(?P<prerelease>(?P<pre_label>dev|alpha|a|beta|b|rc|pre|preview)\.?(?P<pre_number>[0-9]+)))?$"
+)
+NIGHTLY_PATTERN = re.compile(r"^v0\.0\.0-dev\.(?P<sequence>[1-9][0-9]*)$")
+CANONICAL_PRERELEASE_PATTERN = re.compile(
+    r"^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"-(?:alpha|beta|rc)\.(?:0|[1-9][0-9]*)$"
+)
+CANONICAL_STABLE_PATTERN = re.compile(
+    r"^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
+)
+CONTAINER_TAG_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+
+
+@dataclass(frozen=True)
+class ReleaseSpec:
+    tag: str
+    channel: str
+    source_commit: str
+    build_controller_commit: str
+    npm_version: str
+    python_version: str
+    container_tag: str
+
+    def document(self) -> dict[str, object]:
+        return {
+            "schema_version": 4,
+            "tag": self.tag,
+            "version": self.tag.removeprefix("v"),
+            "channel": self.channel,
+            "source_commit": self.source_commit,
+            "build_controller_commit": self.build_controller_commit,
+            "build_contract_schema": 1,
+            "registry_versions": {
+                "npm": self.npm_version,
+                "python": self.python_version,
+                "container": self.container_tag,
+            },
+        }
+
+
+def parse_version(tag: str) -> tuple[tuple[int, int, int], tuple[str, ...] | None]:
+    match = TAG_PATTERN.fullmatch(tag)
+    if not match:
+        raise SystemExit(f"release channel requires a semantic version tag: {tag}")
+    prerelease = match.group("prerelease")
+    number = match.group("pre_number")
+    if number and len(number) > 1 and number.startswith("0"):
+        raise SystemExit(f"invalid semantic version prerelease: {tag}")
+    identifiers = None
+    if prerelease:
+        label = {
+            "alpha": "a",
+            "beta": "b",
+            "pre": "rc",
+            "preview": "rc",
+        }.get(match.group("pre_label"), match.group("pre_label"))
+        identifiers = (str(label), str(int(number)))
+    return (
+        (
+            int(match.group("major")),
+            int(match.group("minor")),
+            int(match.group("patch")),
+        ),
+        identifiers,
+    )
+
+
+def normalize_release_version(raw: str, *, allow_legacy: bool = False) -> str:
+    tag = raw if raw.startswith("v") else f"v{raw}"
+    parse_version(tag)
+    if not allow_legacy and not is_canonical_tag(tag):
+        raise SystemExit(f"release candidate must use canonical tag syntax: {tag}")
+    return tag.removeprefix("v")
+
+
+def python_version_from_release(raw: str, *, allow_legacy: bool = False) -> str:
+    version = normalize_release_version(raw, allow_legacy=allow_legacy)
+    match = TAG_PATTERN.fullmatch(f"v{version}")
+    assert match is not None
+    python_version = (
+        f"{match.group('major')}.{match.group('minor')}.{match.group('patch')}"
+    )
+    if label := match.group("pre_label"):
+        label = {
+            "alpha": "a",
+            "beta": "b",
+            "pre": "rc",
+            "preview": "rc",
+        }.get(label, label)
+        number = str(int(match.group("pre_number")))
+        python_version += f".dev{number}" if label == "dev" else f"{label}{number}"
+    return python_version
+
+
+def registry_identity(tag: str, *, allow_legacy: bool = False) -> dict[str, str]:
+    version = normalize_release_version(tag, allow_legacy=allow_legacy)
+    return {
+        "npm_version": version,
+        "python_version": python_version_from_release(
+            version, allow_legacy=allow_legacy
+        ),
+        "container_tag": f"v{version}",
+    }
+
+
+def is_canonical_tag(tag: str) -> bool:
+    return bool(
+        CANONICAL_STABLE_PATTERN.fullmatch(tag)
+        or CANONICAL_PRERELEASE_PATTERN.fullmatch(tag)
+        or NIGHTLY_PATTERN.fullmatch(tag)
+    )
+
+
+def build_release_spec(
+    tag: str,
+    requested_channel: str,
+    source_commit: str,
+    build_controller_commit: str,
+    policy: dict[str, Any] | None = None,
+    *,
+    allow_legacy: bool = False,
+) -> ReleaseSpec:
+    for name, commit in (
+        ("source", source_commit),
+        ("build controller", build_controller_commit),
+    ):
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise SystemExit(f"invalid {name} commit: {commit}")
+    channel_name, _ = resolve_channel(
+        tag, requested_channel, policy, allow_legacy=allow_legacy
+    )
+    registry = registry_identity(tag, allow_legacy=allow_legacy)
+    return ReleaseSpec(
+        tag=tag,
+        channel=channel_name,
+        source_commit=source_commit,
+        build_controller_commit=build_controller_commit,
+        npm_version=registry["npm_version"],
+        python_version=registry["python_version"],
+        container_tag=registry["container_tag"],
+    )
+
+
+def compare_version_precedence(left: str, right: str) -> int:
+    left_core, left_pre = parse_version(left)
+    right_core, right_pre = parse_version(right)
+    if left_core != right_core:
+        return -1 if left_core < right_core else 1
+    if left_pre is None or right_pre is None:
+        if left_pre is right_pre:
+            return 0
+        return 1 if left_pre is None else -1
+    for left_id, right_id in zip(left_pre, right_pre):
+        if left_id == right_id:
+            continue
+        left_numeric = left_id.isdigit()
+        right_numeric = right_id.isdigit()
+        if left_numeric and right_numeric:
+            return -1 if int(left_id) < int(right_id) else 1
+        if left_numeric != right_numeric:
+            return -1 if left_numeric else 1
+        return -1 if left_id < right_id else 1
+    if len(left_pre) == len(right_pre):
+        return 0
+    return -1 if len(left_pre) < len(right_pre) else 1
+
+
+def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
+    policy = json.loads(path.read_text(encoding="utf-8"))
+    if policy.get("schema_version") != 4:
+        raise SystemExit(f"unsupported release-channel schema in {path}")
+    channels = policy.get("channels")
+    if not isinstance(channels, dict) or set(channels) != CHANNEL_NAMES:
+        raise SystemExit("release-channel policy must define stable, next, and nightly")
+
+    destinations: set[tuple[str, str]] = set()
+    journal_keys: set[str] = set()
+    for name, channel in channels.items():
+        if not isinstance(channel, dict) or REQUIRED_FIELDS - channel.keys():
+            raise SystemExit(f"release channel {name} is missing required fields")
+        if channel["tag_kind"] not in {"stable", "prerelease", "nightly"}:
+            raise SystemExit(f"release channel {name} has invalid tag_kind")
+        if channel["ordering"] not in {"semver", "sequence"}:
+            raise SystemExit(f"release channel {name} has invalid ordering")
+        bootstrap_sources = channel["bootstrap_sources"]
+        if (
+            not isinstance(bootstrap_sources, list)
+            or not bootstrap_sources
+            or len(set(bootstrap_sources)) != len(bootstrap_sources)
+            or not set(bootstrap_sources)
+            <= {"github-latest", "npm", "object-storage", "homebrew"}
+        ):
+            raise SystemExit(f"release channel {name} has invalid bootstrap_sources")
+        if channel["github_release"] not in {"latest", "prerelease", "none"}:
+            raise SystemExit(f"release channel {name} has invalid GitHub mode")
+        expected_bootstrap_sources = {"object-storage"}
+        if channel["publish_npm"]:
+            expected_bootstrap_sources.add("npm")
+        if channel["github_release"] == "latest":
+            expected_bootstrap_sources.add("github-latest")
+        if channel["publish_homebrew"]:
+            expected_bootstrap_sources.add("homebrew")
+        if set(bootstrap_sources) != expected_bootstrap_sources:
+            raise SystemExit(
+                f"release channel {name} does not bootstrap every version-bearing destination"
+            )
+        recovery_sources = channel["recovery_sources"]
+        if (
+            not isinstance(recovery_sources, list)
+            or not recovery_sources
+            or len(set(recovery_sources)) != len(recovery_sources)
+            or not set(recovery_sources) <= {"github-release", "object-storage"}
+        ):
+            raise SystemExit(f"release channel {name} has invalid recovery_sources")
+        expected_recovery_sources = ["object-storage"]
+        if channel["github_release"] != "none":
+            expected_recovery_sources.insert(0, "github-release")
+        if recovery_sources != expected_recovery_sources:
+            raise SystemExit(
+                f"release channel {name} has incomplete or unordered recovery_sources"
+            )
+        journal_key = channel["journal_key"]
+        if (
+            not isinstance(journal_key, str)
+            or not re.fullmatch(r"antfly/channels/[a-z][a-z0-9-]*\.json", journal_key)
+            or journal_key in journal_keys
+        ):
+            raise SystemExit(
+                f"release channel {name} has invalid or duplicate journal_key"
+            )
+        journal_keys.add(journal_key)
+        for flag in ("publish_npm", "publish_pypi", "publish_homebrew"):
+            if not isinstance(channel[flag], bool):
+                raise SystemExit(f"release channel {name} has invalid {flag}")
+        static_files = channel["object_static_files"]
+        if not isinstance(static_files, dict):
+            raise SystemExit(f"release channel {name} has invalid object_static_files")
+        for object_name, source in static_files.items():
+            if (
+                not isinstance(object_name, str)
+                or not object_name
+                or Path(object_name).name != object_name
+                or object_name == "metadata.json"
+                or not isinstance(source, str)
+                or not re.fullmatch(r"scripts/release/[a-z0-9_.-]+", source)
+            ):
+                raise SystemExit(
+                    f"release channel {name} has invalid object_static_files"
+                )
+        for sink, field in (
+            ("npm", "npm_tag"),
+            ("container", "container_alias"),
+            ("object-storage", "object_alias"),
+        ):
+            alias = channel[field]
+            if sink == "npm" and not channel["publish_npm"]:
+                if alias is not None:
+                    raise SystemExit(
+                        f"release channel {name} has an npm_tag while npm is disabled"
+                    )
+                continue
+            if not isinstance(alias, str) or not re.fullmatch(
+                r"[a-z][a-z0-9-]*", alias
+            ):
+                raise SystemExit(f"release channel {name} has invalid {field}")
+            destination = (sink, alias)
+            if destination in destinations:
+                raise SystemExit(f"mutable destination is owned twice: {sink}:{alias}")
+            destinations.add(destination)
+
+    if {
+        name: (channel["tag_kind"], channel["ordering"])
+        for name, channel in channels.items()
+    } != {
+        "stable": ("stable", "semver"),
+        "next": ("prerelease", "semver"),
+        "nightly": ("nightly", "sequence"),
+    }:
+        raise SystemExit("release channels have invalid tag or ordering contracts")
+
+    nightly = channels["nightly"]
+    if (
+        nightly["ordering"] != "sequence"
+        or nightly["publish_npm"]
+        or nightly["publish_pypi"]
+        or nightly["publish_homebrew"]
+        or nightly["github_release"] != "none"
+        or nightly["recovery_sources"] != ["object-storage"]
+    ):
+        raise SystemExit("nightly channel must be snapshot-only")
+    stable_retention = channels["stable"]["retention"]
+    next_retention = channels["next"]["retention"]
+    nightly_retention = nightly["retention"]
+    if stable_retention != {"mode": "forever"}:
+        raise SystemExit("stable channel must be retained forever")
+    if (
+        not isinstance(next_retention, dict)
+        or set(next_retention) != {"mode", "grace_days"}
+        or next_retention["mode"] != "after-stable"
+        or isinstance(next_retention["grace_days"], bool)
+        or not isinstance(next_retention["grace_days"], int)
+        or next_retention["grace_days"] < 0
+    ):
+        raise SystemExit("next channel has invalid retention")
+    if (
+        not isinstance(nightly_retention, dict)
+        or set(nightly_retention) != {"mode", "days", "minimum_count"}
+        or nightly_retention["mode"] != "age-and-count"
+        or isinstance(nightly_retention["days"], bool)
+        or not isinstance(nightly_retention["days"], int)
+        or nightly_retention["days"] < 0
+        or isinstance(nightly_retention["minimum_count"], bool)
+        or not isinstance(nightly_retention["minimum_count"], int)
+        or nightly_retention["minimum_count"] < 1
+    ):
+        raise SystemExit("nightly channel has invalid retention")
+    if channels["stable"]["object_static_files"] != {
+        "install.sh": "scripts/release/install_bootstrap.sh"
+    } or any(channels[name]["object_static_files"] for name in ("next", "nightly")):
+        raise SystemExit("only stable may publish the canonical install bootstrap")
+    return policy
+
+
+def validate_observed_channel_tag(
+    tag: str, channel_name: str, policy: dict[str, Any]
+) -> None:
+    channel = policy["channels"].get(channel_name)
+    if not isinstance(channel, dict):
+        raise SystemExit(f"unknown release channel: {channel_name}")
+    _, prerelease = parse_version(tag)
+    if not CONTAINER_TAG_PATTERN.fullmatch(tag):
+        raise SystemExit(
+            f"release tag cannot be represented by the container registry: {tag}"
+        )
+    kind = channel["tag_kind"]
+    if kind == "stable" and prerelease is not None:
+        raise SystemExit(
+            f"stable channel requires a stable semantic version tag: {tag}"
+        )
+    if kind == "prerelease" and prerelease is None:
+        raise SystemExit(
+            f"next channel requires a prerelease semantic version tag: {tag}"
+        )
+    if kind == "prerelease" and NIGHTLY_PATTERN.fullmatch(tag):
+        raise SystemExit(f"nightly snapshot tag requires the nightly channel: {tag}")
+    if kind == "nightly" and not NIGHTLY_PATTERN.fullmatch(tag):
+        raise SystemExit(f"nightly channel requires v0.0.0-dev.<sequence>: {tag}")
+    if kind != "nightly" and NIGHTLY_PATTERN.fullmatch(tag):
+        raise SystemExit(f"nightly snapshot tag requires the nightly channel: {tag}")
+
+
+def validate_channel_tag(
+    tag: str,
+    channel_name: str,
+    policy: dict[str, Any],
+    *,
+    allow_legacy: bool = False,
+) -> None:
+    validate_observed_channel_tag(tag, channel_name, policy)
+    if not allow_legacy and not is_canonical_tag(tag):
+        raise SystemExit(f"release candidate must use canonical tag syntax: {tag}")
+
+
+def resolve_channel(
+    tag: str,
+    requested: str = "auto",
+    policy: dict[str, Any] | None = None,
+    *,
+    allow_legacy: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    policy = policy or load_policy()
+    _, prerelease = parse_version(tag)
+    if requested == "auto":
+        requested = "next" if prerelease is not None else "stable"
+    validate_channel_tag(tag, requested, policy, allow_legacy=allow_legacy)
+    return requested, dict(policy["channels"][requested])
+
+
+def compare_channel_tags(
+    left: str, right: str, channel_name: str, policy: dict[str, Any]
+) -> int:
+    validate_observed_channel_tag(left, channel_name, policy)
+    validate_observed_channel_tag(right, channel_name, policy)
+    channel = policy["channels"][channel_name]
+    if channel["ordering"] == "semver":
+        return compare_version_precedence(left, right)
+    left_match = NIGHTLY_PATTERN.fullmatch(left)
+    right_match = NIGHTLY_PATTERN.fullmatch(right)
+    assert left_match is not None and right_match is not None
+    left_sequence = int(left_match.group("sequence"))
+    right_sequence = int(right_match.group("sequence"))
+    return (left_sequence > right_sequence) - (left_sequence < right_sequence)
+
+
+def github_outputs(
+    channel_name: str,
+    channel: dict[str, Any],
+    tag: str | None = None,
+    *,
+    allow_legacy: bool = False,
+) -> dict[str, str]:
+    result = {"channel": channel_name}
+    for key, value in channel.items():
+        if isinstance(value, bool):
+            result[key] = str(value).lower()
+        elif value is None:
+            result[key] = ""
+        elif isinstance(value, list):
+            result[key] = json.dumps(value, separators=(",", ":"))
+        else:
+            result[key] = str(value)
+    if tag:
+        result.update(registry_identity(tag, allow_legacy=allow_legacy))
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("validate", "resolve", "spec"))
+    parser.add_argument("--tag")
+    parser.add_argument("--channel", default="auto")
+    parser.add_argument("--github-output", type=Path)
+    parser.add_argument("--source-commit")
+    parser.add_argument("--build-controller-commit")
+    parser.add_argument("--allow-legacy", action="store_true")
+    args = parser.parse_args()
+
+    policy = load_policy()
+    if args.command == "validate":
+        print(f"validated {len(policy['channels'])} release channels")
+        return 0
+    if not args.tag:
+        parser.error("resolve requires --tag")
+    if args.command == "spec":
+        if not args.source_commit or not args.build_controller_commit:
+            parser.error("spec requires --source-commit and --build-controller-commit")
+        spec = build_release_spec(
+            args.tag,
+            args.channel,
+            args.source_commit,
+            args.build_controller_commit,
+            policy,
+            allow_legacy=args.allow_legacy,
+        )
+        print(json.dumps(spec.document(), indent=2, sort_keys=True))
+        return 0
+    channel_name, channel = resolve_channel(
+        args.tag, args.channel, policy, allow_legacy=args.allow_legacy
+    )
+    outputs = github_outputs(
+        channel_name, channel, args.tag, allow_legacy=args.allow_legacy
+    )
+    output_path = args.github_output
+    if output_path is None and os.environ.get("GITHUB_OUTPUT"):
+        output_path = Path(os.environ["GITHUB_OUTPUT"])
+    if output_path:
+        with output_path.open("a", encoding="utf-8") as output:
+            for key, value in outputs.items():
+                output.write(f"{key}={value}\n")
+    print(json.dumps(outputs, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

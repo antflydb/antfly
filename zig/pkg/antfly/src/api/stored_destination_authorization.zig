@@ -292,6 +292,11 @@ pub fn authorizeReplicationSourceValue(
     defer destinations.deinit(alloc);
     try collectRouteDestinations(alloc, source, &destinations);
     const grant = try validateGrant(source.object, destinations.items);
+    // The envelope authorizes writes into other Antfly tables. A source with
+    // no routes has no such destination and therefore needs neither a user
+    // grant nor a catalog-service exception. External source credentials are
+    // governed by the secret store and connection policy instead.
+    if (destinations.items.len == 0) return;
     if (authorizer) |live| {
         const payload = try grantSigningPayloadAlloc(
             alloc,
@@ -568,6 +573,18 @@ fn appendJsonValue(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), v
 test "stored destination envelopes cannot be forged and validate on resume" {
     const alloc = std.testing.allocator;
     const disabled_authorizer: Authorizer = .{ .auth_enabled = false };
+    var source_only = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"type\":\"postgres\",\"dsn\":\"postgres://source\"}",
+        .{},
+    );
+    defer source_only.deinit();
+    // Authentication state is irrelevant when the source has no Antfly write
+    // destinations. In particular, the catalog service is not asked to mint
+    // or validate an empty grant.
+    try authorizeReplicationSourceValue(alloc, source_only.value, "source", .{ .auth_enabled = true });
+
     const raw =
         \\[{"type":"postgres","routes":[{"target_table":"protected"}],"_antfly_destination_authorization_v1":["decoy"]}]
     ;

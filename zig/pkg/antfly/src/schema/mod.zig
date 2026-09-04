@@ -401,7 +401,7 @@ fn freeRuntimeDynamicTemplateItems(alloc: std.mem.Allocator, templates: []storag
 }
 
 fn runtimeDynamicTemplateFromParsed(alloc: std.mem.Allocator, template: impl.DynamicTemplate) !storage_schema.DynamicTemplate {
-    const field_type = runtimeFieldTypeFromParsed(template.field_type);
+    const field_type = parseRuntimeFieldType(template.field_type orelse "text");
     const sortable = template.sortable orelse false;
     const do_index = template.do_index orelse true;
     try validateRuntimeSortableMapping(field_type, sortable);
@@ -859,13 +859,6 @@ fn runtimeExactFieldFromParsed(
             .analyzer = analyzer,
         },
     };
-}
-
-fn runtimeFieldTypeFromParsed(field_type: ?[]const u8) storage_schema.AntflyType {
-    // Unknown mapping names were historically interpreted as text. Preserve
-    // that behavior when loading existing table schemas; sortable validation
-    // still rejects combinations that text cannot represent.
-    return impl.runtimeFieldTypeFromName(field_type orelse "text") orelse .text;
 }
 
 fn freeRuntimeExactFieldItems(alloc: std.mem.Allocator, fields: []storage_schema.ExactField) void {
@@ -1658,35 +1651,6 @@ test "runtime schema derives internal doc values from sortable scalar mappings" 
     try std.testing.expectEqual(storage_schema.AntflyType.geopoint, runtime.dynamic_templates[4].mapping.field_type);
     try std.testing.expect(!runtime.dynamic_templates[4].mapping.doc_values);
     try std.testing.expect(!runtime.dynamic_templates[4].mapping.sortable);
-}
-
-test "runtime schema preserves legacy unknown mapping types as text" {
-    const alloc = std.testing.allocator;
-    var parsed = try parseValidatedTableSchema(alloc,
-        \\{
-        \\  "dynamic_templates": [
-        \\    {"name":"legacy_dynamic","path_match":"dynamic","mapping":{"type":"json"}}
-        \\  ],
-        \\  "document_schemas": {
-        \\    "doc": {
-        \\      "schema": {
-        \\        "type": "object",
-        \\        "properties": {
-        \\          "declared": {"type":"string","x-antfly-field":{"type":"legacy_custom"}}
-        \\        }
-        \\      }
-        \\    }
-        \\  }
-        \\}
-    );
-    defer parsed.deinit(alloc);
-
-    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
-    defer storage_schema.freeSchema(alloc, runtime);
-
-    try std.testing.expectEqual(@as(usize, 2), runtime.dynamic_templates.len);
-    try std.testing.expectEqual(storage_schema.AntflyType.text, runtime.dynamic_templates[0].mapping.field_type);
-    try std.testing.expectEqual(storage_schema.AntflyType.text, runtime.dynamic_templates[1].mapping.field_type);
 }
 
 test "schema rejects sortable non-scalar dynamic mappings" {

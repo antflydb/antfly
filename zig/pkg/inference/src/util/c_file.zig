@@ -24,10 +24,10 @@ const build_options = @import("build_options");
 
 pub const link_libc = build_options.link_libc;
 
-/// `posix_fadvise` is a Linux API despite its name; Darwin does not export the
-/// symbol. Keep capability selection in one compile-time constant so advisory
-/// I/O paths cannot accidentally leave an unresolved reference on another
-/// libc platform.
+/// This advisory-I/O implementation is currently enabled only on Linux;
+/// Darwin does not export `posix_fadvise`. Keep capability selection in one
+/// compile-time constant so another libc target cannot accidentally retain an
+/// unresolved reference.
 pub const supports_posix_file_advice = build_options.link_libc and builtin.os.tag == .linux;
 
 pub const c = if (build_options.link_libc) PosixC else struct {};

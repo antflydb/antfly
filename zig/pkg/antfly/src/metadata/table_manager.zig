@@ -15,6 +15,7 @@
 const std = @import("std");
 
 pub const artifact_sources_protocol_version: u16 = 1;
+pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
@@ -52,9 +53,102 @@ pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
         lhs.min_ranges == rhs.min_ranges;
 }
 
+pub const TableDefinitionFingerprint = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
+fn hashTableDefinitionPart(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    var encoded_len: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_len, @intCast(value.len), .little);
+    hasher.update(&encoded_len);
+    hasher.update(value);
+}
+
+pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerprint {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly-table-definition-v1");
+    var encoded: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, table.table_id, .little);
+    hasher.update(&encoded);
+    hashTableDefinitionPart(&hasher, table.name);
+    hashTableDefinitionPart(&hasher, table.description);
+    hashTableDefinitionPart(&hasher, table.schema_json);
+    hashTableDefinitionPart(&hasher, table.read_schema_json);
+    hashTableDefinitionPart(&hasher, table.indexes_json);
+    hashTableDefinitionPart(&hasher, table.replication_sources_json);
+    hashTableDefinitionPart(&hasher, table.placement_role);
+    hashTableDefinitionPart(&hasher, table.restore_backup_id);
+    hashTableDefinitionPart(&hasher, table.restore_location);
+    std.mem.writeInt(u32, encoded[0..4], table.desired_replica_count, .little);
+    hasher.update(encoded[0..4]);
+    std.mem.writeInt(u32, encoded[0..4], table.min_ranges, .little);
+    hasher.update(encoded[0..4]);
+    var fingerprint: TableDefinitionFingerprint = undefined;
+    hasher.final(&fingerprint);
+    return fingerprint;
+}
+
 pub const TableMigrationState = topology_records.TableMigrationState;
 pub const TableIndexCatalog = topology_records.TableIndexCatalog;
 pub const RangeRecord = topology_records.RangeRecord;
+
+/// Canonical ordering for every complete table keyspace projection. Keeping
+/// this in the metadata domain lets backup admission, restore planning, and
+/// Raft apply enforce exactly the same bytewise routing contract.
+pub fn sortKeyspaceRanges(comptime Range: type, ranges: []Range) void {
+    std.mem.sort(Range, ranges, {}, struct {
+        fn lessThan(_: void, lhs: Range, rhs: Range) bool {
+            return std.mem.order(u8, lhs.start_key, rhs.start_key) == .lt;
+        }
+    }.lessThan);
+}
+
+/// Validate a sorted, gap-free, non-overlapping partition of the complete
+/// byte-string keyspace. The empty start and open final end are routing
+/// sentinels, not optional decoration: omitting either would publish a table
+/// for which some document keys have no owner.
+pub fn validateCompleteKeyspaceRanges(ranges: anytype) !void {
+    if (ranges.len == 0 or ranges[0].start_key.len != 0 or
+        ranges[ranges.len - 1].end_key != null)
+        return error.InvalidRangeTopology;
+
+    for (ranges, 0..) |range, index| {
+        if (range.end_key) |end_key| {
+            if (end_key.len == 0 or std.mem.order(u8, range.start_key, end_key) != .lt)
+                return error.InvalidRangeTopology;
+        } else if (index != ranges.len - 1) {
+            return error.InvalidRangeTopology;
+        }
+        if (index > 0) {
+            const previous_end = ranges[index - 1].end_key orelse
+                return error.InvalidRangeTopology;
+            if (!std.mem.eql(u8, previous_end, range.start_key))
+                return error.InvalidRangeTopology;
+        }
+    }
+}
+
+test "complete keyspace range validation requires both routing sentinels" {
+    const complete = [_]RangeRecord{
+        .{ .group_id = 7001, .table_id = 1, .start_key = "", .end_key = "m" },
+        .{ .group_id = 7002, .table_id = 1, .start_key = "m", .end_key = null },
+    };
+    try validateCompleteKeyspaceRanges(&complete);
+
+    const missing_leading = [_]RangeRecord{
+        .{ .group_id = 7001, .table_id = 1, .start_key = "a", .end_key = null },
+    };
+    try std.testing.expectError(
+        error.InvalidRangeTopology,
+        validateCompleteKeyspaceRanges(&missing_leading),
+    );
+
+    const missing_trailing = [_]RangeRecord{
+        .{ .group_id = 7001, .table_id = 1, .start_key = "", .end_key = "z" },
+    };
+    try std.testing.expectError(
+        error.InvalidRangeTopology,
+        validateCompleteKeyspaceRanges(&missing_trailing),
+    );
+}
 
 pub const RestoreCompletionFingerprint = topology_records.RestoreCompletionFingerprint;
 pub const empty_restore_completion_fingerprint =
@@ -261,30 +355,53 @@ pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
         );
 }
 
-/// Returns true when an existing topology is either the exact requested
-/// restore intent or a prefix left by an interrupted multi-record publish.
-pub fn restoreIntentTopologyCompatible(
-    alloc: std.mem.Allocator,
-    existing_table: TableRecord,
-    existing_ranges: []const RangeRecord,
-    expected_table: TableRecord,
-    expected_ranges: []const RangeRecord,
-) !bool {
-    if (!tableDefinitionsEqual(existing_table, expected_table)) return false;
+/// Restore publication is monotonic: immediately after the catalog publishes
+/// an active restore intent, a data node may complete it and clear the
+/// transient restore fields. Admission retries and post-commit verification
+/// must therefore accept either the exact published record or that one valid
+/// successor state. All topology and document-identity fields remain exact,
+/// and the completion fingerprint proves which restore cleared the intent.
+pub fn rangeMatchesRestorePublication(
+    projected: RangeRecord,
+    expected: RangeRecord,
+) bool {
+    if (rangeRecordsEqual(projected, expected)) return true;
 
-    var expected_by_group: std.AutoHashMapUnmanaged(u64, RangeRecord) = .empty;
-    defer expected_by_group.deinit(alloc);
-    try expected_by_group.ensureTotalCapacity(alloc, @intCast(expected_ranges.len));
-    for (expected_ranges) |expected_range| {
-        if (expected_by_group.contains(expected_range.group_id)) return false;
-        expected_by_group.putAssumeCapacity(expected_range.group_id, expected_range);
+    if (expected.restore_backup_id.len == 0 or
+        expected.restore_artifact_backup_id.len == 0 or
+        expected.restore_location.len == 0)
+    {
+        return false;
     }
-    for (existing_ranges) |existing_range| {
-        if (existing_range.table_id != existing_table.table_id) continue;
-        const expected_range = expected_by_group.get(existing_range.group_id) orelse return false;
-        if (!rangeRecordsEqual(existing_range, expected_range)) return false;
+    if (projected.restore_backup_id.len != 0 or
+        projected.restore_artifact_backup_id.len != 0 or
+        projected.restore_location.len != 0 or
+        projected.restore_snapshot_path.len != 0 or
+        projected.restore_connection.len != 0 or
+        projected.restore_artifact_size_bytes != 0 or
+        projected.restore_artifact_sha256.len != 0 or
+        projected.restore_native_manifest_size_bytes != 0 or
+        projected.restore_native_manifest_sha256.len != 0)
+    {
+        return false;
     }
-    return true;
+
+    return projected.group_id == expected.group_id and
+        projected.range_id == expected.range_id and
+        projected.table_id == expected.table_id and
+        std.mem.eql(u8, projected.start_key, expected.start_key) and
+        ((projected.end_key == null and expected.end_key == null) or
+            (projected.end_key != null and expected.end_key != null and
+                std.mem.eql(u8, projected.end_key.?, expected.end_key.?))) and
+        projected.doc_identity_shard_id == expected.doc_identity_shard_id and
+        projected.doc_identity_range_id == expected.doc_identity_range_id and
+        projected.split_attempt_epoch == expected.split_attempt_epoch and
+        rangeRestoreCompletionMatches(
+            projected,
+            expected.restore_backup_id,
+            expected.restore_artifact_backup_id,
+            expected.restore_location,
+        );
 }
 
 pub const node_lifecycle_active = "active";
@@ -669,6 +786,13 @@ pub fn voterSetFingerprint(node_ids: []const u64, required_node_id: ?u64) VoterS
 
 pub const StoreStatusReport = struct {
     store_id: u64,
+    /// Version of the volatile owner-activity projection carried by this
+    /// heartbeat. Zero means absent/legacy; version 2 is the current schema.
+    /// This is intentionally not copied into StoreRecord or Raft state.
+    embedding_activity_protocol_version: u16 = 0,
+    /// Monotonic volatile report order within `reporter_incarnation`. This is
+    /// independent from `status_generation` and never reaches StoreRecord.
+    embedding_activity_sequence: u64 = 0,
     /// Must match the incarnation established by store registration. Zero is
     /// reserved for rolling-upgrade compatibility with legacy reporters.
     reporter_incarnation: u64 = 0,
@@ -692,6 +816,43 @@ pub const StoreStatusReport = struct {
 /// never exist without the process incarnation that gives it meaning.
 pub fn reporterFenceValid(reporter_incarnation: u64, status_generation: u64) bool {
     return reporter_incarnation != 0 or status_generation == 0;
+}
+
+pub fn embeddingActivityProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
+    return (protocol_version == 0 or protocol_version == embedding_activity_protocol_version) and
+        (protocol_version == 0 or reporter_incarnation != 0);
+}
+
+/// Sequenced activity is all-or-nothing: legacy reports omit both fields,
+/// while the current protocol requires a process incarnation and report order.
+pub fn embeddingActivityReportValid(
+    reporter_incarnation: u64,
+    protocol_version: u16,
+    activity_sequence: u64,
+) bool {
+    if (!embeddingActivityProtocolValid(reporter_incarnation, protocol_version)) return false;
+    return if (protocol_version == 0)
+        activity_sequence == 0
+    else
+        activity_sequence != 0;
+}
+
+/// Activity observation validity is explicit per index. Legacy reports cannot
+/// smuggle volatile samples into the current cache, and current observations
+/// must carry both incarnation and sample ordering fences.
+pub fn embeddingActivitySamplesValid(
+    protocol_version: u16,
+    runtime_statuses: []const RuntimeGroupStatusReport,
+) bool {
+    for (runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (!index_status.embedding_activity_observed) continue;
+            if (protocol_version != embedding_activity_protocol_version or
+                index_status.embedding_activity.epoch == 0 or
+                index_status.embedding_activity.sample_sequence == 0) return false;
+        }
+    }
+    return true;
 }
 
 pub fn artifactSourcesProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
@@ -723,6 +884,28 @@ test "artifact source protocol support fails closed and includes custom placemen
     try std.testing.expect(storeServesTableData("hot"));
     try std.testing.expect(storeServesTableData("cold"));
     try std.testing.expect(!storeServesTableData("metadata"));
+}
+
+test "embedding activity protocol requires an incarnation fence" {
+    try std.testing.expect(embeddingActivityProtocolValid(0, 0));
+    try std.testing.expect(!embeddingActivityProtocolValid(0, embedding_activity_protocol_version));
+    try std.testing.expect(embeddingActivityProtocolValid(7, embedding_activity_protocol_version));
+    try std.testing.expect(!embeddingActivityProtocolValid(7, embedding_activity_protocol_version - 1));
+    try std.testing.expect(!embeddingActivityProtocolValid(7, embedding_activity_protocol_version + 1));
+    try std.testing.expect(embeddingActivityReportValid(0, 0, 0));
+    try std.testing.expect(!embeddingActivityReportValid(7, 0, 1));
+    try std.testing.expect(!embeddingActivityReportValid(7, embedding_activity_protocol_version, 0));
+    try std.testing.expect(embeddingActivityReportValid(7, embedding_activity_protocol_version, 1));
+
+    var indexes = [_]RuntimeIndexStatusReport{.{
+        .embedding_activity_observed = true,
+        .embedding_activity = .{ .epoch = 3, .sample_sequence = 4 },
+    }};
+    const groups = [_]RuntimeGroupStatusReport{.{ .indexes = indexes[0..] }};
+    try std.testing.expect(embeddingActivitySamplesValid(embedding_activity_protocol_version, &groups));
+    try std.testing.expect(!embeddingActivitySamplesValid(0, &groups));
+    indexes[0].embedding_activity.sample_sequence = 0;
+    try std.testing.expect(!embeddingActivitySamplesValid(embedding_activity_protocol_version, &groups));
 }
 
 pub const RuntimeEnrichmentStatusReport = struct {
@@ -787,6 +970,13 @@ pub const RuntimeGroupStatusReport = struct {
     topology_generation: u64 = 0,
     lsm_root_generation: u64 = 0,
     status_generation: u64 = 0,
+    /// Opaque monotonic watermark captured before the owner sampled this
+    /// group. It is ordered only within one reporter incarnation.
+    target_observation_revision: u64 = 0,
+    /// True only when this immutable owner observation includes the latest
+    /// accepted replay target for the group. Heartbeat/activity freshness is
+    /// intentionally independent from this convergence proof.
+    target_observation_complete: bool = true,
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
     disk_bytes_known: bool = false,
@@ -866,6 +1056,36 @@ pub const RuntimeDocSetPlanningStatusReport = struct {
     stale_identity_generation_rejection_count: u64 = 0,
 };
 
+pub const RuntimeEmbeddingActivityStatusReport = struct {
+    pub const Phase = enum {
+        idle,
+        preparing,
+        embedding,
+        publishing,
+        waiting_retry,
+    };
+
+    epoch: u64 = 0,
+    /// Monotonic sample order within `epoch`. Activity-only heartbeats reuse the
+    /// durable store generation and are ordered exclusively by this sequence.
+    sample_sequence: u64 = 0,
+    phase: Phase = .idle,
+    chunks_created: u64 = 0,
+    embedding_batches_completed: u64 = 0,
+    embeddings_computed: u64 = 0,
+    active_batch_size: u64 = 0,
+    last_progress_at_ms: u64 = 0,
+};
+
+/// Exact scheduler meaning for an incarnation-scoped lifecycle record. This
+/// travels with V15 repair state so readers never infer corruption from the
+/// implementation lane used to build a new index.
+pub const IndexLifecycleWorkClass = enum(u8) {
+    none = 0,
+    initial_build = 1,
+    repair = 2,
+};
+
 pub const RuntimeIndexStatusReport = struct {
     name: []const u8 = "",
     kind: []const u8 = "",
@@ -878,6 +1098,15 @@ pub const RuntimeIndexStatusReport = struct {
     edge_count: u64 = 0,
     node_count: u64 = 0,
     root_node: u64 = 0,
+    /// Exact physical artifact cardinality for the reported incarnation.
+    /// Missing proof is deliberately false so current readers fail closed.
+    publication_target_count: u64 = 0,
+    publication_target_ready: bool = false,
+    /// Exact owner-side proof that the current incarnation has an installed
+    /// snapshot which passes the same resident admission gate as search. This
+    /// is independent of cardinality: a published empty snapshot is ready.
+    /// Missing proof fails closed on mixed-version readers.
+    serving_snapshot_ready: bool = false,
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
@@ -890,13 +1119,46 @@ pub const RuntimeIndexStatusReport = struct {
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
+    /// True when the owner observed `embedding_activity` at a stable lifecycle
+    /// boundary. False means unavailable for this heartbeat, not idle.
+    embedding_activity_observed: bool = false,
+    embedding_activity: RuntimeEmbeddingActivityStatusReport = .{},
     source_replay: []RuntimeIndexSourceReplayStatusReport = &.{},
+    lifecycle_work_class: IndexLifecycleWorkClass = .none,
     repair_status: ?IndexRepairStatus = null,
     /// This proof is meaningful only while repair_status is non-null. It means
     /// the active generation is safe to query, not necessarily complete.
     /// Missing proof is deliberately false so mixed-version reports fail closed.
     repair_active_generation_serviceable: bool = false,
 };
+
+/// V15 is one atomic runtime-status profile. Keep profile selection next to the
+/// domain record so transport negotiation and durable encoding cannot evolve
+/// separate lists of current-only facts.
+pub fn runtimeIndexRequiresCurrentProfile(record: RuntimeIndexStatusReport) bool {
+    return record.publication_target_ready or
+        record.serving_snapshot_ready or
+        record.lifecycle_work_class != .none or
+        record.repair_status != null or
+        record.source_replay.len != 0;
+}
+
+pub fn storeRequiresCurrentRuntimeStatusProfile(record: StoreRecord) bool {
+    if (record.native_generation_restore_version != 0 or
+        record.artifact_sources_protocol_version != 0 or
+        record.reporter_incarnation != 0 or
+        record.status_generation != 0)
+    {
+        return true;
+    }
+    for (record.runtime_statuses) |runtime_status| {
+        if (!runtime_status.target_observation_complete) return true;
+        for (runtime_status.indexes) |index_status| {
+            if (runtimeIndexRequiresCurrentProfile(index_status)) return true;
+        }
+    }
+    return false;
+}
 
 pub const RuntimeIndexSourceReplayStatusReport = struct {
     artifact_name: []const u8 = "",
@@ -930,6 +1192,28 @@ pub const RestoreProgressRecord = struct {
     phase: []const u8 = "",
     last_error: []const u8 = "",
     updated_at_ms: u64 = 0,
+};
+
+/// Stable key for one node's durable restore-repair observation. Keeping the
+/// delete contract separate from the full record prevents stale callers from
+/// accidentally re-publishing artifact state while cleaning up completed
+/// restore intents.
+pub const RestoreProgressIdentity = struct {
+    table_id: u64,
+    node_id: u64,
+    group_id: u64,
+};
+
+/// Keep one reconciliation page comfortably below both the metadata request
+/// and Raft proposal byte ceilings while amortizing network and consensus
+/// overhead across a useful amount of work. The byte limit remains the final
+/// authority because diagnostic strings and storage paths are variable-sized.
+pub const max_restore_progress_sync_records: usize = 128;
+pub const max_restore_progress_sync_body_bytes: usize = 1024 * 1024;
+
+pub const RestoreProgressSync = struct {
+    upserts: []const RestoreProgressRecord = &.{},
+    removals: []const RestoreProgressIdentity = &.{},
 };
 
 pub const ReplicationSourceStatusRecord = struct {
@@ -2267,6 +2551,8 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .topology_generation = record.topology_generation,
         .lsm_root_generation = record.lsm_root_generation,
         .status_generation = record.status_generation,
+        .target_observation_revision = record.target_observation_revision,
+        .target_observation_complete = record.target_observation_complete,
         .doc_count = record.doc_count,
         .disk_bytes = record.disk_bytes,
         .disk_bytes_known = record.disk_bytes_known,
@@ -2343,6 +2629,9 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .edge_count = record.edge_count,
         .node_count = record.node_count,
         .root_node = record.root_node,
+        .publication_target_count = record.publication_target_count,
+        .publication_target_ready = record.publication_target_ready,
+        .serving_snapshot_ready = record.serving_snapshot_ready,
         .coverage_produced_count = record.coverage_produced_count,
         .coverage_skipped_count = record.coverage_skipped_count,
         .coverage_terminal_failed_count = record.coverage_terminal_failed_count,
@@ -2355,7 +2644,10 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .replay_applied_sequence = record.replay_applied_sequence,
         .replay_target_sequence = record.replay_target_sequence,
         .replay_catch_up_required = record.replay_catch_up_required,
+        .embedding_activity_observed = record.embedding_activity_observed,
+        .embedding_activity = record.embedding_activity,
         .source_replay = source_replay,
+        .lifecycle_work_class = record.lifecycle_work_class,
         .repair_status = record.repair_status,
         .repair_active_generation_serviceable = record.repair_active_generation_serviceable,
     };

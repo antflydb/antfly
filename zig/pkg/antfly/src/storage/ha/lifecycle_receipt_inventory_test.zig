@@ -279,6 +279,7 @@ fn fencedStore(alloc: std.mem.Allocator, root: []const u8) !fencing.Store {
         .promoted_node_id = "standby-a",
         .new_timeline_id = 5,
         .new_epoch = 7,
+        .generation = 1,
         .required_lsn = 51,
         .observed_lsn = 51,
         .reason = "automatic failover",

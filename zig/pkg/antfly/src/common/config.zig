@@ -41,6 +41,8 @@ pub const default_write_max_concurrent_requests: u32 = 16;
 pub const default_inference_max_concurrent_requests: u32 = 32;
 pub const default_mcp_max_tool_result_bytes: u32 = 96 * 1024;
 pub const minimum_mcp_max_tool_result_bytes: u32 = 512;
+pub const default_backup_operation_timeout_ms: u64 = 60 * 60 * 1_000;
+pub const max_backup_operation_timeout_ms: u64 = 24 * 60 * 60 * 1_000;
 pub const local_inference_connection_id = "local-inference";
 
 pub const DeploymentMode = enum {
@@ -73,6 +75,7 @@ pub const Config = struct {
     admission: AdmissionConfig = .{},
     graph_execution: graph_work_budget.Limits = .{},
     mcp: McpConfig = .{},
+    backup: BackupConfig = .{},
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
     transaction_sessions: TransactionSessionConfig = .{},
@@ -96,6 +99,12 @@ pub const Config = struct {
     pub const McpConfig = struct {
         /// Zero disables the serialized MCP tool-result compatibility guard.
         max_tool_result_bytes: u32 = default_mcp_max_tool_result_bytes,
+    };
+
+    pub const BackupConfig = struct {
+        /// End-to-end execution ceiling for one table or cluster backup. The
+        /// durable writer lease remains a separate cleanup safety envelope.
+        operation_timeout_ms: u64 = default_backup_operation_timeout_ms,
     };
 
     fn graphExecutionLimitsFromOpenApi(value: ?common_openapi.GraphExecutionConfig) !graph_work_budget.Limits {
@@ -687,6 +696,19 @@ pub const Config = struct {
                 return error.InvalidConfig;
             }
         }
+        var backup_operation_timeout_ms = default_backup_operation_timeout_ms;
+        if (root.get("backup")) |backup_value| {
+            try validateObjectMemberFields(root, "backup", &.{"operation_timeout_seconds"});
+            const backup_object = switch (backup_value) {
+                .object => |object| object,
+                else => return error.InvalidConfig,
+            };
+            const timeout_seconds = try optionalU64Field(backup_object, "operation_timeout_seconds") orelse
+                default_backup_operation_timeout_ms / 1_000;
+            if (timeout_seconds == 0 or timeout_seconds > max_backup_operation_timeout_ms / 1_000)
+                return error.InvalidConfig;
+            backup_operation_timeout_ms = timeout_seconds * 1_000;
+        }
 
         var validated = std.json.parseFromValue(common_openapi.Config, alloc, parsed_tree.value, .{
             .allocate = .alloc_always,
@@ -777,6 +799,7 @@ pub const Config = struct {
             },
             .graph_execution = try graphExecutionLimitsFromOpenApi(validated.value.graph_execution),
             .mcp = .{ .max_tool_result_bytes = mcp_max_tool_result_bytes },
+            .backup = .{ .operation_timeout_ms = backup_operation_timeout_ms },
             .metadata = try parseMetadataConfig(
                 alloc,
                 root,
@@ -3182,6 +3205,7 @@ test "common config parses minimal config with admission defaults" {
     try std.testing.expectEqual(graph_work_budget.default_max_retained_state_bytes, cfg.graph_execution.max_retained_state_bytes);
     try std.testing.expectEqual(graph_work_budget.default_max_distinct_identities, cfg.graph_execution.max_distinct_identities);
     try std.testing.expectEqual(default_mcp_max_tool_result_bytes, cfg.mcp.max_tool_result_bytes);
+    try std.testing.expectEqual(default_backup_operation_timeout_ms, cfg.backup.operation_timeout_ms);
     try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
     try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
     try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
@@ -3195,6 +3219,29 @@ test "common config parses minimal config with admission defaults" {
     try std.testing.expectEqual(@as(usize, 512), cfg.inference.prompt_cache.max_bytes_mb);
     try std.testing.expectEqual(@as(usize, 64), cfg.inference.prompt_cache.min_tokens);
     try std.testing.expectEqual(@as(u64, 300_000), cfg.inference.prompt_cache.ttl_ms);
+}
+
+test "common config validates backup operation timeout" {
+    const alloc = std.testing.allocator;
+    var cfg = try Config.parseFromSlice(
+        alloc,
+        "{\"backup\":{\"operation_timeout_seconds\":7200}}",
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u64, 7_200_000), cfg.backup.operation_timeout_ms);
+
+    try std.testing.expectError(
+        error.InvalidConfig,
+        Config.parseFromSlice(alloc, "{\"backup\":{\"operation_timeout_seconds\":0}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidConfig,
+        Config.parseFromSlice(alloc, "{\"backup\":{\"operation_timeout_seconds\":86401}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidConfig,
+        Config.parseFromSlice(alloc, "{\"backup\":{\"operation_timeout_seconds\":3600,\"unknown\":true}}"),
+    );
 }
 
 test "common config parses operator-owned graph execution ceilings" {

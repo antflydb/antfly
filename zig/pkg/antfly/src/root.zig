@@ -160,6 +160,9 @@ pub const persistent = @import("storage/persistent.zig");
 pub const docstore = @import("storage/docstore.zig");
 pub const resource_manager = @import("storage/resource_manager.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
+pub const backup_bundle = @import("storage/backup_bundle.zig");
+pub const backup_bundle_io = @import("storage/backup_bundle_io.zig");
+pub const backup_repository = @import("storage/backup_repository.zig");
 pub const portable_backup = @import("storage/portable_backup.zig");
 pub const internal_keys = @import("storage/internal_keys.zig");
 pub const shard = @import("storage/shard.zig");
@@ -271,6 +274,7 @@ test {
     _ = raft;
     _ = @import("raft/reconciler.zig");
     _ = extensions;
+    _ = @import("extensions/lifecycle.zig");
     _ = metadata;
     _ = metadata_api;
     _ = metadata_admin;
@@ -313,6 +317,9 @@ test {
     _ = persistent;
     _ = docstore;
     _ = backup_codec;
+    _ = backup_bundle;
+    _ = backup_bundle_io;
+    _ = backup_repository;
     _ = portable_backup;
     _ = internal_keys;
     _ = shard;

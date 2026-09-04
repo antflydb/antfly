@@ -80,6 +80,14 @@ pub const AppliedBatch = struct {
     progress: standby_mod.Progress,
 };
 
+pub const ApplyFetchedOptions = struct {
+    standby_apply: standby_mod.ApplyOptions = .{},
+    /// When durable receive progress is already ahead of apply progress, drain
+    /// that debt before accepting another fetched batch. The caller can safely
+    /// refetch the ignored frames from the unchanged receive LSN.
+    drain_pending_before_receive: bool = false,
+};
+
 pub const AuthOptions = struct {
     bearer_token: ?[]const u8 = null,
 };
@@ -239,6 +247,17 @@ pub const Client = struct {
         apply_ctx: *anyopaque,
         apply_fn: standby_mod.ApplyFn,
     ) !AppliedBatch {
+        return try self.applyFetchedWithOptions(batch, standby, apply_ctx, apply_fn, .{});
+    }
+
+    pub fn applyFetchedWithOptions(
+        self: *Client,
+        batch: *const FetchedBatch,
+        standby: *standby_mod.Standby,
+        apply_ctx: *anyopaque,
+        apply_fn: standby_mod.ApplyFn,
+        options: ApplyFetchedOptions,
+    ) !AppliedBatch {
         _ = self;
         try standby.lockExclusive();
         defer standby.unlockExclusive();
@@ -249,13 +268,21 @@ pub const Client = struct {
             return error.HAStandbyStateChanged;
         }
 
-        for (batch.frames) |frame| {
-            _ = try standby.receiveLocked(frame.record);
+        const accept_fetched = !options.drain_pending_before_receive or
+            before.progress.applied_lsn == before.progress.received_lsn;
+        if (accept_fetched) {
+            for (batch.frames) |frame| {
+                _ = try standby.receiveLocked(frame.record);
+            }
         }
-        const applied_count = try standby.applyAvailableLocked(apply_ctx, apply_fn);
+        const applied_count = try standby.applyAvailableLockedWithOptions(
+            apply_ctx,
+            apply_fn,
+            options.standby_apply,
+        );
         const after = standby.snapshotLocked();
         return .{
-            .received_count = batch.frames.len,
+            .received_count = if (accept_fetched) batch.frames.len else 0,
             .applied_count = applied_count,
             .identity = after.identity,
             .progress = after.progress,
@@ -709,7 +736,16 @@ fn mapStatus(status: u16, body: []const u8) !void {
         return error.InternalReplicationEndpointNotFound;
     }
     if (status == 405) return error.UnsupportedOperation;
-    if (status == 409) return error.InternalReplicationConflict;
+    if (status == 409) {
+        const reason = std.mem.trim(u8, body, " \t\r\n");
+        if (std.mem.eql(u8, reason, "PrimaryUnavailable") or std.mem.eql(u8, reason, "primary unavailable")) return error.PrimaryUnavailable;
+        if (std.mem.eql(u8, reason, "SlotAlreadyExists")) return error.SlotAlreadyExists;
+        if (std.mem.eql(u8, reason, "SlotSeeding")) return error.SlotSeeding;
+        if (std.mem.eql(u8, reason, "SlotInactive")) return error.SlotInactive;
+        if (std.mem.eql(u8, reason, "SlotRequiresReseed")) return error.SlotRequiresReseed;
+        if (std.mem.eql(u8, reason, "WalNoLongerRetained")) return error.WalNoLongerRetained;
+        return error.InternalReplicationConflict;
+    }
     if (status == 503) return error.InternalReplicationEndpointNotReady;
     return error.UnexpectedHttpStatus;
 }
@@ -717,6 +753,13 @@ fn mapStatus(status: u16, body: []const u8) !void {
 test "http replication status distinguishes missing slots from missing routes" {
     try std.testing.expectError(error.SlotNotFound, mapStatus(404, "SlotNotFound"));
     try std.testing.expectError(error.InternalReplicationEndpointNotFound, mapStatus(404, "not found"));
+}
+
+test "http replication status preserves exact conflict reason" {
+    try std.testing.expectError(error.WalNoLongerRetained, mapStatus(409, "WalNoLongerRetained\n"));
+    try std.testing.expectError(error.SlotInactive, mapStatus(409, "SlotInactive"));
+    try std.testing.expectError(error.PrimaryUnavailable, mapStatus(409, "primary unavailable"));
+    try std.testing.expectError(error.InternalReplicationConflict, mapStatus(409, "future-conflict"));
 }
 
 const TestPaths = struct {
@@ -1252,6 +1295,50 @@ test "storage.ha http replication client pulls applies and acknowledges standby 
         .standby_names = &names,
     });
     try std.testing.expectEqual(primary_mod.DurabilityStatus.satisfied, decision.status);
+}
+
+test "storage.ha http replication client drains bounded apply debt before receiving more" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "bounded-apply-debt");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var server = http_internal.Server.init(alloc, &primary);
+    var client = Client.init(alloc, server.executor());
+    try client.createReplicationSlot("http://primary.internal.test", "standby-a", 0);
+    _ = try primary.append(.{ .payload = "one" });
+    _ = try primary.append(.{ .payload = "two" });
+    _ = try primary.append(.{ .payload = "three" });
+
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    var first = try client.fetchAvailable("http://primary.internal.test", "standby-a", identity, 1, .{});
+    defer first.deinit();
+    const first_apply = try client.applyFetchedWithOptions(&first, &standby, &capture, ApplyCapture.apply, .{
+        .standby_apply = .{ .max_records = 1 },
+        .drain_pending_before_receive = true,
+    });
+    try std.testing.expectEqual(@as(usize, 3), first_apply.received_count);
+    try std.testing.expectEqual(@as(usize, 1), first_apply.applied_count);
+    try std.testing.expectEqual(@as(u64, 3), first_apply.progress.received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), first_apply.progress.applied_lsn);
+
+    _ = try primary.append(.{ .payload = "four" });
+    var second = try client.fetchAvailable("http://primary.internal.test", "standby-a", identity, 4, .{});
+    defer second.deinit();
+    const debt_apply = try client.applyFetchedWithOptions(&second, &standby, &capture, ApplyCapture.apply, .{
+        .standby_apply = .{ .max_records = 1 },
+        .drain_pending_before_receive = true,
+    });
+    try std.testing.expectEqual(@as(usize, 0), debt_apply.received_count);
+    try std.testing.expectEqual(@as(usize, 1), debt_apply.applied_count);
+    try std.testing.expectEqual(@as(u64, 3), debt_apply.progress.received_lsn);
+    try std.testing.expectEqual(@as(u64, 2), debt_apply.progress.applied_lsn);
 }
 
 test "storage.ha http replication client replicates mixed tables for whole instance identity" {

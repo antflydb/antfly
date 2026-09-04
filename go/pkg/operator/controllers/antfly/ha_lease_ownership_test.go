@@ -14,8 +14,74 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 )
+
+func TestLeaseRenewalClockIgnoresStatusOnlyEvents(t *testing.T) {
+	predicate := haLeaseRenewalEventPredicate()
+	oldCluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	oldCluster.Generation = 7
+	updatedStatus := oldCluster.DeepCopy()
+	updatedStatus.Status.HAStatus = caughtUpHAStatus()
+	if predicate.Update(event.UpdateEvent{ObjectOld: oldCluster, ObjectNew: updatedStatus}) {
+		t.Fatal("status-only update bypassed the dedicated renewal cadence")
+	}
+
+	updatedSpec := updatedStatus.DeepCopy()
+	updatedSpec.Generation++
+	if !predicate.Update(event.UpdateEvent{ObjectOld: updatedStatus, ObjectNew: updatedSpec}) {
+		t.Fatal("HA spec generation change did not wake Lease renewal immediately")
+	}
+}
+
+func TestLeaseRenewalControllerDoesNotWaitForManagerLeadership(t *testing.T) {
+	options := haLeaseRenewalControllerOptions()
+	if options.NeedLeaderElection == nil || *options.NeedLeaderElection {
+		t.Fatal("data-plane Lease renewal must remain live during operator leader election")
+	}
+	if options.MaxConcurrentReconciles != 16 {
+		t.Fatalf("MaxConcurrentReconciles = %d, want 16", options.MaxConcurrentReconciles)
+	}
+}
+
+func TestFullReconcileIgnoresStatusFeedbackButObservesDesiredState(t *testing.T) {
+	predicate := antflyClusterDesiredStateEventPredicate()
+	oldCluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	oldCluster.Generation = 7
+	updatedStatus := oldCluster.DeepCopy()
+	updatedStatus.Status.HAStatus = caughtUpHAStatus()
+	if predicate.Update(event.UpdateEvent{ObjectOld: oldCluster, ObjectNew: updatedStatus}) {
+		t.Fatal("operator-owned status update re-enqueued the full reconciler")
+	}
+
+	cases := map[string]func(*antflyv1.AntflyCluster){
+		"spec generation": func(cluster *antflyv1.AntflyCluster) { cluster.Generation++ },
+		"label": func(cluster *antflyv1.AntflyCluster) {
+			cluster.Labels = map[string]string{"cloud.antfly.io/instance-id": "instance-a"}
+		},
+		"annotation": func(cluster *antflyv1.AntflyCluster) {
+			cluster.Annotations = map[string]string{"cloud.antfly.io/ha-topology-generation": "2"}
+		},
+		"finalizer": func(cluster *antflyv1.AntflyCluster) {
+			cluster.Finalizers = []string{"storage.antfly.io/seed-retention"}
+		},
+		"deletion": func(cluster *antflyv1.AntflyCluster) {
+			now := metav1.Now()
+			cluster.DeletionTimestamp = &now
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			updated := updatedStatus.DeepCopy()
+			mutate(updated)
+			if !predicate.Update(event.UpdateEvent{ObjectOld: updatedStatus, ObjectNew: updated}) {
+				t.Fatal("desired-state change did not wake full reconciliation")
+			}
+		})
+	}
+}
 
 func TestReconcileHAFencingLeaseRejectsStaleControllersAcrossSuccessiveTransfers(t *testing.T) {
 	now := time.Unix(1_750_000_000, 0)
@@ -37,11 +103,21 @@ func TestReconcileHAFencingLeaseRejectsStaleControllersAcrossSuccessiveTransfers
 	assertLeaseHolderAndTransition(t, reconciler, "standby-a", 2)
 
 	// A may keep B alive only through the exact committed handoff bridge.
+	// The bridge must survive B's transient inactive proof while Colony is
+	// publishing B's successor CR; otherwise the Lease expires during an
+	// otherwise successful failover and B self-fences.
+	clusterA.Status.HAStatus.PrimaryAdminLastError = "HA Lease watchdog is not active for node standby-a"
+	beforeHandoff := getOwnershipTestLease(t, reconciler).Spec.RenewTime.DeepCopy()
 	now = now.Add(time.Second)
 	if err := reconciler.reconcileHAFencingLease(context.Background(), clusterA); err != nil {
 		t.Fatalf("A handoff renewal for B: %v", err)
 	}
 	assertLeaseHolderAndTransition(t, reconciler, "standby-a", 2)
+	afterHandoff := getOwnershipTestLease(t, reconciler)
+	if afterHandoff.Spec.RenewTime == nil || !afterHandoff.Spec.RenewTime.Time.Equal(now) ||
+		afterHandoff.Spec.RenewTime.Equal(beforeHandoff) {
+		t.Fatalf("exact inactive-successor handoff did not advance renewTime: before=%s after=%s", beforeHandoff, afterHandoff.Spec.RenewTime)
+	}
 
 	clusterB := clusterA.DeepCopy()
 	clusterB.UID = types.UID("cluster-b-uid")
@@ -150,6 +226,385 @@ func TestDedicatedLeaseRenewalAdvancesUnchangedHolderFromFreshRuntimeProof(t *te
 	if renewed.Spec.HolderIdentity == nil || *renewed.Spec.HolderIdentity != "primary-a" ||
 		renewed.Spec.LeaseTransitions == nil || *renewed.Spec.LeaseTransitions != 1 {
 		t.Fatalf("dedicated renewal changed holder authority: %#v", renewed.Spec)
+	}
+}
+
+func TestDedicatedLeaseRenewalClosesExactPrimaryRestartBootstrap(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	proof := candidateLeaseProof(now, "primary-a", "primary-a", 1)
+	proof.AuthorityGranted = true
+	proof.AuthorityRemainingMS = 8_000
+	cluster.Status.HAStatus.PrimaryWatchdogProof = proof
+	leaseRenewedAt := now.Add(-time.Second)
+	lease := haFenceLease(cluster, leaseRenewedAt, 10, 1, "primary-a")
+	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = proof.ProcessBootID
+	receipt := haFencingLeaseBootstrapReceipt("primary-a", 1, proof.ProcessBootID)
+	lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] = receipt
+	reconciler := testHAReconciler(t, cluster, lease, candidateLeasePod(now, "primary-a-pod-uid"))
+	reconciler.Now = func() time.Time { return now }
+
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("dedicated renewal with pending bootstrap receipt: %v", err)
+	}
+	observed := getOwnershipTestLease(t, reconciler)
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(now) {
+		t.Fatalf("dedicated renewal did not close the exact restart bootstrap: %#v", observed.Spec.RenewTime)
+	}
+	if observed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != "" ||
+		observed.Annotations[haFencingLeaseAnnotationActivationReceipt] != "" {
+		t.Fatalf("dedicated renewal retained completed bootstrap receipts: %#v", observed.Annotations)
+	}
+}
+
+func TestDedicatedLeaseRenewalActivatesBoundProcessExactlyOnce(t *testing.T) {
+	boundAt := time.Now().UTC().Truncate(time.Microsecond)
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	proof := candidateLeaseProof(boundAt.Add(time.Second), "primary-a", "primary-a", 1)
+	cluster.Status.HAStatus.PrimaryWatchdogProof = proof
+	lease := haFenceLease(cluster, boundAt, 10, 1, "primary-a")
+	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = proof.ProcessBootID
+	receipt := haFencingLeaseBootstrapReceipt("primary-a", 1, proof.ProcessBootID)
+	lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] = receipt
+	reconciler := testHAReconciler(t, cluster, lease, candidateLeasePod(boundAt, "primary-a-pod-uid"))
+	now := boundAt.Add(2 * time.Second)
+	reconciler.Now = func() time.Time { return now }
+
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("activate exact bound process: %v", err)
+	}
+	activated := getOwnershipTestLease(t, reconciler)
+	if activated.Spec.RenewTime == nil || !activated.Spec.RenewTime.Time.Equal(now) ||
+		activated.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != receipt ||
+		activated.Annotations[haFencingLeaseAnnotationActivationReceipt] != receipt {
+		t.Fatalf("bound process did not receive one durable activation renewal: %#v", activated)
+	}
+	if activated.Spec.HolderIdentity == nil || *activated.Spec.HolderIdentity != "primary-a" ||
+		activated.Spec.LeaseTransitions == nil || *activated.Spec.LeaseTransitions != 1 {
+		t.Fatalf("activation renewal changed Lease authority: %#v", activated.Spec)
+	}
+
+	// A process that remains pending cannot turn the activation exception into
+	// an ordinary renewal loop.
+	now = now.Add(time.Second)
+	proof.ObservedAt = metav1.NewTime(now)
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("repeat pending activation: %v", err)
+	}
+	repeated := getOwnershipTestLease(t, reconciler)
+	if !repeated.Spec.RenewTime.Equal(activated.Spec.RenewTime) {
+		t.Fatalf("pending process renewed more than once: first=%s repeat=%s", activated.Spec.RenewTime, repeated.Spec.RenewTime)
+	}
+
+	// Only a fresh full-authority proof after the activation boundary consumes
+	// both receipts and resumes normal renewal.
+	now = now.Add(time.Second)
+	proof.AuthorityGranted = true
+	proof.AuthorityRemainingMS = 8_000
+	proof.ObservedAt = metav1.NewTime(now)
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("close activated process bootstrap: %v", err)
+	}
+	authorized := getOwnershipTestLease(t, reconciler)
+	if authorized.Spec.RenewTime == nil || !authorized.Spec.RenewTime.Time.Equal(now) ||
+		authorized.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != "" ||
+		authorized.Annotations[haFencingLeaseAnnotationActivationReceipt] != "" {
+		t.Fatalf("authorized process did not close activation receipts: %#v", authorized)
+	}
+}
+
+func TestDedicatedLeaseRenewalClosesExactSuccessorHandoff(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.UID = types.UID("successor-cluster-uid")
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	cluster.Spec.HighAvailability.Identity.TimelineID = 2
+	cluster.Spec.HighAvailability.Identity.Epoch = 2
+	cluster.Spec.HighAvailability.Runtime.NodeID = "standby-a"
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	proof := candidateLeaseProof(now, "standby-a", "standby-a", 2)
+	proof.AuthorityGranted = true
+	proof.AuthorityRemainingMS = 8_000
+	proof.ProcessBootID = strings.Repeat("b", 64)
+	cluster.Status.HAStatus.PrimaryWatchdogProof = proof
+	lease := haFenceLease(cluster, now.Add(-2*time.Second), 30, 2, "standby-a")
+	lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
+	lease.Annotations[haFencingLeaseAnnotationFormerHolder] = "primary-a"
+	lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = "former-cluster-uid"
+	lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = "2"
+	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = proof.ProcessBootID
+	lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] =
+		haFencingLeaseBootstrapReceipt("standby-a", 2, proof.ProcessBootID)
+	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "11"
+	reconciler := testHAReconciler(t, cluster, lease, candidateLeasePod(now, "standby-a-pod-uid"))
+	reconciler.Now = func() time.Time { return now }
+
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("dedicated successor takeover: %v", err)
+	}
+	observed := getOwnershipTestLease(t, reconciler)
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(now) {
+		t.Fatalf("successor takeover did not renew Lease: %#v", observed.Spec.RenewTime)
+	}
+	for _, key := range []string{
+		haFencingLeaseAnnotationBootstrapReceipt,
+		haFencingLeaseAnnotationTransferCommitted,
+		haFencingLeaseAnnotationFormerHolder,
+		haFencingLeaseAnnotationTransferOriginUID,
+		haFencingLeaseAnnotationCommittedTransition,
+	} {
+		if observed.Annotations[key] != "" {
+			t.Fatalf("successor takeover retained %s=%q", key, observed.Annotations[key])
+		}
+	}
+	if observed.Spec.HolderIdentity == nil || *observed.Spec.HolderIdentity != "standby-a" ||
+		observed.Spec.LeaseTransitions == nil || *observed.Spec.LeaseTransitions != 2 {
+		t.Fatalf("successor takeover changed authority: %#v", observed.Spec)
+	}
+	if observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "12" {
+		t.Fatalf("successor takeover did not advance the monotonic runtime boundary: %#v", observed.Annotations)
+	}
+}
+
+func TestDedicatedLeaseRenewalRejectsInexactSuccessorHandoff(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		mutate func(*antflyv1.AntflyCluster, *coordinationv1.Lease)
+	}{
+		{
+			name: "same controller UID",
+			mutate: func(cluster *antflyv1.AntflyCluster, lease *coordinationv1.Lease) {
+				lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = string(cluster.UID)
+			},
+		},
+		{
+			name: "mismatched process receipt",
+			mutate: func(_ *antflyv1.AntflyCluster, lease *coordinationv1.Lease) {
+				lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] =
+					haFencingLeaseBootstrapReceipt("standby-a", 2, strings.Repeat("c", 64))
+			},
+		},
+		{
+			name: "mismatched child identity",
+			mutate: func(_ *antflyv1.AntflyCluster, lease *coordinationv1.Lease) {
+				lease.Annotations[haFencingLeaseAnnotationEpoch] = "3"
+			},
+		},
+		{
+			name: "inactive proof",
+			mutate: func(cluster *antflyv1.AntflyCluster, _ *coordinationv1.Lease) {
+				cluster.Status.HAStatus.PrimaryWatchdogProof.Active = false
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+			cluster.UID = types.UID("successor-cluster-uid")
+			cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+			cluster.Spec.HighAvailability.Identity.TimelineID = 2
+			cluster.Spec.HighAvailability.Identity.Epoch = 2
+			cluster.Spec.HighAvailability.Runtime.NodeID = "standby-a"
+			cluster.Status.HAStatus = caughtUpHAStatus()
+			proof := candidateLeaseProof(now, "standby-a", "standby-a", 2)
+			proof.AuthorityGranted = true
+			proof.AuthorityRemainingMS = 8_000
+			proof.ProcessBootID = strings.Repeat("b", 64)
+			cluster.Status.HAStatus.PrimaryWatchdogProof = proof
+			leaseRenewedAt := now.Add(-2 * time.Second)
+			lease := haFenceLease(cluster, leaseRenewedAt, 30, 2, "standby-a")
+			lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
+			lease.Annotations[haFencingLeaseAnnotationFormerHolder] = "primary-a"
+			lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = "former-cluster-uid"
+			lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = "2"
+			lease.Annotations[haFencingLeaseAnnotationProcessBootID] = proof.ProcessBootID
+			lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] =
+				haFencingLeaseBootstrapReceipt("standby-a", 2, proof.ProcessBootID)
+			tt.mutate(cluster, lease)
+			reconciler := testHAReconciler(t, cluster, lease, candidateLeasePod(now, "standby-a-pod-uid"))
+			reconciler.Now = func() time.Time { return now }
+
+			if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+				t.Fatalf("inexact successor handoff: %v", err)
+			}
+			observed := getOwnershipTestLease(t, reconciler)
+			if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(leaseRenewedAt) {
+				t.Fatalf("inexact successor handoff renewed Lease: %#v", observed.Spec.RenewTime)
+			}
+			if observed.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" {
+				t.Fatal("inexact successor handoff consumed transfer authority")
+			}
+		})
+	}
+}
+
+func TestDedicatedLeaseRenewalAdvancesOnlyExactCommittedHandoff(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		receipt     string
+		activated   bool
+		wantRenewed bool
+	}{
+		{name: "before successor process binding", wantRenewed: true},
+		{
+			name: "exact bound successor process",
+			receipt: haFencingLeaseBootstrapReceipt(
+				"standby-a", 2, strings.Repeat("b", 64),
+			),
+			wantRenewed: true,
+		},
+		{
+			name: "mismatched bound successor process",
+			receipt: haFencingLeaseBootstrapReceipt(
+				"standby-a", 2, strings.Repeat("c", 64),
+			),
+			wantRenewed: false,
+		},
+		{
+			name: "successor spent one-shot activation",
+			receipt: haFencingLeaseBootstrapReceipt(
+				"standby-a", 2, strings.Repeat("b", 64),
+			),
+			activated:   true,
+			wantRenewed: false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+			cluster.Status.HAStatus = caughtUpHAStatus()
+			leaseRenewedAt := now.Add(-time.Second)
+			lease := haFenceLease(cluster, leaseRenewedAt, 30, 2, "standby-a")
+			lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
+			lease.Annotations[haFencingLeaseAnnotationFormerHolder] = "primary-a"
+			lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = string(cluster.UID)
+			lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = "2"
+			lease.Annotations[haFencingLeaseAnnotationProcessBootID] = strings.Repeat("b", 64)
+			if tt.receipt != "" {
+				lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] = tt.receipt
+			}
+			if tt.activated {
+				lease.Annotations[haFencingLeaseAnnotationActivationReceipt] = tt.receipt
+			}
+			reconciler := testHAReconciler(t, cluster, lease)
+			reconciler.Now = func() time.Time { return now }
+
+			if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+				t.Fatalf("dedicated committed-handoff renewal: %v", err)
+			}
+			observed := getOwnershipTestLease(t, reconciler)
+			wantRenewTime := leaseRenewedAt
+			if tt.wantRenewed {
+				wantRenewTime = now
+			}
+			if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(wantRenewTime) {
+				t.Fatalf("renewTime = %#v, want %s", observed.Spec.RenewTime, wantRenewTime)
+			}
+			if observed.Spec.HolderIdentity == nil || *observed.Spec.HolderIdentity != "standby-a" ||
+				observed.Spec.LeaseTransitions == nil || *observed.Spec.LeaseTransitions != 2 ||
+				observed.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" ||
+				observed.Annotations[haFencingLeaseAnnotationProcessBootID] != strings.Repeat("b", 64) {
+				t.Fatalf("dedicated handoff renewal mutated authority: %#v", observed)
+			}
+		})
+	}
+}
+
+func TestDedicatedLeaseRenewalKeepsCommittedHandoffAfterFormerControllerDemotion(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Spec.HighAvailability.Admin.ExecutePlannedActions = false
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	cluster.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRoleStandby
+	leaseRenewedAt := now.Add(-time.Second)
+	lease := haFenceLease(cluster, leaseRenewedAt, 30, 2, "standby-a")
+	lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
+	lease.Annotations[haFencingLeaseAnnotationFormerHolder] = "primary-a"
+	lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = string(cluster.UID)
+	lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = "2"
+	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = strings.Repeat("b", 64)
+	lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] =
+		haFencingLeaseBootstrapReceipt("standby-a", 2, strings.Repeat("b", 64))
+	reconciler := testHAReconciler(t, cluster, lease)
+	reconciler.Now = func() time.Time { return now }
+
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("demoted former-controller handoff renewal: %v", err)
+	}
+	observed := getOwnershipTestLease(t, reconciler)
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(now) {
+		t.Fatalf("topology adoption stopped exact handoff renewal: %#v", observed.Spec.RenewTime)
+	}
+	if observed.Spec.HolderIdentity == nil || *observed.Spec.HolderIdentity != "standby-a" ||
+		observed.Spec.LeaseTransitions == nil || *observed.Spec.LeaseTransitions != 2 ||
+		observed.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" {
+		t.Fatalf("demoted former-controller renewal mutated authority: %#v", observed)
+	}
+}
+
+func TestDedicatedLeaseRenewalRejectsDemotedControllerWithoutCommittedHandoff(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Spec.HighAvailability.Admin.ExecutePlannedActions = false
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	cluster.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRoleStandby
+	leaseRenewedAt := now.Add(-time.Second)
+	lease := haFenceLease(cluster, leaseRenewedAt, 30, 1, "primary-a")
+	reconciler := testHAReconciler(t, cluster, lease)
+	reconciler.Now = func() time.Time { return now }
+
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("disabled ordinary renewal: %v", err)
+	}
+	observed := getOwnershipTestLease(t, reconciler)
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(leaseRenewedAt) {
+		t.Fatalf("demoted controller renewed without a committed handoff: %#v", observed.Spec.RenewTime)
+	}
+}
+
+func TestLeaseRenewalControllerKeepsCommittedHandoffWhenProofEndpointIsUnavailable(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
+		<-req.Context().Done()
+	}))
+	defer server.Close()
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Spec.HighAvailability.Admin.PrimaryURL = server.URL
+	cluster.Spec.HighAvailability.Admin.PrimaryActionURL = server.URL
+	lease := haFenceLease(cluster, now.Add(-time.Second), 30, 2, "standby-a")
+	lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
+	lease.Annotations[haFencingLeaseAnnotationFormerHolder] = "primary-a"
+	lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = string(cluster.UID)
+	lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = "2"
+	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = strings.Repeat("b", 64)
+	lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] =
+		haFencingLeaseBootstrapReceipt("standby-a", 2, strings.Repeat("b", 64))
+	parent := testHAReconciler(t, cluster, lease)
+	parent.Now = func() time.Time { return now }
+	reconciler := &haLeaseRenewalReconciler{parent: parent}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace},
+	})
+	if err != nil {
+		t.Fatalf("periodic committed-handoff renewal: %v", err)
+	}
+	if result.RequeueAfter != haLeaseRenewalInterval {
+		t.Fatalf("requeueAfter = %s, want %s", result.RequeueAfter, haLeaseRenewalInterval)
+	}
+	observed := getOwnershipTestLease(t, parent)
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(now) {
+		t.Fatalf("proof outage prevented exact handoff renewal: %#v", observed)
+	}
+	if observed.Spec.HolderIdentity == nil || *observed.Spec.HolderIdentity != "standby-a" ||
+		observed.Spec.LeaseTransitions == nil || *observed.Spec.LeaseTransitions != 2 ||
+		observed.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" {
+		t.Fatalf("periodic handoff renewal mutated authority: %#v", observed)
 	}
 }
 

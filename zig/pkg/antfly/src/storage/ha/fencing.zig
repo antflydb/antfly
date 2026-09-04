@@ -71,6 +71,9 @@ pub const FenceRequest = struct {
     promoted_node_id: []const u8,
     new_timeline_id: u64,
     new_epoch: u64,
+    /// Exact external fencing-authority generation. For Kubernetes Lease
+    /// fencing this is spec.leaseTransitions, not a node-local counter.
+    generation: u64,
     required_lsn: u64,
     observed_lsn: u64,
     force: bool = false,
@@ -194,8 +197,10 @@ pub const Store = struct {
             }
         }
 
-        const generation = if (self.current_receipt) |held| held.receipt.generation + 1 else 1;
-        const token = try tokenFor(self.alloc, request, generation);
+        if (self.current_receipt) |held| {
+            if (request.generation <= held.receipt.generation) return error.NonMonotonicFenceGeneration;
+        }
+        const token = try tokenFor(self.alloc, request, request.generation);
         defer self.alloc.free(token);
         const receipt = Receipt{
             .identity = .{
@@ -213,7 +218,7 @@ pub const Store = struct {
             .new_epoch = request.new_epoch,
             .required_lsn = request.required_lsn,
             .observed_lsn = request.observed_lsn,
-            .generation = generation,
+            .generation = request.generation,
             .forced = request.force,
             .token = token,
             .reason = request.reason,
@@ -275,6 +280,7 @@ fn validateFenceRequest(request: FenceRequest) !void {
     if (std.mem.eql(u8, request.old_primary_id, request.promoted_node_id)) return error.InvalidPromotedNodeId;
     if (request.new_timeline_id <= request.identity.timeline_id) return error.InvalidTimelineSwitch;
     if (request.new_epoch <= request.identity.epoch) return error.InvalidTimelineSwitch;
+    if (request.generation == 0) return error.NonMonotonicFenceGeneration;
     if (request.required_lsn == 0) return error.InvalidFenceLsn;
     if (request.old_primary_id.len > std.math.maxInt(u32) or
         request.promoted_node_id.len > std.math.maxInt(u32) or
@@ -321,6 +327,7 @@ fn sameFence(receipt: Receipt, request: FenceRequest) bool {
         receipt.parent_epoch == request.identity.epoch and
         receipt.new_timeline_id == request.new_timeline_id and
         receipt.new_epoch == request.new_epoch and
+        receipt.generation == request.generation and
         receipt.required_lsn == request.required_lsn and
         receipt.observed_lsn == request.observed_lsn and
         receipt.forced == request.force and
@@ -613,6 +620,7 @@ fn baseRequest() FenceRequest {
         .promoted_node_id = "standby-b",
         .new_timeline_id = 2,
         .new_epoch = 2,
+        .generation = 7,
         .required_lsn = 10,
         .observed_lsn = 10,
         .reason = "manual failover",
@@ -629,13 +637,13 @@ test "storage.ha fencing persists promotion receipt and builds promotion request
         defer store.close();
         const receipt = try store.acquirePromotionFence(baseRequest());
         defer freeReceipt(alloc, receipt);
-        try std.testing.expectEqual(@as(u64, 1), receipt.generation);
+        try std.testing.expectEqual(@as(u64, 7), receipt.generation);
         try std.testing.expectEqual(@as(u64, 2), receipt.new_timeline_id);
         try std.testing.expectEqual(@as(u64, 2), receipt.new_epoch);
         try std.testing.expectEqual(@as(u64, 10), receipt.required_lsn);
         try std.testing.expectEqualStrings("primary-a", receipt.old_primary_id);
         try std.testing.expectEqualStrings("standby-b", receipt.promoted_node_id);
-        try std.testing.expect(std.mem.startsWith(u8, receipt.token, "ha-fence:100:10:20:2:2:1:"));
+        try std.testing.expect(std.mem.startsWith(u8, receipt.token, "ha-fence:100:10:20:2:2:7:"));
 
         const promotion = receipt.promotionRequest();
         try std.testing.expectEqual(@as(u64, 2), promotion.new_timeline_id);
@@ -650,7 +658,7 @@ test "storage.ha fencing persists promotion receipt and builds promotion request
         defer reopened.close();
         const receipt = (try reopened.current(alloc)).?;
         defer freeReceipt(alloc, receipt);
-        try std.testing.expectEqual(@as(u64, 1), receipt.generation);
+        try std.testing.expectEqual(@as(u64, 7), receipt.generation);
         try std.testing.expectEqualStrings("manual failover", receipt.reason);
         try std.testing.expectEqualStrings("standby-b", receipt.promoted_node_id);
     }
@@ -672,12 +680,12 @@ test "storage.ha fencing rejects unsafe and competing promotions" {
     const forced = try store.acquirePromotionFence(behind);
     defer freeReceipt(alloc, forced);
     try std.testing.expect(forced.forced);
-    try std.testing.expectEqual(@as(u64, 1), forced.generation);
+    try std.testing.expectEqual(@as(u64, 7), forced.generation);
 
     const repeated = try store.acquirePromotionFence(behind);
     defer freeReceipt(alloc, repeated);
     try std.testing.expectEqualStrings(forced.token, repeated.token);
-    try std.testing.expectEqual(@as(u64, 1), repeated.generation);
+    try std.testing.expectEqual(@as(u64, 7), repeated.generation);
 
     var competing = baseRequest();
     competing.promoted_node_id = "standby-c";
@@ -693,12 +701,22 @@ test "storage.ha fencing rejects unsafe and competing promotions" {
     competing.identity.timeline_id = 2;
     competing.identity.epoch = 2;
     competing.old_primary_id = "standby-b";
+    competing.generation = 9;
     const next = try store.acquirePromotionFence(competing);
     defer freeReceipt(alloc, next);
-    try std.testing.expectEqual(@as(u64, 2), next.generation);
+    try std.testing.expectEqual(@as(u64, 9), next.generation);
     try std.testing.expectEqual(@as(u64, 2), next.parent_timeline_id);
     try std.testing.expectEqualStrings("standby-b", next.old_primary_id);
     try std.testing.expectEqualStrings("standby-c", next.promoted_node_id);
+
+    competing.identity.timeline_id = 3;
+    competing.identity.epoch = 3;
+    competing.old_primary_id = "standby-c";
+    competing.promoted_node_id = "standby-d";
+    competing.new_timeline_id = 4;
+    competing.new_epoch = 4;
+    competing.generation = 8;
+    try std.testing.expectError(error.NonMonotonicFenceGeneration, store.acquirePromotionFence(competing));
 }
 
 test "storage.ha fencing rejects invalid node identifiers" {
@@ -777,7 +795,7 @@ test "storage.ha fencing rejects stale parent generation on replay" {
         stale_parent.new_epoch = 3;
         stale_parent.identity.timeline_id = 3;
         stale_parent.identity.epoch = 3;
-        stale_parent.generation = 2;
+        stale_parent.generation = 8;
         stale_parent.token = "stale-parent-token";
         const encoded = try encodeReceipt(alloc, .promotion_fence, stale_parent);
         defer alloc.free(encoded);

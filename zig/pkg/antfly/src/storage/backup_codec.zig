@@ -21,8 +21,10 @@ const ArrayList = std.ArrayList;
 /// AFB file magic bytes: "ANTFLYB\n"
 pub const magic = [8]u8{ 'A', 'N', 'T', 'F', 'L', 'Y', 'B', '\n' };
 
-/// Current format version. Version 2 adds self-describing relational-row
-/// document entries; readers still accept version-1 document backups.
+/// AFB1 remains readable. AFB2 is the common transport envelope for portable
+/// logical streams and native physical generations, including self-describing
+/// relational-row document entries.
+pub const legacy_format_version: u32 = 1;
 pub const format_version: u32 = 2;
 
 /// Fixed size of the file header in bytes.
@@ -42,6 +44,9 @@ pub const BlockType = enum(u8) {
     cluster_manifest = 0x01,
     table_manifest = 0x02,
     shard_header = 0x03,
+    /// Required first block in AFB2. It describes representation, full/delta
+    /// semantics, parent identity, and codec/security metadata.
+    bundle_manifest = 0x04,
     document_batch = 0x10,
     embedding_batch = 0x11,
     sparse_batch = 0x12,
@@ -53,6 +58,9 @@ pub const BlockType = enum(u8) {
     metadata_batch = 0x18,
     artifact_batch = 0x19,
     resolution_batch = 0x1A,
+    blob_header = 0x20,
+    blob_chunk = 0x21,
+    footer_index = 0x22,
     shard_footer = 0xF0,
     file_footer = 0xFF,
     _,
@@ -240,7 +248,7 @@ pub const SliceReader = struct {
         }
 
         const ver = std.mem.readInt(u32, buf[8..12], .little);
-        if (ver > format_version) {
+        if (ver < legacy_format_version or ver > format_version) {
             return error.UnsupportedVersion;
         }
 
@@ -364,7 +372,7 @@ pub const FileReader = struct {
         const stored_crc = std.mem.readInt(u32, buf[48..52], .little);
         if (stored_crc != Crc32.hash(buf[0..48])) return error.HeaderCrcMismatch;
         const ver = std.mem.readInt(u32, buf[8..12], .little);
-        if (ver > format_version) return error.UnsupportedVersion;
+        if (ver < legacy_format_version or ver > format_version) return error.UnsupportedVersion;
         return .{
             .format_version = ver,
             .flags = std.mem.readInt(u32, buf[12..16], .little),

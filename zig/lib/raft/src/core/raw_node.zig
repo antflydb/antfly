@@ -84,9 +84,45 @@ pub const RawNode = struct {
         return try self.raft.proposeWithReceipt(data, accepted_index);
     }
 
+    pub fn proposeBatchWithReceipt(
+        self: *RawNode,
+        payloads: []const []const u8,
+        accepted_first_index: *?types.Index,
+        accepted_last_index: *?types.Index,
+    ) !void {
+        self.clearReadyMessages();
+        return try self.raft.proposeBatchWithReceipt(
+            payloads,
+            accepted_first_index,
+            accepted_last_index,
+        );
+    }
+
     pub fn readIndex(self: *RawNode, rctx: []const u8) !void {
         self.clearReadyMessages();
         return try self.raft.readIndex(rctx);
+    }
+
+    pub fn reportSnapshotFailure(
+        self: *RawNode,
+        to: types.NodeId,
+        leader_term: types.Term,
+        snapshot_index: types.Index,
+        snapshot_term: types.Term,
+        attempt_generation: u64,
+    ) bool {
+        return self.raft.reportSnapshotFailure(to, leader_term, snapshot_index, snapshot_term, attempt_generation);
+    }
+
+    pub fn reportSnapshotDelivered(
+        self: *RawNode,
+        to: types.NodeId,
+        leader_term: types.Term,
+        snapshot_index: types.Index,
+        snapshot_term: types.Term,
+        attempt_generation: u64,
+    ) bool {
+        return self.raft.reportSnapshotDelivered(to, leader_term, snapshot_index, snapshot_term, attempt_generation);
     }
 
     pub fn proposeConfChange(self: *RawNode, conf_change: types.ConfChange) !void {

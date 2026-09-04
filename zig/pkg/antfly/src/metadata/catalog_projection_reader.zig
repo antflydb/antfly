@@ -508,6 +508,26 @@ pub const CatalogProjectionReader = struct {
         );
     }
 
+    /// Validate retirement against the same retained, point-in-time catalog
+    /// projection used by routing and publication fences. Linearizability is
+    /// established by the caller before entering this allocation-free check.
+    pub fn validateGroupRetirement(
+        self: *CatalogProjectionReader,
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64,
+        source: Source,
+        incarnation: ?metadata_api.MetadataClusterIncarnation,
+        contract: metadata_api.CatalogGroupRetirementContract,
+    ) !metadata_api.CatalogGroupRetirementValidation {
+        var lease = try self.snapshotLease(alloc, metadata_group_id, source, null);
+        defer lease.deinit();
+        return lease.snapshot().index.validateGroupRetirement(
+            contract,
+            metadata_group_id,
+            incarnation,
+        );
+    }
+
     pub fn freeRoutingSnapshot(
         _: *CatalogProjectionReader,
         alloc: std.mem.Allocator,

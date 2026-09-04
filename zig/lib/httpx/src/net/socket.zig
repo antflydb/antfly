@@ -228,17 +228,54 @@ pub const Socket = struct {
         while (true) {
             try self.checkRequestCancellation();
             try self.applyRequestDeadline(.send);
-            const sent = self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1) catch |err| {
+            const sent = (if (is_windows)
+                self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1)
+            else
+                sendPosixOnce(self.handle, data)) catch |err| {
                 if (err == error.Canceled) self.io.recancel();
                 try self.checkRequestCancellation();
                 if (err == error.Timeout or err == error.WouldBlock) {
                     try self.checkRequestDeadline();
-                    if (self.request_cancel_cb != null) continue;
+                    if (self.request_cancel_cb != null or self.request_deadline_ms != null) continue;
                 }
                 return error.SendFailed;
             };
             try self.checkRequestDeadline();
             return sent;
+        }
+    }
+
+    /// Zig 0.16's Threaded.netWrite treats EAGAIN as an internal errno bug,
+    /// but a blocking socket with SO_SNDTIMEO legitimately returns EAGAIN
+    /// under backpressure. httpx installs that timeout to enforce request
+    /// deadlines and cancellation polling, so POSIX writes must translate the
+    /// kernel result here instead of crossing the std.Io adapter.
+    fn sendPosixOnce(fd: net.Socket.Handle, data: []const u8) !usize {
+        if (data.len == 0) return 0;
+        var iov = posix.iovec_const{
+            .base = data.ptr,
+            .len = data.len,
+        };
+        var msg: posix.msghdr_const = .{
+            .name = null,
+            .namelen = 0,
+            .iov = @ptrCast(&iov),
+            .iovlen = 1,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+        while (true) {
+            const rc = posix.system.sendmsg(fd, &msg, posix.MSG.NOSIGNAL);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                .PIPE, .NOTCONN => return error.SocketUnconnected,
+                .NOBUFS, .NOMEM => return error.SystemResources,
+                else => |err| return posix.unexpectedErrno(err),
+            }
         }
     }
 
@@ -1391,6 +1428,33 @@ test "Socket recv timeout returns error.Timeout" {
 
     var recv_buf: [8]u8 = undefined;
     try std.testing.expectError(error.Timeout, accepted.socket.recv(&recv_buf));
+}
+
+test "Socket send timeout reports backpressure without panicking" {
+    if (is_windows) return;
+
+    const io = std.testing.io;
+    const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try TcpListener.init(listen_addr, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    var accepted = try listener.accept();
+    defer accepted.socket.close();
+
+    const send_buffer: u32 = 4096;
+    try Socket.setSocketOption(sender.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&send_buffer));
+    try sender.setSendTimeout(5);
+
+    var payload: [64 * 1024]u8 = @splat(0xa5);
+    var attempts: usize = 0;
+    while (attempts < 1024) : (attempts += 1) {
+        _ = sender.send(&payload) catch |err| {
+            try std.testing.expectEqual(error.SendFailed, err);
+            return;
+        };
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "SliceIoReader skips leading empty buffers" {

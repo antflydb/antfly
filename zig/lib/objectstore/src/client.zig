@@ -26,8 +26,8 @@ pub const Client = struct {
 
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
-        bucket_exists: *const fn (*anyopaque, []const u8) anyerror!bool,
-        make_bucket: *const fn (*anyopaque, []const u8) anyerror!void,
+        bucket_exists: *const fn (*anyopaque, []const u8, types.BucketOptions) anyerror!bool,
+        make_bucket: *const fn (*anyopaque, []const u8, types.BucketOptions) anyerror!void,
         put_object: *const fn (*anyopaque, Allocator, []const u8, []const u8, []const u8, types.PutOptions) anyerror!types.PutResult,
         put_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8, types.PutOptions) anyerror!types.PutResult = null,
         get_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8) anyerror!void = null,
@@ -39,6 +39,7 @@ pub const Client = struct {
         stat_object_with_options: ?*const fn (*anyopaque, Allocator, []const u8, []const u8, types.StatOptions) anyerror!types.ObjectMetadata = null,
         delete_object: *const fn (*anyopaque, []const u8, []const u8, types.DeleteOptions) anyerror!void,
         list_objects: *const fn (*anyopaque, Allocator, []const u8, types.ListOptions) anyerror!types.ListResult,
+        list_object_versions: ?*const fn (*anyopaque, Allocator, []const u8, types.ListObjectVersionsOptions) anyerror!types.ListObjectVersionsResult = null,
     };
 
     pub fn deinit(self: *Client) void {
@@ -47,14 +48,25 @@ pub const Client = struct {
     }
 
     pub fn bucketExists(self: *Client, bucket: []const u8) !bool {
-        return try self.vtable.bucket_exists(self.ptr, bucket);
+        return try self.bucketExistsWithOptions(bucket, .{});
+    }
+
+    pub fn bucketExistsWithOptions(self: *Client, bucket: []const u8, opts: types.BucketOptions) !bool {
+        if (opts.cancellation) |token| try token.check();
+        return try self.vtable.bucket_exists(self.ptr, bucket, opts);
     }
 
     pub fn makeBucket(self: *Client, bucket: []const u8) !void {
-        try self.vtable.make_bucket(self.ptr, bucket);
+        try self.makeBucketWithOptions(bucket, .{});
+    }
+
+    pub fn makeBucketWithOptions(self: *Client, bucket: []const u8, opts: types.BucketOptions) !void {
+        if (opts.cancellation) |token| try token.check();
+        try self.vtable.make_bucket(self.ptr, bucket, opts);
     }
 
     pub fn putObject(self: *Client, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
+        if (opts.cancellation) |token| try token.check();
         return try self.vtable.put_object(self.ptr, self.allocator, bucket, key, body, opts);
     }
 
@@ -65,7 +77,10 @@ pub const Client = struct {
     }
 
     pub fn putFileWithIo(self: *Client, io: std.Io, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
-        if (self.vtable.put_file) |put_file| return try put_file(self.ptr, self.allocator, io, bucket, key, src_path, opts);
+        if (opts.cancellation) |token| try token.check();
+        if (self.vtable.put_file) |put_file| {
+            return try put_file(self.ptr, self.allocator, io, bucket, key, src_path, opts);
+        }
         const file = try openFilePath(io, src_path);
         defer file.close(io);
         const stat = try file.stat(io);
@@ -75,6 +90,7 @@ pub const Client = struct {
         if (try file.readPositionalAll(io, body, 0) != body.len) return error.SourceFileChanged;
         var extra: [1]u8 = undefined;
         if (try file.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
+        if (opts.cancellation) |token| try token.check();
         return try self.putObject(bucket, key, body, opts);
     }
 
@@ -181,14 +197,30 @@ pub const Client = struct {
     }
 
     pub fn deleteObject(self: *Client, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
+        if (opts.cancellation) |token| try token.check();
         try self.vtable.delete_object(self.ptr, bucket, key, opts);
+        if (opts.cancellation) |token| try token.check();
     }
 
     pub fn listObjects(self: *Client, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
         if (opts.max_keys == 0) return error.InvalidPageSize;
         if (opts.max_keys > max_list_page_keys) return error.PageSizeTooLarge;
         if (opts.start_after != null and opts.continuation_token != null) return error.AmbiguousContinuation;
-        return try self.vtable.list_objects(self.ptr, self.allocator, bucket, opts);
+        if (opts.cancellation) |token| try token.check();
+        var result = try self.vtable.list_objects(self.ptr, self.allocator, bucket, opts);
+        errdefer result.deinit(self.allocator);
+        if (opts.cancellation) |token| try token.check();
+        return result;
+    }
+
+    pub fn listObjectVersions(self: *Client, bucket: []const u8, opts: types.ListObjectVersionsOptions) !types.ListObjectVersionsResult {
+        if (opts.max_keys == 0) return error.InvalidPageSize;
+        if (opts.max_keys > max_list_page_keys) return error.PageSizeTooLarge;
+        if (opts.version_id_marker != null and opts.key_marker == null)
+            return error.InvalidVersionPagination;
+        const list_versions = self.vtable.list_object_versions orelse
+            return error.ObjectVersionListingUnsupported;
+        return try list_versions(self.ptr, self.allocator, bucket, opts);
     }
 };
 
