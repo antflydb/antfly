@@ -1,7 +1,7 @@
 ---
-title: "PostgreSQL Replication"
-unlisted: true
-description: "Automatically stream INSERT, UPDATE, and DELETE changes from PostgreSQL into Antfly using logical replication"
+title: "Stream PostgreSQL into Antfly"
+description: "An Antfly table that mirrors a PostgreSQL table on its own, every insert, update, and delete included, with PostgreSQL still the system of record"
+order: 6
 ---
 
 <Questions>
@@ -9,57 +9,83 @@ description: "Automatically stream INSERT, UPDATE, and DELETE changes from Postg
 - How do I set up CDC replication with Cloud SQL, AlloyDB, Supabase, Neon, or RDS?
 - How do I control which PostgreSQL columns map to Antfly document fields?
 - How do I handle soft deletes or document deletion on PostgreSQL DELETE?
+- Why are my PostgreSQL deletes not reaching Antfly?
 </Questions>
 
-Antfly has built-in **Change Data Capture (CDC)** that streams real-time changes from PostgreSQL tables into Antfly documents using [logical replication](https://www.postgresql.org/docs/current/logical-replication.html). No external daemon or sync process required — just add a `replication_sources` block when creating a table.
-
-## Architecture
-
-```
-┌───────────────────┐
-│   PostgreSQL      │
-│   (source table)  │
-└────────┬──────────┘
-         │  WAL (logical replication)
-         │  pgoutput protocol v2
-         │
-┌────────▼──────────┐
-│  Antfly Metadata  │
-│  Leader           │
-│  ┌──────────────┐ │          ┌──────────────┐
-│  │  CDC Worker   │─┼─────────▶  Antfly      │
-│  │  (per source) │ │ transform│  Shard       │
-│  └──────────────┘ │          └──────────────┘
-└───────────────────┘
-```
-
-Each replication source gets a dedicated worker that:
-
-1. Connects to PostgreSQL using the `pgoutput` logical decoding plugin
-2. Creates a replication slot and publication (or reuses pre-created ones)
-3. Streams WAL changes and converts them to Antfly transform operations
-4. Persists LSN checkpoints in the metadata Raft store for crash recovery
-5. Reconnects automatically with exponential backoff on transient errors
-
-## Prerequisites
-
-- PostgreSQL **15+** (for pgoutput protocol v2)
-- `wal_level = logical` on the source database
-- A database user with the `REPLICATION` attribute (or equivalent managed-service role)
-
-## Quick Start
-
-### 1. Enable logical replication on PostgreSQL
+By the end of this guide, every insert, update, and delete on a PostgreSQL table lands in an Antfly table without a sync job or a daemon in between. Antfly subscribes to PostgreSQL logical replication, backfills the existing rows, then follows the stream. Nothing changes in the application that writes to PostgreSQL. You need Antfly running, PostgreSQL 14 or later with `wal_level = logical`, and a database user with the `REPLICATION` attribute:
 
 ```sql
--- Self-hosted PostgreSQL
-ALTER SYSTEM SET wal_level = logical;
--- Then restart PostgreSQL
+SHOW wal_level;  -- logical
 ```
 
-For managed services, see [Cloud Provider Setup](#cloud-provider-setup) below.
+Here is the call you'll be making by the end, and the proof it worked:
 
-### 2. Create the source table in PostgreSQL
+```bash
+curl -X POST http://localhost:8080/db/v1/tables/users \
+  -u admin:admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "replication_sources": [
+      {
+        "type": "postgres",
+        "dsn": "${secret:pg_dsn}",
+        "postgres_table": "users",
+        "key_template": "id"
+      }
+    ]
+  }'
+```
+
+```bash
+curl -s http://localhost:8080/db/v1/tables/users/documents/user-1 -u admin:admin
+```
+
+```json
+{ "id": "user-1", "name": "Alice", "email": "alice@example.com", "score": 100 }
+```
+
+Five steps get you there.
+
+## 1. Turn On Logical Replication
+
+On self-hosted PostgreSQL, set the WAL level and give the stream room for one slot and one sender per replication source:
+
+```sql
+ALTER SYSTEM SET wal_level = logical;
+ALTER SYSTEM SET max_replication_slots = 10;
+ALTER SYSTEM SET max_wal_senders = 10;
+```
+
+Restart PostgreSQL, then confirm:
+
+```sql
+SHOW wal_level;  -- logical
+```
+
+`wal_level` is server-wide, not per database. Managed services set it through a flag or a console switch instead; [Managed PostgreSQL Setup](#managed-postgresql-setup) has each one.
+
+Grant the replication attribute to the user Antfly will connect as:
+
+```sql
+ALTER USER antfly WITH REPLICATION;
+```
+
+## 2. Store the Connection String as a Secret
+
+The DSN carries a password, so it goes in the secret store and the table config references it by name:
+
+```bash
+curl -X PUT http://localhost:8080/db/v1/secrets/pg_dsn \
+  -u admin:admin \
+  -H "Content-Type: application/json" \
+  -d '{"value": "postgres://antfly:secret@pg-host:5432/mydb?sslmode=require"}'
+```
+
+Use the direct connection, never a pooler. PgBouncer and Supavisor do not speak the replication protocol, and a DSN that points at one reconnects forever without an obvious error.
+
+## 3. Create the Replicated Table
+
+The source table in PostgreSQL:
 
 ```sql
 CREATE TABLE users (
@@ -70,18 +96,17 @@ CREATE TABLE users (
 );
 ```
 
-### 3. Create an Antfly table with a replication source
+The Antfly table, with a `replication_sources` block naming it:
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/table \
+curl -X POST http://localhost:8080/db/v1/tables/users \
   -u admin:admin \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "users",
     "replication_sources": [
       {
         "type": "postgres",
-        "dsn": "postgres://user:pass@pg-host:5432/mydb?sslmode=require",
+        "dsn": "${secret:pg_dsn}",
         "postgres_table": "users",
         "key_template": "id"
       }
@@ -89,83 +114,60 @@ curl -X POST http://localhost:8080/db/v1/table \
   }'
 ```
 
-That's it. Antfly will automatically create a replication slot and publication, then start streaming changes. Any `INSERT`, `UPDATE`, or `DELETE` on the PostgreSQL `users` table will be reflected in the Antfly `users` table.
+Antfly creates a replication slot and a publication, snapshots the rows already in the table through the normal batch path, then polls the slot for changes. The source's `status` in the table detail moves from `snapshot` to `streaming`:
 
-### 4. Verify replication
+```bash
+curl -s http://localhost:8080/db/v1/tables/users -u admin:admin
+```
+
+Three errors show up here and nowhere else. `permission denied to create replication slot` means the user lacks `REPLICATION` (or the managed-service role); pre-create the slot and pass `slot_name`. `publication does not exist` means the user cannot create publications; have the table owner create one and pass `publication_name`. `wal_level is not logical` means step 1 did not take effect, usually because the restart is still pending.
+
+## 4. Watch a Row Arrive
+
+Insert in PostgreSQL:
 
 ```sql
--- Insert a row in PostgreSQL
 INSERT INTO users (id, name, email, score) VALUES ('user-1', 'Alice', 'alice@example.com', 100);
 ```
 
+Read it back from Antfly:
+
 ```bash
-# Check it appears in Antfly
-curl -s http://localhost:8080/db/v1/table/users/key/user-1 -u admin:admin | jq .
+curl -s http://localhost:8080/db/v1/tables/users/documents/user-1 -u admin:admin
 ```
-
-## Configuration Reference
-
-### Replication Source Fields
-
-| Field | Required | Default | Description |
-|---|---|---|---|
-| `type` | Yes | — | Must be `"postgres"` |
-| `dsn` | Yes | — | PostgreSQL connection string. Supports `${secret:key}` references. |
-| `postgres_table` | Yes | — | Source table name in PostgreSQL |
-| `key_template` | No | `"id"` | How to derive the Antfly document key. Plain column name or `{{col}}` template. |
-| `slot_name` | No | auto-derived | Replication slot name. Set this when using pre-created slots. |
-| `publication_name` | No | auto-derived | Publication name. Set this when using pre-created publications. |
-| `on_update` | No | passthrough | Transform ops for INSERT/UPDATE events |
-| `on_delete` | No | auto-derived | Transform ops for DELETE events |
-
-### Key Templates
 
 ```json
-"key_template": "id"
+{ "id": "user-1", "name": "Alice", "email": "alice@example.com", "score": 100 }
 ```
-Uses the `id` column value as the Antfly document key.
+
+Every column became a field. Updates flow the same way. Replicated rows go through the normal write path, so any embeddings index on the table embeds them as they land, exactly as a direct write would.
+
+If nothing arrives, the DSN is the first suspect: check that PostgreSQL is reachable from the Antfly metadata node, that `sslmode=require` is set for cloud providers, and that the host is the direct endpoint rather than a pooler.
+
+## 5. Shape the Document
+
+Three fields on the source control how a row becomes a document.
+
+**`key_template`** derives the document key. A column name uses that column; a template composes several:
 
 ```json
 "key_template": "{{tenant_id}}:{{user_id}}"
 ```
-Composite key from multiple columns, producing keys like `"acme:user-42"`.
 
-### Transform Operations
-
-By default (passthrough mode), every column in the PostgreSQL row becomes a field in the Antfly document via `$set`. You can customize this with `on_update` and `on_delete`.
-
-**Custom `on_update`** — select and rename columns:
+**`on_update`** replaces passthrough with explicit transforms for inserts and updates. Column references resolve to the row; literals are set every time:
 
 ```json
 "on_update": [
   { "op": "$set", "path": "name", "value": "{{user_name}}" },
   { "op": "$set", "path": "email", "value": "{{user_email}}" },
-  { "op": "$set", "path": "active", "value": true }
-]
-```
-
-Literal values (like `true` above) are set on every INSERT/UPDATE. Column references (`{{user_name}}`) resolve to the current row's value.
-
-**`$merge`** — flatten a JSONB column into top-level fields:
-
-```json
-"on_update": [
+  { "op": "$set", "path": "active", "value": true },
   { "op": "$merge", "value": "{{metadata}}" }
 ]
 ```
 
-If `metadata` is `{"role": "admin", "team": "eng"}`, the document gets `role` and `team` as top-level fields.
+`$merge` flattens a JSONB column into top-level fields: `{"role": "admin", "team": "eng"}` becomes `role` and `team` on the document. `{{metadata.role}}` reaches into decoded JSONB for a single key.
 
-**Custom `on_delete`** — soft delete pattern:
-
-```json
-"on_delete": [
-  { "op": "$set", "path": "active", "value": false },
-  { "op": "$currentDate", "path": "deleted_at" }
-]
-```
-
-**`$delete_document`** — remove the Antfly document entirely:
+**`on_delete`** decides what a PostgreSQL `DELETE` does. Remove the document:
 
 ```json
 "on_delete": [
@@ -173,280 +175,74 @@ If `metadata` is `{"role": "admin", "team": "eng"}`, the document gets `role` an
 ]
 ```
 
-If `on_delete` is omitted, Antfly auto-derives `$unset` operations from the `on_update` paths, which removes only the fields this source set (safe for multi-source tables).
-
-### Secrets
-
-Never put credentials directly in the DSN. Use a protected Antfly secret-store file:
-
-```bash
-# Store the DSN as a secret
-curl -X PUT http://localhost:8080/db/v1/secrets/pg_dsn \
-  -u admin:admin \
-  -H "Content-Type: application/json" \
-  -d '{"value": "postgres://user:pass@pg-host:5432/mydb?sslmode=require"}'
-```
-
-Then reference it:
+Or keep it and mark it:
 
 ```json
-"dsn": "${secret:pg_dsn}"
+"on_delete": [
+  { "op": "$set", "path": "active", "value": false }
+]
 ```
 
-## Cloud Provider Setup
+Omit `on_delete` and Antfly derives `$unset` operations from the `on_update` paths, removing only the fields this source set. With neither set, a delete unsets every replicated column except the key fields.
 
-Each managed PostgreSQL service requires slightly different configuration to enable logical replication. The core requirement is the same: `wal_level=logical` and a user with replication privileges.
-
-### Google Cloud SQL
-
-1. **Enable logical decoding** in the Cloud SQL instance flags:
-
-   ```
-   cloudsql.logical_decoding = on
-   ```
-
-   This can be set in the Google Cloud Console under **Instance > Configuration > Flags**, or via `gcloud`:
-
-   ```bash
-   gcloud sql instances patch INSTANCE_NAME \
-     --database-flags=cloudsql.logical_decoding=on
-   ```
-
-   <Callout type="warning">
-   Changing this flag requires a database restart.
-   </Callout>
-
-2. **Grant replication privileges** to your database user:
-
-   ```sql
-   ALTER USER myuser WITH REPLICATION;
-   ```
-
-   Or grant the built-in `cloudsql.replication` role if your user cannot be altered.
-
-3. **Pre-create the publication** if your user doesn't own the source table:
-
-   ```sql
-   -- Run as the table owner
-   CREATE PUBLICATION antfly_pub_users FOR TABLE users;
-   ```
-
-   Then reference it in the Antfly config:
-
-   ```json
-   {
-     "type": "postgres",
-     "dsn": "${secret:cloudsql_dsn}",
-     "postgres_table": "users",
-     "publication_name": "antfly_pub_users"
-   }
-   ```
-
-4. **Connect via Cloud SQL Auth Proxy** (recommended) or direct IP with SSL:
-
-   ```bash
-   # With Auth Proxy running on localhost:5432
-   "dsn": "postgres://myuser:pass@localhost:5432/mydb"
-   ```
-
-### Google AlloyDB
-
-1. **Enable logical decoding** via the AlloyDB instance flag:
-
-   ```
-   alloydb.logical_decoding = on
-   ```
-
-   Set this in the AlloyDB console or via `gcloud`:
-
-   ```bash
-   gcloud alloydb instances update INSTANCE_NAME \
-     --cluster=CLUSTER_NAME \
-     --region=REGION \
-     --database-flags=alloydb.logical_decoding=on
-   ```
-
-   <Callout type="warning">
-   Changing this flag requires a database restart.
-   </Callout>
-
-2. **Grant replication** to the user and pre-create publications as with Cloud SQL (AlloyDB uses the same `alloydb.replication` role model).
-
-### Supabase
-
-Supabase enables logical replication by default. To use it with Antfly:
-
-1. **Create a publication** in the Supabase SQL editor:
-
-   ```sql
-   CREATE PUBLICATION antfly_pub_users FOR TABLE public.users;
-   ```
-
-2. **Use the direct connection string** (not the pooled connection). Find it in your Supabase dashboard under **Settings > Database > Connection string > URI**. The direct connection typically uses port `5432`, while the pooled connection uses port `6543`.
-
-   <Callout type="info">
-   PgBouncer (Supabase's connection pooler on port 6543) does not support the replication protocol. You must use the direct connection on port 5432.
-   </Callout>
-
-3. **Configure the source** with the pre-created publication:
-
-   ```json
-   {
-     "type": "postgres",
-     "dsn": "${secret:supabase_dsn}",
-     "postgres_table": "users",
-     "publication_name": "antfly_pub_users",
-     "slot_name": "antfly_users_slot"
-   }
-   ```
-
-### Neon
-
-1. **Enable logical replication** in the Neon console:
-
-   Go to **Project > Settings > Logical Replication** and enable it. This sets `wal_level=logical` and restarts the compute endpoint.
-
-2. **Pre-create the publication and slot** in the Neon SQL editor:
-
-   ```sql
-   CREATE PUBLICATION antfly_pub_users FOR TABLE users;
-   ```
-
-   <Callout type="info">
-   Neon manages replication slots carefully due to its branching architecture. Slots are supported on the primary branch. See [Neon's logical replication docs](https://neon.tech/docs/guides/logical-replication-guide) for current limitations.
-   </Callout>
-
-3. **Use the direct connection string** (not the pooled endpoint). Set `sslmode=require`:
-
-   ```json
-   {
-     "type": "postgres",
-     "dsn": "${secret:neon_dsn}",
-     "postgres_table": "users",
-     "publication_name": "antfly_pub_users"
-   }
-   ```
-
-### Amazon RDS
-
-1. **Set the `rds.logical_replication` parameter** to `1`:
-
-   In the RDS console, edit your DB parameter group and set:
-
-   ```
-   rds.logical_replication = 1
-   ```
-
-   Or via the AWS CLI:
-
-   ```bash
-   aws rds modify-db-parameter-group \
-     --db-parameter-group-name my-param-group \
-     --parameters "ParameterName=rds.logical_replication,ParameterValue=1,ApplyMethod=pending-reboot"
-   ```
-
-   <Callout type="warning">
-   This requires a reboot of the RDS instance.
-   </Callout>
-
-2. **Grant `rds_replication`** to your user:
-
-   ```sql
-   GRANT rds_replication TO myuser;
-   ```
-
-3. **Pre-create publications** as with other managed services, or let Antfly auto-create them if the user owns the tables.
-
-### Amazon Aurora PostgreSQL
-
-Same as RDS — set `rds.logical_replication = 1` in the cluster parameter group and grant `rds_replication` to the user. Aurora supports logical replication on the writer instance.
-
-<Callout type="info">
-Aurora reader instances cannot be used as replication sources. Always point the DSN at the writer endpoint.
-</Callout>
-
-### Self-Hosted PostgreSQL
+For deletes to arrive at all, the source table needs a replica identity. A primary key provides one. A table without one needs:
 
 ```sql
-ALTER SYSTEM SET wal_level = logical;
-ALTER SYSTEM SET max_replication_slots = 10;  -- at least 1 per replication source
-ALTER SYSTEM SET max_wal_senders = 10;        -- at least 1 per replication source
+ALTER TABLE users REPLICA IDENTITY FULL;
 ```
 
-Then restart PostgreSQL. Verify with:
-
-```sql
-SHOW wal_level;  -- should return "logical"
-```
-
-## Multi-Source Tables
-
-Multiple PostgreSQL tables can feed into a single Antfly table. This is useful for denormalization — combining related data from different tables into one searchable document.
+Several PostgreSQL tables can feed one Antfly table. Give each source its own `on_update` and the auto-derived deletes stay scoped: deleting a row from `scores` unsets `score` and `level` and leaves `name` and `email` from the `users` source in place:
 
 ```json
-{
-  "name": "users",
-  "replication_sources": [
-    {
-      "type": "postgres",
-      "dsn": "${secret:pg_dsn}",
-      "postgres_table": "users",
-      "key_template": "id",
-      "on_update": [
-        { "op": "$set", "path": "name", "value": "{{name}}" },
-        { "op": "$set", "path": "email", "value": "{{email}}" }
-      ]
-    },
-    {
-      "type": "postgres",
-      "dsn": "${secret:pg_dsn}",
-      "postgres_table": "scores",
-      "key_template": "user_id",
-      "on_update": [
-        { "op": "$set", "path": "score", "value": "{{score}}" },
-        { "op": "$set", "path": "level", "value": "{{level}}" }
-      ]
-    }
-  ]
-}
+"replication_sources": [
+  {
+    "type": "postgres",
+    "dsn": "${secret:pg_dsn}",
+    "postgres_table": "users",
+    "key_template": "id",
+    "on_update": [
+      { "op": "$set", "path": "name", "value": "{{name}}" },
+      { "op": "$set", "path": "email", "value": "{{email}}" }
+    ]
+  },
+  {
+    "type": "postgres",
+    "dsn": "${secret:pg_dsn}",
+    "postgres_table": "scores",
+    "key_template": "user_id",
+    "on_update": [
+      { "op": "$set", "path": "score", "value": "{{score}}" },
+      { "op": "$set", "path": "level", "value": "{{level}}" }
+    ]
+  }
+]
 ```
 
-When a row is deleted from `scores`, only `score` and `level` are unset — the `name` and `email` fields from the `users` source remain intact.
+## Managed PostgreSQL Setup
 
-## Monitoring and Troubleshooting
+Every provider needs the same two things, `wal_level = logical` and a user allowed to replicate, and each exposes them differently. Pre-create the publication as the table owner whenever the replication user does not own the table, then pass `publication_name`:
 
-### Check replication status
-
-Look for CDC-related log messages on the Antfly metadata leader:
-
-```
-Starting CDC replication worker  table=users pgTable=users slot=antfly_users_users
-connected to postgres for replication
-starting replication  start_lsn=0/0
+```sql
+CREATE PUBLICATION antfly_pub_users FOR TABLE users;
 ```
 
-### Common issues
+**Google Cloud SQL.** Set the instance flag `cloudsql.logical_decoding = on` (console: Instance > Configuration > Flags, or `gcloud sql instances patch INSTANCE_NAME --database-flags=cloudsql.logical_decoding=on`); the instance restarts. Grant with `ALTER USER myuser WITH REPLICATION;`, or the `cloudsql.replication` role if the user cannot be altered. Connect through the Cloud SQL Auth Proxy or direct IP with SSL.
 
-**"permission denied to create replication slot"**
-- The database user needs `REPLICATION` attribute (self-hosted) or the cloud-specific replication role (`cloudsql.replication`, `rds_replication`, etc.)
-- Alternative: pre-create the slot and pass `slot_name` in the config
+**Google AlloyDB.** Set `alloydb.logical_decoding = on` (`gcloud alloydb instances update INSTANCE_NAME --cluster=CLUSTER_NAME --region=REGION --database-flags=alloydb.logical_decoding=on`); the instance restarts. Replication grants and publications work as on Cloud SQL, with the `alloydb.replication` role.
 
-**"publication does not exist"**
-- The user lacks permission to create publications. Pre-create it and pass `publication_name`.
+**Supabase.** Logical replication is on by default. Create the publication in the SQL editor with the `public.` schema prefix, then use the direct connection string from Settings > Database > Connection string > URI, on port `5432`. Port `6543` is the pooler and cannot replicate. Pass both `publication_name` and a `slot_name`.
 
-**"wal_level is not logical"**
-- The source PostgreSQL instance needs `wal_level=logical`. See [Cloud Provider Setup](#cloud-provider-setup) for your platform.
+**Neon.** Enable logical replication under Project > Settings > Logical Replication; the compute endpoint restarts. Create the publication in the SQL editor. Use the direct (unpooled) connection string with `sslmode=require`. Slots are supported on the primary branch; [Neon's logical replication guide](https://neon.tech/docs/guides/logical-replication-guide) lists current limits.
 
-**Worker reconnects in a loop**
-- Check that the DSN is correct and the PostgreSQL instance is reachable from the Antfly metadata node
-- Verify SSL settings (`sslmode=require` for most cloud providers)
-- Check that you're using the direct connection, not a connection pooler (PgBouncer, Supavisor, etc.)
+**Amazon RDS and Aurora PostgreSQL.** Set `rds.logical_replication = 1` in the DB or cluster parameter group (`aws rds modify-db-parameter-group --db-parameter-group-name my-param-group --parameters "ParameterName=rds.logical_replication,ParameterValue=1,ApplyMethod=pending-reboot"`) and reboot. Grant with `GRANT rds_replication TO myuser;`. On Aurora, point the DSN at the writer endpoint; readers cannot serve as replication sources.
 
-**DELETE events have no effect**
-- The source table needs `REPLICA IDENTITY` set. For tables with a primary key, this is automatic (`DEFAULT`). For tables without a primary key, run:
-  ```sql
-  ALTER TABLE users REPLICA IDENTITY FULL;
-  ```
+## Why PostgreSQL Stays the System of Record
+
+Replication runs one way. Antfly never writes back, so your application keeps its transactions, constraints, and backups exactly where they are, and Antfly holds a searchable copy that is as current as the stream. Write to PostgreSQL; query Antfly.
+
+The cost of that arrangement is the replication slot. A slot makes PostgreSQL retain WAL until the subscriber has consumed it. While Antfly is up, that is a few seconds of WAL. While Antfly is down for a long stretch, PostgreSQL keeps every change since the last checkpoint, and disk usage grows until the stream resumes. Monitor slot lag the way you would for any logical subscriber, and if you decommission an Antfly table, drop its slot in PostgreSQL rather than leaving it to hold WAL forever.
+
+That one-way flow is also why the delete decision is yours. PostgreSQL knows a row is gone; only you know whether the document should vanish from search or stay, marked inactive, so that history remains retrievable. `$delete_document` is right for data that should not be found once removed. A soft delete is right when the document is evidence, such as a resolved ticket that still teaches a classifier.
 
 ## Let Your Agent Drive
 
@@ -457,4 +253,10 @@ so a coding agent can execute this guide for you:
 npx skills add antflydb/antfly-skills
 ```
 
-Then prompt it with the outcome — e.g. "Stream my Postgres orders table into Antfly with logical replication" — and use this page to judge the result.
+Then prompt it with the outcome, for example "Stream my Postgres orders table into Antfly with logical replication and soft-delete on DELETE", and use this page to judge the result.
+
+## Next Steps
+
+- [Route Tickets with Retrieval](/docs/guides/ticket-routing): a replicated table doing real work, with a semantic index added in the same create call
+- [Build a Support Answer Agent](/docs/guides/support-answer-agent): answer questions from content that arrives this way
+- [Document Engine](/docs/guides/document-engine): how the replicated fields become searchable, filterable, and sortable

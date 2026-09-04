@@ -1,33 +1,77 @@
-# Guide authoring standard
+# Docs authoring standard
 
-Guides take a reader who has finished the [Quickstart](quickstart.mdx) to one named
-outcome. They are written for humans steering an agent-assisted workflow — the agent
-gets its knowledge from the `antfly-skills` skill, so the guide's job is judgment and
-context, not exhaustive reference. (This file is `.md`, not `.mdx`, so it never syncs
-to the docs site.)
+Every page under `docs/guides/` is one of two kinds. A **guide** takes a reader who has
+finished the [Quickstart](quickstart.mdx) to one named outcome. A **concept** page explains
+how one part of Antfly works so the reader can make good decisions with it. Both are
+written for people steering an agent-assisted workflow: the agent gets its knowledge from
+the `antfly-skills` skill, so the page's job is judgment and context, not exhaustive
+reference. (This file is `.md`, not `.mdx`, so it never syncs to the docs site.)
 
-## Shape
+The bar for every sentence: it earns its place or it goes. Nothing stays because it was
+there before.
 
-Match the voice of `support-answer-agent.mdx`: confident, concrete, show-first.
-Target 120–180 lines. Structure:
+## Voice
 
-1. **Frontmatter** — `title` (imperative outcome: "Build a …", "Add … to …"),
-   `description` (one sentence, what the reader ends up with), `order`, and
-   optionally `unlisted`. Nothing else — no `prerequisites`/`difficulty`/
-   `estimatedTime`/`tags`: labels about the doing rot once an agent does the
-   doing. A genuine state requirement (credentials, a configured Postgres)
-   goes in prose with a verification command, not in metadata.
-2. **`<Questions>`** — 3–5 questions a person would actually type, right after
-   frontmatter.
-3. **The Pattern** — a few sentences of framing: what this solution is and the one
-   insight that shapes how you build it. No scope disclaimers, no "what this doesn't
-   do" — humans don't read like that.
-4. **Numbered steps** — each ends in something runnable with visible output. Real
-   commands against `http://localhost:8080`, real JSON, no `{{PLACEHOLDER}}` blocks.
-   Use `<Tabs>` for CLI/cURL variants where both exist.
-5. **One "why" section** — the judgment call the reader must own (tuning, tradeoff,
-   failure mode). This is the part the skill can't do for them.
-6. **Let your agent drive** — every guide carries this section near the end:
+Docs are a demonstrating surface. They show the result; they never make the company's
+argument. The test for any sentence: if it would survive as a slide in a pitch, it does
+not belong here. Mechanism is fine ("closest can still be far away, and an answer
+generated from far-away context is confidently wrong"). Slogans are not ("an agent
+believes what it retrieves").
+
+- Second person, present tense, imperative for instructions. The reader is the one
+  building; Antfly is the tool in their hands.
+- Short sentences, one idea each. Contractions are natural.
+- No em-dashes, and no double-hyphen stand-ins. Recast with a period, colon, comma, or
+  parentheses.
+- No hype, no pain exaggeration, no rhetorical-question hooks, no "simply" or "just".
+- "Antfly", never "AntflyDB". "Antfly Inference" for the built-in model runtime.
+  "standalone mode" for `antfly standalone`.
+- Roadmap never appears as shipped. No "coming soon", no "future enhancements".
+- Explain the why only for non-obvious steps. Readers are here for the commands.
+- Callouts carry one fact each and only when the fact would otherwise be missed. An
+  `info` callout that restates the paragraph above it is deleted.
+
+## Frontmatter
+
+`title`, `description`, `order`, and optionally `unlisted` and `sidebar`. Nothing else.
+No `difficulty`, `estimatedTime`, `prerequisites`, or `tags`: labels about the doing rot
+once an agent does the doing. A real state requirement (credentials, a running Postgres)
+goes in the opener as prose with a verification command.
+
+- Guide titles are an outcome with a verb: "Build a Support Answer Agent", "Tune Hybrid
+  Search". The `description` is what the reader ends with, one sentence.
+- Concept pages set `sidebar: concepts` and take a noun title: "Document Engine",
+  "Antfly Lite". The `description` says what the page explains.
+
+## Guide anatomy
+
+Target 120 to 200 lines. In this order:
+
+1. **`<Questions>`** right after frontmatter: three to five questions a person would
+   actually type into a search box.
+
+2. **The opener**, no heading, two to four sentences. What the reader will have when
+   they finish, in their own world. What must already be running, with a command that
+   proves it. Nothing else: no framing, no category, no what-this-guide-covers sentence.
+   The title already said what the guide covers.
+
+3. **The result first.** Show the finished artifact before step one: the final request
+   and a trimmed real response, or the finished component, under a sentence like "Here
+   is the call you'll be making by the end." This is what lets the reader decide in ten
+   seconds whether the page is for them. Then a one-line bridge into the steps ("Three
+   steps get you there.").
+
+4. **Numbered steps.** Each ends in something runnable with visible output. Real
+   commands against `http://localhost:8080`, real JSON, no `{{PLACEHOLDER}}` blocks. Use
+   `<Tabs>` for CLI and cURL where both exist. Step headings are imperative ("Load Your
+   Help Articles").
+
+5. **One judgment section**, headed by its content, never by a generic label. This is
+   the tradeoff, tuning decision, or failure mode the reader has to own because the skill
+   cannot own it for them ("Why Pruning Is a Correctness Feature", "Why the Answer Box
+   Gets Its Own Input"). One per guide. If there are two, the second is a concept page.
+
+6. **Let Your Agent Drive**, verbatim shape:
 
    ```md
    ## Let Your Agent Drive
@@ -39,26 +83,53 @@ Target 120–180 lines. Structure:
    npx skills add antflydb/antfly-skills
    ```
 
-   Then prompt it with the outcome — e.g. "<one concrete prompt matching this guide>" —
-   and use this page to judge the result.
+   Then prompt it with the outcome, for example "<one concrete prompt matching this
+   guide>", and use this page to judge the result.
    ```
 
-7. **Next Steps** — 2–4 links to related guides.
+7. **Next Steps**: two or three links, each with a clause saying why you would go there.
+
+Not in a guide: an "Overview" section, a "What this doesn't do" section, a
+"Troubleshooting" section (fold the two errors people actually hit into the step where
+they happen), an "Additional Resources" list, a feature table.
+
+## Concept anatomy
+
+Target 150 to 300 lines. Concept pages answer "how does this work and what should I
+decide?" They are read when a guide's judgment section was not enough.
+
+1. **`<Questions>`** as above.
+2. **The opener**, no heading: what the thing is in one or two sentences, and the one
+   decision the reader most often needs it for. Then the smallest runnable example that
+   proves the thing exists, where one fits in ten lines.
+3. **Sections by mechanism**, each answering one question the reader has. Headings are
+   nouns or short claims, not "How It Works" or "Overview". Tables for state machines
+   and option matrices; prose for reasoning.
+4. **The decisions**, near the end: when to choose which option, stated as rules with
+   the reason attached.
+5. **Let Your Agent Drive** and **Next Steps** as in guides, where a concrete prompt
+   makes sense. A concept page whose subject an agent would never be prompted to "do"
+   (model compatibility, for instance) skips the agent section.
 
 ## Facts
 
-Every endpoint, flag, provider name, enum value, and default must be verified against
-the **current** Antfly source before it ships — the API surface has moved and older
-examples break silently. The recurring traps:
+Every endpoint, flag, provider name, enum value, and default is verified against the
+**current** Antfly source before it ships. The API surface has moved and older examples
+break silently. The recurring traps:
 
-- API bases are `/db/v1` (database), `/auth/v1` (users/keys), `/ai/v1` (inference) —
-  never `/api/v1`.
+- API bases are `/db/v1` (database), `/auth/v1` (users and keys), `/ai/v1` (inference).
+  Never `/api/v1` or a bare `/v1`.
 - The local inference provider is `antfly` (not `termite`); the CLI namespace is
-  `antfly inference` and the local command is `antfly standalone`.
+  `antfly inference` and the local server command is `antfly standalone`.
+- Fusion is configured with `merge_config: {strategy, weights, window_size,
+  rank_constant}`. `strategy` is `rrf` (default) or `rsf`; `failover` parses but is
+  rejected with a 422. There is no `merge_strategy` field.
+- A `reranker` needs `provider`, `model`, and `field` (or `template`). Only
+  `provider: antfly` executes.
 - Retrieval-agent generation runs via `steps.generation` and accepts providers
   `gemini`, `vertex`, `openai`, `ollama`, `antfly` only; responses are JSON unless
   `stream: true`.
-- `semantic_search` requires `indexes: [...]` — omitting it is an HTTP 422.
+- `semantic_search` requires `indexes: [...]`; omitting it is an HTTP 422.
 - `sync_level: "full_index"` for read-after-write vector queries.
 - Model refs are owner-qualified (`BAAI/bge-small-en-v1.5`,
   `mixedbread-ai/mxbai-rerank-base-v1`).
@@ -66,5 +137,5 @@ examples break silently. The recurring traps:
 When in doubt, `antfly-skills/references/` is the verified corpus (CI-checked against
 `openapi.yaml`); the implementation outranks spec prose.
 
-A guide ships only after someone — or an agent under observation — has executed it
+A guide ships only after someone, or an agent under observation, has executed it
 end-to-end against a live instance.

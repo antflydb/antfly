@@ -1,7 +1,7 @@
 ---
 title: "Use Antfly from n8n"
-description: "An n8n AI Agent whose retrieval tool is your Antfly instance, connected over MCP with no application code"
-order: 2.3
+description: "An n8n AI Agent that answers from your Antfly table over hosted MCP, with no application code between the two"
+order: 3
 ---
 
 <Questions>
@@ -11,25 +11,17 @@ order: 2.3
 - Why does my n8n agent's Antfly query fail with `invalid query request`?
 </Questions>
 
-## The Pattern
+By the end of this guide, an n8n AI Agent answers chat messages from your Antfly table. n8n keeps owning the parts around the answer (the trigger, the ticket it opens, the CRM row it updates) and Antfly supplies what the agent knows, as one more tool on the canvas. You need an Antfly Cloud instance with an indexed table (the examples use `docs` with an embeddings index `docs_vectors` and a text field `text`) and an n8n workspace.
 
-n8n already owns the parts around the answer: the chat trigger, the ticket that gets opened, the CRM record that gets updated, the email that goes out. What it does not own is knowing anything. Antfly supplies that half through a single MCP connection, and the agent gets grounded retrieval as one more tool on the canvas.
-
-The thing that makes this different from wiring retrieval into your own service is that there is no application code in the middle. Nothing normalizes a malformed tool call, retries a bad query shape, or rewrites a citation before it reaches the user. Whatever discipline the retrieval needs has to live in the agent's system message, written out explicitly, because the system message is the only place left to put it.
+There is no application code in this setup. Nothing normalizes a malformed tool call or retries a bad query shape, so the discipline the retrieval needs lives in the agent's system message, written out in full. Step 3 gives you that message. Four steps get you there.
 
 ## 1. Create a Read-Only Instance Key
 
-In the Antfly Cloud console, create an API key on the instance you want n8n to read, with key type **read only**. Copy it when it is shown; it is displayed once. A cloud key carries an `antflydb_` prefix — anything else is rejected as not a cloud API key.
+In the Antfly Cloud console, create an API key on the instance n8n should read, with key type **read only**. Copy it when it is shown; it is displayed once. Cloud keys carry an `antflydb_` prefix.
 
-The key scope is what shapes the agent's power. A read-only key makes the instance filter its own tool list, so the agent is offered `query`, `get_document`, `describe_table`, `list_indexes`, `describe_indexes`, `sample_documents`, and the two `describe_*` helpers — and no `batch`, no `create_table`, no `drop_index`. The agent cannot write to your data because the tools to do it are never sent to it.
+The key type decides what the agent can do. A read-only key makes the instance filter its own tool list: the agent is offered the read tools (`query`, `get_document`, `describe_table`, `list_indexes`, `describe_indexes`, `sample_documents`, `describe_query_request`, `describe_mcp_capabilities`, and `list_tables` on an unscoped key) and never sees `batch`, `create_table`, or `drop_index`. The agent cannot write to your data because the tools to do it are never sent to it.
 
-Your MCP endpoint is the instance id dropped into the hosted path:
-
-```
-https://platform.antfly.io/cloud/v1/inst_abc123/mcp/v1
-```
-
-Replace `inst_abc123` with your own instance id. Confirm the pair works before you open n8n:
+Your MCP endpoint is your instance id dropped into the hosted path. Confirm the pair works before opening n8n:
 
 ```bash
 curl -X POST https://platform.antfly.io/cloud/v1/inst_abc123/mcp/v1 \
@@ -48,15 +40,11 @@ curl -X POST https://platform.antfly.io/cloud/v1/inst_abc123/mcp/v1 \
   }'
 ```
 
-A successful response carries an `Mcp-Session-Id` header and the server's capabilities. A `401` means the key is missing or malformed; a `403` means the key belongs to a different instance than the one in the URL.
-
-<Callout type="info">
-Hosted MCP is a server-side surface. The gateway rejects any request carrying an `Origin` header with a `403`, so this endpoint is for n8n and other backends, not for browser code.
-</Callout>
+A good response carries an `Mcp-Session-Id` header and the server's capabilities. A `401` means the key is missing or malformed. A `403` means the key belongs to a different instance than the one in the URL, or the request carried an `Origin` header: hosted MCP is for backends like n8n, never for browser code.
 
 ## 2. Add the MCP Client Tool Node
 
-Build the workflow from three nodes plus a trigger:
+The workflow is three nodes and a trigger:
 
 ```text
 When chat message received -> AI Agent
@@ -64,17 +52,17 @@ When chat message received -> AI Agent
                               `-- MCP Client Tool
 ```
 
-Add **When chat message received** and connect it to an **AI Agent**. Connect one chat model to the agent — retrieval is model-independent, so use whichever generation provider is approved for your deployment. Then attach an **MCP Client Tool** to the agent's Tool input and configure it:
+Add **When chat message received** and connect it to an **AI Agent**. Connect any chat model to the agent; retrieval does not depend on which one. Attach an **MCP Client Tool** to the agent's Tool input:
 
-- Set the MCP URL to your instance endpoint from step 1, ending in `/mcp/v1`.
-- Select **Bearer Auth** and create a credential containing the token only. n8n supplies the `Authorization: Bearer` header itself.
-- Set **Tools to Include** to **Selected**, and expose only `query` and `get_document`.
+- MCP URL: your instance endpoint from step 1, ending in `/mcp/v1`.
+- Authentication: **Bearer Auth**, with a credential holding the token only. n8n adds the `Authorization: Bearer` header itself.
+- Tools to Include: **Selected**, exposing only `query` and `get_document`.
 
-Run the MCP node on its own before touching the agent. It should list the tools you selected. Fixing a connection here, where one node fails in isolation, is far easier than reading it out of an agent execution trace later.
+Run the MCP node on its own before touching the agent. It should list the two tools. A connection problem is far easier to read here, where one node fails alone, than out of an agent execution trace later.
 
 ## 3. Give the Agent the Query Vocabulary
 
-Paste this into the AI Agent's **System Message** field. It is doing the job your application code would otherwise do — pinning the exact tool-call shape so the model has nothing to improvise:
+Paste this into the AI Agent's **System Message**. It pins the exact tool-call shape so the model has nothing to improvise:
 
 ```text
 You are a documentation support agent. Answer only from evidence returned by the
@@ -86,7 +74,7 @@ For every substantive question, start with exactly one `query` call against tabl
 `queryRequest`. `queryRequest` must be a JSON object, never a quoted string, and
 never combined with shorthand arguments. Do not put `table` inside `queryRequest`.
 
-For broad questions — definitions, overviews, architecture, "when do I use" — send
+For broad questions (definitions, overviews, architecture, "when do I use") send
 one expanded semantic query:
 
 {
@@ -99,7 +87,7 @@ one expanded semantic query:
   }
 }
 
-For exact terms — API paths, error strings, flags, field names, commands — combine
+For exact terms (API paths, error strings, flags, field names, commands) combine
 full-text and semantic search and fuse them:
 
 {
@@ -130,25 +118,25 @@ Use only read tools. Business actions such as opening a ticket are separate n8n
 tools, not Antfly ones.
 ```
 
-Replace `docs`, `docs_vectors`, and `text` with your own table, embedding index, and text field. Two details are load-bearing: `semantic_search` is rejected with a `422` if `indexes` is missing, and `hierarchy: {}` is what asks for direct chunk-level matches rather than whole source documents.
+Replace `docs`, `docs_vectors`, and `text` with your own table, embeddings index, and text field. Two details carry weight: `semantic_search` is rejected with a `422` when `indexes` is missing, and `hierarchy: {}` asks for direct chunk-level matches rather than whole source documents.
 
-Set the chat model temperature to `0` or `0.1` and keep the agent's maximum iterations between 4 and 6. That is tight enough to suppress speculative tool calls while still allowing the one focused fallback.
+Set the chat model temperature to `0` or `0.1` and the agent's maximum iterations between 4 and 6. That is tight enough to suppress speculative tool calls while allowing the one focused fallback.
 
-## 4. Send a Chat Message and Read the Trace
+## 4. Send a Message and Read the Trace
 
-Open the chat panel and ask something your table can actually answer. Then open the execution and read the agent's tool calls rather than just the prose.
+Open the chat panel and ask something your table can answer. Then open the execution and read the agent's tool calls, not just the prose.
 
-A healthy execution makes one `query` call, returns chunks with real text in them, and cites pages that exist. Then check the negative case: ask it to create a table. It must decline, because no write tool was ever offered to it.
+A healthy execution makes one `query` call, gets chunks with real text in them, and cites pages that exist. Then check the negative case: ask it to create a table. It must decline, because no write tool was ever offered.
 
-When a call comes back `invalid query request`, open the failed tool call and look at its actual input. The stack trace will not tell you which property was wrong; the input will. It is nearly always the same thing — `queryRequest` arriving as a quoted string, or shorthand arguments mixed in beside it.
+When a call comes back `invalid query request`, open the failed tool call and look at its actual input. The error will not say which property was wrong; the input will. It is nearly always `queryRequest` arriving as a quoted string, or shorthand arguments mixed in beside it.
 
-## Why the Workflow Should Stop, Not Retry
+## Why the Workflow Stops Instead of Retrying
 
-In a coded integration, a transport failure is something you catch and handle. Here there is no catch block, and the agent's instinct on a failed tool call is to try again, differently — a second query, then a third, fanning out against an instance that is already unhealthy or a credential that was already rejected.
+In a coded integration a transport failure is something you catch. Here there is no catch block, and an agent's instinct on a failed tool call is to try again, differently: a second query, then a third, fanning out against an instance that is already unhealthy or a credential that was already rejected.
 
-None of those retries can succeed. An expired key returns `401` every time. A closed MCP connection stays closed. What the retries do accomplish is turning one clear failure into a slow execution that eventually produces a confident answer written from the model's memory instead of your documents, which is worse than an error message.
+None of those retries can succeed. An expired key returns `401` every time. A closed MCP connection stays closed. What the retries do produce is a slow execution that ends in a confident answer written from the model's memory instead of your documents, which is worse than an error message. So the system message tells the agent to stop calling tools for the rest of that answer and report the outage.
 
-So the system message tells the agent to stop making tool calls for the rest of that answer, and the model reports the outage instead of routing around it. When you diagnose it: if every client fails, it is an instance or gateway incident, not a prompt problem. If only n8n fails, recreate the Bearer credential and refresh the node connection, then run the MCP node alone again.
+When you diagnose one: if every client fails, it is an instance or gateway problem, not a prompt problem. If only n8n fails, recreate the Bearer credential, refresh the node connection, and run the MCP node alone again.
 
 ## Let Your Agent Drive
 
@@ -159,10 +147,10 @@ so a coding agent can execute this guide for you:
 npx skills add antflydb/antfly-skills
 ```
 
-Then prompt it with the outcome — e.g. "Set up an n8n workflow that answers questions from my Antfly docs table over MCP" — and use this page to judge the result.
+Then prompt it with the outcome, for example "Set up an n8n workflow that answers questions from my Antfly docs table over MCP", and use this page to judge the result.
 
 ## Next Steps
 
 - [Build a Support Answer Agent](/docs/guides/support-answer-agent): the same outcome with reranking and pruning, when you control the code
-- [Hybrid Search](/docs/guides/hybrid-search): tuning the fusion behind the exact-term query above
+- [Tune Hybrid Search](/docs/guides/hybrid-search): the fusion behind the exact-term query above
 - [Quickstart](/docs/guides/quickstart): create and index the table this workflow reads from

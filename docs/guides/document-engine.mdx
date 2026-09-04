@@ -1,7 +1,8 @@
 ---
 title: Document Engine
-order: 5
-description: How Antfly stores, indexes, queries, filters, sorts, paginates, and traverses documents
+order: 1
+sidebar: concepts
+description: How one query composes full-text, vector, filters, graph traversal, exact sort, and cursor pagination over a table's physical indexes
 ---
 
 <Questions>
@@ -12,44 +13,24 @@ description: How Antfly stores, indexes, queries, filters, sorts, paginates, and
 - Why does an exact sorted query return 422?
 </Questions>
 
-## Overview
+A table stores JSON documents. Schema mappings describe how each field becomes a queryable structure, and the planner picks the exact or approximate execution path that matches the request. The decision this page is most often read for: when a query needs an exact sorted page, which fields can serve it, and why the planner refuses rather than guesses.
 
-Antfly's document engine is one query system over several physical indexes. A
-table stores JSON documents, schema mappings describe how fields become queryable
-structures, and the planner chooses the exact or approximate execution path that
-matches the request.
+The pieces the planner composes:
 
-The important pieces are:
-
-- **Documents** are the source payload returned to clients.
-- **Mappings** declare field types such as `text`, `keyword`, `number`,
-  `date`, `boolean`, `embedding`, and `geo_point`.
-- **Full-text indexes** execute BM25 and phrase-style searches over analyzed
-  text fields.
+- **Documents** are the source payload returned to clients. Stored JSON is never the production search or sort index.
+- **Mappings** declare field types such as `text`, `keyword`, `number`, `date`, `boolean`, `embedding`, and `geo_point`.
+- **Full-text indexes** execute BM25 and phrase-style searches over analyzed text fields.
 - **Vector indexes** execute semantic nearest-neighbor search over embeddings.
-- **Typed field values** power exact structured filters, aggregations, and field
-  sort without parsing stored JSON on the hot path.
-- **Graph indexes** materialize relationships and run traversal or pattern
-  queries over document ids.
-- **The query planner** composes those structures, applies filters and
-  exclusions, sorts or ranks the eligible set, and returns one page.
+- **Typed field values** power exact structured filters, aggregations, and field sort without parsing stored JSON on the hot path.
+- **Graph indexes** materialize relationships and run traversal or pattern queries over document ids.
 
-Stored JSON remains the document payload. It is not the production search or
-sort index.
+Indexes that union generated document, chunk, embedding, or relationship streams are covered in [Artifact-Backed Indexes](/docs/guides/artifact-indexes).
 
-For indexes that union generated document, chunk, embedding, or relationship
-streams, see [Artifact-Backed Indexes](/docs/guides/artifact-indexes).
+## Mappings Decide What a Field Can Do
 
-## Schema And Field Capabilities
+Antfly accepts schemaless documents, but fields that take part in filters, sort, and graph traversals behave best with a mapping. A mapping gives the planner a stable type and lets indexing build the right physical sections.
 
-Antfly can accept schemaless documents, but production query behavior is best
-when fields that participate in filters, sort, and graph traversals have schema
-mappings. Mappings give the planner a stable type model and let Antfly build the
-right physical sections during indexing.
-
-Use `text` for analyzed search and an exact scalar mapping for exact filters and
-sort. A common pattern is to expose both a searchable text field and a keyword
-subfield:
+Use `text` for analyzed search and an exact scalar mapping for exact filters and sort. The common shape is a searchable text field with a keyword subfield:
 
 ```json
 {
@@ -108,46 +89,22 @@ subfield:
 }
 ```
 
-`sortable` is the user-facing declaration. Antfly derives the internal typed
-field-value structures needed for exact sort and filters. Do not configure
-`doc_values` directly.
+`sortable` is the whole declaration. Antfly derives the typed field-value structures that exact sort and filters need; there is no `doc_values` to configure. The SDKs expose `DocumentFieldMapping` and `DocumentSubfieldMapping` for this `x-antfly-field` shape. `TemplateFieldMapping` is deliberately narrower: it represents one dynamic-template output and does not accept `fields`.
 
-SDKs expose `DocumentFieldMapping` and `DocumentSubfieldMapping` for the
-`x-antfly-field` shape above. `TemplateFieldMapping` is intentionally narrower:
-it represents one dynamic-template output and does not accept `fields`.
+The compact `x-antfly-types` shorthand still works for simple and multi-field search mappings, but it never enables exact sort on its own. Sort needs the detailed `x-antfly-field` form with `sortable: true`, so that doc-value storage and build cost land only on the scalar fields that asked for them. A mapping change rebuilds physical coverage. Once the write or rebuild visibility barrier completes, clients can issue `order_by` directly: Antfly validates a cold field on first use and fails closed if physical coverage is incomplete. Status reads never warm columns, so a safe but not-yet-validated field can remain `declared` until that first sort.
 
-The compact `x-antfly-types` shorthand remains supported for simple and
-multi-field search mappings, but does not implicitly enable exact sort. Use
-`x-antfly-field` as the detailed form when a field needs physical options such
-as `sortable: true`. This intentionally avoids adding doc-value storage and
-build cost to every scalar field. The mapping change rebuilds physical
-coverage. Once the write or rebuild visibility barrier completes, clients may
-issue `order_by` directly: Antfly validates a cold field on first use and fails
-closed if physical coverage is incomplete. Status reads never warm columns, so
-a safe but not-yet-validated field can remain `declared` until that first sort.
-
-Explicit mappings are exact, table-wide physical declarations. Present values
-must be encodable by the mapping—for example, a `date` mapping accepts an RFC
-3339/date string or a non-negative nanosecond timestamp—and invalid writes are
-rejected before indexing. An `allOf` may contribute an exact mapping. Every
-alternative of an `anyOf` or `oneOf` must contribute the same normalized
-mapping; conditional or dynamically named mappings are rejected because they
-cannot guarantee one stable physical type for the dotted path.
+Explicit mappings are exact, table-wide physical declarations. Present values must be encodable by the mapping (a `date` mapping accepts an RFC 3339 date string or a non-negative nanosecond timestamp), and invalid writes are rejected before indexing. An `allOf` may contribute an exact mapping. Every alternative of an `anyOf` or `oneOf` must contribute the same normalized mapping; conditional or dynamically named mappings are rejected because they cannot guarantee one stable physical type for the dotted path.
 
 Field capabilities report what the planner can safely do with a concrete field:
 
-- `query_modes` describes modes such as `full_text`, `exact`, `range`, `geo`,
-  and `autocomplete`.
+- `query_modes` lists modes such as `full_text`, `exact`, `range`, `geo`, and `autocomplete`.
 - `sortable` says the field is declared sortable.
-- `sort_lifecycle_state` reports cached physical evidence. `queryable` and
-  `accelerated` are already validated; `declared` or `indexed` can be validated
-  by the first exact-sort request. `unsupported` is not sortable.
-- `index_sort_position` and `index_sort_order` identify fields participating in
-  the table's physical index sort.
+- `sort_lifecycle_state` reports cached physical evidence. `queryable` and `accelerated` are already validated; `declared` or `indexed` can be validated by the first exact-sort request; `unsupported` is not sortable.
+- `index_sort_position` and `index_sort_order` identify fields in the table's physical index sort.
 
-## Query Pipeline
+## One Request, One Execution Shape
 
-A query request can combine several inputs:
+A query request combines several inputs:
 
 - `query` or `full_text_search` supplies the scoring text query.
 - `semantic_search` supplies the vector query.
@@ -155,13 +112,10 @@ A query request can combine several inputs:
 - `exclusion_query` removes matching documents.
 - `graph_queries` run graph traversals or patterns alongside document search.
 - `order_by`, `search_after`, and `search_before` control exact ordered pages.
-- `reranker` and `pruner` can post-process the selected search results.
+- `reranker` and `pruner` post-process the selected results.
 - `fields` controls the response projection.
 
-The planner normalizes the request into one execution shape. Full-text and
-semantic search can both produce candidates, filters and exclusions narrow the
-eligible set, graph searches can add relationship results, and sort or score
-ordering decides which page is returned.
+The planner normalizes the request into one execution shape. Full-text and semantic search both produce candidates, filters and exclusions narrow the eligible set, graph searches add relationship results, and sort or score ordering decides which page comes back.
 
 ```json
 {
@@ -181,28 +135,29 @@ ordering decides which page is returned.
 }
 ```
 
+## Scoring Order Versus Exact Order
+
+Full-text search uses analyzed text fields and returns BM25-style relevance. Use it when exact terms, phrases, field scoping, and lexical constraints matter. Vector search ranks by semantic similarity; use it when meaning matters more than wording. Hybrid search runs both and fuses the ranked sets, most often with Reciprocal Rank Fusion.
+
+When a request includes `semantic_search`, the primary order is semantic score or hybrid relevance. Exact field sorting stays separate on purpose: approximate vector top-k is not "all matching documents sorted by field". A request that could only be served by approximate overfetch and rerank pretending to be exact sort is rejected instead of answered with a misleading page.
+
+## Filters Shape the Eligible Set
+
+Filters are clauses that must match in addition to the main query. Exclusions remove documents after candidate selection. For scalar fields with native mappings, term, range, boolean, and date filters are evaluated from native field structures rather than parsed JSON.
+
+This is what makes exact sort possible: an exact sorted page needs an exact eligible set. A broad filter with an `index_sort`-compatible order is served by scanning sorted segments. A selective filter usually works better as candidate-first doc-values top-N. A filter and sort combination the planner cannot serve exactly fails closed with a stable 422 reason rather than falling back to an unbounded stored-source scan.
+
 ## Graph Queries
 
-`graph_queries` is an operation-keyed DSL. Each named query contains exactly
-one of `traverse`, `match`, `shortest_path`, or `k_shortest_paths`. A traversal
-defaults to one hop, and stored documents are returned only when the operation
-enables `include_documents`.
+`graph_queries` is an operation-keyed DSL. Each named query contains exactly one of `traverse`, `match`, `shortest_path`, or `k_shortest_paths`. A traversal defaults to one hop, and stored documents come back only when the operation enables `include_documents`.
 
-Traversal, MATCH edges, shortest paths, and K-shortest paths all use the same
-stored-edge `direction`: `out` by default, `in` for reverse expansion, and
-`both` for undirected expansion. Store one physical relationship and select
-`both` when its query semantics are undirected; storing a reciprocal edge
-creates a second physical relationship and can therefore create a second
-binding or path.
+Traversal, MATCH edges, shortest paths, and K-shortest paths all use the same stored-edge `direction`: `out` by default, `in` for reverse expansion, and `both` for undirected expansion. Store one physical relationship and select `both` when its semantics are undirected; a reciprocal edge is a second physical relationship and can produce a second binding or path.
 
-Every canonical result is self-describing through `kind`: MATCH returns
-`bindings` or `aggregates`, traversal returns `nodes`, and shortest-path
-operations return `paths`. Each `paths[]` item owns one authoritative `path`
-and, when requested, its terminal `document`; clients never need to align a
-parallel terminal-node array with the path array.
+Every result is self-describing through `kind`: MATCH returns `bindings` or `aggregates`, traversal returns `nodes`, and shortest-path operations return `paths`. Each `paths[]` item owns one authoritative `path` and, when requested, its terminal `document`, so clients never align a parallel terminal-node array with the path array.
 
-Use `$query_results` to seed a graph operation from the final ranked result page,
-regardless of whether retrieval was lexical, vector, or fused:
+### Seeding From Search Results
+
+`$query_results` seeds a graph operation from the final ranked result page, whether retrieval was lexical, vector, or fused:
 
 ```jsonc
 {
@@ -222,33 +177,19 @@ regardless of whether retrieval was lexical, vector, or fused:
 }
 ```
 
-Traversal and path outputs can seed another graph operation with
-`$graph_results.<query-name>`. A path result contributes the endpoint node of
-each returned path. MATCH produces rows with multiple aliases, so a downstream
-selector must also name the returned `binding`:
+Traversal and path outputs can seed another operation with `$graph_results.<query-name>`. A path result contributes the endpoint node of each returned path. MATCH produces rows with several aliases, so a downstream selector also names the `binding`:
 
 ```jsonc
 {"result_ref": "$graph_results.authors_and_posts", "binding": "post", "limit": 100}
 ```
 
-Omit `limit` only when the referenced result is complete. Antfly rejects
-unbounded references to truncated result pages rather than returning a partial
-answer. Table-qualified identities use `{"key":"…","table":"…"}`; omitting
-`table`, or explicitly naming the queried table, has the same identity
-semantics.
+Omit `limit` only when the referenced result is complete. Antfly rejects unbounded references to truncated result pages rather than returning a partial answer. Table-qualified identities use `{"key":"…","table":"…"}`; omitting `table`, or naming the queried table explicitly, has the same identity semantics.
 
-Canonical paths preserve that identity on both nodes and edges. Each path edge
-uses typed `from` and `to` endpoints and is ordered with the node list:
-`edges[i]` traverses from `nodes[i]` to `nodes[i + 1]`. The deprecated
-`graph_searches` response keeps its original unqualified `source` and `target`
-edge keys during the compatibility window.
+Canonical paths keep that identity on nodes and edges. Each path edge uses typed `from` and `to` endpoints and is ordered with the node list: `edges[i]` traverses from `nodes[i]` to `nodes[i + 1]`. The deprecated `graph_searches` response keeps its original unqualified `source` and `target` edge keys during the compatibility window.
 
-`match` expresses branched conjunctive patterns and can return rows or exact
-named counts. Node filters are non-scoring stored-document predicates; they do
-not run full-text analyzers. Range predicates use explicit `numeric_range` or
-`term_range` wrappers, or `date_range` with RFC 3339 bounds, so their types
-remain unambiguous in every SDK. Date bounds are normalized into Antfly's
-unsigned Unix-nanosecond domain (1970-01-01 through 2554-07-21 UTC).
+### MATCH Patterns
+
+`match` expresses branched conjunctive patterns and returns rows or exact named counts. Node filters are non-scoring stored-document predicates; they do not run full-text analyzers. Range predicates use explicit `numeric_range` or `term_range` wrappers, or `date_range` with RFC 3339 bounds, so their types stay unambiguous in every SDK. Date bounds normalize into Antfly's unsigned Unix-nanosecond domain (1970-01-01 through 2554-07-21 UTC).
 
 ```jsonc
 {
@@ -289,15 +230,19 @@ unsigned Unix-nanosecond domain (1970-01-01 through 2554-07-21 UTC).
 }
 ```
 
-Optional groups are correlated left-outer patterns and run in array order. Each
-group must connect to an alias from the required pattern or an earlier optional
-group. A group with no match retains one row and exposes each alias introduced
-by that group as `null`. `where.not_exists` is the anti-join form: its edges may
-refer only to aliases already visible at that point and do not introduce aliases.
+`match.anchor` names the alias enumerated from the query table. Omit a node's `table` for that same table; declare `table` on every cross-table alias. The declaration is part of the alias's identity and lets the planner expand a relationship in reverse without guessing its source table. Reached aliases keep their table-qualified identities, and a binding from a different table never satisfies the declaration. For cross-table multi-hop patterns, declare an alias at each table boundary and connect them with single-hop edges; Antfly fails closed when exact execution would need to reverse a variable-length edge through unnamed intermediate nodes whose source tables cannot be proven.
 
-For example, this forms authored-post bindings with optional replies. The
-anti-join excludes bindings where the author also has a `BLOCKED` relationship
-to that post:
+MATCH edge direction is relative to `from` and defaults to `out`. `direction: "in"` traverses a stored relationship in reverse; `direction: "both"` treats one stored relationship as undirected, and a physical self-loop still contributes only one relationship binding under `both`. Fixed single-hop relationships preserve physical self-loops, so distinct aliases may bind the same node unless `where.not_equal` excludes it. Variable-length relationships stay node-simple except for explicit repeated-alias cycle closure.
+
+Top-level full-text, semantic, and filter clauses shape the retrieval result only; they do not narrow `MATCH`. Put source constraints on the node named by `match.anchor`. Row-level authorization still applies to every anchor and reached node. Anchor identities are read in stable snapshot-pinned pages, independently for each named operation. An `ids` filter, or a disjunction containing only `ids` filters, resolves through the primary identity index and needs no secondary index. Other fields used by anchor or authorization filters must have native index coverage, because exact anchors are cursor-scanned in `_id` order; Antfly returns `graph_anchor_filter_requires_index` when it cannot prove that complete scan. Index the referenced fields rather than relying on stored-source fallback.
+
+Graph document filters address stored values with RFC 6901 JSON Pointers: `/kind` for a top-level field, `/author/name` for a nested one; escape `~` as `~0` and `/` within a key as `~1`.
+
+### Optional Groups and Anti-Joins
+
+Optional groups are correlated left-outer patterns and run in array order. Each group must connect to an alias from the required pattern or an earlier optional group. A group with no match keeps one row and exposes each alias it introduced as `null`. `where.not_exists` is the anti-join form: its edges may refer only to aliases already visible at that point and introduce none.
+
+This forms authored-post bindings with optional replies, and excludes bindings where the author also has a `BLOCKED` relationship to that post:
 
 ```jsonc
 {
@@ -341,125 +286,27 @@ to that post:
 }
 ```
 
-`count(*)` includes the null-extended row produced when a post has no reply.
-`count(alias)` ignores rows where that alias is null, matching SQL count
-semantics. If several replies match one post, the row and reply counts observe
-each resulting binding; use `distinct: true` on an alias count when unique
-identities are required, as the `posts` aggregate does above.
+### Counts and Rows
 
-Use `CountGraphRows` and `CountGraphAlias` in Go, `countGraphRows` and
-`countGraphAlias` in TypeScript, or `count_graph_rows` and `count_graph_alias`
-in Python to construct validated count expressions. The alias helpers reject
-reserved or unsafe graph identifiers before a request is sent.
+`count(*)` includes the null-extended row produced when a post has no reply. `count(alias)` ignores rows where that alias is null, matching SQL count semantics. If several replies match one post, the row and reply counts observe each resulting binding; use `distinct: true` on an alias count when unique identities are required, as the `posts` aggregate does above. Put multiple counts over one pattern in a single `match` return object so they share one complete anchor scan and one set of bindings. A request may contain at most eight named `match` operations.
 
-Exact aggregation streams bindings without materializing a bounded row page.
-Row returns expose each alias as a compact `{key, table?, document?}` binding.
-Traversal-only metrics such as `depth`, `distance`, and `path` are intentionally
-absent because a node in a branched match has no single canonical traversal
-distance. Request a traversal or path operation when those metrics are the
-desired result.
-`match.anchor` names the alias enumerated from the query table. Omit a node's
-`table` for that same table; declare `table` on every cross-table alias. The
-declaration is part of the alias's identity and lets the planner safely expand a
-relationship in reverse without guessing its source table. Reached aliases
-retain their table-qualified identities, and a binding from a different table
-never satisfies the declaration. Anchor
-identities are read in stable snapshot-pinned pages, independently for each
-named graph operation. A request may contain at most eight named `match`
-operations. Put multiple counts over one pattern in a single `match` return
-object so they share one complete anchor scan and one set of bindings.
-For cross-table multi-hop MATCH patterns, declare an alias at each table
-boundary and connect those aliases with single-hop edges. Antfly fails closed
-when exact execution would otherwise need to reverse a variable-length edge
-through unnamed intermediate nodes whose source tables cannot be proven.
-Aliases and aggregate names are limited to 128 Unicode code points. A binding
-projection explicitly lists between one and 64 unique aliases; list every
-declared alias when the complete row is required. These bounds keep admission
-predictable and let the matcher compile projection membership once per operation.
-Fixed single-hop relationships preserve physical self-loops, so distinct aliases
-may bind the same node unless `where.not_equal` excludes that binding. Variable-
-length relationships remain node-simple except for explicit repeated-alias cycle
-closure.
-MATCH edge direction is relative to `from` and defaults to `out`. Use
-`direction: "in"` to traverse a stored relationship in reverse, or
-`direction: "both"` to treat one stored relationship as undirected. A physical
-self-loop still contributes only one relationship binding under `both`.
-Top-level full-text, semantic, and filter clauses shape the retrieval result only;
-they do not implicitly narrow `MATCH`. Put source constraints on the node named by
-`match.anchor`. Row-level authorization still applies to every anchor and reached
-node. An `ids` filter, or a disjunction containing only `ids` filters, resolves
-through the primary identity index and needs no secondary index. Other fields
-used by anchor or authorization filters must have native index coverage because
-exact anchors are cursor-scanned in `_id` order. Antfly returns
-`graph_anchor_filter_requires_index` when it cannot prove that complete scan;
-index the referenced fields rather than relying on stored-source fallback.
-Graph document filters address stored values with RFC 6901 JSON Pointers. For
-example, use `/kind` for a top-level field and `/author/name` for a nested field;
-escape `~` as `~0` and `/` within a key as `~1`.
+Use `CountGraphRows` and `CountGraphAlias` in Go, `countGraphRows` and `countGraphAlias` in TypeScript, or `count_graph_rows` and `count_graph_alias` in Python to build validated count expressions; the alias helpers reject reserved or unsafe graph identifiers before a request is sent.
 
-All graph expansion work is budgeted across the whole request, including every
-named operation and every K-shortest-path spur search. Traversal and path
-operations also retain their explicit per-operation depth and result bounds.
-The matcher also enforces a byte ceiling on retained frontier ancestry, in
-addition to its node, edge, and intermediate-state limits, so long identities
-cannot bypass the memory invariant.
-If Antfly cannot enumerate the complete authorized anchor relation or exhausts
-that budget, the request fails instead of returning a partial count.
-Exact `count(distinct alias)` sets also share a request-scoped identity and byte
-budget. Exhaustion returns `graph_distinct_budget_exceeded`; narrow the anchor
-predicate or use a non-distinct aggregate.
+Exact aggregation streams bindings without materializing a bounded row page. Row returns expose each alias as a compact `{key, table?, document?}` binding. A binding projection lists between one and 64 unique aliases; list every declared alias when the complete row is required. Aliases and aggregate names are limited to 128 Unicode code points. Traversal-only metrics such as `depth`, `distance`, and `path` are absent from MATCH results, because a node in a branched match has no single canonical traversal distance; request a traversal or path operation when those are the result you want.
 
-The deprecated `graph_searches` request field remains a wire-compatibility
-adapter for the v0.2 shape. Its operation names remain opaque legacy map keys;
-the canonical GraphIdentifier policy applies only to `graph_queries`. The
-request-wide 64-operation safety limit applies to both dialects. New clients
-should generate only `graph_queries`. A successful stateful request that uses
-`graph_searches` includes the RFC 9745 deprecation date
-`Deprecation: @1787702400` (2026-08-26 UTC), and Antfly emits a stable
-low-cardinality acceptance log without table names, operation names, or query
-contents. The compatibility adapter must not be removed until fleet telemetry
-shows that legacy traffic has drained; serverless Antfly and MemoryAF remain
-canonical-only and do not emit legacy responses.
+### Budgets
 
-## Full-Text And Vector Search
+All graph expansion work is budgeted across the whole request, including every named operation and every K-shortest-path spur search. Traversal and path operations also keep their explicit per-operation depth and result bounds. The matcher enforces a byte ceiling on retained frontier ancestry in addition to its node, edge, and intermediate-state limits, so long identities cannot bypass the memory invariant. If Antfly cannot enumerate the complete authorized anchor relation or exhausts the budget, the request fails instead of returning a partial count. Exact `count(distinct alias)` sets share a request-scoped identity and byte budget; exhaustion returns `graph_distinct_budget_exceeded`, and the fix is to narrow the anchor predicate or use a non-distinct aggregate.
 
-Full-text search uses analyzed text fields and returns BM25-style relevance.
-Use it when exact terms, phrases, field scoping, and lexical constraints matter.
+### The Deprecated `graph_searches` Dialect
 
-Vector search ranks by semantic similarity. Use it when natural-language meaning
-matters more than exact wording. Hybrid search runs both and fuses the ranked
-sets, commonly with Reciprocal Rank Fusion.
+`graph_searches` remains a wire-compatibility adapter for the v0.2 shape. Its operation names stay opaque legacy map keys; the canonical GraphIdentifier policy applies only to `graph_queries`. The request-wide 64-operation safety limit applies to both dialects. New clients generate only `graph_queries`. A successful stateful request that uses `graph_searches` includes the RFC 9745 deprecation date `Deprecation: @1787702400` (2026-08-26 UTC), and Antfly emits a stable low-cardinality acceptance log without table names, operation names, or query contents. The adapter stays until fleet telemetry shows legacy traffic has drained; serverless Antfly and MemoryAF are canonical-only and do not emit legacy responses.
 
-When a request includes `semantic_search`, the primary result order is semantic
-score or hybrid relevance. Exact field sorting is intentionally separate because
-approximate vector top-k is not the same as "all matching documents sorted by
-field." If a request would need approximate overfetch and rerank to pretend to
-be exact field sort, Antfly should reject it instead of returning a misleading
-page.
+## Exact Sort and Cursor Pagination
 
-## Filters And Exclusions
+`order_by` produces exact sorted pages over `_id` or mapped scalar fields whose capability is `queryable` or `accelerated`. Antfly appends `_id` ascending as a deterministic tie-breaker when it is omitted.
 
-Filters are query clauses that must match in addition to the main query.
-Exclusions remove documents after candidate selection. For scalar fields with
-native mappings, Antfly can evaluate term, range, boolean, and date filters from
-native field structures instead of parsing stored JSON.
-
-This matters for sort because exact sorted pages need an exact eligible set. A
-broad filter with an `index_sort`-compatible order can be served by scanning
-sorted segments. A selective filter often works better as candidate-first
-doc-values top-N. Unsupported filter and sort combinations should fail closed
-with a stable 422 reason rather than falling back to an unbounded stored-source
-scan.
-
-## Sort And Cursor Pagination
-
-Use `order_by` for exact sorted pages over `_id` or mapped scalar fields whose
-capability is `queryable` or `accelerated`. Antfly appends `_id` ascending as a
-deterministic tie-breaker when it is omitted.
-
-The response includes `_sort` values for each hit. Pass those values back
-unchanged as `search_after` for the next page or `search_before` for the
-previous page:
+Each hit carries `_sort` values. Pass them back unchanged as `search_after` for the next page or `search_before` for the previous one:
 
 ```json
 {
@@ -475,31 +322,19 @@ previous page:
 }
 ```
 
-Cursor values preserve JSON scalar types. Strings remain strings, numbers remain
-numbers, and booleans remain booleans. Nulls, arrays, objects, and non-finite
-numbers are rejected because they cannot form replayable typed cursor tuples.
+Cursor values preserve JSON scalar types: strings stay strings, numbers stay numbers, booleans stay booleans. Nulls, arrays, objects, and non-finite numbers are rejected because they cannot form replayable typed cursor tuples.
 
-Use cursor pagination for large or changing result sets. Offset pagination is
-useful for shallow UI pages, but it requires the engine to count past skipped
-results and is less stable when documents change between requests.
+Use cursors for large or changing result sets. Offset pagination suits shallow UI pages, but it makes the engine count past skipped results and shifts when documents change between requests.
 
 ## Physical Index Sort
 
-`index_sort` is an optional acceleration path for one dominant order. It stores
-new segments in that physical tuple order and preserves the order during merges.
-When a broad query asks for the same order, the planner can use sorted segment
-seek instead of collecting all candidates and sorting them.
+`index_sort` is an optional acceleration path for one dominant order. New segments are stored in that physical tuple order and the order survives merges. When a broad query asks for the same order, the planner uses sorted segment seek instead of collecting every candidate and sorting.
 
-There is only one physical order per index generation. Arbitrary `order_by`
-fields still use typed field values and top-N collection. Changing `index_sort`
-is a layout change; existing generations need backfill, compaction, or reindex
-before the accelerated path can be considered fully covered.
+There is one physical order per index generation. Other `order_by` fields still use typed field values and top-N collection. Changing `index_sort` is a layout change; existing generations need backfill, compaction, or reindex before the accelerated path counts as fully covered.
 
-## Rejections And Diagnostics
+## When a Sorted Query Returns 422
 
-Exact public query behavior should fail closed. A sorted request can return 422
-when the engine cannot execute the requested order exactly through a native
-path. Common reasons include:
+Exact query behavior fails closed. A sorted request returns 422 when the engine cannot execute the requested order exactly through a native path:
 
 - unmapped sort field
 - analyzed text field used directly for sort
@@ -507,11 +342,31 @@ path. Common reasons include:
 - field not yet `queryable` or `accelerated`
 - missing typed field coverage in older segments
 - invalid `search_after` or `search_before` tuple
-- semantic/vector candidate source used for exact field sort
+- semantic or vector candidate source used for exact field sort
 - count-only query combined with ordered pagination
 
-Set `profile: true` while diagnosing. The stable public sort profile reports
-the selected plan, source, candidate source, selection reason, exactness,
-candidate counts, source-load behavior, and rejection reasons. Lower-level
-executor counters belong in logs, traces, benchmarks, or explicit debug
-surfaces rather than normal SDK responses.
+Set `profile: true` while diagnosing. The public sort profile reports the selected plan, source, candidate source, selection reason, exactness, candidate counts, source-load behavior, and rejection reasons. Lower-level executor counters live in logs, traces, and benchmarks, not in SDK responses.
+
+## Which Path to Ask For
+
+- Relevance-ordered results, text or hybrid: `full_text_search` or `semantic_search` with `limit`, no `order_by`. Add `reranker` and `pruner` when the top of the page has to be right.
+- Exact ordered browsing over a filter: map the sort field with `sortable: true`, use `order_by`, and page with `search_after`. Reserve `offset` for shallow pages.
+- One dominant sort order over a large table: declare it as `index_sort` and let broad queries in that order seek instead of collect.
+- Relationship questions: seed `graph_queries` from `$query_results`, and use `match` with counts when the answer is a number rather than a list.
+
+## Let Your Agent Drive
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Map created_at as sortable on my articles table and page through published articles newest-first with search_after", and use this page to judge the result.
+
+## Next Steps
+
+- [Tune Hybrid Search](/docs/guides/hybrid-search): fusion, reranking, and pruning for relevance-ordered queries
+- [Artifact-Backed Indexes](/docs/guides/artifact-indexes): indexes over generated chunk, embedding, and relationship streams
+- [Build a Support Answer Agent](/docs/guides/support-answer-agent): the query pipeline feeding a generated answer
