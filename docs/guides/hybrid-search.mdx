@@ -150,7 +150,7 @@ Set `candidate_count` to at least `offset + limit` (often 50-100, up to 1,000; V
 
 ## Pruning
 
-Pruning filters out low-quality results after fusion (and after reranking, if configured). Instead of returning a fixed number of results, pruning returns only the results that meet a quality threshold.
+Pruning filters out low-quality results after global fusion (and after reranking, if configured), before `offset` and `limit` select the final page. It runs once at the coordinator, so standalone and distributed deployments use the same score domain. Instead of returning a fixed number of results, pruning returns only the results that meet a quality threshold.
 
 This is especially valuable for RAG pipelines, where sending marginally relevant documents to an LLM adds noise and degrades answer quality.
 

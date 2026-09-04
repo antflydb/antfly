@@ -6,7 +6,7 @@ const std = @import("std");
 /// Configuration for the Antfly inference reranking provider.
 pub const AntflyRerankerConfig = struct {
     provider: []const u8,
-    /// Optional reranking model name. When omitted, the Antfly inference service selects a model from its reranker model directory. Set this explicitly when more than one reranker is installed.
+    /// Optional reranking model name. When omitted, Antfly inference selects a model from its reranker model directory. Set this explicitly when more than one local reranker is installed.
     model: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
@@ -46,14 +46,14 @@ pub const AntflyRerankerConfig = struct {
 pub const CohereRerankerConfig = struct {
     provider: []const u8,
     /// The name of the Cohere reranking model to use.
-    model: []const u8,
+    model: ?[]const u8 = null,
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
     api_key: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
-        .{ "model", "model", false },
+        .{ "model", "model", true },
         .{ "api_key", "api_key", true },
     };
 
@@ -69,8 +69,10 @@ pub const CohereRerankerConfig = struct {
         try jw.beginObject();
         try jw.objectField("provider");
         try jw.write(self.provider);
-        try jw.objectField("model");
-        try jw.write(self.model);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
             try jw.write(value);
@@ -90,7 +92,7 @@ pub const RerankerConfig = struct {
     candidate_count: ?i64 = null,
     /// Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present or the selected provider's candidate ceiling; Vertex currently accepts at most 200.
     top_n: ?i64 = null,
-    /// Optional reranking model name. When omitted, the Antfly inference service selects a model from its reranker model directory. Set this explicitly when more than one reranker is installed.
+    /// Optional reranking model name. When omitted, Antfly inference selects a model from its reranker model directory. Set this explicitly when more than one local reranker is installed.
     model: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
@@ -200,7 +202,7 @@ pub const RerankerProvider = enum {
 pub const VertexRerankerConfig = struct {
     provider: []const u8,
     /// The ranking model to use.
-    model: []const u8,
+    model: ?[]const u8 = null,
     /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
     /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain.
@@ -209,7 +211,7 @@ pub const VertexRerankerConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
-        .{ "model", "model", false },
+        .{ "model", "model", true },
         .{ "project_id", "project_id", true },
         .{ "credentials_path", "credentials_path", true },
     };
@@ -226,8 +228,10 @@ pub const VertexRerankerConfig = struct {
         try jw.beginObject();
         try jw.objectField("provider");
         try jw.write(self.provider);
-        try jw.objectField("model");
-        try jw.write(self.model);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
         if (self.project_id) |value| {
             try jw.objectField("project_id");
             try jw.write(value);

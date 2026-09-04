@@ -5054,6 +5054,8 @@ pub fn build(b: *std.Build) void {
     lib_db_enrichment_merge_cutover_reopen_step.dependOn(&run_lib_db_enrichment_merge_cutover_reopen_tests.step);
 
     const lib_db_query_default_filters = [_][]const u8{
+        "composed fusion preserves the coordinator reranker window",
+        "fuseNamedSets applies offset after fusion and pruning",
         "grouped candidate budget parses disabled and fallback values",
         "adaptive candidate window covers requested offset page and grows bounded",
         "grouped result page satisfaction treats nested match count as a maximum",
@@ -6387,6 +6389,10 @@ pub fn build(b: *std.Build) void {
     const api_table_reads_docid_tests = b.addTest(.{
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
+            "distributed reranking widens retrieval and stays coordinator owned",
+            "reranker candidate and output windows have distinct bounds",
+            "reranker paging preserves the underlying retrieval total",
+            "coordinator prunes the final score domain before paging",
             "profiled composed dense query preserves exact route telemetry",
             "aggregation completeness requires exact total relation",
             "aggregation context rejects non-current identity generation",
@@ -6583,6 +6589,7 @@ pub fn build(b: *std.Build) void {
             "derived coverage aggregation rejects mixed config observations",
             "derived coverage embedding activity aggregation is order independent and phase authoritative",
             "derived coverage ready full text status reports complete progress",
+            "readiness observation completion requires convergence and full topology",
             "chunked dense completion follows the physical publication target",
             "runtime status best effort overlay cannot clear readiness under apply contention",
             "index status exposes compact repair state without internal diagnostics",

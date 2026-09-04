@@ -22,7 +22,7 @@ components:
           enum: [antfly]
         model:
           type: string
-          description: "Optional reranking model name. When omitted, the Antfly inference service selects a model from its reranker model directory. Set this explicitly when more than one reranker is installed."
+          description: "Optional reranking model name. When omitted, Antfly inference selects a model from its reranker model directory. Set this explicitly when more than one local reranker is installed."
         url:
           type: string
           format: uri
@@ -58,7 +58,6 @@ components:
           description: "The Cohere API key. Can also be set via COHERE_API_KEY environment variable."
       required:
         - provider
-        - model
       example:
         provider: "cohere"
         model: "rerank-english-v3.0"
@@ -96,7 +95,6 @@ components:
           description: "Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain."
       required:
         - provider
-        - model
       example:
         provider: "vertex"
         model: "semantic-ranker-default@latest"

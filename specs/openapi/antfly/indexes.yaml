@@ -2199,7 +2199,9 @@ components:
       description: |
         Configuration for pruning search results based on score quality.
         Helps filter out low-relevance results in RAG pipelines by detecting
-        score gaps or deviations from top results.
+        score gaps or deviations from top results. Pruning runs once on the
+        globally merged score domain, after reranking when a reranker is
+        configured and before offset/limit paging.
       properties:
         min_score_ratio:
           x-go-type-skip-optional-pointer: true
@@ -2208,7 +2210,7 @@ components:
           description: |
             Keep only results with score >= max_score * min_score_ratio.
             For example, 0.5 keeps results scoring at least half of the top result.
-            Applied after fusion scoring.
+            Applied to final scores after global fusion and optional reranking.
           example: 0.5
         max_score_gap_percent:
           x-go-type-skip-optional-pointer: true

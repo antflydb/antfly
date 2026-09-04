@@ -337,7 +337,9 @@ class QueryRequest:
              Example: {{encodeToon this.fields}}.
         pruner (Pruner | Unset): Configuration for pruning search results based on score quality.
             Helps filter out low-relevance results in RAG pipelines by detecting
-            score gaps or deviations from top results.
+            score gaps or deviations from top results. Pruning runs once on the
+            globally merged score domain, after reranking when a reranker is
+            configured and before offset/limit paging.
         join (JoinClause | Unset): Configuration for joining data from another table.
             Supports inner, left, and right joins with automatic strategy selection.
         foreign_sources (QueryRequestForeignSources | Unset): Map of table name to foreign data source configuration for

@@ -7279,7 +7279,10 @@ export interface components {
              *     - You have semantic or hybrid search results to refine
              *     - Latency trade-off is acceptable (reranking adds 100-500ms typically)
              *
-             *     **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size.
+             *     **Best practice:** Set `candidate_count` to the bounded retrieval window
+             *     (often 50-100) and use the query `limit` for the final page size. Antfly
+             *     retrieves and globally merges that window, calls the reranker once, then
+             *     applies pruning, offset, and limit at the coordinator.
              *
              *     Example:
              *     ```json
@@ -7346,7 +7349,9 @@ export interface components {
              * @description Optional result pruning configuration to filter low-relevance results.
              *
              *     Pruning helps detect "elbows" in score distributions and removes
-             *     results that are significantly worse than top matches.
+             *     results that are significantly worse than top matches. It runs once
+             *     on globally merged results, after optional reranking and before the
+             *     final offset/limit page is selected.
              *
              *     **Common patterns:**
              *     - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs
@@ -12328,7 +12333,7 @@ export interface components {
         AntflyRerankerConfig: {
             /** @enum {string} */
             provider: "antfly";
-            /** @description Optional reranking model name. When omitted, the Antfly inference service selects a model from its reranker model directory. Set this explicitly when more than one reranker is installed. */
+            /** @description Optional reranking model name. When omitted, Antfly inference selects a model from its reranker model directory. Set this explicitly when more than one local reranker is installed. */
             model?: string;
             /**
              * Format: uri
@@ -12357,7 +12362,7 @@ export interface components {
              * @default rerank-english-v3.0
              * @example rerank-english-v3.0
              */
-            model: string;
+            model?: string;
             /** @description The Cohere API key. Can also be set via COHERE_API_KEY environment variable. */
             api_key?: string;
         };
@@ -12389,7 +12394,7 @@ export interface components {
              * @default semantic-ranker-default@latest
              * @example semantic-ranker-default@latest
              */
-            model: string;
+            model?: string;
             /** @description Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable. */
             project_id?: string;
             /** @description Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain. */
@@ -12763,14 +12768,16 @@ export interface components {
         /**
          * @description Configuration for pruning search results based on score quality.
          *     Helps filter out low-relevance results in RAG pipelines by detecting
-         *     score gaps or deviations from top results.
+         *     score gaps or deviations from top results. Pruning runs once on the
+         *     globally merged score domain, after reranking when a reranker is
+         *     configured and before offset/limit paging.
          */
         Pruner: {
             /**
              * Format: double
              * @description Keep only results with score >= max_score * min_score_ratio.
              *     For example, 0.5 keeps results scoring at least half of the top result.
-             *     Applied after fusion scoring.
+             *     Applied to final scores after global fusion and optional reranking.
              * @example 0.5
              */
             min_score_ratio?: number;

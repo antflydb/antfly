@@ -8471,9 +8471,9 @@ pub const PatternStep = struct {
     }
 };
 
-/// Configuration for pruning search results based on score quality. Helps filter out low-relevance results in RAG pipelines by detecting score gaps or deviations from top results.
+/// Configuration for pruning search results based on score quality. Helps filter out low-relevance results in RAG pipelines by detecting score gaps or deviations from top results. Pruning runs once on the globally merged score domain, after reranking when a reranker is configured and before offset/limit paging.
 pub const Pruner = struct {
-    /// Keep only results with score >= max_score * min_score_ratio. For example, 0.5 keeps results scoring at least half of the top result. Applied after fusion scoring.
+    /// Keep only results with score >= max_score * min_score_ratio. For example, 0.5 keeps results scoring at least half of the top result. Applied to final scores after global fusion and optional reranking.
     min_score_ratio: ?f64 = null,
     /// Stop returning results when the gap between consecutive scores exceeds this percentage of the total score range (max - min). Detects "elbows" in score distributions regardless of score scale. For example, 30.0 stops when a gap spans 30% of the score range.
     max_score_gap_percent: ?f64 = null,

@@ -1266,12 +1266,16 @@ pub fn searchComposed(
     }
 
     const fuse_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+    // Reranking and pruning are coordinator transforms. Keep their bounded
+    // retrieval window through local fusion instead of truncating it to the
+    // final page, and defer pruning until provider scores exist when present.
+    const fusion_req = composedFusionRequest(shared_req);
     var base = if (named_sets.items.len == 0)
         try emptySearchResult(alloc)
     else if (named_sets.items.len == 1)
         try executor.clone_named_set(executor.ctx, alloc, named_sets.items[0], shared_req.include_stored)
     else
-        try executor.fuse_named_sets(executor.ctx, alloc, shared_req, named_sets.items);
+        try executor.fuse_named_sets(executor.ctx, alloc, fusion_req, named_sets.items);
     if (bench_query_profile) fuse_ns = platform_time.monotonicNs() - fuse_start_ns;
     errdefer base.deinit();
 
@@ -1722,6 +1726,42 @@ fn componentPaging(req: types.SearchRequest) ComponentPaging {
         .offset = 0,
         .limit = limit,
     };
+}
+
+fn composedFusionRequest(req: types.SearchRequest) types.SearchRequest {
+    if (req.reranker == null and req.pruner == null) return req;
+    const paging = componentPaging(req);
+    var copy = req;
+    copy.offset = paging.offset;
+    copy.limit = paging.limit;
+    copy.pruner = null;
+    return copy;
+}
+
+test "composed fusion preserves the coordinator reranker window" {
+    const req = types.SearchRequest{
+        .offset = 10,
+        .limit = 10,
+        .reranker = .{
+            .provider = .antfly,
+            .field = "body",
+            .candidate_count = 50,
+        },
+        .pruner = .{ .min_score_ratio = 0.5 },
+    };
+    const fusion_req = composedFusionRequest(req);
+    try std.testing.expectEqual(@as(u32, 0), fusion_req.offset);
+    try std.testing.expectEqual(@as(u32, 50), fusion_req.limit);
+    try std.testing.expect(fusion_req.pruner == null);
+
+    const pruner_only = composedFusionRequest(.{
+        .offset = 10,
+        .limit = 10,
+        .pruner = .{ .min_score_ratio = 0.5 },
+    });
+    try std.testing.expectEqual(@as(u32, 0), pruner_only.offset);
+    try std.testing.expectEqual(@as(u32, 20), pruner_only.limit);
+    try std.testing.expect(pruner_only.pruner == null);
 }
 
 test "reranker component paging includes the post-rerank offset" {

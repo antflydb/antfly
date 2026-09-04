@@ -27,13 +27,13 @@ class CohereRerankerConfig:
 
         Attributes:
             provider (CohereRerankerConfigProvider):
-            model (str): The name of the Cohere reranking model to use. Default: 'rerank-english-v3.0'. Example: rerank-
-                english-v3.0.
+            model (str | Unset): The name of the Cohere reranking model to use. Default: 'rerank-english-v3.0'. Example:
+                rerank-english-v3.0.
             api_key (str | Unset): The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
     """
 
     provider: CohereRerankerConfigProvider
-    model: str = "rerank-english-v3.0"
+    model: str | Unset = "rerank-english-v3.0"
     api_key: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -49,9 +49,10 @@ class CohereRerankerConfig:
         field_dict.update(
             {
                 "provider": provider,
-                "model": model,
             }
         )
+        if model is not UNSET:
+            field_dict["model"] = model
         if api_key is not UNSET:
             field_dict["api_key"] = api_key
 
@@ -62,7 +63,7 @@ class CohereRerankerConfig:
         d = dict(src_dict)
         provider = CohereRerankerConfigProvider(d.pop("provider"))
 
-        model = d.pop("model")
+        model = d.pop("model", UNSET)
 
         api_key = d.pop("api_key", UNSET)
 

@@ -947,11 +947,12 @@ tags:
 
       {
         "semantic_search": "gaming laptops",
-        "limit": 100,
+        "limit": 10,
         "reranker": {
           "provider": "antfly",
           "model": "mixedbread-ai/mxbai-rerank-base-v1",
-          "field": "description"
+          "field": "description",
+          "candidate_count": 100
         }
       }
 
@@ -15454,7 +15455,13 @@ components:
             - Latency trade-off is acceptable (reranking adds 100-500ms typically)
 
 
-            **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size.
+            **Best practice:** Set `candidate_count` to the bounded retrieval window
+
+            (often 50-100) and use the query `limit` for the final page size. Antfly
+
+            retrieves and globally merges that window, calls the reranker once, then
+
+            applies pruning, offset, and limit at the coordinator.
 
 
             Example:
@@ -15560,7 +15567,11 @@ components:
 
             Pruning helps detect "elbows" in score distributions and removes
 
-            results that are significantly worse than top matches.
+            results that are significantly worse than top matches. It runs once
+
+            on globally merged results, after optional reranking and before the
+
+            final offset/limit page is selected.
 
 
             **Common patterns:**
@@ -23500,9 +23511,8 @@ components:
             - antfly
         model:
           type: string
-          description: Optional reranking model name. When omitted, the Antfly inference service selects
-            a model from its reranker model directory. Set this explicitly when more than one reranker
-            is installed.
+          description: Optional reranking model name. When omitted, Antfly inference selects a model from
+            its reranker model directory. Set this explicitly when more than one local reranker is installed.
         url:
           type: string
           format: uri
@@ -23542,7 +23552,6 @@ components:
           description: The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
       required:
         - provider
-        - model
       example:
         provider: cohere
         model: rerank-english-v3.0
@@ -23591,7 +23600,6 @@ components:
             back to the default ADC chain.
       required:
         - provider
-        - model
       example:
         provider: vertex
         model: semantic-ranker-default@latest
@@ -24664,7 +24672,11 @@ components:
 
         Helps filter out low-relevance results in RAG pipelines by detecting
 
-        score gaps or deviations from top results.
+        score gaps or deviations from top results. Pruning runs once on the
+
+        globally merged score domain, after reranking when a reranker is
+
+        configured and before offset/limit paging.
       properties:
         min_score_ratio:
           x-go-type-skip-optional-pointer: true
@@ -24675,7 +24687,7 @@ components:
 
             For example, 0.5 keeps results scoring at least half of the top result.
 
-            Applied after fusion scoring.
+            Applied to final scores after global fusion and optional reranking.
           example: 0.5
         max_score_gap_percent:
           x-go-type-skip-optional-pointer: true

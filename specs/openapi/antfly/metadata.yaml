@@ -659,11 +659,12 @@ tags:
       ```json
       {
         "semantic_search": "gaming laptops",
-        "limit": 100,
+        "limit": 10,
         "reranker": {
           "provider": "antfly",
           "model": "mixedbread-ai/mxbai-rerank-base-v1",
-          "field": "description"
+          "field": "description",
+          "candidate_count": 100
         }
       }
       ```
@@ -7550,7 +7551,10 @@ components:
             - You have semantic or hybrid search results to refine
             - Latency trade-off is acceptable (reranking adds 100-500ms typically)
 
-            **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size.
+            **Best practice:** Set `candidate_count` to the bounded retrieval window
+            (often 50-100) and use the query `limit` for the final page size. Antfly
+            retrieves and globally merges that window, calls the reranker once, then
+            applies pruning, offset, and limit at the coordinator.
 
             Example:
             ```json
@@ -7618,7 +7622,9 @@ components:
             Optional result pruning configuration to filter low-relevance results.
 
             Pruning helps detect "elbows" in score distributions and removes
-            results that are significantly worse than top matches.
+            results that are significantly worse than top matches. It runs once
+            on globally merged results, after optional reranking and before the
+            final offset/limit page is selected.
 
             **Common patterns:**
             - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs

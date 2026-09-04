@@ -6039,10 +6039,11 @@ const DistributedCoordinatorPaging = struct {
     limit: u32,
 };
 
-/// Reranking is a coordinator transform. Retain the global retrieval window
-/// here and apply the caller's offset/final limit only after provider scoring.
+/// Reranking and distributed pruning are coordinator transforms. Retain the
+/// global retrieval window here and apply the caller's offset/final limit only
+/// after final-score processing.
 fn distributedCoordinatorPaging(req: db_mod.types.SearchRequest) DistributedCoordinatorPaging {
-    if (req.reranker != null) return .{
+    if (req.reranker != null or req.pruner != null) return .{
         .offset = 0,
         .limit = distributedSearchShardLimit(req),
     };
@@ -6065,6 +6066,7 @@ test "distributed reranking widens retrieval and stays coordinator owned" {
     try std.testing.expectEqual(@as(u32, 50), shard.limit);
     try std.testing.expectEqual(@as(u32, 0), shard.offset);
     try std.testing.expect(shard.reranker == null);
+    try std.testing.expect(shard.pruner == null);
     try std.testing.expectEqual(@as(usize, 0), shard.reranker_query_text.len);
 
     const coordinator = distributedCoordinatorPaging(req);
@@ -6345,6 +6347,10 @@ fn distributedSearchShardRequest(
     // the global merge.
     copy.reranker = null;
     copy.reranker_query_text = "";
+    // Pruning is score-domain-sensitive. Applying it independently on shards
+    // would produce topology-dependent results and, with a reranker, would use
+    // retrieval scores instead of the provider's final scores.
+    copy.pruner = null;
     // Unit payloads and their parent-owned navigation state may belong to
     // independent child ranges. Shards select identities from local state; the
     // coordinator hydrates the globally selected unit page through routed
@@ -17252,8 +17258,14 @@ fn applyQueryPostProcessing(
     secret_store: ?*common_secrets.FileStore,
     reranker_runtime: ?*reranking_runtime.Runtime,
 ) !void {
-    if (req.reranker == null or result.hits.len == 0) return;
-    try applyReranker(alloc, req, result, meta, antfly_provider, secret_store, reranker_runtime);
+    if ((req.reranker == null and req.pruner == null) or result.hits.len == 0) return;
+    const candidate_count = if (req.reranker != null)
+        try applyReranker(alloc, req, result, meta, antfly_provider, secret_store, reranker_runtime)
+    else
+        result.hits.len;
+    const pruned_count = pruneSearchHitPrefix(req, result.hits[0..candidate_count]).len;
+    const output_limit = if (req.reranker) |reranker| rerankerOutputLimit(req.limit, reranker.top_n) else req.limit;
+    try pageSearchHitsAfterScoreTransforms(alloc, result, pruned_count, req.offset, output_limit);
 }
 
 fn applyReranker(
@@ -17264,8 +17276,8 @@ fn applyReranker(
     antfly_provider: ?managed_embedder.AntflyProvider,
     secret_store: ?*common_secrets.FileStore,
     reranker_runtime: ?*reranking_runtime.Runtime,
-) !void {
-    const cfg = req.reranker orelse return;
+) !usize {
+    const cfg = req.reranker orelse return 0;
     if (req.reranker_query_text.len == 0) return error.UnsupportedQueryRequest;
     try checkQueryDeadline(req);
 
@@ -17372,13 +17384,27 @@ fn applyReranker(
         }
     }.lessThan);
 
-    try pageRerankedSearchHits(alloc, result, rerank_count, req.offset, output_limit);
-
     meta.reranker = .{
         .model = cfg.model,
         .documents_reranked = @intCast(owned_scores.len),
         .duration_ms = @intCast(@divTrunc(platform_time.monotonicNs() - rerank_start_ns, std.time.ns_per_ms)),
     };
+    return rerank_count;
+}
+
+const SearchHitPrunerAdapter = struct {
+    pub fn score(hit: db_mod.types.SearchHit) f64 {
+        return @floatCast(hit.score orelse 0);
+    }
+
+    pub fn indexCount(hit: db_mod.types.SearchHit) usize {
+        return hit.index_scores.len;
+    }
+};
+
+fn pruneSearchHitPrefix(req: db_mod.types.SearchRequest, hits: []db_mod.types.SearchHit) []db_mod.types.SearchHit {
+    const pruner = req.pruner orelse return hits;
+    return pruner.pruneWith(hits, SearchHitPrunerAdapter);
 }
 
 fn rerankerCandidateCount(
@@ -17447,7 +17473,7 @@ fn renderRerankerDocument(
     return template_mod.renderDocument(alloc, doc_template, raw) catch try alloc.dupe(u8, "");
 }
 
-fn pageRerankedSearchHits(
+fn pageSearchHitsAfterScoreTransforms(
     alloc: std.mem.Allocator,
     result: *db_mod.types.SearchResult,
     candidate_count: usize,
@@ -17485,7 +17511,33 @@ test "reranker paging preserves the underlying retrieval total" {
     };
     defer result.deinit();
 
-    try pageRerankedSearchHits(alloc, &result, 2, 1, 3);
+    try pageSearchHitsAfterScoreTransforms(alloc, &result, 2, 1, 3);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("b", result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 100), result.total_hits);
+}
+
+test "coordinator prunes the final score domain before paging" {
+    const alloc = std.testing.allocator;
+    const hits = try alloc.alloc(db_mod.types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "a"), .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "b"), .score = 0.6 };
+    hits[2] = .{ .id = try alloc.dupe(u8, "c"), .score = 0.2 };
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 100,
+    };
+    defer result.deinit();
+
+    const req = db_mod.types.SearchRequest{
+        .offset = 1,
+        .limit = 2,
+        .pruner = .{ .min_score_ratio = 0.5 },
+    };
+    var meta = query_api.QueryResponseMeta{};
+    defer meta.deinit(alloc);
+    try applyQueryPostProcessing(alloc, req, &result, &meta, null, null, null);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("b", result.hits[0].id);
     try std.testing.expectEqual(@as(u32, 100), result.total_hits);

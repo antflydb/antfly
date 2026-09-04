@@ -33,8 +33,8 @@ class VertexRerankerConfig:
 
         Attributes:
             provider (VertexRerankerConfigProvider):
-            model (str): The ranking model to use. Default: 'semantic-ranker-default@latest'. Example: semantic-ranker-
-                default@latest.
+            model (str | Unset): The ranking model to use. Default: 'semantic-ranker-default@latest'. Example: semantic-
+                ranker-default@latest.
             project_id (str | Unset): Google Cloud project ID. Shared Vertex credential field; see
                 vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
             credentials_path (str | Unset): Path to an ADC credential JSON file (service-account, authorized-user, or
@@ -43,7 +43,7 @@ class VertexRerankerConfig:
     """
 
     provider: VertexRerankerConfigProvider
-    model: str = "semantic-ranker-default@latest"
+    model: str | Unset = "semantic-ranker-default@latest"
     project_id: str | Unset = UNSET
     credentials_path: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -62,9 +62,10 @@ class VertexRerankerConfig:
         field_dict.update(
             {
                 "provider": provider,
-                "model": model,
             }
         )
+        if model is not UNSET:
+            field_dict["model"] = model
         if project_id is not UNSET:
             field_dict["project_id"] = project_id
         if credentials_path is not UNSET:
@@ -77,7 +78,7 @@ class VertexRerankerConfig:
         d = dict(src_dict)
         provider = VertexRerankerConfigProvider(d.pop("provider"))
 
-        model = d.pop("model")
+        model = d.pop("model", UNSET)
 
         project_id = d.pop("project_id", UNSET)
 

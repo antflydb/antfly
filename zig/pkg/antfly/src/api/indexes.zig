@@ -2197,6 +2197,86 @@ const IndexObservationAuthority = struct {
     coverage_authoritative: bool,
 };
 
+const IndexReadinessObservation = struct {
+    expected_source_observations: u64,
+    observation_available: bool,
+    observation_fresh: bool,
+    target_observation_complete: bool,
+    topology_complete: bool,
+    incarnation_current: bool,
+    sources_complete: bool,
+
+    fn completionFencesClear(self: @This()) bool {
+        return self.observation_fresh and
+            self.target_observation_complete and
+            self.topology_complete and
+            self.incarnation_current and
+            self.sources_complete;
+    }
+};
+
+/// Produce the observation/topology portion of readiness once. Progress,
+/// readiness state, milestones, and pending reasons must not reconstruct this
+/// independently or a partial cluster observation can look 100% complete.
+fn indexReadinessObservation(
+    item: anytype,
+    authority: IndexObservationAuthority,
+    coverage_generation: u64,
+) IndexReadinessObservation {
+    const Item = @TypeOf(item);
+    const expected_source_observations: u64 = if (@hasField(Item, "fresh_group_count"))
+        @max(1, item.fresh_group_count)
+    else
+        1;
+    const topology_complete = if (@hasField(Item, "expected_group_count") and @hasField(Item, "fresh_group_count"))
+        item.expected_group_count == item.fresh_group_count
+    else
+        true;
+    const observation_fresh = authority.freshness_authoritative;
+    const sources_complete = if (@hasField(Item, "source_replay")) blk: {
+        const sources = if (@hasField(Item, "source_replay_count"))
+            item.source_replay[0..item.source_replay_count]
+        else
+            item.source_replay;
+        break :blk indexSourcesComplete(sources, observation_fresh, topology_complete, expected_source_observations);
+    } else true;
+    return .{
+        .expected_source_observations = expected_source_observations,
+        .observation_available = authority.facts_authoritative,
+        .observation_fresh = observation_fresh,
+        .target_observation_complete = authority.convergence_authoritative,
+        .topology_complete = topology_complete,
+        .incarnation_current = coverage_generation != 0 and authority.incarnation_current,
+        .sources_complete = sources_complete,
+    };
+}
+
+test "readiness observation completion requires convergence and full topology" {
+    const authority = IndexObservationAuthority{
+        .runtime_present = true,
+        .incarnation_current = true,
+        .facts_authoritative = true,
+        .freshness_authoritative = true,
+        .readiness_authoritative = true,
+        .convergence_authoritative = true,
+        .coverage_authoritative = true,
+    };
+    const partial = AggregatedIndexStatus{
+        .expected_group_count = 2,
+        .fresh_group_count = 1,
+    };
+    try std.testing.expect(!indexReadinessObservation(partial, authority, 42).completionFencesClear());
+
+    var unconverged = authority;
+    unconverged.convergence_authoritative = false;
+    const complete_topology = AggregatedIndexStatus{
+        .expected_group_count = 2,
+        .fresh_group_count = 2,
+    };
+    try std.testing.expect(!indexReadinessObservation(complete_topology, unconverged, 42).completionFencesClear());
+    try std.testing.expect(indexReadinessObservation(complete_topology, authority, 42).completionFencesClear());
+}
+
 fn indexObservationIsDerived(item: anytype) bool {
     const Item = @TypeOf(item);
     if (!@hasField(Item, "kind")) return false;
@@ -5536,6 +5616,7 @@ fn appendSingleIndexRuntimeStatus(
     const terminal_enrichment_failure = enrichment_degraded or
         (if (visible_enrichment) |stats| stats.worker_failed else false);
     const terminal_load_failure = load_error != null and raw_load_error_matches_desired_incarnation;
+    const readiness_observation = indexReadinessObservation(item, authority, coverage_generation);
     // Progress is a completion fraction, not merely a pulse from an active
     // worker. Full-text runtime snapshots can legitimately retain their last
     // cursor value after the worker settles; once the exact incarnation is
@@ -5543,8 +5624,7 @@ fn appendSingleIndexRuntimeStatus(
     // state as 1.0. This keeps `ready`, indexed cardinality, and progress
     // mutually consistent for CLI/UI consumers.
     if (index_type == .full_text and
-        coverage_generation != 0 and
-        authority.readiness_authoritative and
+        readiness_observation.completionFencesClear() and
         !backfill_active and
         !replay_catch_up_required and
         replay_applied_sequence >= replay_target_sequence and
@@ -5974,23 +6054,18 @@ fn appendIndexReadinessStatus(
     artifact_publish_pending: bool,
 ) !void {
     const Item = @TypeOf(item);
-    const expected_source_observations: u64 = if (@hasField(Item, "fresh_group_count"))
-        @max(1, item.fresh_group_count)
-    else
-        1;
-    const observation_available = authority.facts_authoritative;
-    const observation_fresh = authority.freshness_authoritative;
-    const target_observation_complete = authority.convergence_authoritative;
-    const topology_complete = if (@hasField(Item, "expected_group_count") and @hasField(Item, "fresh_group_count"))
-        item.expected_group_count == item.fresh_group_count
-    else
-        true;
+    const observation = indexReadinessObservation(item, authority, coverage_generation);
+    const expected_source_observations = observation.expected_source_observations;
+    const observation_available = observation.observation_available;
+    const observation_fresh = observation.observation_fresh;
+    const target_observation_complete = observation.target_observation_complete;
+    const topology_complete = observation.topology_complete;
     // Incarnation fencing is common to every public index kind. The catalog
     // assigns one identity per semantic definition and storage reports the
     // exact identity it installed; accepting a same-name observation without
     // comparing both would let a replaced full-text, graph, or algebraic index
     // satisfy a wait with stale cardinality.
-    const incarnation_current = coverage_generation != 0 and authority.incarnation_current;
+    const incarnation_current = observation.incarnation_current;
     const repair_failed = repair_state != null and repair_action_required;
     const failed = terminal_load_failure or repair_failed or terminal_enrichment_failure;
     const globally_failed = terminal_load_failure or repair_failed or terminal_enrichment_global_failure;
@@ -6016,13 +6091,7 @@ fn appendIndexReadinessStatus(
             !serving_snapshot_ready);
     const coverage_pending = index_type == .embeddings and embeddings_coverage_policy != .external and
         !source_coverage_complete;
-    const sources_complete = if (@hasField(Item, "source_replay")) blk: {
-        const sources = if (@hasField(Item, "source_replay_count"))
-            item.source_replay[0..item.source_replay_count]
-        else
-            item.source_replay;
-        break :blk indexSourcesComplete(sources, observation_fresh, topology_complete, expected_source_observations);
-    } else true;
+    const sources_complete = observation.sources_complete;
     const pending = !failed and (!observation_fresh or !target_observation_complete or !topology_complete or !incarnation_current or !sources_complete or
         backfill_active or repair_blocks_complete or replay_catch_up_required or catch_up_active or
         publication_pending or coverage_pending);

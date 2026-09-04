@@ -87,6 +87,16 @@ pub fn maxCandidateCountForProvider(provider: Provider) u32 {
     };
 }
 
+/// Stable provider defaults live at the executable boundary so every client
+/// (generated or hand-written) gets the same behavior when `model` is omitted.
+pub fn defaultModelForProvider(provider: Provider) []const u8 {
+    return switch (provider) {
+        .antfly => "",
+        .cohere => "rerank-english-v3.0",
+        .vertex => "semantic-ranker-default@latest",
+    };
+}
+
 pub const Config = struct {
     provider: Provider,
     field: []const u8 = "",
@@ -191,11 +201,12 @@ pub fn stringifyAlloc(alloc: Allocator, cfg: Config) ![]u8 {
 }
 
 pub fn configFromOpenApi(alloc: Allocator, generated: openapi.RerankerConfig) !Config {
+    const model = generated.model orelse defaultModelForProvider(generated.provider);
     var cfg = Config{
         .provider = generated.provider,
         .field = if (generated.field) |field| try alloc.dupe(u8, field) else "",
         .template = if (generated.template) |template| try alloc.dupe(u8, template) else "",
-        .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
+        .model = if (model.len > 0) try alloc.dupe(u8, model) else "",
         .url = if (generated.url) |url| try alloc.dupe(u8, url) else "",
         .api_key = if (generated.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
         .project_id = if (generated.project_id) |project_id| try alloc.dupe(u8, project_id) else "",
@@ -212,6 +223,22 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.RerankerConfig) !C
     errdefer cfg.deinit(alloc);
     try cfg.validate();
     return cfg;
+}
+
+test "external reranker models have executable defaults" {
+    var cohere = try configFromOpenApi(std.testing.allocator, .{
+        .provider = .cohere,
+        .field = "body",
+    });
+    defer cohere.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("rerank-english-v3.0", cohere.model);
+
+    var vertex = try configFromOpenApi(std.testing.allocator, .{
+        .provider = .vertex,
+        .field = "body",
+    });
+    defer vertex.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("semantic-ranker-default@latest", vertex.model);
 }
 
 pub fn openApiFromConfig(cfg: Config) openapi.RerankerConfig {
