@@ -322,6 +322,10 @@ pub const Detail = enum(c_int) {
     invalid_embedding_artifact_producer,
     embedding_artifact_dimension_required,
     conflicting_embedding_artifact_dimensions,
+    native_backup_repair_state_not_quiescent,
+    native_backup_projection_not_quiescent,
+    native_backup_projection_repair_failed,
+    native_backup_projection_repair_paused,
 };
 
 pub const Status = extern struct {
@@ -496,6 +500,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidEmbeddingArtifactProducer => status(.invalid_argument, .invalid_embedding_artifact_producer),
         error.EmbeddingArtifactDimensionRequired => status(.invalid_argument, .embedding_artifact_dimension_required),
         error.ConflictingEmbeddingArtifactDimensions => status(.invalid_argument, .conflicting_embedding_artifact_dimensions),
+        error.NativeBackupRepairStateNotQuiescent => status(.retryable, .native_backup_repair_state_not_quiescent),
+        error.NativeBackupProjectionNotQuiescent => status(.retryable, .native_backup_projection_not_quiescent),
+        error.NativeBackupProjectionRepairFailed => status(.corrupt, .native_backup_projection_repair_failed),
+        error.NativeBackupProjectionRepairPaused => status(.conflict, .native_backup_projection_repair_paused),
         error.EnrichmentNotFound => status(.not_found, .enrichment_not_found),
         error.InvalidExtensionEnrichment => status(.invalid_argument, .invalid_extension_enrichment),
         error.ConflictingEnrichmentConfig => status(.invalid_argument, .conflicting_enrichment_config),
@@ -948,6 +956,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_embedding_artifact_producer => "InvalidEmbeddingArtifactProducer",
         .embedding_artifact_dimension_required => "EmbeddingArtifactDimensionRequired",
         .conflicting_embedding_artifact_dimensions => "ConflictingEmbeddingArtifactDimensions",
+        .native_backup_repair_state_not_quiescent => "NativeBackupRepairStateNotQuiescent",
+        .native_backup_projection_not_quiescent => "NativeBackupProjectionNotQuiescent",
+        .native_backup_projection_repair_failed => "NativeBackupProjectionRepairFailed",
+        .native_backup_projection_repair_paused => "NativeBackupProjectionRepairPaused",
     };
 }
 
@@ -971,6 +983,8 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.PreDecisionDeadlineExceeded, errorFromStatus(statusFromError(error.PreDecisionDeadlineExceeded)));
     try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, errorFromStatus(statusFromError(error.MetadataMutationOutcomeUnknown)));
     try std.testing.expectEqual(error.InvalidEmbeddingArtifactProducer, errorFromStatus(statusFromError(error.InvalidEmbeddingArtifactProducer)));
+    try std.testing.expectEqual(error.NativeBackupRepairStateNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupRepairStateNotQuiescent)));
+    try std.testing.expectEqual(error.NativeBackupProjectionNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupProjectionNotQuiescent)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));

@@ -27,7 +27,6 @@ import tempfile
 import time
 
 import pytest
-
 from helpers import assert_created_index, wait_until
 from test_backup_restore import _chunked_doc, _semantic_top_hit
 
@@ -75,7 +74,11 @@ def test_stress_chunked_semantic_corruption(backup_api, openai_embedder):
         )
 
         backup_api.wait_index_ready(
-            table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5
+            table_name,
+            "semantic_chunked_idx",
+            timeout_s=30.0,
+            interval_s=0.5,
+            until="complete",
         )
 
         batch = backup_api.batch_write(

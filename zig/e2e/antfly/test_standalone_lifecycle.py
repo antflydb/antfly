@@ -23,7 +23,6 @@ from urllib.parse import quote
 
 import pytest
 import requests
-
 from conftest import ready_index_status
 from helpers import assert_created_index, wait_until
 from test_standalone import (
@@ -137,7 +136,8 @@ def test_standalone_drop_drains_pending_enrichment_work(
                             server,
                             "GET",
                             f"/tables/{table_name}/indexes/semantic_idx",
-                        )
+                        ),
+                        until="complete",
                     ),
                     timeout_s=30.0,
                     interval_s=0.1,

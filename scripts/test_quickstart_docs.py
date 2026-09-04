@@ -10,7 +10,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 REPO = Path(__file__).resolve().parents[1]
 QUICKSTART = REPO / "docs" / "guides" / "quickstart.mdx"
 GO_EXAMPLE = REPO / "go" / "pkg" / "sdk" / "examples" / "quickstart" / "main.go"
@@ -110,7 +109,7 @@ def main() -> int:
         "--tasks rerank --variants f32 cross-encoder/ms-marco-MiniLM-L6-v2",
         "full_text_index_v0",
         "antfly index wait --table wikipedia",
-        "--until queryable",
+        "--until searchable-artifacts=1",
         "physical chunks or vector",
         "## Troubleshooting",
         "standalone inference paths",
@@ -141,20 +140,22 @@ def main() -> int:
         if language in {"bash", "sh", "shell"} and "antfly index wait" in block
     ]
     if len(wait_blocks) < 2 or any(
-        "--until queryable" not in block for block in wait_blocks
+        "--until searchable-artifacts=1" not in block for block in wait_blocks
     ):
-        fail("every quickstart index wait must stop at first safe queryability")
+        fail("every quickstart index wait must require a published searchable artifact")
     if "rg '" in source:
         fail("quickstart troubleshooting must not require undeclared ripgrep tooling")
-    if "--until queryable" not in quickstart_tape:
-        fail("the quickstart recording must wait for queryability")
-    if "Wait@1200s /reached queryable:/" not in quickstart_tape:
-        fail("the quickstart recording must match the queryable success message")
+    if "--until searchable-artifacts=1" not in quickstart_tape:
+        fail("the quickstart recording must wait for a searchable artifact")
+    if "Wait@1200s /reached searchable-artifacts=1:/" not in quickstart_tape:
+        fail(
+            "the quickstart recording must match the searchable-artifact success message"
+        )
     if "Wait@1200s /ready/" in quickstart_tape:
         fail("the quickstart recording must not wait for the complete-only ready state")
 
     for token in (
-        'NewAntflyClient("http://localhost:8080", http.DefaultClient)',
+        'NewAntflyClient("http://127.0.0.1:8080", http.DefaultClient)',
         "client.CreateTable(ctx",
         "client.Query(ctx",
         "client.RetrievalAgent(ctx",

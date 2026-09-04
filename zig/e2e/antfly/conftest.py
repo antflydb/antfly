@@ -49,12 +49,11 @@ import time
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any, Callable, Literal
 from urllib.parse import quote, unquote, urlparse
-from typing import Any, Callable
 
 import pytest
 import requests
-
 from helpers import create_index_payload, start_http_server
 from port_reservations import LoopbackPortReservations, find_free_port
 
@@ -361,7 +360,10 @@ def _canonical_index_readiness(status: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def ready_index_status(
-    index_info: dict[str, Any], *, require_query_fresh: bool = False
+    index_info: dict[str, Any],
+    *,
+    until: Literal["queryable", "complete"],
+    require_query_fresh: bool = False,
 ) -> dict[str, Any] | None:
     status = index_info.get("status")
     if status is None:
@@ -370,9 +372,30 @@ def ready_index_status(
         return None
     if status.get("error"):
         return None
-    # `readiness` is the authoritative, incarnation-scoped contract. Prefer
-    # it over the legacy activity flags so a polling client cannot mistake a
-    # queryable or still-running generation for complete readiness.
+    # Current status owns readiness through milestone-specific facts. Once the
+    # requested milestone is reached, background work belonging only to a
+    # later milestone must not be reinterpreted as a blocker by this client.
+    # Absence of `milestones` identifies the released v0.2.0 fallback below.
+    if isinstance(status.get("milestones"), dict):
+        milestone = status["milestones"].get(until)
+        readiness = _canonical_index_readiness(status)
+        if not isinstance(milestone, dict) or milestone.get("reached") is not True:
+            return None
+        blockers = milestone.get("blockers")
+        if not isinstance(blockers, list) or blockers:
+            return None
+        if readiness is None or readiness.get("state") == "failed":
+            return None
+        published_revision = readiness.get("published_revision")
+        target_revision = readiness.get("target_revision")
+        if published_revision is not None and published_revision < target_revision:
+            return None
+        if require_query_fresh and not _index_query_observation_fresh(status):
+            return None
+        return status
+
+    # v0.2.0 has no milestone contract. Its only safe interpretation is the
+    # historical fully-settled state for either requested milestone.
     readiness = _canonical_index_readiness(status)
     if readiness is not None:
         if readiness.get("state") != "ready":
@@ -390,10 +413,10 @@ def ready_index_status(
         # still fail closed until the published revision reaches its target.
         if published_revision is not None and published_revision < target_revision:
             return None
-    elif "backfill_state" in status and status.get("backfill_state") != "ready":
-        # Compatibility for older servers that predate canonical readiness.
-        # Presence of the field is meaningful: running/retrying/degraded are
-        # all incomplete, not merely non-terminal alternatives to `failed`.
+    if "backfill_state" in status and status.get("backfill_state") != "ready":
+        # v0.2.0 exposes this field without canonical readiness. Current
+        # serverless artifacts can expose both, so neither signal may weaken
+        # the other when milestones are absent.
         return None
     if status.get("materialization_blocked", False):
         return None
@@ -421,33 +444,37 @@ def ready_index_status(
         mismatch_count = coverage.get("config_mismatch_group_count")
         if type(mismatch_count) is not int or mismatch_count != 0:
             return None
-    if require_query_fresh:
-        expected_groups = status.get("expected_groups")
-        fresh_groups = status.get("fresh_groups")
-        if not isinstance(expected_groups, int) or expected_groups <= 0:
-            return None
-        if not isinstance(fresh_groups, int) or fresh_groups < expected_groups:
-            return None
-        if status.get("runtime_present") is not True:
-            return None
-        stale_groups = status.get("stale_groups")
-        if isinstance(stale_groups, int) and stale_groups > 0:
-            return None
-        if status.get("runtime_fresh") is False:
-            return None
+    if require_query_fresh and not _index_query_observation_fresh(status):
+        return None
     return status
+
+
+def _index_query_observation_fresh(status: dict[str, Any]) -> bool:
+    expected_groups = status.get("expected_groups")
+    fresh_groups = status.get("fresh_groups")
+    if not isinstance(expected_groups, int) or expected_groups <= 0:
+        return False
+    if not isinstance(fresh_groups, int) or fresh_groups < expected_groups:
+        return False
+    if status.get("runtime_present") is not True:
+        return False
+    stale_groups = status.get("stale_groups")
+    if isinstance(stale_groups, int) and stale_groups > 0:
+        return False
+    return status.get("runtime_fresh") is not False
 
 
 def _index_ready_timeout_message(
     table_name: str,
     index_name: str,
+    until: Literal["queryable", "complete"],
     timeout_s: float,
     last_info: dict[str, Any] | None,
     last_error: BaseException | None,
     server: Any,
 ) -> str:
     parts = [
-        f"index did not become ready within {timeout_s}s table={table_name!r} index={index_name!r}",
+        f"index did not reach {until} within {timeout_s}s table={table_name!r} index={index_name!r}",
     ]
     if last_info is not None:
         parts.append("[last index response]")
@@ -1864,10 +1891,19 @@ class PacingSensitiveOpenAiEmbeddingServer:
 
 
 class InferenceEmbeddingServer:
-    def __init__(self, host: str = "127.0.0.1"):
+    def __init__(self, host: str = "127.0.0.1", response_delay_s: float = 0.0):
         port = find_free_port()
         self.base_url = f"http://{host}:{port}"
         self.url = inference_public_api_url(self.base_url)
+        self.response_delay_s = response_delay_s
+        self._embedding_request_active = threading.Event()
+        self._delay_enabled = threading.Event()
+        self._delay_released = threading.Event()
+        self._malformed_embedding_lock = threading.Lock()
+        self._malformed_embedding_model: str | None = None
+        self._transient_embedding_lock = threading.Lock()
+        self._transient_embedding_model: str | None = None
+        self._transient_embedding_requests = 0
 
         outer = self
 
@@ -1941,6 +1977,55 @@ class InferenceEmbeddingServer:
                     f"{INFERENCE_PUBLIC_API_ROOT}/embeddings",
                 ):
                     model = payload.get("model", "")
+                    is_dimension_probe = (
+                        "antfly embedding dimension probe"
+                        in json.dumps(payload.get("input", ""))
+                    )
+                    with outer._transient_embedding_lock:
+                        transient = (
+                            outer._transient_embedding_model is not None
+                            and outer._transient_embedding_model in model
+                            and not is_dimension_probe
+                        )
+                        if transient:
+                            outer._transient_embedding_requests += 1
+                    if transient:
+                        self.send_error(503, "transient embedding fixture")
+                        return
+                    with outer._malformed_embedding_lock:
+                        malformed = (
+                            outer._malformed_embedding_model is not None
+                            and outer._malformed_embedding_model in model
+                        )
+                        if malformed:
+                            outer._malformed_embedding_model = None
+                    if malformed:
+                        body = json.dumps(
+                            {
+                                "object": "list",
+                                "data": [
+                                    {
+                                        "object": "embedding",
+                                        "index": 0,
+                                        "embedding": [1.0, 0.0],
+                                    }
+                                ],
+                                "model": model,
+                            }
+                        ).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    # Corpus work can be held to exercise lifecycle and
+                    # scheduling edges without turning the control-plane
+                    # dimension probe into the same long-running batch. The
+                    # probe is a separate, bounded admission class.
+                    if outer._delay_enabled.is_set() and not is_dimension_probe:
+                        outer._embedding_request_active.set()
+                        outer._delay_released.wait(outer.response_delay_s)
                     input_value = payload.get("input", [])
                     if isinstance(input_value, list):
                         values = [
@@ -1984,11 +2069,16 @@ class InferenceEmbeddingServer:
                         }
                     ).encode("utf-8")
 
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    except (BrokenPipeError, ConnectionResetError):
+                        # An activation request may preempt the worker that
+                        # owns this provider call.
+                        pass
                     return
 
                 self.send_error(404)
@@ -2015,6 +2105,37 @@ class InferenceEmbeddingServer:
         if '"mime_type": "image/png"' in lowered or '"type": "media"' in lowered:
             return [1.0, 0.0, 0.0]
         return [0.0, 0.0, 1.0]
+
+    def wait_for_embedding_request(self, timeout_s: float) -> bool:
+        return self._embedding_request_active.wait(timeout_s)
+
+    def arm_delay(self) -> None:
+        self._embedding_request_active.clear()
+        self._delay_released.clear()
+        self._delay_enabled.set()
+
+    def arm_malformed_embedding_response(self, model: str) -> None:
+        """Give the next request for ``model`` a wrong-dimension vector."""
+        with self._malformed_embedding_lock:
+            self._malformed_embedding_model = model
+
+    def arm_transient_embedding_failures(self, model: str) -> None:
+        with self._transient_embedding_lock:
+            self._transient_embedding_requests = 0
+            self._transient_embedding_model = model
+
+    def release_transient_embedding_failures(self) -> None:
+        with self._transient_embedding_lock:
+            self._transient_embedding_model = None
+
+    @property
+    def transient_embedding_requests(self) -> int:
+        with self._transient_embedding_lock:
+            return self._transient_embedding_requests
+
+    def release_delay(self) -> None:
+        self._delay_enabled.clear()
+        self._delay_released.set()
 
     def stop(self) -> None:
         self._server.shutdown()
@@ -2158,6 +2279,7 @@ def serverless_api(serverless_runtime):
             *,
             timeout_s: float = 30.0,
             interval_s: float = 0.5,
+            until: Literal["queryable", "complete"],
             require_query_fresh: bool = False,
         ) -> dict:
             deadline = time.monotonic() + timeout_s
@@ -2167,7 +2289,9 @@ def serverless_api(serverless_runtime):
                 try:
                     last_info = self.get(f"/tables/{table_name}/indexes/{index_name}")
                     ready = ready_index_status(
-                        last_info, require_query_fresh=require_query_fresh
+                        last_info,
+                        until=until,
+                        require_query_fresh=require_query_fresh,
                     )
                     if ready is not None:
                         return ready
@@ -2178,6 +2302,7 @@ def serverless_api(serverless_runtime):
                         _index_ready_timeout_message(
                             table_name,
                             index_name,
+                            until,
                             timeout_s,
                             last_info,
                             last_error,
@@ -2309,6 +2434,13 @@ def openai_embedder():
 def slow_openai_embedder():
     server = OpenAiEmbeddingServer(response_delay_s=2.0)
     yield server.url
+    server.stop()
+
+
+@pytest.fixture(scope="function")
+def slow_inference_embedder():
+    server = InferenceEmbeddingServer(response_delay_s=30.0)
+    yield server
     server.stop()
 
 
@@ -3120,6 +3252,11 @@ def backup_api(request: pytest.FixtureRequest):
             self._request_lock = threading.Lock()
             self._created_tables: set[str] = set()
 
+        def debug_logs(self) -> str:
+            if self._server is None:
+                return ""
+            return self._server.debug_logs().strip()
+
         def _raise_request_error(self, err: requests.RequestException) -> None:
             raise_request_error_with_logs(err, self._server)
 
@@ -3319,6 +3456,7 @@ def backup_api(request: pytest.FixtureRequest):
             *,
             timeout_s: float = 30.0,
             interval_s: float = 0.5,
+            until: Literal["queryable", "complete"],
             require_query_fresh: bool = False,
         ) -> dict:
             deadline = time.monotonic() + timeout_s
@@ -3328,7 +3466,9 @@ def backup_api(request: pytest.FixtureRequest):
                 try:
                     last_info = self.get(f"/tables/{table_name}/indexes/{index_name}")
                     ready = ready_index_status(
-                        last_info, require_query_fresh=require_query_fresh
+                        last_info,
+                        until=until,
+                        require_query_fresh=require_query_fresh,
                     )
                     if ready is not None:
                         return ready
@@ -3339,6 +3479,7 @@ def backup_api(request: pytest.FixtureRequest):
                         _index_ready_timeout_message(
                             table_name,
                             index_name,
+                            until,
                             timeout_s,
                             last_info,
                             last_error,
@@ -3575,6 +3716,7 @@ def table_api(request):
             *,
             timeout_s: float = 30.0,
             interval_s: float = 0.5,
+            until: Literal["queryable", "complete"],
             require_query_fresh: bool = False,
         ) -> dict:
             deadline = time.monotonic() + timeout_s
@@ -3584,7 +3726,9 @@ def table_api(request):
                 try:
                     last_info = self.get_index(table_name, index_name)
                     ready = ready_index_status(
-                        last_info, require_query_fresh=require_query_fresh
+                        last_info,
+                        until=until,
+                        require_query_fresh=require_query_fresh,
                     )
                     if ready is not None:
                         return ready
@@ -3595,6 +3739,7 @@ def table_api(request):
                         _index_ready_timeout_message(
                             table_name,
                             index_name,
+                            until,
                             timeout_s,
                             last_info,
                             last_error,
