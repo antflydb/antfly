@@ -41,15 +41,15 @@ Sleep 2s
 
 # --- Load data ---
 
-Type@75ms `antfly load -t wikipedia -f wiki-articles.json --id-field title`
+Type@75ms `antfly load -t wikipedia -f wiki-articles.jsonl --id-field title --sync-level full_text`
 Enter
 Sleep 2s
 
-# Wait for a published embedding artifact. This returns immediately on fast
-# machines and fails clearly instead of silently continuing after five minutes.
-Type@75ms `antfly index wait -t wikipedia -i title_body --until searchable-artifacts=1 --timeout 20m`
+# Wait for a meaningful, query-visible slice of the embedding corpus. The
+# remaining source documents continue indexing after the threshold is reached.
+Type@75ms `antfly index wait -t wikipedia -i title_body --until source-covered=10% --timeout 20m`
 Enter
-Wait@1200s /reached searchable-artifacts=1:/
+Wait@1200s /reached source-covered=10%:/
 Sleep 1s
 
 # --- Full-text search ---
