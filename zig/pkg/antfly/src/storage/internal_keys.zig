@@ -40,6 +40,12 @@ pub const graph_edge_contender_kind: u8 = 0x39;
 /// arbitrary document, artifact, embedding, and unit names cannot alias a
 /// user-visible asset-state key or another staging generation.
 pub const pdf_page_embedding_stage_kind: u8 = 0x40;
+/// Attempt-private resolved document units. Document extraction writes these
+/// records only while one source is being prepared, replays them through the
+/// materialization sinks, and removes the whole attempt prefix afterwards.
+/// Keeping the spool in its own kind prevents it from being mistaken for a
+/// user-visible artifact or from participating in artifact source indexes.
+pub const document_extraction_unit_spool_kind: u8 = 0x41;
 pub const graph_edge_contender_count_kind: u8 = 0x00;
 pub const graph_edge_contender_record_kind: u8 = 0x01;
 pub const derived_coverage_outcome_marker_kind: u8 = 0x00;
@@ -349,6 +355,45 @@ pub fn pdfPageEmbeddingStageAttemptRootPrefixAlloc(
     try list.appendSlice(alloc, root);
     try appendEncodedComponent(&list, alloc, attempt_id);
     return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentExtractionUnitSpoolArtifactRootPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, document_extraction_unit_spool_kind);
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentExtractionUnitSpoolRootPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    attempt_id: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const artifact_root = try documentExtractionUnitSpoolArtifactRootPrefixAlloc(alloc, doc_key, artifact_name);
+    defer alloc.free(artifact_root);
+    try list.appendSlice(alloc, artifact_root);
+    try appendEncodedComponent(&list, alloc, attempt_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentExtractionUnitSpoolKeyAlloc(
+    alloc: Allocator,
+    root: []const u8,
+    unit_index: u64,
+) ![]u8 {
+    var key = try alloc.alloc(u8, root.len + @sizeOf(u64));
+    @memcpy(key[0..root.len], root);
+    std.mem.writeInt(u64, key[root.len..][0..@sizeOf(u64)], unit_index, .big);
+    return key;
 }
 
 pub fn graphAssetStateRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
@@ -2615,4 +2660,39 @@ test "decodePrimaryDocumentKeyAlloc round-trips and rejects non-primary keys" {
     defer alloc.free(asset);
     try std.testing.expect(!isPrimaryDocumentKey(asset));
     try std.testing.expect((try decodePrimaryDocumentKeyAlloc(alloc, asset)) == null);
+}
+
+test "document extraction spool keys isolate attempts and preserve unit order" {
+    const alloc = std.testing.allocator;
+    const artifact_root = try documentExtractionUnitSpoolArtifactRootPrefixAlloc(
+        alloc,
+        "doc\x00one",
+        "pages\x00v1",
+    );
+    defer alloc.free(artifact_root);
+    const first_root = try documentExtractionUnitSpoolRootPrefixAlloc(
+        alloc,
+        "doc\x00one",
+        "pages\x00v1",
+        "7:fingerprint-a",
+    );
+    defer alloc.free(first_root);
+    const second_root = try documentExtractionUnitSpoolRootPrefixAlloc(
+        alloc,
+        "doc\x00one",
+        "pages\x00v1",
+        "8:fingerprint-b",
+    );
+    defer alloc.free(second_root);
+    const first = try documentExtractionUnitSpoolKeyAlloc(alloc, first_root, 1);
+    defer alloc.free(first);
+    const second = try documentExtractionUnitSpoolKeyAlloc(alloc, first_root, 2);
+    defer alloc.free(second);
+
+    try std.testing.expect(std.mem.startsWith(u8, first, first_root));
+    try std.testing.expect(std.mem.startsWith(u8, second, first_root));
+    try std.testing.expect(std.mem.startsWith(u8, first_root, artifact_root));
+    try std.testing.expect(std.mem.startsWith(u8, second_root, artifact_root));
+    try std.testing.expect(!std.mem.startsWith(u8, first, second_root));
+    try std.testing.expect(std.mem.order(u8, first, second) == .lt);
 }

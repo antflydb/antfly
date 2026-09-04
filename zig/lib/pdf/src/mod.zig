@@ -317,6 +317,26 @@ pub fn renderParsedPagePngAdaptiveWithProfileAlloc(
         .max_dimension = max_dimension,
     });
 
+    return renderParsedPagePngWithGeometryAlloc(
+        alloc,
+        parsed,
+        page_number,
+        requested_dpi,
+        max_pixels,
+        geometry,
+        profile,
+    );
+}
+
+fn renderParsedPagePngWithGeometryAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    requested_dpi: u16,
+    max_pixels: u64,
+    geometry: AdaptiveRenderGeometry,
+    profile: RenderProfile,
+) !RenderedPagePng {
     parsed.clearRenderDiagnostics();
     var used_compatibility_backend = false;
     const png = try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, geometry.effective_dpi, max_pixels, geometry.rotation, profile, &used_compatibility_backend);
@@ -464,13 +484,12 @@ const PreparedRenderPage = struct {
     request: PageRenderRequest,
     pixels: u64,
     admitted_bytes: usize,
+    geometry: AdaptiveRenderGeometry,
 };
 
 const RenderWaveControl = struct {
     external: reader.CancellationProbe,
     stopped: std.atomic.Value(bool) = .init(false),
-    start_released: std.atomic.Value(bool) = .init(false),
-    arrived: std.atomic.Value(usize) = .init(0),
     active: std.atomic.Value(usize) = .init(0),
     peak_active: std.atomic.Value(usize) = .init(0),
 
@@ -500,32 +519,63 @@ const RenderWaveControl = struct {
     fn leaveRender(self: *@This()) void {
         _ = self.active.fetchSub(1, .acq_rel);
     }
+};
 
-    /// Count every successfully launched worker before allowing the wave to
-    /// render. Besides avoiding first-spawn scheduling bias in diagnostics,
-    /// this makes a render wave begin from one immutable, fully prepared set
-    /// of task-local readers.
-    fn arriveAndWaitForStart(self: *@This()) void {
-        _ = self.arrived.fetchAdd(1, .acq_rel);
-        while (!self.start_released.load(.acquire)) {
-            std.atomic.spinLoopHint();
-            std.Thread.yield() catch {};
-        }
+/// Per-batch worker rendezvous. Threads are created once and reused across all
+/// admitted waves in the window; task-local PDF readers are still recreated
+/// between waves so mutable decode caches never cross page ownership.
+const RenderBatchThreadControl = struct {
+    mutex: std.Io.Mutex = .init,
+    wave_ready: std.Io.Condition = .init,
+    wave_complete: std.Io.Condition = .init,
+    sync_io: std.Io,
+    generation: usize = 0,
+    completed: usize = 0,
+    active_len: usize = 0,
+    stopping: bool = false,
+
+    fn init() @This() {
+        return .{ .sync_io = std.Io.Threaded.global_single_threaded.io() };
     }
 
-    fn releaseStartWhenReady(self: *@This(), expected: usize) void {
-        while (self.arrived.load(.acquire) < expected) {
-            self.external.check() catch {
-                // A deadline must release workers that already reached the
-                // gate. Late workers observe the released gate, then fail the
-                // composed cancellation probe before rendering.
-                self.stop();
-                break;
-            };
-            std.atomic.spinLoopHint();
-            std.Thread.yield() catch {};
+    fn startWave(self: *@This(), active_len: usize) void {
+        self.mutex.lockUncancelable(self.sync_io);
+        self.active_len = active_len;
+        self.completed = 0;
+        self.generation +%= 1;
+        self.wave_ready.broadcast(self.sync_io);
+        self.mutex.unlock(self.sync_io);
+    }
+
+    fn awaitWave(self: *@This(), previous_generation: *usize, worker_index: usize) ?bool {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        while (!self.stopping and self.generation == previous_generation.*) {
+            self.wave_ready.waitUncancelable(self.sync_io, &self.mutex);
         }
-        self.start_released.store(true, .release);
+        if (self.stopping) return null;
+        previous_generation.* = self.generation;
+        return worker_index < self.active_len;
+    }
+
+    fn completeWave(self: *@This()) void {
+        self.mutex.lockUncancelable(self.sync_io);
+        self.completed += 1;
+        self.wave_complete.signal(self.sync_io);
+        self.mutex.unlock(self.sync_io);
+    }
+
+    fn waitForWorkers(self: *@This(), expected: usize) void {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        while (self.completed < expected) self.wave_complete.waitUncancelable(self.sync_io, &self.mutex);
+    }
+
+    fn stop(self: *@This()) void {
+        self.mutex.lockUncancelable(self.sync_io);
+        self.stopping = true;
+        self.wave_ready.broadcast(self.sync_io);
+        self.mutex.unlock(self.sync_io);
     }
 };
 
@@ -558,30 +608,58 @@ const PageRenderWorker = struct {
     failure: ?anyerror = null,
     render_elapsed_ns: u64 = 0,
     thread: ?std.Thread = null,
-    wave_control: *RenderWaveControl,
+    wave_control: *RenderWaveControl = undefined,
+    planned_geometry: AdaptiveRenderGeometry = undefined,
+    thread_control: *RenderBatchThreadControl,
+    worker_index: usize,
+    task_initialized: bool = false,
 
-    fn init(self: *PageRenderWorker, source: *reader.Reader, request: PageRenderRequest, profile: RenderProfile, wave_control: *RenderWaveControl, admitted_bytes: usize) !void {
+    fn initBase(self: *PageRenderWorker, thread_control: *RenderBatchThreadControl, worker_index: usize) void {
         self.* = .{
-            .request = request,
-            .profile = profile,
-            .budget = .{
-                .backing = std.heap.page_allocator,
-                .max_live_bytes = admitted_bytes,
-            },
-            .wave_control = wave_control,
+            .request = undefined,
+            .profile = undefined,
+            .budget = undefined,
+            .thread_control = thread_control,
+            .worker_index = worker_index,
         };
-        errdefer self.deinit();
+    }
+
+    fn prepare(self: *PageRenderWorker, source: *reader.Reader, prepared: PreparedRenderPage, profile: RenderProfile, wave_control: *RenderWaveControl) !void {
+        std.debug.assert(!self.task_initialized);
+        self.request = prepared.request;
+        self.profile = profile;
+        self.budget = .{
+            .backing = std.heap.page_allocator,
+            .max_live_bytes = prepared.admitted_bytes,
+        };
+        self.wave_control = wave_control;
+        self.planned_geometry = prepared.geometry;
+        self.rendered = null;
+        self.failure = null;
+        self.render_elapsed_ns = 0;
+        self.task_initialized = true;
+        errdefer self.deinitTask();
         self.parsed = try source.forkForRendering(self.budget.allocator(), wave_control.probe());
     }
 
-    fn deinit(self: *PageRenderWorker) void {
+    fn deinitTask(self: *PageRenderWorker) void {
+        if (!self.task_initialized) return;
         if (self.rendered) |*rendered| rendered.deinit(self.budget.allocator());
         if (self.parsed) |*parsed| parsed.deinit();
-        self.* = undefined;
+        self.rendered = null;
+        self.parsed = null;
+        self.task_initialized = false;
     }
 
-    fn run(self: *PageRenderWorker) void {
-        self.wave_control.arriveAndWaitForStart();
+    fn threadMain(self: *PageRenderWorker) void {
+        var generation: usize = 0;
+        while (self.thread_control.awaitWave(&generation, self.worker_index)) |active| {
+            if (active) self.runPrepared();
+            self.thread_control.completeWave();
+        }
+    }
+
+    fn runPrepared(self: *PageRenderWorker) void {
         self.wave_control.probe().check() catch {
             self.failure = error.Canceled;
             return;
@@ -597,15 +675,26 @@ const PageRenderWorker = struct {
         var attempts: u8 = 0;
         while (true) {
             attempts +|= 1;
-            var rendered = renderParsedPagePngAdaptiveWithProfileAlloc(
-                self.budget.allocator(),
-                &self.parsed.?,
-                request.page_number,
-                request.requested_dpi,
-                request.max_pixels,
-                request.max_dimension,
-                self.profile,
-            ) catch |err| {
+            var rendered = (if (attempts == 1)
+                renderParsedPagePngWithGeometryAlloc(
+                    self.budget.allocator(),
+                    &self.parsed.?,
+                    request.page_number,
+                    request.requested_dpi,
+                    request.max_pixels,
+                    self.planned_geometry,
+                    self.profile,
+                )
+            else
+                renderParsedPagePngAdaptiveWithProfileAlloc(
+                    self.budget.allocator(),
+                    &self.parsed.?,
+                    request.page_number,
+                    request.requested_dpi,
+                    request.max_pixels,
+                    request.max_dimension,
+                    self.profile,
+                )) catch |err| {
                 self.failure = if (err == error.OutOfMemory and self.budget.limit_exceeded)
                     error.RenderWorkerMemoryLimitExceeded
                 else
@@ -660,10 +749,7 @@ fn nextBoundedRenderDimension(current: u32, encoded_bytes: usize, byte_budget: u
 fn renderPageAdmissionBytes(parsed: *const reader.Reader, pixels: u64, options: PageRenderBatchOptions) !usize {
     const raster_bytes_u64 = std.math.mul(u64, pixels, std.math.cast(u64, options.bytes_per_pixel_reserve) orelse return error.RenderBatchAdmissionExceeded) catch return error.RenderBatchAdmissionExceeded;
     const raster_bytes = std.math.cast(usize, raster_bytes_u64) orelse return error.RenderBatchAdmissionExceeded;
-    // Forks borrow source bytes, but their cloned page/xref metadata can grow
-    // with document size. Charging the complete source length is deliberately
-    // conservative and gives the task-local allocator a hard upper bound.
-    const with_metadata = std.math.add(usize, raster_bytes, parsed.sourceBytes().len) catch return error.RenderBatchAdmissionExceeded;
+    const with_metadata = std.math.add(usize, raster_bytes, try parsed.renderForkMetadataBytes()) catch return error.RenderBatchAdmissionExceeded;
     return std.math.add(usize, with_metadata, parsed.decode_limits.max_working_set_bytes) catch return error.RenderBatchAdmissionExceeded;
 }
 
@@ -675,7 +761,7 @@ fn prepareRenderPageForAdmission(
 ) !PreparedRenderPage {
     const fixed_bytes = std.math.add(
         usize,
-        parsed.sourceBytes().len,
+        try parsed.renderForkMetadataBytes(),
         parsed.decode_limits.max_working_set_bytes,
     ) catch return error.RenderBatchAdmissionExceeded;
     if (fixed_bytes >= options.max_inflight_bytes) return error.RenderBatchAdmissionExceeded;
@@ -700,6 +786,7 @@ fn prepareRenderPageForAdmission(
         .request = adjusted,
         .pixels = geometry.pixels,
         .admitted_bytes = admitted_bytes,
+        .geometry = geometry,
     };
 }
 
@@ -762,13 +849,33 @@ pub fn renderParsedPagesBatchAlloc(
     const wave = try alloc.alloc(PreparedRenderPage, worker_capacity);
     defer alloc.free(wave);
 
+    var thread_control = RenderBatchThreadControl.init();
+    for (workers, 0..) |*worker, i| worker.initBase(&thread_control, i);
+    var thread_spawn_fallbacks: usize = 0;
+    var spawned_workers: usize = 0;
+    if (worker_capacity > 1) {
+        for (workers) |*worker| {
+            worker.thread = std.Thread.spawn(.{}, PageRenderWorker.threadMain, .{worker}) catch blk: {
+                thread_spawn_fallbacks += 1;
+                break :blk null;
+            };
+            if (worker.thread != null) spawned_workers += 1;
+        }
+    }
+    defer {
+        thread_control.stop();
+        for (workers) |*worker| {
+            if (worker.thread) |thread| thread.join();
+            worker.deinitTask();
+        }
+    }
+
     var next_request: usize = 0;
     var retained_png_bytes: usize = 0;
     var peak_launched_workers: usize = 0;
     var peak_parallelism: usize = 0;
     var peak_admitted_pixels: u64 = 0;
     var peak_admitted_bytes: usize = 0;
-    var thread_spawn_fallbacks: usize = 0;
     while (next_request < requests.len) {
         try cancellation.check();
         var wave_len: usize = 0;
@@ -791,40 +898,32 @@ pub fn renderParsedPagesBatchAlloc(
         var wave_control = RenderWaveControl{ .external = cancellation };
         var initialized_workers: usize = 0;
         defer {
-            for (workers[0..initialized_workers]) |*worker| worker.deinit();
+            for (workers[0..initialized_workers]) |*worker| worker.deinitTask();
         }
         for (wave[0..wave_len], 0..) |candidate, i| {
-            try workers[i].init(
+            try workers[i].prepare(
                 parsed,
-                candidate.request,
+                candidate,
                 options.profile,
                 &wave_control,
-                candidate.admitted_bytes,
             );
             initialized_workers += 1;
         }
 
-        if (wave_len == 1) {
+        if (wave_len == 1 and spawned_workers == 0) {
             // The conservative default does not need a helper thread. Keeping
             // the serial case inline avoids thread setup cost while exercising
             // the exact same batch ownership and admission path.
-            wave_control.releaseStartWhenReady(0);
-            workers[0].run();
+            workers[0].runPrepared();
         } else {
-            var spawned_workers: usize = 0;
-            for (workers[0..wave_len]) |*worker| {
-                worker.thread = std.Thread.spawn(.{}, PageRenderWorker.run, .{worker}) catch blk: {
-                    thread_spawn_fallbacks += 1;
-                    break :blk null;
-                };
-                if (worker.thread != null) spawned_workers += 1;
-            }
-            peak_launched_workers = @max(peak_launched_workers, spawned_workers);
-            wave_control.releaseStartWhenReady(spawned_workers);
-            for (workers[0..wave_len]) |*worker| if (worker.thread == null) worker.run();
-            for (workers[0..wave_len]) |*worker| {
-                if (worker.thread) |thread| thread.join();
-            }
+            thread_control.startWave(wave_len);
+            var active_spawned_workers: usize = 0;
+            for (workers[0..wave_len]) |*worker| if (worker.thread == null) worker.runPrepared();
+            for (workers[0..wave_len]) |worker| if (worker.thread != null) {
+                active_spawned_workers += 1;
+            };
+            thread_control.waitForWorkers(spawned_workers);
+            peak_launched_workers = @max(peak_launched_workers, active_spawned_workers);
         }
 
         peak_parallelism = @max(peak_parallelism, wave_control.peak_active.load(.acquire));
@@ -3400,6 +3499,11 @@ test "render forks isolate mutable state across concurrent pages" {
     defer first_fork.deinit();
     var second_fork = try parsed.forkForRendering(second_arena.allocator(), .{});
     defer second_fork.deinit();
+    try std.testing.expect(!first_fork.owns_document_metadata);
+    try std.testing.expect(!second_fork.owns_document_metadata);
+    try std.testing.expectEqual(@intFromPtr(parsed.xref_entries.ptr), @intFromPtr(first_fork.xref_entries.ptr));
+    try std.testing.expectEqual(@intFromPtr(parsed.page_index.?.ptr), @intFromPtr(first_fork.page_index.?.ptr));
+    try std.testing.expectEqual(@intFromPtr(parsed.page_index.?.ptr), @intFromPtr(second_fork.page_index.?.ptr));
 
     const Worker = struct {
         alloc: Allocator,
@@ -3638,45 +3742,29 @@ test "render wave control composes cancellation and measures active workers" {
     try std.testing.expectError(error.Canceled, control.probe().check());
 }
 
-test "render wave start gate releases immediately on cancellation" {
-    const Cancellation = struct {
-        cancelled: std.atomic.Value(bool) = .init(false),
-
-        fn check(context: ?*const anyopaque) bool {
-            const self: *const @This() = @ptrCast(@alignCast(context.?));
-            return self.cancelled.load(.acquire);
-        }
-    };
-    const Releaser = struct {
-        control: *RenderWaveControl,
+test "render batch thread control reuses workers across generations" {
+    const Worker = struct {
+        control: *RenderBatchThreadControl,
+        waves: std.atomic.Value(usize) = .init(0),
 
         fn run(self: *@This()) void {
-            // Deliberately expect a worker that never arrives. Cancellation
-            // must still release the gate and let this thread terminate.
-            self.control.releaseStartWhenReady(1);
+            var generation: usize = 0;
+            while (self.control.awaitWave(&generation, 0)) |active| {
+                if (active) _ = self.waves.fetchAdd(1, .acq_rel);
+                self.control.completeWave();
+            }
         }
     };
-
-    var cancellation = Cancellation{};
-    var control = RenderWaveControl{ .external = .{
-        .context = &cancellation,
-        .is_cancelled_fn = Cancellation.check,
-    } };
-    var releaser = Releaser{ .control = &control };
-    const thread = try std.Thread.spawn(.{}, Releaser.run, .{&releaser});
-    cancellation.cancelled.store(true, .release);
+    var control = RenderBatchThreadControl.init();
+    var worker = Worker{ .control = &control };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    control.startWave(1);
+    control.waitForWorkers(1);
+    control.startWave(1);
+    control.waitForWorkers(1);
+    control.stop();
     thread.join();
-
-    try std.testing.expect(control.start_released.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), control.arrived.load(.acquire));
-    try std.testing.expectError(error.Canceled, control.probe().check());
-
-    // A worker scheduled after cancellation cannot become trapped behind the
-    // already released start gate.
-    control.enterRender();
-    control.arriveAndWaitForStart();
-    control.leaveRender();
-    try std.testing.expectEqual(@as(usize, 0), control.active.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), worker.waves.load(.acquire));
 }
 
 test "bounded render batch enforces window admission and retained output limits" {

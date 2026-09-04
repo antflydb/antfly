@@ -311,20 +311,16 @@ pub const ReadingPipeline = struct {
         defer allocator.free(pixel_values);
 
         for (image_datas, 0..) |image_data, i| {
-            {
-                const decoded = try image.decode(allocator, image_data);
-                defer decoded.deinit(allocator);
-                const single = try image.preprocessDecodedWithResample(
-                    allocator,
-                    decoded,
-                    img_size,
-                    self.config.image_mean,
-                    self.config.image_std,
-                    self.config.resample,
-                );
-                defer allocator.free(single);
-                @memcpy(pixel_values[i * per_image ..][0..per_image], single);
-            }
+            const decoded = try image.decode(allocator, image_data);
+            defer decoded.deinit(allocator);
+            try image.preprocessDecodedWithResampleInto(
+                decoded,
+                pixel_values[i * per_image ..][0..per_image],
+                img_size,
+                self.config.image_mean,
+                self.config.image_std,
+                self.config.resample,
+            );
         }
 
         const prompt_text = self.config.prompt orelse "<OCR>";

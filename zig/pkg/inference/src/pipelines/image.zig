@@ -685,6 +685,17 @@ pub fn preprocessDecodedWithResample(
     return shared.preprocessDecodedWithResample(allocator, toSharedImage(img), target_size, mean, std_dev, resample);
 }
 
+pub fn preprocessDecodedWithResampleInto(
+    img: Image,
+    output: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    resample: Resample,
+) !void {
+    return shared.preprocessDecodedWithResampleInto(toSharedImage(img), output, target_size, mean, std_dev, resample);
+}
+
 /// Preprocess an already-decoded image to an explicit width/height target.
 pub fn preprocessDecodedRect(
     allocator: std.mem.Allocator,
@@ -975,9 +986,16 @@ pub fn preprocessBatch(
     errdefer allocator.free(result);
 
     for (image_list, 0..) |image_bytes, i| {
-        const single = try preprocess(allocator, image_bytes, target_size, mean, std_dev);
-        defer allocator.free(single);
-        @memcpy(result[i * per_image ..][0..per_image], single);
+        const decoded = try decode(allocator, image_bytes);
+        defer decoded.deinit(allocator);
+        try preprocessDecodedWithResampleInto(
+            decoded,
+            result[i * per_image ..][0..per_image],
+            target_size,
+            mean,
+            std_dev,
+            .bilinear,
+        );
     }
 
     return result;

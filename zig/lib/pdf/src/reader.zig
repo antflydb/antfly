@@ -3659,6 +3659,10 @@ pub const Reader = struct {
     render_target: ?RenderTarget = null,
     last_render_diagnostics: ?PageRenderDiagnostics = null,
     cancellation: CancellationProbe = .{},
+    /// Render forks borrow the immutable document index from their source
+    /// reader. Mutable decode caches remain fork-local, while this flag keeps
+    /// teardown from walking or freeing the shared xref/trailer/page tree.
+    owns_document_metadata: bool = true,
 
     const max_recursive_pdf_objects: usize = 100_000;
 
@@ -3826,9 +3830,11 @@ pub const Reader = struct {
     }
 
     pub fn deinit(self: *Reader) void {
-        if (self.page_index) |pages| {
-            for (pages) |*page| page.deinit(self.alloc);
-            self.alloc.free(pages);
+        if (self.owns_document_metadata) {
+            if (self.page_index) |pages| {
+                for (pages) |*page| page.deinit(self.alloc);
+                self.alloc.free(pages);
+            }
         }
         var font_iter = self.font_cache.valueIterator();
         while (font_iter.next()) |font| font.deinit(self.alloc);
@@ -3840,18 +3846,20 @@ pub const Reader = struct {
         }
         self.encrypted_streams.deinit(self.alloc);
         self.alloc.destroy(self.encrypted_streams);
-        self.alloc.free(self.xref_entries);
-        self.trailer.deinit(self.alloc);
+        if (self.owns_document_metadata) {
+            self.alloc.free(self.xref_entries);
+            self.trailer.deinit(self.alloc);
+        }
         self.* = undefined;
     }
 
-    /// Create an independently owned render view of this parsed document.
+    /// Create an independently mutable render view of this parsed document.
     ///
     /// The source byte slice remains borrowed from the original document and
-    /// must outlive the returned Reader. Parsed document metadata is cloned,
-    /// while every mutable cache and render diagnostic is task-local. A fork
-    /// may therefore be moved to another thread as long as its allocator is
-    /// also safe to use exclusively from that thread.
+    /// must outlive the returned Reader. The frozen xref, trailer, and page
+    /// index are borrowed; every mutable cache and render diagnostic remains
+    /// task-local. A fork may therefore be moved to another thread as long as
+    /// its allocator is also safe to use exclusively from that thread.
     ///
     /// Callers must create all forks before starting render threads. This
     /// serializes lazy page-tree discovery and makes the shared source Reader
@@ -3859,24 +3867,6 @@ pub const Reader = struct {
     pub fn forkForRendering(self: *Reader, alloc: Allocator, cancellation: CancellationProbe) !Reader {
         try cancellation.check();
         try self.ensurePageIndex();
-
-        const xref_entries = try alloc.dupe(XrefEntry, self.xref_entries);
-        errdefer alloc.free(xref_entries);
-
-        var trailer = try self.trailer.clone(alloc);
-        errdefer trailer.deinit(alloc);
-
-        const source_pages = self.page_index.?;
-        const page_index = try alloc.alloc(syntax.Object, source_pages.len);
-        var initialized_pages: usize = 0;
-        errdefer {
-            for (page_index[0..initialized_pages]) |*page| page.deinit(alloc);
-            alloc.free(page_index);
-        }
-        for (source_pages, 0..) |page, i| {
-            page_index[i] = try page.clone(alloc);
-            initialized_pages += 1;
-        }
 
         const font_cache = try alloc.create(std.AutoHashMapUnmanaged(u64, PageFont));
         errdefer alloc.destroy(font_cache);
@@ -3901,15 +3891,27 @@ pub const Reader = struct {
             .decode_limits = self.decode_limits,
             .version_minor = self.version_minor,
             .startxref_offset = self.startxref_offset,
-            .xref_entries = xref_entries,
-            .trailer = trailer,
-            .page_index = page_index,
+            .xref_entries = self.xref_entries,
+            .trailer = self.trailer,
+            .page_index = self.page_index,
             .font_cache = font_cache,
             .image_cache = image_cache,
             .encryption = self.encryption,
             .encrypted_streams = encrypted_streams,
             .cancellation = cancellation,
+            .owns_document_metadata = false,
         };
+    }
+
+    /// Conservative task-local metadata allowance for a render fork. The
+    /// immutable document index is shared and therefore deliberately excluded.
+    pub fn renderForkMetadataBytes(self: *const Reader) !usize {
+        _ = self;
+        // Hash-map growth and decoded object storage are already bounded by
+        // decode_limits.max_working_set_bytes. This allowance is only for the
+        // Reader value and small map/control allocations created before that
+        // budget is exercised; it must not scale with shared document state.
+        return 64 * 1024;
     }
 
     pub fn trailerGet(self: *const Reader, key: []const u8) ?*const syntax.Object {

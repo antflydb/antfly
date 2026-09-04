@@ -60,6 +60,27 @@ pub fn preprocessDecodedWithResample(
     return preprocessDecodedRectWithResample(allocator, img, target_size, target_size, mean, std_dev, resample);
 }
 
+/// Write normalized CHW pixels directly into caller-owned batch storage.
+pub fn preprocessDecodedWithResampleInto(
+    img: ImageU8,
+    output: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    resample: Resample,
+) !void {
+    return preprocessDecodedRectScaledWithResampleInto(
+        img,
+        output,
+        target_size,
+        target_size,
+        mean,
+        std_dev,
+        1.0 / 255.0,
+        resample,
+    );
+}
+
 /// Convert a decoded RGB/RGBA image into normalized CHW f32 layout with explicit width and height.
 pub fn preprocessDecodedRect(
     allocator: std.mem.Allocator,
@@ -105,7 +126,8 @@ pub fn preprocessDecodedRectScaledWithResample(
     rescale_factor: f32,
     resample: Resample,
 ) ![]f32 {
-    const expected_min = @as(usize, img.width) * @as(usize, img.height) * img.channels();
+    const source_pixels = std.math.mul(usize, img.width, img.height) catch return error.InvalidImageBuffer;
+    const expected_min = std.math.mul(usize, source_pixels, img.channels()) catch return error.InvalidImageBuffer;
     if (img.data.len < expected_min) return error.InvalidImageBuffer;
 
     const tw: usize = target_width;
@@ -113,9 +135,41 @@ pub fn preprocessDecodedRectScaledWithResample(
     const result = try allocator.alloc(f32, 3 * tw * th);
     errdefer allocator.free(result);
 
+    try preprocessDecodedRectScaledWithResampleInto(
+        img,
+        result,
+        target_width,
+        target_height,
+        mean,
+        std_dev,
+        rescale_factor,
+        resample,
+    );
+    return result;
+}
+
+pub fn preprocessDecodedRectScaledWithResampleInto(
+    img: ImageU8,
+    result: []f32,
+    target_width: u32,
+    target_height: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    rescale_factor: f32,
+    resample: Resample,
+) !void {
+    const expected_min = @as(usize, img.width) * @as(usize, img.height) * img.channels();
+    if (img.data.len < expected_min) return error.InvalidImageBuffer;
+
+    const tw: usize = target_width;
+    const th: usize = target_height;
+    const output_len = std.math.mul(usize, 3, std.math.mul(usize, tw, th) catch return error.InvalidImageBuffer) catch
+        return error.InvalidImageBuffer;
+    if (result.len != output_len) return error.InvalidImageBuffer;
+
     if (solidRgb(img)) |rgb| {
         fillSolidChw(result, tw, th, rgb, mean, std_dev, rescale_factor);
-        return result;
+        return;
     }
 
     const src_w: f32 = @floatFromInt(img.width);
@@ -125,7 +179,7 @@ pub fn preprocessDecodedRectScaledWithResample(
 
     if (resample == .bilinear) {
         preprocessDecodedRectBilinearInterleaved(img, result, tw, th, mean, std_dev, rescale_factor, scale_x, scale_y);
-        return result;
+        return;
     }
 
     for (0..th) |y| {
@@ -136,8 +190,6 @@ pub fn preprocessDecodedRectScaledWithResample(
             }
         }
     }
-
-    return result;
 }
 
 pub fn computeAspectFitWidth(src_width: u32, src_height: u32, target_height: u32, max_width: u32) u32 {
@@ -584,6 +636,47 @@ test "preprocess decoded rgba ignores alpha" {
     try std.testing.expectApproxEqAbs(@as(f32, 10.0 / 255.0), out[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 20.0 / 255.0), out[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 30.0 / 255.0), out[2], 1e-6);
+}
+
+test "preprocess decoded into caller batch storage matches allocating path" {
+    const alloc = std.testing.allocator;
+    const rgba = [_]u8{
+        255, 0,   0,   255,
+        0,   255, 0,   128,
+        0,   0,   255, 64,
+        255, 255, 255, 0,
+    };
+    const image = ImageU8{ .data = &rgba, .width = 2, .height = 2, .format = .rgba8 };
+    const expected = try preprocessDecodedWithResample(
+        alloc,
+        image,
+        3,
+        .{ 0.5, 0.5, 0.5 },
+        .{ 0.5, 0.5, 0.5 },
+        .bilinear,
+    );
+    defer alloc.free(expected);
+    var actual: [27]f32 = undefined;
+    try preprocessDecodedWithResampleInto(
+        image,
+        &actual,
+        3,
+        .{ 0.5, 0.5, 0.5 },
+        .{ 0.5, 0.5, 0.5 },
+        .bilinear,
+    );
+    try std.testing.expectEqualSlices(f32, expected, &actual);
+    try std.testing.expectError(
+        error.InvalidImageBuffer,
+        preprocessDecodedWithResampleInto(
+            image,
+            actual[0..26],
+            3,
+            .{ 0.5, 0.5, 0.5 },
+            .{ 0.5, 0.5, 0.5 },
+            .bilinear,
+        ),
+    );
 }
 
 test "preprocess decoded rect returns non-square chw output" {

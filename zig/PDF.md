@@ -3,7 +3,8 @@
 Status: bounded document preparation, indexed reader execution, multimodal
 generation transport, distributed model-aware routing, lease-fenced durable
 page-image embedding, observed remote execution, and post-review batching
-hardening implemented
+hardening, single-pass PDF preparation, bounded unit replay, and hot-path
+allocation reductions implemented
 
 This document describes how Antfly turns documents into bounded inference work.
 PDF extraction, page rendering, OCR, generation, and embedding share document
@@ -2225,6 +2226,44 @@ The hardening above follows these long-term rules:
     base64 gate is removed. Exact logical request limits and the resolved
     transport planner govern admission, while PDF-only staging arrays are
     sized from actual pending work under a process-wide control-item ceiling.
+71. **Implemented after repeated-work review:** one prepared PDF reader now
+    owns inspection, page metadata, and the immutable xref/trailer state used
+    by OCR render forks. Final resolved units are serialized once into a
+    bounded, attempt-private hybrid spool and replayed one unit at a time for
+    artifact materialization and publication. PDFs below the four-MiB spool
+    window replay directly from admitted memory; larger documents spill in
+    bounded store batches. The old three extraction walks are therefore one
+    transformation walk plus two cheap typed replays. Spill writes are
+    transactional but intentionally do not force durability or enter artifact
+    accounting; a retry prefix-clears every stale attempt for the leased
+    document artifact before writing, and every exit performs best-effort
+    cleanup. The PDF reader and its native memory reservation are released
+    before database materialization begins.
+72. **Implemented after renderer metadata review:** render workers borrow the
+    prepared document's immutable page index, xref entries, and trailer rather
+    than cloning structures proportional to the PDF for every page. Each fork
+    still owns mutable font, image, encryption, decode, and diagnostic caches,
+    so sharing does not weaken thread isolation. Admission charges a bounded
+    fork-control allowance instead of charging the source document once per
+    worker.
+73. **Implemented after render scheduling review:** a render call creates its
+    worker team once and reuses those threads across every admitted wave. Each
+    wave still creates and destroys task-local mutable reader state, while a
+    generation counter coordinates reusable workers and joins all active work
+    before buffers are released. Planned adaptive geometry is passed into the
+    first render attempt, avoiding duplicate page-box/rotation work; geometry
+    is recomputed only for a quality/size retry.
+74. **Implemented after output-credit and storage review:** page-image
+    embedding pins its complete pre-admitted output credit for the whole
+    operation instead of releasing and reacquiring capacity between windows.
+    Attempt-private page embeddings are committed once per bounded render
+    window rather than once per page. These changes remove allocator races and
+    writer-transaction amplification without retaining more than one window.
+75. **Implemented after hot-path allocation review:** OCR and visual embedding
+    choose the largest admissible prefix with monotonic binary search rather
+    than decrementing one page at a time. Generic image batches and Florence
+    batches preprocess decoded images directly into their final batch tensor,
+    eliminating one full float tensor allocation and copy per image.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -3104,6 +3143,8 @@ byte admission. Parallelism defaults to one and is operator-capped at eight.
   persistent/decode/raster budgets, and recompute available render bytes before
   each window.
 - Downsize encoded output within each worker before retaining a completed page.
+- Borrow immutable document metadata into worker forks and reuse one worker
+  team across all waves in a render call; mutable caches remain wave-local.
 
 ### Phase 4: Binary local media handoff
 
@@ -3134,7 +3175,8 @@ prefetch at zero.
 
 ### Phase 6: Optional decoded-image handoff
 
-Status: measurement-driven follow-up.
+Status: direct-to-batch-tensor preprocessing is complete; passing decoded PDF
+rasters across the local model boundary remains measurement-driven follow-up.
 
 - Measure whether PNG encode/decode remains material after Phase 4.
 - If justified, define a stable decoded pixel format at the local boundary.
@@ -3143,14 +3185,14 @@ Status: measurement-driven follow-up.
 
 ### Phase 7: Fuse PDF inspection and render preparation if needed
 
-Status: measurement-driven follow-up.
+Status: complete. One prepared reader owns inspection and lends immutable
+metadata to render forks. A bounded attempt spool prevents materialization and
+publication from walking the PDF again.
 
-- Measure the remaining cost of parsing once for embedded text and once for the
-  render operation.
-- If material, add a coarse PDF preparation operation that shares one parsed
-  document across text analysis and candidate rendering.
-- Prefer a single bounded streaming operation over a long-lived opaque ABI
-  handle.
+- Parse and transform a PDF once per changed source fingerprint.
+- Keep the prepared handle operation-scoped, never process-global.
+- Replay resolved typed units from bounded attempt storage, then clean that
+  private keyspace.
 
 ## Acceptance criteria
 
@@ -3158,8 +3200,8 @@ The implemented baseline satisfies these criteria:
 
 - Compatible multi-page PDF OCR requests use the native Florence batch path by
   default, with an eight-item document default.
-- A document is parsed once for its render operation, independent of the
-  number of OCR pages.
+- A changed PDF is parsed and transformed once for its complete extraction
+  operation, independent of the number of OCR pages and publication passes.
 - Render concurrency is explicitly capped and never derived from CPU count.
 - Aggregate pixels and working bytes are admitted before concurrent work, and
   every worker also has a hard live-allocation ceiling.
@@ -3196,9 +3238,10 @@ The following remain qualification work rather than architectural blockers:
 - Whether the conservative source-size, decode-working-set, and
   bytes-per-pixel reservation can be tightened with measured high-water data.
 - Whether a process-wide CPU permit pool materially improves control beyond
-  the existing per-document cap, bounded enrichment execution lanes, and
-  global resource-manager byte reservation.
+  the existing reusable per-render worker team, per-document cap, bounded
+  enrichment execution lanes, and global resource-manager byte reservation.
 - Whether the long-term pipeline should retain PNG as the local interchange
   format or move directly to RGB pixels after measuring Phase 4.
-- Whether extraction and render preparation should share one parse after
-  measuring the remaining second document parse.
+- Whether the attempt spool should eventually use a compact versioned binary
+  unit codec instead of JSON after corpus measurements quantify serialization
+  CPU and temporary storage size.

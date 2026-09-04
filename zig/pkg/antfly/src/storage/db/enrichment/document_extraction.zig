@@ -47,6 +47,10 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                     return error.PdfExtractionUnavailable;
                 }
 
+                pub fn forkForRendering(_: *Reader, _: Allocator, _: CancellationProbe) anyerror!Reader {
+                    return error.PdfExtractionUnavailable;
+                }
+
                 pub fn deinit(_: *Reader) void {}
 
                 pub fn setCancellationProbe(_: *Reader, _: CancellationProbe) void {}
@@ -452,6 +456,15 @@ pub const PdfRenderSession = struct {
 
     pub fn initWithDecodeLimitsAndCancellation(alloc: Allocator, pdf_bytes: []const u8, decode_limits: pdf.reader.DecodeLimits, cancellation: PdfCancellationProbe) !PdfRenderSession {
         return .{ .parsed = try pdf.reader.Reader.initWithDecodeLimitsAndCancellation(alloc, pdf_bytes, decode_limits, cancellation) };
+    }
+
+    /// Build a task-local render session over a prepared document's immutable
+    /// xref, trailer, and page index. The prepared source must outlive this
+    /// session; mutable decode caches and diagnostics remain independently
+    /// owned by `alloc`.
+    pub fn initFromPrepared(alloc: Allocator, source: *PdfRenderSession, cancellation: PdfCancellationProbe) !PdfRenderSession {
+        try source.prepareForBatchRendering();
+        return .{ .parsed = try source.parsed.forkForRendering(alloc, cancellation) };
     }
 
     pub fn deinit(self: *PdfRenderSession) void {
@@ -2061,6 +2074,17 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
     var parsed = try pdf.reader.Reader.initWithDecodeLimits(alloc, bytes, decode_limits);
     defer parsed.deinit();
 
+    return extractParsedPdfStreaming(alloc, &parsed, content_type, ocr_mode, quality_config, sink);
+}
+
+/// Stream units from an already prepared PDF. This is the task-neutral bridge
+/// used when text inspection and page rendering share one immutable document
+/// index inside a bounded operation.
+pub fn extractPreparedPdfStreaming(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink) !void {
+    return extractParsedPdfStreaming(alloc, &session.parsed, content_type, ocr_mode, quality_config, sink);
+}
+
+fn extractParsedPdfStreaming(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink) !void {
     const page_count = try parsed.pageCount();
     try sink.on_begin(sink.ptr, .{ .content_type = content_type, .route_type = "pdf" });
 
@@ -2070,7 +2094,7 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
         const force_ocr = ocr_mode == .always;
         // Keep embedded text even in forced mode so OCR is not a blind
         // replacement for usable born-digital content.
-        const candidate = try extractPdfPageTextBestEffort(alloc, &parsed, page_num);
+        const candidate = try extractPdfPageTextBestEffort(alloc, parsed, page_num);
         const analysis = candidate.analysis;
         defer {
             for (analysis.runs) |*run| run.deinit(alloc);
