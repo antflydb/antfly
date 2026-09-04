@@ -58,9 +58,11 @@ class ReplicationSource:
         postgres_table (str): Name of the table in the PostgreSQL database to replicate from.
              Example: users.
         key_template (str | Unset): Template for constructing the Antfly document key from PG columns.
+            When omitted, Antfly first uses `_id`, then falls back to `id` if
+            the row has no `_id` column.
             A plain string (e.g., "id") uses that column's value directly.
             Use `{{column}}` syntax for composite keys: `{{tenant_id}}:{{user_id}}`.
-             Default: 'id'. Example: id.
+             Default: '_id'. Example: id.
         slot_name (str | Unset): PostgreSQL replication slot name. If omitted, auto-derived from
             the Antfly table and PG table names. Specify this when using
             pre-created slots (e.g., on Supabase or Neon).
@@ -102,7 +104,7 @@ class ReplicationSource:
     type_: ReplicationSourceType
     dsn: str
     postgres_table: str
-    key_template: str | Unset = "id"
+    key_template: str | Unset = "_id"
     slot_name: str | Unset = UNSET
     publication_name: str | Unset = UNSET
     on_update: list[ReplicationTransformOp] | Unset = UNSET

@@ -6,55 +6,33 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
-
-T = TypeVar("T", bound="OllamaRerankerConfig")
+T = TypeVar("T", bound="TableSchemaPatch")
 
 
 @_attrs_define
-class OllamaRerankerConfig:
-    """Configuration for the Ollama reranking provider.
+class TableSchemaPatch:
+    """RFC 7396 JSON Merge Patch for a table schema. Object members are merged
+    recursively; null removes a member. The resulting document must be a
+    valid TableSchema and `version` remains server-managed.
 
-    Attributes:
-        model (str): The name of the Ollama model to use for reranking.
-        url (str | Unset): The URL of the Ollama API endpoint.
     """
 
-    model: str
-    url: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        model = self.model
-
-        url = self.url
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update(
-            {
-                "model": model,
-            }
-        )
-        if url is not UNSET:
-            field_dict["url"] = url
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        model = d.pop("model")
+        table_schema_patch = cls()
 
-        url = d.pop("url", UNSET)
-
-        ollama_reranker_config = cls(
-            model=model,
-            url=url,
-        )
-
-        ollama_reranker_config.additional_properties = d
-        return ollama_reranker_config
+        table_schema_patch.additional_properties = d
+        return table_schema_patch
 
     @property
     def additional_keys(self) -> list[str]:

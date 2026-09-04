@@ -98,6 +98,17 @@ pub const GenerativeQualificationTrace = struct {
     }
 };
 
+/// Optional request-lifetime hook installed by servers. The pipeline checks it
+/// at bounded batch boundaries without depending on an HTTP or API context.
+pub const ExecutionControl = struct {
+    ptr: ?*anyopaque,
+    check_fn: *const fn (?*anyopaque) anyerror!void,
+
+    pub fn check(self: ExecutionControl) !void {
+        return self.check_fn(self.ptr);
+    }
+};
+
 pub const RerankingPipeline = struct {
     allocator: std.mem.Allocator,
     session: backends.Session,
@@ -107,6 +118,7 @@ pub const RerankingPipeline = struct {
     /// remains parallel; only the session forward pass is serialized.
     execution_lock: ?*std.atomic.Mutex = null,
     generative_qualification_trace: ?*GenerativeQualificationTrace = null,
+    execution_control: ?ExecutionControl = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -135,13 +147,17 @@ pub const RerankingPipeline = struct {
     /// Score query-document pairs using the configured reranker mode.
     /// Returns scores in the same order as documents.
     pub fn rerank(self: *RerankingPipeline, query: []const u8, documents: []const []const u8) ![]f32 {
+        try self.checkExecution();
         if (documents.len == 0) return try self.allocator.alloc(f32, 0);
 
-        return switch (self.config.mode) {
+        const scores = try switch (self.config.mode) {
             .cross_encoder => self.rerankCrossEncoder(query, documents),
             .late_interaction => self.rerankLateInteraction(query, documents),
             .generative_yes_no => self.rerankGenerativeYesNo(query, documents),
         };
+        errdefer self.allocator.free(scores);
+        try self.checkExecution();
+        return scores;
     }
 
     fn encodeGenerativeYesNoPair(
@@ -205,6 +221,7 @@ pub const RerankingPipeline = struct {
 
         var offset: usize = 0;
         while (offset < documents.len) {
+            try self.checkExecution();
             const chunk_len = @min(chunk_limit, documents.len - offset);
             const encoded = try alloc.alloc([]i32, chunk_len);
             defer alloc.free(encoded);
@@ -272,6 +289,22 @@ pub const RerankingPipeline = struct {
     }
 
     fn rerankCrossEncoder(self: *RerankingPipeline, query: []const u8, documents: []const []const u8) ![]f32 {
+        const scores = try self.allocator.alloc(f32, documents.len);
+        errdefer self.allocator.free(scores);
+        const chunk_size = @max(@as(usize, 1), self.config.batch_size);
+        var offset: usize = 0;
+        while (offset < documents.len) {
+            try self.checkExecution();
+            const chunk_len = @min(chunk_size, documents.len - offset);
+            const chunk_scores = try self.rerankCrossEncoderBatch(query, documents[offset .. offset + chunk_len]);
+            defer self.allocator.free(chunk_scores);
+            @memcpy(scores[offset .. offset + chunk_len], chunk_scores);
+            offset += chunk_len;
+        }
+        return scores;
+    }
+
+    fn rerankCrossEncoderBatch(self: *RerankingPipeline, query: []const u8, documents: []const []const u8) ![]f32 {
         const alloc = self.allocator;
         const max_len = self.config.max_length;
         const batch = documents.len;
@@ -362,6 +395,7 @@ pub const RerankingPipeline = struct {
             &query_permit,
         );
         defer query_run.deinit();
+        try self.checkExecution();
 
         const query_output = try query_run.output();
         if (query_output.shape.len != 3) return error.UnexpectedOutputShape;
@@ -371,6 +405,7 @@ pub const RerankingPipeline = struct {
 
         var offset: usize = 0;
         while (offset < documents.len) {
+            try self.checkExecution();
             const chunk_len = @min(chunk_size, documents.len - offset);
             var doc_permit = try self.admitTextRun(chunk_len, max_len);
             defer doc_permit.deinit();
@@ -421,6 +456,10 @@ pub const RerankingPipeline = struct {
         }
 
         return scores;
+    }
+
+    fn checkExecution(self: *const RerankingPipeline) !void {
+        if (self.execution_control) |control| try control.check();
     }
 
     /// Rerank and return results sorted by score descending.
@@ -691,6 +730,50 @@ test "cross encoder trims dynamic batches but preserves fixed input shapes" {
     try std.testing.expectEqual(@as(usize, 8), fixed_session.last_sequence.load(.acquire));
 }
 
+test "cross encoder bounds working memory with configured batches" {
+    const allocator = std.testing.allocator;
+    var tokenizer_state = FakeRerankingTokenizer{};
+    var session_state = FakeRerankingSession{ .fixed_sequence = false };
+    var pipeline = RerankingPipeline.init(
+        allocator,
+        session_state.session(),
+        tokenizer_state.tokenizer(),
+        .{ .max_length = 8, .batch_size = 2 },
+    );
+    const documents = [_][]const u8{ "one", "two", "three", "four", "five" };
+    const scores = try pipeline.rerank("query", &documents);
+    defer allocator.free(scores);
+    try std.testing.expectEqual(@as(usize, documents.len), scores.len);
+    try std.testing.expectEqual(@as(usize, 3), session_state.run_count.load(.acquire));
+    try std.testing.expectEqual(@as(usize, documents.len * 2), tokenizer_state.encode_count.load(.acquire));
+}
+
+test "cross encoder observes cancellation between bounded batches" {
+    const Control = struct {
+        checks: std.atomic.Value(usize) = .init(0),
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const count = self.checks.fetchAdd(1, .acq_rel) + 1;
+            if (count >= 3) return error.Cancelled;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var tokenizer_state = FakeRerankingTokenizer{};
+    var session_state = FakeRerankingSession{ .fixed_sequence = false };
+    var control = Control{};
+    var pipeline = RerankingPipeline.init(
+        allocator,
+        session_state.session(),
+        tokenizer_state.tokenizer(),
+        .{ .max_length = 8, .batch_size = 2 },
+    );
+    pipeline.execution_control = .{ .ptr = &control, .check_fn = Control.check };
+    try std.testing.expectError(error.Cancelled, pipeline.rerank("query", &.{ "one", "two", "three" }));
+    try std.testing.expectEqual(@as(usize, 1), session_state.run_count.load(.acquire));
+}
+
 test "cross encoder admission rejects before tokenization" {
     const memory = @import("../runtime/tier/memory.zig");
     var controller = memory.AdmissionController{};
@@ -748,6 +831,37 @@ test "generative yes-no reranking batches exact prompt paths without CLS extract
     try std.testing.expectEqual(@as(usize, 3), trace.raw_logits.items.len);
     try std.testing.expect(std.mem.indexOf(u8, trace.pairs.items[0].rendered_prompt, "<Query>:red planet") != null);
     try std.testing.expectEqual(@as(f32, 0), trace.raw_logits.items[0]);
+}
+
+test "generative yes-no reranking observes cancellation between bounded batches" {
+    const Control = struct {
+        checks: std.atomic.Value(usize) = .init(0),
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const count = self.checks.fetchAdd(1, .acq_rel) + 1;
+            if (count >= 3) return error.Cancelled;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var tokenizer_state = FakeRerankingTokenizer{};
+    var session_state = FakeRerankingSession{ .fixed_sequence = false };
+    var control = Control{};
+    var pipeline = RerankingPipeline.init(
+        allocator,
+        session_state.session(),
+        tokenizer_state.tokenizer(),
+        .{
+            .max_length = 32,
+            .batch_size = 2,
+            .mode = .generative_yes_no,
+        },
+    );
+    pipeline.execution_control = .{ .ptr = &control, .check_fn = Control.check };
+    try std.testing.expectError(error.Cancelled, pipeline.rerank("query", &.{ "one", "two", "three" }));
+    try std.testing.expectEqual(@as(usize, 1), session_state.run_count.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), tokenizer_state.encode_count.load(.acquire));
 }
 
 test "reranking execution gate blocks the session forward pass" {
@@ -1043,9 +1157,7 @@ test "reranking score extraction handles single-logit classifier output" {
 
 test "reranking returns an empty score list for empty documents" {
     const allocator = std.testing.allocator;
-    var pipeline: RerankingPipeline = undefined;
-    pipeline.allocator = allocator;
-    pipeline.config = .{};
+    var pipeline = RerankingPipeline.init(allocator, undefined, undefined, .{});
 
     const scores = try pipeline.rerank("what is cuda", &.{});
     defer allocator.free(scores);

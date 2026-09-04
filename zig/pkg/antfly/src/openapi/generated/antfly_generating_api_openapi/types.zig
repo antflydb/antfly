@@ -166,30 +166,21 @@ pub const ClarificationRequest = struct {
 
 /// Configuration for the classification step. This step analyzes the query, selects the optimal retrieval strategy, and generates semantic transformations.
 pub const ClassificationStepConfig = struct {
-    /// Enable query classification and strategy selection
+    /// Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
     enabled: ?bool = null,
-    /// Generator to use for classification. If not specified, uses the default summarizer.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
     /// Include pre-retrieval reasoning explaining query analysis and strategy selection
     with_reasoning: ?bool = null,
     /// Override LLM strategy selection. If not set, the LLM chooses optimal strategy.
     force_strategy: ?QueryStrategy = null,
     /// Override semantic query mode selection.
     force_semantic_mode: ?SemanticQueryMode = null,
-    /// Number of alternative query phrasings to generate
-    multi_phrase_count: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", false },
-        .{ "chain", "chain", true },
         .{ "with_reasoning", "with_reasoning", true },
         .{ "force_strategy", "force_strategy", true },
         .{ "force_semantic_mode", "force_semantic_mode", true },
-        .{ "multi_phrase_count", "multi_phrase_count", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -206,17 +197,6 @@ pub const ClassificationStepConfig = struct {
             try jw.objectField("enabled");
             try jw.write(value);
         }
-        if (self.generator) |value| {
-            try jw.objectField("generator");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("generator");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.chain) |value| {
-            try jw.objectField("chain");
-            try jw.write(value);
-        }
         if (self.with_reasoning) |value| {
             try jw.objectField("with_reasoning");
             try jw.write(value);
@@ -227,10 +207,6 @@ pub const ClassificationStepConfig = struct {
         }
         if (self.force_semantic_mode) |value| {
             try jw.objectField("force_semantic_mode");
-            try jw.write(value);
-        }
-        if (self.multi_phrase_count) |value| {
-            try jw.objectField("multi_phrase_count");
             try jw.write(value);
         }
         try jw.endObject();
@@ -315,21 +291,12 @@ pub const ClassificationTransformationResult = struct {
 
 /// Configuration for confidence assessment. Evaluates answer quality and resource relevance. Can use a model calibrated for scoring tasks.
 pub const ConfidenceStepConfig = struct {
-    /// Enable confidence scoring
+    /// Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
     enabled: ?bool = null,
-    /// Generator for confidence assessment. If not specified, uses the answer step's generator.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Custom guidance for confidence assessment approach
-    context: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", false },
-        .{ "chain", "chain", true },
-        .{ "context", "context", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -344,21 +311,6 @@ pub const ConfidenceStepConfig = struct {
         try jw.beginObject();
         if (self.enabled) |value| {
             try jw.objectField("enabled");
-            try jw.write(value);
-        }
-        if (self.generator) |value| {
-            try jw.objectField("generator");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("generator");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.chain) |value| {
-            try jw.objectField("chain");
-            try jw.write(value);
-        }
-        if (self.context) |value| {
-            try jw.objectField("context");
             try jw.write(value);
         }
         try jw.endObject();
@@ -375,26 +327,17 @@ pub const FilterSpec = struct {
     value: std.json.Value,
 };
 
-/// Configuration for generating follow-up questions. Uses a separate generator call which can use a cheaper/faster model.
+/// Configuration for deterministic follow-up suggestions derived from the original query and the standard Antfly follow-up templates.
 pub const FollowupStepConfig = struct {
-    /// Enable follow-up question generation
+    /// Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
     enabled: ?bool = null,
-    /// Generator for follow-up questions. If not specified, uses the answer step's generator.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
     /// Number of follow-up questions to generate
     count: ?i64 = null,
-    /// Custom guidance for follow-up question focus and style
-    context: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", false },
-        .{ "chain", "chain", true },
         .{ "count", "count", true },
-        .{ "context", "context", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -411,23 +354,8 @@ pub const FollowupStepConfig = struct {
             try jw.objectField("enabled");
             try jw.write(value);
         }
-        if (self.generator) |value| {
-            try jw.objectField("generator");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("generator");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.chain) |value| {
-            try jw.objectField("chain");
-            try jw.write(value);
-        }
         if (self.count) |value| {
             try jw.objectField("count");
-            try jw.write(value);
-        }
-        if (self.context) |value| {
-            try jw.objectField("context");
             try jw.write(value);
         }
         try jw.endObject();
@@ -497,10 +425,10 @@ pub const GenerationResult = struct {
 
 /// Configuration for the generation step. This step generates the final response from retrieved documents using the reasoning as context.
 pub const GenerationStepConfig = struct {
-    /// Enable generation from retrieved documents
+    /// Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
     enabled: ?bool = null,
-    /// Generator to use for generation. If not specified, uses the default summarizer.
-    generator: ?GeneratorConfig = null,
+    /// Canonical generator configuration for this step. When omitted, the top-level request generator is used.
+    generator: ?antfly_generating_openapi.GeneratorConfig = null,
     /// Chain of generators to try in order. Mutually exclusive with 'generator'.
     chain: ?[]const ChainLink = null,
     /// Custom system prompt for answer generation
@@ -553,10 +481,6 @@ pub const GenerationStepConfig = struct {
         try jw.endObject();
     }
 };
-
-pub const GeneratorConfig = antfly_generating_openapi.GeneratorConfig;
-
-pub const GeneratorProvider = antfly_generating_openapi.GeneratorProvider;
 
 /// Strategy for query transformation and retrieval: - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries. - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part questions. - step_back: Generate broader background query first, then specific query. Best for questions needing context. - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual questions.
 pub const QueryStrategy = enum {

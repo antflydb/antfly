@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.open_router_embedder_config_provider import OpenRouterEmbedderConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="OpenRouterEmbedderConfig")
@@ -27,18 +28,22 @@ class OpenRouterEmbedderConfig:
             {'provider': 'openrouter', 'model': 'openai/text-embedding-3-small', 'api_key': 'sk-or-...'}
 
         Attributes:
+            provider (OpenRouterEmbedderConfigProvider):
             model (str): The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-
                 embedding-001'). Default: 'openai/text-embedding-3-small'. Example: openai/text-embedding-3-small.
             api_key (str | Unset): The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
             dimensions (int | Unset): Output dimension for the embedding (if supported by the model).
     """
 
+    provider: OpenRouterEmbedderConfigProvider
     model: str = "openai/text-embedding-3-small"
     api_key: str | Unset = UNSET
     dimensions: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         api_key = self.api_key
@@ -49,6 +54,7 @@ class OpenRouterEmbedderConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -62,6 +68,8 @@ class OpenRouterEmbedderConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = OpenRouterEmbedderConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         api_key = d.pop("api_key", UNSET)
@@ -69,6 +77,7 @@ class OpenRouterEmbedderConfig:
         dimensions = d.pop("dimensions", UNSET)
 
         open_router_embedder_config = cls(
+            provider=provider,
             model=model,
             api_key=api_key,
             dimensions=dimensions,

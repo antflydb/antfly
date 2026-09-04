@@ -20,6 +20,114 @@ const Allocator = std.mem.Allocator;
 
 pub const Provider = openapi.RerankerProvider;
 pub const OpenApiConfig = openapi.RerankerConfig;
+pub const max_candidate_count: u32 = 1000;
+pub const vertex_max_candidate_count: u32 = 200;
+
+pub const CredentialKind = enum { none, api_key, google_adc };
+
+/// Executable provider behavior resolved before retrieval begins. Keeping
+/// defaults and cost ceilings together gives validation, SDK-facing defaults,
+/// and dispatch one stable provider capability boundary.
+pub const ProviderCapabilities = struct {
+    default_model: []const u8,
+    default_url: []const u8,
+    max_candidate_count: u32,
+    model_required: bool,
+    credential_kind: CredentialKind,
+};
+
+pub fn providerCapabilities(provider: Provider) ProviderCapabilities {
+    return switch (provider) {
+        .antfly => .{
+            .default_model = "",
+            .default_url = "http://127.0.0.1:8082",
+            .max_candidate_count = max_candidate_count,
+            .model_required = false,
+            .credential_kind = .none,
+        },
+        .cohere => .{
+            .default_model = "rerank-english-v3.0",
+            .default_url = "https://api.cohere.com",
+            .max_candidate_count = max_candidate_count,
+            .model_required = true,
+            .credential_kind = .api_key,
+        },
+        .vertex => .{
+            .default_model = "semantic-ranker-default@latest",
+            .default_url = "https://discoveryengine.googleapis.com/v1",
+            .max_candidate_count = vertex_max_candidate_count,
+            .model_required = true,
+            .credential_kind = .google_adc,
+        },
+    };
+}
+
+pub const CandidateLimitDiagnostic = struct {
+    provider: Provider,
+    maximum: u32,
+};
+
+/// Request-owned storage for the structured detail attached to
+/// `RerankerCandidateLimitExceeded`. Zig errors intentionally carry no
+/// payload, so public request boundaries bind this storage while synchronous
+/// query validation runs.
+pub const CandidateLimitDiagnosticStorage = struct {
+    diagnostic: ?CandidateLimitDiagnostic = null,
+};
+
+threadlocal var active_candidate_limit_storage: ?*CandidateLimitDiagnosticStorage = null;
+
+pub const CandidateLimitDiagnosticBinding = struct {
+    previous: ?*CandidateLimitDiagnosticStorage,
+
+    pub fn deinit(self: CandidateLimitDiagnosticBinding) void {
+        active_candidate_limit_storage = self.previous;
+    }
+};
+
+pub fn bindCandidateLimitDiagnostic(storage: *CandidateLimitDiagnosticStorage) CandidateLimitDiagnosticBinding {
+    const previous = active_candidate_limit_storage;
+    active_candidate_limit_storage = storage;
+    return .{ .previous = previous };
+}
+
+pub fn resetCandidateLimitDiagnostic() void {
+    if (active_candidate_limit_storage) |storage| storage.diagnostic = null;
+}
+
+pub fn takeCandidateLimitDiagnostic() ?CandidateLimitDiagnostic {
+    const storage = active_candidate_limit_storage orelse return null;
+    const diagnostic = storage.diagnostic;
+    storage.diagnostic = null;
+    return diagnostic;
+}
+
+fn recordCandidateLimitDiagnostic(provider: Provider) void {
+    const storage = active_candidate_limit_storage orelse return;
+    storage.diagnostic = .{
+        .provider = provider,
+        .maximum = maxCandidateCountForProvider(provider),
+    };
+}
+
+fn candidateLimitExceeded(provider: Provider) error{RerankerCandidateLimitExceeded} {
+    recordCandidateLimitDiagnostic(provider);
+    return error.RerankerCandidateLimitExceeded;
+}
+
+/// The provider request is deliberately a single globally-ranked window. Keep
+/// its ceiling aligned with each upstream API instead of accepting work that
+/// the selected provider cannot execute or splitting scores into incomparable
+/// batches.
+pub fn maxCandidateCountForProvider(provider: Provider) u32 {
+    return providerCapabilities(provider).max_candidate_count;
+}
+
+/// Stable provider defaults live at the executable boundary so every client
+/// (generated or hand-written) gets the same behavior when `model` is omitted.
+pub fn defaultModelForProvider(provider: Provider) []const u8 {
+    return providerCapabilities(provider).default_model;
+}
 
 pub const Config = struct {
     provider: Provider,
@@ -30,8 +138,8 @@ pub const Config = struct {
     api_key: ?[]const u8 = null,
     project_id: []const u8 = "",
     credentials_path: []const u8 = "",
+    candidate_count: ?u32 = null,
     top_n: ?u32 = null,
-    max_chunks_per_doc: ?u32 = null,
 
     pub fn clone(self: Config, alloc: Allocator) !Config {
         return .{
@@ -43,8 +151,8 @@ pub const Config = struct {
             .api_key = if (self.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
             .project_id = if (self.project_id.len > 0) try alloc.dupe(u8, self.project_id) else "",
             .credentials_path = if (self.credentials_path.len > 0) try alloc.dupe(u8, self.credentials_path) else "",
+            .candidate_count = self.candidate_count,
             .top_n = self.top_n,
-            .max_chunks_per_doc = self.max_chunks_per_doc,
         };
     }
 
@@ -61,29 +169,44 @@ pub const Config = struct {
 
     pub fn validate(self: Config) !void {
         if (self.field.len == 0 and self.template.len == 0) return error.InvalidRerankerConfig;
-        switch (self.provider) {
-            .antfly => {},
-            .ollama, .cohere, .vertex => {
-                if (self.model.len == 0) return error.InvalidRerankerConfig;
-            },
+        const capabilities = providerCapabilities(self.provider);
+        if (capabilities.model_required and self.model.len == 0) return error.InvalidRerankerConfig;
+        const provider_max = capabilities.max_candidate_count;
+        if (self.candidate_count) |candidate_count| {
+            if (candidate_count == 0) return error.InvalidRerankerConfig;
+            if (candidate_count > provider_max) return candidateLimitExceeded(self.provider);
         }
         if (self.top_n) |top_n| {
             if (top_n == 0) return error.InvalidRerankerConfig;
+            if (top_n > provider_max) return candidateLimitExceeded(self.provider);
         }
-        if (self.max_chunks_per_doc) |max_chunks_per_doc| {
-            if (max_chunks_per_doc == 0) return error.InvalidRerankerConfig;
+        if (self.candidate_count != null and self.top_n != null and self.top_n.? > self.candidate_count.?) {
+            return error.InvalidRerankerConfig;
         }
     }
 
     pub fn defaultedUrl(self: Config) []const u8 {
         if (self.url.len > 0) return self.url;
-        return switch (self.provider) {
-            .ollama => "http://127.0.0.1:11434",
-            .antfly => "http://127.0.0.1:8082",
-            else => "",
-        };
+        return providerCapabilities(self.provider).default_url;
     }
 };
+
+/// Validate the effective retrieval window before any shard fan-out begins.
+/// `candidate_count` is optional for ergonomic small queries, but omitting it
+/// must not let `offset + limit` bypass the same provider-work ceiling.
+pub fn validateQueryWindow(cfg: Config, offset: u32, limit: u32) !void {
+    try cfg.validate();
+    const output_limit = cfg.top_n orelse limit;
+    const page_end = offset +| output_limit;
+    if (cfg.candidate_count) |candidate_count| {
+        // An explicit cost window must still contain the requested page. Fail
+        // before retrieval instead of returning a misleading short page.
+        if (candidate_count < page_end) return error.InvalidRerankerConfig;
+    }
+    const effective_candidates = cfg.candidate_count orelse page_end;
+    if (effective_candidates > maxCandidateCountForProvider(cfg.provider))
+        return candidateLimitExceeded(cfg.provider);
+}
 
 pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
     const parsed = try json.parseFromSlice(openapi.RerankerConfig, alloc, raw, .{});
@@ -103,27 +226,55 @@ pub fn stringifyAlloc(alloc: Allocator, cfg: Config) ![]u8 {
 }
 
 pub fn configFromOpenApi(alloc: Allocator, generated: openapi.RerankerConfig) !Config {
+    const model = generated.model orelse defaultModelForProvider(generated.provider);
     var cfg = Config{
         .provider = generated.provider,
         .field = if (generated.field) |field| try alloc.dupe(u8, field) else "",
         .template = if (generated.template) |template| try alloc.dupe(u8, template) else "",
-        .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
+        .model = if (model.len > 0) try alloc.dupe(u8, model) else "",
         .url = if (generated.url) |url| try alloc.dupe(u8, url) else "",
         .api_key = if (generated.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
         .project_id = if (generated.project_id) |project_id| try alloc.dupe(u8, project_id) else "",
         .credentials_path = if (generated.credentials_path) |credentials_path| try alloc.dupe(u8, credentials_path) else "",
-        .top_n = if (generated.top_n) |top_n|
-            std.math.cast(u32, top_n) orelse return error.InvalidRerankerConfig
+        .candidate_count = if (generated.candidate_count) |candidate_count|
+            std.math.cast(u32, candidate_count) orelse return error.InvalidRerankerConfig
         else
             null,
-        .max_chunks_per_doc = if (generated.max_chunks_per_doc) |max_chunks_per_doc|
-            std.math.cast(u32, max_chunks_per_doc) orelse return error.InvalidRerankerConfig
+        .top_n = if (generated.top_n) |top_n|
+            std.math.cast(u32, top_n) orelse return error.InvalidRerankerConfig
         else
             null,
     };
     errdefer cfg.deinit(alloc);
     try cfg.validate();
     return cfg;
+}
+
+test "external reranker models have executable defaults" {
+    const antfly = providerCapabilities(.antfly);
+    try std.testing.expectEqualStrings("", antfly.default_model);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8082", antfly.default_url);
+    try std.testing.expectEqual(CredentialKind.none, antfly.credential_kind);
+    try std.testing.expect(!antfly.model_required);
+
+    var cohere = try configFromOpenApi(std.testing.allocator, .{
+        .provider = .cohere,
+        .field = "body",
+    });
+    defer cohere.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("rerank-english-v3.0", cohere.model);
+    try std.testing.expectEqualStrings("https://api.cohere.com", cohere.defaultedUrl());
+    try std.testing.expectEqual(CredentialKind.api_key, providerCapabilities(.cohere).credential_kind);
+
+    var vertex = try configFromOpenApi(std.testing.allocator, .{
+        .provider = .vertex,
+        .field = "body",
+    });
+    defer vertex.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("semantic-ranker-default@latest", vertex.model);
+    try std.testing.expectEqualStrings("https://discoveryengine.googleapis.com/v1", vertex.defaultedUrl());
+    try std.testing.expectEqual(vertex_max_candidate_count, providerCapabilities(.vertex).max_candidate_count);
+    try std.testing.expectEqual(CredentialKind.google_adc, providerCapabilities(.vertex).credential_kind);
 }
 
 pub fn openApiFromConfig(cfg: Config) openapi.RerankerConfig {
@@ -136,15 +287,15 @@ pub fn openApiFromConfig(cfg: Config) openapi.RerankerConfig {
         .api_key = cfg.api_key,
         .project_id = if (cfg.project_id.len > 0) cfg.project_id else null,
         .credentials_path = if (cfg.credentials_path.len > 0) cfg.credentials_path else null,
+        .candidate_count = if (cfg.candidate_count) |candidate_count| candidate_count else null,
         .top_n = if (cfg.top_n) |top_n| top_n else null,
-        .max_chunks_per_doc = if (cfg.max_chunks_per_doc) |max_chunks_per_doc| max_chunks_per_doc else null,
     };
 }
 
 test "reranker config round trip" {
     const alloc = std.testing.allocator;
     const raw =
-        \\{"provider":"antfly","model":"cross-encoder/ms-marco-MiniLM-L-6-v2","url":"http://localhost:8082","field":"body","top_n":8}
+        \\{"provider":"antfly","model":"cross-encoder/ms-marco-MiniLM-L-6-v2","url":"http://localhost:8082","field":"body","candidate_count":16,"top_n":8}
     ;
     var cfg = try parseConfigFromSlice(alloc, raw);
     defer cfg.deinit(alloc);
@@ -152,6 +303,7 @@ test "reranker config round trip" {
     try std.testing.expectEqual(.antfly, cfg.provider);
     try std.testing.expectEqualStrings("body", cfg.field);
     try std.testing.expectEqualStrings("cross-encoder/ms-marco-MiniLM-L-6-v2", cfg.model);
+    try std.testing.expectEqual(@as(?u32, 16), cfg.candidate_count);
     try std.testing.expectEqual(@as(?u32, 8), cfg.top_n);
 
     const encoded = try stringifyAlloc(alloc, cfg);
@@ -162,10 +314,112 @@ test "reranker config round trip" {
     try std.testing.expectEqualStrings("body", reparsed.field);
 }
 
+test "reranker output count cannot exceed candidate count" {
+    const cfg = Config{
+        .provider = .antfly,
+        .field = "body",
+        .model = "reranker",
+        .candidate_count = 4,
+        .top_n = 5,
+    };
+    try std.testing.expectError(error.InvalidRerankerConfig, cfg.validate());
+}
+
+test "reranker work is bounded with and without an explicit candidate count" {
+    const base = Config{ .provider = .antfly, .field = "body" };
+    var explicit = base;
+    explicit.candidate_count = max_candidate_count + 1;
+    try std.testing.expectError(error.RerankerCandidateLimitExceeded, explicit.validate());
+    try std.testing.expectError(error.RerankerCandidateLimitExceeded, validateQueryWindow(base, 1, max_candidate_count));
+    try validateQueryWindow(base, 0, max_candidate_count);
+}
+
+test "reranker candidate window must contain the requested page" {
+    const cfg = Config{
+        .provider = .antfly,
+        .field = "body",
+        .candidate_count = 14,
+    };
+    try std.testing.expectError(error.InvalidRerankerConfig, validateQueryWindow(cfg, 5, 10));
+
+    var exact = cfg;
+    exact.candidate_count = 15;
+    try validateQueryWindow(exact, 5, 10);
+}
+
+test "reranker candidate limits follow provider request capabilities" {
+    const vertex = Config{
+        .provider = .vertex,
+        .field = "body",
+        .model = "semantic-ranker-default@latest",
+    };
+    try validateQueryWindow(vertex, 0, vertex_max_candidate_count);
+    try std.testing.expectError(
+        error.RerankerCandidateLimitExceeded,
+        validateQueryWindow(vertex, 0, vertex_max_candidate_count + 1),
+    );
+
+    const cohere = Config{
+        .provider = .cohere,
+        .field = "body",
+        .model = "rerank-v4.0-pro",
+    };
+    try validateQueryWindow(cohere, 0, max_candidate_count);
+}
+
+test "reranker candidate limit diagnostics are request scoped and provider specific" {
+    var outer_storage: CandidateLimitDiagnosticStorage = .{};
+    const outer_binding = bindCandidateLimitDiagnostic(&outer_storage);
+    defer outer_binding.deinit();
+
+    const cohere = Config{
+        .provider = .cohere,
+        .field = "body",
+        .model = "rerank-v4.0-pro",
+        .candidate_count = max_candidate_count + 1,
+    };
+    try std.testing.expectError(error.RerankerCandidateLimitExceeded, cohere.validate());
+    const outer = takeCandidateLimitDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Provider.cohere, outer.provider);
+    try std.testing.expectEqual(max_candidate_count, outer.maximum);
+    try std.testing.expect(takeCandidateLimitDiagnostic() == null);
+
+    recordCandidateLimitDiagnostic(.antfly);
+    var inner_storage: CandidateLimitDiagnosticStorage = .{};
+    const inner_binding = bindCandidateLimitDiagnostic(&inner_storage);
+    const vertex = Config{
+        .provider = .vertex,
+        .field = "body",
+        .model = "semantic-ranker-default@latest",
+    };
+    try std.testing.expectError(
+        error.RerankerCandidateLimitExceeded,
+        validateQueryWindow(vertex, 0, vertex_max_candidate_count + 1),
+    );
+    const inner = takeCandidateLimitDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Provider.vertex, inner.provider);
+    try std.testing.expectEqual(vertex_max_candidate_count, inner.maximum);
+    inner_binding.deinit();
+
+    const restored = takeCandidateLimitDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Provider.antfly, restored.provider);
+    try std.testing.expectEqual(max_candidate_count, restored.maximum);
+}
+
 test "reranker config requires field or template" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(
         error.InvalidRerankerConfig,
         parseConfigFromSlice(alloc, "{\"provider\":\"antfly\"}"),
     );
+}
+
+test "antfly reranker config permits the inference default model" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseConfigFromSlice(alloc, "{\"provider\":\"antfly\",\"field\":\"body\"}");
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqual(Provider.antfly, cfg.provider);
+    try std.testing.expectEqualStrings("", cfg.model);
+    try std.testing.expectEqualStrings("body", cfg.field);
 }
