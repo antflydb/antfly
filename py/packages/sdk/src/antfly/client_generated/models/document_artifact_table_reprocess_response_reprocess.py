@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class DocumentArtifactTableReprocessResponseReprocess(str, Enum):
+class DocumentArtifactTableReprocessResponseReprocess(StrEnum):
     TRIGGERED = "triggered"
 
     def __str__(self) -> str:

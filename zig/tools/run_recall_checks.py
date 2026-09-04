@@ -41,7 +41,9 @@ def build_commands(
     return tuple(commands)
 
 
-def stream_output(label: str, process: subprocess.Popen[str], lock: threading.Lock) -> None:
+def stream_output(
+    label: str, process: subprocess.Popen[str], lock: threading.Lock
+) -> None:
     assert process.stdout is not None
     for line in process.stdout:
         with lock:

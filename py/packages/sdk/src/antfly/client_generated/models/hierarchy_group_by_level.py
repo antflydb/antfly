@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class HierarchyGroupByLevel(str, Enum):
+class HierarchyGroupByLevel(StrEnum):
     SOURCE = "source"
     UNIT = "unit"
 

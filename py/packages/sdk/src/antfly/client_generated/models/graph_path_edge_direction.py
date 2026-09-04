@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphPathEdgeDirection(str, Enum):
+class GraphPathEdgeDirection(StrEnum):
     IN = "in"
     OUT = "out"
 

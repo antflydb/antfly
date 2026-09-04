@@ -32,6 +32,23 @@ def load_module(name: str, filename: str):
 
 
 class ReleasePromotionTests(unittest.TestCase):
+    def test_declared_source_contract_paths_exist_in_repository(self) -> None:
+        contract = load_module(
+            "validate_source_contract_paths_test", "validate_source_contract.py"
+        )
+        repo_root = RELEASE_DIR.parents[1]
+        document = json.loads((RELEASE_DIR / "build-contract.json").read_text())
+
+        self.assertEqual(
+            set(document["required_source_paths"]), contract.REQUIRED_PATHS
+        )
+        missing = [
+            path
+            for path in document["required_source_paths"]
+            if not (repo_root / path).is_file()
+        ]
+        self.assertEqual(missing, [])
+
     def test_source_commit_must_declare_a_supported_build_contract(self) -> None:
         contract = load_module(
             "validate_source_contract_test", "validate_source_contract.py"

@@ -31,10 +31,20 @@ def test_models_returns_json(api):
 def test_models_has_expected_keys(api):
     resp = api.models()
     # At minimum, the response should contain category keys
-    expected_keys = {"embedders", "rerankers", "chunkers", "generators",
-                     "extractors", "classifiers", "rewriters", "readers",
-                     "transcribers"}
-    assert expected_keys.issubset(resp.keys()), f"Missing keys: {expected_keys - resp.keys()}"
+    expected_keys = {
+        "embedders",
+        "rerankers",
+        "chunkers",
+        "generators",
+        "extractors",
+        "classifiers",
+        "rewriters",
+        "readers",
+        "transcribers",
+    }
+    assert expected_keys.issubset(resp.keys()), (
+        f"Missing keys: {expected_keys - resp.keys()}"
+    )
 
 
 def test_models_has_openai_data_field(api):
@@ -82,9 +92,7 @@ def test_composite_model_eviction_churn_stays_healthy(api):
     """Audio-sidecar teardown and reader eviction must not corrupt the server."""
 
     listing = api.models()
-    clipclap = listed_model_name(
-        set(listing.get("embedders", {})), CLIPCLAP_MODEL
-    )
+    clipclap = listed_model_name(set(listing.get("embedders", {})), CLIPCLAP_MODEL)
     if clipclap is None:
         pytest.skip(f"{CLIPCLAP_MODEL} is not available")
     reader = next(

@@ -12,11 +12,7 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 
 interface MultiSelectContextValue {
@@ -55,16 +51,14 @@ function MultiSelect({
       if (!isControlled) setInternalOpen(next);
       onOpenChange?.(next);
     },
-    [isControlled, onOpenChange],
+    [isControlled, onOpenChange]
   );
 
   const toggle = React.useCallback(
     (item: string) => {
-      onValueChange(
-        value.includes(item) ? value.filter((v) => v !== item) : [...value, item],
-      );
+      onValueChange(value.includes(item) ? value.filter((v) => v !== item) : [...value, item]);
     },
-    [value, onValueChange],
+    [value, onValueChange]
   );
 
   return (
@@ -97,8 +91,8 @@ function MultiSelectTrigger({
         {...props}
       >
         <span className="flex min-w-0 flex-wrap items-center gap-1">
-          {children || (
-            value.length > 0 ? (
+          {children ||
+            (value.length > 0 ? (
               value.map((v) => (
                 <Badge key={v} className="text-xs">
                   {v}
@@ -106,8 +100,7 @@ function MultiSelectTrigger({
               ))
             ) : (
               <span className="text-muted-foreground">{placeholder}</span>
-            )
-          )}
+            ))}
         </span>
         <ChevronDown className="size-3.5 shrink-0 opacity-50" />
       </Button>
@@ -170,19 +163,11 @@ function MultiSelectItem({
     >
       <span
         aria-hidden
-        className={cn(
-          "size-1.5 shrink-0",
-          isSelected ? "bg-primary" : "bg-transparent",
-        )}
+        className={cn("size-1.5 shrink-0", isSelected ? "bg-primary" : "bg-transparent")}
       />
       <span className="flex-1 truncate">{children}</span>
     </CommandItem>
   );
 }
 
-export {
-  MultiSelect,
-  MultiSelectContent,
-  MultiSelectItem,
-  MultiSelectTrigger,
-};
+export { MultiSelect, MultiSelectContent, MultiSelectItem, MultiSelectTrigger };

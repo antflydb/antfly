@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class RuntimeDeclMode(str, Enum):
+class RuntimeDeclMode(StrEnum):
     ANTFLY_API_TEMPLATE = "antfly_api_template"
     MANIFEST_ONLY = "manifest_only"
     NATIVE = "native"

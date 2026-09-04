@@ -40,7 +40,7 @@ run_check "typecheck" pnpm typecheck
 run_check "build" pnpm build
 run_check "test" pnpm test
 
-# Playwright tests (from ts-ci.yml) - must run from apps/antfarm directory.
+# Playwright tests (from sdks-ci.yml) - must run from apps/antfarm directory.
 # Keep this in sync with CI: WebKit is intentionally excluded because its Linux
 # dependency install is much heavier and has been unreliable on hosted runners.
 if [[ -d "apps/antfarm" ]]; then

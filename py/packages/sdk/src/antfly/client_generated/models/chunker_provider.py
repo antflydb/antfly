@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ChunkerProvider(str, Enum):
+class ChunkerProvider(StrEnum):
     ANTFLY = "antfly"
     MOCK = "mock"
 

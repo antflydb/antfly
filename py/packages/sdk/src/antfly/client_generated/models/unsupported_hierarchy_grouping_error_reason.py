@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class UnsupportedHierarchyGroupingErrorReason(str, Enum):
+class UnsupportedHierarchyGroupingErrorReason(StrEnum):
     UNIT_IDENTITY_UNAVAILABLE = "unit_identity_unavailable"
 
     def __str__(self) -> str:

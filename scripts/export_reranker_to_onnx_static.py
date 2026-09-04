@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run
 # /// script
-# requires-python = ">=3.8"
+# requires-python = ">=3.11"
 # dependencies = [
 #     "onnx",
 #     "onnxruntime",
@@ -29,7 +29,12 @@ from pathlib import Path
 import numpy as np
 from optimum.onnxruntime import ORTModelForSequenceClassification
 from transformers import AutoTokenizer
-from onnxruntime.quantization import quantize_static, CalibrationDataReader, QuantType, QuantFormat
+from onnxruntime.quantization import (
+    quantize_static,
+    CalibrationDataReader,
+    QuantType,
+    QuantFormat,
+)
 from onnxruntime.quantization.shape_inference import quant_pre_process
 
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +46,7 @@ class RerankerCalibrationDataReader(CalibrationDataReader):
     Calibration data reader for ONNX Runtime static quantization.
     Provides batches of tokenized query-document pairs.
     """
+
     def __init__(self, tokenizer, num_samples=100):
         self.tokenizer = tokenizer
         self.num_samples = num_samples
@@ -98,7 +104,7 @@ class RerankerCalibrationDataReader(CalibrationDataReader):
             padding="max_length",
             truncation=True,
             max_length=512,
-            return_tensors="np"
+            return_tensors="np",
         )
 
         # Convert to dictionary of numpy arrays (ONNX Runtime format)
@@ -159,9 +165,9 @@ def export_model_static_quantization(model_id: str, output_dir: str):
             input_model_path=model_input,
             output_model_path=model_preprocessed,
             skip_optimization=False,  # Apply optimizations
-            skip_onnx_shape=False,    # Run shape inference
+            skip_onnx_shape=False,  # Run shape inference
             skip_symbolic_shape=False,  # Run symbolic shape inference
-            auto_merge=True,           # Merge nodes where possible
+            auto_merge=True,  # Merge nodes where possible
             save_as_external_data=False,
         )
         logger.info("✅ Preprocessing complete")
@@ -195,10 +201,10 @@ def export_model_static_quantization(model_id: str, output_dir: str):
                 model_output=model_output,
                 calibration_data_reader=calibration_reader,
                 quant_format=QuantFormat.QOperator,  # QOperator format - keeps activations in int8!
-                activation_type=QuantType.QInt8,      # int8 activations
-                weight_type=QuantType.QInt8,          # int8 weights
-                per_channel=False,                    # Per-tensor quantization
-                reduce_range=False,                   # Don't reduce range (better for ARM64)
+                activation_type=QuantType.QInt8,  # int8 activations
+                weight_type=QuantType.QInt8,  # int8 weights
+                per_channel=False,  # Per-tensor quantization
+                reduce_range=False,  # Don't reduce range (better for ARM64)
             )
             logger.info("✅ Successfully quantized with QOperator format!")
         except Exception as e:
@@ -206,17 +212,19 @@ def export_model_static_quantization(model_id: str, output_dir: str):
             logger.info("Falling back to QDQ format...")
 
             # Reset calibration reader
-            calibration_reader = RerankerCalibrationDataReader(tokenizer, num_samples=100)
+            calibration_reader = RerankerCalibrationDataReader(
+                tokenizer, num_samples=100
+            )
 
             quantize_static(
                 model_input=quantization_input,
                 model_output=model_output,
                 calibration_data_reader=calibration_reader,
-                quant_format=QuantFormat.QDQ,        # QDQ format - more compatible
-                activation_type=QuantType.QInt8,      # int8 activations
-                weight_type=QuantType.QInt8,          # int8 weights
-                per_channel=False,                    # Per-tensor quantization
-                reduce_range=False,                   # Don't reduce range (better for ARM64)
+                quant_format=QuantFormat.QDQ,  # QDQ format - more compatible
+                activation_type=QuantType.QInt8,  # int8 activations
+                weight_type=QuantType.QInt8,  # int8 weights
+                per_channel=False,  # Per-tensor quantization
+                reduce_range=False,  # Don't reduce range (better for ARM64)
             )
             logger.info("✅ Successfully quantized with QDQ format (fallback)")
 
@@ -225,6 +233,7 @@ def export_model_static_quantization(model_id: str, output_dir: str):
 
         # Copy config files
         import shutil
+
         for file in ["config.json", "special_tokens_map.json", "tokenizer_config.json"]:
             src = temp_dir / file
             if src.exists():
@@ -240,16 +249,22 @@ def export_model_static_quantization(model_id: str, output_dir: str):
 
         # Check which format was used
         import onnx
+
         quantized_model = onnx.load(model_output)
-        has_qlinear = any('QLinear' in node.op_type for node in quantized_model.graph.node)
+        has_qlinear = any(
+            "QLinear" in node.op_type for node in quantized_model.graph.node
+        )
         if has_qlinear:
-            logger.info("   - Format: QOperator (QLinearMatMul - activations stay in int8!)")
+            logger.info(
+                "   - Format: QOperator (QLinearMatMul - activations stay in int8!)"
+            )
         else:
             logger.info("   - Format: QDQ (QuantizeLinear/DequantizeLinear pairs)")
 
     except Exception as e:
         logger.error(f"❌ Quantization failed: {e}")
         import traceback
+
         traceback.print_exc()
         raise
 
@@ -280,13 +295,13 @@ def main():
         "--model",
         type=str,
         default="mixedbread-ai/mxbai-rerank-base-v1",
-        help="HuggingFace model ID to export"
+        help="HuggingFace model ID to export",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
         default="./models/rerankers/reranker_onnx_static",
-        help="Output directory for quantized ONNX model"
+        help="Output directory for quantized ONNX model",
     )
 
     args = parser.parse_args()
@@ -294,16 +309,18 @@ def main():
     try:
         export_model_static_quantization(args.model, args.output_dir)
 
-        logger.info("\n" + "="*70)
+        logger.info("\n" + "=" * 70)
         logger.info("🎉 All done! The statically quantized model is ready to use.")
-        logger.info("="*70)
+        logger.info("=" * 70)
         logger.info("\n✨ Key Benefits:")
         logger.info("  • Activations stay in int8 throughout the network")
         logger.info("  • Should be 2-4x faster than non-quantized models")
         logger.info("  • Uses QLinearMatMul/QLinearConv for true int8 compute")
         logger.info("  • Optimized for ARM64 NEON SDOT/SMMLA instructions")
         logger.info("\n🚀 Next Steps:")
-        logger.info(f"  1. Test the model: go test -v -run TestCompareAllRerankerModels ./termite/")
+        logger.info(
+            f"  1. Test the model: go test -v -run TestCompareAllRerankerModels ./termite/"
+        )
         logger.info("  2. Run benchmarks to measure the speedup")
         logger.info("  3. Verify accuracy is acceptable (should be >95% of original)")
 

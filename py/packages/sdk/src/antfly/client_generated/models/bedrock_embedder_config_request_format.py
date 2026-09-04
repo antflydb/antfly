@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class BedrockEmbedderConfigRequestFormat(str, Enum):
+class BedrockEmbedderConfigRequestFormat(StrEnum):
     AUTO = "auto"
     COHERE_V3 = "cohere_v3"
     COHERE_V4 = "cohere_v4"

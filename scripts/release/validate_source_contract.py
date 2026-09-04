@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 CONTRACT_PATH = "scripts/release/build-contract.json"
 SUPPORTED_SCHEMA = 1
 REQUIRED_PATHS = {
-    "build.zig",
+    "zig/build.zig",
     "scripts/install.sh",
     "scripts/packaging/build_zig_release_archive.sh",
     "scripts/packaging/package_cli_release.py",

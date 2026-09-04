@@ -122,9 +122,16 @@ class A4BProfileParserTest(unittest.TestCase):
         self.assertIn('"--mode",\n        "compiled"', script_source)
         self.assertIn('"--compiled-target",\n        "whole-model"', script_source)
         self.assertIn('getenv("TERMITE_METAL_STAGE_TIMING_ROOFLINE")', metal_source)
-        self.assertIn("allow_roofline && regime == TERMITE_METAL_FRAME_REGIME_DECODE", metal_source)
-        self.assertIn("metal_roofline_op: schema=antfly.metal_roofline_op.v1", metal_source)
-        self.assertIn("metal_roofline_frame: schema=antfly.metal_roofline_frame.v1", metal_source)
+        self.assertIn(
+            "allow_roofline && regime == TERMITE_METAL_FRAME_REGIME_DECODE",
+            metal_source,
+        )
+        self.assertIn(
+            "metal_roofline_op: schema=antfly.metal_roofline_op.v1", metal_source
+        )
+        self.assertIn(
+            "metal_roofline_frame: schema=antfly.metal_roofline_frame.v1", metal_source
+        )
         for reason in (
             "incomplete-layer-coverage",
             "incomplete-layer-operations",
@@ -154,7 +161,9 @@ class A4BProfileParserTest(unittest.TestCase):
             self.assertIn(op, metal_source)
 
     def test_roofline_ledger_parses_shape_rate_barriers_and_coverage(self) -> None:
-        path = self.write_log(self.legacy_prefix(frame_gpu=1_000) + self.roofline_suffix())
+        path = self.write_log(
+            self.legacy_prefix(frame_gpu=1_000) + self.roofline_suffix()
+        )
         parsed = profile.parse_log(path, 15, True)
         roofline = parsed["roofline"]
         self.assertEqual(roofline["schema"], "antfly.gemma4_a4b_roofline_ledger.v1")
@@ -181,12 +190,16 @@ class A4BProfileParserTest(unittest.TestCase):
 
     def test_roofline_summary_uses_v2_and_weighted_totals(self) -> None:
         first = profile.parse_log(
-            self.write_log(self.legacy_prefix(frame_gpu=1_000) + self.roofline_suffix()),
+            self.write_log(
+                self.legacy_prefix(frame_gpu=1_000) + self.roofline_suffix()
+            ),
             15,
             True,
         )
         second = profile.parse_log(
-            self.write_log(self.legacy_prefix(frame_gpu=1_000) + self.roofline_suffix()),
+            self.write_log(
+                self.legacy_prefix(frame_gpu=1_000) + self.roofline_suffix()
+            ),
             15,
             True,
         )
@@ -200,7 +213,9 @@ class A4BProfileParserTest(unittest.TestCase):
         self.assertEqual(roofline["coverage"]["frame_count"], 2)
         self.assertEqual(roofline["reconciliation"]["frame_gpu_ns"], 2_000)
         self.assertEqual(roofline["reconciliation"]["delta_ns"], 0)
-        self.assertEqual(roofline["reconciliation"]["operation_accounted_fraction"], 0.9)
+        self.assertEqual(
+            roofline["reconciliation"]["operation_accounted_fraction"], 0.9
+        )
         local_total = next(
             total
             for total in roofline["operation_totals"]
@@ -227,7 +242,9 @@ class A4BProfileParserTest(unittest.TestCase):
         body = (self.legacy_prefix(frame_gpu=1_000) + self.roofline_suffix()).replace(
             "barrier_count=1", "barrier_count=0"
         )
-        with self.assertRaisesRegex(profile.ProfileError, "barrier count does not reconcile"):
+        with self.assertRaisesRegex(
+            profile.ProfileError, "barrier count does not reconcile"
+        ):
             profile.parse_log(self.write_log(body), 15, True)
 
     def test_roofline_barrier_metadata_is_fail_closed(self) -> None:
@@ -237,7 +254,9 @@ class A4BProfileParserTest(unittest.TestCase):
             "gpu_ns=1 logical_bytes=1 dispatches=1 pipeline=p barrier_before=1 "
             "barrier_after=0 barrier_scope=none barrier_reason=none"
         )
-        with self.assertRaisesRegex(profile.ProfileError, "scope and reason are required"):
+        with self.assertRaisesRegex(
+            profile.ProfileError, "scope and reason are required"
+        ):
             profile.parse_roofline_operation(fields, Path("test.log"))
 
     def test_roofline_frame_rejects_mixed_kv_positions(self) -> None:
@@ -274,18 +293,23 @@ class A4BProfileParserTest(unittest.TestCase):
             "gpu_ns=1 logical_bytes=1 dispatches=1 pipeline=p barrier_before=0 "
             "barrier_after=0 barrier_scope=none barrier_reason=none"
         )
-        with self.assertRaisesRegex(profile.ProfileError, "unsupported roofline operation"):
+        with self.assertRaisesRegex(
+            profile.ProfileError, "unsupported roofline operation"
+        ):
             profile.parse_roofline_operation(fields, Path("test.log"))
-        body = self.legacy_prefix(frame_gpu=1_000) + self.roofline_suffix().split(
-            "metal_roofline_frame:"
-        )[0]
+        body = (
+            self.legacy_prefix(frame_gpu=1_000)
+            + self.roofline_suffix().split("metal_roofline_frame:")[0]
+        )
         with self.assertRaisesRegex(profile.ProfileError, "records are incomplete"):
             profile.parse_log(self.write_log(body), 15, True)
 
     def test_summary_rejects_mixed_legacy_and_roofline_formats(self) -> None:
         legacy = profile.parse_log(self.write_log(self.legacy_prefix()), 15, True)
         roofline = profile.parse_log(
-            self.write_log(self.legacy_prefix(frame_gpu=1_000) + self.roofline_suffix()),
+            self.write_log(
+                self.legacy_prefix(frame_gpu=1_000) + self.roofline_suffix()
+            ),
             15,
             True,
         )
@@ -308,12 +332,14 @@ class A4BProfileParserTest(unittest.TestCase):
         first = {
             "token_ids_sha256": "a",
             "token_count": 2,
-            "samples": [{
-                "moe_gate_up": 10,
-                "moe_activation": 1,
-                "moe_down": 9,
-                "moe_reduce": 1,
-            }],
+            "samples": [
+                {
+                    "moe_gate_up": 10,
+                    "moe_activation": 1,
+                    "moe_down": 9,
+                    "moe_reduce": 1,
+                }
+            ],
         }
         second = {**first, "token_ids_sha256": "b"}
         with self.assertRaises(profile.ProfileError):
@@ -355,7 +381,10 @@ class A4BProfileParserTest(unittest.TestCase):
                     "metal": {
                         "resident_mapped": {
                             "dispatches": {"down": 1, "reduce": 1, "fused_gate_up": 2},
-                            "model_buffer": {"prepare_successes": 1, "prepare_failures": 0},
+                            "model_buffer": {
+                                "prepare_successes": 1,
+                                "prepare_failures": 0,
+                            },
                             "residency_set": {"allocated_bytes": 14_937_423_872},
                         },
                         "residency": {
@@ -373,7 +402,10 @@ class A4BProfileParserTest(unittest.TestCase):
                             "decode_fallback": 0,
                             "decode_success": 3 if prepared else 0,
                         },
-                        "prepared_frame": {"fast_path": 3 if prepared else 0, "fallback": 0},
+                        "prepared_frame": {
+                            "fast_path": 3 if prepared else 0,
+                            "fallback": 0,
+                        },
                     },
                 }
                 json_path.write_text(json.dumps(payload))
