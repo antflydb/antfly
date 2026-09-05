@@ -2703,7 +2703,7 @@ pub const Backend = struct {
             // pressure denominator while retaining overlap-triggered L0 work.
             const defer_soft_compaction = if (self.options.resource_manager) |manager|
                 manager.shouldDeferSoftCompactionForDerivedReplay() or
-                    manager.shouldDeferOptionalMaintenanceForForegroundQuery()
+                    manager.shouldDeferOptionalMaintenanceForForegroundTraffic()
             else
                 false;
             if (!defer_soft_compaction) {

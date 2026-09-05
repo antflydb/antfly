@@ -575,6 +575,24 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return try self.backlog.track(self.alloc, sequence, bytes);
     }
 
+    pub fn admitBacklogBytes(self: *DerivedRuntime, bytes: u64) !backlog_tracker_mod.Tracker.Admission {
+        const io = self.ioContext();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return try self.backlog.admit(self.alloc, bytes);
+    }
+
+    pub fn commitBacklogAdmission(
+        self: *DerivedRuntime,
+        sequence: u64,
+        admission: *backlog_tracker_mod.Tracker.Admission,
+    ) void {
+        const io = self.ioContext();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.backlog.commitAdmission(sequence, admission);
+    }
+
     pub fn backlogThrottleTargetSequence(self: *DerivedRuntime) ?u64 {
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);

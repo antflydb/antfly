@@ -2193,6 +2193,7 @@ fn cloneManagedSyncTargetsAll(
 }
 
 pub const BatchProfile = struct {
+    source_sequence: u64 = 0,
     total_ns: u64 = 0,
     resolve_transforms_ns: u64 = 0,
     merge_effective_req_ns: u64 = 0,
@@ -2222,6 +2223,7 @@ pub const BatchProfile = struct {
     build_derived_ns: u64 = 0,
     apply_shadow_ns: u64 = 0,
     collect_sync_targets_ns: u64 = 0,
+    backlog_admission_ns: u64 = 0,
     append_replay_journal_ns: u64 = 0,
     wait_sync_ns: u64 = 0,
     backlog_pressure_ns: u64 = 0,
@@ -2430,6 +2432,7 @@ fn recordProfileNs(profile: ?*BatchProfile, field: *u64, start_ns: u64) void {
 }
 
 fn addBatchProfile(total: *BatchProfile, delta: BatchProfile) void {
+    total.source_sequence = @max(total.source_sequence, delta.source_sequence);
     total.total_ns += delta.total_ns;
     total.resolve_transforms_ns += delta.resolve_transforms_ns;
     total.merge_effective_req_ns += delta.merge_effective_req_ns;
@@ -2459,6 +2462,7 @@ fn addBatchProfile(total: *BatchProfile, delta: BatchProfile) void {
     total.build_derived_ns += delta.build_derived_ns;
     total.apply_shadow_ns += delta.apply_shadow_ns;
     total.collect_sync_targets_ns += delta.collect_sync_targets_ns;
+    total.backlog_admission_ns += delta.backlog_admission_ns;
     total.append_replay_journal_ns += delta.append_replay_journal_ns;
     total.wait_sync_ns += delta.wait_sync_ns;
     total.backlog_pressure_ns += delta.backlog_pressure_ns;
@@ -2756,8 +2760,9 @@ fn logReplayCatchUpProfile(index_ref: index_manager_mod.ManagedIndexRef, applied
 
 fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
     std.log.info(
-        "antfly_bench_batch writes={d} deletes={d} graph_writes={d} graph_deletes={d} transforms={d} sync={s} total_ms={d} resolve_ms={d} merge_ms={d} predicates_ms={d} range_ms={d} extract_ms={d} delete_artifacts_ms={d} precompute_ms={d} identity_capacity_ms={d} identity_metadata_ms={d} identity_metadata_writes={d} store_ms={d} split_delta_ms={d} build_derived_ms={d} shadow_ms={d} collect_sync_ms={d} append_replay_journal_ms={d} backlog_pressure_ms={d} executor_notify_ms={d} sync_wait_ms={d} wait_sync_ms={d} notify_enrichment_ms={d}",
+        "antfly_bench_batch sequence={d} writes={d} deletes={d} graph_writes={d} graph_deletes={d} transforms={d} sync={s} total_ms={d} resolve_ms={d} merge_ms={d} predicates_ms={d} range_ms={d} extract_ms={d} delete_artifacts_ms={d} precompute_ms={d} identity_capacity_ms={d} identity_metadata_ms={d} identity_metadata_writes={d} store_ms={d} split_delta_ms={d} build_derived_ms={d} shadow_ms={d} collect_sync_ms={d} backlog_admission_ms={d} append_replay_journal_ms={d} backlog_pressure_ms={d} executor_notify_ms={d} sync_wait_ms={d} wait_sync_ms={d} notify_enrichment_ms={d}",
         .{
+            profile.source_sequence,
             req.writes.len,
             req.deletes.len,
             req.graph_writes.len,
@@ -2780,6 +2785,7 @@ fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
             nsToMs(profile.build_derived_ns),
             nsToMs(profile.apply_shadow_ns),
             nsToMs(profile.collect_sync_targets_ns),
+            nsToMs(profile.backlog_admission_ns),
             nsToMs(profile.append_replay_journal_ns),
             nsToMs(profile.backlog_pressure_ns),
             nsToMs(profile.executor_notify_ns),
@@ -7161,6 +7167,8 @@ pub const DB = struct {
             &owned_store_keys,
             &owned_store_values,
         );
+        var backlog_admission = try self.executor.admitBacklogBytes(@intCast(replay_payload.len));
+        defer backlog_admission.cancel();
         try self.core.store.putBatchWithReplay(
             self.backend_runtime.io(),
             store_writes.items,
@@ -7175,7 +7183,7 @@ pub const DB = struct {
             try self.core.appendSplitDelta(currentTimeNs(), store_writes.items, delete_keys.items);
         }
 
-        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        self.executor.commitBacklogAdmission(sequence, &backlog_admission);
         self.core.unlockApply();
         apply_mutex_held = false;
         snapshot_mutation.release();
@@ -7217,6 +7225,9 @@ pub const DB = struct {
         }
 
         try self.executor.failIfUnhealthy();
+
+        var foreground_write = resource_manager_mod.ResourceManager.ForegroundWriteLease{};
+        defer foreground_write.release();
 
         // Global LSM throttling must happen before the DB apply lock. Derived
         // and maintenance workers may need that lock to publish or flush the
@@ -7293,6 +7304,13 @@ pub const DB = struct {
                 apply_mutex_held = true;
             }
         }
+
+        // A pending coalescer flush may itself run a complete nested batch and
+        // visibility wait. Enter foreground scheduling only for this batch's
+        // own primary mutation so nested `.full_index` work cannot be hidden
+        // behind an outer maintenance-deferral lease.
+        if (self.core.index_manager.resource_manager) |manager|
+            foreground_write = manager.beginForegroundWrite();
 
         if (!try self.shouldApplySplitReplicationLocked(req)) {
             self.core.unlockApply();
@@ -7809,6 +7827,7 @@ pub const DB = struct {
             self.core.nextDerivedSequence()
         else
             self.core.reserveDerivedAppendSequence();
+        if (profile) |active_profile| active_profile.source_sequence = sequence;
         const identity_metadata_start_ns = monotonicTimeNs();
         const identity_live_before = if (identity_upsert_keys.items.len != 0 or effective_req.deletes.len != 0)
             (try doc_identity.fastStatsFromStore(self.core.store)).live_ordinals
@@ -8055,6 +8074,17 @@ pub const DB = struct {
             }
         else
             null;
+        // This is the final fallible replay-retention boundary. It is an
+        // immediate node-wide reservation: no reclamation, disk I/O, or wait
+        // occurs while the apply fence is held. A hard-limit failure is
+        // returned before the primary mutation and replay intent commit.
+        const backlog_admission_start_ns = monotonicTimeNs();
+        var backlog_admission = if (append_derived_replay)
+            try self.executor.admitBacklogBytes(@intCast(replay_payload.len))
+        else
+            derived_executor_mod.BacklogAdmission{};
+        if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_admission_ns, backlog_admission_start_ns);
+        defer backlog_admission.cancel();
         const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
             const outcome = try self.core.resolveTransactionIntentsWithExtraBatch(
                 resolution.txn_id,
@@ -8129,15 +8159,28 @@ pub const DB = struct {
 
         if (append_derived_replay) {
             const append_replay_journal_start_ns = monotonicTimeNs();
-            self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+            self.executor.commitBacklogAdmission(sequence, &backlog_admission);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
         }
         self.core.unlockApply();
         apply_mutex_held = false;
         snapshot_mutation.release();
+        // Explicit derived-visibility waits are not part of foreground write
+        // admission. Releasing here lets optional maintenance make progress
+        // while `.full_index` deliberately waits below.
+        foreground_write.release();
         if (append_derived_replay)
             notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
         releaseHAMutationShared(&ha_mutation);
+        // Replay intent is locally durable at this point. Wake derived workers
+        // before any remote HA acknowledgment so HBC/full-text progress is
+        // independent of response durability latency; explicit visibility
+        // waits still occur only after the HA gate below.
+        if (append_derived_replay and self.executor.hasWorkers()) {
+            const notify_executor_start_ns = monotonicTimeNs();
+            notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, effective_req.sync_level, sequence, sync_targets);
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.executor_notify_ns, notify_executor_start_ns);
+        }
         if (!opts.bypass_ha_write_gate) {
             const ha_ctx = self.batchContext();
             try deferred_ha_gates.waitForDurabilityAndAuthority(ha_ctx.ha_write_gate);
@@ -8166,9 +8209,6 @@ pub const DB = struct {
         }
         const wait_sync_start_ns = monotonicTimeNs();
         if (append_derived_replay and self.executor.hasWorkers()) {
-            const notify_executor_start_ns = monotonicTimeNs();
-            notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, effective_req.sync_level, sequence, sync_targets);
-            if (profile) |active_profile| recordProfileNs(profile, &active_profile.executor_notify_ns, notify_executor_start_ns);
             if (opts.wait_for_sync_level) {
                 const sync_wait_start_ns = monotonicTimeNs();
                 try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation);
@@ -10278,12 +10318,14 @@ pub const DB = struct {
             .key = manifest_key,
             .value = updated_manifest,
         }};
+        var backlog_admission = try self.executor.admitBacklogBytes(@intCast(replay_payload.len));
+        defer backlog_admission.cancel();
         try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes[0..], &.{}, .{
             .sequence = sequence,
             .payload = replay_payload,
         });
         self.mirrorHAReplayPayloadBestEffort(replay_payload);
-        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        self.executor.commitBacklogAdmission(sequence, &backlog_admission);
         self.core.unlockApply();
         apply_mutex_held = false;
         snapshot_mutation.release();
@@ -22204,12 +22246,14 @@ pub const DB = struct {
         }, sequence);
         defer self.alloc.free(replay_payload);
 
+        var backlog_admission = try self.executor.admitBacklogBytes(@intCast(replay_payload.len));
+        defer backlog_admission.cancel();
         try self.core.store.putBatchWithReplay(self.backend_runtime.io(), &.{}, deletes.items, .{
             .sequence = sequence,
             .payload = replay_payload,
         });
         self.mirrorHAReplayPayloadBestEffort(replay_payload);
-        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        self.executor.commitBacklogAdmission(sequence, &backlog_admission);
         return sequence;
     }
 
@@ -22346,12 +22390,14 @@ pub const DB = struct {
             .key = override_key,
             .value = override_bytes,
         }};
+        var backlog_admission = try self.executor.admitBacklogBytes(@intCast(replay_payload.len));
+        defer backlog_admission.cancel();
         try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes[0..], &.{}, .{
             .sequence = sequence,
             .payload = replay_payload,
         });
         self.mirrorHAReplayPayloadBestEffort(replay_payload);
-        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        self.executor.commitBacklogAdmission(sequence, &backlog_admission);
         self.core.unlockApply();
         apply_mutex_held = false;
         snapshot_mutation.release();
@@ -42049,10 +42095,13 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     try delete_keys.appendSlice(ctx.alloc, identity_visibility_deletes.items);
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
+    var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(replay_payload.len));
+    defer backlog_admission.cancel();
     try ctx.store.putBatchWithReplay(ctx.io, store_writes.items, delete_keys.items, .{
         .sequence = sequence,
         .payload = replay_payload,
     });
+    ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     if (pending_identity_visibility_summary) |summary| {
         if (ctx.identity_visibility_owner_slot) |slot| {
             if (slot.load(.acquire)) |owner| {
@@ -42074,7 +42123,6 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
     defer sync_targets.deinit(ctx.alloc);
-    ctx.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
     try markPrecomputedEnrichmentAppliedForSyncContext(ctx, sync_level, sequence);
     try applyDerivedBacklogPressureContext(ctx, sequence, sync_level, sync_targets);
     if (ctx.executor.hasWorkers()) {
@@ -42140,7 +42188,10 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     const sequence = ctx.store.reserveNextReplaySequence(1);
     const payload = try encodeChangeRecordPayload(ctx, batch, sequence);
     defer ctx.alloc.free(payload);
+    var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(payload.len));
+    defer backlog_admission.cancel();
     try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence);
+    ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     var deferred_ha_gates = HADeferredCommitGates.begin(ctx);
     defer deferred_ha_gates.releaseTransition();
     deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(ctx, payload));
@@ -42151,7 +42202,6 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     DB.notifyQueryVisibilityTargetAdvancedContext(ctx, sequence);
     releaseHAMutationShared(&ha_mutation);
     try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
-    ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
     return sequence;
 }
 
@@ -42168,9 +42218,11 @@ fn appendReplicatedHADerivedEffectContext(ctx: *const BatchExecutionContext, rec
     const payload = try change_journal_mod.encodeRecord(ctx.alloc, decoded.record);
     defer ctx.alloc.free(payload);
 
+    var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(payload.len));
+    defer backlog_admission.cancel();
     try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence);
+    ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     DB.notifyQueryVisibilityTargetAdvancedContext(ctx, sequence);
-    ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
     return sequence;
 }
 
@@ -42544,18 +42596,14 @@ fn noteHAMirrorFailure(mirror: HAAsyncEffectMirror, comptime label: []const u8, 
 fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequence: u64, sync_level: types.SyncLevel, sync_targets: ManagedSyncTargets) !void {
     if (!syncLevelParticipatesInDerivedBacklogPressure(sync_level)) return;
     const throttle_target = ctx.executor.backlogThrottleTargetSequence() orelse return;
-    if (sync_level == .full_text) {
-        try runDerivedUntilTargetsContext(ctx, sequence, sync_targets.full_text_indexes);
-        return;
-    }
+    _ = sync_targets;
+    // Retention capacity was reserved before the source WAL commit. Crossing
+    // the sequence or soft-byte watermark is therefore an urgency signal for
+    // the derived queue, never permission to make the committed HTTP request
+    // perform corpus-scale HBC catch-up. Explicit `.full_text`/`.full_index`
+    // visibility is still enforced by waitForSyncLevel below.
     if (shouldDeferBacklogPressureForExternalDenseBulk(ctx, sync_level)) return;
-    runDerivedUntilContext(ctx, throttle_target) catch |err| switch (err) {
-        error.WriterLocked, error.ReplayDocumentNotVisible, error.ArtifactRepairRequired => {
-            ctx.executor.notifySequence(sequence);
-            return;
-        },
-        else => return err,
-    };
+    ctx.executor.forceSequence(@min(sequence, throttle_target));
 }
 
 fn syncLevelParticipatesInDerivedBacklogPressure(sync_level: types.SyncLevel) bool {
@@ -42565,10 +42613,9 @@ fn syncLevelParticipatesInDerivedBacklogPressure(sync_level: types.SyncLevel) bo
     };
 }
 
-test "durable writes participate in derived backlog admission control" {
-    // `.write` controls visibility/durability, not admission. Once asynchronous
-    // derived payloads cross their memory budget, a normal durable writer must
-    // help the worker catch up instead of admitting an unbounded replay queue.
+test "durable writes signal asynchronous derived backlog pressure" {
+    // `.write` reserves retention before commit and signals background urgency
+    // afterward; it never performs synchronous derived catch-up.
     try std.testing.expect(syncLevelParticipatesInDerivedBacklogPressure(.write));
     try std.testing.expect(!syncLevelParticipatesInDerivedBacklogPressure(.propose));
 }
@@ -43918,10 +43965,13 @@ fn appendResolutionRecordWithHook(
         write.target_hints,
     );
     defer batch_ctx.alloc.free(payload);
+    var backlog_admission = try batch_ctx.executor.admitBacklogBytes(@intCast(payload.len));
+    defer backlog_admission.cancel();
     try batch_ctx.store.putBatchWithReplay(batch_ctx.io, store_writes, write.artifact_deletes, .{
         .sequence = sequence,
         .payload = payload,
     });
+    batch_ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     if (shouldAppendSplitDeltaForContext(&batch_ctx)) {
         try batch_ctx.shard_manager.appendSplitDelta(currentTimeNs(), store_writes, write.artifact_deletes);
     }
@@ -43938,7 +43988,6 @@ fn appendResolutionRecordWithHook(
     try deferred_ha_gates.waitForDurabilityAndAuthority(batch_ctx.ha_write_gate);
     before_handoff_publish.run();
     try publishResolutionHandoffContext(&batch_ctx, write);
-    batch_ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
     if (ctx.executor.hasWorkers()) {
         ctx.executor.forceSequence(sequence);
@@ -44646,10 +44695,13 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
         &owned_counter_keys,
         &owned_counter_values,
     );
+    var backlog_admission = try batch_ctx.executor.admitBacklogBytes(@intCast(payload.len));
+    defer backlog_admission.cancel();
     try batch_ctx.store.putBatchWithReplay(batch_ctx.io, counter_writes.items, artifact_delete_keys, .{
         .sequence = sequence,
         .payload = payload,
     });
+    batch_ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     if (shouldAppendSplitDeltaForContext(&batch_ctx)) {
         try batch_ctx.shard_manager.appendSplitDelta(currentTimeNs(), &.{}, artifact_delete_keys);
     }
@@ -44663,8 +44715,6 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
     DB.notifyQueryVisibilityTargetAdvancedContext(&batch_ctx, sequence);
     releaseHAMutationShared(&ha_mutation);
     try deferred_ha_gates.waitForDurabilityAndAuthority(batch_ctx.ha_write_gate);
-    batch_ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
-
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
     if (ctx.executor.hasWorkers()) {
         ctx.executor.forceSequence(sequence);
@@ -52665,16 +52715,18 @@ fn markSplitOffDocumentArtifactChildRangesLocked(
         .changed_artifact_keys = changed_artifact_keys.items,
     }, sequence);
     defer self.alloc.free(replay_payload);
+    var backlog_admission = try self.executor.admitBacklogBytes(@intCast(replay_payload.len));
+    defer backlog_admission.cancel();
     try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes.items, &.{}, .{
         .sequence = sequence,
         .payload = replay_payload,
     });
+    self.executor.commitBacklogAdmission(sequence, &backlog_admission);
     DB.notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
     self.mirrorHAReplayPayloadBestEffort(replay_payload);
     if (shouldAppendSplitDelta(self)) {
         try self.core.appendSplitDelta(currentTimeNs(), writes.items, &.{});
     }
-    self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
 }
 
 fn documentArtifactChildRangeMovedBySplit(
@@ -89805,6 +89857,69 @@ test "db repair replay pin applies hard-pressure write backpressure" {
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
     });
+}
+
+test "db rejects derived backlog exhaustion before primary commit" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = 1,
+    };
+    var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resources.deinit(alloc);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .resource_manager = &resources,
+    });
+    defer db.close();
+
+    try std.testing.expectError(error.ResourceBudgetExceeded, db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .write,
+    }));
+    const stored = try db.get(alloc, "doc:a");
+    defer if (stored) |value| alloc.free(value);
+    try std.testing.expect(stored == null);
+    try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.derived_backlog).used_bytes);
+}
+
+test "write sync never drains sequence-only derived backlog inline" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var resources = resource_manager_mod.ResourceManager.init(.{
+        .derived_backlog_high_sequences = 1,
+        .derived_backlog_resume_sequences = 0,
+        .derived_backlog_throttle_window_sequences = 1,
+    });
+    defer resources.deinit(alloc);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .resource_manager = &resources,
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expect(resources.sliceStats(.derived_backlog).used_bytes > 0);
+    const stored = try db.get(alloc, "doc:b");
+    defer if (stored) |value| alloc.free(value);
+    try std.testing.expect(stored != null);
 }
 
 test "db removing one repair pin preserves pressure gate for another index" {

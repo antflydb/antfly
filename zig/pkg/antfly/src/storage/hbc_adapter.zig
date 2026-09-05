@@ -3907,7 +3907,7 @@ fn yieldExperimentalCheckpointForForeground(
     force_progress: ?*const std.atomic.Value(bool),
 ) void {
     const manager = resource_manager orelse return;
-    while (manager.shouldDeferOptionalMaintenanceForForegroundQuery()) {
+    while (manager.shouldDeferOptionalMaintenanceForForegroundTraffic()) {
         if (force_progress) |force| if (force.load(.acquire)) return;
         platform.time.yieldBriefly();
     }
@@ -16335,12 +16335,12 @@ pub const HBCIndex = struct {
     fn optionalPostingMaintenanceShouldContinue(context: *anyopaque) bool {
         const self: *HBCIndex = @ptrCast(@alignCast(context));
         const manager = self.resource_manager orelse return true;
-        return !manager.shouldDeferOptionalMaintenanceForForegroundQuery();
+        return !manager.shouldDeferOptionalMaintenanceForForegroundTraffic();
     }
 
     pub fn shouldDeferOptionalPostingMaintenance(self: *const HBCIndex) bool {
         const manager = self.resource_manager orelse return false;
-        return manager.shouldDeferOptionalMaintenanceForForegroundQuery();
+        return manager.shouldDeferOptionalMaintenanceForForegroundTraffic();
     }
 
     pub fn repairDirtyPostingsOptionalWithOptions(self: *HBCIndex, options: PostingMaintenanceOptions) !PostingMaintenanceResult {

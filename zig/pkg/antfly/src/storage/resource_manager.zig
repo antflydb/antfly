@@ -29,6 +29,7 @@ const dense_replay_finish_hard_ns: u64 = 8 * std.time.ns_per_s;
 const dense_replay_write_pressure_hard_ns: u64 = std.time.ns_per_s;
 const dense_replay_soft_compaction_quiet_ns: u64 = 500 * std.time.ns_per_ms;
 const foreground_query_maintenance_quiet_ns: u64 = 25 * std.time.ns_per_ms;
+const foreground_write_maintenance_quiet_ns: u64 = 2 * std.time.ns_per_ms;
 // A two-millisecond cap is shorter than one cold vector query and lets a
 // multi-GiB compactor repeatedly reclaim the storage device before the query
 // can fault its native posting/vector pages. Fifty milliseconds still gives a
@@ -321,10 +322,10 @@ pub const Options = struct {
     /// These are runtime policy values, not index or API configuration.
     derived_backlog_high_sequences: usize = 200,
     derived_backlog_resume_sequences: usize = 100,
-    /// Bound how much sequence-only replay debt one foreground admission must
-    /// inherit. Byte and aggregate LSM pressure can still request a larger
-    /// drain; this window only prevents a healthy async index backlog from
-    /// concentrating minutes of work into one public write acknowledgement.
+    /// Bound the asynchronous urgency target emitted when sequence-only replay
+    /// debt crosses its high watermark. Foreground requests never drain this
+    /// window themselves; payload plus tracker metadata remain independently
+    /// bounded by the derived-backlog byte budget.
     derived_backlog_throttle_window_sequences: usize = 16,
     /// Node-owned filesystem growth policy. This is deliberately not table or
     /// index configuration. The larger of the fixed floor and this fraction
@@ -733,6 +734,8 @@ pub const ResourceManager = struct {
     latency_sensitive_derived_replay_quiet_until_ns: std.atomic.Value(u64) = .init(0),
     foreground_query_sessions: std.atomic.Value(u64) = .init(0),
     foreground_query_quiet_until_ns: std.atomic.Value(u64) = .init(0),
+    foreground_write_sessions: std.atomic.Value(u64) = .init(0),
+    foreground_write_quiet_until_ns: std.atomic.Value(u64) = .init(0),
     dense_search_admission_mutex: std.atomic.Mutex = .unlocked,
     dense_search_bandwidth_capacity_bytes: u64 = 0,
     dense_search_active_bytes: u64 = 0,
@@ -1025,6 +1028,31 @@ pub const ResourceManager = struct {
         }
     }
 
+    pub const ForegroundWriteLease = struct {
+        manager: ?*ResourceManager = null,
+
+        pub fn release(self: *ForegroundWriteLease) void {
+            const manager = self.manager orelse return;
+            const previous = manager.foreground_write_sessions.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+            if (previous == 1) {
+                manager.foreground_write_quiet_until_ns.store(
+                    platform_time.monotonicNs() +| foreground_write_maintenance_quiet_ns,
+                    .release,
+                );
+            }
+            self.manager = null;
+        }
+    };
+
+    /// Marks only the latency-sensitive mutation portion of a request. Callers
+    /// release this lease immediately after primary WAL publication, before
+    /// any explicit full-index visibility wait.
+    pub fn beginForegroundWrite(self: *ResourceManager) ForegroundWriteLease {
+        _ = self.foreground_write_sessions.fetchAdd(1, .release);
+        return .{ .manager = self };
+    }
+
     fn denseSearchGrantBytes(self: *const ResourceManager, requested_bytes: u64) u64 {
         const capacity = self.dense_search_bandwidth_capacity_bytes;
         if (capacity == 0) return 0;
@@ -1188,9 +1216,12 @@ pub const ResourceManager = struct {
         };
     }
 
-    pub fn shouldDeferOptionalMaintenanceForForegroundQuery(self: *const ResourceManager) bool {
+    pub fn shouldDeferOptionalMaintenanceForForegroundTraffic(self: *const ResourceManager) bool {
         if (self.foreground_query_sessions.load(.acquire) != 0) return true;
-        return platform_time.monotonicNs() < self.foreground_query_quiet_until_ns.load(.acquire);
+        if (self.foreground_write_sessions.load(.acquire) != 0) return true;
+        const now_ns = platform_time.monotonicNs();
+        return now_ns < self.foreground_query_quiet_until_ns.load(.acquire) or
+            now_ns < self.foreground_write_quiet_until_ns.load(.acquire);
     }
 
     /// Soft compaction builders call this at bounded work intervals. Each
@@ -1198,7 +1229,7 @@ pub const ResourceManager = struct {
     /// must continue making progress even under a sustained query stream.
     pub fn yieldOptionalMaintenanceForForegroundQuery(self: *const ResourceManager) void {
         const deadline_ns = platform_time.monotonicNs() +| foreground_query_compaction_yield_max_ns;
-        while (self.shouldDeferOptionalMaintenanceForForegroundQuery()) {
+        while (self.shouldDeferOptionalMaintenanceForForegroundTraffic()) {
             if (platform_time.monotonicNs() >= deadline_ns) return;
             platform_time.yieldBriefly();
         }
@@ -1837,6 +1868,14 @@ pub const ResourceManager = struct {
             if (self.reclaimForAllocation(slice, bytes) == 0) return err;
             return self.reserveOnce(slice, bytes);
         };
+    }
+
+    /// Performs the final non-blocking admission check at a commit boundary.
+    /// Unlike `reserve`, this never invokes reclaimers: callers may use it
+    /// while holding a short mutation fence when failure still precedes WAL
+    /// publication. Any slower pacing or reclamation belongs above that fence.
+    pub fn reserveImmediate(self: *ResourceManager, slice: Slice, bytes: u64) !Reservation {
+        return try self.reserveOnce(slice, bytes);
     }
 
     fn reserveOnce(self: *ResourceManager, slice: Slice, bytes: u64) !Reservation {
@@ -3638,20 +3677,27 @@ test "latency-sensitive derived replay defers only optional background work" {
     try std.testing.expect(!manager.shouldDeferSoftCompactionForDerivedReplay());
 }
 
-test "foreground queries defer optional maintenance through a short quiet window" {
+test "foreground traffic defers optional maintenance through bounded quiet windows" {
     var manager = ResourceManager.init(.{});
     defer manager.deinit(std.testing.allocator);
 
-    try std.testing.expect(!manager.shouldDeferOptionalMaintenanceForForegroundQuery());
+    try std.testing.expect(!manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
     manager.beginForegroundQuery();
     manager.beginForegroundQuery();
-    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundQuery());
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
     manager.finishForegroundQuery();
-    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundQuery());
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
     manager.finishForegroundQuery();
-    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundQuery());
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
     manager.foreground_query_quiet_until_ns.store(0, .release);
-    try std.testing.expect(!manager.shouldDeferOptionalMaintenanceForForegroundQuery());
+    try std.testing.expect(!manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+
+    var write = manager.beginForegroundWrite();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+    write.release();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+    manager.foreground_write_quiet_until_ns.store(0, .release);
+    try std.testing.expect(!manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
 }
 
 test "resource manager background deferral follows slice policy" {

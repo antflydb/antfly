@@ -3654,6 +3654,22 @@ pub const IndexManager = struct {
             if (current_tip != applied_sequence) return;
         }
 
+        // A certified immutable base plus its complete WAL/delta suffix is
+        // already the exact native generation at this source boundary. Do
+        // not rewrite the corpus merely to remove bounded query-time fan-out:
+        // that is optional consolidation and belongs to the background
+        // maintenance lane. The empty-bootstrap exception remains enforced
+        // by vectorBlockGenerationReadyAtSequenceAndCount, so initial
+        // publication still produces a cardinality-certified base.
+        if (self.vectorBlockReadyAtSequenceAndCount(
+            applied_sequence,
+            entry,
+            entry.index.stats().active_count,
+        )) {
+            self.vector_block_projection_dirty.store(false, .release);
+            return;
+        }
+
         // Prefer the transactionally complete native mutation generation.
         // Its shard-local merge preserves exact revisions and source coverage
         // without cloning/scanning primary LSM artifacts. Missing, lossy, or
@@ -7780,13 +7796,14 @@ pub const IndexManager = struct {
             defer entry.apply_mutex.unlock();
             const source_sequence = primary.lastReplaySequence(0);
             const posting_sequence_before = entry.index.experimentalPostingDurableAppliedSequence();
-            // A recovered sequence-complete index can still carry a maximum
-            // delta chain or WAL tail. Stable-tip publication is the explicit
-            // lifecycle fence that retires that query-time merge debt; do not
-            // infer physical readiness merely from logical source coverage.
+            // The lifecycle fence certifies query-visible authority, not
+            // physical consolidation. A complete posting WAL/delta suffix is
+            // already durable at this source sequence; flattening it here can
+            // turn a small full_index/runUntilIdle fence into a multi-GiB
+            // rewrite. Background maintenance retains the flattening policy.
             _ = try self.finalizeNativePostingGenerationAtStableTipLocked(entry, source_sequence, .{
                 .validate_payloads = true,
-                .flatten = true,
+                .flatten = false,
             });
             var changed = posting_sequence_before == null;
             const posting_sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
@@ -30120,23 +30137,45 @@ test "dense index unions multiple embedding artifact sources without overwriting
 
     _ = try manager.publishVectorBlockBasesAtStableTip();
     try std.testing.expect(manager.vectorBlockReadyForDenseIndex("document_vectors"));
-    const native_generation = manager.acquireVectorBlockGeneration() orelse return error.TestUnexpectedResult;
-    defer native_generation.release();
-    try std.testing.expectEqual(
-        @as(?u64, 2),
-        IndexManager.denseVectorArtifactCoverageCount(&native_generation.opened, entry),
-    );
-    for ([_][]const u8{ title_artifact, body_artifact }) |artifact_key| {
-        const found = try native_generation.opened.get(
-            artifact_key,
-            native_generation.opened.store.covered_source_sequence,
-            null,
+    const base_generation = blk: {
+        const native_generation = manager.acquireVectorBlockGeneration() orelse return error.TestUnexpectedResult;
+        defer native_generation.release();
+        try std.testing.expectEqual(
+            @as(?u64, 2),
+            IndexManager.denseVectorArtifactCoverageCount(&native_generation.opened, entry),
         );
-        switch (found) {
-            .vector => {},
-            .missing, .tombstone => return error.TestUnexpectedResult,
+        for ([_][]const u8{ title_artifact, body_artifact }) |artifact_key| {
+            const found = try native_generation.opened.get(
+                artifact_key,
+                native_generation.opened.store.covered_source_sequence,
+                null,
+            );
+            switch (found) {
+                .vector => {},
+                .missing, .tombstone => return error.TestUnexpectedResult,
+            }
         }
-    }
+        break :blk native_generation.opened.store.manifest.?.base_generation;
+    };
+
+    // An ordinary update is a complete exact suffix over the certified base.
+    // Stable-tip readiness must retain that bounded overlay instead of
+    // rewriting the complete base on every full_index/runUntilIdle boundary.
+    const updated_title_payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &[_]f32{ 0.9, 0.1, 0 });
+    defer alloc.free(updated_title_payload);
+    try store.put(title_artifact, updated_title_payload);
+    const update_sequence = store.lastReplaySequence(0);
+    try std.testing.expect(try manager.publishVectorBlockMutationWal(entry, &.{.{
+        .kind = .upsert,
+        .vector_id = deterministicDenseVectorId(title_artifact),
+        .metadata = @constCast(title_artifact),
+        .vector = @constCast(&[_]f32{ 0.9, 0.1, 0 }),
+    }}, update_sequence));
+    try manager.ensureVectorBlockBaseAtAppliedSequence("document_vectors", update_sequence);
+    const updated_generation = manager.acquireVectorBlockGeneration() orelse return error.TestUnexpectedResult;
+    defer updated_generation.release();
+    try std.testing.expectEqual(base_generation, updated_generation.opened.store.manifest.?.base_generation);
+    try std.testing.expect(updated_generation.opened.baseOnlyVectorCount() == null);
 }
 
 test "sparse multi-source requests carry semantic producer identity" {

@@ -156,6 +156,14 @@ const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
             _ = bytes;
         }
 
+        pub fn admitBacklogBytes(_: *@This(), _: u64) !BacklogAdmission {
+            return .{};
+        }
+
+        pub fn commitBacklogAdmission(_: *@This(), _: u64, admission: *BacklogAdmission) void {
+            admission.cancel();
+        }
+
         pub fn backlogThrottleTargetSequence(_: *@This()) ?u64 {
             return null;
         }
@@ -192,6 +200,7 @@ pub const FinishCatchUpFn = async_runtime_mod.FinishCatchUpFn;
 pub const CanAdvanceToTargetFn = async_runtime_mod.CanAdvanceToTargetFn;
 pub const AppliedSequenceAdvancedFn = async_runtime_mod.AppliedSequenceAdvancedFn;
 pub const RuntimeError = async_runtime_mod.RuntimeError;
+pub const BacklogAdmission = backlog_tracker_mod.Tracker.Admission;
 
 pub const Backend = runtime_backend.Backend;
 
@@ -216,6 +225,8 @@ pub const Executor = struct {
         notify_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) void,
         notify_except_kind: *const fn (ptr: *anyopaque, sequence: u64, excluded_kind: types.IndexKind) void,
         force_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
+        admit_backlog_bytes: *const fn (ptr: *anyopaque, bytes: u64) anyerror!BacklogAdmission,
+        commit_backlog_admission: *const fn (ptr: *anyopaque, sequence: u64, admission: *BacklogAdmission) void,
         track_backlog_bytes: *const fn (ptr: *anyopaque, sequence: u64, bytes: u64) anyerror!void,
         backlog_throttle_target_sequence: *const fn (ptr: *anyopaque) ?u64,
         release_backlog_through: *const fn (ptr: *anyopaque, sequence: u64) void,
@@ -277,6 +288,14 @@ pub const Executor = struct {
 
     pub fn trackBacklogBytes(self: *Executor, sequence: u64, bytes: u64) !void {
         return try self.vtable.track_backlog_bytes(self.ptr, sequence, bytes);
+    }
+
+    pub fn admitBacklogBytes(self: *Executor, bytes: u64) !BacklogAdmission {
+        return try self.vtable.admit_backlog_bytes(self.ptr, bytes);
+    }
+
+    pub fn commitBacklogAdmission(self: *Executor, sequence: u64, admission: *BacklogAdmission) void {
+        self.vtable.commit_backlog_admission(self.ptr, sequence, admission);
     }
 
     pub fn backlogThrottleTargetSequence(self: *Executor) ?u64 {
@@ -429,6 +448,14 @@ const ManualRuntime = struct {
 
     fn trackBacklogBytes(self: *ManualRuntime, sequence: u64, bytes: u64) !void {
         return try self.backlog.track(self.alloc, sequence, bytes);
+    }
+
+    fn admitBacklogBytes(self: *ManualRuntime, bytes: u64) !BacklogAdmission {
+        return try self.backlog.admit(self.alloc, bytes);
+    }
+
+    fn commitBacklogAdmission(self: *ManualRuntime, sequence: u64, admission: *BacklogAdmission) void {
+        self.backlog.commitAdmission(sequence, admission);
     }
 
     fn backlogThrottleTargetSequence(self: *ManualRuntime) ?u64 {
@@ -635,6 +662,8 @@ const manual_vtable = Executor.VTable{
     .notify_indexes = manualNotifyIndexes,
     .notify_except_kind = manualNotifyExceptKind,
     .force_sequence = manualForceSequence,
+    .admit_backlog_bytes = manualAdmitBacklogBytes,
+    .commit_backlog_admission = manualCommitBacklogAdmission,
     .track_backlog_bytes = manualTrackBacklogBytes,
     .backlog_throttle_target_sequence = manualBacklogThrottleTargetSequence,
     .release_backlog_through = manualReleaseBacklogThrough,
@@ -705,6 +734,16 @@ fn manualTrackBacklogBytes(ptr: *anyopaque, sequence: u64, bytes: u64) !void {
     return try runtime.trackBacklogBytes(sequence, bytes);
 }
 
+fn manualAdmitBacklogBytes(ptr: *anyopaque, bytes: u64) !BacklogAdmission {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    return try runtime.admitBacklogBytes(bytes);
+}
+
+fn manualCommitBacklogAdmission(ptr: *anyopaque, sequence: u64, admission: *BacklogAdmission) void {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    runtime.commitBacklogAdmission(sequence, admission);
+}
+
 fn manualBacklogThrottleTargetSequence(ptr: *anyopaque) ?u64 {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
     return runtime.backlogThrottleTargetSequence();
@@ -768,6 +807,8 @@ const io_threaded_vtable = Executor.VTable{
     .notify_indexes = ioThreadedNotifyIndexes,
     .notify_except_kind = ioThreadedNotifyExceptKind,
     .force_sequence = ioThreadedForceSequence,
+    .admit_backlog_bytes = ioThreadedAdmitBacklogBytes,
+    .commit_backlog_admission = ioThreadedCommitBacklogAdmission,
     .track_backlog_bytes = ioThreadedTrackBacklogBytes,
     .backlog_throttle_target_sequence = ioThreadedBacklogThrottleTargetSequence,
     .release_backlog_through = ioThreadedReleaseBacklogThrough,
@@ -839,6 +880,16 @@ fn ioThreadedForceSequence(ptr: *anyopaque, sequence: u64) void {
 fn ioThreadedTrackBacklogBytes(ptr: *anyopaque, sequence: u64, bytes: u64) !void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     return try runtime.trackBacklogBytes(sequence, bytes);
+}
+
+fn ioThreadedAdmitBacklogBytes(ptr: *anyopaque, bytes: u64) !BacklogAdmission {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    return try runtime.admitBacklogBytes(bytes);
+}
+
+fn ioThreadedCommitBacklogAdmission(ptr: *anyopaque, sequence: u64, admission: *BacklogAdmission) void {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    runtime.commitBacklogAdmission(sequence, admission);
 }
 
 fn ioThreadedBacklogThrottleTargetSequence(ptr: *anyopaque) ?u64 {
