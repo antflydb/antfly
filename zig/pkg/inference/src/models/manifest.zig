@@ -180,6 +180,7 @@ pub const EmbeddingStyle = enum {
 /// replace these fields.
 pub const ModelManifestDeclarations = struct {
     model_type: bool = false,
+    inputs: bool = false,
     pooling: bool = false,
     normalize: bool = false,
     embedding_profile: bool = false,
@@ -644,6 +645,15 @@ fn ignoreNonResourceMetadataError(result: anytype) !void {
     };
 }
 
+/// Antfly-owned bundle metadata remains forward-compatible, but a disagreement
+/// with another Antfly-owned executable contract must fail closed.
+fn ignoreOptionalAntflyMetadataError(result: anytype) !void {
+    result catch |err| switch (err) {
+        error.OutOfMemory, error.InvalidModelManifest => return err,
+        else => return,
+    };
+}
+
 const ArtifactCatalog = struct {
     allocator: std.mem.Allocator,
     model_dir_path: []const u8,
@@ -915,7 +925,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
 
     if (try catalog.readOptional("antfly_inference_bundle.json")) |bundle_bytes| {
         defer allocator.free(bundle_bytes);
-        try ignoreNonResourceMetadataError(parseInferenceBundleJsonWithCatalog(&manifest, allocator, catalog, bundle_bytes));
+        try ignoreOptionalAntflyMetadataError(parseInferenceBundleJsonWithCatalog(&manifest, allocator, catalog, bundle_bytes));
     }
     if (shouldParseClipclapGgufVariant(catalog)) {
         try parseOptionalInferenceVariantsFile(&manifest, allocator, catalog);
@@ -1048,7 +1058,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
 
     if (try catalog.readOptional("antfly_inference_bundle.json")) |bundle_bytes| {
         defer allocator.free(bundle_bytes);
-        try ignoreNonResourceMetadataError(parseInferenceBundleJsonWithCatalog(&manifest, allocator, &catalog, bundle_bytes));
+        try ignoreOptionalAntflyMetadataError(parseInferenceBundleJsonWithCatalog(&manifest, allocator, &catalog, bundle_bytes));
     }
     try parseOptionalInferenceVariantsFile(&manifest, allocator, &catalog);
 
@@ -2396,6 +2406,7 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
 
     if (obj.get("inputs")) |v| {
         replaceOwnedStringArray(allocator, &manifest.inputs, try dupeManifestStringArray(allocator, v));
+        manifest.model_manifest_declarations.inputs = true;
     }
 
     if (obj.get("sparse_3d_output_layout")) |v| {
@@ -2523,6 +2534,56 @@ fn parseInferenceBundleJsonWithCatalog(
     return parseInferenceBundleJsonInternal(manifest, allocator, catalog, catalog.model_dir_path, json_bytes);
 }
 
+/// Reconcile the model family implied by Antfly bundle metadata with an
+/// explicit model_manifest.json declaration. Both files are executable Antfly
+/// contracts: agreement preserves the manifest's provenance, disagreement is
+/// invalid rather than letting parse order choose the runtime implementation.
+fn applyBundleModelTypeContract(manifest: *ModelManifest, bundle_type: ModelType) !void {
+    if (manifest.model_manifest_declarations.model_type) {
+        if (manifest.model_type != bundle_type) return error.InvalidModelManifest;
+        return;
+    }
+    manifest.model_type = bundle_type;
+    manifest.model_type_origin = .bundle;
+}
+
+fn applyBundleInputsContract(
+    allocator: std.mem.Allocator,
+    manifest: *ModelManifest,
+    bundle_inputs: []const []const u8,
+) !void {
+    if (manifest.model_manifest_declarations.inputs) {
+        if (!stringSetEql(manifest.inputs, bundle_inputs)) return error.InvalidModelManifest;
+        return;
+    }
+    try setManifestInputs(allocator, manifest, bundle_inputs);
+}
+
+fn stringSetEql(lhs: []const []const u8, rhs: []const []const u8) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs) |candidate| {
+        var found = false;
+        for (rhs) |other| {
+            if (std.mem.eql(u8, candidate, other)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    for (rhs) |candidate| {
+        var found = false;
+        for (lhs) |other| {
+            if (std.mem.eql(u8, candidate, other)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
 fn parseInferenceBundleJsonInternal(
     manifest: *ModelManifest,
     allocator: std.mem.Allocator,
@@ -2557,11 +2618,10 @@ fn parseInferenceBundleJsonInternal(
             else
                 null;
             errdefer if (owned_wrapper) |value| allocator.free(value);
-            try setManifestInputs(allocator, manifest, &.{"text"});
+            try applyBundleModelTypeContract(manifest, .recognizer);
+            try applyBundleInputsContract(allocator, manifest, &.{"text"});
             replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
             if (owned_wrapper) |value| replaceOwnedString(allocator, &manifest.gliner_model_type, value);
-            manifest.model_type = .recognizer;
-            manifest.model_type_origin = .bundle;
             return;
         }
         const encoder_path = try resolveBundlePath(allocator, catalog, model_dir_path, encoder.?.string);
@@ -2576,7 +2636,8 @@ fn parseInferenceBundleJsonInternal(
         else
             null;
         errdefer if (owned_wrapper) |value| allocator.free(value);
-        try setManifestInputs(allocator, manifest, &.{"text"});
+        try applyBundleModelTypeContract(manifest, .recognizer);
+        try applyBundleInputsContract(allocator, manifest, &.{"text"});
 
         replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
         if (owned_wrapper) |value| replaceOwnedString(allocator, &manifest.gliner_model_type, value);
@@ -2586,8 +2647,6 @@ fn parseInferenceBundleJsonInternal(
         } else {
             setOptionalPath(allocator, &manifest.gliner_head_safetensors_path, head_path);
         }
-        manifest.model_type = .recognizer;
-        manifest.model_type_origin = .bundle;
         return;
     }
     if (std.mem.eql(u8, bundle_family, "clipclap_gguf_bundle/v1")) {
@@ -2602,13 +2661,13 @@ fn parseInferenceBundleJsonInternal(
         errdefer allocator.free(owned_family);
         const config_model_arch = try allocator.dupe(u8, "clipclap");
         errdefer allocator.free(config_model_arch);
-        try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
+        try applyBundleModelTypeContract(manifest, .embedder);
+        try applyBundleInputsContract(allocator, manifest, &.{ "text", "image", "audio" });
 
         replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
         setOptionalPath(allocator, &manifest.gguf_path, clip_path);
         setOptionalPath(allocator, &manifest.audio_model_path, clap_path);
         manifest.native_arch_hint = .clip;
-        manifest.model_type_origin = .bundle;
         replaceOwnedString(allocator, &manifest.config_model_arch, config_model_arch);
         return;
     }
@@ -2631,11 +2690,10 @@ fn parseInferenceBundleJsonInternal(
             errdefer allocator.free(owned_family);
             const owned_arch = try allocator.dupe(u8, "qwen3_vl");
             errdefer allocator.free(owned_arch);
-            try setManifestInputs(allocator, manifest, &.{ "text", "image" });
+            try applyBundleModelTypeContract(manifest, .reranker);
+            try applyBundleInputsContract(allocator, manifest, &.{ "text", "image" });
             replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
             replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
-            manifest.model_type = .reranker;
-            manifest.model_type_origin = .bundle;
             return;
         }
         const model_path = try resolveBundlePath(allocator, catalog, model_dir_path, model.?.string);
@@ -2644,12 +2702,11 @@ fn parseInferenceBundleJsonInternal(
         errdefer allocator.free(owned_family);
         const owned_arch = try allocator.dupe(u8, "qwen3_vl");
         errdefer allocator.free(owned_arch);
-        try setManifestInputs(allocator, manifest, &.{ "text", "image" });
+        try applyBundleModelTypeContract(manifest, .reranker);
+        try applyBundleInputsContract(allocator, manifest, &.{ "text", "image" });
         replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
         replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
         setOptionalPath(allocator, &manifest.safetensors_path, model_path);
-        manifest.model_type = .reranker;
-        manifest.model_type_origin = .bundle;
         return;
     }
     if (std.mem.eql(u8, bundle_family, qwen3_vl_gguf_bundle_family) or
@@ -2667,11 +2724,10 @@ fn parseInferenceBundleJsonInternal(
             errdefer allocator.free(owned_family);
             const owned_arch = try allocator.dupe(u8, "qwen3_vl");
             errdefer allocator.free(owned_arch);
-            try setManifestInputs(allocator, manifest, &.{ "text", "image" });
+            try applyBundleModelTypeContract(manifest, if (is_reranker) .reranker else .generator);
+            try applyBundleInputsContract(allocator, manifest, &.{ "text", "image" });
             replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
             replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
-            manifest.model_type = if (is_reranker) .reranker else .generator;
-            manifest.model_type_origin = .bundle;
             return;
         }
 
@@ -2683,14 +2739,13 @@ fn parseInferenceBundleJsonInternal(
         errdefer allocator.free(owned_family);
         const owned_arch = try allocator.dupe(u8, "qwen3_vl");
         errdefer allocator.free(owned_arch);
-        try setManifestInputs(allocator, manifest, &.{ "text", "image" });
+        try applyBundleModelTypeContract(manifest, if (is_reranker) .reranker else .generator);
+        try applyBundleInputsContract(allocator, manifest, &.{ "text", "image" });
 
         replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
         replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
         setOptionalPath(allocator, &manifest.gguf_path, decoder_path);
         setOptionalPath(allocator, &manifest.gguf_projector_path, projector_path);
-        manifest.model_type = if (is_reranker) .reranker else .generator;
-        manifest.model_type_origin = .bundle;
         return;
     }
 
@@ -2793,6 +2848,8 @@ fn parseInferenceVariantsJsonInternal(
     errdefer allocator.free(family);
     const arch = try allocator.dupe(u8, "clipclap");
     errdefer allocator.free(arch);
+    try applyBundleModelTypeContract(manifest, .embedder);
+    try applyBundleInputsContract(allocator, manifest, &.{ "text", "image", "audio" });
 
     if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
     manifest.inference_bundle_family = family;
@@ -2801,16 +2858,14 @@ fn parseInferenceVariantsJsonInternal(
     setOptionalPath(allocator, &manifest.audio_model_path, pair.clap_path);
     pair.clap_path = "";
     manifest.native_arch_hint = .clip;
-    manifest.model_type_origin = .bundle;
     if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
     manifest.config_model_arch = arch;
-    try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
 }
 
 fn parseOptionalInferenceVariantsFile(manifest: *ModelManifest, allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !void {
     const variants_bytes = (try catalog.readOptional("antfly_inference_variants.json")) orelse return;
     defer allocator.free(variants_bytes);
-    try ignoreNonResourceMetadataError(parseInferenceVariantsJsonWithCatalog(manifest, allocator, catalog, variants_bytes));
+    try ignoreOptionalAntflyMetadataError(parseInferenceVariantsJsonWithCatalog(manifest, allocator, catalog, variants_bytes));
 }
 
 fn parseGliner2InferenceVariantsJson(
@@ -2850,6 +2905,8 @@ fn parseGliner2InferenceVariantsJson(
     errdefer allocator.free(family);
     const wrapper = try allocator.dupe(u8, "gliner2");
     errdefer allocator.free(wrapper);
+    try applyBundleModelTypeContract(manifest, .recognizer);
+    try applyBundleInputsContract(allocator, manifest, &.{"text"});
 
     if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
     manifest.inference_bundle_family = family;
@@ -2859,9 +2916,6 @@ fn parseGliner2InferenceVariantsJson(
     pair.encoder_path = "";
     setOptionalPath(allocator, &manifest.gliner_head_gguf_path, pair.head_path);
     pair.head_path = "";
-    manifest.model_type = .recognizer;
-    manifest.model_type_origin = .bundle;
-    try setManifestInputs(allocator, manifest, &.{"text"});
 }
 
 fn parseFlorence2InferenceVariantsJson(
@@ -2913,6 +2967,8 @@ fn applyFlorence2GgufBundle(
     errdefer if (family.len > 0) allocator.free(family);
     var arch = try allocator.dupe(u8, "florence2");
     errdefer if (arch.len > 0) allocator.free(arch);
+    try applyBundleModelTypeContract(manifest, .reader);
+    try applyBundleInputsContract(allocator, manifest, &.{ "text", "image" });
 
     if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
     manifest.inference_bundle_family = family;
@@ -2920,12 +2976,9 @@ fn applyFlorence2GgufBundle(
     setOptionalPath(allocator, &manifest.gguf_path, path);
     path = "";
     manifest.native_arch_hint = .florence;
-    manifest.model_type = .reader;
-    manifest.model_type_origin = .bundle;
     if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
     manifest.config_model_arch = arch;
     arch = "";
-    try setManifestInputs(allocator, manifest, &.{ "text", "image" });
 }
 
 fn setManifestInputs(allocator: std.mem.Allocator, manifest: *ModelManifest, inputs: []const []const u8) !void {
@@ -3841,6 +3894,41 @@ test "loadListingFromDir fails closed on invalid explicit model manifests" {
     }
 }
 
+test "loaders reject conflicting Antfly manifest and bundle contracts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    inline for (.{
+        "{\"type\":\"generator\"}",
+        "{\"type\":\"embedder\",\"inputs\":[\"text\"]}",
+    }) |manifest_json| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.createDirPath(io, "model");
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "model/model_manifest.json",
+            .data = manifest_json,
+        });
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "model/antfly_inference_bundle.json",
+            .data = "{\"family\":\"clipclap_gguf_bundle/v1\",\"clip\":\"clip.gguf\",\"clap\":\"clap.gguf\"}",
+        });
+        try tmp.dir.writeFile(io, .{ .sub_path = "model/clip.gguf", .data = "clip" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "model/clap.gguf", .data = "clap" });
+
+        const model_dir = try std.fs.path.join(
+            allocator,
+            &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" },
+        );
+        defer allocator.free(model_dir);
+
+        try std.testing.expectError(error.InvalidModelManifest, loadFromDir(allocator, model_dir));
+        try std.testing.expectError(error.InvalidModelManifest, loadListingFromDir(allocator, model_dir));
+        try std.testing.expectEqual(null, try loadListingCandidateFromDir(allocator, model_dir));
+    }
+}
+
 test "explicit embedding profiles reject malformed fields without family fallback" {
     const allocator = std.testing.allocator;
 
@@ -4270,6 +4358,47 @@ test "manifest parses Antfly inference bundle marker" {
 
     try std.testing.expectEqualStrings("gliner2_split_bundle/v1", manifest.inference_bundle_family);
     try std.testing.expectEqualStrings("gliner2", manifest.gliner_model_type);
+}
+
+test "Antfly bundles must agree with explicit manifest contracts" {
+    const allocator = std.testing.allocator;
+    const gliner_bundle =
+        \\{"family":"gliner2_split_bundle/v1","wrapper":"gliner2"}
+    ;
+
+    var matching = ModelManifest{ .allocator = allocator };
+    defer matching.deinit();
+    try parseModelManifestJson(&matching, allocator, "{\"type\":\"recognizer\",\"inputs\":[\"text\"]}");
+    try parseInferenceBundleJson(&matching, allocator, ".", gliner_bundle);
+    try std.testing.expectEqual(ModelType.recognizer, matching.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, matching.model_type_origin);
+    try std.testing.expect(matching.model_manifest_declarations.inputs);
+    try std.testing.expectEqualStrings("text", matching.inputs[0]);
+
+    var conflicting = ModelManifest{ .allocator = allocator };
+    defer conflicting.deinit();
+    try parseModelManifestJson(&conflicting, allocator, "{\"type\":\"embedder\"}");
+    try std.testing.expectError(
+        error.InvalidModelManifest,
+        ignoreOptionalAntflyMetadataError(parseInferenceBundleJson(&conflicting, allocator, ".", gliner_bundle)),
+    );
+    try std.testing.expectEqual(ModelType.embedder, conflicting.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, conflicting.model_type_origin);
+    try std.testing.expectEqualStrings("", conflicting.inference_bundle_family);
+
+    var conflicting_inputs = ModelManifest{ .allocator = allocator };
+    defer conflicting_inputs.deinit();
+    try parseModelManifestJson(
+        &conflicting_inputs,
+        allocator,
+        "{\"type\":\"recognizer\",\"inputs\":[\"image\"]}",
+    );
+    try std.testing.expectError(
+        error.InvalidModelManifest,
+        ignoreOptionalAntflyMetadataError(parseInferenceBundleJson(&conflicting_inputs, allocator, ".", gliner_bundle)),
+    );
+    try std.testing.expectEqualStrings("image", conflicting_inputs.inputs[0]);
+    try std.testing.expectEqualStrings("", conflicting_inputs.inference_bundle_family);
 }
 
 test "manifest parses clipclap gguf bundle marker" {
