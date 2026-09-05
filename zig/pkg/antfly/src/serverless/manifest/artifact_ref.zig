@@ -15,13 +15,14 @@
 //! Dependency-light manifest artifact references shared by manifest codecs and
 //! lake-native publication planning.
 
-/// First manifest version that old readers can safely consume when graph
-/// metric artifact references are present.
-pub const graph_metric_min_manifest_wire_version: u16 = 15;
-pub const graph_metric_range_integrity_manifest_wire_version: u16 = 16;
-/// First manifest version whose readers understand graph-metric segment v6's
-/// authenticated, score-ranked footer tier.
-pub const graph_metric_top_tier_manifest_wire_version: u16 = 17;
+/// First manifest version carrying artifact materializer provenance.
+pub const artifact_provenance_manifest_wire_version: u16 = 15;
+
+/// The only manifest wire that may publish graph-metric artifacts. Serverless
+/// has not shipped, so partial pre-release graph-metric layouts are rejected
+/// instead of becoming a permanent compatibility surface.
+pub const graph_metric_manifest_wire_version: u16 = 17;
+pub const graph_metric_segment_wire_version: u16 = 7;
 
 pub const GraphMetricMaterializationState = enum(u8) {
     ready = 0,
@@ -65,7 +66,7 @@ pub const ArtifactRef = struct {
     /// catalog scheduling can detect stale materializations without fetching
     /// the object payload. Zero denotes a pre-v15 manifest.
     materializer_fingerprint: u64 = 0,
-    /// Authenticated range metadata for graph-metric wire v5+. Fixed-size
+    /// Authenticated range metadata for the current graph-metric wire. Fixed-size
     /// digests avoid per-reference allocations and let point/status reads stay
     /// bounded without trusting object-store range responses.
     graph_metric_control_len: u32 = 0,

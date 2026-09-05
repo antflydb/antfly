@@ -17,13 +17,13 @@ const Allocator = std.mem.Allocator;
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const bounded_decode = @import("../bounded_decode.zig");
 const graph_mod = @import("../../graph/graph.zig");
+const artifact_ref = @import("../manifest/artifact_ref.zig");
 const types = @import("types.zig");
 
 pub const wire_magic = "AFGM";
-pub const wire_version: u16 = 6;
-const fixed_header_len_v1 = 4 + 2 + 1 + 1 + 4 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
-const fixed_header_len_v2 = fixed_header_len_v1 + 2;
-const fixed_header_len = fixed_header_len_v2 + 8;
+pub const wire_version: u16 = artifact_ref.graph_metric_segment_wire_version;
+const fixed_header_len = wire_magic.len + @sizeOf(u16) + 4 * @sizeOf(u8) + @sizeOf(u32) +
+    3 * @sizeOf(u64) + 3 * @sizeOf(u32);
 const routing_magic = "AFGR";
 const top_tier_magic = "AFTK";
 pub const routing_trailer_len: usize = 8;
@@ -32,12 +32,11 @@ pub const ranked_score_block_entries: usize = 256;
 pub const max_persisted_top_entries: usize = 10_000;
 pub const max_routing_bytes: usize = 16 * 1024 * 1024;
 pub const max_score_node_id_bytes: usize = 4096;
-pub const max_ranked_score_block_bytes: usize = ranked_score_block_entries * (ranked_score_fixed_len + max_score_node_id_bytes);
+pub const max_ranked_score_block_bytes: usize = @sizeOf(u16) + max_score_node_id_bytes + ranked_score_block_entries * (ranked_score_fixed_len + max_score_node_id_bytes);
 const routing_header_len = routing_magic.len + @sizeOf(u32);
-const routing_entry_fixed_len_v4 = @sizeOf(u32) + @sizeOf(u64) + @sizeOf(u32);
-const routing_entry_fixed_len = routing_entry_fixed_len_v4 + std.crypto.hash.sha2.Sha256.digest_length;
+const routing_entry_fixed_len = @sizeOf(u32) + @sizeOf(u64) + @sizeOf(u32) + std.crypto.hash.sha2.Sha256.digest_length;
 const top_tier_header_len = top_tier_magic.len + @sizeOf(u32) + @sizeOf(u32);
-const ranked_score_fixed_len = @sizeOf(u32) + @sizeOf(u64);
+const ranked_score_fixed_len = @sizeOf(u16) + @sizeOf(u64);
 const ranked_routing_entry_len = @sizeOf(u64) + @sizeOf(u32) + std.crypto.hash.sha2.Sha256.digest_length;
 const max_ranked_score_blocks = (max_persisted_top_entries + ranked_score_block_entries - 1) / ranked_score_block_entries;
 
@@ -48,8 +47,6 @@ pub const Header = struct {
     rejection_reason: types.RejectionReason,
     config_fingerprint: u64,
     materializer_fingerprint: u64,
-    graph_index_name: []const u8,
-    metric_name: []const u8,
     source_graph_artifact_id: []const u8,
     source_graph_checksum: []const u8,
     converged: bool,
@@ -121,11 +118,44 @@ pub const RoutingIndex = struct {
 };
 
 pub const BorrowedBlockScore = struct {
-    node_id: []const u8,
+    node_suffix: []const u8,
     value: f64,
+
+    pub fn nodeIdLen(self: @This(), node_prefix: []const u8) usize {
+        return node_prefix.len + self.node_suffix.len;
+    }
+
+    pub fn orderNode(self: @This(), node_prefix: []const u8, node_id: []const u8) std.math.Order {
+        const shared_prefix = @min(node_prefix.len, node_id.len);
+        const prefix_order = std.mem.order(u8, node_prefix[0..shared_prefix], node_id[0..shared_prefix]);
+        if (prefix_order != .eq) return prefix_order;
+        if (node_id.len < node_prefix.len) return .gt;
+        return std.mem.order(u8, self.node_suffix, node_id[node_prefix.len..]);
+    }
+
+    pub fn eqlNode(self: @This(), node_prefix: []const u8, node_id: []const u8) bool {
+        return self.nodeIdLen(node_prefix) == node_id.len and self.orderNode(node_prefix, node_id) == .eq;
+    }
+
+    pub fn copyNode(self: @This(), node_prefix: []const u8, destination: []u8) ![]u8 {
+        if (destination.len < self.nodeIdLen(node_prefix)) return error.NoSpaceLeft;
+        @memcpy(destination[0..node_prefix.len], node_prefix);
+        @memcpy(destination[node_prefix.len..][0..self.node_suffix.len], self.node_suffix);
+        return destination[0..self.nodeIdLen(node_prefix)];
+    }
+
+    pub fn dupeNodeAlloc(self: @This(), alloc: Allocator, node_prefix: []const u8) ![]u8 {
+        const result = try alloc.alloc(u8, self.nodeIdLen(node_prefix));
+        errdefer alloc.free(result);
+        _ = try self.copyNode(node_prefix, result);
+        return result;
+    }
 };
 
 pub const DecodedScoreBlock = struct {
+    /// Stored once per block rather than once per score, keeping the bounded
+    /// decode frame compact even when node IDs have long shared prefixes.
+    node_prefix: []const u8 = &.{},
     scores: [score_block_entries]BorrowedBlockScore = undefined,
     len: usize = 0,
 
@@ -134,7 +164,7 @@ pub const DecodedScoreBlock = struct {
         var high = self.len;
         while (low < high) {
             const mid = low + (high - low) / 2;
-            switch (std.mem.order(u8, self.scores[mid].node_id, node_id)) {
+            switch (self.scores[mid].orderNode(self.node_prefix, node_id)) {
                 .lt => low = mid + 1,
                 .gt => high = mid,
                 .eq => return self.scores[mid].value,
@@ -144,19 +174,15 @@ pub const DecodedScoreBlock = struct {
     }
 };
 
-/// Exact bounded prefix needed to decode provenance from an artifact produced
-/// by this codec. Older wire versions have shorter fixed headers, so the small
-/// current-version surplus remains valid for backward-compatible status reads.
+/// Exact bounded prefix needed to decode provenance from a current artifact.
+/// Logical names are manifest metadata and deliberately do not affect the
+/// content address.
 pub fn headerProbeLen(
     artifact_byte_len: u64,
-    graph_index_name: []const u8,
-    metric_name: []const u8,
     source_graph_artifact_id: []const u8,
     source_graph_checksum: []const u8,
 ) !usize {
     var required: usize = fixed_header_len;
-    required = std.math.add(usize, required, graph_index_name.len) catch return error.GraphMetricSegmentTooLarge;
-    required = std.math.add(usize, required, metric_name.len) catch return error.GraphMetricSegmentTooLarge;
     required = std.math.add(usize, required, source_graph_artifact_id.len) catch return error.GraphMetricSegmentTooLarge;
     required = std.math.add(usize, required, source_graph_checksum.len) catch return error.GraphMetricSegmentTooLarge;
     const required_u64 = std.math.cast(u64, required) orelse return error.GraphMetricSegmentTooLarge;
@@ -165,16 +191,12 @@ pub fn headerProbeLen(
 
 pub fn controlProbeLen(
     artifact_byte_len: u64,
-    graph_index_name: []const u8,
-    metric_name: []const u8,
     source_graph_artifact_id: []const u8,
     source_graph_checksum: []const u8,
     edge_filter: graph_mod.GraphMetricEdgeFilter,
 ) !usize {
     var required = try headerProbeLen(
         std.math.maxInt(u64),
-        graph_index_name,
-        metric_name,
         source_graph_artifact_id,
         source_graph_checksum,
     );
@@ -190,9 +212,7 @@ pub fn controlProbeLen(
 /// that the persisted edge filter is exactly the configured set.
 pub fn decodeControl(data: []const u8, expected_edge_filter: graph_mod.GraphMetricEdgeFilter) !Control {
     const header = try decodeHeader(data);
-    var pos = fixedHeaderLenForVersion(header.version);
-    pos = std.math.add(usize, pos, header.graph_index_name.len) catch return error.InvalidGraphMetricSegment;
-    pos = std.math.add(usize, pos, header.metric_name.len) catch return error.InvalidGraphMetricSegment;
+    var pos = fixed_header_len;
     pos = std.math.add(usize, pos, header.source_graph_artifact_id.len) catch return error.InvalidGraphMetricSegment;
     pos = std.math.add(usize, pos, header.source_graph_checksum.len) catch return error.InvalidGraphMetricSegment;
     if (header.edge_type_count != expected_edge_filter.types.len) return error.InvalidGraphMetricSegment;
@@ -251,7 +271,7 @@ pub fn decodeRoutingIndexForVersionWithCancellationAlloc(
     cancellation: CancellationToken,
 ) !RoutingIndex {
     try cancellation.check();
-    if (segment_version < 4 or segment_version > wire_version) return error.UnsupportedGraphMetricSegmentVersion;
+    if (segment_version != wire_version) return error.UnsupportedGraphMetricSegmentVersion;
     if (footer.len < routing_header_len + routing_trailer_len) return error.InvalidGraphMetricSegment;
     const footer_len = try routingFooterLenFromTrailer(artifact_byte_len, footer[footer.len - routing_trailer_len ..]);
     if (footer_len != footer.len) return error.InvalidGraphMetricSegment;
@@ -259,8 +279,7 @@ pub fn decodeRoutingIndexForVersionWithCancellationAlloc(
     var pos: usize = 0;
     if (!std.mem.eql(u8, try take(footer, &pos, routing_magic.len), routing_magic)) return error.InvalidGraphMetricSegment;
     const entry_count = try readInt(u32, footer, &pos);
-    const entry_fixed_len: usize = if (segment_version >= 5) routing_entry_fixed_len else routing_entry_fixed_len_v4;
-    if (@as(usize, entry_count) > (footer.len - routing_header_len - routing_trailer_len) / entry_fixed_len) {
+    if (@as(usize, entry_count) > (footer.len - routing_header_len - routing_trailer_len) / routing_entry_fixed_len) {
         return error.InvalidGraphMetricSegment;
     }
     const entries = try alloc.alloc(RoutingEntry, entry_count);
@@ -272,10 +291,8 @@ pub fn decodeRoutingIndexForVersionWithCancellationAlloc(
         if (first_node_id_len == 0 or first_node_id_len > max_score_node_id_bytes) return error.InvalidGraphMetricSegment;
         const offset = try readInt(u64, footer, &pos);
         const len_u32 = try readInt(u32, footer, &pos);
-        var checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @splat(0);
-        if (segment_version >= 5) {
-            @memcpy(&checksum, try take(footer, &pos, checksum.len));
-        }
+        var checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        @memcpy(&checksum, try take(footer, &pos, checksum.len));
         if (len_u32 == 0) return error.InvalidGraphMetricSegment;
         const first_node_id = try take(footer, &pos, first_node_id_len);
         const end = std.math.add(u64, offset, len_u32) catch return error.InvalidGraphMetricSegment;
@@ -286,40 +303,33 @@ pub fn decodeRoutingIndexForVersionWithCancellationAlloc(
         entry.* = .{ .first_node_id = first_node_id, .offset = offset, .len = len_u32, .checksum = checksum };
         previous_end = end;
     }
-    var top_score_count: usize = 0;
-    const ranked_entries = if (segment_version >= 6) blk: {
-        if (!std.mem.eql(u8, try take(footer, &pos, top_tier_magic.len), top_tier_magic)) return error.InvalidGraphMetricSegment;
-        const top_count = try readInt(u32, footer, &pos);
-        if (top_count > max_persisted_top_entries) return error.InvalidGraphMetricSegment;
-        top_score_count = top_count;
-        const block_count = try readInt(u32, footer, &pos);
-        const expected_block_count = scoreBlockCountForSize(top_score_count, ranked_score_block_entries);
-        if (block_count != expected_block_count or block_count > max_ranked_score_blocks) return error.InvalidGraphMetricSegment;
-        if (pos > footer.len - routing_trailer_len) return error.InvalidGraphMetricSegment;
-        if (@as(usize, block_count) > (footer.len - pos - routing_trailer_len) / ranked_routing_entry_len) {
-            return error.InvalidGraphMetricSegment;
-        }
-        const decoded = try alloc.alloc(RankedRoutingEntry, block_count);
-        errdefer alloc.free(decoded);
-        var ranked_offset = previous_end orelse footer_offset;
-        for (decoded, 0..) |*entry, block_index| {
-            if (block_index % 16 == 0) try cancellation.check();
-            const offset = try readInt(u64, footer, &pos);
-            const len_u32 = try readInt(u32, footer, &pos);
-            if (len_u32 == 0 or len_u32 > max_ranked_score_block_bytes or offset != ranked_offset) return error.InvalidGraphMetricSegment;
-            var checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-            @memcpy(&checksum, try take(footer, &pos, checksum.len));
-            const end = std.math.add(u64, offset, len_u32) catch return error.InvalidGraphMetricSegment;
-            if (end > footer_offset) return error.InvalidGraphMetricSegment;
-            entry.* = .{ .offset = offset, .len = len_u32, .checksum = checksum };
-            ranked_offset = end;
-        }
-        if (ranked_offset != footer_offset) return error.InvalidGraphMetricSegment;
-        break :blk decoded;
-    } else try alloc.alloc(RankedRoutingEntry, 0);
+    if (!std.mem.eql(u8, try take(footer, &pos, top_tier_magic.len), top_tier_magic)) return error.InvalidGraphMetricSegment;
+    const top_score_count = try readInt(u32, footer, &pos);
+    if (top_score_count > max_persisted_top_entries) return error.InvalidGraphMetricSegment;
+    const block_count = try readInt(u32, footer, &pos);
+    const expected_block_count = scoreBlockCountForSize(top_score_count, ranked_score_block_entries);
+    if (block_count != expected_block_count or block_count > max_ranked_score_blocks) return error.InvalidGraphMetricSegment;
+    if (pos > footer.len - routing_trailer_len) return error.InvalidGraphMetricSegment;
+    if (@as(usize, block_count) > (footer.len - pos - routing_trailer_len) / ranked_routing_entry_len) {
+        return error.InvalidGraphMetricSegment;
+    }
+    const ranked_entries = try alloc.alloc(RankedRoutingEntry, block_count);
     errdefer alloc.free(ranked_entries);
+    var ranked_offset = previous_end orelse footer_offset;
+    for (ranked_entries, 0..) |*entry, block_index| {
+        if (block_index % 16 == 0) try cancellation.check();
+        const offset = try readInt(u64, footer, &pos);
+        const len_u32 = try readInt(u32, footer, &pos);
+        if (len_u32 == 0 or len_u32 > max_ranked_score_block_bytes or offset != ranked_offset) return error.InvalidGraphMetricSegment;
+        var checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        @memcpy(&checksum, try take(footer, &pos, checksum.len));
+        const end = std.math.add(u64, offset, len_u32) catch return error.InvalidGraphMetricSegment;
+        if (end > footer_offset) return error.InvalidGraphMetricSegment;
+        entry.* = .{ .offset = offset, .len = len_u32, .checksum = checksum };
+        ranked_offset = end;
+    }
+    if (ranked_offset != footer_offset) return error.InvalidGraphMetricSegment;
     if (pos + routing_trailer_len != footer.len) return error.InvalidGraphMetricSegment;
-    if (segment_version < 6 and entries.len > 0 and previous_end.? != footer_offset) return error.InvalidGraphMetricSegment;
     try cancellation.check();
     return .{
         .entries = entries,
@@ -333,8 +343,6 @@ pub fn artifactIntegrity(segment: types.Segment, payload: []const u8) !ArtifactI
     if (payload.len > std.math.maxInt(u32)) return error.GraphMetricSegmentTooLarge;
     const control_len = try controlProbeLen(
         payload.len,
-        segment.graph_index_name,
-        segment.metric_name,
         segment.source_graph_artifact_id,
         segment.source_graph_checksum,
         segment.edge_filter,
@@ -358,19 +366,24 @@ pub fn artifactIntegrity(segment: types.Segment, payload: []const u8) !ArtifactI
 pub fn decodeScoreBlockWithCancellation(block: []const u8, cancellation: CancellationToken) !DecodedScoreBlock {
     var decoded = DecodedScoreBlock{};
     var pos: usize = 0;
-    var previous: ?[]const u8 = null;
+    const prefix_len = try readInt(u16, block, &pos);
+    if (prefix_len > max_score_node_id_bytes) return error.InvalidGraphMetricSegment;
+    const prefix = try take(block, &pos, prefix_len);
+    decoded.node_prefix = prefix;
+    var previous_suffix: ?[]const u8 = null;
     var score_index: usize = 0;
     while (pos < block.len) : (score_index += 1) {
         if (score_index >= score_block_entries) return error.InvalidGraphMetricSegment;
         if (score_index % 256 == 0) try cancellation.check();
-        const node_len = try readInt(u32, block, &pos);
+        const suffix_len = try readInt(u16, block, &pos);
+        const node_len = prefix.len + suffix_len;
         if (node_len == 0 or node_len > max_score_node_id_bytes) return error.InvalidGraphMetricSegment;
         const value: f64 = @bitCast(try readInt(u64, block, &pos));
-        if (!std.math.isFinite(value)) return error.InvalidGraphMetricSegment;
-        const current = try take(block, &pos, node_len);
-        if (previous != null and std.mem.order(u8, previous.?, current) != .lt) return error.InvalidGraphMetricSegment;
-        decoded.scores[score_index] = .{ .node_id = current, .value = value };
-        previous = current;
+        if (!validMetricScore(value)) return error.InvalidGraphMetricSegment;
+        const suffix = try take(block, &pos, suffix_len);
+        if (previous_suffix != null and std.mem.order(u8, previous_suffix.?, suffix) != .lt) return error.InvalidGraphMetricSegment;
+        decoded.scores[score_index] = .{ .node_suffix = suffix, .value = value };
+        previous_suffix = suffix;
     }
     if (score_index == 0) return error.InvalidGraphMetricSegment;
     decoded.len = score_index;
@@ -381,23 +394,29 @@ pub fn decodeScoreBlockWithCancellation(block: []const u8, cancellation: Cancell
 pub fn decodeRankedScoreBlockWithCancellation(block: []const u8, cancellation: CancellationToken) !DecodedScoreBlock {
     var decoded = DecodedScoreBlock{};
     var pos: usize = 0;
+    const prefix_len = try readInt(u16, block, &pos);
+    if (prefix_len > max_score_node_id_bytes) return error.InvalidGraphMetricSegment;
+    const prefix = try take(block, &pos, prefix_len);
+    decoded.node_prefix = prefix;
     var score_index: usize = 0;
     while (pos < block.len) : (score_index += 1) {
         if (score_index >= ranked_score_block_entries) return error.InvalidGraphMetricSegment;
         if (score_index % 64 == 0) try cancellation.check();
-        const node_len = try readInt(u32, block, &pos);
+        const suffix_len = try readInt(u16, block, &pos);
+        const node_len = prefix.len + suffix_len;
         if (node_len == 0 or node_len > max_score_node_id_bytes) return error.InvalidGraphMetricSegment;
         const value: f64 = @bitCast(try readInt(u64, block, &pos));
-        if (!std.math.isFinite(value)) return error.InvalidGraphMetricSegment;
-        const node_id = try take(block, &pos, node_len);
-        const current = PersistedTopScore{ .node_id = node_id, .value = value };
+        if (!validMetricScore(value)) return error.InvalidGraphMetricSegment;
+        const suffix = try take(block, &pos, suffix_len);
         if (score_index > 0) {
             const previous = decoded.scores[score_index - 1];
-            if (!topScoreRanksBefore(.{ .node_id = previous.node_id, .value = previous.value }, current)) {
+            if (previous.value < value or
+                (previous.value == value and std.mem.order(u8, previous.node_suffix, suffix) != .lt))
+            {
                 return error.InvalidGraphMetricSegment;
             }
         }
-        decoded.scores[score_index] = .{ .node_id = node_id, .value = value };
+        decoded.scores[score_index] = .{ .node_suffix = suffix, .value = value };
     }
     if (score_index == 0) return error.InvalidGraphMetricSegment;
     decoded.len = score_index;
@@ -413,44 +432,32 @@ pub fn scoreFromBlockWithCancellation(block: []const u8, node_id: []const u8, ca
 /// Decodes only provenance and lifecycle metadata from a bounded prefix. Score
 /// vectors and edge filters are deliberately not materialized.
 pub fn decodeHeader(data: []const u8) !Header {
-    if (data.len < fixed_header_len_v1) return error.InvalidGraphMetricSegment;
+    if (data.len < fixed_header_len) return error.InvalidGraphMetricSegment;
     var pos: usize = 0;
     if (!std.mem.eql(u8, try take(data, &pos, 4), wire_magic)) return error.InvalidGraphMetricSegment;
     const version = try readInt(u16, data, &pos);
-    if (version == 0 or version > wire_version) return error.UnsupportedGraphMetricSegmentVersion;
+    if (version != wire_version) return error.UnsupportedGraphMetricSegmentVersion;
     if (pos >= data.len) return error.InvalidGraphMetricSegment;
     const kind = std.enums.fromInt(@import("../../graph/graph.zig").GraphMetricKind, data[pos]) orelse return error.InvalidGraphMetricSegment;
     pos += 1;
-    const materialization_state: types.MaterializationState = if (version >= 2) blk: {
-        if (pos >= data.len) return error.InvalidGraphMetricSegment;
-        const value = std.enums.fromInt(types.MaterializationState, data[pos]) orelse return error.InvalidGraphMetricSegment;
-        pos += 1;
-        break :blk value;
-    } else .ready;
-    const rejection_reason: types.RejectionReason = if (version >= 2) blk: {
-        if (pos >= data.len) return error.InvalidGraphMetricSegment;
-        const value = std.enums.fromInt(types.RejectionReason, data[pos]) orelse return error.InvalidGraphMetricSegment;
-        pos += 1;
-        break :blk value;
-    } else .none;
+    const materialization_state = std.enums.fromInt(types.MaterializationState, data[pos]) orelse return error.InvalidGraphMetricSegment;
+    pos += 1;
+    const rejection_reason = std.enums.fromInt(types.RejectionReason, data[pos]) orelse return error.InvalidGraphMetricSegment;
+    pos += 1;
     const converged_byte = (try take(data, &pos, 1))[0];
     if (converged_byte > 1) return error.InvalidGraphMetricSegment;
     const iterations = try readInt(u32, data, &pos);
     const fingerprint = try readInt(u64, data, &pos);
-    const materializer_fingerprint = if (version >= 3) try readInt(u64, data, &pos) else 0;
+    const materializer_fingerprint = try readInt(u64, data, &pos);
     const delta: f64 = @bitCast(try readInt(u64, data, &pos));
-    if (!std.math.isFinite(delta)) return error.InvalidGraphMetricSegment;
+    if (!validMetricScore(delta)) return error.InvalidGraphMetricSegment;
     switch (materialization_state) {
         .ready => if (rejection_reason != .none) return error.InvalidGraphMetricSegment,
         .rejected => if (rejection_reason == .none or converged_byte != 0 or iterations != 0 or delta != 0) return error.InvalidGraphMetricSegment,
     }
-    const graph_len = try readInt(u32, data, &pos);
-    const metric_len = try readInt(u32, data, &pos);
     const artifact_len = try readInt(u32, data, &pos);
     const checksum_len = try readInt(u32, data, &pos);
     const edge_type_count = try readInt(u32, data, &pos);
-    const graph_index_name = try take(data, &pos, graph_len);
-    const metric_name = try take(data, &pos, metric_len);
     const source_graph_artifact_id = try take(data, &pos, artifact_len);
     const source_graph_checksum = try take(data, &pos, checksum_len);
     return .{
@@ -460,8 +467,6 @@ pub fn decodeHeader(data: []const u8) !Header {
         .rejection_reason = rejection_reason,
         .config_fingerprint = fingerprint,
         .materializer_fingerprint = materializer_fingerprint,
-        .graph_index_name = graph_index_name,
-        .metric_name = metric_name,
         .source_graph_artifact_id = source_graph_artifact_id,
         .source_graph_checksum = source_graph_checksum,
         .converged = converged_byte == 1,
@@ -483,18 +488,21 @@ pub fn encodedSizeWithCancellation(segment: types.Segment, cancellation: Cancell
 fn encodedSizeWithPreparedTopTier(segment: types.Segment, prepared: *const PreparedTopTier, cancellation: CancellationToken) !usize {
     try validateSegmentWithCancellation(segment, cancellation);
     var size: usize = fixed_header_len;
-    size = std.math.add(usize, size, segment.graph_index_name.len) catch return error.GraphMetricSegmentTooLarge;
-    size = std.math.add(usize, size, segment.metric_name.len) catch return error.GraphMetricSegmentTooLarge;
+    // Logical index/metric names live in the manifest reference. Keeping them
+    // out of the content-addressed payload lets aliases and equivalently
+    // configured metrics share one immutable object.
     size = std.math.add(usize, size, segment.source_graph_artifact_id.len) catch return error.GraphMetricSegmentTooLarge;
     size = std.math.add(usize, size, segment.source_graph_checksum.len) catch return error.GraphMetricSegmentTooLarge;
     for (segment.edge_filter.types) |edge_type| {
         size = std.math.add(usize, size, 4 + edge_type.len) catch return error.GraphMetricSegmentTooLarge;
     }
     size = std.math.add(usize, size, @sizeOf(u32)) catch return error.GraphMetricSegmentTooLarge;
-    for (segment.scores, 0..) |score, score_index| {
-        if (score_index % 4096 == 0) try cancellation.check();
-        size = std.math.add(usize, size, 4 + 8) catch return error.GraphMetricSegmentTooLarge;
-        size = std.math.add(usize, size, score.node_id.len) catch return error.GraphMetricSegmentTooLarge;
+    var score_start: usize = 0;
+    while (score_start < segment.scores.len) : (score_start += score_block_entries) {
+        try cancellation.check();
+        const score_end = @min(segment.scores.len, score_start + score_block_entries);
+        size = std.math.add(usize, size, try scoreBlockEncodedSize(segment.scores[score_start..score_end])) catch
+            return error.GraphMetricSegmentTooLarge;
     }
     size = std.math.add(usize, size, prepared.payload_size) catch return error.GraphMetricSegmentTooLarge;
     size = std.math.add(usize, size, try routingEncodedSize(segment.scores, prepared)) catch return error.GraphMetricSegmentTooLarge;
@@ -535,13 +543,9 @@ pub fn encodeAllocWithCancellationAndLimit(
     putInt(u64, data, &pos, segment.config_fingerprint);
     putInt(u64, data, &pos, segment.materializer_fingerprint);
     putInt(u64, data, &pos, @bitCast(segment.delta));
-    putInt(u32, data, &pos, @intCast(segment.graph_index_name.len));
-    putInt(u32, data, &pos, @intCast(segment.metric_name.len));
     putInt(u32, data, &pos, @intCast(segment.source_graph_artifact_id.len));
     putInt(u32, data, &pos, @intCast(segment.source_graph_checksum.len));
     putInt(u32, data, &pos, @intCast(segment.edge_filter.types.len));
-    putBytes(data, &pos, segment.graph_index_name);
-    putBytes(data, &pos, segment.metric_name);
     putBytes(data, &pos, segment.source_graph_artifact_id);
     putBytes(data, &pos, segment.source_graph_checksum);
     for (segment.edge_filter.types) |edge_type| {
@@ -550,11 +554,20 @@ pub fn encodeAllocWithCancellationAndLimit(
     }
     putInt(u32, data, &pos, @intCast(segment.scores.len));
     const score_data_offset = pos;
-    for (segment.scores, 0..) |score, score_index| {
-        if (score_index % 4096 == 0) try cancellation.check();
-        putInt(u32, data, &pos, @intCast(score.node_id.len));
-        putInt(u64, data, &pos, @bitCast(score.value));
-        putBytes(data, &pos, score.node_id);
+    var primary_start: usize = 0;
+    while (primary_start < segment.scores.len) : (primary_start += score_block_entries) {
+        try cancellation.check();
+        const primary_end = @min(segment.scores.len, primary_start + score_block_entries);
+        const block_scores = segment.scores[primary_start..primary_end];
+        const prefix_len = scoreBlockPrefixLen(block_scores);
+        putInt(u16, data, &pos, @intCast(prefix_len));
+        putBytes(data, &pos, block_scores[0].node_id[0..prefix_len]);
+        for (block_scores) |score| {
+            const suffix = score.node_id[prefix_len..];
+            putInt(u16, data, &pos, @intCast(suffix.len));
+            putInt(u64, data, &pos, @bitCast(score.value));
+            putBytes(data, &pos, suffix);
+        }
     }
     const score_data_end = pos;
     var ranked_entries: [max_ranked_score_blocks]RankedRoutingEntry = undefined;
@@ -564,11 +577,16 @@ pub fn encodeAllocWithCancellationAndLimit(
         const ranked_start = ranked_block_index * ranked_score_block_entries;
         const ranked_end = @min(prepared.count, ranked_start + ranked_score_block_entries);
         const block_offset = pos;
-        for (prepared.indexes[ranked_start..ranked_end]) |top_index| {
+        const block_indexes = prepared.indexes[ranked_start..ranked_end];
+        const prefix_len = rankedBlockPrefixLen(segment.scores, block_indexes);
+        putInt(u16, data, &pos, @intCast(prefix_len));
+        putBytes(data, &pos, segment.scores[block_indexes[0]].node_id[0..prefix_len]);
+        for (block_indexes) |top_index| {
             const score = segment.scores[top_index];
-            putInt(u32, data, &pos, @intCast(score.node_id.len));
+            const suffix = score.node_id[prefix_len..];
+            putInt(u16, data, &pos, @intCast(suffix.len));
             putInt(u64, data, &pos, @bitCast(score.value));
-            putBytes(data, &pos, score.node_id);
+            putBytes(data, &pos, suffix);
         }
         const block_len = pos - block_offset;
         var block_checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -589,10 +607,7 @@ pub fn encodeAllocWithCancellationAndLimit(
     while (score_index < segment.scores.len) : (score_index += score_block_entries) {
         try cancellation.check();
         const block_end = @min(segment.scores.len, score_index + score_block_entries);
-        var block_len: usize = 0;
-        for (segment.scores[score_index..block_end]) |score| {
-            block_len = std.math.add(usize, block_len, 12 + score.node_id.len) catch return error.GraphMetricSegmentTooLarge;
-        }
+        const block_len = try scoreBlockEncodedSize(segment.scores[score_index..block_end]);
         const first_node_id = segment.scores[score_index].node_id;
         putInt(u32, data, &pos, @intCast(first_node_id.len));
         putInt(u64, data, &pos, @intCast(block_offset));
@@ -649,48 +664,30 @@ pub fn decodeAllocWithLimitsAndCancellation(
 }
 
 fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decode.Budget, cancellation: CancellationToken) !types.Segment {
-    if (data.len < fixed_header_len_v1 + 4) return error.InvalidGraphMetricSegment;
+    if (data.len < fixed_header_len + @sizeOf(u32)) return error.InvalidGraphMetricSegment;
     var pos: usize = 0;
     if (!std.mem.eql(u8, take(data, &pos, 4) catch return error.InvalidGraphMetricSegment, wire_magic)) return error.InvalidGraphMetricSegment;
     const version = readInt(u16, data, &pos) catch return error.InvalidGraphMetricSegment;
-    if (version == 0 or version > wire_version) return error.UnsupportedGraphMetricSegmentVersion;
+    if (version != wire_version) return error.UnsupportedGraphMetricSegmentVersion;
     const kind = std.enums.fromInt(@import("../../graph/graph.zig").GraphMetricKind, data[pos]) orelse return error.InvalidGraphMetricSegment;
     pos += 1;
-    const materialization_state: types.MaterializationState = if (version >= 2) blk: {
-        if (pos >= data.len) return error.InvalidGraphMetricSegment;
-        const value = std.enums.fromInt(types.MaterializationState, data[pos]) orelse return error.InvalidGraphMetricSegment;
-        pos += 1;
-        break :blk value;
-    } else .ready;
-    const rejection_reason: types.RejectionReason = if (version >= 2) blk: {
-        if (pos >= data.len) return error.InvalidGraphMetricSegment;
-        const value = std.enums.fromInt(types.RejectionReason, data[pos]) orelse return error.InvalidGraphMetricSegment;
-        pos += 1;
-        break :blk value;
-    } else .none;
+    const materialization_state = std.enums.fromInt(types.MaterializationState, data[pos]) orelse return error.InvalidGraphMetricSegment;
+    pos += 1;
+    const rejection_reason = std.enums.fromInt(types.RejectionReason, data[pos]) orelse return error.InvalidGraphMetricSegment;
+    pos += 1;
     const converged_byte = data[pos];
     pos += 1;
     if (converged_byte > 1) return error.InvalidGraphMetricSegment;
     const iterations = readInt(u32, data, &pos) catch return error.InvalidGraphMetricSegment;
     const fingerprint = readInt(u64, data, &pos) catch return error.InvalidGraphMetricSegment;
-    const materializer_fingerprint = if (version >= 3)
-        readInt(u64, data, &pos) catch return error.InvalidGraphMetricSegment
-    else
-        0;
+    const materializer_fingerprint = readInt(u64, data, &pos) catch return error.InvalidGraphMetricSegment;
     const delta: f64 = @bitCast(readInt(u64, data, &pos) catch return error.InvalidGraphMetricSegment);
-    if (!std.math.isFinite(delta)) return error.InvalidGraphMetricSegment;
-    const graph_len = readInt(u32, data, &pos) catch return error.InvalidGraphMetricSegment;
-    const metric_len = readInt(u32, data, &pos) catch return error.InvalidGraphMetricSegment;
+    if (!validMetricScore(delta)) return error.InvalidGraphMetricSegment;
     const artifact_len = readInt(u32, data, &pos) catch return error.InvalidGraphMetricSegment;
     const checksum_len = readInt(u32, data, &pos) catch return error.InvalidGraphMetricSegment;
     const edge_type_count = readInt(u32, data, &pos) catch return error.InvalidGraphMetricSegment;
-    const names_len = std.math.add(usize, graph_len, metric_len) catch return error.InvalidGraphMetricSegment;
     const identity_len = std.math.add(usize, artifact_len, checksum_len) catch return error.InvalidGraphMetricSegment;
-    try budget.admitBytes(std.math.add(usize, names_len, identity_len) catch return error.InvalidGraphMetricSegment);
-    const graph_name = try dupeTake(alloc, data, &pos, graph_len);
-    errdefer alloc.free(graph_name);
-    const metric_name = try dupeTake(alloc, data, &pos, metric_len);
-    errdefer alloc.free(metric_name);
+    try budget.admitBytes(identity_len);
     const artifact_id = try dupeTake(alloc, data, &pos, artifact_len);
     errdefer alloc.free(artifact_id);
     const checksum = try dupeTake(alloc, data, &pos, checksum_len);
@@ -708,24 +705,35 @@ fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decod
         initialized_edge_types += 1;
     }
     const score_count = readInt(u32, data, &pos) catch return error.InvalidGraphMetricSegment;
-    _ = try budget.admitCount(types.Score, score_count, data.len - pos, 12);
+    _ = try budget.admitCount(types.Score, score_count, data.len - pos, ranked_score_fixed_len);
     const scores = try alloc.alloc(types.Score, score_count);
     errdefer alloc.free(scores);
     var initialized: usize = 0;
     errdefer for (scores[0..initialized]) |*score| score.deinit(alloc);
+    var block_prefix: []const u8 = &.{};
     for (scores, 0..) |*score, score_index| {
         if (score_index % 4096 == 0) try cancellation.check();
-        const node_len = readInt(u32, data, &pos) catch return error.InvalidGraphMetricSegment;
+        if (score_index % score_block_entries == 0) {
+            const prefix_len = readInt(u16, data, &pos) catch return error.InvalidGraphMetricSegment;
+            if (prefix_len > max_score_node_id_bytes) return error.InvalidGraphMetricSegment;
+            block_prefix = take(data, &pos, prefix_len) catch return error.InvalidGraphMetricSegment;
+        }
+        const suffix_len = readInt(u16, data, &pos) catch return error.InvalidGraphMetricSegment;
+        const node_len = std.math.add(usize, block_prefix.len, suffix_len) catch return error.InvalidGraphMetricSegment;
+        if (node_len == 0 or node_len > max_score_node_id_bytes) return error.InvalidGraphMetricSegment;
         const value: f64 = @bitCast(readInt(u64, data, &pos) catch return error.InvalidGraphMetricSegment);
-        if (!std.math.isFinite(value)) return error.InvalidGraphMetricSegment;
+        if (!validMetricScore(value)) return error.InvalidGraphMetricSegment;
         try budget.admitBytes(node_len);
-        score.* = .{ .node_id = try dupeTake(alloc, data, &pos, node_len), .value = value };
+        const suffix = take(data, &pos, suffix_len) catch return error.InvalidGraphMetricSegment;
+        const node_id = try alloc.alloc(u8, node_len);
+        errdefer alloc.free(node_id);
+        @memcpy(node_id[0..block_prefix.len], block_prefix);
+        @memcpy(node_id[block_prefix.len..], suffix);
+        score.* = .{ .node_id = node_id, .value = value };
         initialized += 1;
     }
-    if (version >= 4) {
-        try validateRoutingFooter(data, pos, scores, version, cancellation);
-    } else if (pos != data.len) return error.InvalidGraphMetricSegment;
-    var segment = types.Segment{ .metadata_version = version, .graph_index_name = graph_name, .metric_name = metric_name, .kind = kind, .source_graph_artifact_id = artifact_id, .source_graph_checksum = checksum, .config_fingerprint = fingerprint, .materializer_fingerprint = materializer_fingerprint, .materialization_state = materialization_state, .rejection_reason = rejection_reason, .edge_filter = .{ .mode = if (edge_type_count == 0) .all else .types, .types = edge_types }, .converged = converged_byte == 1, .iterations_completed = iterations, .delta = delta, .scores = scores };
+    try validateRoutingFooter(data, pos, scores, cancellation);
+    var segment = types.Segment{ .metadata_version = version, .kind = kind, .source_graph_artifact_id = artifact_id, .source_graph_checksum = checksum, .config_fingerprint = fingerprint, .materializer_fingerprint = materializer_fingerprint, .materialization_state = materialization_state, .rejection_reason = rejection_reason, .edge_filter = .{ .mode = if (edge_type_count == 0) .all else .types, .types = edge_types }, .converged = converged_byte == 1, .iterations_completed = iterations, .delta = delta, .scores = scores };
     errdefer segment.deinit(alloc);
     try validateSegmentWithCancellation(segment, cancellation);
     return segment;
@@ -737,13 +745,11 @@ fn validateSegment(segment: types.Segment) !void {
 
 fn validateSegmentWithCancellation(segment: types.Segment, cancellation: CancellationToken) !void {
     try cancellation.check();
-    if (segment.graph_index_name.len == 0 or segment.metric_name.len == 0 or segment.source_graph_artifact_id.len == 0 or segment.source_graph_checksum.len == 0) return error.InvalidGraphMetricSegment;
-    _ = std.math.cast(u32, segment.graph_index_name.len) orelse return error.GraphMetricSegmentTooLarge;
-    _ = std.math.cast(u32, segment.metric_name.len) orelse return error.GraphMetricSegmentTooLarge;
+    if (segment.source_graph_artifact_id.len == 0 or segment.source_graph_checksum.len == 0) return error.InvalidGraphMetricSegment;
     _ = std.math.cast(u32, segment.source_graph_artifact_id.len) orelse return error.GraphMetricSegmentTooLarge;
     _ = std.math.cast(u32, segment.source_graph_checksum.len) orelse return error.GraphMetricSegmentTooLarge;
     _ = std.math.cast(u32, segment.scores.len) orelse return error.GraphMetricSegmentTooLarge;
-    if (!std.math.isFinite(segment.delta)) return error.InvalidGraphMetricSegment;
+    if (!validMetricScore(segment.delta)) return error.InvalidGraphMetricSegment;
     switch (segment.materialization_state) {
         .ready => if (segment.rejection_reason != .none) return error.InvalidGraphMetricSegment,
         .rejected => {
@@ -758,16 +764,12 @@ fn validateSegmentWithCancellation(segment: types.Segment, cancellation: Cancell
     }
     for (segment.scores, 0..) |score, i| {
         if (i % 4096 == 0) try cancellation.check();
-        if (score.node_id.len == 0 or !std.math.isFinite(score.value)) return error.InvalidGraphMetricSegment;
+        if (score.node_id.len == 0 or !validMetricScore(score.value)) return error.InvalidGraphMetricSegment;
         if (score.node_id.len > max_score_node_id_bytes) return error.GraphMetricSegmentTooLarge;
         _ = std.math.cast(u32, score.node_id.len) orelse return error.GraphMetricSegmentTooLarge;
         if (i > 0 and std.mem.order(u8, segment.scores[i - 1].node_id, score.node_id) != .lt) return error.InvalidGraphMetricSegment;
     }
     try cancellation.check();
-}
-
-fn fixedHeaderLenForVersion(version: u16) usize {
-    return if (version == 1) fixed_header_len_v1 else if (version == 2) fixed_header_len_v2 else fixed_header_len;
 }
 
 fn scoreBlockCount(score_count: usize) usize {
@@ -776,6 +778,58 @@ fn scoreBlockCount(score_count: usize) usize {
 
 fn scoreBlockCountForSize(score_count: usize, block_entries: usize) usize {
     return score_count / block_entries + @intFromBool(score_count % block_entries != 0);
+}
+
+fn commonPrefixLen(left: []const u8, right: []const u8) usize {
+    const end = @min(left.len, right.len);
+    var index: usize = 0;
+    while (index < end and left[index] == right[index]) : (index += 1) {}
+    return index;
+}
+
+fn validMetricScore(value: f64) bool {
+    // Reject negative zero as well as negative/NaN/infinite values. This keeps
+    // canonical encodings unique and makes unsigned IEEE-754 radix order match
+    // numeric order exactly.
+    const bits: u64 = @bitCast(value);
+    return std.math.isFinite(value) and bits & (@as(u64, 1) << 63) == 0;
+}
+
+fn scoreBlockPrefixLen(scores: []const types.Score) usize {
+    if (scores.len == 0) return 0;
+    // Primary blocks are node-sorted, so the first/last common prefix is the
+    // prefix shared by the complete block.
+    return commonPrefixLen(scores[0].node_id, scores[scores.len - 1].node_id);
+}
+
+fn rankedBlockPrefixLen(scores: []const types.Score, indexes: []const usize) usize {
+    if (indexes.len == 0) return 0;
+    var prefix_len = scores[indexes[0]].node_id.len;
+    for (indexes[1..]) |index| {
+        prefix_len = @min(prefix_len, commonPrefixLen(scores[indexes[0]].node_id[0..prefix_len], scores[index].node_id));
+        if (prefix_len == 0) break;
+    }
+    return prefix_len;
+}
+
+fn scoreBlockEncodedSize(scores: []const types.Score) !usize {
+    const prefix_len = scoreBlockPrefixLen(scores);
+    var size = std.math.add(usize, @sizeOf(u16), prefix_len) catch return error.GraphMetricSegmentTooLarge;
+    for (scores) |score| {
+        size = std.math.add(usize, size, ranked_score_fixed_len + score.node_id.len - prefix_len) catch
+            return error.GraphMetricSegmentTooLarge;
+    }
+    return size;
+}
+
+fn rankedBlockEncodedSize(scores: []const types.Score, indexes: []const usize) !usize {
+    const prefix_len = rankedBlockPrefixLen(scores, indexes);
+    var size = std.math.add(usize, @sizeOf(u16), prefix_len) catch return error.GraphMetricSegmentTooLarge;
+    for (indexes) |index| {
+        size = std.math.add(usize, size, ranked_score_fixed_len + scores[index].node_id.len - prefix_len) catch
+            return error.GraphMetricSegmentTooLarge;
+    }
+    return size;
 }
 
 fn topScoreRanksBefore(a: PersistedTopScore, b: PersistedTopScore) bool {
@@ -820,6 +874,11 @@ fn selectTopScoreIndexes(
     cancellation: CancellationToken,
 ) ![]usize {
     const target = @min(scores.len, max_persisted_top_entries);
+    // Express the ratio without multiplication so this admission check stays
+    // overflow-safe if the persisted tier limit becomes configurable later.
+    if (target >= 512 and scores.len > target and scores.len - target > target) {
+        return try selectTopScoreIndexesRadix(scores, storage, target, cancellation);
+    }
     var heap_len: usize = 0;
     for (scores, 0..) |_, score_index| {
         if (score_index % 4096 == 0) try cancellation.check();
@@ -842,6 +901,66 @@ fn selectTopScoreIndexes(
     return storage[0..heap_len];
 }
 
+fn scoreIndexLessThan(scores: []const types.Score, left: usize, right: usize) bool {
+    return scoreIndexRanksBefore(scores, left, right);
+}
+
+/// Select a large persisted prefix by IEEE-754 radix instead of paying
+/// O(N log K) heap comparisons. Graph metric scores are finite and
+/// non-negative, so their bit representation preserves numeric ordering.
+/// Equal-score membership remains deterministic because the input vector is
+/// node-sorted and the final K indexes use the canonical score/node ordering.
+fn selectTopScoreIndexesRadix(
+    scores: []const types.Score,
+    storage: *[max_persisted_top_entries]usize,
+    target: usize,
+    cancellation: CancellationToken,
+) ![]usize {
+    std.debug.assert(target > 0 and target <= storage.len and target < scores.len);
+    var prefix: u64 = 0;
+    var prefix_mask: u64 = 0;
+    var rank = target - 1;
+    for (0..8) |pass| {
+        var counts: [256]usize = @splat(0);
+        const shift: u6 = @intCast(56 - pass * 8);
+        for (scores, 0..) |score, score_index| {
+            if (score_index % 4096 == 0) try cancellation.check();
+            const bits: u64 = @bitCast(score.value);
+            if (bits & prefix_mask != prefix) continue;
+            counts[@as(u8, @truncate(bits >> shift))] += 1;
+        }
+        var bucket: usize = counts.len;
+        while (bucket > 0) {
+            bucket -= 1;
+            if (rank < counts[bucket]) break;
+            rank -= counts[bucket];
+        }
+        prefix |= @as(u64, @intCast(bucket)) << shift;
+        prefix_mask |= @as(u64, 0xff) << shift;
+    }
+    const threshold: f64 = @bitCast(prefix);
+    var selected: usize = 0;
+    for (scores, 0..) |score, score_index| {
+        if (score_index % 4096 == 0) try cancellation.check();
+        if (score.value > threshold) {
+            if (selected >= target) return error.InvalidGraphMetricSegment;
+            storage[selected] = score_index;
+            selected += 1;
+        }
+    }
+    for (scores, 0..) |score, score_index| {
+        if (selected == target) break;
+        if (score_index % 4096 == 0) try cancellation.check();
+        if (score.value == threshold) {
+            storage[selected] = score_index;
+            selected += 1;
+        }
+    }
+    if (selected != target) return error.InvalidGraphMetricSegment;
+    std.mem.sort(usize, storage[0..selected], scores, scoreIndexLessThan);
+    return storage[0..selected];
+}
+
 const PreparedTopTier = struct {
     indexes: [max_persisted_top_entries]usize = undefined,
     count: usize = 0,
@@ -856,10 +975,15 @@ fn prepareTopTier(scores: []const types.Score, cancellation: CancellationToken) 
     var prepared = PreparedTopTier{};
     const selected = try selectTopScoreIndexes(scores, &prepared.indexes, cancellation);
     prepared.count = selected.len;
-    for (selected, 0..) |score_index, index| {
-        if (index % 256 == 0) try cancellation.check();
-        prepared.payload_size = std.math.add(usize, prepared.payload_size, ranked_score_fixed_len) catch return error.GraphMetricSegmentTooLarge;
-        prepared.payload_size = std.math.add(usize, prepared.payload_size, scores[score_index].node_id.len) catch return error.GraphMetricSegmentTooLarge;
+    var ranked_start: usize = 0;
+    while (ranked_start < selected.len) : (ranked_start += ranked_score_block_entries) {
+        try cancellation.check();
+        const ranked_end = @min(selected.len, ranked_start + ranked_score_block_entries);
+        prepared.payload_size = std.math.add(
+            usize,
+            prepared.payload_size,
+            try rankedBlockEncodedSize(scores, selected[ranked_start..ranked_end]),
+        ) catch return error.GraphMetricSegmentTooLarge;
     }
     return prepared;
 }
@@ -876,7 +1000,7 @@ fn routingEncodedSize(scores: []const types.Score, prepared: *const PreparedTopT
     return size;
 }
 
-fn validateRoutingFooter(data: []const u8, score_data_end: usize, scores: []const types.Score, version: u16, cancellation: CancellationToken) !void {
+fn validateRoutingFooter(data: []const u8, score_data_end: usize, scores: []const types.Score, cancellation: CancellationToken) !void {
     try cancellation.check();
     if (score_data_end > data.len or data.len < routing_trailer_len) return error.InvalidGraphMetricSegment;
     const footer_len = try routingFooterLenFromTrailer(data.len, data[data.len - routing_trailer_len ..]);
@@ -891,44 +1015,34 @@ fn validateRoutingFooter(data: []const u8, score_data_end: usize, scores: []cons
         try cancellation.check();
         const score_start = block_index * score_block_entries;
         const score_end = @min(scores.len, score_start + score_block_entries);
-        var block_len: usize = 0;
-        for (scores[score_start..score_end], 0..) |score, block_score_index| {
-            if (block_score_index % 256 == 0) try cancellation.check();
-            block_len = std.math.add(usize, block_len, 12 + score.node_id.len) catch return error.InvalidGraphMetricSegment;
-        }
+        const block_len = try scoreBlockEncodedSize(scores[score_start..score_end]);
         expected_offset -= block_len;
     }
     for (0..scoreBlockCount(scores.len)) |block_index| {
         try cancellation.check();
         const score_start = block_index * score_block_entries;
         const score_end = @min(scores.len, score_start + score_block_entries);
-        var block_len: usize = 0;
-        for (scores[score_start..score_end], 0..) |score, block_score_index| {
-            if (block_score_index % 256 == 0) try cancellation.check();
-            block_len += 12 + score.node_id.len;
-        }
+        const block_len = try scoreBlockEncodedSize(scores[score_start..score_end]);
         const first_len = try readInt(u32, footer, &pos);
         const offset = try readInt(u64, footer, &pos);
         const encoded_block_len = try readInt(u32, footer, &pos);
-        var encoded_checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @splat(0);
-        if (version >= 5) @memcpy(&encoded_checksum, try take(footer, &pos, encoded_checksum.len));
+        var encoded_checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        @memcpy(&encoded_checksum, try take(footer, &pos, encoded_checksum.len));
         const first = try take(footer, &pos, first_len);
         if (!std.mem.eql(u8, first, scores[score_start].node_id) or
             offset != expected_offset or encoded_block_len != block_len)
         {
             return error.InvalidGraphMetricSegment;
         }
-        if (version >= 5) {
-            var actual_checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-            const block_offset = std.math.cast(usize, offset) orelse return error.InvalidGraphMetricSegment;
-            if (block_offset > data.len or block_len > data.len - block_offset) return error.InvalidGraphMetricSegment;
-            std.crypto.hash.sha2.Sha256.hash(data[block_offset..][0..block_len], &actual_checksum, .{});
-            if (!std.mem.eql(u8, &actual_checksum, &encoded_checksum)) return error.InvalidGraphMetricSegment;
-        }
+        var actual_checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        const block_offset = std.math.cast(usize, offset) orelse return error.InvalidGraphMetricSegment;
+        if (block_offset > data.len or block_len > data.len - block_offset) return error.InvalidGraphMetricSegment;
+        std.crypto.hash.sha2.Sha256.hash(data[block_offset..][0..block_len], &actual_checksum, .{});
+        if (!std.mem.eql(u8, &actual_checksum, &encoded_checksum)) return error.InvalidGraphMetricSegment;
         expected_offset += block_len;
     }
     if (expected_offset != score_data_end) return error.InvalidGraphMetricSegment;
-    if (version >= 6) {
+    {
         if (!std.mem.eql(u8, try take(footer, &pos, top_tier_magic.len), top_tier_magic)) return error.InvalidGraphMetricSegment;
         var top_storage: [max_persisted_top_entries]usize = undefined;
         const expected_top = try selectTopScoreIndexes(scores, &top_storage, cancellation);
@@ -955,18 +1069,65 @@ fn validateRoutingFooter(data: []const u8, score_data_end: usize, scores: []cons
             if (decoded.len != ranked_end - ranked_start) return error.InvalidGraphMetricSegment;
             for (decoded.scores[0..decoded.len], expected_top[ranked_start..ranked_end]) |actual, score_index| {
                 const expected = scores[score_index];
-                if (!std.mem.eql(u8, actual.node_id, expected.node_id) or @as(u64, @bitCast(actual.value)) != @as(u64, @bitCast(expected.value))) {
+                if (!actual.eqlNode(decoded.node_prefix, expected.node_id) or @as(u64, @bitCast(actual.value)) != @as(u64, @bitCast(expected.value))) {
                     return error.InvalidGraphMetricSegment;
                 }
             }
             ranked_offset = std.math.add(usize, block_offset, block_len) catch return error.InvalidGraphMetricSegment;
         }
         if (ranked_offset != footer_offset) return error.InvalidGraphMetricSegment;
-    } else if (score_data_end != footer_offset) {
-        return error.InvalidGraphMetricSegment;
     }
     if (pos + routing_trailer_len != footer.len) return error.InvalidGraphMetricSegment;
     try cancellation.check();
+}
+
+test "serverless graph metric large top tier uses exact radix selection" {
+    const alloc = std.testing.allocator;
+    const score_count = max_persisted_top_entries * 2 + 1;
+    const scores = try alloc.alloc(types.Score, score_count);
+    defer alloc.free(scores);
+    for (scores, 0..) |*score, index| score.* = .{
+        .node_id = @constCast("node"),
+        .value = @floatFromInt(index),
+    };
+    var storage: [max_persisted_top_entries]usize = undefined;
+    const selected = try selectTopScoreIndexes(scores, &storage, .none);
+    try std.testing.expectEqual(max_persisted_top_entries, selected.len);
+    try std.testing.expectEqual(score_count - 1, selected[0]);
+    try std.testing.expectEqual(score_count - max_persisted_top_entries, selected[selected.len - 1]);
+}
+
+test "serverless graph metric score blocks compress shared node prefixes" {
+    const scores = [_]types.Score{
+        .{ .node_id = @constCast("tenant:west:node:0001"), .value = 1 },
+        .{ .node_id = @constCast("tenant:west:node:0002"), .value = 2 },
+        .{ .node_id = @constCast("tenant:west:node:0003"), .value = 3 },
+    };
+    var uncompressed_size: usize = 0;
+    for (scores) |score| uncompressed_size += @sizeOf(u32) + @sizeOf(u64) + score.node_id.len;
+    try std.testing.expect(try scoreBlockEncodedSize(&scores) < uncompressed_size);
+}
+
+test "serverless graph metric canonical scores reject negative zero" {
+    const scores = [_]types.Score{.{ .node_id = @constCast("node"), .value = -0.0 }};
+    const segment = types.Segment{
+        .kind = .pagerank,
+        .source_graph_artifact_id = @constCast("sha256:graph"),
+        .source_graph_checksum = @constCast("sha256:sum"),
+        .config_fingerprint = 1,
+        .edge_filter = .{},
+        .converged = true,
+        .iterations_completed = 1,
+        .delta = 0,
+        .scores = @constCast(&scores),
+    };
+    try std.testing.expectError(error.InvalidGraphMetricSegment, encodedSize(segment));
+
+    const valid_scores = [_]types.Score{.{ .node_id = @constCast("node"), .value = 0.0 }};
+    var noncanonical_delta = segment;
+    noncanonical_delta.scores = @constCast(&valid_scores);
+    noncanonical_delta.delta = -0.0;
+    try std.testing.expectError(error.InvalidGraphMetricSegment, encodedSize(noncanonical_delta));
 }
 
 fn putBytes(data: []u8, pos: *usize, value: []const u8) void {
@@ -998,23 +1159,22 @@ test "serverless graph metric segment round trips with binary-search lookup" {
     var scores = try alloc.alloc(types.Score, 2);
     scores[0] = .{ .node_id = try alloc.dupe(u8, "a"), .value = 0.25 };
     scores[1] = .{ .node_id = try alloc.dupe(u8, "b"), .value = 0.75 };
-    var segment = types.Segment{ .graph_index_name = try alloc.dupe(u8, "graph"), .metric_name = try alloc.dupe(u8, "pagerank"), .kind = .pagerank, .source_graph_artifact_id = try alloc.dupe(u8, "sha256:graph"), .source_graph_checksum = try alloc.dupe(u8, "sha256:sum"), .config_fingerprint = 42, .edge_filter = .{}, .converged = true, .iterations_completed = 12, .delta = 0.00001, .scores = scores };
+    var segment = types.Segment{ .kind = .pagerank, .source_graph_artifact_id = try alloc.dupe(u8, "sha256:graph"), .source_graph_checksum = try alloc.dupe(u8, "sha256:sum"), .config_fingerprint = 42, .edge_filter = .{}, .converged = true, .iterations_completed = 12, .delta = 0.00001, .scores = scores };
     defer segment.deinit(alloc);
     const encoded = try encodeAlloc(alloc, segment);
     defer alloc.free(encoded);
     const header_len = try headerProbeLen(
         encoded.len,
-        segment.graph_index_name,
-        segment.metric_name,
         segment.source_graph_artifact_id,
         segment.source_graph_checksum,
     );
     try std.testing.expectEqual(
-        fixed_header_len + segment.graph_index_name.len + segment.metric_name.len + segment.source_graph_artifact_id.len + segment.source_graph_checksum.len,
+        fixed_header_len + segment.source_graph_artifact_id.len + segment.source_graph_checksum.len,
         header_len,
     );
     const header = try decodeHeader(encoded[0..header_len]);
-    try std.testing.expectEqualStrings(segment.metric_name, header.metric_name);
+    try std.testing.expectEqual(graph_mod.GraphMetricKind.pagerank, header.kind);
+    try std.testing.expectEqualStrings(segment.source_graph_artifact_id, header.source_graph_artifact_id);
     var decoded = try decodeAlloc(alloc, encoded);
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(@as(?f64, 0.75), decoded.score("b"));
@@ -1038,8 +1198,6 @@ test "serverless graph metric routing resolves exact scores without decoding the
         initialized += 1;
     }
     var segment = types.Segment{
-        .graph_index_name = try alloc.dupe(u8, "graph"),
-        .metric_name = try alloc.dupe(u8, "pagerank"),
         .kind = .pagerank,
         .source_graph_artifact_id = try alloc.dupe(u8, "sha256:graph"),
         .source_graph_checksum = try alloc.dupe(u8, "sha256:sum"),
@@ -1054,7 +1212,7 @@ test "serverless graph metric routing resolves exact scores without decoding the
     defer segment.deinit(alloc);
     const encoded = try encodeAlloc(alloc, segment);
     defer alloc.free(encoded);
-    const control_len = try controlProbeLen(encoded.len, "graph", "pagerank", "sha256:graph", "sha256:sum", .{});
+    const control_len = try controlProbeLen(encoded.len, "sha256:graph", "sha256:sum", .{});
     const control = try decodeControl(encoded[0..control_len], .{});
     try std.testing.expectEqual(@as(u32, score_block_entries + 1), control.score_count);
 
@@ -1071,9 +1229,9 @@ test "serverless graph metric routing resolves exact scores without decoding the
         .none,
     );
     try std.testing.expectEqual(@as(usize, ranked_score_block_entries), first_ranked.len);
-    try std.testing.expectEqualStrings("node:1024", first_ranked.scores[0].node_id);
+    try std.testing.expect(first_ranked.scores[0].eqlNode(first_ranked.node_prefix, "node:1024"));
     try std.testing.expectEqual(@as(f64, 1024), first_ranked.scores[0].value);
-    try std.testing.expectEqualStrings("node:0769", first_ranked.scores[first_ranked.len - 1].node_id);
+    try std.testing.expect(first_ranked.scores[first_ranked.len - 1].eqlNode(first_ranked.node_prefix, "node:0769"));
     try std.testing.expectEqual(control.score_data_offset, routing.entries[0].offset);
     const entry = routing.find("node:1024").?;
     try std.testing.expectEqual(@as(?f64, 1024), try scoreFromBlockWithCancellation(
@@ -1101,8 +1259,6 @@ test "serverless graph metric routing resolves exact scores without decoding the
 test "serverless graph metric segment round trips terminal materialization rejection" {
     const alloc = std.testing.allocator;
     var segment = types.Segment{
-        .graph_index_name = try alloc.dupe(u8, "graph"),
-        .metric_name = try alloc.dupe(u8, "pagerank"),
         .kind = .pagerank,
         .source_graph_artifact_id = try alloc.dupe(u8, "sha256:graph"),
         .source_graph_checksum = try alloc.dupe(u8, "sha256:sum"),
@@ -1125,11 +1281,9 @@ test "serverless graph metric segment round trips terminal materialization rejec
     try std.testing.expectEqual(@as(usize, 0), decoded.scores.len);
 }
 
-test "serverless graph metric segment decodes version one artifacts as ready" {
+test "serverless graph metric segment rejects unpublished legacy wire versions" {
     const alloc = std.testing.allocator;
     var segment = types.Segment{
-        .graph_index_name = try alloc.dupe(u8, "graph"),
-        .metric_name = try alloc.dupe(u8, "degree"),
         .kind = .degree,
         .source_graph_artifact_id = try alloc.dupe(u8, "sha256:graph"),
         .source_graph_checksum = try alloc.dupe(u8, "sha256:sum"),
@@ -1141,35 +1295,23 @@ test "serverless graph metric segment decodes version one artifacts as ready" {
         .scores = try alloc.alloc(types.Score, 0),
     };
     defer segment.deinit(alloc);
-    const version_four = try encodeAlloc(alloc, segment);
-    defer alloc.free(version_four);
-    const footer_len = try routingFooterLenFromTrailer(version_four.len, version_four[version_four.len - routing_trailer_len ..]);
-    const version_three = try alloc.dupe(u8, version_four[0 .. version_four.len - footer_len]);
-    defer alloc.free(version_three);
-    std.mem.writeInt(u16, version_three[4..6], 3, .little);
-    const version_one = try alloc.alloc(u8, version_three.len - 10);
+    const current = try encodeAlloc(alloc, segment);
+    defer alloc.free(current);
+    const version_one = try alloc.dupe(u8, current);
     defer alloc.free(version_one);
-    @memcpy(version_one[0..7], version_three[0..7]);
-    @memcpy(version_one[7..20], version_three[9..22]);
-    @memcpy(version_one[20..], version_three[30..]);
     std.mem.writeInt(u16, version_one[4..6], 1, .little);
+    try std.testing.expectError(error.UnsupportedGraphMetricSegmentVersion, decodeHeader(version_one));
+    try std.testing.expectError(error.UnsupportedGraphMetricSegmentVersion, decodeAlloc(alloc, version_one));
 
-    const header = try decodeHeader(version_one);
-    try std.testing.expectEqual(types.MaterializationState.ready, header.materialization_state);
-    try std.testing.expectEqual(types.RejectionReason.none, header.rejection_reason);
-    var decoded = try decodeAlloc(alloc, version_one);
-    defer decoded.deinit(alloc);
-    try std.testing.expectEqual(types.MaterializationState.ready, decoded.materialization_state);
-    try std.testing.expectEqual(types.RejectionReason.none, decoded.rejection_reason);
-    try std.testing.expectEqual(@as(u64, 0), decoded.materializer_fingerprint);
+    const version_six = try alloc.dupe(u8, current);
+    defer alloc.free(version_six);
+    std.mem.writeInt(u16, version_six[4..6], 6, .little);
+    try std.testing.expectError(error.UnsupportedGraphMetricSegmentVersion, decodeHeader(version_six));
+    try std.testing.expectError(error.UnsupportedGraphMetricSegmentVersion, decodeAlloc(alloc, version_six));
 
-    const version_two = try alloc.alloc(u8, version_three.len - 8);
-    defer alloc.free(version_two);
-    @memcpy(version_two[0..22], version_three[0..22]);
-    @memcpy(version_two[22..], version_three[30..]);
-    std.mem.writeInt(u16, version_two[4..6], 2, .little);
-    var decoded_v2 = try decodeAlloc(alloc, version_two);
-    defer decoded_v2.deinit(alloc);
-    try std.testing.expectEqual(types.MaterializationState.ready, decoded_v2.materialization_state);
-    try std.testing.expectEqual(@as(u64, 0), decoded_v2.materializer_fingerprint);
+    const future = try alloc.dupe(u8, current);
+    defer alloc.free(future);
+    std.mem.writeInt(u16, future[4..6], wire_version + 1, .little);
+    try std.testing.expectError(error.UnsupportedGraphMetricSegmentVersion, decodeHeader(future));
+    try std.testing.expectError(error.UnsupportedGraphMetricSegmentVersion, decodeAlloc(alloc, future));
 }

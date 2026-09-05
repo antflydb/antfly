@@ -131,8 +131,17 @@ pub const PreparedGraphArtifact = struct {
     source_checksum: []u8,
     source_byte_len: u64,
     topology: CompiledTopology,
+    /// Bounded, request-scoped projection reuse. Publication visits graph
+    /// aliases sequentially, so retaining only the most recent filter keeps
+    /// peak memory O(one projection) while eliminating repeated O(V+E) work
+    /// for aliases over the same immutable graph.
+    cached_projection: ?Projection = null,
+    cached_projection_filter: ?graph_mod.GraphMetricEdgeFilter = null,
+    cached_projection_requirements: metrics.TopologyRequirements = .{},
 
     pub fn deinit(self: *PreparedGraphArtifact, alloc: Allocator) void {
+        if (self.cached_projection) |*projection| projection.deinit(alloc);
+        if (self.cached_projection_filter) |*filter| filter.deinit(alloc);
         alloc.free(self.source_artifact_id);
         alloc.free(self.source_checksum);
         self.topology.deinit(alloc);
@@ -389,7 +398,7 @@ pub fn publishManyFromPreparedGraphWithBudgetAlloc(
     cancellation: CancellationToken,
     limits: Limits,
     batch_budget: *graph_metric_policy.Budget,
-    prepared: *const PreparedGraphArtifact,
+    prepared: *PreparedGraphArtifact,
     provenance: Provenance,
     runtime: ComputeRuntime,
 ) ![]artifact_ref.ArtifactRef {
@@ -430,7 +439,7 @@ pub fn publishManyFromPreparedGraphWithBudgetAlloc(
             .max_parallelism = runtime.max_parallelism,
             .topology_requirements = group_requirements,
         };
-        var projection = buildProjectionFromTopologyAlloc(alloc, prepared.topology, 0, group_options) catch |err| switch (err) {
+        const projection_result = preparedProjectionAlloc(alloc, prepared, group_options) catch |err| switch (err) {
             error.GraphMetricBuildBudgetExceeded => {
                 for (configs, 0..) |candidate, candidate_index| {
                     if (processed[candidate_index] or !candidate.edge_filter.equivalent(config.edge_filter)) continue;
@@ -442,9 +451,8 @@ pub fn publishManyFromPreparedGraphWithBudgetAlloc(
             },
             else => return err,
         };
-        defer projection.deinit(alloc);
-        projection.decoded_retained_bytes = prepared.topology.retained_bytes;
-        chargeProjectionWork(group_options, projection) catch {
+        const projection = projection_result.projection;
+        if (projection_result.built) chargeProjectionWork(group_options, projection.*) catch {
             for (configs, 0..) |candidate, candidate_index| {
                 if (processed[candidate_index] or !candidate.edge_filter.equivalent(config.edge_filter)) continue;
                 refs[candidate_index] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, candidate, cancellation, .build_budget_exceeded, limits, provenance);
@@ -463,7 +471,7 @@ pub fn publishManyFromPreparedGraphWithBudgetAlloc(
                 const pair_refs = publishHitsPairFromProjectionAlloc(
                     alloc,
                     artifacts,
-                    projection,
+                    projection.*,
                     options,
                     configs[pair_index],
                     cancellation,
@@ -487,7 +495,7 @@ pub fn publishManyFromPreparedGraphWithBudgetAlloc(
                 processed[pair_index] = true;
                 continue;
             }
-            var built = buildFromProjectionAlloc(alloc, projection, options) catch |err| switch (err) {
+            var built = buildFromProjectionAlloc(alloc, projection.*, options) catch |err| switch (err) {
                 error.GraphMetricBuildBudgetExceeded => {
                     refs[candidate_index] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, candidate, cancellation, .build_budget_exceeded, limits, provenance);
                     initialized[candidate_index] = true;
@@ -604,7 +612,7 @@ fn publishRejectedAlloc(
     provenance: Provenance,
 ) !artifact_ref.ArtifactRef {
     try cancellation.check();
-    var segment = try rejectedSegmentAlloc(alloc, graph_index_name, source_graph, config, reason, limits, provenance);
+    var segment = try rejectedSegmentAlloc(alloc, source_graph, config, reason, limits, provenance);
     defer segment.deinit(alloc);
     const payload = try metric_segment.encodeAllocWithCancellation(alloc, segment, cancellation);
     defer alloc.free(payload);
@@ -633,17 +641,12 @@ fn publishRejectedAlloc(
 
 fn rejectedSegmentAlloc(
     alloc: Allocator,
-    graph_index_name: []const u8,
     source_graph: artifact_ref.ArtifactRef,
     config: graph_mod.GraphMetricConfig,
     reason: metric_segment.RejectionReason,
     limits: Limits,
     provenance: Provenance,
 ) !metric_segment.Segment {
-    const owned_graph_index_name = try alloc.dupe(u8, graph_index_name);
-    errdefer alloc.free(owned_graph_index_name);
-    const owned_metric_name = try alloc.dupe(u8, config.name);
-    errdefer alloc.free(owned_metric_name);
     const owned_source_graph_artifact_id = try alloc.dupe(u8, source_graph.artifact_id);
     errdefer alloc.free(owned_source_graph_artifact_id);
     const owned_source_graph_checksum = try alloc.dupe(u8, source_graph.checksum);
@@ -653,8 +656,6 @@ fn rejectedSegmentAlloc(
     const scores = try alloc.alloc(metric_segment.Score, 0);
     errdefer alloc.free(scores);
     const segment = metric_segment.Segment{
-        .graph_index_name = owned_graph_index_name,
-        .metric_name = owned_metric_name,
         .kind = config.kind,
         .source_graph_artifact_id = owned_source_graph_artifact_id,
         .source_graph_checksum = owned_source_graph_checksum,
@@ -913,9 +914,8 @@ fn buildProjectionFromTopologyAlloc(
         allowed_edge_types[edge_type_id] = filter.allows(edge_type);
     }
 
-    const active_nodes = try alloc.alloc(bool, topology.node_ids.len);
-    defer alloc.free(active_nodes);
-    @memset(active_nodes, false);
+    var active_nodes = try std.DynamicBitSetUnmanaged.initEmpty(alloc, topology.node_ids.len);
+    defer active_nodes.deinit(alloc);
     var projected_edge_count: usize = 0;
     var inspected_edges: usize = 0;
     for (allowed_edge_types, 0..) |allowed, edge_type_id| {
@@ -929,13 +929,13 @@ fn buildProjectionFromTopologyAlloc(
         for (topology.edges[range_start..range_end]) |edge| {
             inspected_edges += 1;
             if (inspected_edges % 4096 == 0) try options.cancellation.check();
-            active_nodes[edge.source] = true;
-            active_nodes[edge.target] = true;
+            active_nodes.set(edge.source);
+            active_nodes.set(edge.target);
         }
     }
     var projected_node_count: usize = 0;
-    for (active_nodes) |active| {
-        if (!active) continue;
+    for (0..topology.node_ids.len) |node_ordinal| {
+        if (!active_nodes.isSet(node_ordinal)) continue;
         projected_node_count = std.math.add(usize, projected_node_count, 1) catch
             return error.GraphMetricBuildBudgetExceeded;
     }
@@ -944,7 +944,9 @@ fn buildProjectionFromTopologyAlloc(
     var construction_peak = std.math.add(usize, decoded_retained_bytes, topology.retained_bytes) catch
         return error.GraphMetricBuildBudgetExceeded;
     try addPeakArrayBytes(&construction_peak, topology.edge_types.len, bool);
-    try addPeakArrayBytes(&construction_peak, topology.node_ids.len, bool);
+    const active_node_word_count = std.math.divCeil(usize, topology.node_ids.len, @bitSizeOf(usize)) catch
+        return error.GraphMetricBuildBudgetExceeded;
+    try addPeakArrayBytes(&construction_peak, active_node_word_count, usize);
     try addPeakArrayBytes(&construction_peak, topology.node_ids.len, u32);
     try addPeakArrayBytes(&construction_peak, projected_node_count, []const u8);
     // Exact temporary edge pairs coexist only while building the required
@@ -973,8 +975,8 @@ fn buildProjectionFromTopologyAlloc(
     var projected_edges = std.ArrayListUnmanaged(metrics.Edge).empty;
     defer projected_edges.deinit(alloc);
     try projected_edges.ensureTotalCapacityPrecise(alloc, projected_edge_count);
-    for (topology.node_ids, active_nodes, 0..) |node_id, active, global_ordinal| {
-        if (!active) continue;
+    for (topology.node_ids, 0..) |node_id, global_ordinal| {
+        if (!active_nodes.isSet(global_ordinal)) continue;
         if (projection.node_ids.items.len > std.math.maxInt(u32)) return error.GraphMetricBuildBudgetExceeded;
         global_to_local[global_ordinal] = @intCast(projection.node_ids.items.len);
         projection.node_ids.appendAssumeCapacity(node_id);
@@ -1003,6 +1005,42 @@ fn buildProjectionFromTopologyAlloc(
         options.cancellation,
     );
     return projection;
+}
+
+const PreparedProjection = struct {
+    projection: *Projection,
+    built: bool,
+};
+
+fn preparedProjectionAlloc(
+    alloc: Allocator,
+    prepared: *PreparedGraphArtifact,
+    options: BuildOptions,
+) !PreparedProjection {
+    const requirements = options.topology_requirements orelse topologyRequirementsForKind(options.config.kind);
+    if (prepared.cached_projection != null and
+        prepared.cached_projection_filter.?.equivalent(options.config.edge_filter) and
+        prepared.cached_projection_requirements.satisfies(requirements))
+    {
+        return .{ .projection = &prepared.cached_projection.?, .built = false };
+    }
+
+    // Clone the tiny filter identity before releasing the previous projection,
+    // then replace the cache in place. A failed rebuild leaves it empty rather
+    // than retaining a projection whose requirements do not satisfy the call.
+    var filter = try options.config.edge_filter.cloneAlloc(alloc);
+    errdefer filter.deinit(alloc);
+    if (prepared.cached_projection) |*projection| projection.deinit(alloc);
+    prepared.cached_projection = null;
+    if (prepared.cached_projection_filter) |*previous_filter| previous_filter.deinit(alloc);
+    prepared.cached_projection_filter = null;
+
+    var projection = try buildProjectionFromTopologyAlloc(alloc, prepared.topology, 0, options);
+    projection.decoded_retained_bytes = prepared.topology.retained_bytes;
+    prepared.cached_projection = projection;
+    prepared.cached_projection_filter = filter;
+    prepared.cached_projection_requirements = requirements;
+    return .{ .projection = &prepared.cached_projection.?, .built = true };
 }
 
 fn buildProjectionAlloc(alloc: Allocator, graph: graph_segment.Segment, options: BuildOptions) !Projection {
@@ -1316,10 +1354,6 @@ fn validateOptions(graph_payload: []const u8, options: BuildOptions) !void {
 }
 
 fn makeMetricSegmentAlloc(alloc: Allocator, options: BuildOptions, result: metrics.Result, scores: []metric_segment.Score) !metric_segment.Segment {
-    const graph_index_name = try alloc.dupe(u8, options.graph_index_name);
-    errdefer alloc.free(graph_index_name);
-    const metric_name = try alloc.dupe(u8, options.config.name);
-    errdefer alloc.free(metric_name);
     const source_artifact_id = try alloc.dupe(u8, options.source_graph.artifact_id);
     errdefer alloc.free(source_artifact_id);
     const source_checksum = try alloc.dupe(u8, options.source_graph.checksum);
@@ -1327,8 +1361,6 @@ fn makeMetricSegmentAlloc(alloc: Allocator, options: BuildOptions, result: metri
     var edge_filter = try cloneSortedEdgeFilterAlloc(alloc, options.config.edge_filter);
     errdefer edge_filter.deinit(alloc);
     return .{
-        .graph_index_name = graph_index_name,
-        .metric_name = metric_name,
         .kind = options.config.kind,
         .source_graph_artifact_id = source_artifact_id,
         .source_graph_checksum = source_checksum,
@@ -1863,4 +1895,54 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         defer decoded.deinit(alloc);
         try std.testing.expectEqual(expected_state, decoded.materialization_state);
     }
+
+    // Logical aliases must not perturb immutable metric content. With enough
+    // aggregate work budget both publications reuse the cached projection and
+    // converge on the same object-store identity; only their manifest names
+    // differ.
+    // Two 254-item kernels plus one 15-item projection fit exactly. A second
+    // projection would force the alias publication into terminal rejection.
+    const alias_limits = Limits{ .max_work_items = 523, .max_total_work_items = 523 };
+    var alias_budget = graph_metric_policy.Budget{ .limits = alias_limits };
+    var alias_prepared = try prepareGraphArtifactAlloc(alloc, &artifacts, source, .none, alias_limits);
+    defer alias_prepared.deinit(alloc);
+    const alias_a = try publishManyFromPreparedGraphWithBudgetAlloc(
+        alloc,
+        &artifacts,
+        "alias_a",
+        source,
+        &one_config,
+        .none,
+        alias_limits,
+        &alias_budget,
+        &alias_prepared,
+        .{ .published_generation = 2, .edge_generation = 1, .computed_at_ms = 2 },
+        .{},
+    );
+    defer {
+        for (alias_a) |ref| freeArtifactRef(alloc, ref);
+        alloc.free(alias_a);
+    }
+    const alias_b = try publishManyFromPreparedGraphWithBudgetAlloc(
+        alloc,
+        &artifacts,
+        "alias_b",
+        source,
+        &one_config,
+        .none,
+        alias_limits,
+        &alias_budget,
+        &alias_prepared,
+        .{ .published_generation = 2, .edge_generation = 1, .computed_at_ms = 2 },
+        .{},
+    );
+    defer {
+        for (alias_b) |ref| freeArtifactRef(alloc, ref);
+        alloc.free(alias_b);
+    }
+    try std.testing.expectEqual(@as(usize, 1), alias_a.len);
+    try std.testing.expectEqual(@as(usize, 1), alias_b.len);
+    try std.testing.expect(!std.mem.eql(u8, alias_a[0].name, alias_b[0].name));
+    try std.testing.expectEqualStrings(alias_a[0].artifact_id, alias_b[0].artifact_id);
+    try std.testing.expectEqualStrings(alias_a[0].checksum, alias_b[0].checksum);
 }

@@ -43,8 +43,6 @@ pub const Segment = struct {
     /// Wire schema observed while decoding. Producers leave this at zero; the
     /// codec stamps the emitted version on read.
     metadata_version: u16 = 0,
-    graph_index_name: []u8,
-    metric_name: []u8,
     kind: graph_mod.GraphMetricKind,
     source_graph_artifact_id: []u8,
     source_graph_checksum: []u8,
@@ -74,8 +72,6 @@ pub const Segment = struct {
     owns_score_node_ids: bool = true,
 
     pub fn deinit(self: *Segment, alloc: Allocator) void {
-        alloc.free(self.graph_index_name);
-        alloc.free(self.metric_name);
         alloc.free(self.source_graph_artifact_id);
         alloc.free(self.source_graph_checksum);
         self.edge_filter.deinit(alloc);

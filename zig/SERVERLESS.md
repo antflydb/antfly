@@ -682,11 +682,11 @@ release in two phases:
 Graph metric materialization remains dormant while the gate is at version 12.
 Once version 17 is enabled, catalog reconciliation detects configured metrics
 without artifacts and schedules their publication. Readers remain backward
-compatible with version 12 manifests throughout the rollout. Versions 15 and
-16 remain accepted only for compatibility with deployments that already used
-the earlier graph-metric layouts; new graph-metric publications require version
-17 so every reader understands the authenticated ranked-score blocks. Other
-values fail startup rather than risking a partially compatible deployment.
+compatible with version 12 manifests throughout the rollout. Because the
+serverless graph-metric feature has not shipped, partial development versions
+15 and 16 are deliberately unsupported: graph-metric manifests and segments
+must use the current authenticated ranked-block format. Other values fail
+startup rather than risking a partially compatible deployment.
 
 ## Image And CI Path
 

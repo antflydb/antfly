@@ -675,7 +675,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                     if (existing.binding.sidecar_kind == .graph_metric and
                         source_binding.sameSourceSnapshot(existing.binding, graph_declaration.binding) and
                         std.mem.eql(u8, existing.binding.index_config_hash, expected_hash) and
-                        try graphMetricArtifactReusable(alloc, artifacts, existing.artifact, spec.index_name, config, graph_declaration.artifact, cancellation))
+                        try graphMetricArtifactReusable(alloc, artifacts, existing.artifact, config, graph_declaration.artifact, cancellation))
                     {
                         var cloned = try cloneDeclarationAlloc(alloc, existing);
                         if (cloned.artifact.published_generation == 0) cloned.artifact.published_generation = effective_provenance.published_generation;
@@ -878,8 +878,6 @@ fn stampExternalGraphTopologyGenerations(
                 alloc,
                 artifacts,
                 metric.artifact,
-                parsed_name.graph_index_name,
-                parsed_name.metric_name,
                 previous_graph.artifact,
                 cancellation,
             )) continue;
@@ -897,15 +895,11 @@ fn graphMetricArtifactBoundToGraphAlloc(
     alloc: Allocator,
     artifacts: *artifact_store.ArtifactStore,
     metric_ref: manifest_artifact.ArtifactRef,
-    graph_index_name: []const u8,
-    metric_name: []const u8,
     graph_ref: manifest_artifact.ArtifactRef,
     cancellation: CancellationToken,
 ) !bool {
     const prefix_len = graph_metric_segment.headerProbeLen(
         metric_ref.byte_len,
-        graph_index_name,
-        metric_name,
         graph_ref.artifact_id,
         graph_ref.checksum,
     ) catch return false;
@@ -924,9 +918,7 @@ fn graphMetricArtifactBoundToGraphAlloc(
     };
     defer alloc.free(prefix);
     const header = graph_metric_segment.decodeHeader(prefix) catch return false;
-    return std.mem.eql(u8, header.graph_index_name, graph_index_name) and
-        std.mem.eql(u8, header.metric_name, metric_name) and
-        std.mem.eql(u8, header.source_graph_artifact_id, graph_ref.artifact_id) and
+    return std.mem.eql(u8, header.source_graph_artifact_id, graph_ref.artifact_id) and
         std.mem.eql(u8, header.source_graph_checksum, graph_ref.checksum);
 }
 
@@ -1591,7 +1583,6 @@ fn graphMetricArtifactReusable(
     alloc: Allocator,
     artifacts: *artifact_store.ArtifactStore,
     ref: manifest_artifact.ArtifactRef,
-    graph_index_name: []const u8,
     config: @import("../../graph/graph.zig").GraphMetricConfig,
     graph_ref: manifest_artifact.ArtifactRef,
     cancellation: CancellationToken,
@@ -1602,8 +1593,6 @@ fn graphMetricArtifactReusable(
     };
     const prefix_len = try graph_metric_segment.headerProbeLen(
         ref.byte_len,
-        graph_index_name,
-        config.name,
         graph_ref.artifact_id,
         graph_ref.checksum,
     );
@@ -1622,9 +1611,7 @@ fn graphMetricArtifactReusable(
     };
     defer alloc.free(prefix);
     const header = graph_metric_segment.decodeHeader(prefix) catch return false;
-    return std.mem.eql(u8, header.graph_index_name, graph_index_name) and
-        std.mem.eql(u8, header.metric_name, config.name) and
-        header.kind == config.kind and
+    return header.kind == config.kind and
         header.config_fingerprint == lake_graph_metric.configFingerprint(config) and
         header.materializer_fingerprint == lake_graph_metric.materializerFingerprint(.{}) and
         std.mem.eql(u8, header.source_graph_artifact_id, graph_ref.artifact_id) and

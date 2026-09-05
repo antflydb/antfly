@@ -1377,11 +1377,15 @@ pub const GraphIndex = struct {
     }
 
     fn graphMetricControlKeyAlloc(self: *GraphIndex, parts: []const []const u8) ![]u8 {
+        return try graphMetricControlKeyWithAllocator(self.alloc, parts);
+    }
+
+    fn graphMetricControlKeyWithAllocator(alloc: Allocator, parts: []const []const u8) ![]u8 {
         var list = std.ArrayListUnmanaged(u8).empty;
-        defer list.deinit(self.alloc);
-        try list.appendSlice(self.alloc, graph_metric_control_key_prefix);
-        for (parts) |part| try internal_keys.appendEncodedComponent(&list, self.alloc, part);
-        return try list.toOwnedSlice(self.alloc);
+        defer list.deinit(alloc);
+        try list.appendSlice(alloc, graph_metric_control_key_prefix);
+        for (parts) |part| try internal_keys.appendEncodedComponent(&list, alloc, part);
+        return try list.toOwnedSlice(alloc);
     }
 
     fn graphMetricScoreKeyAlloc(self: *GraphIndex, metric_name: []const u8, generation: u64, node: []const u8) ![]u8 {
@@ -1500,12 +1504,14 @@ pub const GraphIndex = struct {
         iteration: u32,
         page_id: u64,
     ) ![]u8 {
-        const job_id_text = try std.fmt.allocPrint(self.alloc, "{d}", .{job_id});
-        defer self.alloc.free(job_id_text);
-        const iteration_text = try std.fmt.allocPrint(self.alloc, "{d}", .{iteration});
-        defer self.alloc.free(iteration_text);
-        const page_id_text = try std.fmt.allocPrint(self.alloc, "{d}", .{page_id});
-        defer self.alloc.free(page_id_text);
+        var job_id_buf: [20]u8 = undefined;
+        const job_id_text = try std.fmt.bufPrint(&job_id_buf, "{d}", .{job_id});
+        var iteration_buf: [10]u8 = undefined;
+        const iteration_text = try std.fmt.bufPrint(&iteration_buf, "{d}", .{iteration});
+        var page_id_buf: [20]u8 = undefined;
+        // Page keys are cursor-scanned. Fixed-width decimal preserves numeric
+        // ordering across digit boundaries without a heap allocation.
+        const page_id_text = try std.fmt.bufPrint(&page_id_buf, "{d:0>20}", .{page_id});
         return try self.graphMetricControlKeyAlloc(&.{ metric_name, "job", job_id_text, "page", @tagName(phase), iteration_text, page_id_text });
     }
 
@@ -9123,18 +9129,37 @@ pub const GraphIndex = struct {
         errdefer batch.abort();
         const current_page = try self.metricBuildPage(&batch, metric_name, job.job_id, .iterate_contributions, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
+        var key_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer key_arena.deinit();
+        const key_alloc = key_arena.allocator();
         const contribution_keys = try self.alloc.alloc([]u8, contributions.count());
-        var initialized_keys: usize = 0;
-        defer {
-            for (contribution_keys[0..initialized_keys]) |key| self.alloc.free(key);
-            self.alloc.free(contribution_keys);
-        }
+        defer self.alloc.free(contribution_keys);
         const contribution_deltas = try self.alloc.alloc(f64, contributions.count());
         defer self.alloc.free(contribution_deltas);
+        var job_id_buf: [20]u8 = undefined;
+        const job_id_text = try std.fmt.bufPrint(&job_id_buf, "{d}", .{job.job_id});
+        var iteration_buf: [10]u8 = undefined;
+        const iteration_text = try std.fmt.bufPrint(&iteration_buf, "{d}", .{claimed_page.iteration});
+        var page_id_buf: [20]u8 = undefined;
+        const page_id_text = try std.fmt.bufPrint(&page_id_buf, "{d}", .{claimed_page.page_id});
+        var attempt_buf: [20]u8 = undefined;
+        const attempt_text = try std.fmt.bufPrint(&attempt_buf, "{d}", .{claimed_page.attempt});
+        var initialized_keys: usize = 0;
         var it = contributions.iterator();
         while (it.next()) |entry| {
             if (!std.math.isFinite(entry.value_ptr.*)) return error.InvalidGraphMetricScore;
-            contribution_keys[initialized_keys] = try self.graphMetricBuildAttemptPageRankContributionKeyAlloc(metric_name, job.job_id, .iterate_contributions, claimed_page.iteration, claimed_page.page_id, claimed_page.attempt, entry.key_ptr.*);
+            contribution_keys[initialized_keys] = try graphMetricControlKeyWithAllocator(key_alloc, &.{
+                metric_name,
+                "job",
+                job_id_text,
+                "attempt",
+                @tagName(GraphMetricBuildPhase.iterate_contributions),
+                iteration_text,
+                page_id_text,
+                attempt_text,
+                "pagerank_contribution",
+                entry.key_ptr.*,
+            });
             contribution_deltas[initialized_keys] = entry.value_ptr.*;
             initialized_keys += 1;
         }
@@ -14442,7 +14467,7 @@ pub const GraphIndex = struct {
             initialized_columns += 1;
         }
 
-        // Flatten every requested column into one sorted storage read. Query
+        // Flatten every requested column into a sorted stream of bounded storage reads. Query
         // shapes commonly need the same rows for projection, filtering, and
         // ordering; issuing one multi-get per metric makes latency scale with
         // the number of clauses even though all keys share this snapshot.
@@ -14450,10 +14475,6 @@ pub const GraphIndex = struct {
             column_index: usize,
             row_index: usize,
             key: []const u8,
-
-            fn lessThan(_: void, left: @This(), right: @This()) bool {
-                return std.mem.order(u8, left.key, right.key) == .lt;
-            }
         };
         var active_columns: usize = 0;
         for (statuses) |status| active_columns += @intFromBool(status.published_generation != 0);
@@ -14469,6 +14490,32 @@ pub const GraphIndex = struct {
             active_column_indexes[active_index] = column_index;
             active_index += 1;
         }
+        const ColumnOrder = struct {
+            names: []const []const u8,
+
+            fn lessThan(context: @This(), left: usize, right: usize) bool {
+                const order = std.mem.order(u8, context.names[left], context.names[right]);
+                return order == .lt or (order == .eq and left < right);
+            }
+        };
+        // Encoded key components preserve byte ordering. Sorting the small
+        // column and row dimensions independently therefore produces the same
+        // storage order as sorting C*N allocated full keys, while reducing the
+        // planning cost to O(C log C + N log N).
+        std.mem.sort(usize, active_column_indexes, ColumnOrder{ .names = metric_names }, ColumnOrder.lessThan);
+
+        const ordered_rows = try self.alloc.alloc(usize, nodes.len);
+        defer self.alloc.free(ordered_rows);
+        for (ordered_rows, 0..) |*row, row_index| row.* = row_index;
+        const RowOrder = struct {
+            nodes: []const []const u8,
+
+            fn lessThan(context: @This(), left: usize, right: usize) bool {
+                const order = std.mem.order(u8, context.nodes[left], context.nodes[right]);
+                return order == .lt or (order == .eq and left < right);
+            }
+        };
+        std.mem.sort(usize, ordered_rows, RowOrder{ .nodes = nodes }, RowOrder.lessThan);
 
         const max_keys_per_read: usize = 4096;
         var offset: usize = 0;
@@ -14482,7 +14529,7 @@ pub const GraphIndex = struct {
             for (pending, 0..) |*item, relative_index| {
                 const flat_index = offset + relative_index;
                 const active_column_index = flat_index / nodes.len;
-                const row_index = flat_index % nodes.len;
+                const row_index = ordered_rows[flat_index % nodes.len];
                 const column_index = active_column_indexes[active_column_index];
                 item.* = .{
                     .column_index = column_index,
@@ -14495,8 +14542,6 @@ pub const GraphIndex = struct {
                     ),
                 };
             }
-            std.mem.sort(PendingColumnScoreLoad, pending, {}, PendingColumnScoreLoad.lessThan);
-
             const read_keys = try self.alloc.alloc([]const u8, pending.len);
             defer self.alloc.free(read_keys);
             const read_values = try self.alloc.alloc(?[]const u8, pending.len);
@@ -14528,43 +14573,57 @@ pub const GraphIndex = struct {
         if (generation == 0 or nodes.len == 0) return scores;
         const PendingScoreLoad = struct {
             original_index: usize,
-            key: []u8,
-
-            fn lessThan(_: void, left: @This(), right: @This()) bool {
-                return std.mem.order(u8, left.key, right.key) == .lt;
-            }
+            key: []const u8,
         };
 
-        var generation_buf: [20]u8 = undefined;
-        const generation_text = try std.fmt.bufPrint(&generation_buf, "{d}", .{generation});
-        const pending = try self.alloc.alloc(PendingScoreLoad, nodes.len);
-        var initialized: usize = 0;
-        defer {
-            for (pending[0..initialized]) |item| self.alloc.free(item.key);
-            self.alloc.free(pending);
-        }
-        for (nodes, 0..) |node, i| {
-            var score_key = std.ArrayListUnmanaged(u8).empty;
-            errdefer score_key.deinit(self.alloc);
-            try self.writeGraphMetricKey(&score_key, &.{ metric_name, "score", generation_text, node });
-            pending[i] = .{ .original_index = i, .key = try score_key.toOwnedSlice(self.alloc) };
-            initialized += 1;
-        }
-        std.mem.sort(PendingScoreLoad, pending, {}, PendingScoreLoad.lessThan);
+        const ordered_rows = try self.alloc.alloc(usize, nodes.len);
+        defer self.alloc.free(ordered_rows);
+        for (ordered_rows, 0..) |*row, row_index| row.* = row_index;
+        const RowOrder = struct {
+            nodes: []const []const u8,
 
-        const read_keys = try self.alloc.alloc([]const u8, pending.len);
-        defer self.alloc.free(read_keys);
-        const read_values = try self.alloc.alloc(?[]const u8, pending.len);
-        defer self.alloc.free(read_values);
-        @memset(read_values, null);
-        for (pending, 0..) |item, i| read_keys[i] = item.key;
-        try txn.getManySorted(read_keys, read_values);
+            fn lessThan(context: @This(), left: usize, right: usize) bool {
+                const order = std.mem.order(u8, context.nodes[left], context.nodes[right]);
+                return order == .lt or (order == .eq and left < right);
+            }
+        };
+        std.mem.sort(usize, ordered_rows, RowOrder{ .nodes = nodes }, RowOrder.lessThan);
 
-        for (pending, read_values) |item, maybe_raw| {
-            const raw = maybe_raw orelse continue;
-            const score = decodeF64(raw) orelse return error.InvalidGraphMetricScore;
-            if (!std.math.isFinite(score)) return error.InvalidGraphMetricScore;
-            scores[item.original_index] = score;
+        // Bound temporary keys and backend result vectors independently of the
+        // candidate set. Each batch is already in storage order, so no C*N key
+        // sort or long-lived per-key allocation is required.
+        const max_keys_per_read: usize = 4096;
+        var offset: usize = 0;
+        while (offset < ordered_rows.len) {
+            const batch_len = @min(max_keys_per_read, ordered_rows.len - offset);
+            var key_arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer key_arena.deinit();
+            const key_alloc = key_arena.allocator();
+            const pending = try self.alloc.alloc(PendingScoreLoad, batch_len);
+            defer self.alloc.free(pending);
+            for (pending, 0..) |*item, relative_index| {
+                const row_index = ordered_rows[offset + relative_index];
+                item.* = .{
+                    .original_index = row_index,
+                    .key = try graphMetricScoreKeyWithAllocator(key_alloc, metric_name, generation, nodes[row_index]),
+                };
+            }
+
+            const read_keys = try self.alloc.alloc([]const u8, pending.len);
+            defer self.alloc.free(read_keys);
+            const read_values = try self.alloc.alloc(?[]const u8, pending.len);
+            defer self.alloc.free(read_values);
+            @memset(read_values, null);
+            for (pending, 0..) |item, i| read_keys[i] = item.key;
+            try txn.getManySorted(read_keys, read_values);
+
+            for (pending, read_values) |item, maybe_raw| {
+                const raw = maybe_raw orelse continue;
+                const score = decodeF64(raw) orelse return error.InvalidGraphMetricScore;
+                if (!std.math.isFinite(score)) return error.InvalidGraphMetricScore;
+                scores[item.original_index] = score;
+            }
+            offset += batch_len;
         }
         return scores;
     }
@@ -14935,14 +14994,14 @@ test "graph metric failed rebuild preserves published generation and records eve
     const published_generation = published.published_generation;
 
     @constCast(graph.metric_configs)[0].damping = std.math.nan(f64);
-    try std.testing.expectError(error.InvalidGraphMetricScore, graph.runGraphMetric("pagerank"));
+    try std.testing.expectError(error.InvalidGraphMetricOptions, graph.runGraphMetric("pagerank"));
 
     var failed = try graph.graphMetricStatus("pagerank");
     defer failed.deinit(alloc);
     try std.testing.expectEqual(GraphIndex.GraphMetricState.failed, failed.state);
     try std.testing.expectEqual(published_generation, failed.published_generation);
     try std.testing.expectEqual(@as(u64, 1), failed.retry_count);
-    try std.testing.expectEqualStrings("InvalidGraphMetricScore", failed.last_error);
+    try std.testing.expectEqualStrings("InvalidGraphMetricOptions", failed.last_error);
     try std.testing.expect(failed.last_event != null);
     try std.testing.expectEqual(GraphIndex.GraphMetricEventKind.failed, failed.last_event.?.kind);
     try std.testing.expect(failed.recent_events.len >= 2);
@@ -14953,8 +15012,8 @@ test "graph metric failed rebuild preserves published generation and records eve
         defer job_txn.abort();
         const failed_job = try graph.metricBuildJob(&job_txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(@as(u64, 1), failed_job.retry_count);
-        try std.testing.expectEqualStrings("InvalidGraphMetricScore", failed_job.last_error);
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.check_convergence, failed_job.phase);
+        try std.testing.expectEqualStrings("InvalidGraphMetricOptions", failed_job.last_error);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.initialize_ranks, failed_job.phase);
         try std.testing.expect(failed_job.score_generation != failed_job.target_generation);
         try std.testing.expect(failed_job.score_generation != failed.published_generation);
     }
@@ -15072,12 +15131,12 @@ test "graph metric failed rebuild preserves published generation across reopen" 
         expected_top_score = before_failure_top[0].score;
 
         @constCast(graph.metric_configs)[0].damping = std.math.nan(f64);
-        try std.testing.expectError(error.InvalidGraphMetricScore, graph.runGraphMetric("pagerank"));
+        try std.testing.expectError(error.InvalidGraphMetricOptions, graph.runGraphMetric("pagerank"));
         var job_txn = try graph.beginReadReverseTxn();
         defer job_txn.abort();
         const failed_job = try graph.metricBuildJob(&job_txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(@as(u64, 1), failed_job.retry_count);
-        try std.testing.expectEqualStrings("InvalidGraphMetricScore", failed_job.last_error);
+        try std.testing.expectEqualStrings("InvalidGraphMetricOptions", failed_job.last_error);
     }
     store.close();
 
@@ -15092,7 +15151,7 @@ test "graph metric failed rebuild preserves published generation across reopen" 
     try std.testing.expectEqual(GraphIndex.GraphMetricState.failed, failed.state);
     try std.testing.expectEqual(published_generation, failed.published_generation);
     try std.testing.expectEqual(@as(u64, 1), failed.retry_count);
-    try std.testing.expectEqualStrings("InvalidGraphMetricScore", failed.last_error);
+    try std.testing.expectEqualStrings("InvalidGraphMetricOptions", failed.last_error);
     try std.testing.expect(failed.build_queued);
     try std.testing.expectEqual(GraphIndex.GraphMetricEventKind.failed, failed.last_event.?.kind);
     {
@@ -15100,8 +15159,8 @@ test "graph metric failed rebuild preserves published generation across reopen" 
         defer job_txn.abort();
         const failed_job = try graph.metricBuildJob(&job_txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(@as(u64, 1), failed_job.retry_count);
-        try std.testing.expectEqualStrings("InvalidGraphMetricScore", failed_job.last_error);
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.check_convergence, failed_job.phase);
+        try std.testing.expectEqualStrings("InvalidGraphMetricOptions", failed_job.last_error);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.initialize_ranks, failed_job.phase);
     }
 
     const after_reopen_top = try graph.graphMetricTopK("pagerank", 1);
@@ -15612,7 +15671,8 @@ test "graph metric build pagerank manifest partitions iterative phase pages" {
     var txn = try graph.beginReadReverseTxn();
     defer txn.abort();
     const manifest = try graph.metricBuildManifest(&txn, "pagerank", active_job.job_id) orelse return error.TestExpectedGraphMetricBuildManifest;
-    try std.testing.expectEqual(GraphIndex.graph_metric_iterative_build_phases.len + 8, manifest.page_count);
+    // Eight data-partition pages plus two dependency-summary pages.
+    try std.testing.expectEqual(GraphIndex.graph_metric_iterative_build_phases.len + 10, manifest.page_count);
 
     const first_scan = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .scan_edges_and_out_degree, 0, 1) orelse return error.TestExpectedGraphMetricBuildPage;
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.reverse_edges, first_scan.range_kind);
@@ -18750,14 +18810,14 @@ test "graph metric build degree manifest partitions reverse-edge scan pages" {
         defer txn.abort();
         const manifest = try graph.metricBuildManifest(&txn, "degree", active_job.job_id) orelse return error.TestExpectedGraphMetricBuildManifest;
         try std.testing.expectEqual(GraphIndex.graph_metric_degree_build_phases.len, manifest.phase_count);
-        try std.testing.expectEqual(GraphIndex.graph_metric_degree_build_phases.len + 3, manifest.page_count);
+        // Three data-partition pages plus the reduction dependency summary.
+        try std.testing.expectEqual(GraphIndex.graph_metric_degree_build_phases.len + 4, manifest.page_count);
 
         const first_scan = try graph.metricBuildPage(&txn, "degree", active_job.job_id, .scan_edges_and_out_degree, 0, 1) orelse return error.TestExpectedGraphMetricBuildPage;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.pending, first_scan.state);
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.reverse_edges, first_scan.range_kind);
         try std.testing.expect(first_scan.range_lower.len > 0);
         try std.testing.expect(first_scan.range_upper.len > 0);
-        try std.testing.expectEqual(@as(u64, graph_metric_build_target_scan_page_units), first_scan.total_units);
         try std.testing.expect(first_scan.output_prefix.len > 0);
 
         const second_scan = try graph.metricBuildPage(&txn, "degree", active_job.job_id, .scan_edges_and_out_degree, 0, 2) orelse return error.TestExpectedGraphMetricBuildPage;
@@ -18765,7 +18825,9 @@ test "graph metric build degree manifest partitions reverse-edge scan pages" {
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.reverse_edges, second_scan.range_kind);
         try std.testing.expectEqualStrings(first_scan.range_upper, second_scan.range_lower);
         try std.testing.expectEqualStrings("", second_scan.range_upper);
-        try std.testing.expectEqual(@as(u64, 1), second_scan.total_units);
+        try std.testing.expect(first_scan.total_units >= second_scan.total_units);
+        try std.testing.expect(first_scan.total_units - second_scan.total_units <= 1);
+        try std.testing.expectEqual(graph.edge_count, first_scan.total_units + second_scan.total_units);
 
         try std.testing.expect((try graph.metricBuildPage(&txn, "degree", active_job.job_id, .scan_edges_and_out_degree, 0, 3)) == null);
 
@@ -18773,14 +18835,15 @@ test "graph metric build degree manifest partitions reverse-edge scan pages" {
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.nodes, reduce.range_kind);
         try std.testing.expect(reduce.range_lower.len > 0);
         try std.testing.expect(reduce.range_upper.len > 0);
-        try std.testing.expectEqual(@as(u64, graph_metric_build_target_reduce_page_units), reduce.total_units);
         try std.testing.expect(reduce.output_prefix.len > 0);
 
         const second_reduce = try graph.metricBuildPage(&txn, "degree", active_job.job_id, .reduce_ranks, 0, 3) orelse return error.TestExpectedGraphMetricBuildPage;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.nodes, second_reduce.range_kind);
         try std.testing.expectEqualStrings(reduce.range_upper, second_reduce.range_lower);
         try std.testing.expectEqualStrings("", second_reduce.range_upper);
-        try std.testing.expectEqual(graph.node_count - graph_metric_build_target_reduce_page_units, second_reduce.total_units);
+        try std.testing.expect(reduce.total_units >= second_reduce.total_units);
+        try std.testing.expect(reduce.total_units - second_reduce.total_units <= 1);
+        try std.testing.expectEqual(graph.node_count, reduce.total_units + second_reduce.total_units);
 
         try std.testing.expect((try graph.metricBuildPage(&txn, "degree", active_job.job_id, .reduce_ranks, 0, 4)) == null);
 
@@ -18799,11 +18862,11 @@ test "graph metric build degree manifest partitions reverse-edge scan pages" {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
         const manifest = try graph.metricBuildManifest(&txn, "degree", active_job.job_id) orelse return error.TestExpectedGraphMetricBuildManifest;
-        try std.testing.expectEqual(GraphIndex.graph_metric_degree_build_phases.len + 3, manifest.page_count);
+        try std.testing.expectEqual(GraphIndex.graph_metric_degree_build_phases.len + 4, manifest.page_count);
         const first_scan = try graph.metricBuildPage(&txn, "degree", active_job.job_id, .scan_edges_and_out_degree, 0, 1) orelse return error.TestExpectedGraphMetricBuildPage;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.pending, first_scan.state);
         const second_scan = try graph.metricBuildPage(&txn, "degree", active_job.job_id, .scan_edges_and_out_degree, 0, 2) orelse return error.TestExpectedGraphMetricBuildPage;
-        try std.testing.expectEqual(@as(u64, 1), second_scan.total_units);
+        try std.testing.expectEqual(graph.edge_count, first_scan.total_units + second_scan.total_units);
     }
 }
 
@@ -19918,7 +19981,9 @@ test "graph metric build page progress cursor survives renew and reopen" {
         try std.testing.expectEqualStrings("edge-page:0001", page.cursor);
         try std.testing.expectEqual(@as(u64, 1), page.completed_units);
         const job = try graph.metricBuildJob(&txn, "degree") orelse return error.TestExpectedGraphMetricBuildJob;
-        try std.testing.expectEqualStrings("edge-page:0001", job.cursor);
+        // Parallel page cursors remain page-local; the aggregate job does not
+        // publish one worker's checkpoint as a global resume position.
+        try std.testing.expectEqualStrings("", job.cursor);
         try std.testing.expectEqual(@as(u64, 1), job.completed_units);
     }
     var reopened_status = try graph.graphMetricStatus("degree");
@@ -20072,7 +20137,9 @@ test "graph metric build phase barrier summarizes every durable page in phase" {
     try std.testing.expectEqual(@as(u64, 1), pending.completed_pages);
     try std.testing.expectEqual(@as(u64, 3), pending.total_units);
     try std.testing.expectEqual(@as(u64, 1), pending.completed_units);
-    try std.testing.expectEqual(@as(u64, 20), pending.output_fingerprint);
+    // Incomplete phases use the O(1) progress record and defer the full-page
+    // fingerprint fold until every page is complete.
+    try std.testing.expectEqual(@as(u64, 0), pending.output_fingerprint);
     try std.testing.expect(!(try graph.advanceGraphMetricBuildPhaseIfReady("degree", active_job.job_id, .scan_edges_and_out_degree, 0)));
 
     _ = try graph.claimGraphMetricBuildPageAt("degree", active_job.job_id, .scan_edges_and_out_degree, 0, 99, "worker-b", 3000);

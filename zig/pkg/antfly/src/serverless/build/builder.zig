@@ -3664,7 +3664,7 @@ fn buildGraphMetricArtifactRefsAlloc(
                     defer alloc.free(artifact_name);
                     if (findNamedArtifactIndex(manifest, .graph_metric_segment, artifact_name)) |metric_index| {
                         const metric_ref = manifest.artifacts[metric_index];
-                        if (try graphMetricArtifactReusable(alloc, artifacts, metric_ref, spec.index_name, config, graph_ref, cancellation)) {
+                        if (try graphMetricArtifactReusable(alloc, artifacts, metric_ref, config, graph_ref, cancellation)) {
                             var cloned = try cloneArtifactRefAlloc(alloc, metric_ref);
                             if (cloned.published_generation == 0) cloned.published_generation = effective_provenance.published_generation;
                             if (cloned.edge_generation == 0) cloned.edge_generation = effective_provenance.edge_generation;
@@ -3816,7 +3816,6 @@ fn graphMetricArtifactReusable(
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
     ref: manifest_mod.ArtifactRef,
-    graph_index_name: []const u8,
     config: @import("../../graph/graph.zig").GraphMetricConfig,
     graph_ref: manifest_mod.ArtifactRef,
     cancellation: CancellationToken,
@@ -3827,8 +3826,6 @@ fn graphMetricArtifactReusable(
     };
     const prefix_len = try graph_metric_segment_mod.headerProbeLen(
         ref.byte_len,
-        graph_index_name,
-        config.name,
         graph_ref.artifact_id,
         graph_ref.checksum,
     );
@@ -3847,9 +3844,7 @@ fn graphMetricArtifactReusable(
     };
     defer alloc.free(prefix);
     const header = graph_metric_segment_mod.decodeHeader(prefix) catch return false;
-    return std.mem.eql(u8, header.graph_index_name, graph_index_name) and
-        std.mem.eql(u8, header.metric_name, config.name) and
-        header.kind == config.kind and
+    return header.kind == config.kind and
         header.config_fingerprint == lake_graph_metric.configFingerprint(config) and
         header.materializer_fingerprint == lake_graph_metric.materializerFingerprint(.{}) and
         std.mem.eql(u8, header.source_graph_artifact_id, graph_ref.artifact_id) and

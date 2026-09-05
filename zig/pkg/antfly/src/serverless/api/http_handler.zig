@@ -907,35 +907,24 @@ pub const HttpHandler = struct {
                         else
                             session.manifest.version;
                         status.materializer_fingerprint = metric_ref.materializer_fingerprint;
-                        if (metric_ref.metadata_version >= 5) {
-                            const source_checksum = blk: {
-                                artifacts_mod.validateSha256ArtifactIdentity(graph_ref.artifact_id, graph_ref.checksum) catch break :blk null;
-                                break :blk artifacts_mod.sha256DigestFromChecksum(graph_ref.checksum) catch null;
-                            };
-                            const valid_identity = metric_ref.graph_metric_config_fingerprint == status.config_fingerprint;
-                            const valid_source = if (source_checksum) |digest|
-                                std.mem.eql(u8, &digest, &metric_ref.graph_metric_source_checksum)
-                            else
-                                false;
-                            const current_policy = metric_ref.materializer_fingerprint == build_mod.lake_graph_metric.materializerFingerprint(.{});
-                            const current_format = metric_ref.metadata_version == graph_metric_segment_mod.wire_version;
-                            status.state = if (!valid_identity or !valid_source or !current_policy or !current_format)
-                                if (publication_enabled) .stale else .unsupported
-                            else switch (metric_ref.graph_metric_materialization_state) {
-                                .ready => .ready,
-                                .rejected => .rejected,
-                            };
-                            status.rejection_reason = @enumFromInt(@intFromEnum(metric_ref.graph_metric_rejection_reason));
-                            statuses[initialized] = status;
-                            initialized += 1;
-                            status_moved = true;
-                            continue;
-                        }
-                        // Legacy metric refs lack authenticated lifecycle
-                        // metadata. Report them as stale and let the normal
-                        // head-republish path upgrade them; status reads must
-                        // never scan user-sized score payloads.
-                        status.state = if (publication_enabled) .stale else .unsupported;
+                        const source_checksum = blk: {
+                            artifacts_mod.validateSha256ArtifactIdentity(graph_ref.artifact_id, graph_ref.checksum) catch break :blk null;
+                            break :blk artifacts_mod.sha256DigestFromChecksum(graph_ref.checksum) catch null;
+                        };
+                        const valid_identity = metric_ref.graph_metric_config_fingerprint == status.config_fingerprint;
+                        const valid_source = if (source_checksum) |digest|
+                            std.mem.eql(u8, &digest, &metric_ref.graph_metric_source_checksum)
+                        else
+                            false;
+                        const current_policy = metric_ref.materializer_fingerprint == build_mod.lake_graph_metric.materializerFingerprint(.{});
+                        const current_format = metric_ref.metadata_version == graph_metric_segment_mod.wire_version;
+                        status.state = if (!valid_identity or !valid_source or !current_policy or !current_format)
+                            if (publication_enabled) .stale else .unsupported
+                        else switch (metric_ref.graph_metric_materialization_state) {
+                            .ready => .ready,
+                            .rejected => .rejected,
+                        };
+                        status.rejection_reason = @enumFromInt(@intFromEnum(metric_ref.graph_metric_rejection_reason));
                     }
                 }
                 statuses[initialized] = status;

@@ -112,12 +112,15 @@ The mapping is direct:
 - Antfly text, vector, sparse, graph, and algebraic accelerators map to
   serverless artifacts.
 - Graph metrics map to immutable `graph_metric_segment` artifacts derived from
-  one named graph artifact. Each metric payload records the source graph's
-  content address, checksum, configuration fingerprint, edge filter, convergence
-  metadata, and a node-sorted score vector. Query sessions reject a metric when
+  one named graph artifact. Logical graph/metric names remain in manifest
+  bindings, while each content-addressed payload records the source graph's
+  identity, configuration fingerprint, edge filter, convergence metadata, and
+  prefix-compressed node-sorted/ranked score blocks. Equivalent aliases reuse
+  the same payload. Query sessions reject a metric when
   that source identity does not match the graph artifact pinned by the same
   manifest, so published scores cannot be mixed across generations. Manifest
-  v13 adds the artifact kind while continuing to decode v12 manifests.
+  v17 is the first supported graph-metric publication format; v12 manifests
+  remain readable and graph-metric-free during rollout.
 - Metric materialization uses storage-independent, cancellation-aware bounded
   kernels for degree, PageRank, eigenvector centrality, and both HITS vectors.
   The build call itself is synchronous and deterministic; deployments schedule

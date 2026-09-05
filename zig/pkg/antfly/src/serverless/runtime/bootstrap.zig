@@ -704,11 +704,7 @@ pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
     if (cfg.graph_metric_max_parallelism == 0 or cfg.graph_metric_max_parallelism > build_mod.max_graph_metric_compute_parallelism)
         return error.InvalidGraphMetricBuildOptions;
-    if (cfg.manifest_write_version != manifest_mod.codec.rolling_compatible_write_version and
-        cfg.manifest_write_version != manifest_mod.codec.legacy_graph_metric_write_version and
-        cfg.manifest_write_version != manifest_mod.codec.range_integrity_write_version and
-        cfg.manifest_write_version != manifest_mod.codec.wire_version)
-    {
+    if (cfg.manifest_write_version != manifest_mod.codec.rolling_compatible_write_version and cfg.manifest_write_version != manifest_mod.codec.wire_version) {
         return error.UnsupportedManifestWriteVersion;
     }
     if (cfg.query_cache_dir) |path| {
