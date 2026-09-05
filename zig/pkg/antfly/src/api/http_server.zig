@@ -11572,11 +11572,20 @@ pub const ApiHttpServer = struct {
         rebuilding,
         resolve: *ApiHttpServer,
 
-        fn isRebuilding(self: @This(), table_name: []const u8, req: db_mod.types.SearchRequest) !bool {
+        const Disposition = enum {
+            preserve,
+            invalid_request,
+            rebuilding,
+        };
+
+        fn classify(self: @This(), table_name: []const u8, req: db_mod.types.SearchRequest) !Disposition {
             return switch (self) {
-                .none => false,
-                .rebuilding => true,
-                .resolve => |server| try server.queryReferencesOnlyCatalogIndexes(table_name, req),
+                .none => .preserve,
+                .rebuilding => .rebuilding,
+                .resolve => |server| if (try server.queryReferencesOnlyCatalogIndexes(table_name, req))
+                    .rebuilding
+                else
+                    .invalid_request,
             };
         }
     };
@@ -11617,9 +11626,14 @@ pub const ApiHttpServer = struct {
                     continue;
                 },
                 // A catalog-valid name with no physical reader is a serving
-                // convergence gap. Unknown names retain IndexNotFound so typos
-                // are not masked as transient readiness.
-                error.IndexNotFound => if (try missing_index_lifecycle.isRebuilding(table_name, req)) return error.IndexRebuilding else return err,
+                // convergence gap. Unknown names are attributed to the public
+                // request instead of leaking a storage error as an internal
+                // 500. Non-public callers can preserve the original error.
+                error.IndexNotFound => switch (try missing_index_lifecycle.classify(table_name, req)) {
+                    .preserve => return err,
+                    .invalid_request => return error.InvalidQueryRequest,
+                    .rebuilding => return error.IndexRebuilding,
+                },
                 error.Timeout, error.Cancelled => return err,
                 else => {
                     std.log.warn("public table query read failed table={s} err={}", .{ table_name, err });
@@ -22819,7 +22833,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
 
     const unknown_request: db_mod.types.SearchRequest = .{ .index_name = "typo_idx" };
     try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", unknown_request));
-    try std.testing.expectError(error.IndexNotFound, ApiHttpServer.queryWithTransientReadRetry(
+    try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
         FakeReads.source(),
         "docs",
