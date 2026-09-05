@@ -3567,7 +3567,14 @@ The post-implementation performance review resulted in these concrete changes:
 - Encoded visual embedding now allocates normalized model input once and
   adopts that allocation into the tensor. Image and borrowed-raster decode,
   resize, and normalization happen before the model execution lock; only
-  resident projector/session use is serialized.
+  resident projector/session use is serialized. Caller-retained media, the
+  normalized tensor, and the bounded codec slab hold a host-only process
+  admission lease during preprocessing; backend/GPU workspace is acquired
+  only after the model lock, so requests queued for one session do not pin
+  accelerator capacity. After codec scratch is released, the host permit is
+  reduced to the actual retained inputs and composed with a run request that
+  credits exactly those bytes. Inputs therefore stay continuously admitted
+  without a release/reacquire gap or double-counted host residency.
 - CLIP/SigLIP raster preprocessing resolves channel count and row stride once
   per image rather than in the inner sample loop.
 - A native reader broker candidate no longer owns a singleton inference lease
@@ -3583,13 +3590,33 @@ The post-implementation performance review resulted in these concrete changes:
   temporary allocator, are joined before transfer to the caller allocator, and
   preserve input order and cancellation semantics. Linked model state remains
   serial.
-- Gemini, Vertex, and Cohere embedding adapters borrow the managed embedder's
-  shared HTTP client. Connection pools and TLS sessions now live with the
-  resolved provider entry instead of one request.
+- Gemini, Vertex, and Cohere embedding adapters borrow a lazily created HTTP
+  client from the service-scoped `ProviderRuntime`. Connection pools, DNS/TLS
+  state, Google credentials, and regional Bedrock credential caches therefore
+  survive request-scoped `ManagedEmbedder` construction. First publication is
+  mutex-protected and request allocation uses a thread-safe allocator; a
+  standalone embedder retains the owned compatibility fallback.
+- Ordered remote compatibility batches transfer each completed wave into final
+  caller-owned results and release the thread-safe temporary responses before
+  admitting the next wave. The unavoidable final outputs scale with item
+  count, while the second response copy is bounded by compatibility width.
+  Asset-producer and reranker service pools likewise use thread-safe internal
+  HTTP allocation because their admitted calls may run concurrently even when
+  the runtime shell itself was constructed by an arena-backed owner. Durable
+  remote chunk providers now also own one keep-alive client and publish it as
+  a borrowed execution-context dependency; standalone chunk calls create the
+  old call-scoped client only when no provider runtime was supplied.
 - The distributed proxy reuses the registry refresher's exact node catalog
-  snapshot when the endpoint incarnation and authorization digest match.
+  snapshot when the endpoint incarnation and authorization digest match. It
+  publishes canonical immutable category maps, so hot requests borrow one
+  generation without cloning the body, reparsing category JSON, or repeatedly
+  sanitizing unique capability descriptors. Merged response size is tracked
+  incrementally with a conservative JSON-escaping bound and asserted exactly
+  after serialization, avoiding the prior quadratic full-catalog rescans.
   Snapshot residency has a process-wide 64 MiB cap with oldest-snapshot
-  eviction, and freshness is bounded to twice the configured refresh interval
+  eviction; charges include owned keys, descriptors, map buckets, headers, and
+  allocator/GC overhead rather than only original wire bytes. Freshness is
+  bounded to twice the configured refresh interval
   (between 30 seconds and five minutes). Caller-specific authorization never
   reuses another authority's catalog. This removes request-time all-node
   discovery and repeated node manifest scans on the common service-credential

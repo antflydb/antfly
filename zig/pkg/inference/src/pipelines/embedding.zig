@@ -794,19 +794,17 @@ pub const EmbeddingPipeline = struct {
             encoded_bytes = std.math.add(usize, encoded_bytes, encoded.len) catch
                 return error.ResourceLimitExceeded;
         }
-        var run_permit = try vs.admit(.{
-            .batch = batch,
-            // Pixel area is fully represented by input_bytes. Patch/token
-            // sequence length is backend-specific and must not be guessed from
-            // raw pixels for the transformer activation profile.
-            .sequence = 1,
-            .input_bytes = pixel_bytes,
-            // Normalized pixels are allocated once and adopted by the input
-            // tensor below. Encoded sources remain separately resident while
-            // bounded codec scratch is charged by the preprocessing executor.
-            .host_preprocess_bytes = encoded_bytes,
-        });
-        defer run_permit.deinit();
+        const preprocess_options = image.BatchPreprocessOptions{ .io = self.config.preprocess_io };
+        const preprocess_resident_bytes = std.math.add(
+            usize,
+            std.math.add(usize, encoded_bytes, pixel_bytes) catch return error.ResourceLimitExceeded,
+            preprocess_options.max_inflight_decoded_bytes,
+        ) catch return error.ResourceLimitExceeded;
+        // This host-only lease covers caller-retained media, the normalized
+        // tensor, and the aggregate codec slab. It remains live while waiting
+        // for the model mutex, but does not reserve serialized backend scratch.
+        var preprocess_permit = try vs.admitHostPreprocess(preprocess_resident_bytes);
+        defer preprocess_permit.deinit();
 
         // Preprocess all images to [batch, 3, H, W]
         const preprocess_start = embedTimingStart(self.print_timing);
@@ -821,7 +819,7 @@ pub const EmbeddingPipeline = struct {
                 image.IMAGENET_MEAN,
                 image.IMAGENET_STD,
                 .bilinear,
-                .{ .io = self.config.preprocess_io },
+                preprocess_options,
             ),
             .clip => try image.preprocessClipBatchIntoBounded(
                 pixel_values,
@@ -829,7 +827,7 @@ pub const EmbeddingPipeline = struct {
                 img_size,
                 image.IMAGENET_MEAN,
                 image.IMAGENET_STD,
-                .{ .io = self.config.preprocess_io },
+                preprocess_options,
             ),
         }
         logEmbedTiming("image.preprocess", batch, preprocess_start);
@@ -841,10 +839,28 @@ pub const EmbeddingPipeline = struct {
         pixel_values_owned = false;
         defer pv_tensor.deinit();
 
-        // Admission and bounded CPU preprocessing are independent across
-        // requests. Serialize only access to resident backend/session state.
+        const retained_host_bytes = std.math.add(usize, encoded_bytes, pixel_bytes) catch
+            return error.ResourceLimitExceeded;
+        // Codec scratch is gone once preprocessing returns. Retain only the
+        // encoded sources and adopted normalized tensor while queued for this
+        // session; the run request below credits exactly these still-live
+        // bytes and reserves the remaining host/backend peak.
+        try preprocess_permit.retainHostBytes(retained_host_bytes);
+
+        // Serialize only access to resident backend/session state. Transition
+        // from the retained host lease to a composed run lease while owning
+        // this mutex, so queued preprocessors cannot reserve GPU capacity and
+        // there is no unadmitted release/reacquire interval.
         self.lockExecution();
         defer self.unlockExecution();
+        var run_permit = try vs.admit(.{
+            .batch = batch,
+            .sequence = 1,
+            .input_bytes = pixel_bytes,
+            .host_preprocess_bytes = encoded_bytes,
+            .pre_admitted_host_bytes = retained_host_bytes,
+        });
+        defer run_permit.deinit();
 
         if (self.visual_projection) |proj| {
             const resident = self.tryEmbedResidentProjection(
@@ -932,17 +948,14 @@ pub const EmbeddingPipeline = struct {
             raster_bytes = std.math.add(usize, raster_bytes, raster.bytes.len) catch
                 return error.ResourceLimitExceeded;
         }
-        var run_permit = try vs.admit(.{
-            .batch = batch,
-            .sequence = 1,
-            .input_bytes = pixel_bytes,
-            // The preprocessing buffer is adopted as the input tensor below,
-            // so it has one live representation rather than a temporary plus
-            // a copied tensor. Borrowed renderer rasters remain separately
-            // resident for the duration of preprocessing.
-            .host_preprocess_bytes = raster_bytes,
-        });
-        defer run_permit.deinit();
+        const preprocess_options = image.BatchPreprocessOptions{ .io = self.config.preprocess_io };
+        const preprocess_resident_bytes = std.math.add(
+            usize,
+            std.math.add(usize, raster_bytes, pixel_bytes) catch return error.ResourceLimitExceeded,
+            preprocess_options.max_inflight_decoded_bytes,
+        ) catch return error.ResourceLimitExceeded;
+        var preprocess_permit = try vs.admitHostPreprocess(preprocess_resident_bytes);
+        defer preprocess_permit.deinit();
 
         const pixel_values = try alloc.alloc(f32, pixel_elements);
         var pixel_values_owned = true;
@@ -957,7 +970,7 @@ pub const EmbeddingPipeline = struct {
                 image.IMAGENET_MEAN,
                 image.IMAGENET_STD,
                 .bilinear,
-                .{ .io = self.config.preprocess_io },
+                preprocess_options,
             ),
             .clip => try image.preprocessClipBorrowedRasterBatchIntoWithOptions(
                 alloc,
@@ -966,7 +979,7 @@ pub const EmbeddingPipeline = struct {
                 img_size,
                 image.IMAGENET_MEAN,
                 image.IMAGENET_STD,
-                .{ .io = self.config.preprocess_io },
+                preprocess_options,
             ),
         }
         logEmbedTiming("image.preprocess.raster", batch, preprocess_start);
@@ -977,8 +990,20 @@ pub const EmbeddingPipeline = struct {
         pixel_values_owned = false;
         defer pv_tensor.deinit();
 
+        const retained_host_bytes = std.math.add(usize, raster_bytes, pixel_bytes) catch
+            return error.ResourceLimitExceeded;
+        try preprocess_permit.retainHostBytes(retained_host_bytes);
+
         self.lockExecution();
         defer self.unlockExecution();
+        var run_permit = try vs.admit(.{
+            .batch = batch,
+            .sequence = 1,
+            .input_bytes = pixel_bytes,
+            .host_preprocess_bytes = raster_bytes,
+            .pre_admitted_host_bytes = retained_host_bytes,
+        });
+        defer run_permit.deinit();
 
         if (self.visual_projection) |proj| {
             const resident = try self.tryEmbedResidentProjection(

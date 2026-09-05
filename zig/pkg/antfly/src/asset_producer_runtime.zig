@@ -232,6 +232,7 @@ pub const Runtime = struct {
             .execution = .{
                 .default_endpoint = options.inference_api_url,
                 .capability_cache = options.remote_capability_cache,
+                .http_client = http,
                 .io = http.io,
                 .routing = .{ .source_table = options.source_table },
             },
@@ -266,7 +267,11 @@ pub const Runtime = struct {
         client_config.max_response_size = max_asset_http_response_bytes;
         client_config.timeouts = httpx.Timeouts.uniform(max_asset_provider_timeout_ms);
         client_config.timeouts.request_ms = max_asset_provider_timeout_ms;
-        client.* = httpx.Client.initWithConfig(alloc, io, client_config);
+        // Compatibility waves and independent document workers share this
+        // transport concurrently. httpx uses its client allocator for
+        // request-local headers, URLs, and responses, so keep those allocations
+        // off a possibly arena-backed runtime owner.
+        client.* = httpx.Client.initWithConfig(std.heap.smp_allocator, io, client_config);
         errdefer client.deinit();
 
         const owned_default_endpoint = if (options.inference_api_url) |endpoint|
@@ -1493,6 +1498,13 @@ pub const Runtime = struct {
         for (tasks, requests) |*task, request| task.* = .{ .runtime = self, .request = request };
         errdefer for (tasks) |*task| if (task.output) |output| std.heap.smp_allocator.free(output);
 
+        const out = try alloc.alloc([]u8, requests.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |output| alloc.free(output);
+            alloc.free(out);
+        }
+
         var start: usize = 0;
         while (start < tasks.len) : (start += width) {
             const end = @min(start + width, tasks.len);
@@ -1500,20 +1512,18 @@ pub const Runtime = struct {
             for (tasks[start..end]) |*task| group.async(io, Task.run, .{task});
             try group.await(io);
             for (tasks[start..end]) |task| if (task.failure) |err| return err;
-        }
 
-        const out = try alloc.alloc([]u8, requests.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (out[0..initialized]) |output| alloc.free(output);
-            alloc.free(out);
-        }
-        for (tasks, out) |*task, *output| {
-            const temporary = task.output orelse return error.MissingAssetProducerOutput;
-            output.* = try alloc.dupe(u8, temporary);
-            initialized += 1;
-            std.heap.smp_allocator.free(temporary);
-            task.output = null;
+            // Transfer and release this wave before admitting the next one.
+            // Final caller-owned results necessarily scale with item count, but
+            // the thread-safe compatibility copies stay bounded by `width`
+            // instead of accumulating a second complete result set.
+            for (tasks[start..end], out[start..end]) |*task, *output| {
+                const temporary = task.output orelse return error.MissingAssetProducerOutput;
+                output.* = try alloc.dupe(u8, temporary);
+                initialized += 1;
+                std.heap.smp_allocator.free(temporary);
+                task.output = null;
+            }
         }
         return out;
     }
@@ -5265,6 +5275,8 @@ test "owned asset producer foreground contract follows the selected route" {
     const runtime = try Runtime.createOwned(alloc, io_impl.io(), .{ .antfly_provider = local.provider() });
     const producer = runtime.ownedProducer();
     defer producer.deinit(alloc);
+    try std.testing.expect(runtime.http.allocator.vtable == std.heap.smp_allocator.vtable);
+    try std.testing.expect(!runtime.http.config.cookies_enabled);
 
     try std.testing.expect(!try producer.foregroundBoundedForRequests(alloc, &.{.{
         .producer_type = .reader,

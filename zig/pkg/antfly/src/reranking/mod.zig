@@ -47,7 +47,14 @@ pub const Runtime = struct {
     pub fn init(alloc: std.mem.Allocator, io: std.Io) Runtime {
         return .{
             .io = io,
-            .http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = true }),
+            // Runtime.rerank admits concurrent requests. httpx uses its client
+            // allocator for request-local URLs, headers, and bodies as well as
+            // pool state, so an arena-backed cache owner is not a safe client
+            // allocator even though the connection pool synchronizes itself.
+            .http = httpx.Client.initWithConfig(std.heap.smp_allocator, io, .{
+                .keep_alive = true,
+                .cookies_enabled = false,
+            }),
             .credentials = google_auth.CredentialManager.init(alloc, io),
         };
     }
@@ -179,6 +186,8 @@ test "reranking runtime rejects saturation and expired work before provider disp
     defer io_impl.deinit();
     var runtime = Runtime.init(alloc, io_impl.io());
     defer runtime.deinit();
+    try std.testing.expect(runtime.http.allocator.vtable == std.heap.smp_allocator.vtable);
+    try std.testing.expect(!runtime.http.config.cookies_enabled);
     runtime.admission = request_admission.RequestAdmission.init(1);
     try std.testing.expect(runtime.admission.tryAcquire());
     defer runtime.admission.release();

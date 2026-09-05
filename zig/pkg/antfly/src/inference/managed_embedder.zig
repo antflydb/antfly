@@ -425,17 +425,49 @@ const BedrockCredentialPool = struct {
 /// embedders. API runtimes should own one of these for their full service
 /// lifetime so request-scoped embedders reuse credentials and refresh work.
 pub const ProviderRuntime = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
     google_credentials: google_auth.CredentialManager,
     bedrock_credentials: BedrockCredentialPool,
+    http_mutex: std.atomic.Mutex = .unlocked,
+    http_client: std.atomic.Value(?*httpx.Client) = .init(null),
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) ProviderRuntime {
         return .{
+            .alloc = alloc,
+            .io = io,
             .google_credentials = google_auth.CredentialManager.init(alloc, io),
             .bedrock_credentials = BedrockCredentialPool.init(alloc, io),
         };
     }
 
+    /// Lazily publish one service-scoped transport. Provider request objects
+    /// retain per-request URLs, authentication, cancellation, and deadlines;
+    /// the client owns only reusable DNS/TLS/connection state.
+    fn httpClient(self: *ProviderRuntime) !*httpx.Client {
+        if (self.http_client.load(.acquire)) |client| return client;
+        lockAtomic(&self.http_mutex);
+        defer self.http_mutex.unlock();
+        if (self.http_client.load(.acquire)) |client| return client;
+        const client = try self.alloc.create(httpx.Client);
+        errdefer self.alloc.destroy(client);
+        // Request-local URL/header/response allocations happen concurrently;
+        // keep them off a possibly arena-backed service owner allocator.
+        client.* = httpx.Client.initWithConfig(std.heap.smp_allocator, self.io, .{
+            .keep_alive = true,
+            .cookies_enabled = false,
+            .max_response_size = remote_embedding_max_response_bytes,
+            .timeouts = httpx.Timeouts.uniform(max_embedding_request_timeout_ms),
+        });
+        self.http_client.store(client, .release);
+        return client;
+    }
+
     pub fn deinit(self: *ProviderRuntime) void {
+        if (self.http_client.swap(null, .acq_rel)) |client| {
+            client.deinit();
+            self.alloc.destroy(client);
+        }
         self.bedrock_credentials.deinit();
         self.google_credentials.deinit();
         self.* = undefined;
@@ -747,6 +779,7 @@ pub const ManagedEmbeddingEntry = struct {
     /// Request-local overlays borrow this pointer, preserving connection/DNS/
     /// TLS state without moving client synchronization objects.
     shared_http_client: ?*httpx.Client = null,
+    provider_runtime: ?*ProviderRuntime = null,
     dimensions: u32,
     sparse: bool = false,
     multimodal: bool = false,
@@ -775,6 +808,7 @@ pub const ManagedEmbeddingEntry = struct {
 
     fn httpClient(self: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator, fallback: *?httpx.Client) !*httpx.Client {
         if (self.shared_http_client) |client| return client;
+        if (self.provider_runtime) |runtime| return runtime.httpClient();
         // Direct unit construction remains supported; production constructors
         // always attach the lifetime client below.
         fallback.* = httpx.Client.initWithConfig(alloc, try embeddingHttpIo(self), try embeddingHttpClientConfig(self));
@@ -1260,7 +1294,13 @@ pub const ManagedEmbedder = struct {
             }
             if (owned_pacer_scope_keys.len > 0) alloc.free(owned_pacer_scope_keys);
         }
-        const owned_http_client = try createManagedEmbeddingHttpClient(alloc, owned_entries);
+        for (owned_entries) |*entry| {
+            if (entry.antfly_provider == null) entry.provider_runtime = options.provider_runtime;
+        }
+        const owned_http_client = if (options.provider_runtime == null)
+            try createManagedEmbeddingHttpClient(alloc, owned_entries)
+        else
+            null;
         errdefer deinitManagedEmbeddingHttpClient(alloc, owned_http_client);
         if (owned_http_client) |client| for (owned_entries) |*entry| {
             if (entry.antfly_provider == null) entry.shared_http_client = client;
@@ -6463,8 +6503,17 @@ pub fn testManagedVertexCredentialManagerLifetime() !void {
 
     try std.testing.expect(first_request.owned_google_credentials == null);
     try std.testing.expect(second_request.owned_google_credentials == null);
+    try std.testing.expect(first_request.owned_http_client == null);
+    try std.testing.expect(second_request.owned_http_client == null);
     try std.testing.expect(first_request.entries[0].google_credentials == &provider_runtime.google_credentials);
     try std.testing.expect(second_request.entries[0].google_credentials == &provider_runtime.google_credentials);
+    var first_fallback: ?httpx.Client = null;
+    var second_fallback: ?httpx.Client = null;
+    const first_client = try first_request.entries[0].httpClient(std.testing.allocator, &first_fallback);
+    const second_client = try second_request.entries[0].httpClient(std.testing.allocator, &second_fallback);
+    try std.testing.expect(first_client == second_client);
+    try std.testing.expect(first_fallback == null);
+    try std.testing.expect(second_fallback == null);
 }
 
 test "request-scoped managed Vertex embedders borrow the service credential manager" {

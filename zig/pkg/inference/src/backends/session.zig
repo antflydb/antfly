@@ -167,10 +167,16 @@ pub const RunAdmission = struct {
             self.static_workspace_bytes,
             @max(dynamic_workspace, try self.profiledWorkspace(request)),
         );
+        const resident_input_bytes = try addBytes(request.host_preprocess_bytes, input_bytes);
+        // A preceding host-only permit may remain live across execution. Its
+        // retained bytes are an explicit credit, not permission to hide
+        // outputs or backend workspace from this run reservation.
+        if (request.pre_admitted_host_bytes > resident_input_bytes)
+            return error.ResourceLimitExceeded;
         const host_output_peak = try mulBytes(output_bytes, 2);
         const host_io_peak = try addBytes(
-            request.host_preprocess_bytes,
-            try addBytes(input_bytes, host_output_peak),
+            resident_input_bytes - request.pre_admitted_host_bytes,
+            host_output_peak,
         );
 
         return switch (self.backend_class) {
@@ -228,6 +234,11 @@ pub const RunRequest = struct {
     sequence: usize = 1,
     input_bytes: usize = 0,
     host_preprocess_bytes: usize = 0,
+    /// Host input bytes still covered by a separate live permit. This credit
+    /// is limited to input + preprocessing residency and lets callers compose
+    /// CPU preprocessing with backend execution without a release/reacquire
+    /// gap or transient double charge.
+    pre_admitted_host_bytes: usize = 0,
 
     pub fn fromTensors(tensors: []const Tensor) !RunRequest {
         var input_bytes: usize = 0;
@@ -490,6 +501,13 @@ pub const RunPermit = struct {
         return run_resident(self.session.ptr, inputs, request, allocator);
     }
 
+    /// Reduce a host-only preprocessing lease to the bytes that remain live
+    /// as model inputs. The retained permit can then be composed with a run
+    /// request carrying the same `pre_admitted_host_bytes` credit.
+    pub fn retainHostBytes(self: *RunPermit, bytes: usize) !void {
+        if (self.lease) |*lease| try lease.retain(.{ .host_scratch_bytes = bytes });
+    }
+
     pub fn deinit(self: *RunPermit) void {
         if (self.lease) |*lease| lease.release();
         self.lease = null;
@@ -648,6 +666,48 @@ test "run admission scales dynamic outputs and honors reserved backend workspace
     try std.testing.expectEqual(@as(usize, 128), controller.snapshot().host_scratch_bytes);
     preprocess_permit.deinit();
     try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+
+    const composed_request = RunRequest{
+        .batch = 2,
+        .sequence = 4,
+        .input_bytes = 64,
+        .host_preprocess_bytes = 128,
+    };
+    const full_composed_amounts = try cpu.estimateRequest(
+        composed_request,
+        admitted_session.outputInfo(),
+    );
+    var retained_preprocess = try admitted_session.admitHostPreprocess(512);
+    try retained_preprocess.retainHostBytes(192);
+    try std.testing.expectEqual(@as(usize, 192), controller.snapshot().host_scratch_bytes);
+    var credited_request = composed_request;
+    credited_request.pre_admitted_host_bytes = 192;
+    const credited_amounts = try cpu.estimateRequest(
+        credited_request,
+        admitted_session.outputInfo(),
+    );
+    try std.testing.expectEqual(
+        full_composed_amounts.host_scratch_bytes - 192,
+        credited_amounts.host_scratch_bytes,
+    );
+    var composed_run = try admitted_session.admit(credited_request);
+    try std.testing.expectEqual(
+        credited_amounts.host_scratch_bytes,
+        composed_run.lease.?.amounts.host_scratch_bytes,
+    );
+    try std.testing.expectEqual(
+        full_composed_amounts.host_scratch_bytes,
+        controller.snapshot().host_scratch_bytes,
+    );
+    composed_run.deinit();
+    try std.testing.expectEqual(@as(usize, 192), controller.snapshot().host_scratch_bytes);
+    retained_preprocess.deinit();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+    credited_request.pre_admitted_host_bytes = 193;
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        admitted_session.admit(credited_request),
+    );
 
     const profiled = RunAdmission{
         .controller = &controller,

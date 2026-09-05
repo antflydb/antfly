@@ -26872,7 +26872,10 @@ fn chunkProviderForRuntime(
         result.boundary_dispatch = resolved.boundary_dispatch;
         result.chunk_input_with_context_callback = @ptrCast(chunk_input);
     };
-    return try result.ownExecutionStrings(alloc);
+    var owned = try result.ownExecutionStrings(alloc);
+    errdefer owned.deinit();
+    if (io) |runtime_io| try owned.attachOwnedHttpClient(runtime_io);
+    return owned;
 }
 
 test "remote chunk runtime services do not require a local callback provider" {
@@ -26885,6 +26888,7 @@ test "remote chunk runtime services do not require a local callback provider" {
     try std.testing.expect(context.chunk_input_callback == null);
     try std.testing.expect(context.chunk_input_with_context_callback == null);
     try std.testing.expect(context.execution.capability_cache.? == &cache);
+    try std.testing.expect(context.execution.http_client == null);
     try std.testing.expectEqualStrings("http://inference", context.execution.default_endpoint.?);
     try std.testing.expectEqualStrings("docs", context.execution.routing.source_table);
     try std.testing.expect(try chunkProviderForRuntime(std.testing.allocator, null, null, null, null, "") == null);

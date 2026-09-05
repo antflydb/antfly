@@ -151,8 +151,15 @@ pub fn chunkInputWithProvider(
         break :blk fallback_io.?.io();
     };
 
-    var http = httpx.Client.init(alloc, io);
-    defer http.deinit();
+    var fallback_http: ?httpx.Client = null;
+    defer if (fallback_http) |*client| client.deinit();
+    const http = execution.http_client orelse blk: {
+        fallback_http = httpx.Client.initWithConfig(alloc, io, .{
+            .keep_alive = false,
+            .cookies_enabled = false,
+        });
+        break :blk &fallback_http.?;
+    };
 
     var fallback_capability_cache: ?remote_capabilities.Cache = null;
     defer if (fallback_capability_cache) |*cache| cache.deinit();
@@ -166,7 +173,7 @@ pub fn chunkInputWithProvider(
     const routing_header_count = try execution.routing.appendHeaders(&routing_header_storage, 0);
     const routing_headers = routing_header_storage[0..routing_header_count];
     const capability_lease = try capability_cache.?.getOrDiscoverLeaseWithContext(
-        &http,
+        http,
         endpoint,
         model,
         .chunk,

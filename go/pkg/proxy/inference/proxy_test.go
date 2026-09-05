@@ -1153,8 +1153,8 @@ func TestRegistryCatalogSnapshotFencesAuthorizationAndIncarnation(t *testing.T) 
 		"reader-a": {"read": true},
 	})
 
-	if snapshot, ok := registry.catalogSnapshotAtIncarnation(address, incarnation, "Bearer tenant-a"); !ok || string(snapshot) != body {
-		t.Fatalf("matching snapshot = %q, %t", snapshot, ok)
+	if snapshot, ok := registry.catalogSnapshotAtIncarnation(address, incarnation, "Bearer tenant-a"); !ok || string(snapshot["readers"]["reader-a"]) != `{}` {
+		t.Fatalf("matching snapshot = %v, %t", snapshot, ok)
 	}
 	if _, ok := registry.catalogSnapshotAtIncarnation(address, incarnation, "Bearer tenant-b"); ok {
 		t.Fatal("catalog crossed authorization authority")
@@ -3699,12 +3699,55 @@ func TestChunkCatalogAliasesNormalizeAcrossMixedVersions(t *testing.T) {
 		t.Fatal("canonical fixed request did not match legacy fixed_bert catalog")
 	}
 	merged := make(map[string]map[string]json.RawMessage)
-	mergeModelCatalog(merged, legacy)
+	mergeModelCatalog(merged, legacy, make(map[string]bool))
 	if _, ok := merged["chunkers"]["fixed"]; !ok {
 		t.Fatalf("legacy chunk alias was not normalized: %#v", merged["chunkers"])
 	}
 	if _, ok := merged["chunkers"]["fixed_bert"]; ok {
 		t.Fatalf("legacy alias leaked into merged catalog: %#v", merged["chunkers"])
+	}
+}
+
+func TestMergedCatalogAccountingBoundsEncodedCompatibilityResponse(t *testing.T) {
+	source := map[string]json.RawMessage{
+		"readers":   json.RawMessage(`{"reader\n\"one":{"inference_capabilities":{"accepted_mime_types":["image/png"]}},"legacy":{"description":"<>&"}}`),
+		"embedders": json.RawMessage(`{"reader\n\"one":{},"embedder\\two":{"inputs":["image"]}}`),
+	}
+	categories := make(map[string]map[string]json.RawMessage)
+	names := make(map[string]bool)
+	upperBound := len(`{"data":[]}`) + mergeModelCatalog(categories, source, names)
+	response := make(map[string]any, len(categories)+1)
+	for category, models := range categories {
+		response[category] = models
+	}
+	ids := make([]map[string]string, 0, len(names))
+	for name := range names {
+		ids = append(ids, map[string]string{"id": name})
+	}
+	response["data"] = ids
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > upperBound {
+		t.Fatalf("encoded catalog length %d exceeded conservative bound %d: %s", len(encoded), upperBound, encoded)
+	}
+}
+
+func TestCanonicalModelCatalogSnapshotNormalizesOnceAndChargesObjects(t *testing.T) {
+	body := []byte(`{"chunkers":{"fixed_bert":{"inputs":["text"]}},"readers":{"ocr":{"inference_capabilities":"invalid"}}}`)
+	snapshot, charge, err := parseCanonicalModelCatalog(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := snapshot["chunkers"]["fixed"]; !ok {
+		t.Fatalf("chunk alias was not canonicalized: %#v", snapshot["chunkers"])
+	}
+	if got := string(snapshot["readers"]["ocr"]); got != `{}` {
+		t.Fatalf("invalid capability descriptor was not poisoned: %s", got)
+	}
+	if charge <= int64(len(body)) {
+		t.Fatalf("snapshot charge %d did not include object overhead above body %d", charge, len(body))
 	}
 }
 
@@ -5170,13 +5213,13 @@ func TestScopedCatalogRequiresProcessWideByteAdmission(t *testing.T) {
 func TestScopedCatalogReducesFanoutToFitRetainedByteLimit(t *testing.T) {
 	t.Parallel()
 
-	const retainedLimit = int64(64 << 20)
+	const retainedLimit = int64(80 << 20)
 	workers, reservation, err := modelCatalogFanoutPlan(2, retainedLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if workers != 1 || reservation != 56<<20 {
-		t.Fatalf("plan = %d workers, %d bytes; want 1 worker, %d bytes", workers, reservation, 56<<20)
+	if workers != 1 || reservation != 72<<20 {
+		t.Fatalf("plan = %d workers, %d bytes; want 1 worker, %d bytes", workers, reservation, 72<<20)
 	}
 
 	p := NewProxy(Config{

@@ -9,6 +9,7 @@
 //! future task families from independently inventing localhost fallbacks.
 
 const std = @import("std");
+const httpx = @import("httpx");
 const remote_capabilities = @import("remote_capabilities.zig");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const platform_time = @import("antfly_platform").time;
@@ -56,6 +57,12 @@ pub const InferenceExecutionContext = struct {
     /// with their own hard limit rather than treating it as permission to
     /// allocate more.
     max_response_bytes: ?usize = null,
+    /// Optional provider-runtime transport. Keep new execution context fields
+    /// append-only because this value crosses checked linked task boundaries.
+    /// The context borrows this pointer; task adapters must not destroy it or
+    /// retain it beyond their durable provider owner. Standalone invocations
+    /// may create a call-scoped compatibility client when it is absent.
+    http_client: ?*httpx.Client = null,
 
     pub fn resolveAntflyEndpoint(
         self: InferenceExecutionContext,

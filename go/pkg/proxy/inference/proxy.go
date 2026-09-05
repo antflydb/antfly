@@ -119,12 +119,16 @@ type Endpoint struct {
 	// yet. Bootstrap endpoints participate only in task-unscoped legacy lookup;
 	// executable routes require a discovered per-model operation.
 	catalogKnown bool
-	// catalogBody is the bounded, immutable discovery response captured by the
+	// catalogSnapshot is the bounded, immutable discovery response captured by the
 	// health refresher for this exact endpoint incarnation and authorization
 	// authority. Scoped /models requests can reuse it instead of refetching the
 	// same catalog from every node. It remains private registry state because a
 	// caller credential must never observe a catalog fetched with another one.
-	catalogBody                []byte
+	// Maps and RawMessages are never mutated after publication, so readers may
+	// borrow the snapshot after dropping the registry lock; Go's GC retains the
+	// replaced generation until the last request releases it.
+	catalogSnapshot            modelCatalogSnapshot
+	catalogSnapshotChargeBytes int64
 	catalogAuthorizationDigest [sha256.Size]byte
 	catalogCapturedAt          time.Time
 	runtime                    *endpointRuntime
@@ -510,8 +514,9 @@ func (r *ModelRegistry) clearCatalogSnapshotLocked(endpoint *Endpoint) {
 	if endpoint == nil {
 		return
 	}
-	r.catalogSnapshotBytes -= int64(len(endpoint.catalogBody))
-	endpoint.catalogBody = nil
+	r.catalogSnapshotBytes -= endpoint.catalogSnapshotChargeBytes
+	endpoint.catalogSnapshot = nil
+	endpoint.catalogSnapshotChargeBytes = 0
 	endpoint.catalogAuthorizationDigest = [sha256.Size]byte{}
 	endpoint.catalogCapturedAt = time.Time{}
 }
@@ -753,6 +758,14 @@ func (r *ModelRegistry) updateModelCatalogForEndpoint(address string, expected *
 	}
 	sort.Strings(models)
 
+	// Parse, validate, and own the immutable snapshot outside the registry write
+	// lock. Publication below is one pointer replacement.
+	var snapshot modelCatalogSnapshot
+	snapshotChargeBytes := int64(0)
+	if int64(len(body)) <= maxRegistryCatalogSnapshotBytes {
+		snapshot, snapshotChargeBytes, _ = parseCanonicalModelCatalog(body)
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ep := r.endpoints[address]
@@ -761,13 +774,13 @@ func (r *ModelRegistry) updateModelCatalogForEndpoint(address string, expected *
 	}
 	r.updateModelsForEndpointLocked(ep, address, models, operations, true)
 	r.clearCatalogSnapshotLocked(ep)
-	if int64(len(body)) > maxRegistryCatalogSnapshotBytes {
+	if snapshot == nil || snapshotChargeBytes <= 0 || snapshotChargeBytes > maxRegistryCatalogSnapshotBytes {
 		return
 	}
-	for r.catalogSnapshotBytes+int64(len(body)) > maxRegistryCatalogSnapshotBytes {
+	for r.catalogSnapshotBytes+snapshotChargeBytes > maxRegistryCatalogSnapshotBytes {
 		var oldest *Endpoint
 		for _, candidate := range r.endpoints {
-			if candidate == ep || len(candidate.catalogBody) == 0 {
+			if candidate == ep || candidate.catalogSnapshot == nil {
 				continue
 			}
 			if oldest == nil || candidate.catalogCapturedAt.Before(oldest.catalogCapturedAt) {
@@ -779,13 +792,14 @@ func (r *ModelRegistry) updateModelCatalogForEndpoint(address string, expected *
 		}
 		r.clearCatalogSnapshotLocked(oldest)
 	}
-	ep.catalogBody = bytes.Clone(body)
+	ep.catalogSnapshot = snapshot
+	ep.catalogSnapshotChargeBytes = snapshotChargeBytes
 	ep.catalogAuthorizationDigest = sha256.Sum256([]byte(authorization))
 	ep.catalogCapturedAt = time.Now()
-	r.catalogSnapshotBytes += int64(len(ep.catalogBody))
+	r.catalogSnapshotBytes += snapshotChargeBytes
 }
 
-func (r *ModelRegistry) catalogSnapshotAtIncarnation(address string, incarnation uint64, authorization string) ([]byte, bool) {
+func (r *ModelRegistry) catalogSnapshotAtIncarnation(address string, incarnation uint64, authorization string) (modelCatalogSnapshot, bool) {
 	digest := sha256.Sum256([]byte(authorization))
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -793,7 +807,7 @@ func (r *ModelRegistry) catalogSnapshotAtIncarnation(address string, incarnation
 	if !r.catalogSnapshotMatchesLocked(ep, incarnation, digest, time.Now()) {
 		return nil, false
 	}
-	return bytes.Clone(ep.catalogBody), true
+	return ep.catalogSnapshot, true
 }
 
 func (r *ModelRegistry) catalogSnapshotFreshAtIncarnation(address string, incarnation uint64, authorization string) bool {
@@ -804,7 +818,7 @@ func (r *ModelRegistry) catalogSnapshotFreshAtIncarnation(address string, incarn
 }
 
 func (r *ModelRegistry) catalogSnapshotMatchesLocked(ep *Endpoint, incarnation uint64, digest [sha256.Size]byte, now time.Time) bool {
-	return ep != nil && ep.incarnation == incarnation && len(ep.catalogBody) > 0 &&
+	return ep != nil && ep.incarnation == incarnation && ep.catalogSnapshot != nil &&
 		ep.catalogAuthorizationDigest == digest && now.Sub(ep.catalogCapturedAt) <= r.catalogSnapshotMaxAge()
 }
 
@@ -2708,7 +2722,13 @@ const maxRegistryCatalogSnapshotBytes int64 = 64 << 20
 const minRegistryCatalogSnapshotAge = 30 * time.Second
 const maxRegistryCatalogSnapshotAge = 5 * time.Minute
 const maxConcurrentModelCatalogRequests = 8
-const maxModelCatalogWorkingBytes = 3 * maxModelCatalogBytes
+
+// One worker may simultaneously retain the wire body, top-level RawMessages,
+// one decoded category, and the canonical immutable snapshot. Keep this tied
+// to the wire ceiling rather than relying on average descriptor density.
+const maxModelCatalogWorkingBytes = 5 * maxModelCatalogBytes
+const maxModelCatalogModels = 8192
+const maxModelCatalogNameBytes = 4 << 10
 
 func modelCatalogFanoutPlan(endpointCount int, retainedByteLimit int64) (workerCount int, reservationBytes int64, err error) {
 	if endpointCount <= 0 {
@@ -2826,7 +2846,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	type catalogResult struct {
 		target   catalogTarget
-		catalog  map[string]json.RawMessage
+		catalog  modelCatalogSnapshot
 		eligible bool
 		err      error
 	}
@@ -2839,7 +2859,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	for range workerCount {
 		go func() {
 			for target := range jobs {
-				body, cached := p.registry.catalogSnapshotAtIncarnation(target.address, target.incarnation, authorization)
+				catalog, cached := p.registry.catalogSnapshotAtIncarnation(target.address, target.incarnation, authorization)
 				if !cached {
 					address := target.address
 					request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(address, "/")+"/ai/v1/models", nil)
@@ -2860,19 +2880,19 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 						results <- catalogResult{err: fmt.Errorf("upstream catalog returned %d", response.StatusCode)}
 						continue
 					}
-					body, err = io.ReadAll(io.LimitReader(response.Body, maxModelCatalogBytes+1))
+					body, err := io.ReadAll(io.LimitReader(response.Body, maxModelCatalogBytes+1))
 					_ = response.Body.Close()
 					if err != nil || len(body) > maxModelCatalogBytes {
 						results <- catalogResult{err: errors.New("upstream model catalog is unreadable or too large")}
 						continue
 					}
+					catalog, _, err = parseCanonicalModelCatalog(body)
+					if err != nil {
+						results <- catalogResult{err: err}
+						continue
+					}
 				}
-				var catalog map[string]json.RawMessage
-				if err := json.Unmarshal(body, &catalog); err != nil {
-					results <- catalogResult{err: err}
-					continue
-				}
-				if model != "" && !catalogContainsTaskModel(catalog, taskScope, model) {
+				if model != "" && !canonicalCatalogContainsTaskModel(catalog, taskScope, model) {
 					results <- catalogResult{target: target}
 					continue
 				}
@@ -2882,6 +2902,11 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	categories := map[string]map[string]json.RawMessage{}
+	modelNames := map[string]bool{}
+	// Includes the outer object and the always-present compatibility data list.
+	// Merge helpers add conservative JSON-escaped bytes incrementally, avoiding
+	// a full O(catalog) rescan after every endpoint.
+	mergedCatalogBytes := len(`{"data":[]}`)
 	successes := 0
 	failures := 0
 	mergedTooLarge := false
@@ -2909,12 +2934,18 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 			operations:  operations,
 		}
 		if !mergedTooLarge {
+			var added int
 			if model != "" {
-				mergeScopedModelCatalog(categories, result.catalog, taskScope, model)
+				added = mergeCanonicalScopedModelCatalog(categories, result.catalog, taskScope, model, modelNames)
 			} else {
-				mergeModelCatalog(categories, result.catalog)
+				added = mergeCanonicalModelCatalog(categories, result.catalog, modelNames)
 			}
-			mergedTooLarge = modelCatalogEncodedBytes(categories) > maxMergedModelCatalogBytes
+			if added > math.MaxInt-mergedCatalogBytes {
+				mergedTooLarge = true
+			} else {
+				mergedCatalogBytes += added
+				mergedTooLarge = mergedCatalogBytes > maxMergedModelCatalogBytes
+			}
 		}
 	}
 	if mergedTooLarge {
@@ -2930,13 +2961,9 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	modelNames := map[string]bool{}
 	response := make(map[string]any, len(categories)+1)
 	for category, models := range categories {
 		response[category] = models
-		for model := range models {
-			modelNames[model] = true
-		}
 	}
 	names := make([]string, 0, len(modelNames))
 	for model := range modelNames {
@@ -2951,6 +2978,13 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	responseBody, err := json.Marshal(response)
 	if err != nil {
 		http.Error(w, "failed to encode merged inference model catalog", http.StatusInternalServerError)
+		return
+	}
+	// The incremental counter is intentionally conservative, but retain an exact
+	// assertion at the serialization boundary so future response fields cannot
+	// silently escape the process admission contract.
+	if len(responseBody) > maxMergedModelCatalogBytes {
+		http.Error(w, "merged inference model catalog is too large", http.StatusBadGateway)
 		return
 	}
 	descriptorDigest := sha256.Sum256(responseBody)
@@ -3285,6 +3319,13 @@ func catalogContainsTaskModel(catalog map[string]json.RawMessage, scope catalogT
 	return ok
 }
 
+type modelCatalogSnapshot map[string]map[string]json.RawMessage
+
+func canonicalCatalogContainsTaskModel(catalog modelCatalogSnapshot, scope catalogTaskScope, model string) bool {
+	_, ok := catalogModelDescriptor(catalog[scope.Category], scope.Category, model)
+	return ok
+}
+
 func canonicalCatalogModel(category, model string) string {
 	if category == "chunkers" {
 		return canonicalChunkModel(model)
@@ -3305,16 +3346,75 @@ func catalogModelDescriptor(models map[string]json.RawMessage, category, model s
 	return nil, false
 }
 
-func modelCatalogEncodedBytes(categories map[string]map[string]json.RawMessage) int {
-	total := 0
-	for category, models := range categories {
-		total += len(category)
-		for model, descriptor := range models {
-			model = canonicalCatalogModel(category, model)
-			total += len(model) + len(descriptor)
-		}
+func catalogJSONQuotedUpperBound(value string) int {
+	// encoding/json emits at most one six-byte escape per input byte, plus quotes.
+	if len(value) > (math.MaxInt-2)/6 {
+		return math.MaxInt
 	}
-	return total
+	return 2 + 6*len(value)
+}
+
+func catalogSizeAdd(total, amount int) int {
+	if amount > 0 && total > math.MaxInt-amount {
+		return math.MaxInt
+	}
+	return total + amount
+}
+
+func catalogSnapshotChargeAdd(total int64, amount int) int64 {
+	if amount < 0 || total > math.MaxInt64-int64(amount) {
+		return math.MaxInt64
+	}
+	return total + int64(amount)
+}
+
+func mergeCatalogModel(
+	target map[string]map[string]json.RawMessage,
+	category string,
+	model string,
+	descriptor json.RawMessage,
+	modelNames map[string]bool,
+) int {
+	return mergeCanonicalCatalogModel(target, category, model, sanitizeModelDescriptor(descriptor), modelNames)
+}
+
+func mergeCanonicalCatalogModel(
+	target map[string]map[string]json.RawMessage,
+	category string,
+	model string,
+	descriptor json.RawMessage,
+	modelNames map[string]bool,
+) int {
+	added := 0
+	models := target[category]
+	if models == nil {
+		models = make(map[string]json.RawMessage)
+		target[category] = models
+		// Comma, escaped category key, colon, and the category object braces.
+		added = catalogSizeAdd(added, catalogJSONQuotedUpperBound(category))
+		added = catalogSizeAdd(added, 4)
+	}
+
+	model = canonicalCatalogModel(category, model)
+	if existing, duplicate := models[model]; duplicate {
+		replacement := conservativeModelDescriptor(existing, descriptor)
+		models[model] = replacement
+		return catalogSizeAdd(added, len(replacement)-len(existing))
+	}
+
+	models[model] = append(json.RawMessage(nil), descriptor...)
+	// A leading comma is charged for every member; this overcounts the first and
+	// makes the bound independent of map ordering.
+	added = catalogSizeAdd(added, 1)
+	added = catalogSizeAdd(added, catalogJSONQuotedUpperBound(model))
+	added = catalogSizeAdd(added, 1+len(descriptor))
+	if !modelNames[model] {
+		modelNames[model] = true
+		// Compatibility data item: comma + {"id":<escaped model>}.
+		added = catalogSizeAdd(added, 1+len(`{"id":}`))
+		added = catalogSizeAdd(added, catalogJSONQuotedUpperBound(model))
+	}
+	return added
 }
 
 var modelCatalogCategories = []string{
@@ -3322,7 +3422,73 @@ var modelCatalogCategories = []string{
 	"extractors", "rewriters", "transcribers",
 }
 
-func mergeModelCatalog(target map[string]map[string]json.RawMessage, source map[string]json.RawMessage) {
+// parseCanonicalModelCatalog pays JSON validation and descriptor normalization
+// once per endpoint generation. The returned nested maps and RawMessages are
+// immutable after publication, so request fan-out can borrow them without a
+// body clone or repeated category parsing. The charge includes a deliberately
+// generous per-map/member allowance in addition to owned key and payload
+// bytes; it bounds the cache's Go object overhead rather than counting only the
+// original wire representation.
+func parseCanonicalModelCatalog(body []byte) (modelCatalogSnapshot, int64, error) {
+	var rawCatalog map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rawCatalog); err != nil {
+		return nil, 0, err
+	}
+	snapshot := make(modelCatalogSnapshot)
+	charge := int64(256) // outer map and allocation metadata
+	for _, category := range modelCatalogCategories {
+		raw, ok := rawCatalog[category]
+		if !ok {
+			continue
+		}
+		var rawModels map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &rawModels); err != nil {
+			continue
+		}
+		if len(rawModels) > maxModelCatalogModels {
+			return nil, 0, errors.New("upstream model catalog has too many models")
+		}
+		models := make(map[string]json.RawMessage, len(rawModels))
+		charge = catalogSnapshotChargeAdd(charge, len(category)+256)
+		for model, descriptor := range rawModels {
+			if len(model) == 0 || len(model) > maxModelCatalogNameBytes {
+				return nil, 0, errors.New("upstream model catalog contains an invalid model name")
+			}
+			model = canonicalCatalogModel(category, model)
+			descriptor = sanitizeModelDescriptor(descriptor)
+			if existing, duplicate := models[model]; duplicate {
+				descriptor = conservativeModelDescriptor(existing, descriptor)
+			}
+			models[model] = append(json.RawMessage(nil), descriptor...)
+			// Covers string/slice headers, hash buckets, allocator size classes,
+			// and GC metadata as well as the owned key and descriptor payload.
+			charge = catalogSnapshotChargeAdd(charge, len(model)+len(descriptor)+256)
+		}
+		snapshot[category] = models
+	}
+	return snapshot, charge, nil
+}
+
+func mergeCanonicalModelCatalog(target map[string]map[string]json.RawMessage, source modelCatalogSnapshot, modelNames map[string]bool) int {
+	added := 0
+	for _, category := range modelCatalogCategories {
+		for model, descriptor := range source[category] {
+			added = catalogSizeAdd(added, mergeCanonicalCatalogModel(target, category, model, descriptor, modelNames))
+		}
+	}
+	return added
+}
+
+func mergeCanonicalScopedModelCatalog(target map[string]map[string]json.RawMessage, source modelCatalogSnapshot, scope catalogTaskScope, model string, modelNames map[string]bool) int {
+	descriptor, ok := catalogModelDescriptor(source[scope.Category], scope.Category, model)
+	if !ok {
+		return 0
+	}
+	return mergeCanonicalCatalogModel(target, scope.Category, model, descriptor, modelNames)
+}
+
+func mergeModelCatalog(target map[string]map[string]json.RawMessage, source map[string]json.RawMessage, modelNames map[string]bool) int {
+	added := 0
 	for _, category := range modelCatalogCategories {
 		raw, ok := source[category]
 		if !ok {
@@ -3332,41 +3498,24 @@ func mergeModelCatalog(target map[string]map[string]json.RawMessage, source map[
 		if err := json.Unmarshal(raw, &models); err != nil {
 			continue
 		}
-		if target[category] == nil {
-			target[category] = make(map[string]json.RawMessage)
-		}
 		for model, descriptor := range models {
-			model = canonicalCatalogModel(category, model)
-			descriptor = sanitizeModelDescriptor(descriptor)
-			if existing, duplicate := target[category][model]; duplicate {
-				target[category][model] = conservativeModelDescriptor(existing, descriptor)
-			} else {
-				target[category][model] = append(json.RawMessage(nil), descriptor...)
-			}
+			added = catalogSizeAdd(added, mergeCatalogModel(target, category, model, descriptor, modelNames))
 		}
 	}
+	return added
 }
 
-func mergeScopedModelCatalog(target map[string]map[string]json.RawMessage, source map[string]json.RawMessage, scope catalogTaskScope, model string) {
+func mergeScopedModelCatalog(target map[string]map[string]json.RawMessage, source map[string]json.RawMessage, scope catalogTaskScope, model string, modelNames map[string]bool) int {
 	raw := source[scope.Category]
 	var models map[string]json.RawMessage
 	if json.Unmarshal(raw, &models) != nil {
-		return
+		return 0
 	}
 	descriptor, ok := catalogModelDescriptor(models, scope.Category, model)
 	if !ok {
-		return
+		return 0
 	}
-	if target[scope.Category] == nil {
-		target[scope.Category] = make(map[string]json.RawMessage)
-	}
-	model = canonicalCatalogModel(scope.Category, model)
-	descriptor = sanitizeModelDescriptor(descriptor)
-	if existing, duplicate := target[scope.Category][model]; duplicate {
-		target[scope.Category][model] = conservativeModelDescriptor(existing, descriptor)
-	} else {
-		target[scope.Category][model] = append(json.RawMessage(nil), descriptor...)
-	}
+	return mergeCatalogModel(target, scope.Category, model, descriptor, modelNames)
 }
 
 // Capability descriptors are admission contracts, so a malformed descriptor
@@ -3379,7 +3528,14 @@ func sanitizeModelDescriptor(raw json.RawMessage) json.RawMessage {
 	}
 	capabilities, found := descriptor["inference_capabilities"]
 	if !found {
-		return append(json.RawMessage(nil), raw...)
+		// Canonicalize legacy descriptors too. Keeping arbitrary RawMessage here
+		// would let the outer encoder expand HTML-sensitive string bytes after
+		// incremental response-size admission had already accepted the catalog.
+		normalized, err := json.Marshal(descriptor)
+		if err != nil {
+			return json.RawMessage(`{}`)
+		}
+		return normalized
 	}
 	capabilityMap, ok := capabilities.(map[string]any)
 	if !ok {
