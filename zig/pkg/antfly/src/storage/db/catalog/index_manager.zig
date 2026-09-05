@@ -714,12 +714,13 @@ pub const TextPublicationPlan = struct {
 /// callers then validate TextPublicationContext once more before publishing.
 pub const PreparedTextMapperPublication = struct {
     alloc: Allocator,
+    segment_alloc: Allocator,
     segments: [][]u8 = &.{},
     observed_field_analyzers: []mapper.ObservedFieldAnalyzer = &.{},
 
     pub fn deinit(self: *PreparedTextMapperPublication) void {
         for (self.segments) |segment| {
-            if (segment.len > 0) self.alloc.free(segment);
+            if (segment.len > 0) self.segment_alloc.free(segment);
         }
         if (self.segments.len > 0) self.alloc.free(self.segments);
         for (self.observed_field_analyzers) |item| {
@@ -2755,24 +2756,16 @@ pub const IndexManager = struct {
     fn acquireSchemaVersionView(self: *IndexManager, version: u32) !schema_registry_mod.SchemaView {
         const registry = self.schema_registry orelse return error.SchemaRegistryUnavailable;
         if (registry.acquireVersion(version)) |view| return view;
+        registry.lockHistoricalFault();
+        defer registry.unlockHistoricalFault();
+        if (registry.acquireVersion(version)) |view| return view;
         const store = self.primary_store orelse return error.SchemaRegistryUnavailable;
         const historical = try schema_mod.loadSchemaVersion(store, self.alloc, version) orelse
             return error.UnknownSchemaVersion;
         var historical_owned = true;
         errdefer if (historical_owned) schema_mod.freeSchema(self.alloc, historical);
-        const public_key = try schema_api.versionedSchemaKeyAlloc(self.alloc, version);
-        defer self.alloc.free(public_key);
-        const public_json = store.get(self.alloc, public_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
-        defer if (public_json) |json| self.alloc.free(json);
-        var validator = if (public_json) |json| try schema_api.CompiledTableValidator.init(self.alloc, json) else null;
-        var validator_owned = validator != null;
-        errdefer if (validator_owned) validator.?.deinit(self.alloc);
-        const epoch = try schema_registry_mod.Epoch.createOwnedValidated(self.alloc, historical, validator);
+        const epoch = try schema_registry_mod.Epoch.createOwned(self.alloc, historical);
         historical_owned = false;
-        validator_owned = false;
         errdefer epoch.release();
         return try registry.installHistorical(epoch);
     }
@@ -12268,15 +12261,16 @@ pub const IndexManager = struct {
             return error.TextProjectionChanged;
         }
 
+        const segment_alloc = entry.persistent.alloc;
         var segments = std.ArrayListUnmanaged([]u8).empty;
         errdefer {
-            for (segments.items) |segment| alloc.free(segment);
+            for (segments.items) |segment| segment_alloc.free(segment);
             segments.deinit(alloc);
         }
         var observed = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
         errdefer freeOwnedObservedFieldAnalyzers(alloc, &observed);
 
-        if (docs.len == 0) return .{ .alloc = alloc };
+        if (docs.len == 0) return .{ .alloc = alloc, .segment_alloc = segment_alloc };
 
         var filtered = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
         defer filtered.deinit(alloc);
@@ -12285,7 +12279,7 @@ pub const IndexManager = struct {
             if (!try textIndexShouldConsumeDoc(self, entry, doc.key)) continue;
             try filtered.append(alloc, doc);
         }
-        if (filtered.items.len == 0) return .{ .alloc = alloc };
+        if (filtered.items.len == 0) return .{ .alloc = alloc, .segment_alloc = segment_alloc };
 
         const source_target_bytes = textProjectionSourceBuildTargetBytes();
         var start: usize = 0;
@@ -12318,7 +12312,7 @@ pub const IndexManager = struct {
                 const runtime_index_sort = if (entry.runtime_schema) |schema| schema.index_sort else &.{};
                 const index_sort = try textIndexSortFieldsForSegmentAlloc(arena, runtime_index_sort);
                 const built = try mapper.buildTextSegmentsFromProjectionBatch(
-                    alloc,
+                    segment_alloc,
                     projection_batch,
                     entry.text_analysis,
                     .{
@@ -12332,12 +12326,12 @@ pub const IndexManager = struct {
                 );
                 if (built.len > 0) {
                     segments.ensureUnusedCapacity(alloc, built.len) catch |err| {
-                        for (built) |segment| alloc.free(segment);
-                        alloc.free(built);
+                        for (built) |segment| segment_alloc.free(segment);
+                        segment_alloc.free(built);
                         return err;
                     };
                     for (built) |segment| segments.appendAssumeCapacity(segment);
-                    alloc.free(built);
+                    segment_alloc.free(built);
                 }
             }
             start = end;
@@ -12345,6 +12339,7 @@ pub const IndexManager = struct {
 
         return .{
             .alloc = alloc,
+            .segment_alloc = segment_alloc,
             .segments = try segments.toOwnedSlice(alloc),
             .observed_field_analyzers = try observed.toOwnedSlice(alloc),
         };
@@ -13040,9 +13035,9 @@ pub const IndexManager = struct {
 
     /// Publish a segment set produced by prepareTextMapperDocsPublication.
     /// The caller owns the managed-index apply guard and has revalidated the
-    /// matching publication context. Persistent indexes may use a different
-    /// allocator than the request pipeline, so publication copies into the
-    /// index's ownership domain; the prepared bytes remain retry-safe.
+    /// matching publication context. Preparation allocates segment bytes in the
+    /// persistent index's ownership domain, so publication transfers them
+    /// without copying large immutable buffers under the apply guard.
     pub fn applyPreparedTextMapperPublicationByNameWithOptions(
         self: *IndexManager,
         store: *docstore_mod.DocStore,
@@ -13062,9 +13057,14 @@ pub const IndexManager = struct {
             if (prepared.observed_field_analyzers.len > 0) {
                 try mergeObservedTextFieldAnalyzers(self, store, entry, prepared.observed_field_analyzers);
             }
-            for (prepared.segments) |segment| {
+            for (prepared.segments) |*segment| {
                 if (segment.len == 0) continue;
-                try entry.persistent.indexSegment(segment);
+                const owned = segment.*;
+                // Transfer before entering persistent publication: success and
+                // every error path consume the buffer, while untouched suffix
+                // segments remain owned by PreparedTextMapperPublication.
+                segment.* = &.{};
+                try entry.persistent.indexSegmentOwned(owned);
                 stats.noteIndex(true);
             }
             try self.finalizeTextBatchMutations(entry, opts, stats);

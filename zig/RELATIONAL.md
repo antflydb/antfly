@@ -67,11 +67,12 @@ whole-document blob is not double-written.
 Each row carries its schema version, a semantic content hash, and a physical
 checksum. The semantic hash is computed from canonical typed logical values and
 therefore survives equivalent storage-format migrations. The checksum covers
-the encoded bytes and detects corruption. Presence/null bitmaps identify
-logical state. Each row deterministically uses the smaller of two canonical
-bodies: dense fixed-width slots plus a variable offset table for populated
-schemas, or a sorted ordinal/payload directory for wide sparse schemas. Both
-support direct projection without reconstructing the whole document.
+the encoded bytes and detects corruption. Each row deterministically uses the
+smaller of two canonical bodies: dense presence/null bitmaps, fixed-width slots,
+and a variable offset table for populated schemas; or a sorted ordinal/payload
+directory whose ordinal word carries the null bit for wide sparse schemas. The
+sparse representation has no schema-width section. Both support direct
+projection without reconstructing the whole document.
 
 Segment-level typed columns remain a derived acceleration structure. They can
 be added for scans, predicates, sorts, and aggregations without changing point
@@ -103,11 +104,13 @@ In `relational` mode the following are implied/enforced:
   dynamic rules inside `json` columns require the later JSON-subdocument
   lifecycle integration.
 
-The parsed public schema is compiled once per immutable schema generation inside the DB.
-Every storage entry point validates its final post-transform rows against that
-same cached contract, including embedded batches, transaction prepares,
-replicated callers, and recovery resolution. API validation remains an early
-feedback optimization rather than the only integrity boundary.
+The active public schema is compiled once per immutable write generation inside
+the DB. Historical cache misses load only the immutable runtime decode layout;
+they are single-flight and never compile a validator that cannot participate in
+a write. Every storage entry point validates its final post-transform rows
+against the active cached contract, including embedded batches, transaction
+prepares, replicated callers, and recovery resolution. API validation remains
+an early feedback optimization rather than the only integrity boundary.
 
 The raw JSON Schema type `json` is accepted for a relational property. It is
 not a dynamic-template `AntflyType`: a `json` column is stored as a `bytes`
@@ -171,8 +174,8 @@ borrow the request body for derived consumers instead of copying it; rows with
 reserved fields clone and stringify one stripped logical tree. Large batches
 prepare on the bounded runtime worker pool into one ref-counted arena per
 worker, so allocator synchronization occurs at page granularity without one
-allocator/page chain per row. Store keys, compatibility deletes, timestamps,
-and derived write effects are prepared from a ref-counted immutable
+allocator/page chain per row. Store keys, timestamps, and derived write effects
+are prepared from a ref-counted immutable
 `WritePlanSnapshot`. Graph/vector extraction and generated-enrichment templates
 are compiled once per durable catalog generation, so foreground work does not
 hold a live catalog lease per row. Slow embedding and asset provider calls run

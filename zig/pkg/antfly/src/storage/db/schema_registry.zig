@@ -143,6 +143,10 @@ pub const Registry = struct {
     alloc: Allocator,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
+    /// Serializes durable cache misses. Faulting is rare and potentially does
+    /// storage I/O; one fiber-aware lane prevents concurrent readers from
+    /// deserializing the same immutable layout and compiling redundant state.
+    historical_fault_mutex: std.Io.Mutex = .init,
     current: std.atomic.Value(?*Epoch) = .init(null),
     /// Readers publish a short acquisition hazard without entering a mutex or
     /// suspending the current std.Io task. Replacement flips banks, then waits
@@ -233,6 +237,14 @@ pub const Registry = struct {
         self.touchHistoricalLocked(epoch);
         epoch.retain();
         return .{ .epoch = epoch };
+    }
+
+    pub fn lockHistoricalFault(self: *Registry) void {
+        self.historical_fault_mutex.lockUncancelable(self.io);
+    }
+
+    pub fn unlockHistoricalFault(self: *Registry) void {
+        self.historical_fault_mutex.unlock(self.io);
     }
 
     fn touchHistoricalLocked(self: *Registry, epoch: *Epoch) void {

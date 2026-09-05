@@ -2467,7 +2467,6 @@ const PreparedRowEffects = struct {
     graph_writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
     graph_clears: std.ArrayListUnmanaged(GraphArtifactClear) = .empty,
     store_key: ?[]u8 = null,
-    legacy_document_key: ?[]u8 = null,
     timestamp_key: ?[]u8 = null,
     timestamp_value: ?[]u8 = null,
 };
@@ -8582,7 +8581,6 @@ pub const DB = struct {
                             row.extracted.artifact_keys_owned_individually = false;
                             if (row.extracted.cleaned_value != null) {
                                 effect.store_key = try encodeStoreLookupKeyAlloc(self, effects_alloc, write.key);
-                                effect.legacy_document_key = try internal_keys.documentKeyAlloc(effects_alloc, write.key);
                                 if (shouldWriteTimestamp(write.key)) {
                                     const write_timestamp_ns = try relational_row_codec.rowWriteTimestampNsTrusted(row.packed_row);
                                     effect.timestamp_key = try makeTimestampKey(effects_alloc, write.key);
@@ -9102,19 +9100,6 @@ pub const DB = struct {
                     .key = store_key,
                     .value = store_value,
                 });
-                if (relationalColumns(self) != null) {
-                    const legacy_document_key = if (use_preprepared_rows) preprepared_effects.?[i].legacy_document_key.? else try internal_keys.documentKeyAlloc(self.alloc, write.key);
-                    if (use_preprepared_rows) {
-                        preprepared_effects.?[i].legacy_document_key = null;
-                        try delete_keys.append(self.alloc, legacy_document_key);
-                    } else {
-                        var legacy_document_key_owned = false;
-                        defer if (!legacy_document_key_owned) self.alloc.free(legacy_document_key);
-                        try owned_delete_keys.append(self.alloc, legacy_document_key);
-                        legacy_document_key_owned = true;
-                        try delete_keys.append(self.alloc, legacy_document_key);
-                    }
-                }
                 try identity_upsert_keys.append(self.alloc, write.key);
                 try identity_upsert_write_indexes.append(self.alloc, i);
                 if (shouldWriteTimestamp(write.key)) {
@@ -9266,14 +9251,6 @@ pub const DB = struct {
             const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, key);
             try owned_delete_keys.append(self.alloc, store_key);
             try delete_keys.append(self.alloc, store_key);
-            if (relationalColumns(self) != null) {
-                const legacy_document_key = try internal_keys.documentKeyAlloc(self.alloc, key);
-                var legacy_document_key_owned = false;
-                defer if (!legacy_document_key_owned) self.alloc.free(legacy_document_key);
-                try owned_delete_keys.append(self.alloc, legacy_document_key);
-                legacy_document_key_owned = true;
-                try delete_keys.append(self.alloc, legacy_document_key);
-            }
             if (shouldWriteTimestamp(key)) {
                 const timestamp_key = try makeTimestampKey(self.alloc, key);
                 try timestamp_delete_keys.append(self.alloc, timestamp_key);
@@ -45756,14 +45733,6 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
             try internal_keys.documentKeyAlloc(ctx.alloc, key);
         try owned_delete_keys.append(ctx.alloc, store_key);
         try delete_keys.append(ctx.alloc, store_key);
-        if (ctx.relational_base_rows) {
-            const legacy_document_key = try internal_keys.documentKeyAlloc(ctx.alloc, key);
-            var legacy_document_key_owned = false;
-            defer if (!legacy_document_key_owned) ctx.alloc.free(legacy_document_key);
-            try owned_delete_keys.append(ctx.alloc, legacy_document_key);
-            legacy_document_key_owned = true;
-            try delete_keys.append(ctx.alloc, legacy_document_key);
-        }
         if (!shouldWriteTimestamp(key)) continue;
         const timestamp_key = try makeTimestampKey(ctx.alloc, key);
         try timestamp_delete_keys.append(ctx.alloc, timestamp_key);

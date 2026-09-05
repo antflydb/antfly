@@ -33,9 +33,11 @@
 //! schemas.
 //!
 //! AROW v2 is the first supported relational row format. Rows always carry a
-//! schema version, semantic content hash, presence/null bitmaps, a canonical
-//! dense or sparse ordinal body, and a physical checksum. There is no
-//! schemaless or pre-v2 compatibility path.
+//! schema version, semantic content hash, a canonical dense or sparse ordinal
+//! body, and a physical checksum. Dense rows carry presence/null bitmaps;
+//! sparse rows encode presence in their directory and the null bit alongside
+//! each ordinal so physical size remains proportional to row density. There is
+//! no schemaless or pre-v2 compatibility path.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -59,6 +61,8 @@ const checksum_len: usize = @sizeOf(u32);
 const capability_sparse_slots: u32 = 1;
 const known_ordinal_capabilities: u32 = capability_sparse_slots;
 const sparse_entry_len: usize = @sizeOf(u32) * 2; // ordinal + payload start
+const sparse_null_flag: u32 = 1 << 31;
+const sparse_ordinal_mask: u32 = ~sparse_null_flag;
 
 /// One reconstructable column value. Owns nothing: `path` and (for `bytes_val`)
 /// the value bytes borrow either the caller's buffers (when serializing) or the
@@ -104,6 +108,7 @@ pub const PhysicalLayout = struct {
 
     pub fn init(alloc: Allocator, table_schema: runtime_schema.TableSchema) !PhysicalLayout {
         const columns = table_schema.relational_columns;
+        if (columns.len > sparse_null_flag) return error.InvalidSchema;
         const column_count = std.math.cast(u32, columns.len) orelse return error.InvalidSchema;
         const fixed_offsets = try alloc.alloc(u32, columns.len);
         errdefer alloc.free(fixed_offsets);
@@ -203,14 +208,15 @@ pub const OrdinalProjectionPlan = struct {
             return error.RelationalRowSchemaMismatch;
         const ordinals = try alloc.alloc(u32, fields.len);
         errdefer alloc.free(ordinals);
-        const emitted = try alloc.alloc(u8, layout.bitmap_len);
-        defer alloc.free(emitted);
-        @memset(emitted, 0);
+        var emitted = std.AutoHashMapUnmanaged(u32, void).empty;
+        defer emitted.deinit(alloc);
+        try emitted.ensureTotalCapacity(alloc, std.math.cast(u32, fields.len) orelse
+            return error.InvalidArgument);
         var count: usize = 0;
         for (fields) |field| {
             const ordinal = layout.ordinalForName(table_schema.relational_columns, field) orelse continue;
-            if (bitmapBit(emitted, ordinal)) continue;
-            setBitmapBit(emitted, ordinal);
+            const result = emitted.getOrPutAssumeCapacity(@intCast(ordinal));
+            if (result.found_existing) continue;
             ordinals[count] = @intCast(ordinal);
             count += 1;
         }
@@ -302,6 +308,7 @@ fn serializeOrdinalInternal(
     validate_json_cells: bool,
     finalize_checksum: bool,
 ) ![]u8 {
+    if (columns.len > sparse_null_flag) return error.InvalidRelationalRow;
     _ = std.math.cast(u32, columns.len) orelse return error.InvalidRelationalRow;
     const bitmap_len: usize = if (layout) |compiled| compiled.bitmap_len else (columns.len + 7) / 8;
     const fixed_len: usize = if (layout) |compiled| compiled.fixed_len else try fixedSectionLen(columns);
@@ -353,11 +360,12 @@ fn serializeOrdinalInternal(
     const sparse_body_len = try serializedLenAdd(sparse_directory_len, sparse_payload_len);
     // The representation is selected solely from schema and logical presence,
     // making canonical re-encoding deterministic across processes.
-    const sparse = sparse_body_len < dense_body_len;
+    const dense_storage_len = try serializedLenAdd(bitmap_sections_len, dense_body_len);
+    const sparse = sparse_body_len < dense_storage_len;
     const capabilities: u32 = if (sparse) capability_sparse_slots else 0;
     const total_len = try serializedLenAdd(
-        try serializedLenAdd(ordinal_header_len + checksum_len, bitmap_sections_len),
-        if (sparse) sparse_body_len else dense_body_len,
+        ordinal_header_len + checksum_len,
+        if (sparse) sparse_body_len else dense_storage_len,
     );
     const out = try alloc.alloc(u8, total_len);
     errdefer alloc.free(out);
@@ -370,12 +378,6 @@ fn serializeOrdinalInternal(
     @memcpy(out[pos..][0..semantic_hash.len], &semantic_hash);
     pos += semantic_hash.len;
     writeU64(out, &pos, 0);
-    const present = out[pos..][0..bitmap_len];
-    @memset(present, 0);
-    pos += bitmap_len;
-    const nulls = out[pos..][0..bitmap_len];
-    @memset(nulls, 0);
-    pos += bitmap_len;
     if (sparse) {
         writeU32(out, &pos, @intCast(cells.len));
         const entries_start = pos;
@@ -389,10 +391,10 @@ fn serializeOrdinalInternal(
         for (cells, 0..) |cell, cell_index| {
             const ordinal: usize = cell.ordinal;
             const column = columns[ordinal];
-            setBitmapBit(present, ordinal);
-            if (cell.is_null) setBitmapBit(nulls, ordinal);
             const entry_pos = entries_start + cell_index * sparse_entry_len;
-            std.mem.writeInt(u32, out[entry_pos..][0..4], @intCast(ordinal), .little);
+            const encoded_ordinal: u32 = @as(u32, @intCast(ordinal)) |
+                (if (cell.is_null) sparse_null_flag else 0);
+            std.mem.writeInt(u32, out[entry_pos..][0..4], encoded_ordinal, .little);
             std.mem.writeInt(u32, out[entry_pos + 4 ..][0..4], @intCast(payload_pos), .little);
             if (!cell.is_null) {
                 if (isVariableColumn(column)) {
@@ -409,6 +411,12 @@ fn serializeOrdinalInternal(
         std.mem.writeInt(u32, out[terminal_offset_pos..][0..4], @intCast(payload_pos), .little);
         std.debug.assert(payload_pos == sparse_payload_len);
     } else {
+        const present = out[pos..][0..bitmap_len];
+        @memset(present, 0);
+        pos += bitmap_len;
+        const nulls = out[pos..][0..bitmap_len];
+        @memset(nulls, 0);
+        pos += bitmap_len;
         const fixed = out[pos..][0..fixed_len];
         @memset(fixed, 0);
         pos += fixed_len;
@@ -555,9 +563,8 @@ pub fn reconstructOrdinalValueAlloc(
     errdefer out.deinit(alloc);
     try out.append(alloc, '{');
     var needs_comma = false;
-    for (table_schema.relational_columns, 0..) |column, ordinal| {
-        if (!bitmapBit(parsed.present, ordinal)) continue;
-        const cell = try ordinalCell(parsed, table_schema.relational_columns, column, ordinal);
+    var iterator = OrdinalCellIterator{ .parsed = parsed, .table_schema = table_schema };
+    while (try iterator.next()) |cell| {
         try appendValidatedCellValue(alloc, &out, cell, needs_comma);
         needs_comma = true;
     }
@@ -576,10 +583,8 @@ pub fn reconstructOrdinalValueWithLayoutAlloc(
     errdefer out.deinit(alloc);
     try out.append(alloc, '{');
     var needs_comma = false;
-    for (table_schema.relational_columns, 0..) |column, ordinal| {
-        if (!bitmapBit(parsed.present, ordinal)) continue;
-        const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
-        const cell = try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal));
+    var iterator = OrdinalCellIterator{ .parsed = parsed, .table_schema = table_schema };
+    while (try iterator.next()) |cell| {
         try appendValidatedCellValue(alloc, &out, cell, needs_comma);
         needs_comma = true;
     }
@@ -723,10 +728,8 @@ fn ownedJsonValueFromCellAlloc(
 
 pub fn validateOrdinal(value: []const u8, table_schema: runtime_schema.TableSchema) !void {
     const parsed = try parseOrdinal(value, table_schema);
-    for (table_schema.relational_columns, 0..) |column, ordinal| {
-        if (!bitmapBit(parsed.present, ordinal)) continue;
-        _ = try ordinalCell(parsed, table_schema.relational_columns, column, ordinal);
-    }
+    var iterator = OrdinalCellIterator{ .parsed = parsed, .table_schema = table_schema };
+    while (try iterator.next()) |_| {}
 }
 
 pub fn validateOrdinalWithLayout(
@@ -735,10 +738,8 @@ pub fn validateOrdinalWithLayout(
     layout: *const PhysicalLayout,
 ) !void {
     const parsed = try parseOrdinalWithLayout(value, table_schema, layout);
-    for (table_schema.relational_columns, 0..) |column, ordinal| {
-        if (!bitmapBit(parsed.present, ordinal)) continue;
-        _ = try ordinalCell(parsed, table_schema.relational_columns, column, ordinal);
-    }
+    var iterator = OrdinalCellIterator{ .parsed = parsed, .table_schema = table_schema };
+    while (try iterator.next()) |_| {}
 }
 
 /// Strictly validate once and expose borrowed typed cells by ordinal. Restore,
@@ -764,8 +765,7 @@ pub fn findCellByOrdinal(
 ) !?Cell {
     if (ordinal >= table_schema.relational_columns.len) return null;
     const parsed = try parseOrdinal(value, table_schema);
-    if (!bitmapBit(parsed.present, ordinal)) return null;
-    return try ordinalCell(parsed, table_schema.relational_columns, table_schema.relational_columns[ordinal], ordinal);
+    return try findParsedOrdinalCell(parsed, table_schema.relational_columns, ordinal);
 }
 
 pub fn findCellByOrdinalWithLayout(
@@ -776,10 +776,7 @@ pub fn findCellByOrdinalWithLayout(
 ) !?Cell {
     if (ordinal >= table_schema.relational_columns.len) return null;
     const parsed = try parseOrdinalWithLayoutRead(value, table_schema, layout);
-    if (!bitmapBit(parsed.present, ordinal)) return null;
-    const column = table_schema.relational_columns[ordinal];
-    const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
-    return try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal));
+    return try findParsedOrdinalCell(parsed, table_schema.relational_columns, ordinal);
 }
 
 /// Reconstruct only selected top-level columns. Callers preflight that field
@@ -811,10 +808,7 @@ pub fn projectOrdinalPlanWithLayoutAlloc(
     var needs_comma = false;
     for (plan.ordinals) |ordinal_raw| {
         const ordinal: usize = ordinal_raw;
-        if (!bitmapBit(parsed.present, ordinal)) continue;
-        const column = table_schema.relational_columns[ordinal];
-        const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
-        const cell = try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal));
+        const cell = (try findParsedOrdinalCell(parsed, table_schema.relational_columns, ordinal)) orelse continue;
         try appendValidatedCellValue(alloc, &out, cell, needs_comma);
         needs_comma = true;
     }
@@ -856,10 +850,7 @@ pub fn projectOrdinalPlanTrustedWithLayoutAlloc(
     var needs_comma = false;
     for (plan.ordinals) |ordinal_raw| {
         const ordinal: usize = ordinal_raw;
-        if (!bitmapBit(parsed.present, ordinal)) continue;
-        const column = table_schema.relational_columns[ordinal];
-        const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
-        const cell = try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal));
+        const cell = (try findParsedOrdinalCell(parsed, table_schema.relational_columns, ordinal)) orelse continue;
         try appendValidatedCellValue(alloc, &out, cell, needs_comma);
         needs_comma = true;
     }
@@ -878,10 +869,7 @@ pub fn findCellByOrdinalTrusted(
 ) !?Cell {
     if (ordinal >= table_schema.relational_columns.len) return null;
     const parsed = try parseOrdinalInternal(value, table_schema, layout, false, false);
-    if (!bitmapBit(parsed.present, ordinal)) return null;
-    const column = table_schema.relational_columns[ordinal];
-    const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
-    return try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal));
+    return try findParsedOrdinalCell(parsed, table_schema.relational_columns, ordinal);
 }
 
 const ParsedOrdinal = struct {
@@ -925,12 +913,11 @@ pub const OrdinalCellIterator = struct {
             if (self.next_sparse_entry >= self.parsed.sparse_entry_count) return null;
             const entry_index = self.next_sparse_entry;
             self.next_sparse_entry += 1;
-            const entry_pos = self.parsed.sparse_entries_start + entry_index * sparse_entry_len;
-            const ordinal: usize = std.mem.readInt(u32, self.parsed.value[entry_pos..][0..4], .little);
+            const ordinal: usize = sparseOrdinalAt(self.parsed, entry_index);
             if (ordinal >= self.table_schema.relational_columns.len) return error.InvalidRelationalRow;
             const column = self.table_schema.relational_columns[ordinal];
             const payload = try sparsePayloadSliceAtIndex(self.parsed, entry_index);
-            return try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(self.parsed.nulls, ordinal));
+            return try ordinalCellFromPayload(column, ordinal, payload, sparseEntryIsNull(self.parsed, entry_index));
         }
 
         while (self.next_ordinal < self.table_schema.relational_columns.len) {
@@ -938,7 +925,10 @@ pub const OrdinalCellIterator = struct {
             self.next_ordinal += 1;
             if (!bitmapBit(self.parsed.present, ordinal)) continue;
             const column = self.table_schema.relational_columns[ordinal];
-            const payload = try ordinalPayloadSliceChecked(self.parsed, column, ordinal);
+            const payload = if (self.parsed.layout != null)
+                try ordinalPayloadSliceChecked(self.parsed, column, ordinal)
+            else
+                ordinalPayloadSlice(self.parsed, self.table_schema.relational_columns, column, ordinal);
             return try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(self.parsed.nulls, ordinal));
         }
         return null;
@@ -981,10 +971,7 @@ pub const OrdinalRowView = struct {
 
     pub fn findCell(self: OrdinalRowView, ordinal: usize) !?Cell {
         if (ordinal >= self.table_schema.relational_columns.len) return null;
-        if (!bitmapBit(self.parsed.present, ordinal)) return null;
-        const column = self.table_schema.relational_columns[ordinal];
-        const payload = try ordinalPayloadSliceChecked(self.parsed, column, ordinal);
-        return try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(self.parsed.nulls, ordinal));
+        return try findParsedOrdinalCell(self.parsed, self.table_schema.relational_columns, ordinal);
     }
 };
 
@@ -1075,18 +1062,22 @@ fn parseOrdinalInternal(
     @memcpy(&semantic_hash, value[pos..][0..semantic_hash_len]);
     pos += semantic_hash_len;
     _ = readU64(value, &pos); // resolved logical write timestamp
-    const bitmap_sections_len = std.math.mul(usize, 2, bitmap_len) catch return error.InvalidRelationalRow;
-    if (bitmap_sections_len > value.len - checksum_len -| pos) return error.InvalidRelationalRow;
-    const present = value[pos..][0..bitmap_len];
-    pos += bitmap_len;
-    const nulls = value[pos..][0..bitmap_len];
-    pos += bitmap_len;
-    for (nulls, present) |null_byte, present_byte| if (null_byte & ~present_byte != 0) return error.InvalidRelationalRow;
-    if (table_schema.relational_columns.len % 8 != 0 and bitmap_len != 0) {
-        const used_bits: u3 = @intCast(table_schema.relational_columns.len % 8);
-        const unused_mask: u8 = ~((@as(u8, 1) << used_bits) - 1);
-        if (present[bitmap_len - 1] & unused_mask != 0 or nulls[bitmap_len - 1] & unused_mask != 0)
-            return error.InvalidRelationalRow;
+    var present: []const u8 = &.{};
+    var nulls: []const u8 = &.{};
+    if (!sparse) {
+        const bitmap_sections_len = std.math.mul(usize, 2, bitmap_len) catch return error.InvalidRelationalRow;
+        if (bitmap_sections_len > value.len - checksum_len -| pos) return error.InvalidRelationalRow;
+        present = value[pos..][0..bitmap_len];
+        pos += bitmap_len;
+        nulls = value[pos..][0..bitmap_len];
+        pos += bitmap_len;
+        for (nulls, present) |null_byte, present_byte| if (null_byte & ~present_byte != 0) return error.InvalidRelationalRow;
+        if (table_schema.relational_columns.len % 8 != 0 and bitmap_len != 0) {
+            const used_bits: u3 = @intCast(table_schema.relational_columns.len % 8);
+            const unused_mask: u8 = ~((@as(u8, 1) << used_bits) - 1);
+            if (present[bitmap_len - 1] & unused_mask != 0 or nulls[bitmap_len - 1] & unused_mask != 0)
+                return error.InvalidRelationalRow;
+        }
     }
     var parsed: ParsedOrdinal = undefined;
     if (sparse) {
@@ -1107,16 +1098,17 @@ fn parseOrdinalInternal(
             var previous_offset: u32 = 0;
             for (0..entry_count) |entry_index| {
                 const entry_pos = entries_start + entry_index * sparse_entry_len;
-                const ordinal = std.mem.readInt(u32, value[entry_pos..][0..4], .little);
+                const encoded_ordinal = std.mem.readInt(u32, value[entry_pos..][0..4], .little);
+                const ordinal = encoded_ordinal & sparse_ordinal_mask;
                 const offset = std.mem.readInt(u32, value[entry_pos + 4 ..][0..4], .little);
                 if (ordinal >= table_schema.relational_columns.len or
                     (previous_ordinal != null and ordinal <= previous_ordinal.?) or
-                    !bitmapBit(present, ordinal) or offset < previous_offset or offset > payload.len)
+                    offset < previous_offset or offset > payload.len)
                     return error.InvalidRelationalRow;
                 previous_ordinal = ordinal;
                 previous_offset = offset;
             }
-            if (terminal_offset < previous_offset or entry_count != bitmapPopulation(present))
+            if (terminal_offset < previous_offset)
                 return error.InvalidRelationalRow;
         }
         parsed = .{
@@ -1135,11 +1127,10 @@ fn parseOrdinalInternal(
         };
         if (canonical) {
             for (0..entry_count) |entry_index| {
-                const entry_pos = entries_start + entry_index * sparse_entry_len;
-                const ordinal: usize = std.mem.readInt(u32, value[entry_pos..][0..4], .little);
+                const ordinal: usize = sparseOrdinalAt(parsed, entry_index);
                 const slot = try sparsePayloadSliceAtIndex(parsed, entry_index);
                 const column = table_schema.relational_columns[ordinal];
-                if (bitmapBit(nulls, ordinal)) {
+                if (sparseEntryIsNull(parsed, entry_index)) {
                     if (slot.len != 0) return error.NonCanonicalRelationalRow;
                 } else if (!isVariableColumn(column) and slot.len != fixedColumnWidth(column)) {
                     return error.InvalidRelationalRow;
@@ -1186,18 +1177,17 @@ fn parseOrdinalInternal(
     if (canonical and sparse) {
         if (layout) |compiled| {
             for (compiled.required_ordinals) |ordinal| {
-                if (!bitmapBit(present, ordinal)) return error.InvalidRelationalRow;
+                if (!parsedHasOrdinal(parsed, ordinal)) return error.InvalidRelationalRow;
             }
         } else {
             for (table_schema.relational_columns, 0..) |column, ordinal| {
-                if (column.required and !bitmapBit(present, ordinal)) return error.InvalidRelationalRow;
+                if (column.required and !parsedHasOrdinal(parsed, ordinal)) return error.InvalidRelationalRow;
             }
         }
         for (0..parsed.sparse_entry_count) |entry_index| {
-            const entry_pos = parsed.sparse_entries_start + entry_index * sparse_entry_len;
-            const ordinal: usize = std.mem.readInt(u32, parsed.value[entry_pos..][0..4], .little);
+            const ordinal = sparseOrdinalAt(parsed, entry_index);
             const column = table_schema.relational_columns[ordinal];
-            if (bitmapBit(nulls, ordinal) and !column.allows_null) return error.InvalidRelationalRow;
+            if (sparseEntryIsNull(parsed, entry_index) and !column.allows_null) return error.InvalidRelationalRow;
         }
     } else if (canonical) {
         for (table_schema.relational_columns, 0..) |column, ordinal| {
@@ -1206,7 +1196,6 @@ fn parseOrdinalInternal(
             } else if (bitmapBit(nulls, ordinal) and !column.allows_null) {
                 return error.InvalidRelationalRow;
             }
-            if (sparse and !bitmapBit(present, ordinal)) continue;
             if (bitmapBit(present, ordinal) and !bitmapBit(nulls, ordinal)) continue;
             const slot = ordinalPayloadSlice(parsed, table_schema.relational_columns, column, ordinal);
             if (isVariableColumn(column)) {
@@ -1231,9 +1220,8 @@ fn shouldUseSparseRepresentation(
     var sparse_payload_len: usize = 0;
     if (parsed.capabilities & capability_sparse_slots != 0) {
         for (0..parsed.sparse_entry_count) |entry_index| {
-            const entry_pos = parsed.sparse_entries_start + entry_index * sparse_entry_len;
-            const ordinal: usize = std.mem.readInt(u32, parsed.value[entry_pos..][0..4], .little);
-            if (bitmapBit(parsed.nulls, ordinal)) continue;
+            const ordinal = sparseOrdinalAt(parsed, entry_index);
+            if (sparseEntryIsNull(parsed, entry_index)) continue;
             const slot = try sparsePayloadSliceAtIndex(parsed, entry_index);
             if (isVariableColumn(columns[ordinal]))
                 dense_variable_payload_len = std.math.add(usize, dense_variable_payload_len, slot.len) catch
@@ -1255,7 +1243,10 @@ fn shouldUseSparseRepresentation(
     const dense_static_len = std.math.add(usize, fixed_len, dense_offsets_len) catch return error.InvalidRelationalRow;
     const dense_body_len = std.math.add(usize, dense_static_len, dense_variable_payload_len) catch
         return error.InvalidRelationalRow;
-    const entry_count = bitmapPopulation(parsed.present);
+    const entry_count = if (parsed.capabilities & capability_sparse_slots != 0)
+        parsed.sparse_entry_count
+    else
+        bitmapPopulation(parsed.present);
     const sparse_directory_len = std.math.add(
         usize,
         @sizeOf(u32) * 2,
@@ -1263,7 +1254,11 @@ fn shouldUseSparseRepresentation(
     ) catch return error.InvalidRelationalRow;
     const sparse_body_len = std.math.add(usize, sparse_directory_len, sparse_payload_len) catch
         return error.InvalidRelationalRow;
-    return sparse_body_len < dense_body_len;
+    const bitmap_len = (columns.len + 7) / 8;
+    const dense_bitmap_len = std.math.mul(usize, 2, bitmap_len) catch return error.InvalidRelationalRow;
+    const dense_storage_len = std.math.add(usize, dense_bitmap_len, dense_body_len) catch
+        return error.InvalidRelationalRow;
+    return sparse_body_len < dense_storage_len;
 }
 
 fn ordinalCell(
@@ -1272,9 +1267,25 @@ fn ordinalCell(
     column: runtime_schema.RelationalColumn,
     ordinal: usize,
 ) !Cell {
-    const is_null = bitmapBit(parsed.nulls, ordinal);
+    const is_null = parsedOrdinalIsNull(parsed, ordinal);
     const payload = ordinalPayloadSlice(parsed, columns, column, ordinal);
     return try ordinalCellFromPayload(column, ordinal, payload, is_null);
+}
+
+fn findParsedOrdinalCell(
+    parsed: ParsedOrdinal,
+    columns: []const runtime_schema.RelationalColumn,
+    ordinal: usize,
+) !?Cell {
+    const column = columns[ordinal];
+    if (parsed.capabilities & capability_sparse_slots != 0) {
+        const entry_index = sparseEntryIndex(parsed, ordinal) orelse return null;
+        const payload = try sparsePayloadSliceAtIndex(parsed, entry_index);
+        return try ordinalCellFromPayload(column, ordinal, payload, sparseEntryIsNull(parsed, entry_index));
+    }
+    if (!bitmapBit(parsed.present, ordinal)) return null;
+    const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
+    return try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal));
 }
 
 fn ordinalCellFromPayload(
@@ -1357,7 +1368,7 @@ fn sparsePayloadSlice(parsed: ParsedOrdinal, target_ordinal: usize) ?[]const u8 
     while (lower < upper) {
         const middle = lower + (upper - lower) / 2;
         const entry_pos = parsed.sparse_entries_start + middle * sparse_entry_len;
-        const ordinal: usize = std.mem.readInt(u32, parsed.value[entry_pos..][0..4], .little);
+        const ordinal: usize = std.mem.readInt(u32, parsed.value[entry_pos..][0..4], .little) & sparse_ordinal_mask;
         if (ordinal < target_ordinal) {
             lower = middle + 1;
         } else if (ordinal > target_ordinal) {
@@ -1373,6 +1384,49 @@ fn sparsePayloadSlice(parsed: ParsedOrdinal, target_ordinal: usize) ?[]const u8 
         }
     }
     return null;
+}
+
+fn sparseOrdinalAt(parsed: ParsedOrdinal, entry_index: usize) usize {
+    std.debug.assert(entry_index < parsed.sparse_entry_count);
+    const entry_pos = parsed.sparse_entries_start + entry_index * sparse_entry_len;
+    return std.mem.readInt(u32, parsed.value[entry_pos..][0..4], .little) & sparse_ordinal_mask;
+}
+
+fn sparseEntryIsNull(parsed: ParsedOrdinal, entry_index: usize) bool {
+    std.debug.assert(entry_index < parsed.sparse_entry_count);
+    const entry_pos = parsed.sparse_entries_start + entry_index * sparse_entry_len;
+    return std.mem.readInt(u32, parsed.value[entry_pos..][0..4], .little) & sparse_null_flag != 0;
+}
+
+fn sparseEntryIndex(parsed: ParsedOrdinal, target_ordinal: usize) ?usize {
+    var lower: usize = 0;
+    var upper: usize = parsed.sparse_entry_count;
+    while (lower < upper) {
+        const middle = lower + (upper - lower) / 2;
+        const ordinal = sparseOrdinalAt(parsed, middle);
+        if (ordinal < target_ordinal) {
+            lower = middle + 1;
+        } else if (ordinal > target_ordinal) {
+            upper = middle;
+        } else {
+            return middle;
+        }
+    }
+    return null;
+}
+
+fn parsedHasOrdinal(parsed: ParsedOrdinal, ordinal: usize) bool {
+    if (parsed.capabilities & capability_sparse_slots != 0)
+        return sparseEntryIndex(parsed, ordinal) != null;
+    return bitmapBit(parsed.present, ordinal);
+}
+
+fn parsedOrdinalIsNull(parsed: ParsedOrdinal, ordinal: usize) bool {
+    if (parsed.capabilities & capability_sparse_slots != 0) {
+        const entry_index = sparseEntryIndex(parsed, ordinal) orelse return false;
+        return sparseEntryIsNull(parsed, entry_index);
+    }
+    return bitmapBit(parsed.nulls, ordinal);
 }
 
 fn sparsePayloadSliceAtIndex(parsed: ParsedOrdinal, entry_index: usize) ![]const u8 {
@@ -1922,7 +1976,7 @@ test "ordinal rows use sparse slots for wide optional schemas" {
         .{ .name = "c12", .path = "c12", .column_type = .integer },
         .{ .name = "c13", .path = "c13", .column_type = .integer },
         .{ .name = "c14", .path = "c14", .column_type = .integer },
-        .{ .name = "c15", .path = "c15", .column_type = .integer },
+        .{ .name = "c15", .path = "c15", .column_type = .integer, .allows_null = true },
     };
     const schema: runtime_schema.TableSchema = .{
         .version = 9,
@@ -1935,10 +1989,25 @@ test "ordinal rows use sparse slots for wide optional schemas" {
     const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0x33} ** semantic_hash_len);
     defer alloc.free(encoded);
     try std.testing.expectEqual(capability_sparse_slots, std.mem.readInt(u32, encoded[12..16], .little));
-    try std.testing.expect(encoded.len < ordinal_header_len + 2 * 2 + 16 * 8 + checksum_len);
+    try std.testing.expectEqual(
+        ordinal_header_len + @sizeOf(u32) + sparse_entry_len + @sizeOf(u32) + @sizeOf(i64) + checksum_len,
+        encoded.len,
+    );
     try validateOrdinal(encoded, schema);
     try std.testing.expect((try findCellByOrdinal(encoded, schema, 0)) == null);
     try std.testing.expectEqual(@as(i64, 42), (try findCellByOrdinal(encoded, schema, 15)).?.value.i64_val);
+
+    const null_cells = [_]Cell{
+        .{ .ordinal = 15, .path = "c15", .value_type = .i64_val, .is_null = true, .value = .{ .i64_val = 0 } },
+    };
+    const encoded_null = try serializeOrdinal(alloc, schema.version, &columns, &null_cells, [_]u8{0x44} ** semantic_hash_len);
+    defer alloc.free(encoded_null);
+    try std.testing.expectEqual(
+        ordinal_header_len + @sizeOf(u32) + sparse_entry_len + @sizeOf(u32) + checksum_len,
+        encoded_null.len,
+    );
+    const decoded_null = (try findCellByOrdinal(encoded_null, schema, 15)).?;
+    try std.testing.expect(decoded_null.is_null);
 }
 
 test "ordinal root materialization preserves exact nested JSON numbers" {

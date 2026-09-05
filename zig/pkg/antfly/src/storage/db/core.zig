@@ -1392,27 +1392,19 @@ pub const DBCore = struct {
 
     pub fn acquireSchemaVersionView(self: *DBCore, version: u32) !?schema_registry_mod.SchemaView {
         if (self.schema_registry.acquireVersion(version)) |view| return view;
+        self.schema_registry.lockHistoricalFault();
+        defer self.schema_registry.unlockHistoricalFault();
+        // Another reader may have completed the immutable fault while this
+        // fiber waited. Recheck before touching durable metadata.
+        if (self.schema_registry.acquireVersion(version)) |view| return view;
         const historical = try schema_mod.loadSchemaVersion(self.store, self.alloc, version) orelse return null;
         var historical_owned = true;
         errdefer if (historical_owned) schema_mod.freeSchema(self.alloc, historical);
-        const public_key = try public_schema_mod.versionedSchemaKeyAlloc(self.alloc, version);
-        defer self.alloc.free(public_key);
-        const public_json = self.store.get(self.alloc, public_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
-        defer if (public_json) |json| self.alloc.free(json);
-        var validator = if (public_json) |json|
-            try public_schema_mod.CompiledTableValidator.init(self.alloc, json)
-        else
-            null;
-        var validator_owned = validator != null;
-        errdefer if (validator_owned) validator.?.deinit(self.alloc);
-        if (validator) |compiled| if (compiled.schema.version != version)
-            return error.InvalidSchema;
-        const epoch = try schema_registry_mod.Epoch.createOwnedValidated(self.alloc, historical, validator);
+        // Historical epochs are read-only decode layouts. Validators belong to
+        // active write epochs; compiling one here adds a second metadata read
+        // and substantial cold-read CPU without participating in validation.
+        const epoch = try schema_registry_mod.Epoch.createOwned(self.alloc, historical);
         historical_owned = false;
-        validator_owned = false;
         errdefer epoch.release();
         return try self.schema_registry.installHistorical(epoch);
     }
