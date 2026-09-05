@@ -8,6 +8,7 @@ pub const BedrockEmbedderConfig = types.BedrockEmbedderConfig;
 pub const CohereEmbedderConfig = types.CohereEmbedderConfig;
 pub const EmbedderConfig = types.EmbedderConfig;
 pub const EmbedderProvider = types.EmbedderProvider;
+pub const EmbeddingRetrievalConfig = types.EmbeddingRetrievalConfig;
 pub const GoogleEmbedderConfig = types.GoogleEmbedderConfig;
 pub const IndexEmbedderConfig = types.IndexEmbedderConfig;
 pub const OllamaEmbedderConfig = types.OllamaEmbedderConfig;
